@@ -122,6 +122,7 @@ Core files:
     - `DynamicBatchingSizeDataset` (preferred) / `DynBszBuffer` (legacy): per-worker buffer, yields when token sum ≥ `micro_batch_seq_length`.
     - `_get_micro_batch` greedily adds samples that fit. Supports `state_dict` / `load_state_dict` for checkpoint resumption.
     - Position IDs in packed sequences must encode segment boundaries (see constraint 10).
+    - With USP context parallelism (`cp_size > 1`), `PackingCollator` pads each document to `2 * cp_size`; dynamic batching must therefore budget total/physical sample lengths rounded up to the same alignment. Padding labels use `IGNORE_INDEX`, while padding position IDs continue monotonically so they do not create false document boundaries.
 
 ### Multimodal Data
 

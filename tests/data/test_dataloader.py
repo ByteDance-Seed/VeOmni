@@ -3,20 +3,27 @@ from functools import partial
 from typing import Literal
 
 import pytest
+import torch
 from utils import DummyDataset, process_dummy_example
 
 from veomni.data import build_dataloader, build_dataset
 from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
+from veomni.utils.constants import IGNORE_INDEX
 
 
-def _fake_ps(sp_size: int):
+def _fake_ps(sp_size: int, cp_size: int = 1):
     sp_enabled = sp_size > 1
+    ulysses_size = sp_size // cp_size
     return types.SimpleNamespace(
         dp_size=1,
         dp_rank=0,
         sp_enabled=sp_enabled,
         sp_size=sp_size,
         sp_rank=0,
+        cp_size=cp_size,
+        cp_rank=0,
+        ulysses_size=ulysses_size,
+        ulysses_rank=0,
     )
 
 
@@ -148,6 +155,68 @@ def test_build_dataloader_dyn_bsz_count_mode(
         assert dl.dataset.get_length_fn is m_ds.get_length_by_labels_fn
         assert dl.dataset.physical_token_cap == 48
         assert dl.dataset.get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
+
+
+@pytest.mark.parametrize("dyn_bsz_runtime", ["main", "worker"])
+@pytest.mark.parametrize("dyn_bsz_count_mode", ["total", "effective"])
+def test_build_dataloader_cp_counts_document_alignment(
+    monkeypatch,
+    dummy_dataset_ci,
+    dyn_bsz_runtime: Literal["main", "worker"],
+    dyn_bsz_count_mode: Literal["total", "effective"],
+):
+    import veomni.data.data_collator as m_col
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=2, cp_size=2)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_col, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    dl = build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1 if dyn_bsz_runtime == "main" else 2,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=0,
+        dyn_bsz=True,
+        dyn_bsz_runtime=dyn_bsz_runtime,
+        dyn_bsz_count_mode=dyn_bsz_count_mode,
+        dyn_bsz_physical_overflow_ratio=1.0,
+        dyn_bsz_buffer_size=1,
+        drop_last=True,
+        prefetch_factor=None,
+        seed=0,
+    )
+    sample = {
+        "input_ids": types.SimpleNamespace(shape=(3,)),
+        "attention_mask": torch.ones(3, dtype=torch.long),
+        "labels": torch.tensor([IGNORE_INDEX, 1, 2]),
+    }
+
+    if dyn_bsz_runtime == "main":
+        length_fn = dl.batching_strategy.buffer._get_length_fn
+        physical_length_fn = dl.batching_strategy.buffer._get_physical_length_fn
+    else:
+        length_fn = dl.dataset.get_length_fn
+        physical_length_fn = dl.dataset.get_physical_length_fn
+
+    if dyn_bsz_count_mode == "total":
+        assert length_fn(sample) == 4
+        assert physical_length_fn is None
+    else:
+        assert length_fn(sample) == 2
+        assert physical_length_fn(sample) == 4
 
 
 def test_build_dataloader_dyn_bsz_physical_overflow_ratio(monkeypatch, dummy_dataset_ci):

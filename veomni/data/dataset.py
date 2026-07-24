@@ -351,6 +351,14 @@ def get_length_fn_by_count_mode(count_mode: str):
     raise ValueError(f"Unknown dyn_bsz count_mode: {count_mode!r} (expected 'total' or 'effective')")
 
 
+def get_aligned_length(sample: Any, *, alignment: int, get_length_fn: Callable[[Any], int]) -> int:
+    """Return a sample length rounded up to ``alignment`` tokens."""
+    if alignment < 1:
+        raise ValueError(f"alignment must be positive, got {alignment}")
+    length = get_length_fn(sample)
+    return (length + alignment - 1) // alignment * alignment
+
+
 def _supports_output_index_for_resume(dataset: Any) -> bool:
     return callable(getattr(dataset, "get_item", None)) and hasattr(dataset, "output_index_for_resume")
 

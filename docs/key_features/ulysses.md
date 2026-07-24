@@ -490,12 +490,14 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 - **Ring path is causal-only**: `cp_size > 1` does not support explicit
   attention masks (only causal). Packed (varlen) sequences ARE supported —
   each document is zig-zag split independently across the `cp` group.
-- **Packed divisibility**: under `cp_size > 1` every packed document length must
-  be divisible by `2 · cp_size` (so each document splits evenly into the
-  `2·cp_size` zig-zag blocks). When every document is aligned, the SP-pad tail
-  segment is automatically aligned too (the total is a multiple of `2·cp_size`).
-  Unaligned documents raise an actionable `ValueError` at collate time — pack
-  your data with this alignment, or keep `cp_size == 1` for arbitrary lengths.
+- **Packed divisibility**: under `cp_size > 1`, `PackingCollator` automatically
+  pads every packed document to a multiple of `2 · cp_size` before concatenation.
+  The inserted tokens use ignored labels (`-100`) and continuing position IDs,
+  so they satisfy the zig-zag layout without creating extra varlen boundaries.
+  Dynamic batching budgets these aligned physical lengths, and fixed/SP tail
+  padding is coalesced into one aligned segment. The lower-level USP reorder
+  helpers still validate the invariant and reject manually constructed
+  unaligned batches.
 - **Flash-attention backend**: ring attention builds on a `flash_attn`
   forward/backward pair, auto-selected at import time (see `FA_BACKEND` in
   `ring_attention.py`): classic **FA2** (`flash_attn.flash_attn_interface`) on

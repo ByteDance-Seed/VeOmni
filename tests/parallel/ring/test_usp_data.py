@@ -27,7 +27,7 @@ import pytest
 import torch
 
 import veomni.data.data_collator as dc
-from veomni.data.data_collator import SequenceParallelCollator
+from veomni.data.data_collator import MainCollator, PackingCollator, SequenceParallelCollator
 from veomni.distributed.sequence_parallel.data import (
     local_cu_seqlens,
     zigzag_block_order,
@@ -35,6 +35,7 @@ from veomni.distributed.sequence_parallel.data import (
     zigzag_reorder_varlen,
     zigzag_undo,
 )
+from veomni.utils.constants import IGNORE_INDEX
 
 
 def test_block_order_cp2():
@@ -135,10 +136,58 @@ class _FakeState:
     def sp_rank(self):
         return self.ulysses_rank * self.cp_size + self.cp_rank
 
+    @property
+    def sp_enabled(self):
+        return self.sp_size > 1
+
 
 def _make_collator(monkeypatch, state):
     monkeypatch.setattr(dc, "get_parallel_state", lambda: state)
     return SequenceParallelCollator()
+
+
+def _unaligned_text_features():
+    return [
+        {
+            "input_ids": torch.tensor([10, 11, 12]),
+            "labels": torch.tensor([10, 11, 12]),
+            "attention_mask": torch.ones(3, dtype=torch.long),
+            "position_ids": torch.arange(3),
+        },
+        {
+            "input_ids": torch.tensor([20, 21]),
+            "labels": torch.tensor([20, 21]),
+            "attention_mask": torch.ones(2, dtype=torch.long),
+            "position_ids": torch.arange(2),
+        },
+    ]
+
+
+def test_packing_collator_aligns_each_document_for_cp(monkeypatch):
+    state = _FakeState(cp_size=2, ulysses_size=1, cp_rank=0, ulysses_rank=0)
+    monkeypatch.setattr(dc, "get_parallel_state", lambda: state)
+
+    batch = PackingCollator(pad_to_length=12)(_unaligned_text_features())
+
+    assert batch["input_ids"].tolist() == [[10, 11, 12, 0, 20, 21, 0, 0, 0, 0, 0, 0]]
+    assert batch["labels"].tolist() == [
+        [10, 11, 12, IGNORE_INDEX, IGNORE_INDEX, 21, IGNORE_INDEX, IGNORE_INDEX, *([IGNORE_INDEX] * 4)]
+    ]
+    assert batch["attention_mask"].tolist() == [[1] * 12]
+    assert batch["position_ids"].tolist() == [[0, 1, 2, 3, 0, 1, 2, 3, 0, 0, 0, 0]]
+    assert batch[dc._LINEAR_ATTN_TAIL_PADDING_LENGTH] == 4
+
+
+def test_main_collator_coalesces_fixed_tail_after_cp_document_alignment(monkeypatch):
+    state = _FakeState(cp_size=2, ulysses_size=1, cp_rank=0, ulysses_rank=0)
+    monkeypatch.setattr(dc, "get_parallel_state", lambda: state)
+
+    batch = MainCollator(pad_to_length=12)(_unaligned_text_features())
+
+    assert batch["cu_seq_lens_q"].tolist() == [0, 4, 8, 12]
+    assert batch["cu_seq_lens_k"].tolist() == [0, 4, 8, 12]
+    assert int(batch["tail_padding_length"]) == 4
+    assert all(length % 4 == 0 for length in torch.diff(batch["cu_seq_lens_q"]).tolist())
 
 
 def test_compute_cp_cu_seqlens_two_docs(monkeypatch):

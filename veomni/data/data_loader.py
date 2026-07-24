@@ -14,6 +14,7 @@
 
 
 import math
+from functools import partial
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -31,7 +32,12 @@ from .data_collator import (
     NoopDataCollator,
     UnpackDataCollator,
 )
-from .dataset import DynamicBatchingSizeDataset, get_length_by_attention_mask_fn, get_length_fn_by_count_mode
+from .dataset import (
+    DynamicBatchingSizeDataset,
+    get_aligned_length,
+    get_length_by_attention_mask_fn,
+    get_length_fn_by_count_mode,
+)
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
@@ -169,13 +175,26 @@ def build_native_dataloader(
         )
         dyn_bsz_collate_fn = collate_fn
         dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
+        cp_size = getattr(parallel_state, "cp_size", 1)
+        cp_aligned_physical_length_fn = None
+        if cp_size > 1:
+            cp_aligned_physical_length_fn = partial(
+                get_aligned_length,
+                alignment=2 * cp_size,
+                get_length_fn=get_length_by_attention_mask_fn,
+            )
+            if dyn_bsz_count_mode == "total":
+                # The packing collator inserts ignored tokens so every document can
+                # be split into 2*cp_size zig-zag blocks. Budget those tokens before
+                # selecting a micro batch so fixed-length padding cannot overflow.
+                dyn_bsz_length_fn = cp_aligned_physical_length_fn
         if dyn_bsz_count_mode == "effective":
             if dyn_bsz_physical_overflow_ratio < 1.0:
                 raise ValueError(
                     f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {dyn_bsz_physical_overflow_ratio}."
                 )
             physical_token_cap = math.ceil(batching_token_len * dyn_bsz_physical_overflow_ratio)
-            dyn_bsz_physical_length_fn = get_length_by_attention_mask_fn
+            dyn_bsz_physical_length_fn = cp_aligned_physical_length_fn or get_length_by_attention_mask_fn
         else:
             physical_token_cap = None
             dyn_bsz_physical_length_fn = None
