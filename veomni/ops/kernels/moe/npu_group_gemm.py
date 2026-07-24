@@ -17,6 +17,7 @@ from typing import List, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import torch_npu
 
 from ....distributed.moe.comm import all_to_all
@@ -24,6 +25,30 @@ from ....distributed.moe.moe_utils import sort_chunks_by_idxs
 from ....distributed.parallel_state import get_parallel_state
 from ....utils.device import stream_synchronize
 from ._kernels.kernel.npu_group_gemm import npu_group_gemm
+
+
+def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """gpt-oss-style clamped SwiGLU (DeepSeek-V4).
+
+    ``torch_npu.npu_swiglu`` is a fused kernel with no clamp support, so this
+    manual (unfused) path is only taken when ``swiglu_limit`` is set -- today
+    that is exclusively DeepSeek-V4's ``PatchedDeepseekV4Experts`` (see
+    ``deepseek_v4_gpu_patch_gen_config.py``). Chunk convention and clamp
+    bounds mirror that class's eager ``_apply_gate`` exactly: first half of
+    the last dim is ``gate`` (clamped to ``max=limit``), second half is ``up``
+    (clamped to ``[-limit, limit]``), activation is SiLU (DeepSeek-V4's
+    ``config.hidden_act``).
+    """
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    return F.silu(gate) * up
+
+
+def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
+    if swiglu_limit is None:
+        return torch_npu.npu_swiglu(x, dim=-1)
+    return _clamped_swiglu(x, swiglu_limit)
 
 
 def _npu_fused_moe_forward(
@@ -35,6 +60,7 @@ def _npu_fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """NPU single-device fused MoE forward pass (non-EP).
 
@@ -53,7 +79,7 @@ def _npu_fused_moe_forward(
         fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
     fc1_weight = fc1_weight.transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert)
-    intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
+    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
     output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert)
     hidden_states = torch_npu.npu_moe_token_unpermute(output, row_ids_map, probs=routing_weights)
     return hidden_states
@@ -69,6 +95,7 @@ def npu_ep_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: Optional[dist.ProcessGroup] = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
 
@@ -95,7 +122,7 @@ def npu_ep_fused_moe_forward(
         fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
     fc1_weight = fc1_weight.transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
-    intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
+    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
     hidden_states = npu_group_gemm(
         intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
     )
@@ -218,9 +245,6 @@ def npu_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
 ):
-    if swiglu_limit is not None:
-        raise NotImplementedError("NPU fused MoE does not support swiglu_limit clamp semantics.")
-
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(
             num_experts,
@@ -232,6 +256,7 @@ def npu_fused_moe_forward(
             fc2_weight,
             fc1_1_2_weight,
             ep_group=get_parallel_state().ep_group,
+            swiglu_limit=swiglu_limit,
         )
     else:
         final_hidden_states = _npu_fused_moe_forward(
@@ -243,5 +268,6 @@ def npu_fused_moe_forward(
             fc1_2_weight,
             fc2_weight,
             fc1_1_2_weight,
+            swiglu_limit=swiglu_limit,
         )
     return final_hidden_states
