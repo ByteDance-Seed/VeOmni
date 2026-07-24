@@ -646,8 +646,11 @@ class BaseTrainer(Stateful, ABC):
             self.tqdm_callback,
             self.channel_loss_callback,
             self.wandb_callback,
-            self.profile_callback,
             self.checkpointer_callback,
+            # Profile schedules use absolute global steps, so initialize them
+            # after checkpoint restore without changing any other callback's
+            # relative ordering.
+            self.profile_callback,
             self.hf_ckpt_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,

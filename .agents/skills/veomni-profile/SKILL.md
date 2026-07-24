@@ -15,6 +15,7 @@ Key components:
 | `VeomniFlopsCounter` | `veomni/utils/count_flops.py` | Analytical FLOPs/MFU computation per model family |
 | `EnvironMeter` | `veomni/utils/helper.py` | Step-level throughput metrics (tokens/s, FLOPs, MFU) |
 | `merge_chrome_trace.py` | `scripts/profile/merge_chrome_trace.py` | Merge multi-rank Chrome traces for unified viewing |
+| `npu_offline_postprocess` | `veomni/utils/npu_offline_postprocess.py` | Async Ascend offline analyse / durable copy / Merlin upload sidecar |
 
 Output formats:
 - **Chrome trace**: `veomni_rank{R}_{timestamp}.pt.trace.json.gz` — viewable in `chrome://tracing` or Perfetto
@@ -88,6 +89,7 @@ train:
     with_stack: true      # capture Python call stacks
     with_modules: true    # annotate with nn.Module names
     rank0_only: true      # profile only rank 0 to reduce overhead
+    npu_analysis_mode: offline  # Ascend only: offline | async
 ```
 
 Or pass via CLI overrides: `--train.profile.enable=true --train.profile.start_step=5 ...`
@@ -148,4 +150,6 @@ On NPU, `create_profiler()` uses `torch_npu.profiler` instead of `torch.profiler
 - Output format includes AiC (Ascend insight Counters) metrics.
 - Memory profiling uses NPU-specific APIs.
 - Analysis tools differ — use Ascend Insight instead of Chrome tracing.
+- `npu_analysis_mode: offline` leaves finalized raw data for later parsing; `async` runs official online analysis in torch_npu's background process pool.
+- `async` requires a pod-local trace directory and may contend with training for CPU/disk. Use `offline` for the smallest training-side critical path.
 - Always guard NPU-specific analysis code with `is_torch_npu_available()`.
