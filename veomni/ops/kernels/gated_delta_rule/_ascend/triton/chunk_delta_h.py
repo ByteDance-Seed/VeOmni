@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...npu_hardware import get_hidden_state_block_value
 from .utils import prepare_chunk_indices, prepare_chunk_offsets, get_autotune_config, get_npu_properties
 
 CUBE_CORE_NUM = get_npu_properties()['num_aicore']
@@ -260,7 +261,7 @@ def chunk_gated_delta_rule_fwd_h(
     h = k.new_empty(B, NT, H, K, V).permute(0, 2, 1, 3, 4).contiguous()
     final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
-    BV = 128
+    BV = get_hidden_state_block_value(k.device.index)
 
     v_new = torch.empty_like(u).permute(0, 2, 1, 3).contiguous() if save_new_value else None
     k = k.permute(0, 2, 1, 3).contiguous()
@@ -544,7 +545,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
     dv2 = torch.empty_like(dv)
 
-    BV = 128
+    BV = get_hidden_state_block_value(q.device.index)
 
     g = g.permute(0, 2, 1).contiguous()
 

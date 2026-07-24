@@ -13,10 +13,11 @@
 # limitations under the License.
 """Vendored NPU Triton kernels for Qwen3.5's gated delta-rule linear attention.
 
-Copied verbatim from MindSpeed-MM (https://gitcode.com/Ascend/MindSpeed-MM),
-which in turn ports flash-linear-attention (FLA) to Ascend NPU; all files keep
-their original Apache-2.0 headers. Do not hand-edit the kernel logic here —
-treat this as a drop-in vendor blob so it stays diff-able against upstream. VeOmni's registry-facing wrappers live one level up
+Copied from MindSpeed-MM (https://gitcode.com/Ascend/MindSpeed-MM), which in
+turn ports flash-linear-attention (FLA) to Ascend NPU; all files keep their
+original Apache-2.0 headers. Keep local changes limited to documented
+hardware launch geometry so the kernels stay diff-able against upstream.
+VeOmni's registry-facing wrappers live one level up
 (``npu_causal_conv1d.py`` and the ``chunk_gated_delta_rule`` factory in the
 package ``__init__``); those are the only entry points other code should call.
 
