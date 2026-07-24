@@ -22,6 +22,7 @@ from transformers.integrations.flex_attention import flex_attention_forward as h
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, causal_mask_function
 
 from ....distributed.parallel_state import get_parallel_state
+from ....utils.device import IS_CUDA_AVAILABLE, get_torch_device
 from .ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -32,6 +33,23 @@ from .ulysses import (
 # Module-level patch slot for the underlying Transformers FlexAttention adapter.
 _flex_attention_forward: Callable = hf_flex_attention_forward
 _flex_attention_mask_builder: Callable = ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"]
+_HEAD_DIM_256_TRITON_STAGE3_SHARED_MEMORY = 151_552
+
+
+def _set_portable_triton_stage_default(query: torch.Tensor, kernel_options: dict) -> None:
+    """Limit Triton pipeline stages when head-dim 256 exceeds the device shared-memory budget."""
+    if (
+        kernel_options.get("BACKEND") != "TRITON"
+        or "num_stages" in kernel_options
+        or query.shape[-1] != 256
+        or not IS_CUDA_AVAILABLE
+        or not query.is_cuda
+    ):
+        return
+
+    device_properties = get_torch_device().get_device_properties(query.device)
+    if device_properties.shared_memory_per_block_optin < _HEAD_DIM_256_TRITON_STAGE3_SHARED_MEMORY:
+        kernel_options["num_stages"] = 1
 
 
 def flex_attention_mask_builder(
@@ -127,6 +145,7 @@ def flex_attention_forward(
     # fail during Inductor kernel selection. Use the standard Triton FlexAttention
     # kernel by default while preserving an explicit caller override.
     kernel_options.setdefault("BACKEND", "TRITON")
+    _set_portable_triton_stage_default(query, kernel_options)
 
     parallel_state = get_parallel_state()
     ulysses_enabled = parallel_state.ulysses_enabled and not skip_ulysses

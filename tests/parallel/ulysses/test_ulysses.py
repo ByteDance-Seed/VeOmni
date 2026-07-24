@@ -9,7 +9,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask
 from transformers.configuration_utils import PreTrainedConfig
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
 
 
 if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
@@ -222,7 +222,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             torch.testing.assert_close(gathered_gradient, baseline_tensor.grad, rtol=8e-2, atol=8e-2)
 
     @pytest.mark.skipif(
-        get_device_type() != "cuda" or get_torch_device().device_count() < 2,
+        not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
         reason="attention backend Ulysses parity requires at least 2 CUDA devices",
     )
     def test_flash_wrapper_matches_non_sp_oracle(self):
@@ -256,7 +256,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             flash_backend.get_parallel_state = original_get_parallel_state
 
     @pytest.mark.skipif(
-        get_device_type() != "cuda" or get_torch_device().device_count() < 2,
+        not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
         reason="FlexAttention Ulysses parity requires at least 2 CUDA devices",
     )
     def test_flex_wrapper_matches_non_sp_oracle(self):
@@ -318,7 +318,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             flex_backend.get_parallel_state = original_get_parallel_state
 
     @pytest.mark.skipif(
-        get_device_type() != "cuda" or get_torch_device().device_count() < 2,
+        not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
         reason="packed FlexAttention Ulysses parity requires at least 2 CUDA devices",
     )
     def test_packed_causal_flex_wrapper_matches_non_sp_oracle(self):

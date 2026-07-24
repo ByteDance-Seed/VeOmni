@@ -29,6 +29,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from veomni.ops import build_ALL_OPS
 from veomni.ops.kernels import attention as veomni_attention
 from veomni.ops.kernels.attention import flex as flex_backend
+from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type, get_torch_device, synchronize
 
 
 class _FakeAttentionModule(nn.Module):
@@ -101,6 +102,57 @@ def test_flex_module_compute_slot_preserves_the_hf_adapter_contract_and_diagnost
     assert dict(build_ALL_OPS())["_flex_attention_forward"] is replacement_backend
 
 
+@pytest.mark.parametrize(
+    ("available_shared_memory", "caller_num_stages", "expected_num_stages"),
+    [
+        (101_376, None, 1),
+        (166_912, None, None),
+        (101_376, 2, 2),
+    ],
+)
+def test_flex_attention_head_dim_256_uses_portable_triton_stages(
+    monkeypatch,
+    available_shared_memory,
+    caller_num_stages,
+    expected_num_stages,
+):
+    device_api = SimpleNamespace(
+        get_device_properties=lambda device: SimpleNamespace(
+            shared_memory_per_block_optin=available_shared_memory,
+        )
+    )
+    monkeypatch.setattr(flex_backend, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(flex_backend, "get_torch_device", lambda: device_api)
+
+    query = SimpleNamespace(shape=(1, 2, 8, 256), device=object(), is_cuda=True)
+    kernel_options = {} if caller_num_stages is None else {"num_stages": caller_num_stages}
+    kernel_options.setdefault("BACKEND", "TRITON")
+    flex_backend._set_portable_triton_stage_default(query, kernel_options)
+
+    assert kernel_options["BACKEND"] == "TRITON"
+    if expected_num_stages is None:
+        assert "num_stages" not in kernel_options
+    else:
+        assert kernel_options["num_stages"] == expected_num_stages
+
+
+def test_flex_attention_head_dim_256_skips_non_selected_device(monkeypatch):
+    def unexpected_device_query(device):
+        raise AssertionError(f"Unexpected device-properties query for {device}.")
+
+    monkeypatch.setattr(flex_backend, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(
+        flex_backend,
+        "get_torch_device",
+        lambda: SimpleNamespace(get_device_properties=unexpected_device_query),
+    )
+
+    kernel_options = {"BACKEND": "TRITON"}
+    flex_backend._set_portable_triton_stage_default(torch.randn(1, 2, 8, 256), kernel_options)
+
+    assert kernel_options == {"BACKEND": "TRITON"}
+
+
 def test_flex_attention_cpu_forward_uses_native_block_mask_and_hf_layout():
     sequence_length = 17
     query = torch.randn(2, 4, sequence_length, 8)
@@ -123,10 +175,10 @@ def test_flex_attention_cpu_forward_uses_native_block_mask_and_hf_layout():
     assert torch.isfinite(output).all()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention backward requires CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlexAttention backward requires CUDA")
 def test_flex_attention_short_query_uses_default_triton_backend():
     sequence_length = 65
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     query = torch.randn(1, 2, sequence_length, 256, device=device, dtype=torch.bfloat16, requires_grad=True)
     key = torch.randn(1, 1, sequence_length, 256, device=device, dtype=torch.bfloat16, requires_grad=True)
     value = torch.randn(1, 1, sequence_length, 256, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -446,10 +498,10 @@ def test_mixed_visibility_block_mask_matches_dense_mask():
     assert torch.equal(reconstructed, dense_mask[0, 0])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention backward requires CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlexAttention backward requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_bagel_like_layer_matches_math_sdpa(dtype):
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     torch.manual_seed(9051)
     sdpa_layer = _MixedVisibilityAttentionLayer().to(device=device, dtype=dtype).train()
     flex_layer = copy.deepcopy(sdpa_layer)
@@ -513,9 +565,10 @@ def _profile_forward_backward(
     backend: str,
     sdpa_backend: SDPBackend | None = None,
 ) -> tuple[float, bool]:
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    device_api = get_torch_device()
+    synchronize()
+    start = device_api.Event(enable_timing=True)
+    end = device_api.Event(enable_timing=True)
     start.record()
     output, auxiliary = layer(
         hidden_states,
@@ -525,7 +578,7 @@ def _profile_forward_backward(
     )
     gradients = torch.autograd.grad(output, (hidden_states, *layer.parameters()), output_gradient)
     end.record()
-    torch.cuda.synchronize()
+    synchronize()
 
     finite = bool(torch.isfinite(output).all().item()) and all(
         bool(torch.isfinite(gradient).all().item()) for gradient in gradients
@@ -538,11 +591,12 @@ def _profile_forward_backward(
 
 
 def _profile_mixed_visibility_backend(sequence_length: int, *, backend: str) -> dict[str, object]:
+    device_api = get_torch_device()
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+    empty_cache()
+    device_api.reset_peak_memory_stats()
 
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     dtype = torch.bfloat16
     torch.manual_seed(12001 + sequence_length)
     layer = _MixedVisibilityAttentionLayer().to(device=device, dtype=dtype).train()
@@ -577,7 +631,7 @@ def _profile_mixed_visibility_backend(sequence_length: int, *, backend: str) -> 
     else:
         raise ValueError(f"Unsupported profiling backend: {backend}")
 
-    torch.cuda.reset_peak_memory_stats()
+    device_api.reset_peak_memory_stats()
     first_iteration_ms, first_finite = _profile_forward_backward(
         layer,
         hidden_states,
@@ -586,7 +640,7 @@ def _profile_mixed_visibility_backend(sequence_length: int, *, backend: str) -> 
         backend=layer_backend,
         sdpa_backend=sdpa_backend,
     )
-    first_iteration_peak_allocated_gib = torch.cuda.max_memory_allocated() / 1024**3
+    first_iteration_peak_allocated_gib = device_api.max_memory_allocated() / 1024**3
     post_first_warmup_ms, warmup_finite = _profile_forward_backward(
         layer,
         hidden_states,
@@ -597,8 +651,8 @@ def _profile_mixed_visibility_backend(sequence_length: int, *, backend: str) -> 
     )
 
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+    empty_cache()
+    device_api.reset_peak_memory_stats()
     steady_state_times_ms = []
     all_finite = first_finite and warmup_finite
     for _ in range(_PROFILE_ITERATIONS):
@@ -623,12 +677,12 @@ def _profile_mixed_visibility_backend(sequence_length: int, *, backend: str) -> 
         "steady_state_iterations": _PROFILE_ITERATIONS,
         "steady_state_times_ms": steady_state_times_ms,
         "steady_state_median_ms": statistics.median(steady_state_times_ms),
-        "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
+        "peak_allocated_gib": device_api.max_memory_allocated() / 1024**3,
         "all_outputs_and_gradients_finite": all_finite,
     }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Attention profiling requires CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Attention profiling requires CUDA")
 @pytest.mark.skipif(
     not _RUN_PROFILE,
     reason="Set RUN_FLEX_ATTENTION_PROFILE=1 to run the BAGEL-like CUDA profile",
@@ -636,18 +690,19 @@ def _profile_mixed_visibility_backend(sequence_length: int, *, backend: str) -> 
 @pytest.mark.benchmark
 @pytest.mark.parametrize("sequence_length", _PROFILE_SEQUENCE_LENGTHS)
 def test_bagel_like_layer_profiles_efficient_sdpa_against_flex(sequence_length):
+    device_api = get_torch_device()
     try:
         efficient_result = _profile_mixed_visibility_backend(sequence_length, backend="efficient_attention")
         flex_result = _profile_mixed_visibility_backend(sequence_length, backend="flex_attention")
-    except torch.cuda.OutOfMemoryError as error:
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except device_api.OutOfMemoryError as error:
+        free_bytes, total_bytes = device_api.mem_get_info()
         pytest.fail(
             json.dumps(
                 {
                     "sequence_length": sequence_length,
                     "error": str(error),
-                    "allocated_gib": torch.cuda.memory_allocated() / 1024**3,
-                    "reserved_gib": torch.cuda.memory_reserved() / 1024**3,
+                    "allocated_gib": device_api.memory_allocated() / 1024**3,
+                    "reserved_gib": device_api.memory_reserved() / 1024**3,
                     "free_gib": free_bytes / 1024**3,
                     "total_gib": total_bytes / 1024**3,
                 },

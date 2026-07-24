@@ -42,6 +42,7 @@ from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu imp
 )
 from veomni.ops.kernels import attention as veomni_attention
 from veomni.ops.kernels.attention import flex as flex_attention
+from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type, get_torch_device, synchronize
 
 
 _TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "gemma3_toy"
@@ -154,14 +155,14 @@ def test_gemma3_patched_causal_lm_forward_supports_eager_training(monkeypatch):
     assert torch.isfinite(model.model.layers[0].self_attn.q_proj.weight.grad).all()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Liger fused linear cross entropy requires CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Liger fused linear cross entropy requires CUDA")
 def test_gemma3_patched_causal_lm_forward_supports_fused_loss(monkeypatch):
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     torch.manual_seed(23)
     model = build_foundation_model(
         _TOY_CONFIG,
         torch_dtype="bfloat16",
-        init_device="cuda",
+        init_device=get_device_type(),
         ops_implementation=_eager_ops_config(
             "eager",
             cross_entropy_loss_implementation="liger_kernel",
@@ -303,9 +304,9 @@ def test_gemma3_packed_flex_matches_independent_samples_on_cpu():
     torch.testing.assert_close(packed_logits[:, 3:], second_logits, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Gemma 3 packed FlexAttention requires CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Gemma 3 packed FlexAttention requires CUDA")
 def test_gemma3_packed_flex_matches_independent_samples_on_cuda():
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     dtype = torch.bfloat16
     torch.manual_seed(127)
     config = _toy_config()
@@ -403,9 +404,9 @@ def test_gemma3_builds_global_pack_aware_masks_with_ulysses(monkeypatch):
         assert not block_mask.mask_mod(zero, zero, torch.tensor(5), torch.tensor(4))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Gemma 3 FlexAttention backward requires CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Gemma 3 FlexAttention backward requires CUDA")
 def test_gemma3_flex_matches_math_sdpa_forward_and_backward():
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     dtype = torch.bfloat16
     torch.manual_seed(29)
     config = _toy_config()
@@ -450,16 +451,17 @@ def test_gemma3_flex_matches_math_sdpa_forward_and_backward():
 
 
 def _run_profile_iteration(model, inputs_embeds):
+    device_api = get_torch_device()
     model.zero_grad(set_to_none=True)
     inputs_embeds.grad = None
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    synchronize()
+    start = device_api.Event(enable_timing=True)
+    end = device_api.Event(enable_timing=True)
     start.record()
     output = model(inputs_embeds=inputs_embeds, use_cache=False).last_hidden_state
     output.float().square().mean().backward()
     end.record()
-    torch.cuda.synchronize()
+    synchronize()
 
     gradients = (
         inputs_embeds.grad,
@@ -475,12 +477,13 @@ def _run_profile_iteration(model, inputs_embeds):
 
 
 def _profile_gemma3_backend(sequence_length, backend):
+    device_api = get_torch_device()
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache()
     if backend == "flex_attention":
         torch.compiler.reset()
 
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
     dtype = torch.bfloat16
     config = _profile_config()
     if backend == "efficient_attention":
@@ -503,13 +506,13 @@ def _profile_gemma3_backend(sequence_length, backend):
         dtype=dtype,
         requires_grad=True,
     )
-    torch.cuda.reset_peak_memory_stats()
+    device_api.reset_peak_memory_stats()
 
     try:
         first_iteration_ms, first_finite = _run_profile_iteration(model, inputs_embeds)
-        first_iteration_peak_allocated_gib = torch.cuda.max_memory_allocated() / 1024**3
+        first_iteration_peak_allocated_gib = device_api.max_memory_allocated() / 1024**3
         warmup_ms, warmup_finite = _run_profile_iteration(model, inputs_embeds)
-        torch.cuda.reset_peak_memory_stats()
+        device_api.reset_peak_memory_stats()
         steady_state_times_ms = []
         all_finite = first_finite and warmup_finite
         for _ in range(_PROFILE_ITERATIONS):
@@ -525,17 +528,17 @@ def _profile_gemma3_backend(sequence_length, backend):
             "steady_state_iterations": _PROFILE_ITERATIONS,
             "steady_state_times_ms": steady_state_times_ms,
             "steady_state_median_ms": statistics.median(steady_state_times_ms),
-            "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
+            "peak_allocated_gib": device_api.max_memory_allocated() / 1024**3,
             "all_outputs_and_gradients_finite": all_finite,
         }
-    except torch.cuda.OutOfMemoryError as error:
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except device_api.OutOfMemoryError as error:
+        free_bytes, total_bytes = device_api.mem_get_info()
         result = {
             "backend": backend,
             "status": "oom",
             "error": str(error),
-            "allocated_gib": torch.cuda.memory_allocated() / 1024**3,
-            "reserved_gib": torch.cuda.memory_reserved() / 1024**3,
+            "allocated_gib": device_api.memory_allocated() / 1024**3,
+            "reserved_gib": device_api.memory_reserved() / 1024**3,
             "free_gib": free_bytes / 1024**3,
             "total_gib": total_bytes / 1024**3,
         }
@@ -543,12 +546,12 @@ def _profile_gemma3_backend(sequence_length, backend):
         del model
         del inputs_embeds
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache()
 
     return result
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Gemma 3 profiling requires CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Gemma 3 profiling requires CUDA")
 @pytest.mark.skipif(
     not _RUN_PROFILE,
     reason="Set RUN_GEMMA3_FLEX_PROFILE=1 to run the Gemma 3 CUDA profile",
