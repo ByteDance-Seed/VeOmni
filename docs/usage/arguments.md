@@ -464,8 +464,10 @@ validation instead of applying ChunkMBS to multiple stacks.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable_activation | `bool` | `False` | Enable activation offload to CPU. |
+| enable_activation | `bool` | `False` | Enable synchronous activation offload to CPU. |
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
+| enable_async_activation | `bool` | `False` | Enable async activation offload via stream-based D2H/H2D. Mutually exclusive with `enable_activation`. Requires `activation_offload_modules`, and at least one pattern must match. |
+| activation_offload_modules | `List[str]` | `[]` | Module name patterns for async offload. Supports glob (`model.layers.*`) and `{*}` for sequential groups (`model.layers.{*}`). |
 
 ### CheckpointConfig
 
