@@ -34,6 +34,7 @@ import pytest
 import veomni.ops  # noqa: F401 — trigger KERNEL_REGISTRY registrations
 from veomni.ops.dispatch import OpSlot
 from veomni.ops.kernel_registry import KERNEL_REGISTRY
+from veomni.utils.import_utils import is_torch_npu_available
 
 
 _REGISTRY_MODULE = "veomni.ops.kernel_registry"
@@ -103,3 +104,36 @@ def test_gdn_registry_has_fla_and_npu(op_name):
     available = KERNEL_REGISTRY.list_available(op_name, "standard")
     assert "fla" in available
     assert "npu" in available
+
+
+# ---------------------------------------------------------------------------
+# npu_ascendc — the second NPU backend on chunk_gated_delta_rule only
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_gdr_registry_has_npu_ascendc():
+    available = KERNEL_REGISTRY.list_available("chunk_gated_delta_rule", "standard")
+    assert "npu_ascendc" in available
+    # npu_ascendc is scoped to chunk_gated_delta_rule; causal_conv1d keeps a single npu backend.
+    assert "npu_ascendc" not in KERNEL_REGISTRY.list_available("causal_conv1d", "standard")
+
+
+@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
+@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
+def test_opslot_npu_ascendc_backend_on_gpu_raises():
+    slot = OpSlot("chunk_gated_delta_rule", "standard")
+    with pytest.raises(RuntimeError, match="device_type='npu'"):
+        slot.bind("npu_ascendc")
+
+
+@pytest.mark.skipif(
+    is_torch_npu_available(),
+    reason="guard only fires when torch_npu/fla_npu are absent; on NPU the factory imports the real kernel",
+)
+def test_npu_ascendc_factory_missing_dep_raises_actionable():
+    """Absent ``fla_npu``/``torch_npu`` surfaces a RuntimeError with install guidance,
+    not a bare ModuleNotFoundError from the transitive ``import fla_npu``."""
+    from veomni.ops.kernels.gated_delta_rule import _npu_ascendc_chunk_gated_delta_rule_factory
+
+    with pytest.raises(RuntimeError, match="fla_npu"):
+        _npu_ascendc_chunk_gated_delta_rule_factory()
