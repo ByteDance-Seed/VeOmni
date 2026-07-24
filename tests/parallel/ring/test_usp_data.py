@@ -12,19 +12,112 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for SequenceParallelCollator USP varlen (packed) slicing.
+"""CPU unit tests for USP data plumbing: zig-zag reorder helpers + collator slicing.
 
-Uses a fake ParallelState so no device mesh / GPUs are needed. Verifies that
-per-document zig-zag slicing across the cp group, when gathered back, restores
-the full sequence, and that the derived per-document offsets are correct.
+Consolidates the pure-CPU (no GPU / no distributed) USP data tests:
+  * zig-zag block ordering, dense + varlen reorder/undo round-trips;
+  * ``SequenceParallelCollator`` USP varlen (packed) per-document slicing,
+    reassembly, cu_seqlens derivation, and alignment error handling.
 """
 
+# ── zig-zag reorder helpers ───────────────────────────────────────────────────
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 import veomni.data.data_collator as dc
 from veomni.data.data_collator import SequenceParallelCollator
+from veomni.distributed.sequence_parallel.data import (
+    local_cu_seqlens,
+    zigzag_block_order,
+    zigzag_reorder,
+    zigzag_reorder_varlen,
+    zigzag_undo,
+)
+
+
+def test_block_order_cp2():
+    # cp=2 -> blocks [0,3,1,2]: rank0 owns {0,3}, rank1 owns {1,2}
+    assert zigzag_block_order(2) == [0, 3, 1, 2]
+
+
+def test_block_order_cp4():
+    assert zigzag_block_order(4) == [0, 7, 1, 6, 2, 5, 3, 4]
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4])
+def test_reorder_then_undo_is_identity(cp_size):
+    seq = 2 * cp_size * 5
+    x = torch.arange(seq).view(1, seq, 1).float()
+    reordered = zigzag_reorder(x, dim=1, cp_size=cp_size)
+    restored = zigzag_undo(reordered, dim=1, cp_size=cp_size)
+    assert torch.equal(restored, x)
+
+
+def test_reorder_gives_expected_blocks_cp2():
+    # 4 blocks of length 2: [b0 b1 b2 b3] -> [b0 b3 b1 b2]
+    x = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]).view(1, 8, 1).float()
+    reordered = zigzag_reorder(x, dim=1, cp_size=2).view(-1).tolist()
+    assert reordered == [0, 1, 6, 7, 2, 3, 4, 5]
+
+
+def test_cp1_is_noop():
+    x = torch.randn(1, 10, 3)
+    assert torch.equal(zigzag_reorder(x, dim=1, cp_size=1), x)
+    assert torch.equal(zigzag_undo(x, dim=1, cp_size=1), x)
+
+
+def test_reorder_requires_divisible_length():
+    x = torch.randn(1, 7, 1)
+    with pytest.raises(AssertionError):
+        zigzag_reorder(x, dim=1, cp_size=2)
+
+
+# ── varlen (packed) per-document zig-zag ──────────────────────────────────────
+
+
+def test_reorder_varlen_shards_each_document_cp2():
+    # two documents: doc0 len 12, doc1 len 8; cp=2 -> 4 blocks per doc.
+    cp = 2
+    doc_lens = [12, 8]
+    cu = torch.tensor([0, 12, 20], dtype=torch.int32)
+    x = torch.arange(sum(doc_lens)).view(-1, 1).float()
+    reordered = zigzag_reorder_varlen(x, cu, dim=0, cp_size=cp)
+    chunk = reordered.shape[0] // cp
+    rank0 = reordered[:chunk].view(-1).int().tolist()
+    rank1 = reordered[chunk:].view(-1).int().tolist()
+    # doc0 blocks of len 3: [0,1,2][3,4,5][6,7,8][9,10,11]; rank0 owns {0,3}
+    # doc1 blocks of len 2: [12,13][14,15][16,17][18,19]; rank0 owns {0,3}
+    assert rank0 == [0, 1, 2, 9, 10, 11, 12, 13, 18, 19]
+    assert rank1 == [3, 4, 5, 6, 7, 8, 14, 15, 16, 17]
+
+
+def test_local_cu_seqlens_cp2():
+    cu = torch.tensor([0, 12, 20], dtype=torch.int32)
+    local = local_cu_seqlens(cu, cp_size=2)
+    # each document length halved for cp=2
+    assert local.tolist() == [0, 6, 10]
+
+
+def test_reorder_varlen_cp1_is_noop():
+    cu = torch.tensor([0, 6, 10], dtype=torch.int32)
+    x = torch.randn(10, 2)
+    assert torch.equal(zigzag_reorder_varlen(x, cu, dim=0, cp_size=1), x)
+    assert torch.equal(local_cu_seqlens(cu, cp_size=1), cu)
+
+
+def test_reorder_varlen_requires_divisible_document():
+    # document length 10 is not divisible by 2*cp=4
+    cu = torch.tensor([0, 10], dtype=torch.int32)
+    x = torch.randn(10, 1)
+    with pytest.raises(AssertionError):
+        zigzag_reorder_varlen(x, cu, dim=0, cp_size=2)
+    with pytest.raises(AssertionError):
+        local_cu_seqlens(cu, cp_size=2)
+
+
+# ── SequenceParallelCollator USP varlen slicing ───────────────────────────────
 
 
 @dataclass
@@ -123,12 +216,10 @@ def test_sp_pad_tail_segment_is_aligned_when_docs_aligned(monkeypatch):
 
 
 def test_unaligned_document_raises_actionable_error(monkeypatch):
-    import pytest as _pytest
-
     state = _FakeState(cp_size=2, ulysses_size=1, cp_rank=0, ulysses_rank=0)
     collator = _make_collator(monkeypatch, state)
     # two docs: len 8 (ok) and len 6 (NOT divisible by 2*cp=4). The len-6 doc
     # cannot be balanced across the cp group and must raise a clear error.
     position_ids = torch.tensor([[*range(8), *range(6)]])
-    with _pytest.raises(ValueError, match="divisible by 2.cp_size"):
+    with pytest.raises(ValueError, match="divisible by 2.cp_size"):
         collator._compute_cp_cu_seqlens({"position_ids": position_ids})
