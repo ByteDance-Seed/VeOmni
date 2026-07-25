@@ -18,7 +18,10 @@ from typing import Dict, Optional
 
 import torch
 import torch_npu
-import fla_npu
+
+# Load-bearing despite being unused: importing fla_npu registers the fused
+# torch.ops.npu.* GDN ops this file dispatches to. Do not prune.
+import fla_npu  # noqa: F401
 
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
@@ -197,7 +200,7 @@ def flash_chunk_gated_delta_rule_fwd(
         A = solve_tril(
             A=A,
             cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
+            chunk_indices=_chunk_tensor(chunk_indices, chunk_size),
             output_dtype=k.dtype,
         )
     else:
@@ -429,6 +432,19 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 64,
     ):
+        # The AscendC backward (npu_chunk_gated_delta_rule_bwd_dhu) hardcodes
+        # h0/dht=None and returns dh0=None, so it produces no gradient w.r.t.
+        # initial_state — this matches upstream MindSpeed-MM's AscendC path (its
+        # Triton `npu` backend does thread h0/dht, but this AscendC one does not).
+        # Forward-only use of initial_state (recurrent-state carry) is fine; guard
+        # only the grad-requiring case so it fails loud instead of silently
+        # returning a None/zero gradient.
+        if torch.is_grad_enabled() and initial_state is not None and initial_state.requires_grad:
+            raise NotImplementedError(
+                "npu_ascendc chunk_gated_delta_rule cannot differentiate initial_state "
+                "(the AscendC backward returns no dh0, same as MindSpeed-MM). Detach "
+                "initial_state, or use the 'npu' (Triton) backend if you need that gradient."
+            )
 
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)

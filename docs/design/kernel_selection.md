@@ -298,8 +298,7 @@ The NPU gated RMSNorm uses `torch_npu`. The NPU causal Conv1D and gated
 delta-rule implementations additionally require `triton-ascend`. For the gated
 delta rule there are two NPU backends: `npu` (the vendored MindSpeed-MM Triton
 kernel) and `npu_ascendc` (an AscendC fused `torch.ops.npu.*` path), the latter
-requiring a manual `fla_npu` install and `ASCEND_CUSTOM_OPP_PATH` exported before
-process start. Registrations live in
+requiring a manual `fla_npu` install. Registrations live in
 `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
 values are documented by `OpsImplementationConfig`.
 

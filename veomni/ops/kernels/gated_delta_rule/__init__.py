@@ -267,6 +267,17 @@ def _npu_ascendc_chunk_gated_delta_rule_factory():
     try:
         from .npu_ascendc_gated_delta_rule import chunk_gated_delta_rule
     except ModuleNotFoundError as e:
+        if e.name == "triton":
+            # triton-ascend (imported as `triton`) backs the `triton_core` glue
+            # kernels; it is a separate install from fla_npu. `npu` needs it too,
+            # so the only dep-free fallback here is `eager`.
+            raise RuntimeError(
+                "chunk_gated_delta_rule 'npu_ascendc' backend requires the 'triton-ascend' "
+                "package (imported as 'triton'), which is not installed. Install it on NPU "
+                "(pip install triton-ascend==3.2.1 "
+                "--extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple), or set "
+                "chunk_gated_delta_rule_implementation to 'eager'."
+            ) from e
         if e.name in ("fla_npu", "torch_npu"):
             raise RuntimeError(
                 f"chunk_gated_delta_rule 'npu_ascendc' backend requires the '{e.name}' package, "

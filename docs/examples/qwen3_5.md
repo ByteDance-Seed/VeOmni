@@ -223,9 +223,14 @@ model:
     chunk_gated_delta_rule_implementation: npu_ascendc
 ```
 
+A ready-to-run MoE-VL training config wired for this backend (plus `fused_npu` MoE and
+Ulysses SP) is provided at
+[`configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml`](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml).
+
 `fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It supports Ascend
-910B (A2) / 910_93 (A3) / 950 (A5); on non-arch35 chips the `solve_tril` step auto-falls-back to
-the vendored Triton kernel via `is_arch35()`.
+910B (A2) / 910_93 (A3), both non-arch35 chips where the `solve_tril` step runs the vendored
+Triton kernel (the arch35 native path is gated behind `is_arch35()`). arch35 (`Ascend910_95` /
+`Ascend950`) is not supported end-to-end: the vendored `causal_conv1d` raises there (see above).
 
 The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
 bundle `fla_npu`:
