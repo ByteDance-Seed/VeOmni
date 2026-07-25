@@ -256,13 +256,12 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
     from veomni.ops.kernels.deepseek_v4 import tilelang_sparse_mla_bwd as sparse_mla_bwd
 
     kv_block = sparse_mla_bwd.KV_BLOCK
-    compiled = []
+    requested_kv_lengths = []
     original_bwd = sparse_mla_bwd.bwd
 
-    def tracking_bwd(*args, **kwargs):
-        kernel = original_bwd(*args, **kwargs)
-        compiled.append(kernel)
-        return kernel
+    def tracking_bwd(B, S, S_kv, *args, **kwargs):
+        requested_kv_lengths.append(S_kv)
+        return original_bwd(B, S, S_kv, *args, **kwargs)
 
     monkeypatch.setattr(sparse_mla_bwd, "bwd", tracking_bwd)
 
@@ -288,7 +287,8 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
         for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
             assert _cosine_similarity(actual_grad, expected_grad) > 0.95
 
-    assert len({id(kernel) for kernel in compiled}) == 1
+    # One specialization key for all three lengths, so TileLang compiles once.
+    assert set(requested_kv_lengths) == {kv_block}
 
 
 def test_deepseek_v4_generated_attention_dispatch_matches_eager():

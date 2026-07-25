@@ -310,6 +310,12 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     #
     # Widening S_kv also widens the kernel's in-range check, so indices at or past
     # the real length are dropped here to keep them out of the pad rows.
+    #
+    # topk is the other key these kernels specialize on. It stays pinned only while
+    # the compressor emits at least index_topk tokens, since the caller asks for
+    # sliding_window + min(compressed_len, index_topk) candidates. It is left
+    # unrounded on purpose: the main loop iterates over topk, so padding it would buy
+    # fewer recompiles at the price of proportionally more kernel time.
     kv_pad = -unpadded_S_kv % KV_BLOCK
     if kv_pad:
         topk_idxs = torch.where(topk_idxs < unpadded_S_kv, topk_idxs, -1)
