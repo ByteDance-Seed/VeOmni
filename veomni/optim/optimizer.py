@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -31,7 +31,7 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from .muon import DistributedMuon, split_muon_adamw_params
+from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
 
 
 def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
@@ -491,6 +491,31 @@ def _is_extra_parallel_param(p: torch.nn.Parameter, extra_parallel_names: Sequen
     return None
 
 
+def _muon_param_groups(
+    params: List[torch.nn.Parameter],
+    head_blocks_by_param: Dict[int, int],
+) -> Union[List[torch.nn.Parameter], List[Dict[str, Any]]]:
+    """Split ``params`` into one Muon param group per head-block count.
+
+    Muon carries the orthogonalization scope as the per-group ``head_blocks``
+    option, so params that disagree must sit in different groups. Groups are
+    emitted in ascending block order so every rank iterates them in the same
+    order — the all-to-all pairing in ``DistributedMuon`` is position-based.
+    """
+    if not head_blocks_by_param:
+        return list(params)
+
+    by_blocks: Dict[int, List[torch.nn.Parameter]] = {}
+    for p in params:
+        by_blocks.setdefault(head_blocks_by_param.get(id(p), 1), []).append(p)
+    # The unsplit group stays free of ``head_blocks`` so its flattened DCP state
+    # dict keys match a run with head splitting disabled.
+    return [
+        {"params": group_params} if blocks == 1 else {"params": group_params, "head_blocks": blocks}
+        for blocks, group_params in sorted(by_blocks.items())
+    ]
+
+
 def _build_muon_with_adamw(
     model: "nn.Module",
     lr: float,
@@ -511,6 +536,12 @@ def _build_muon_with_adamw(
     # Summary-only keys collected by the trainer; not DistributedMuon ctor args.
     expert_zero_comm = bool(muon_kwargs.pop("expert_zero_comm", False))
     adamw_lr = float(muon_kwargs.pop("adamw_lr", lr))
+    # Head-split scope is resolved from the model here, then handed to Muon as
+    # per-param-group ``head_blocks``.
+    head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
+    head_split_modules = muon_kwargs.pop("head_split_modules", None) or None
+    if head_group_size < 0:
+        raise ValueError(f"muon_head_group_size must be >= 0 (0 disables head splitting), got {head_group_size}")
     muon_lr_explicit = bool(
         muon_kwargs.pop("muon_lr_explicit", "lr" in muon_kwargs and muon_kwargs.get("lr") is not None)
     )
@@ -528,6 +559,26 @@ def _build_muon_with_adamw(
             "Muon optimizer was selected but the model has no eligible 2D/3D parameters. "
             "Falling back to AdamW would be silent so we raise instead."
         )
+
+    head_blocks_by_param: Dict[int, int] = {}
+    head_split_names: List[str] = []
+    if head_group_size >= 1:
+        blocks_by_fqn = infer_head_block_counts(model, head_group_size, head_split_modules)
+        muon_name_set = set(muon_names)
+        param_by_name = dict(model.named_parameters())
+        for fqn, blocks in sorted(blocks_by_fqn.items()):
+            if fqn not in muon_name_set:
+                # Routed to AdamW (e.g. via no_decay_modules), so there is no
+                # orthogonalization to scope.
+                continue
+            head_blocks_by_param[id(param_by_name[fqn])] = blocks
+            head_split_names.append(fqn)
+        if not head_split_names:
+            logger.warning_rank0(
+                f"[Muon] muon_head_group_size={head_group_size} matched no attention projection; "
+                "every param stays on full-matrix Muon. Check muon_head_split_modules against "
+                "this architecture's attention module names."
+            )
 
     extra_parallel_aware = _should_build_extra_parallel_aware(model)
     parallel_state = get_parallel_state() if extra_parallel_aware else None
@@ -580,6 +631,15 @@ def _build_muon_with_adamw(
         f"expert_zero_comm={expert_zero_comm} "
         "(applied at FSDP parallelize; see [muon_expert_zero_comm] logs)."
     )
+    if head_split_names:
+        blocks_hist: Dict[int, int] = {}
+        for blocks in head_blocks_by_param.values():
+            blocks_hist[blocks] = blocks_hist.get(blocks, 0) + 1
+        logger.info_rank0(
+            f"[Muon] head split: {len(head_split_names)} param(s) orthogonalized in blocks of "
+            f"{head_group_size} head(s); {{blocks: params}}={dict(sorted(blocks_hist.items()))}; "
+            f"first few: {head_split_names[:3]}."
+        )
     if extra_parallel_aware:
         for para in extra_parallel_names:
             logger.info_rank0(
@@ -590,7 +650,7 @@ def _build_muon_with_adamw(
 
     def _make_muon(params: List[torch.nn.Parameter]) -> DistributedMuon:
         return DistributedMuon(
-            params,
+            _muon_param_groups(params, head_blocks_by_param),
             lr=muon_kwargs.get("lr", 2e-2),
             weight_decay=muon_kwargs.get("weight_decay", 0.0),
             momentum=muon_kwargs.get("momentum", 0.95),

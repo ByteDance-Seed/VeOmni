@@ -60,6 +60,12 @@ train:
     # std | gram | gram_quack (default; needs gram-newton-schulz + quack on H100/B200/GB200)
     muon_ns_implementation: gram_quack
     muon_adjust_lr_fn: match_rms_adamw
+    # Head-split Muon (GLM-5 "Muon Split"). 0 = one polar factor per projection,
+    # 1 = per-head, g > 1 = g heads per block. The main win here is q_b_proj:
+    # V4-Flash stacks 64 heads x 512 into [32768, q_lora_rank], so full-matrix
+    # orthogonalization caps the update at rank=q_lora_rank and starves
+    # individual heads. Off by default because it changes the update math.
+    # muon_head_group_size: 1
     # MoE + EP: whole-expert Shard(0) when (num_experts/ep_size) % ep_fsdp_size == 0
     muon_expert_zero_comm: true
   init_device: meta

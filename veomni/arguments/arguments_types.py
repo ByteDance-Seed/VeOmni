@@ -143,6 +143,30 @@ class OptimizerConfig:
             )
         },
     )
+    muon_head_group_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Attention heads per Newton-Schulz block for head-split Muon (GLM-5 'Muon Split'). "
+                "0 (default) orthogonalizes each projection as a single matrix; 1 is fully per-head; "
+                "g > 1 puts g heads in each block. Expect gains when the head-stacked matrix is much "
+                "taller than its input dim (MLA/low-rank up-projections such as DeepSeek V4 q_b_proj) "
+                "and roughly no effect for square or wide GQA projections."
+            )
+        },
+    )
+    muon_head_split_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Leaf module names eligible for head splitting, matched exactly against the children "
+                "of an attention module. Replaces (does not extend) the default list "
+                "veomni.optim.muon.DEFAULT_HEAD_SPLIT_MODULES, which covers q/k/v_proj, the MLA "
+                "q_b_proj/k_b_proj/v_b_proj forms and the DSA indexer's wq_b. Only consulted when "
+                "muon_head_group_size >= 1."
+            )
+        },
+    )
     muon_expert_zero_comm: bool = field(
         default=False,
         metadata={

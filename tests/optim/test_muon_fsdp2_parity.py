@@ -159,18 +159,38 @@ def _build_dense_model(
     return model
 
 
-def _dense_golden_state(full_shapes: dict, hidden: int, intermediate: int, mixed_dtype: bool) -> dict:
-    """Single-process reference for the dense FSDP2 path."""
-    device = torch.device("cpu")
-    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate, mixed_dtype=mixed_dtype)
-    opt = DistributedMuon(
-        list(model.parameters()),
+def _dense_muon(model: nn.Module, head_blocks: int) -> DistributedMuon:
+    """Muon over every param, optionally splitting each matrix into row blocks.
+
+    ``up`` gets ``head_blocks`` blocks and ``down`` half as many, so splitting
+    produces *two* param groups: the all-to-all bucketing has to stay
+    rank-consistent across groups, not just within one.
+    """
+    if head_blocks <= 1:
+        grouped = list(model.parameters())
+    else:
+        by_blocks: dict = {}
+        for name, p in model.named_parameters():
+            blocks = head_blocks if name.endswith("up.weight") else head_blocks // 2
+            by_blocks.setdefault(blocks, []).append(p)
+        grouped = [{"params": params, "head_blocks": blocks} for blocks, params in sorted(by_blocks.items())]
+    return DistributedMuon(
+        grouped,
         lr=5e-3,
         weight_decay=0.0,
         momentum=0.9,
         nesterov=True,
         adjust_lr_fn="match_rms_adamw",
     )
+
+
+def _dense_golden_state(
+    full_shapes: dict, hidden: int, intermediate: int, mixed_dtype: bool, head_blocks: int = 1
+) -> dict:
+    """Single-process reference for the dense FSDP2 path."""
+    device = torch.device("cpu")
+    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate, mixed_dtype=mixed_dtype)
+    opt = _dense_muon(model, head_blocks)
     for step in range(2):
         _make_grads(model, full_shapes, step, device)
         opt.step()
@@ -178,7 +198,7 @@ def _dense_golden_state(full_shapes: dict, hidden: int, intermediate: int, mixed
     return _full_state_dict(model)
 
 
-def _run_dense(hidden: int = 32, intermediate: int = 64, mixed_dtype: bool = False) -> None:
+def _run_dense(hidden: int = 32, intermediate: int = 64, mixed_dtype: bool = False, head_blocks: int = 1) -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device_type = get_device_type()
     get_torch_device().set_device(f"{device_type}:{local_rank}")
@@ -196,14 +216,7 @@ def _run_dense(hidden: int = 32, intermediate: int = 64, mixed_dtype: bool = Fal
     for name, p in model.named_parameters():
         assert isinstance(p, DTensor), f"expected DTensor for {name}, got {type(p)}"
 
-    opt = DistributedMuon(
-        list(model.parameters()),
-        lr=5e-3,
-        weight_decay=0.0,
-        momentum=0.9,
-        nesterov=True,
-        adjust_lr_fn="match_rms_adamw",
-    )
+    opt = _dense_muon(model, head_blocks)
     a2a_chunk_sizes = []
     original_ortho_fsdp_group_all2all = opt._ortho_fsdp_group_all2all
 
@@ -227,6 +240,7 @@ def _run_dense(hidden: int = 32, intermediate: int = 64, mixed_dtype: bool = Fal
             hidden=hidden,
             intermediate=intermediate,
             mixed_dtype=mixed_dtype,
+            head_blocks=head_blocks,
         )
         assert set(fsdp_state.keys()) == set(golden.keys())
         for k, v in golden.items():
@@ -498,6 +512,16 @@ def test_dense_mixed_dtype_4gpu():
 
 
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
+def test_dense_head_split_4gpu():
+    """Head-block orthogonalization must survive the all-to-all owner path."""
+    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="dense_head_split", use_zero_comm=False)
+    env = os.environ.copy()
+    env.setdefault("NCCL_DEBUG", "WARN")
+    result = subprocess.run(cmd, env=env, check=True)
+    assert result.returncode == 0
+
+
+@pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_qwen3_moe_default_backend_4gpu():
     """Default backend: ``Shard(1)`` on experts + ep_fsdp all-gather in Muon."""
     cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="moe", use_zero_comm=False)
@@ -521,7 +545,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["dense", "dense_empty", "dense_mixed_dtype", "moe"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["dense", "dense_empty", "dense_mixed_dtype", "dense_head_split", "moe"],
+        required=True,
+    )
     parser.add_argument("--zero-comm", type=int, default=0)
     args = parser.parse_args()
     if args.mode == "dense":
@@ -530,5 +558,8 @@ if __name__ == "__main__":
         _run_dense(hidden=2, intermediate=3)
     elif args.mode == "dense_mixed_dtype":
         _run_dense(mixed_dtype=True)
+    elif args.mode == "dense_head_split":
+        # up is [64, 32] and down is [32, 64], so 4 blocks divide both evenly.
+        _run_dense(head_blocks=4)
     else:
         _run_qwen3_moe(use_zero_comm=bool(args.zero_comm))
