@@ -714,11 +714,13 @@ def deepseek_v4_attention_forward_patched(
             )
         local_num_heads = self.num_heads // ulysses_size
         # Compressors / Lightning Indexer window across the full sequence, so
-        # gather the local shard before running them. Q uses true Ulysses
-        # head/sequence exchange; MQA KV stays single-head and is all-gathered.
-        compressor_hidden = gather_outputs(hidden_states, gather_dim=1, group=ulysses_group)
-        compressor_q_residual = gather_outputs(q_residual, gather_dim=1, group=ulysses_group)
-        compressor_position_ids = gather_outputs(position_ids, gather_dim=-1, group=ulysses_group)
+        # gather their local inputs only on compressed-attention layers. Q uses
+        # true Ulysses head/sequence exchange; MQA KV stays single-head and is
+        # all-gathered on every layer.
+        if self.compressor is not None:
+            compressor_hidden = gather_outputs(hidden_states, gather_dim=1, group=ulysses_group)
+            compressor_q_residual = gather_outputs(q_residual, gather_dim=1, group=ulysses_group)
+            compressor_position_ids = gather_outputs(position_ids, gather_dim=-1, group=ulysses_group)
         # Use the same [B, S, H, D] Ulysses layout as FA (seq_dim=1, head_dim=2).
         q = q.transpose(1, 2).contiguous()
         q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2, group=ulysses_group)
@@ -926,10 +928,10 @@ def deepseek_v4_model_forward_patched(
         kwargs["packed_sequence_slices"] = packed_sequence_slices
         compress_rates = tuple(self.config.compress_rates.values())
         hca_rate = self.config.compress_rates["heavily_compressed_attention"]
-        # Metadata is indexed by global positions / cu-seqlens; under SP the
-        # collator already provides full-sequence cu-seqlens while local embeds
-        # are only one shard, so materialize a full-length reference tensor.
-        metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
+        # Metadata only uses the reference's batch/sequence shape, dtype, and
+        # device. Keep the unused feature dimension minimal under SP instead of
+        # materializing a full-width hidden-state placeholder.
+        metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, 1)
         kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
             metadata_reference,
             full_position_ids,
@@ -949,8 +951,9 @@ def deepseek_v4_model_forward_patched(
         mask_position_ids = position_ids
         if ulysses_enabled:
             # SP collator keeps the full 2D attention_mask while slicing
-            # input_ids; build the 4D sliding-window mask on the full length.
-            mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
+            # input_ids. The mask helper only reads batch/sequence shape, dtype,
+            # and device, so a width-1 placeholder is sufficient.
+            mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, 1)
             mask_position_ids = full_position_ids
         causal_mask = create_sliding_window_causal_mask(
             config=self.config,

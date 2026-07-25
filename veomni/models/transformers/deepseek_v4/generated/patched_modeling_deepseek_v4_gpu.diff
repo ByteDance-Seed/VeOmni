@@ -691,7 +691,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -793,47 +1079,78 @@
+@@ -793,47 +1079,80 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -737,11 +737,13 @@
 +                )
 +            local_num_heads = self.num_heads // ulysses_size
 +            # Compressors / Lightning Indexer window across the full sequence, so
-+            # gather the local shard before running them. Q uses true Ulysses
-+            # head/sequence exchange; MQA KV stays single-head and is all-gathered.
-+            compressor_hidden = gather_outputs(hidden_states, gather_dim=1, group=ulysses_group)
-+            compressor_q_residual = gather_outputs(q_residual, gather_dim=1, group=ulysses_group)
-+            compressor_position_ids = gather_outputs(position_ids, gather_dim=-1, group=ulysses_group)
++            # gather their local inputs only on compressed-attention layers. Q uses
++            # true Ulysses head/sequence exchange; MQA KV stays single-head and is
++            # all-gathered on every layer.
++            if self.compressor is not None:
++                compressor_hidden = gather_outputs(hidden_states, gather_dim=1, group=ulysses_group)
++                compressor_q_residual = gather_outputs(q_residual, gather_dim=1, group=ulysses_group)
++                compressor_position_ids = gather_outputs(position_ids, gather_dim=-1, group=ulysses_group)
 +            # Use the same [B, S, H, D] Ulysses layout as FA (seq_dim=1, head_dim=2).
 +            q = q.transpose(1, 2).contiguous()
 +            q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2, group=ulysses_group)
@@ -785,7 +787,7 @@
          attn_output, attn_weights = attention_interface(
              self,
              q,
-@@ -843,22 +1160,27 @@
+@@ -843,22 +1162,27 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -821,7 +823,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -909,22 +1231,30 @@
+@@ -909,22 +1233,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -863,7 +865,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -933,11 +1263,14 @@
+@@ -933,11 +1265,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -881,7 +883,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -953,10 +1286,27 @@
+@@ -953,10 +1288,27 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -909,7 +911,7 @@
 
 
  class DeepseekV4MLP(nn.Module):
-@@ -970,16 +1320,60 @@
+@@ -970,16 +1322,60 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -977,7 +979,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -990,30 +1384,63 @@
+@@ -990,30 +1386,63 @@
          self.limit = config.swiglu_limit
 
      def forward(
@@ -1054,7 +1056,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1027,14 +1454,26 @@
+@@ -1027,14 +1456,26 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
@@ -1084,7 +1086,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1057,10 +1496,14 @@
+@@ -1057,10 +1498,14 @@
          self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1101,7 +1103,7 @@
          scores = self.score_fn(logits)
          indices = self.tid2eid[input_ids.reshape(-1)].long()
          weights = scores.gather(1, indices)
-@@ -1088,6 +1531,12 @@
+@@ -1088,6 +1533,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1114,7 +1116,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1567,20 @@
+@@ -1118,22 +1569,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -1145,7 +1147,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1680,12 @@
+@@ -1233,6 +1682,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1158,7 +1160,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1705,16 @@
+@@ -1252,6 +1707,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1175,7 +1177,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +1730,76 @@
+@@ -1267,28 +1732,77 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1220,10 +1222,10 @@
 +            kwargs["packed_sequence_slices"] = packed_sequence_slices
 +            compress_rates = tuple(self.config.compress_rates.values())
 +            hca_rate = self.config.compress_rates["heavily_compressed_attention"]
-+            # Metadata is indexed by global positions / cu-seqlens; under SP the
-+            # collator already provides full-sequence cu-seqlens while local embeds
-+            # are only one shard, so materialize a full-length reference tensor.
-+            metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
++            # Metadata only uses the reference's batch/sequence shape, dtype, and
++            # device. Keep the unused feature dimension minimal under SP instead of
++            # materializing a full-width hidden-state placeholder.
++            metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, 1)
 +            kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
 +                metadata_reference,
 +                full_position_ids,
@@ -1243,8 +1245,9 @@
 +            mask_position_ids = position_ids
 +            if ulysses_enabled:
 +                # SP collator keeps the full 2D attention_mask while slicing
-+                # input_ids; build the 4D sliding-window mask on the full length.
-+                mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
++                # input_ids. The mask helper only reads batch/sequence shape, dtype,
++                # and device, so a width-1 placeholder is sufficient.
++                mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, 1)
 +                mask_position_ids = full_position_ids
              causal_mask = create_sliding_window_causal_mask(
                  config=self.config,
@@ -1260,7 +1263,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +1903,12 @@
+@@ -1392,6 +1906,12 @@
      return overall_loss * num_experts
 
 
@@ -1273,7 +1276,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +1927,36 @@
+@@ -1410,49 +1930,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1343,7 +1346,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +1969,64 @@
+@@ -1465,26 +1972,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1422,7 +1425,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2034,17 @@
+@@ -1492,7 +2037,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
