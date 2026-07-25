@@ -615,13 +615,11 @@ class DistributedMuon(Optimizer):
                 "gram_ns_reset_iterations": gram_ns_reset_iterations,
             }
 
-            # Phase 1: local momentum update. Collect the orthogonalized update
-            # ``ortho`` per param. Evenly-sharded 2D ``Shard(0)`` params are
-            # deferred into per-mesh buckets so their Newton-Schulz runs once on
-            # a single owner rank (via all-to-all) instead of redundantly on
-            # every rank behind an all-gather + redistribute round-trip.
-            pending: List[Dict[str, Any]] = []
-            a2a_buckets: Dict[Tuple[Any, torch.dtype], List[int]] = {}
+            # Keep at most one owner-assignment chunk live per mesh/dtype. This
+            # bounds temporary updates and orthogonalized shards by world size
+            # instead of retaining the entire optimizer group.
+            a2a_buckets: Dict[Tuple[Any, torch.dtype], List[Tuple[Tensor, Tensor]]] = {}
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -640,58 +638,107 @@ class DistributedMuon(Optimizer):
                 update = grad.lerp(buf, momentum) if nesterov else buf
 
                 kind = _classify_param(p)
-                entry: Dict[str, Any] = {"p": p, "update": update, "kind": kind, "ortho": None}
-
                 if (
                     kind == _KIND_FSDP_GATHER_2D
                     and isinstance(update, DTensor)
                     and _fsdp_all2all_fast_path_eligible(update)
                 ):
-                    a2a_buckets.setdefault(_fsdp_all2all_bucket_key(update), []).append(len(pending))
-                else:
-                    entry["ortho"] = self._compute_ortho(update, kind, **ns_kwargs)
-                pending.append(entry)
-
-            # Phase 2: owner-based all-to-all Newton-Schulz for bucketed params.
-            for (mesh, _local_dtype), idxs in a2a_buckets.items():
-                updates = [pending[i]["update"] for i in idxs]
-                local_orthos = self._ortho_fsdp_group_all2all(updates, mesh, ns_kwargs)
-                for i, local_ortho in zip(idxs, local_orthos):
-                    pending[i]["ortho"] = local_ortho
-                    pending[i]["ortho_is_local_shard"] = True
-
-            # Phase 3: apply the parameter update.
-            for entry in pending:
-                p = entry["p"]
-                ortho = entry["ortho"]
-
-                lr_shape = p.shape[-2:] if p.ndim >= 2 else p.shape
-                adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
-
-                if weight_decay != 0.0:
-                    p.mul_(1 - lr * weight_decay)
-
-                if isinstance(p, DTensor):
-                    target_dtype = p.to_local().dtype
-                    if entry.get("ortho_is_local_shard"):
-                        update_dt = DTensor.from_local(
-                            ortho.to(dtype=target_dtype),
-                            device_mesh=p.device_mesh,
-                            placements=p.placements,
-                            shape=p.shape,
-                            stride=p.stride(),
-                            run_check=False,
+                    key = _fsdp_all2all_bucket_key(update)
+                    entries = a2a_buckets.setdefault(key, [])
+                    entries.append((p, update))
+                    if len(entries) == update.device_mesh.size(0):
+                        self._flush_fsdp_all2all_chunk(
+                            entries,
+                            update.device_mesh,
+                            ns_kwargs,
+                            lr=lr,
+                            weight_decay=weight_decay,
+                            adjust_lr_fn=adjust_lr_fn,
                         )
-                    elif isinstance(ortho, DTensor):
-                        update_dt = ortho.to(dtype=target_dtype)
-                    else:
-                        update_dt = _wrap_full_as_dtensor_like(ortho.to(dtype=target_dtype), p)
                 else:
-                    update_dt = ortho.to(dtype=p.dtype)
+                    ortho = self._compute_ortho(update, kind, **ns_kwargs)
+                    self._apply_ortho(
+                        p,
+                        ortho,
+                        is_local_shard=False,
+                        lr=lr,
+                        weight_decay=weight_decay,
+                        adjust_lr_fn=adjust_lr_fn,
+                    )
 
-                p.add_(update_dt, alpha=-adjusted_lr)
+            for (mesh, _local_dtype), entries in a2a_buckets.items():
+                self._flush_fsdp_all2all_chunk(
+                    entries,
+                    mesh,
+                    ns_kwargs,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    adjust_lr_fn=adjust_lr_fn,
+                )
 
         return loss
+
+    def _flush_fsdp_all2all_chunk(
+        self,
+        entries: List[Tuple[Tensor, Tensor]],
+        mesh: Any,
+        ns_kwargs: Dict[str, Any],
+        *,
+        lr: float,
+        weight_decay: float,
+        adjust_lr_fn: Optional[str],
+    ) -> None:
+        if not entries:
+            return
+
+        updates = [update for _p, update in entries]
+        local_orthos = self._ortho_fsdp_group_all2all(updates, mesh, ns_kwargs)
+        for (p, _update), local_ortho in zip(entries, local_orthos):
+            self._apply_ortho(
+                p,
+                local_ortho,
+                is_local_shard=True,
+                lr=lr,
+                weight_decay=weight_decay,
+                adjust_lr_fn=adjust_lr_fn,
+            )
+        entries.clear()
+
+    @staticmethod
+    def _apply_ortho(
+        p: Tensor,
+        ortho: Tensor,
+        *,
+        is_local_shard: bool,
+        lr: float,
+        weight_decay: float,
+        adjust_lr_fn: Optional[str],
+    ) -> None:
+        lr_shape = p.shape[-2:] if p.ndim >= 2 else p.shape
+        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
+
+        if weight_decay != 0.0:
+            p.mul_(1 - lr * weight_decay)
+
+        if isinstance(p, DTensor):
+            target_dtype = p.to_local().dtype
+            if is_local_shard:
+                update_dt = DTensor.from_local(
+                    ortho.to(dtype=target_dtype),
+                    device_mesh=p.device_mesh,
+                    placements=p.placements,
+                    shape=p.shape,
+                    stride=p.stride(),
+                    run_check=False,
+                )
+            elif isinstance(ortho, DTensor):
+                update_dt = ortho.to(dtype=target_dtype)
+            else:
+                update_dt = _wrap_full_as_dtensor_like(ortho.to(dtype=target_dtype), p)
+        else:
+            update_dt = ortho.to(dtype=p.dtype)
+
+        p.add_(update_dt, alpha=-adjusted_lr)
 
     def _ortho_fsdp_group_all2all(
         self,
@@ -716,13 +763,16 @@ class DistributedMuon(Optimizer):
         all-to-all pairing is position-based, so a rank-divergent bucket would
         deadlock — the same constraint the previous all-gather path relied on.
 
-        Buffers are allocated per parameter (own ``dtype``/``K``), so a bucket
-        may safely mix dtypes and trailing shapes.
+        The caller must pass at most ``world`` updates with one common dtype.
+        Trailing shapes may differ.
 
         Returns one local-shard (``[m_local, K]``) tensor per input update, in
         input order.
         """
         world = mesh.size(0)
+        if len(updates) > world:
+            raise ValueError(f"Expected at most {world} all-to-all updates, got {len(updates)}")
+
         my_idx = int(mesh.get_coordinate()[0])
         group = mesh.get_group(0)
         device = updates[0].to_local().device

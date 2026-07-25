@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -138,6 +139,40 @@ class TestFsdpAllToAllEligibility:
         bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update: update.device_mesh)
 
         assert bucket_key(fp32) != bucket_key(bf16)
+
+
+class TestIntermediateLifetime:
+    def test_non_all_to_all_orthos_are_released_per_parameter(self):
+        params = [nn.Parameter(torch.randn(4, 4)) for _ in range(8)]
+        opt = DistributedMuon(params, lr=1e-3, nesterov=False)
+        live = 0
+        peak = 0
+        calls = 0
+
+        def fake_compute_ortho(update, kind, **kwargs):
+            nonlocal calls, live, peak
+
+            ortho = torch.zeros_like(update)
+            calls += 1
+            live += 1
+            peak = max(peak, live)
+
+            def release():
+                nonlocal live
+                live -= 1
+
+            weakref.finalize(ortho, release)
+            return ortho
+
+        opt._compute_ortho = fake_compute_ortho
+        for p in params:
+            p.grad = torch.randn_like(p)
+
+        opt.step()
+
+        assert calls == len(params)
+        assert peak <= 2
+        assert live == 0
 
 
 class TestNumerics:

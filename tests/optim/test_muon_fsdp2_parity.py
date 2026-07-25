@@ -133,7 +133,7 @@ class _ToyDenseBlock(nn.Module):
 
 
 class _ToyDenseModel(nn.Module):
-    """Two stacked Linear blocks; every weight is 2D and Muon-eligible."""
+    """Three stacked Linear blocks; every weight is 2D and Muon-eligible."""
 
     _no_split_modules = ["_ToyDenseBlock"]
 
@@ -141,9 +141,10 @@ class _ToyDenseModel(nn.Module):
         super().__init__()
         self.block0 = _ToyDenseBlock(hidden, intermediate)
         self.block1 = _ToyDenseBlock(hidden, intermediate)
+        self.block2 = _ToyDenseBlock(hidden, intermediate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block1(self.block0(x)).sum()
+        return self.block2(self.block1(self.block0(x))).sum()
 
 
 def _build_dense_model(
@@ -191,6 +192,7 @@ def _run_dense(hidden: int = 32, intermediate: int = 64, mixed_dtype: bool = Fal
     full_shapes = {fqn: tuple(p.shape) for fqn, p in model.named_parameters() if p.requires_grad}
     fully_shard(model.block0)
     fully_shard(model.block1)
+    fully_shard(model.block2)
     fully_shard(model)
     for name, p in model.named_parameters():
         assert isinstance(p, DTensor), f"expected DTensor for {name}, got {type(p)}"
@@ -203,10 +205,21 @@ def _run_dense(hidden: int = 32, intermediate: int = 64, mixed_dtype: bool = Fal
         nesterov=True,
         adjust_lr_fn="match_rms_adamw",
     )
+    a2a_chunk_sizes = []
+    original_ortho_fsdp_group_all2all = opt._ortho_fsdp_group_all2all
+
+    def checked_ortho_fsdp_group_all2all(updates, mesh, ns_kwargs):
+        a2a_chunk_sizes.append(len(updates))
+        assert len(updates) <= world_size
+        return original_ortho_fsdp_group_all2all(updates, mesh, ns_kwargs)
+
+    opt._ortho_fsdp_group_all2all = checked_ortho_fsdp_group_all2all
     for step in range(2):
         _make_grads(model, full_shapes, step, device)
         opt.step()
         opt.zero_grad()
+    assert a2a_chunk_sizes
+    assert sum(a2a_chunk_sizes) == 2 * len(full_shapes)
 
     fsdp_state = _full_state_dict(model)
     if rank == 0:
