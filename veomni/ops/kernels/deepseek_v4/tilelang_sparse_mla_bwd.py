@@ -26,6 +26,10 @@ import torch
 from tilelang import language as T
 
 
+# KV length granularity these kernels are specialized on; see sparse_mqa_bwd_interface.
+KV_BLOCK = 1024
+
+
 @tilelang.jit(out_idx=[-1])
 def preprocess(
     B,
@@ -277,7 +281,7 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     assert q.is_contiguous() and kv.is_contiguous()
     assert topk_idxs.is_contiguous() and lse.is_contiguous()
     B, S, H, D = q.shape
-    _, S_kv, _ = kv.shape
+    unpadded_S_kv = kv.shape[1]
     topk = topk_idxs.shape[-1]
 
     # Pad topk to next multiple of block_size (kernel requires divisibility)
@@ -297,6 +301,21 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         lse = torch.cat([lse, lse.new_zeros(B, S, head_pad)], dim=2).contiguous()
         attn_sink = torch.cat([attn_sink, attn_sink.new_zeros(head_pad)])
 
+    # Pad KV to a whole number of blocks. The compressor makes S_kv drift by a few
+    # tokens per step, and these kernels specialize on it, so the raw length would
+    # recompile them mid-training (seconds of stall per new length). Rounding up
+    # bounds the variant count while keeping S_kv a compile-time constant, which the
+    # indirect KV gather needs for static strides -- feeding the length in as a
+    # runtime value instead costs ~15% on the backward kernel.
+    #
+    # Widening S_kv also widens the kernel's in-range check, so indices at or past
+    # the real length are dropped here to keep them out of the pad rows.
+    kv_pad = -unpadded_S_kv % KV_BLOCK
+    if kv_pad:
+        topk_idxs = torch.where(topk_idxs < unpadded_S_kv, topk_idxs, -1)
+        kv = torch.cat([kv, kv.new_zeros(B, kv_pad, D)], dim=1).contiguous()
+    S_kv = unpadded_S_kv + kv_pad
+
     preprocess_kernel = preprocess(B, S, padded_H, D)
     bwd_kernel = bwd(B, S, S_kv, padded_H, D, topk, sm_scale)
     postprocess_kernel = postprocess(B, S_kv, D)
@@ -306,4 +325,4 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     d_attn_sink = torch.zeros_like(attn_sink)
     dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink)
     dkv = postprocess_kernel(dkv)
-    return dq[:, :, :H].contiguous(), dkv, d_attn_sink[:H].contiguous()
+    return dq[:, :, :H].contiguous(), dkv[:, :unpadded_S_kv].contiguous(), d_attn_sink[:H].contiguous()

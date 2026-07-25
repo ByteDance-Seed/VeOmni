@@ -250,6 +250,47 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
         assert _cosine_similarity(actual_grad, expected_grad) > 0.95
 
 
+def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monkeypatch):
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+    from veomni.ops.kernels.deepseek_v4 import tilelang_sparse_mla_bwd as sparse_mla_bwd
+
+    kv_block = sparse_mla_bwd.KV_BLOCK
+    compiled = []
+    original_bwd = sparse_mla_bwd.bwd
+
+    def tracking_bwd(*args, **kwargs):
+        kernel = original_bwd(*args, **kwargs)
+        compiled.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(sparse_mla_bwd, "bwd", tracking_bwd)
+
+    batch, seqlen, heads, dim, topk = 1, 32, 8, 512, 64
+    scale = dim**-0.5
+    # All three round up to one KV block, so one compiled kernel must serve them all;
+    # the last one needs no padding at all.
+    for kv_len in (48, 129, kv_block):
+        torch.manual_seed(4)
+        q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+        indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+        # Out of range for the real KV but inside the padded KV: must stay masked out.
+        indices[..., -2:] = kv_len
+
+        actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+        expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+        grad = torch.randn_like(actual)
+        expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+        actual.backward(grad)
+        assert kv.grad.shape == kv.shape
+        for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+            assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+    assert len({id(kernel) for kernel in compiled}) == 1
+
+
 def test_deepseek_v4_generated_attention_dispatch_matches_eager():
     _require_tilelang_cuda()
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
