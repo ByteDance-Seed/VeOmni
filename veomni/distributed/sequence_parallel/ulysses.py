@@ -37,11 +37,12 @@ def _all_gather(
 ):
     """All-gather ``x`` over ``group``, returning the per-rank tensors and their shapes.
 
-    Shards may have different sizes, so the shapes are exchanged first. They are read
-    back to the host with a single ``tolist()``: materializing them as ``torch.Size``
-    from per-rank device tensors instead costs one device-to-host sync per dimension
-    per rank, and with a gather in every layer that drains the device queue thousands
-    of times per step. Shapes are returned as plain ints for the same reason.
+    Shards may differ in length, but every rank must pass the same number of
+    dimensions. Shapes are exchanged first and read back to the host with a single
+    ``tolist()``: materializing them as ``torch.Size`` from per-rank device tensors
+    instead costs one device-to-host sync per dimension per rank, and with a gather in
+    every layer that drains the device queue thousands of times per step. Shapes are
+    returned as plain ints for the same reason.
     """
     group = get_ulysses_sequence_parallel_group() if group is None else group
     sp_world_size = dist.get_world_size(group)
