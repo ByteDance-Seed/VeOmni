@@ -149,9 +149,10 @@ class OptimizerConfig:
             "help": (
                 "Attention heads per Newton-Schulz block for head-split Muon (GLM-5 'Muon Split'). "
                 "0 (default) orthogonalizes each projection as a single matrix; 1 is fully per-head; "
-                "g > 1 puts g heads in each block. Expect gains when the head-stacked matrix is much "
-                "taller than its input dim (MLA/low-rank up-projections such as DeepSeek V4 q_b_proj) "
-                "and roughly no effect for square or wide GQA projections."
+                "g > 1 puts g heads in each block. Any value >= 1 also requires "
+                "muon_head_split_modules. Expect gains when the head-stacked matrix is much taller "
+                "than its input dim (MLA/low-rank up-projections such as DeepSeek V4 q_b_proj) and "
+                "roughly no effect for square or wide GQA projections."
             )
         },
     )
@@ -159,11 +160,13 @@ class OptimizerConfig:
         default_factory=list,
         metadata={
             "help": (
-                "Leaf module names eligible for head splitting, matched exactly against the children "
-                "of an attention module. Replaces (does not extend) the default list "
-                "veomni.optim.muon.DEFAULT_HEAD_SPLIT_MODULES, which covers q/k/v_proj, the MLA "
-                "q_b_proj/k_b_proj/v_b_proj forms and the DSA indexer's wq_b. Only consulted when "
-                "muon_head_group_size >= 1."
+                "Leaf module names to head-split, matched exactly against the children of an "
+                "attention module. Required (no default) whenever muon_head_group_size >= 1, since "
+                "which projections benefit depends on the architecture: e.g. ['q_b_proj'] for "
+                "DeepSeek V3/V4 MLA up-projections, ['q_proj', 'k_proj', 'v_proj'] for GQA, "
+                "['wq_b'] for a GLM MoE DSA indexer. o_proj is head-structured along columns and "
+                "MLA kv_b_proj interleaves K and V inside each head, so neither splits into "
+                "head-aligned rows."
             )
         },
     )

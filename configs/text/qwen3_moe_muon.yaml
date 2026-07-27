@@ -49,10 +49,12 @@ train:
     # std | gram | gram_quack (default; quack CuTeDSL GEMM on H100/B200/GB200)
     muon_ns_implementation: gram_quack
     muon_adjust_lr_fn: match_rms_adamw
-    # Head-split Muon: heads per orthogonalization block (0 = full matrix).
-    # Qwen3's q_proj is only ~2x taller than wide and k/v_proj are wide, so
-    # expect little effect here; see docs/usage/basic_modules.md.
+    # Head-split Muon: heads per orthogonalization block (0 = full matrix), plus
+    # the projections to split (no default). Qwen3's q_proj is only ~2x taller
+    # than wide and k/v_proj are wide, so expect little effect here; see
+    # docs/usage/basic_modules.md.
     # muon_head_group_size: 2
+    # muon_head_split_modules: [q_proj, k_proj, v_proj]
     # Requires (num_experts / ep_size) % ep_fsdp_size == 0; otherwise falls back.
     muon_expert_zero_comm: true
   num_train_epochs: 1

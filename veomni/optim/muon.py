@@ -65,7 +65,6 @@ except ImportError:  # pragma: no cover - torch < 2.9 fallback
 
 
 __all__ = [
-    "DEFAULT_HEAD_SPLIT_MODULES",
     "DEFAULT_NS_COEFFICIENTS",
     "DEFAULT_NS_STEPS",
     "DistributedMuon",
@@ -86,22 +85,6 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "embedding",
     "lm_head",
     "output_layer",
-)
-
-# Leaf module names whose 2D weight stacks one row block per attention head, so
-# splitting rows by head is meaningful. Matched exactly (not as a substring)
-# against children of an attention module, which keeps look-alikes out:
-# ``o_proj`` is head-structured along *columns*, ``q_a_proj`` / ``kv_proj`` are
-# shared across heads, and MLA ``kv_b_proj`` interleaves K and V within each head
-# so uniform row blocks would fuse a head's K with its own V.
-DEFAULT_HEAD_SPLIT_MODULES: Tuple[str, ...] = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "q_b_proj",
-    "k_b_proj",
-    "v_b_proj",
-    "wq_b",  # GLM MoE DSA indexer's query up-projection
 )
 
 # Attribute names carrying a head count and a per-head row stride. Read from the
@@ -531,7 +514,7 @@ def _stacked_head_counts(rows: int, tiers: Sequence[Tuple[Sequence[int], Sequenc
 def infer_head_block_counts(
     model: "nn.Module",
     head_group_size: int,
-    module_names: Optional[Sequence[str]] = None,
+    module_names: Sequence[str],
 ) -> Dict[str, int]:
     """Map parameter FQN to the number of row blocks for head-split Muon.
 
@@ -542,6 +525,11 @@ def infer_head_block_counts(
     ``num_key_value_heads`` and MLA up-projections to ``qk_head_dim`` blocks
     without any per-architecture special casing.
 
+    ``module_names`` is deliberately required and has no default: which
+    projections are worth splitting depends on the architecture's aspect ratios,
+    and a built-in list would quietly change the update math for every model
+    whose attention happens to use the same names.
+
     ``head_group_size`` is the number of heads per orthogonalization block: 1 is
     fully per-head, and values > 1 give the intermediate grouping that tends to
     beat both extremes. Returns only params that end up with >1 block; anything
@@ -551,8 +539,13 @@ def infer_head_block_counts(
     """
     if head_group_size < 1:
         return {}
+    if not module_names:
+        raise ValueError(
+            "Head-split Muon needs an explicit list of attention projection module names "
+            "(head_group_size >= 1 with an empty module_names)."
+        )
 
-    allowed = set(DEFAULT_HEAD_SPLIT_MODULES if module_names is None else module_names)
+    allowed = set(module_names)
     blocks: Dict[str, int] = {}
     warned: set = set()
 

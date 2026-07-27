@@ -413,8 +413,8 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and falls back to the dim-1 + all-to-all-gather path. |
 | `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
 | `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
-| `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. |
-| `muon_head_split_modules` | `[]` | Leaf module names eligible for head splitting, matched exactly against children of any module exposing `head_dim`. Empty uses `veomni.optim.muon.DEFAULT_HEAD_SPLIT_MODULES`. |
+| `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
+| `muon_head_split_modules` | `[]` | Leaf module names to head-split, matched exactly against the children of an attention module. **Required** when `muon_head_group_size >= 1`; there is no default list. |
 
 On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `expert_zero_comm`). Whether zero-comm sharding actually activated is logged separately as `[muon_expert_zero_comm]` during parallelize.
 
@@ -423,6 +423,18 @@ On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `ex
 Attention computes scores per head, but Muon's natural unit is the whole matrix.
 Setting `muon_head_group_size` splits a head-stacked projection into row blocks
 and gives each block its own polar factor — GLM-5's "Muon Split".
+
+Both knobs are needed to turn it on; there is no built-in module list, because a
+default would quietly change the update math for every model whose attention uses
+the same names:
+
+```yaml
+train:
+  optimizer:
+    type: muon
+    muon_head_group_size: 1            # heads per block
+    muon_head_split_modules: [q_b_proj]  # which projections to split
+```
 
 Whether this helps depends on the shape of the stacked matrix:
 
@@ -447,11 +459,12 @@ Mechanics worth knowing when running an A/B:
   not the full matrix. Without that, a split `[32768, 1024]` param would take a
   `sqrt(32)`-times-larger step and the experiment would really be measuring a
   learning-rate change.
-- Splitting is applied by name, and `muon_head_split_modules` **replaces** the
-  default list rather than extending it. `o_proj` is head-structured along
-  *columns* and MLA `kv_b_proj` interleaves K and V inside each head, so neither
-  is eligible by default — nothing stops you from listing them, but row blocks
-  would not line up with heads.
+- Splitting is applied by name, so pick the list deliberately. Reasonable
+  starting points: `[q_b_proj]` for DeepSeek V3/V4 MLA up-projections,
+  `[q_proj, k_proj, v_proj]` for GQA attention, `[wq_b]` for a GLM MoE DSA
+  indexer. Nothing stops you from listing `o_proj` (head-structured along
+  *columns*) or MLA `kv_b_proj` (interleaves K and V inside each head), but row
+  blocks would not line up with heads there.
 - The head count is never guessed from the shape alone: a projection is split
   only when its row count equals a *declared* head count times a *declared*
   per-head dim (`num_heads`/`n_heads`/config equivalents against

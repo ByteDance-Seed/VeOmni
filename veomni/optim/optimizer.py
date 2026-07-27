@@ -539,9 +539,18 @@ def _build_muon_with_adamw(
     # Head-split scope is resolved from the model here, then handed to Muon as
     # per-param-group ``head_blocks``.
     head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
-    head_split_modules = muon_kwargs.pop("head_split_modules", None) or None
+    head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
     if head_group_size < 0:
         raise ValueError(f"muon_head_group_size must be >= 0 (0 disables head splitting), got {head_group_size}")
+    if head_group_size >= 1 and not head_split_modules:
+        raise ValueError(
+            f"muon_head_group_size={head_group_size} requires muon_head_split_modules: there is no "
+            "default list, because which attention projections benefit from head splitting depends "
+            "on the architecture. List the leaf module names to split, e.g. ['q_b_proj'] for "
+            "DeepSeek V4/V3 MLA up-projections or ['q_proj', 'k_proj', 'v_proj'] for GQA attention. "
+            "Note that o_proj is head-structured along columns and MLA kv_b_proj interleaves K and V "
+            "inside each head, so neither splits into head-aligned rows."
+        )
     muon_lr_explicit = bool(
         muon_kwargs.pop("muon_lr_explicit", "lr" in muon_kwargs and muon_kwargs.get("lr") is not None)
     )
@@ -576,8 +585,8 @@ def _build_muon_with_adamw(
         if not head_split_names:
             logger.warning_rank0(
                 f"[Muon] muon_head_group_size={head_group_size} matched no attention projection; "
-                "every param stays on full-matrix Muon. Check muon_head_split_modules against "
-                "this architecture's attention module names."
+                f"every param stays on full-matrix Muon. Check muon_head_split_modules="
+                f"{list(head_split_modules)} against this architecture's attention module names."
             )
 
     extra_parallel_aware = _should_build_extra_parallel_aware(model)

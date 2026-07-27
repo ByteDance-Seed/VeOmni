@@ -63,6 +63,10 @@ def _sample_2d(M: int, K: int, dtype: torch.dtype = torch.float32, seed: int = 0
     return torch.randn(M, K, generator=g, dtype=dtype)
 
 
+# Head splitting has no built-in module list, so every call names its targets.
+_QKV_MODULES = ("q_proj", "k_proj", "v_proj")
+
+
 class _FakeAttention(nn.Module):
     """GQA-shaped attention plus the look-alikes head splitting must not touch.
 
@@ -508,10 +512,10 @@ class TestMuonLrResolution:
 
 
 class TestHeadSplitInference:
-    """``infer_head_block_counts`` must key off names, not just shapes."""
+    """``infer_head_block_counts`` must key off declared head layouts, not shapes."""
 
-    def test_only_row_stacked_projections_are_eligible(self):
-        blocks = infer_head_block_counts(_attention_model(), head_group_size=1)
+    def test_only_listed_modules_are_eligible(self):
+        blocks = infer_head_block_counts(_attention_model(), head_group_size=1, module_names=_QKV_MODULES)
 
         # Equality (not membership) pins down that o_proj / q_a_proj stay out even
         # though their row counts are multiples of head_dim.
@@ -520,6 +524,10 @@ class TestHeadSplitInference:
             "self_attn.k_proj.weight": 2,
             "self_attn.v_proj.weight": 2,
         }
+
+    def test_module_list_is_required(self):
+        with pytest.raises(ValueError, match="explicit list of attention projection module names"):
+            infer_head_block_counts(_attention_model(), head_group_size=1, module_names=())
 
     @pytest.mark.parametrize(
         "head_group_size, expected",
@@ -530,27 +538,30 @@ class TestHeadSplitInference:
         ],
     )
     def test_group_size_controls_block_count(self, head_group_size, expected):
-        blocks = infer_head_block_counts(_attention_model(), head_group_size=head_group_size)
+        blocks = infer_head_block_counts(
+            _attention_model(), head_group_size=head_group_size, module_names=_QKV_MODULES
+        )
         assert blocks == {k: v for k, v in expected.items() if v > 1}
 
     @pytest.mark.parametrize("head_group_size", [0, -1])
     def test_non_positive_group_size_disables_splitting(self, head_group_size):
-        assert infer_head_block_counts(_attention_model(), head_group_size=head_group_size) == {}
+        assert infer_head_block_counts(_attention_model(), head_group_size, module_names=_QKV_MODULES) == {}
 
-    def test_module_allowlist_is_the_only_gate(self):
+    def test_listed_modules_are_trusted_even_when_column_stacked(self):
+        """No name is vetoed: ``o_proj`` splits by row if you ask for it."""
         blocks = infer_head_block_counts(_attention_model(), head_group_size=1, module_names=("o_proj",))
         assert blocks == {"self_attn.o_proj.weight": 8}
 
     def test_modules_without_head_dim_are_skipped(self):
         model = _attention_model()
         del model.self_attn.head_dim
-        assert infer_head_block_counts(model, head_group_size=1) == {}
+        assert infer_head_block_counts(model, head_group_size=1, module_names=_QKV_MODULES) == {}
 
     def test_modules_without_head_count_are_skipped(self):
         model = _attention_model()
         del model.self_attn.num_heads
         del model.self_attn.num_key_value_heads
-        assert infer_head_block_counts(model, head_group_size=1) == {}
+        assert infer_head_block_counts(model, head_group_size=1, module_names=_QKV_MODULES) == {}
 
     def test_mla_row_stride_is_qk_head_dim_not_head_dim(self):
         """MLA's ``head_dim`` is the rope part only; blocks must follow ``qk_head_dim``.
@@ -568,7 +579,8 @@ class TestHeadSplitInference:
         model = nn.Module()
         model.self_attn = attn
 
-        assert infer_head_block_counts(model, head_group_size=1) == {"self_attn.q_b_proj.weight": num_heads}
+        blocks = infer_head_block_counts(model, head_group_size=1, module_names=("q_b_proj",))
+        assert blocks == {"self_attn.q_b_proj.weight": num_heads}
 
     def test_unresolvable_row_count_is_skipped(self):
         """A declared stride that does not tile the rows must not be guessed around."""
@@ -579,7 +591,7 @@ class TestHeadSplitInference:
         model = nn.Module()
         model.self_attn = attn
 
-        assert infer_head_block_counts(model, head_group_size=1) == {}
+        assert infer_head_block_counts(model, head_group_size=1, module_names=_QKV_MODULES) == {}
 
     def test_module_attrs_win_over_config_attrs(self):
         """A DSA indexer's own smaller head layout must beat the shared config's."""
@@ -592,7 +604,8 @@ class TestHeadSplitInference:
         model = nn.Module()
         model.indexer = indexer
 
-        assert infer_head_block_counts(model, head_group_size=1) == {"indexer.wq_b.weight": 4}
+        blocks = infer_head_block_counts(model, head_group_size=1, module_names=("wq_b",))
+        assert blocks == {"indexer.wq_b.weight": 4}
 
 
 class TestHeadSplitUpdate:
@@ -692,6 +705,8 @@ class TestHeadSplitBuild:
 
         muon_kwargs.setdefault("lr", 1e-2)
         muon_kwargs.setdefault("ns_implementation", "std")
+        if muon_kwargs.get("head_group_size"):
+            muon_kwargs.setdefault("head_split_modules", _QKV_MODULES)
         opt = build_optimizer(model, lr=1e-4, optimizer_type="muon", muon_kwargs=muon_kwargs)
         names = {id(p): n for n, p in model.named_parameters()}
         return {
@@ -716,6 +731,11 @@ class TestHeadSplitBuild:
         with pytest.raises(ValueError, match="muon_head_group_size must be >= 0"):
             self._muon_groups_by_blocks(_attention_model(), head_group_size=-2)
 
+    def test_group_size_without_module_list_raises(self):
+        """Opting in must be explicit on both knobs, never half-configured."""
+        with pytest.raises(ValueError, match="requires muon_head_split_modules"):
+            self._muon_groups_by_blocks(_attention_model(), head_group_size=1, head_split_modules=[])
+
     @pytest.mark.parametrize(
         "head_group_size, expected",
         [
@@ -737,7 +757,12 @@ class TestHeadSplitBuild:
             model,
             lr=1e-4,
             optimizer_type="muon",
-            muon_kwargs={"lr": 1e-2, "ns_implementation": "std", "head_group_size": head_group_size},
+            muon_kwargs={
+                "lr": 1e-2,
+                "ns_implementation": "std",
+                "head_group_size": head_group_size,
+                "head_split_modules": _QKV_MODULES,
+            },
         )
         for p in model.parameters():
             if p.requires_grad:
@@ -756,7 +781,12 @@ class TestHeadSplitBuild:
                 model,
                 lr=1e-4,
                 optimizer_type="muon",
-                muon_kwargs={"lr": 1e-2, "ns_implementation": "std", "head_group_size": 2},
+                muon_kwargs={
+                    "lr": 1e-2,
+                    "ns_implementation": "std",
+                    "head_group_size": 2,
+                    "head_split_modules": _QKV_MODULES,
+                },
             )
 
         model_a = _attention_model()
