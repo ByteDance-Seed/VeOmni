@@ -528,7 +528,7 @@ class BaseTrainer(Stateful, ABC):
             **dataloader_kwargs,
         )
 
-    def _build_parallelized_model(self):
+    def _build_parallelized_model(self, *, skip_hf_weight_load: bool = True):
         args: VeOmniArguments = self.args
         kwargs = {}
         cpu_load_param_name = None
@@ -550,7 +550,7 @@ class BaseTrainer(Stateful, ABC):
         # A full non-LoRA resume already contains model weights. Skip the HF
         # materialization pass to avoid a second peak (HF load then checkpoint
         # overwrite) that can OOM large MoE jobs. LoRA resumes still need the HF base.
-        skip_hf_weight_load = should_skip_hf_weight_load(
+        skip_hf_weight_load = skip_hf_weight_load and should_skip_hf_weight_load(
             args.train.checkpoint.load_path,
             args.model.lora_config,
         )
