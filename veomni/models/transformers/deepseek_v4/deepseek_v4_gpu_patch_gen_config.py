@@ -96,8 +96,10 @@ from transformers.utils import TransformersKwargs
 
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_compression_metadata,
+    build_sparse_attention_indices,
     compress_packed_windows,
     isolate_packed_causal_mask_,
+    mask_sparse_attention_indices,
     packed_compressed_block_bias,
     packed_compressed_causal_ranges,
 )
@@ -154,9 +156,11 @@ config.add_import(
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
     names=[
+        "build_sparse_attention_indices",
         "build_packed_compression_metadata",
         "compress_packed_windows",
         "isolate_packed_causal_mask_",
+        "mask_sparse_attention_indices",
         "packed_compressed_block_bias",
         "packed_compressed_causal_ranges",
     ],
@@ -352,7 +356,8 @@ def deepseek_v4_hca_compressor_forward_patched(
     layer_idx: int,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_topk_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
     batch, _, _ = hidden_states.shape
@@ -376,7 +381,8 @@ def deepseek_v4_hca_compressor_forward_patched(
             overlap=False,
         )
         block_bias = packed_compressed_block_bias(rate_metadata)
-        return compressed.unsqueeze(1), block_bias
+        result = (compressed.unsqueeze(1), block_bias)
+        return (*result, None) if return_topk_indices else result
 
     if cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -407,7 +413,8 @@ def deepseek_v4_hca_compressor_forward_patched(
     compressed_len = compressed_kv.shape[2]
     seq_len = position_ids.shape[1]
     if seq_len == 1 or compressed_len == 0:
-        return compressed_kv, None
+        result = (compressed_kv, None)
+        return (*result, None) if return_topk_indices else result
 
     entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
     causal_threshold = (position_ids + 1) // self.compress_rate
@@ -416,7 +423,8 @@ def deepseek_v4_hca_compressor_forward_patched(
         entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
         float("-inf"),
     )
-    return compressed_kv, block_bias
+    result = (compressed_kv, block_bias)
+    return (*result, None) if return_topk_indices else result
 
 
 @config.override_method(
@@ -432,7 +440,8 @@ def deepseek_v4_csa_compressor_forward_patched(
     layer_idx: int,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_topk_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
     batch, seq_len, _ = hidden_states.shape
@@ -470,7 +479,8 @@ def deepseek_v4_csa_compressor_forward_patched(
         safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
         block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
         block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-        return compressed_kv, block_bias[..., :compressed_len]
+        result = (compressed_kv, block_bias[..., :compressed_len])
+        return (*result, top_k_indices) if return_topk_indices else result
 
     if cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -513,7 +523,8 @@ def deepseek_v4_csa_compressor_forward_patched(
     safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
     block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
     block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-    return compressed_kv, block_bias[..., :compressed_len]
+    result = (compressed_kv, block_bias[..., :compressed_len])
+    return (*result, top_k_indices) if return_topk_indices else result
 
 
 # ================================================================
@@ -627,15 +638,45 @@ def deepseek_v4_indexer_forward_patched(
         and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
     )
     if use_tilelang:
+        query = q.transpose(0, 1).contiguous()
+        query_weights = weights.transpose(0, 1).contiguous()
+        query_range_starts = None if packed_ranges is None else packed_ranges[0]
+        query_range_ends = None if packed_ranges is None else packed_ranges[1]
+        parallel_state = get_parallel_state()
+        if parallel_state.ulysses_enabled:
+            if query_range_starts is None and query_range_ends is None:
+                query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+                query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32)
+                query_range_ends = (query_positions + 1) // self.compress_rate
+            if seq_len % parallel_state.ulysses_size != 0:
+                raise ValueError(
+                    f"DeepSeek-V4 indexer sequence length ({seq_len}) must be divisible by "
+                    f"Ulysses size ({parallel_state.ulysses_size})"
+                )
+            local_seq_len = seq_len // parallel_state.ulysses_size
+            query_start = parallel_state.ulysses_rank * local_seq_len
+            query_end = query_start + local_seq_len
+            query = query[query_start:query_end]
+            query_weights = query_weights[query_start:query_end]
+            if query_range_starts is not None and query_range_ends is not None:
+                query_range_starts = query_range_starts[query_start:query_end]
+                query_range_ends = query_range_ends[query_start:query_end]
+
         _, top_k_indices = v4_lighting_indexer(
-            q.transpose(0, 1).contiguous(),
+            query,
             compressed_kv.transpose(0, 1).contiguous(),
-            weights.transpose(0, 1).contiguous(),
+            query_weights,
             self.compress_rate,
             top_k,
-            cu_seqlen_ks=None if packed_ranges is None else packed_ranges[0],
-            cu_seqlen_ke=None if packed_ranges is None else packed_ranges[1],
+            cu_seqlen_ks=query_range_starts,
+            cu_seqlen_ke=query_range_ends,
         )
+        if parallel_state.ulysses_enabled:
+            top_k_indices = gather_outputs(
+                top_k_indices,
+                gather_dim=1,
+                group=parallel_state.ulysses_group,
+            )
         return top_k_indices.to(torch.long)
     # --- Patch.1 ---
 
@@ -728,8 +769,10 @@ def deepseek_v4_attention_forward_patched(
         s_aux = self.sinks.narrow(0, head_start, local_num_heads).contiguous()
 
     block_bias = None
+    compressed_topk_indices = None
+    use_compact_sparse_indices = veomni_dsa_attention_implementation.value == "tilelang" and past_key_values is None
     if self.compressor is not None:
-        compressed_kv, block_bias = self.compressor(
+        compressor_output = self.compressor(
             compressor_hidden,
             compressor_q_residual,
             compressor_position_ids,
@@ -737,7 +780,12 @@ def deepseek_v4_attention_forward_patched(
             self.layer_idx,
             packed_sequence_slices=kwargs.get("packed_sequence_slices"),
             packed_compression_metadata=kwargs.get("packed_compression_metadata"),
+            return_topk_indices=use_compact_sparse_indices,
         )
+        if use_compact_sparse_indices:
+            compressed_kv, block_bias, compressed_topk_indices = compressor_output
+        else:
+            compressed_kv, block_bias = compressor_output
         kv = torch.cat([kv, compressed_kv], dim=2)
 
     if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
@@ -750,6 +798,15 @@ def deepseek_v4_attention_forward_patched(
         self.config._attn_implementation, eager_attention_forward
     )
     kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
+    if use_compact_sparse_indices:
+        kwargs["sparse_topk_indices"] = build_sparse_attention_indices(
+            batch_size=q.shape[0],
+            seq_len=q.shape[-2],
+            sliding_window=self.sliding_window,
+            compressed_len=kv.shape[-2] - q.shape[-2],
+            compressed_indices=compressed_topk_indices,
+            device=q.device,
+        )
     attn_output, attn_weights = attention_interface(
         self,
         q,
@@ -814,22 +871,26 @@ def deepseek_v4_eager_attention_forward_patched(
         and key.shape[1] == 1
     )
     if use_tilelang:
-        batch, _, seq_len, _ = query.shape
-        kv_len = key.shape[-2]
-        compressed_len = max(0, kv_len - seq_len)
-        compressed_budget = compressed_len
-        indexer = getattr(getattr(module, "compressor", None), "indexer", None)
-        if indexer is not None:
-            compressed_budget = min(compressed_len, indexer.index_topk)
-        selected_width = min(kv_len, module.sliding_window + compressed_budget)
+        topk_indices = kwargs.get("sparse_topk_indices")
+        if topk_indices is None:
+            batch, _, seq_len, _ = query.shape
+            kv_len = key.shape[-2]
+            compressed_len = max(0, kv_len - seq_len)
+            compressed_budget = compressed_len
+            indexer = getattr(getattr(module, "compressor", None), "indexer", None)
+            if indexer is not None:
+                compressed_budget = min(compressed_len, indexer.index_topk)
+            selected_width = min(kv_len, module.sliding_window + compressed_budget)
 
-        mask = attention_mask
-        if mask.shape[0] == 1 and batch > 1:
-            mask = mask.expand(batch, -1, -1, -1)
-        allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
-        _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
-        selected_valid = allowed.gather(-1, topk_indices)
-        topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
+            mask = attention_mask
+            if mask.shape[0] == 1 and batch > 1:
+                mask = mask.expand(batch, -1, -1, -1)
+            allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
+            _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
+            selected_valid = allowed.gather(-1, topk_indices)
+            topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
+        else:
+            topk_indices = mask_sparse_attention_indices(attention_mask, topk_indices)
         sinks = kwargs.get("s_aux", module.sinks)
         attn_output = sparse_attn_tilelang(
             query.transpose(1, 2).contiguous(),
