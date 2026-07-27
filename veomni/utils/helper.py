@@ -48,6 +48,12 @@ from .device import (
 from .dist_utils import all_reduce
 from .multisource_utils import parse_multisource_config
 from .seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
+from .token_accounting import (
+    TokenAccounting,
+    metrics_from_totals,
+    pop_token_accounting,
+    sum_accountings,
+)
 
 
 try:
@@ -86,14 +92,30 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 
 
 def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    if "linear_attn_cu_seq_lens_q" in micro_batch:
+        # This metadata remains global when an attention backend replaces
+        # cu_seq_lens_q with sequence-parallel local boundaries.
+        parallel_state = get_parallel_state()
+        tail_padding_length = int(micro_batch.get("tail_padding_length", 0) or 0)
+        if getattr(parallel_state, "cp_enabled", False):
+            tail_padding_length *= int(parallel_state.sp_size)
+        seqlens = valid_seqlens_from_cu_seqlens(
+            micro_batch["linear_attn_cu_seq_lens_q"],
+            tail_padding_length=tail_padding_length,
+        )
+        return seqlens.tolist()
+
     if "cu_seq_lens_q" in micro_batch:
         # packed micro batch
+        parallel_state = get_parallel_state()
         tail_padding_length = micro_batch.get("tail_padding_length")
         seqlens = valid_seqlens_from_cu_seqlens(
             micro_batch["cu_seq_lens_q"],
             tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
-        ).tolist()
-        return seqlens
+        )
+        if getattr(parallel_state, "cp_enabled", False):
+            seqlens = seqlens * int(parallel_state.sp_size)
+        return seqlens.tolist()
 
     elif "attention_mask" in micro_batch:
         # unpacked sample
@@ -192,6 +214,9 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self.batch_token_accountings: List[TokenAccounting] = []
+        self.batch_accounting_expected = 0
+        self.batch_accounting_observed = 0
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -227,17 +252,17 @@ class EnvironMeter:
 
     def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
         if getattr(self.config, "condition_model_type", None) is None:  # hf model
-            if isinstance(micro_batch, List):
-                for sample in micro_batch:
-                    self.batch_seqlens.extend(_compute_seqlens(sample))
-                    self.images_seqlens.extend(_compute_image_seqlens(sample))
-                    if self.enable_multisource:
-                        self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
-            else:
-                self.batch_seqlens.extend(_compute_seqlens(micro_batch))
-                self.images_seqlens.extend(_compute_image_seqlens(micro_batch))
+            samples = micro_batch if isinstance(micro_batch, List) else [micro_batch]
+            for sample in samples:
+                self.batch_accounting_expected += 1
+                accounting = pop_token_accounting(sample)
+                if accounting is not None:
+                    self.batch_token_accountings.append(accounting)
+                    self.batch_accounting_observed += 1
+                self.batch_seqlens.extend(_compute_seqlens(sample))
+                self.images_seqlens.extend(_compute_image_seqlens(sample))
                 if self.enable_multisource:
-                    self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
+                    self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
         else:  # dit diffusers model
             self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
@@ -262,6 +287,39 @@ class EnvironMeter:
         tokens_per_second = batch_tokens / delta_time
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
+
+        local_hook = int(
+            self.batch_accounting_expected > 0 and self.batch_accounting_observed == self.batch_accounting_expected
+        )
+        local_accounting = sum_accountings(self.batch_token_accountings)
+        accounting_values = torch.tensor(
+            (
+                local_accounting.physical_window_tokens,
+                local_accounting.aligned_compute_tokens,
+                local_accounting.source_input_tokens,
+                local_accounting.loss_tokens,
+                local_accounting.num_documents,
+                local_accounting.sum_document_len_squared,
+                local_hook,
+            ),
+            dtype=torch.int64,
+            device=get_device_type(),
+        )
+        (
+            physical_window_tokens,
+            aligned_compute_tokens,
+            source_input_tokens,
+            loss_tokens,
+            num_documents,
+            sum_document_len_squared,
+            hook_ranks,
+        ) = all_reduce(accounting_values, op="sum", group=self.parallel_state.dp_group)
+        max_document_length = all_reduce(
+            torch.tensor(local_accounting.max_document_length, dtype=torch.int64, device=get_device_type()),
+            op="max",
+            group=self.parallel_state.dp_group,
+        )
+        expected_hook_ranks = dist.get_world_size(group=self.parallel_state.dp_group)
 
         # cuda memory
         allocated_memory = get_torch_device().max_memory_allocated()
@@ -290,7 +348,24 @@ class EnvironMeter:
             "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
             "cpu_memory_usage(%)": cpu_memory_info.percent,
             "num_alloc_retries": num_alloc_retries,
+            "token_accounting/collator_hook_ranks": float(hook_ranks),
+            "token_accounting/expected_dp_ranks": float(expected_hook_ranks),
         }
+        if int(hook_ranks) == expected_hook_ranks and expected_hook_ranks > 0:
+            totals = TokenAccounting(
+                physical_window_tokens=int(physical_window_tokens),
+                aligned_compute_tokens=int(aligned_compute_tokens),
+                source_input_tokens=int(source_input_tokens),
+                loss_tokens=int(loss_tokens),
+                num_documents=int(num_documents),
+                max_document_length=int(max_document_length),
+                sum_document_len_squared=int(sum_document_len_squared),
+            )
+            totals.validate_training_step()
+            metrics.update(metrics_from_totals(totals, delta_time=delta_time))
+            metrics["token_accounting/collator_accounting_hook"] = 1.0
+        else:
+            metrics["token_accounting/collator_accounting_hook"] = 0.0
 
         if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
@@ -304,6 +379,9 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self.batch_token_accountings = []
+        self.batch_accounting_expected = 0
+        self.batch_accounting_observed = 0
 
         return metrics
 

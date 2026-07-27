@@ -31,6 +31,13 @@ from ..utils.seqlen_pos_transform_utils import (
     prepare_fa_kwargs_from_position_ids,
     valid_seqlens_from_cu_seqlens,
 )
+from ..utils.token_accounting import (
+    attach_token_accounting,
+    build_token_accounting,
+    count_loss_tokens,
+    document_lengths_from_position_ids,
+    summarize_document_lengths,
+)
 
 
 # A model-provided hook that derives ``multimodal_metadata`` from a packed +
@@ -45,6 +52,7 @@ MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 logger = logging.get_logger(__name__)
 
 _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
+_TOKEN_ACCOUNTING_PARTIAL = "_token_accounting_partial"
 
 
 def add_flash_attention_kwargs_from_position_ids(
@@ -293,6 +301,13 @@ class PackingCollator(DataCollator):
                 if pack_dim == -1:
                     batch[key] = batch[key].unsqueeze(0)
 
+        if "position_ids" in batch:
+            document_stats = summarize_document_lengths(document_lengths_from_position_ids(batch["position_ids"]))
+        else:
+            sequence_length = int(batch["input_ids"].shape[-1]) if "input_ids" in batch else 0
+            document_stats = summarize_document_lengths([sequence_length] if sequence_length else [])
+        batch[_TOKEN_ACCOUNTING_PARTIAL] = document_stats
+
         linear_attn_tail_padding_length = 0
         if self.pad_to_length:
             input_ids_len_before = batch["input_ids"].shape[-1]
@@ -308,9 +323,47 @@ class PackingCollator(DataCollator):
             # the hook sees the SP-padded batch + per-modality pad counts.
             if self.metadata_collate_func is not None:
                 self.metadata_collate_func(batch, {"pixel_values": 0, "pixel_values_videos": 0})
+            if not self.seq_classification and "labels" in batch:
+                shifted_labels = F.pad(batch["labels"][..., 1:].contiguous(), (0, 1), "constant", IGNORE_INDEX)
+                loss_tokens = count_loss_tokens(shifted_labels)
+            else:
+                loss_tokens = count_loss_tokens(batch["labels"]) if "labels" in batch else 0
+            _finalize_token_accounting(
+                batch,
+                partial=batch.pop(_TOKEN_ACCOUNTING_PARTIAL),
+                loss_tokens=loss_tokens,
+                tail_padding_length=linear_attn_tail_padding_length,
+            )
         elif linear_attn_tail_padding_length:
             batch[_LINEAR_ATTN_TAIL_PADDING_LENGTH] = linear_attn_tail_padding_length
         return batch
+
+
+def _finalize_token_accounting(
+    batch: Dict[str, Any],
+    *,
+    partial: Dict[str, int],
+    loss_tokens: int,
+    tail_padding_length: int,
+) -> None:
+    """Attach global token counters before sequence-parallel slicing."""
+    if "position_ids" not in batch:
+        return
+    physical = int(batch["position_ids"].shape[0] * batch["position_ids"].shape[-1])
+    if "linear_attn_cu_seq_lens_q" in batch:
+        aligned = int(batch["linear_attn_cu_seq_lens_q"][-1].item()) - int(tail_padding_length)
+    else:
+        aligned = physical - int(tail_padding_length)
+    stats = build_token_accounting(
+        physical_window_tokens=physical,
+        aligned_compute_tokens=aligned,
+        source_input_tokens=int(partial["source_input_tokens"]),
+        loss_tokens=loss_tokens,
+        num_documents=int(partial["num_documents"]),
+        max_document_length=int(partial["max_document_length"]),
+        sum_document_len_squared=int(partial["sum_document_len_squared"]),
+    )
+    attach_token_accounting(batch, stats)
 
 
 @dataclass
@@ -369,11 +422,15 @@ class SequenceParallelCollator(DataCollator):
             return torch.cat((feature, pad), dim=dim)
 
     def __call__(self, batch: Dict[str, Union[torch.Tensor, List[torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        partial_accounting = batch.pop(_TOKEN_ACCOUNTING_PARTIAL)
         if not self.seq_classification:
             # shift labels
             labels = batch["labels"][..., 1:].contiguous()
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
             batch["labels"] = labels
+            loss_tokens = count_loss_tokens(labels)
+        else:
+            loss_tokens = count_loss_tokens(batch["labels"]) if "labels" in batch else 0
 
         linear_attn_tail_padding_length = int(batch.pop(_LINEAR_ATTN_TAIL_PADDING_LENGTH, 0))
 
@@ -412,6 +469,12 @@ class SequenceParallelCollator(DataCollator):
                 batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
         add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
+        _finalize_token_accounting(
+            batch,
+            partial=partial_accounting,
+            loss_tokens=loss_tokens,
+            tail_padding_length=linear_attn_tail_padding_length,
+        )
 
         batch["position_ids"] = self.sp_slice(
             "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
