@@ -16,10 +16,15 @@
 
 from __future__ import annotations
 
+import weakref
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import Shard
 
+from veomni.optim import muon as muon_impl
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
@@ -31,6 +36,8 @@ from veomni.optim.muon import (  # noqa: E402
     DEFAULT_NS_COEFFICIENTS,
     DEFAULT_NS_STEPS,
     DistributedMuon,
+    _fsdp_all2all_fast_path_eligible,
+    _shard_row_sizes,
     batched_gram_newton_schulz,
     batched_newton_schulz,
     run_newton_schulz,
@@ -111,6 +118,61 @@ class TestParamShapeEligibility:
         else:
             with pytest.raises(ValueError, match="2D and 3D"):
                 DistributedMuon([p], lr=1e-3)
+
+
+class TestFsdpAllToAllEligibility:
+    def test_empty_rank_shards_remain_all_to_all_eligible(self):
+        world_size = 32
+        param = SimpleNamespace(
+            device_mesh=SimpleNamespace(ndim=1, size=lambda dim: world_size),
+            placements=(Shard(0),),
+            shape=(24, 16384),
+        )
+
+        assert _shard_row_sizes(param.shape[0], world_size) == [1] * 24 + [0] * 8
+        assert _fsdp_all2all_fast_path_eligible(param)
+
+    def test_bucket_key_separates_local_dtypes(self):
+        mesh = object()
+        fp32 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.float32))
+        bf16 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.bfloat16))
+        bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update: update.device_mesh)
+
+        assert bucket_key(fp32) != bucket_key(bf16)
+
+
+class TestIntermediateLifetime:
+    def test_non_all_to_all_orthos_are_released_per_parameter(self):
+        params = [nn.Parameter(torch.randn(4, 4)) for _ in range(8)]
+        opt = DistributedMuon(params, lr=1e-3, nesterov=False)
+        live = 0
+        peak = 0
+        calls = 0
+
+        def fake_compute_ortho(update, kind, **kwargs):
+            nonlocal calls, live, peak
+
+            ortho = torch.zeros_like(update)
+            calls += 1
+            live += 1
+            peak = max(peak, live)
+
+            def release():
+                nonlocal live
+                live -= 1
+
+            weakref.finalize(ortho, release)
+            return ortho
+
+        opt._compute_ortho = fake_compute_ortho
+        for p in params:
+            p.grad = torch.randn_like(p)
+
+        opt.step()
+
+        assert calls == len(params)
+        assert peak <= 2
+        assert live == 0
 
 
 class TestNumerics:
