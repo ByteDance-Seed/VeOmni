@@ -63,16 +63,14 @@ def _sample_2d(M: int, K: int, dtype: torch.dtype = torch.float32, seed: int = 0
     return torch.randn(M, K, generator=g, dtype=dtype)
 
 
-# Head splitting has no built-in module list, so every call names its targets.
 _QKV_MODULES = ("q_proj", "k_proj", "v_proj")
 
 
 class _FakeAttention(nn.Module):
-    """GQA-shaped attention plus the look-alikes head splitting must not touch.
+    """GQA attention plus ``o_proj``/``q_a_proj``, which head splitting must not touch.
 
-    ``o_proj`` is head-structured along columns and ``q_a_proj`` is shared across
-    heads, yet both have a row count divisible by ``head_dim`` — so they only
-    stay out of the split by name, which is what the tests below pin down.
+    ``hidden == num_heads * head_dim`` is deliberate: ``o_proj`` then resolves to a
+    valid head layout, so it can only stay out of the split by name.
     """
 
     def __init__(self, hidden: int = 32, num_heads: int = 8, num_kv_heads: int = 2, head_dim: int = 4):
@@ -517,8 +515,7 @@ class TestHeadSplitInference:
     def test_only_listed_modules_are_eligible(self):
         blocks = infer_head_block_counts(_attention_model(), head_group_size=1, module_names=_QKV_MODULES)
 
-        # Equality (not membership) pins down that o_proj / q_a_proj stay out even
-        # though their row counts are multiples of head_dim.
+        # o_proj / q_a_proj stay out despite row counts that are multiples of head_dim.
         assert blocks == {
             "self_attn.q_proj.weight": 8,
             "self_attn.k_proj.weight": 2,
@@ -564,12 +561,7 @@ class TestHeadSplitInference:
         assert infer_head_block_counts(model, head_group_size=1, module_names=_QKV_MODULES) == {}
 
     def test_mla_row_stride_is_qk_head_dim_not_head_dim(self):
-        """MLA's ``head_dim`` is the rope part only; blocks must follow ``qk_head_dim``.
-
-        DeepSeek V3 / GLM-MoE-DSA stack ``num_heads * qk_head_dim`` rows while the
-        config reports ``head_dim == qk_rope_head_dim``, so deriving the count as
-        ``rows // head_dim`` would cut each head into three unrelated blocks.
-        """
+        """MLA's ``head_dim`` is the rope part only; blocks must follow ``qk_head_dim``."""
         num_heads, qk_nope, qk_rope = 8, 32, 16
         attn = nn.Module()
         attn.num_heads = num_heads
@@ -631,14 +623,9 @@ class TestHeadSplitUpdate:
 
     @pytest.mark.parametrize("adjust_lr_fn", ["original", "match_rms_adamw"])
     def test_lr_adjust_follows_the_block_shape(self, adjust_lr_fn):
-        """A tall stack must not inherit the full matrix's larger LR factor.
-
-        Both adjustment rules grow with the long dimension, so scoring a split
-        update against the unsplit ``[rows, cols]`` shape would silently inflate
-        the step by ``sqrt(head_blocks)``.
-        """
+        """A tall stack must not inherit the full matrix's larger LR factor."""
         head_blocks, block_rows, cols = 8, 16, 32
-        rows = head_blocks * block_rows  # 128 x 32: MLA-style tall head stack
+        rows = head_blocks * block_rows
         grad = _sample_2d(rows, cols, seed=5)
         p = nn.Parameter(torch.zeros_like(grad))
         p.grad = grad.clone()
@@ -680,7 +667,6 @@ class TestHeadSplitGuards:
             DistributedMuon([p], lr=1e-3, head_blocks=0)
 
     def test_add_param_group_is_validated_too(self):
-        """Otherwise a bad block count only surfaces mid-step, inside Newton-Schulz."""
         opt = DistributedMuon([nn.Parameter(torch.randn(4, 8))], lr=1e-3)
         with pytest.raises(ValueError, match="does not evenly divide"):
             opt.add_param_group({"params": [nn.Parameter(torch.randn(6, 8))], "head_blocks": 4})
@@ -732,7 +718,6 @@ class TestHeadSplitBuild:
             self._muon_groups_by_blocks(_attention_model(), head_group_size=-2)
 
     def test_group_size_without_module_list_raises(self):
-        """Opting in must be explicit on both knobs, never half-configured."""
         with pytest.raises(ValueError, match="requires muon_head_split_modules"):
             self._muon_groups_by_blocks(_attention_model(), head_group_size=1, head_split_modules=[])
 
@@ -744,12 +729,7 @@ class TestHeadSplitBuild:
         ],
     )
     def test_head_blocks_only_reaches_the_state_dict_when_splitting(self, head_group_size, expected):
-        """With the option off, the flattened DCP schema must match a pre-feature run.
-
-        ``head_blocks`` in the optimizer defaults would add a
-        ``param_groups.<fqn>.head_blocks`` entry for every param, which older
-        checkpoints do not carry.
-        """
+        """With the option off, the flattened DCP schema must match a pre-feature run."""
         from veomni.optim import build_optimizer
 
         model = _attention_model()

@@ -497,10 +497,9 @@ def _muon_param_groups(
 ) -> Union[List[torch.nn.Parameter], List[Dict[str, Any]]]:
     """Split ``params`` into one Muon param group per head-block count.
 
-    Muon carries the orthogonalization scope as the per-group ``head_blocks``
-    option, so params that disagree must sit in different groups. Groups are
-    emitted in ascending block order so every rank iterates them in the same
-    order — the all-to-all pairing in ``DistributedMuon`` is position-based.
+    Groups are emitted in ascending block order so every rank iterates them in
+    the same order: the all-to-all pairing in ``DistributedMuon`` is
+    position-based.
     """
     if not head_blocks_by_param:
         return list(params)
@@ -508,8 +507,8 @@ def _muon_param_groups(
     by_blocks: Dict[int, List[torch.nn.Parameter]] = {}
     for p in params:
         by_blocks.setdefault(head_blocks_by_param.get(id(p), 1), []).append(p)
-    # The unsplit group stays free of ``head_blocks`` so its flattened DCP state
-    # dict keys match a run with head splitting disabled.
+    # The unsplit group stays free of ``head_blocks`` so its DCP state dict keys
+    # match a run with head splitting disabled.
     return [
         {"params": group_params} if blocks == 1 else {"params": group_params, "head_blocks": blocks}
         for blocks, group_params in sorted(by_blocks.items())
@@ -536,8 +535,6 @@ def _build_muon_with_adamw(
     # Summary-only keys collected by the trainer; not DistributedMuon ctor args.
     expert_zero_comm = bool(muon_kwargs.pop("expert_zero_comm", False))
     adamw_lr = float(muon_kwargs.pop("adamw_lr", lr))
-    # Head-split scope is resolved from the model here, then handed to Muon as
-    # per-param-group ``head_blocks``.
     head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
     head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
     if head_group_size < 0:
@@ -547,9 +544,7 @@ def _build_muon_with_adamw(
             f"muon_head_group_size={head_group_size} requires muon_head_split_modules: there is no "
             "default list, because which attention projections benefit from head splitting depends "
             "on the architecture. List the leaf module names to split, e.g. ['q_b_proj'] for "
-            "DeepSeek V4/V3 MLA up-projections or ['q_proj', 'k_proj', 'v_proj'] for GQA attention. "
-            "Note that o_proj is head-structured along columns and MLA kv_b_proj interleaves K and V "
-            "inside each head, so neither splits into head-aligned rows."
+            "DeepSeek V4/V3 MLA up-projections or ['q_proj', 'k_proj', 'v_proj'] for GQA attention."
         )
     muon_lr_explicit = bool(
         muon_kwargs.pop("muon_lr_explicit", "lr" in muon_kwargs and muon_kwargs.get("lr") is not None)
@@ -576,9 +571,7 @@ def _build_muon_with_adamw(
         muon_name_set = set(muon_names)
         param_by_name = dict(model.named_parameters())
         for fqn, blocks in sorted(blocks_by_fqn.items()):
-            if fqn not in muon_name_set:
-                # Routed to AdamW (e.g. via no_decay_modules), so there is no
-                # orthogonalization to scope.
+            if fqn not in muon_name_set:  # routed to AdamW, nothing to scope
                 continue
             head_blocks_by_param[id(param_by_name[fqn])] = blocks
             head_split_names.append(fqn)

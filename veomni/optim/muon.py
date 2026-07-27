@@ -20,9 +20,7 @@ params are gathered only when the NS iteration needs the full trailing
 ``[M, K]`` matrix.
 
 The per-group ``head_blocks`` option orthogonalizes a head-stacked attention
-projection in row blocks (one block per head group) instead of as one matrix,
-which is the "Muon Split" recipe from GLM-5. See
-``docs/usage/basic_modules.md`` for when this helps.
+projection in row blocks (one block per head group) instead of as one matrix.
 """
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -87,9 +85,8 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "output_layer",
 )
 
-# Attribute names carrying a head count and a per-head row stride. Read from the
-# attention module first, then its config: MLA modules keep the true stride as
-# ``qk_head_dim`` while ``config.head_dim`` holds only the rope part.
+# Attribute names carrying a head count and a per-head row stride. MLA modules
+# keep the true stride as ``qk_head_dim``; ``head_dim`` is only the rope part.
 _HEAD_COUNT_ATTRS: Tuple[str, ...] = ("num_heads", "n_heads", "num_attention_heads", "num_key_value_heads")
 _HEAD_STRIDE_ATTRS: Tuple[str, ...] = ("head_dim", "qk_head_dim")
 
@@ -471,10 +468,10 @@ def _declared_ints(source: Any, attrs: Sequence[str]) -> List[int]:
 def _head_layout_tiers(module: "nn.Module") -> List[Tuple[List[int], List[int]]]:
     """``(head counts, per-head dims)`` to try, module attrs before config attrs.
 
-    The module's own attributes come first because a sub-module can disagree with
-    the shared config: a DSA indexer declares a smaller ``n_heads``/``head_dim``
-    pair while seeing the same config as the main attention, and mixing both
-    sources can make two different head counts fit the same row total.
+    A sub-module can disagree with the shared config -- a DSA indexer declares a
+    smaller ``n_heads``/``head_dim`` pair than the attention it sits in -- so its
+    own attributes are tried alone before the merged module+config tier, where
+    two different head counts can fit the same row total.
     """
     counts = _declared_ints(module, _HEAD_COUNT_ATTRS)
     strides = _declared_ints(module, _HEAD_STRIDE_ATTRS)
@@ -493,15 +490,10 @@ def _head_layout_tiers(module: "nn.Module") -> List[Tuple[List[int], List[int]]]
 def _stacked_head_counts(rows: int, tiers: Sequence[Tuple[Sequence[int], Sequence[int]]]) -> List[int]:
     """Head counts consistent with ``rows == heads * per_head_dim``.
 
-    Requiring a *declared* head count times a *declared* per-head dim is what
-    keeps row blocks on real head boundaries. Deriving the count as
-    ``rows // head_dim`` instead splits at arbitrary offsets whenever
-    ``head_dim`` is not the row stride: DeepSeek V3 sets ``config.head_dim`` to
-    the rope part only (16) while a head actually occupies ``qk_head_dim`` (48)
-    rows, so that shortcut would cut every head into three unrelated blocks.
-
-    Returns every match of the last tier tried, so the caller can refuse to
-    guess when a layout stays ambiguous.
+    Both factors must be *declared*, since ``rows // head_dim`` would split at
+    arbitrary offsets whenever ``head_dim`` is not the row stride (DeepSeek V3
+    reports the rope part only). Returns every match of the last tier tried, so
+    the caller can refuse to guess when a layout stays ambiguous.
     """
     matches: List[int] = []
     for counts, strides in tiers:
@@ -520,22 +512,11 @@ def infer_head_block_counts(
 
     A weight is eligible when it lives in a direct child module named in
     ``module_names`` of an attention module that declares both a head count and
-    a per-head dim (``num_heads``/``n_heads``/config equivalents and
-    ``head_dim``/``qk_head_dim``). GQA K/V projections resolve to
-    ``num_key_value_heads`` and MLA up-projections to ``qk_head_dim`` blocks
-    without any per-architecture special casing.
+    a per-head dim. ``head_group_size`` is the number of heads per block.
 
-    ``module_names`` is deliberately required and has no default: which
-    projections are worth splitting depends on the architecture's aspect ratios,
-    and a built-in list would quietly change the update math for every model
-    whose attention happens to use the same names.
-
-    ``head_group_size`` is the number of heads per orthogonalization block: 1 is
-    fully per-head, and values > 1 give the intermediate grouping that tends to
-    beat both extremes. Returns only params that end up with >1 block; anything
-    whose head layout cannot be pinned down, or whose head count is not
-    divisible by ``head_group_size``, is skipped (with a warning) and stays on
-    full-matrix Muon.
+    Returns only params that end up with >1 block; anything whose head layout
+    cannot be pinned down, or whose head count is not divisible by
+    ``head_group_size``, is skipped with a warning and stays on full-matrix Muon.
     """
     if head_group_size < 1:
         return {}
@@ -744,9 +725,9 @@ class DistributedMuon(Optimizer):
             "ns_implementation": ns_implementation,
             "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
-        # Only carried when splitting is actually on: a default would add a
+        # Only carried when splitting is on: as a default it would add a
         # ``param_groups.<fqn>.head_blocks`` entry to every flattened optimizer
-        # state dict and break loading checkpoints written before this option.
+        # state dict, which checkpoints written before this option lack.
         if int(head_blocks) != 1:
             defaults["head_blocks"] = int(head_blocks)
         super().__init__(params, defaults)
@@ -791,9 +772,7 @@ class DistributedMuon(Optimizer):
         not resumable state. Torch restores every param-group option from the
         checkpoint, so without this a DCP resume (which rebuilds groups from the
         live optimizer and then delegates here) would silently drop back to
-        full-matrix updates for a run that turned ``muon_head_group_size`` on.
-        Toggling the option also changes the group count, which plain
-        ``torch.load`` resume rejects outright before reaching this override.
+        full-matrix updates.
         """
         # ``None`` where the group carries no ``head_blocks`` at all, so an unsplit
         # run does not gain the key (and its state dict keys) on resume.
@@ -831,8 +810,8 @@ class DistributedMuon(Optimizer):
             ns_implementation = str(group.get("ns_implementation", "gram_quack"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
             head_blocks = int(group.get("head_blocks", 1))
-            # Orthogonalization-scope settings travel with the NS settings so the
-            # all-to-all owner path picks them up from one dict.
+            # Scope settings travel inside ns_kwargs so the all-to-all owner path
+            # reads them from one dict.
             ns_kwargs = {
                 "ns_coefficients": ns_coefficients,
                 "ns_steps": ns_steps,
@@ -946,8 +925,7 @@ class DistributedMuon(Optimizer):
     ) -> None:
         lr_shape = p.shape[-2:] if p.ndim >= 2 else p.shape
         if head_blocks > 1:
-            # The RMS/spectral scaling must follow the matrix NS actually saw, or
-            # a split param silently takes a ``sqrt(head_blocks)``-too-large step.
+            # Scale by the block shape NS actually saw, not the full matrix.
             lr_shape = (lr_shape[0] // head_blocks, lr_shape[1])
         adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
 
@@ -1087,8 +1065,6 @@ class DistributedMuon(Optimizer):
         """Run Newton-Schulz on ``update`` according to its layout kind."""
 
         def _ns(x: Tensor) -> Tensor:
-            # ``head_blocks > 1`` reuses the batched NS path over row blocks, so
-            # each head group gets its own polar factor instead of sharing one.
             batched = _split_row_blocks(x, head_blocks) if head_blocks > 1 else x
             ortho = run_newton_schulz(
                 batched,
