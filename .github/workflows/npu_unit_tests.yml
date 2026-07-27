@@ -185,6 +185,7 @@ jobs:
       - name: Run ops tests
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
+          uv run --frozen pytest -v -s -x tests/ops/test_gdn_ascend_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
       - name: Run utils tests

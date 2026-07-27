@@ -193,6 +193,42 @@ See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
+#### Ascend 910B4-1
+
+Before importing Triton on an Ascend 910B4-1 host, canonicalize the compiler
+target to the public `triton-ascend` architecture name:
+
+```bash
+export TRITON_ASCEND_ARCH=Ascend910B4
+```
+
+`triton-ascend==3.2.1` validates this value and gives it precedence over the
+raw runtime device name. VeOmni independently reads the raw
+`Ascend910B4-1` device name and uses a 64-wide value tile for the
+GatedDeltaNet hidden-state recurrence in both forward and backward. Other
+Ascend devices retain the upstream 128-wide tile. This changes launch
+geometry only: value tiles are independent, so the training objective and
+gradient equations are unchanged.
+
+Run the live hardware gate before a long Qwen3.5 training job. `--tokens`
+is the sequence length seen by each GatedDeltaNet kernel after Ulysses
+gathers sequence and scatters heads:
+
+```bash
+python scripts/npu/validate_910b4_gdn_training.py \
+  --model-config /path/to/Qwen3.5/config.json \
+  --sp-size 8 \
+  --tokens 131072
+```
+
+The gate covers BF16 causal-convolution and GDR forward/backward, including
+misaligned packed-sequence boundaries, and prints
+`VEOMNI_910B4_GDN_TRAINING_GATE_OK` after the default strict tolerances and
+at least 131072 production tokens pass. Smaller shapes or custom tolerances
+print a diagnostic-only marker. Independent PyTorch references run on the
+short shape; the production-length stage verifies the same kernels packed
+and per segment.
+
 > **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
 > (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`
 > rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
