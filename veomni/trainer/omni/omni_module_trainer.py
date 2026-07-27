@@ -315,6 +315,26 @@ class OmniModuleTrainer:
         # owned by the orchestrator (a module's own wall-clock is meaningless).
         self._metric_meter_result: Optional[MetricMeterResult] = None
 
+    @property
+    def skip_hf_weight_load(self) -> bool:
+        """Return whether this module allows BaseTrainer to skip its HF weights."""
+        # A parameterless module has no persistent model state for either HF or
+        # DCP to restore. This covers modules such as a VAE process-only stage.
+        if not self.base.model.state_dict():
+            return True
+
+        # Fully-frozen Omni modules use _FrozenModuleNoOpCkptCallback, so their
+        # model state will not be restored in on_train_begin. Materialize it
+        # from the released HF checkpoint instead.
+        if not self.has_trainable_parameters:
+            logger.info_rank0(
+                f"OmniModuleTrainer[{self.module_name}]: fully frozen module has persistent model state; "
+                "loading HF weights because no module DCP checkpoint will restore it."
+            )
+            return False
+
+        return True
+
     def _build_parallelized_model(self):
         """FSDP2-wrap this module's model and load its weights (or defer to the module).
 
@@ -345,7 +365,9 @@ class OmniModuleTrainer:
         if customized_model is not None:
             self.base.model = customized_model
         else:
-            self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
+            self.base._build_parallelized_model(
+                skip_hf_weight_load=self.skip_hf_weight_load
+            )  # FSDP2 wrap + per-module weight load
 
     # ── Parallel state (per-module device mesh) ────────────────────────────────
 
