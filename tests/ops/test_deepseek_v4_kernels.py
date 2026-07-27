@@ -626,3 +626,95 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
     expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
+
+
+def _fp8_weight_quant_reference(x, block_size=128):
+    """Bit-exact torch model of the TileLang block-wise FP8 weight quantizer.
+
+    Both compute the scale in FP32 from the tile amax, so the divide, the
+    clamp and the round-to-nearest-even FP8 cast all match exactly.
+    """
+    rows, cols = x.shape
+    tiles = x.float().contiguous().view(rows // block_size, block_size, cols // block_size, block_size)
+    scales = tiles.abs().amax(dim=(1, 3)).clamp_min(1e-4) / 448.0
+    quantized = (tiles / scales[:, None, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return quantized.view(rows, cols), scales
+
+
+def _weight_quant_test_input():
+    """A 2x3 grid of 128x128 tiles, each exercising a different scale regime."""
+    torch.manual_seed(6)
+    tiles = [
+        torch.randn(128, 128),
+        torch.zeros(128, 128),  # amax clamp: must not divide by zero
+        torch.full((128, 128), 1e-8),  # below the clamp floor
+        torch.randn(128, 128) * 1e4,  # large magnitudes
+        torch.randn(128, 128) * 1e-3,  # small magnitudes
+        torch.randn(128, 128),
+    ]
+    tiles[4][7, 11] = 500.0  # lone outlier: the tile scale must absorb it
+    rows = [torch.cat(tiles[:3], dim=1), torch.cat(tiles[3:], dim=1)]
+    return torch.cat(rows, dim=0).to(device=DEVICE, dtype=torch.bfloat16)
+
+
+def test_tilelang_fp8_weight_quant_matches_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128)
+    reference_quantized, reference_scales = _fp8_weight_quant_reference(x)
+
+    assert quantized.shape == x.shape
+    assert quantized.dtype == torch.float8_e4m3fn
+    # A non-square tile grid catches a swapped block index or transposed scales.
+    assert scales.shape == (2, 3)
+    assert scales.dtype == torch.float32
+    assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
+    assert torch.equal(scales, reference_scales)
+    assert not quantized.float().isnan().any()
+
+    # The scale is derived per tile, so each tile stretches to the FP8 max on
+    # its own. The two tiles whose amax falls under the 1e-4 clamp keep the
+    # floor scale instead and therefore stay far below saturation.
+    tile_amax = quantized.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    saturated = torch.tensor([[True, False, False], [True, True, True]], device=DEVICE)
+    assert torch.equal(tile_amax == 448.0, saturated)
+    assert tile_amax[0, 1] == 0.0
+    assert 0.0 < tile_amax[0, 2] < 1.0
+    assert scales[0, 1] == 1e-4 / 448.0
+    assert scales[0, 2] == 1e-4 / 448.0
+
+
+def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128)
+
+    dequantized = quantized.float().view(2, 128, 3, 128) * scales[:, None, :, None]
+    dequantized = dequantized.view(x.shape)
+    # E4M3 keeps 3 mantissa bits, so a correctly scaled tile round-trips to
+    # within one ulp (~2^-4) relative to that tile's amax.
+    tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    tolerance = (tile_amax / 16.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
+    assert ((dequantized - x.float()).abs() <= tolerance).all()
+
+    transposed = x.t().contiguous().t()
+    assert not transposed.is_contiguous()
+    transposed_quantized, transposed_scales = fp8_weight_quant(transposed, block_size=128)
+    assert torch.equal(transposed_quantized.view(torch.uint8), quantized.view(torch.uint8))
+    assert torch.equal(transposed_scales, scales)
+
+
+def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    with pytest.raises(AssertionError, match="2D weight"):
+        fp8_weight_quant(torch.empty(2, 128, 128, device=DEVICE, dtype=torch.bfloat16))
+    with pytest.raises(AssertionError, match="bfloat16 weight"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.float32))
+    with pytest.raises(AssertionError, match="divisible by block_size"):
+        fp8_weight_quant(torch.empty(128, 200, device=DEVICE, dtype=torch.bfloat16))

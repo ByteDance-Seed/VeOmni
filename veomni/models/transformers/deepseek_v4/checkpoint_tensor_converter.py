@@ -49,7 +49,7 @@ import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightRenaming, rename_source_key
 
-from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant
+from veomni.ops.kernels.deepseek_v4 import fp4_act_quant, fp8_weight_quant
 
 from ....utils import logging
 from ...checkpoint_tensor_loading import ConvertedCheckpointTensor, export_weights
@@ -412,7 +412,7 @@ class DeepseekV4CheckpointTensorConverter:
             if fp4_quantize:
                 weight, scale = fp4_act_quant(param, block_size=32, inplace=False)
             else:
-                weight, scale = act_quant(param, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+                weight, scale = fp8_weight_quant(param, block_size=128)
 
             export_weight_names.add(origin)
             export_weight_names.add(scale_name)

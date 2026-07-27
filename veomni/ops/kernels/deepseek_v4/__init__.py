@@ -102,4 +102,21 @@ def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return impl(x, weight)
 
 
-__all__ = ["act_quant", "fp4_act_quant", "linear_bf16_fp32", "sparse_attn_tilelang", "v4_lighting_indexer"]
+def fp8_weight_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_tilelang_sm90()
+    from .act_quant import fp8_weight_quant as impl
+
+    return impl(x, block_size)
+
+
+__all__ = [
+    "act_quant",
+    "fp4_act_quant",
+    "fp8_weight_quant",
+    "linear_bf16_fp32",
+    "sparse_attn_tilelang",
+    "v4_lighting_indexer",
+]

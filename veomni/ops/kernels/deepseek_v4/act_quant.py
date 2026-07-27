@@ -169,6 +169,72 @@ def act_quant(
 
 
 @tilelang.jit(pass_configs=pass_configs)
+def fp8_weight_quant_kernel(
+    M,
+    N,
+    block_size=128,
+):
+    """Block-wise ``block_size x block_size`` FP8 quantization, one tile per CTA."""
+    assert M % block_size == 0 and N % block_size == 0
+    fp8_min = -448.0
+    fp8_max = 448.0
+    fp8_max_inv = 1 / fp8_max
+
+    @T.prim_func
+    def fp8_weight_quant_kernel_(
+        X: T.Tensor[(M, N), BF16],
+        Y: T.Tensor[(M, N), FP8],
+        S: T.Tensor[(M // block_size, N // block_size), FP32],
+    ):
+        with T.Kernel(N // block_size, M // block_size, threads=128) as (bx, by):
+            x_shared = T.alloc_shared((block_size, block_size), BF16)
+            y_shared = T.alloc_shared((block_size, block_size), FP8)
+            amax_row_local = T.alloc_fragment((block_size,), FP32)
+            scale_local = T.alloc_fragment((1,), FP32)
+            scale_shared = T.alloc_shared((1,), FP32)
+
+            T.copy(X[by * block_size, bx * block_size], x_shared)
+            T.reduce_absmax(x_shared, amax_row_local, dim=1)
+            T.reduce_absmax(amax_row_local, scale_local, dim=0)
+            scale_local[0] = T.max(scale_local[0], 1e-4) * fp8_max_inv
+            T.copy(scale_local, scale_shared)
+
+            for i, j in T.Parallel(block_size, block_size):
+                y_shared[i, j] = T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max)
+
+            T.copy(y_shared, Y[by * block_size, bx * block_size])
+            if T.get_thread_binding(0) == 0:
+                S[by, bx] = scale_shared[0]
+
+    return fp8_weight_quant_kernel_
+
+
+def fp8_weight_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise ``block_size x block_size`` FP8 quantization of a 2D weight.
+
+    Returns:
+        weight (torch.float8_e4m3fn): Quantized weight, same shape as ``x``.
+        scale (torch.float32): One scale per ``block_size x block_size`` tile.
+    """
+    assert x.dim() == 2, f"fp8_weight_quant expects a 2D weight, got shape {tuple(x.shape)}"
+    assert x.dtype == torch.bfloat16, f"fp8_weight_quant expects a bfloat16 weight, got {x.dtype}"
+    M, N = x.shape
+    assert M % block_size == 0 and N % block_size == 0, (
+        f"weight shape {(M, N)} is not divisible by block_size {block_size}"
+    )
+    z = x.contiguous()
+    y = torch.empty_like(z, dtype=torch.float8_e4m3fn)
+    s = z.new_empty((M // block_size, N // block_size), dtype=torch.float32)
+    kernel = fp8_weight_quant_kernel(M, N, block_size)
+    print(kernel.get_kernel_source())
+    kernel(z, y, s)
+    return y, s
+
+
+@tilelang.jit(pass_configs=pass_configs)
 def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, inplace=False):
     """Block-wise FP4 quantization. Power-of-2 scale via bit ops. inplace=True does fused quant+dequant."""
     M = T.symbolic("M")
