@@ -16,12 +16,11 @@
 # Adapted from MindSpeed-MM's async_offload.py.
 # Key adaptations for VeOmni:
 #   - Uses VeOmni's device-agnostic stream/event helpers (veomni.utils.device)
-#   - Uses VeOmni's Singleton metaclass (veomni.utils.singleton)
-#   - Uses VeOmni's TrainingContext (veomni.distributed.training_context)
 #   - Uses VeOmni's logger (veomni.utils.logging) instead of print_rank
-#   - Uses VeOmni's module_match (veomni.utils.module_match) instead of mindspeed's str_match
+#   - Uses segment-aware module-name matching instead of mindspeed's str_match
 #   - Supports wildcard pattern ``{*}`` for sequential module groups (e.g. model.layers.{*})
 
+import fnmatch
 from typing import List
 
 import torch
@@ -29,12 +28,30 @@ from torch.autograd.graph import saved_tensors_hooks
 
 from ..utils import logging
 from ..utils.device import create_event, create_stream, get_current_stream, switch_to_specified_stream
-from ..utils.module_match import module_name_match
-from ..utils.singleton import Singleton
-from .training_context import TrainingContext
 
 
 logger = logging.get_logger(__name__)
+
+
+class _Singleton(type):
+    """Metaclass ensuring only one instance of an async-offload class exists."""
+
+    _instances = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            cls._instances[cls] = super().__call__(*args, **kwargs)
+        return cls._instances[cls]
+
+
+def _module_name_match(pattern: str, name: str) -> bool:
+    """Match module paths without allowing wildcards to cross ``.`` separators."""
+    pattern_segments = pattern.split(".")
+    name_segments = name.split(".")
+    return len(pattern_segments) == len(name_segments) and all(
+        fnmatch.fnmatchcase(name_segment, pattern_segment)
+        for pattern_segment, name_segment in zip(pattern_segments, name_segments)
+    )
 
 
 def base_check_fn(tensor) -> bool:
@@ -76,15 +93,15 @@ class GetCnt:
         self._block_idx = -1
         self._block_tensor_nums = {}
 
-    def get_prefetch_keys(self, block_idx, tensor_idx):
+    def get_prefetch_keys(self, block_idx):
         prefetch_block_idx = max((idx for idx in self._block_tensor_nums.keys() if idx < block_idx), default=None)
 
         if prefetch_block_idx is None:
             return []
 
-        block_tensor_nums = self._block_tensor_nums[block_idx]
+        block_tensor_nums = self._block_tensor_nums[prefetch_block_idx]
         prefetch_idxs = list(range(0, block_tensor_nums))
-        return ["{}_{}".format(block_idx - 1, prefetch_idx) for prefetch_idx in prefetch_idxs]
+        return ["{}_{}".format(prefetch_block_idx, prefetch_idx) for prefetch_idx in prefetch_idxs]
 
     def get_layer_tensor_nums(self, block_idx):
         return self._block_tensor_nums[block_idx]
@@ -146,13 +163,12 @@ class SwapTensor:
 
 
 class OffloadItem:
-    def __init__(self, act=None, ref_cnt=0, event=None):
+    def __init__(self, act=None, ref_cnt=0):
         self.act = act
         self.ref_cnt = ref_cnt
-        self.event = event
 
 
-class OffloadManager(metaclass=Singleton):
+class OffloadManager(metaclass=_Singleton):
     def __init__(self):
         self.items = {}
         self.npu_item = []
@@ -172,13 +188,12 @@ class OffloadManager(metaclass=Singleton):
     def exist(self, key):
         return key in self.items
 
-    def put(self, key, act, event=None):
+    def put(self, key, act):
         if key in self.items:
             self.items[key].act = act
             self.items[key].ref_cnt += 1
-            self.items[key].event = event
         else:
-            self.items[key] = OffloadItem(act, 1, event)
+            self.items[key] = OffloadItem(act, 1)
 
     def put_npu_tensor(self, act):
         self.npu_item.append(act)
@@ -206,14 +221,11 @@ class OffloadManager(metaclass=Singleton):
         item = self.items[key]
 
         act = item.act
-        if item.event is not None:
-            item.get_event().wait()
-
         item.ref_cnt -= 1
         return act
 
-    def prefetch_get(self, block_idx, tensor_idx, h2d_stream, d2h_stream):
-        prefetch_keys = self.getcnt.get_prefetch_keys(block_idx, tensor_idx)
+    def prefetch_get(self, block_idx, h2d_stream, d2h_stream):
+        prefetch_keys = self.getcnt.get_prefetch_keys(block_idx)
         for prefetch_key in prefetch_keys:
             if self.exist(prefetch_key):
                 prefetch_swap_tensor = self.get(prefetch_key)
@@ -273,10 +285,8 @@ class async_save_on_cpu(saved_tensors_hooks):
             block_idx, tensor_idx = swap_tensor.key.split("_")
             OffloadManager().clear(swap_tensor.key)
 
-            TrainingContext().set_layer_index(int(block_idx))
-
             if prefetch:
-                OffloadManager().prefetch_get(int(block_idx), int(tensor_idx), h2d_stream, d2h_stream)
+                OffloadManager().prefetch_get(int(block_idx), h2d_stream, d2h_stream)
             return swap_tensor.tensor
 
         super().__init__(_pack_to_cpu, _unpack_from_cpu)
@@ -304,7 +314,7 @@ def get_offload_modules(model, plan: List[str]):
         else:
             depth = 1
             for name, module in model.named_modules():
-                if module_name_match(plan_name, name):
+                if _module_name_match(plan_name, name):
                     if not any(item[0] == name for item in matched_submodules):
                         matched_submodules.append([name, module, offload_layers, depth])
                         offload_layers += 1
@@ -415,9 +425,6 @@ def _patch_class_call(cls):
             custom_check_fn=check_fn,
             prefetch=prefetch,
         )
-
-        TrainingContext().set_model_depth(depth)
-        TrainingContext().set_layer_index(layer_idx)
 
         with ctx:
             return original_call(self, *args, **kwargs)

@@ -19,7 +19,6 @@ import torch.nn as nn
 
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import GetCnt, apply_async_activation_offload, get_offload_modules
-from veomni.utils.module_match import module_name_match
 
 
 def test_offload_config_requires_modules_when_async_enabled():
@@ -43,10 +42,16 @@ def test_offload_config_rejects_sync_and_async_activation_together():
         )
 
 
-def test_module_name_match_glob():
-    assert module_name_match("model.layers.*", "model.layers.0")
-    assert module_name_match("model.layers.*", "model.layers.12")
-    assert not module_name_match("model.layers.*", "model.norm")
+def test_get_offload_modules_glob_is_segment_aware():
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([nn.Linear(4, 4) for _ in range(2)])
+
+    matched = get_offload_modules(Toy(), ["model.layers.*"])
+
+    assert [item[0] for item in matched] == ["model.layers.0", "model.layers.1"]
 
 
 def test_get_cnt_unique_keys_across_second_pass():
@@ -57,6 +62,15 @@ def test_get_cnt_unique_keys_across_second_pass():
     assert first == ["0_0", "1_0", "2_0"]
     assert second == ["0_1", "1_1", "2_1"]
     assert set(first).isdisjoint(second)
+
+
+def test_get_prefetch_keys_use_previous_offloaded_layer_and_its_tensor_count():
+    cnt = GetCnt()
+    cnt.get_cnt(2)
+    cnt.get_cnt(2)
+    cnt.get_cnt(5)
+
+    assert cnt.get_prefetch_keys(5) == ["2_0", "2_1"]
 
 
 def test_get_offload_modules_brace_star_expands_sequential():
