@@ -1072,6 +1072,8 @@ class OpsImplementationConfig:
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
+            "delegates heavy GDN compute to torch.ops.npu.*). "
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
