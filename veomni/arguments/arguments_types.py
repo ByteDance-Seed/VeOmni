@@ -143,6 +143,28 @@ class OptimizerConfig:
             )
         },
     )
+    muon_head_group_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Attention heads per Newton-Schulz block for head-split Muon. "
+                "0 (default) orthogonalizes each projection as a single matrix; 1 is fully per-head; "
+                "g > 1 puts g heads in each block. Any value >= 1 also requires "
+                "muon_head_split_modules."
+            )
+        },
+    )
+    muon_head_split_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Leaf module names to head-split, matched exactly against the children of an "
+                "attention module, e.g. ['q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
+                "['q_proj', 'k_proj', 'v_proj'] for GQA. Required whenever "
+                "muon_head_group_size >= 1; see docs/usage/basic_modules.md."
+            )
+        },
+    )
     muon_expert_zero_comm: bool = field(
         default=False,
         metadata={

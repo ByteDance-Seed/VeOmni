@@ -312,6 +312,8 @@ NPU validation runs at two times:
 | muon_ns_coefficients | `List[float]` | `[3.4445, -4.7750, 2.0315]` | Quintic Newton–Schulz polynomial coefficients. |
 | muon_eps | `float` | `1e-7` | Numerical-stability epsilon used in spectral-norm normalization. |
 | muon_adjust_lr_fn | `Literal["original", "match_rms_adamw"]` | `"match_rms_adamw"` | Per-matrix learning-rate adjustment strategy. |
+| muon_head_group_size | `int` | `0` | Attention heads per Newton–Schulz block ("Muon Split"). `0` orthogonalizes each projection as one matrix, `1` is per-head, `g>1` groups `g` heads. Any value `>= 1` requires `muon_head_split_modules`. |
+| muon_head_split_modules | `List[str]` | `[]` | Leaf module names to head-split, e.g. `[q_b_proj]`. No default — required when `muon_head_group_size >= 1`. |
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |

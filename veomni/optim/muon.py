@@ -18,6 +18,9 @@
 weights and adds batched Newton-Schulz for 3D MoE expert stacks. Sharded
 params are gathered only when the NS iteration needs the full trailing
 ``[M, K]`` matrix.
+
+The per-group ``head_blocks`` option orthogonalizes a head-stacked attention
+projection in row blocks (one block per head group) instead of as one matrix.
 """
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -66,6 +69,7 @@ __all__ = [
     "batched_gram_newton_schulz",
     "NS_IMPLEMENTATIONS",
     "batched_newton_schulz",
+    "infer_head_block_counts",
     "run_newton_schulz",
     "split_muon_adamw_params",
 ]
@@ -80,6 +84,11 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "lm_head",
     "output_layer",
 )
+
+# Attribute names carrying a head count and a per-head row stride. MLA modules
+# keep the true stride as ``qk_head_dim``; ``head_dim`` is only the rope part.
+_HEAD_COUNT_ATTRS: Tuple[str, ...] = ("num_heads", "n_heads", "num_attention_heads", "num_key_value_heads")
+_HEAD_STRIDE_ATTRS: Tuple[str, ...] = ("head_dim", "qk_head_dim")
 
 
 def _as_coeff_schedule(
@@ -125,6 +134,16 @@ def _flatten_matrix_batch(grad: Tensor) -> Tuple[Tensor, torch.Size]:
     if grad.ndim == 3:
         return grad, original_shape
     return grad.reshape(-1, grad.shape[-2], grad.shape[-1]), original_shape
+
+
+def _split_row_blocks(update: Tensor, blocks: int) -> Tensor:
+    """View a 2D ``[M, K]`` update as ``[blocks, M // blocks, K]`` row blocks."""
+    if update.ndim != 2:
+        raise ValueError(f"Head-group splitting expects a 2D update, got shape {tuple(update.shape)}")
+    rows = int(update.shape[0])
+    if blocks < 1 or rows % blocks != 0:
+        raise ValueError(f"Cannot split {rows} rows into {blocks} equal head blocks")
+    return update.reshape(blocks, rows // blocks, update.shape[1])
 
 
 @torch.no_grad()
@@ -432,6 +451,132 @@ def split_muon_adamw_params(
     return muon_params, adamw_params, muon_names, adamw_names
 
 
+def _positive_int(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _declared_ints(source: Any, attrs: Sequence[str]) -> List[int]:
+    """Collect distinct positive ints for ``attrs`` from ``source``."""
+    values: List[int] = []
+    for attr in attrs:
+        value = _positive_int(getattr(source, attr, None))
+        if value is not None and value not in values:
+            values.append(value)
+    return values
+
+
+def _head_layout_tiers(module: "nn.Module") -> List[Tuple[List[int], List[int]]]:
+    """``(head counts, per-head dims)`` to try, module attrs before config attrs.
+
+    A sub-module can disagree with the shared config -- a DSA indexer declares a
+    smaller ``n_heads``/``head_dim`` pair than the attention it sits in -- so its
+    own attributes are tried alone before the merged module+config tier, where
+    two different head counts can fit the same row total.
+    """
+    counts = _declared_ints(module, _HEAD_COUNT_ATTRS)
+    strides = _declared_ints(module, _HEAD_STRIDE_ATTRS)
+    tiers = [(counts, strides)]
+    config = getattr(module, "config", None)
+    if config is not None:
+        tiers.append(
+            (
+                counts + [v for v in _declared_ints(config, _HEAD_COUNT_ATTRS) if v not in counts],
+                strides + [v for v in _declared_ints(config, _HEAD_STRIDE_ATTRS) if v not in strides],
+            )
+        )
+    return tiers
+
+
+def _stacked_head_counts(rows: int, tiers: Sequence[Tuple[Sequence[int], Sequence[int]]]) -> List[int]:
+    """Head counts consistent with ``rows == heads * per_head_dim``.
+
+    Both factors must be *declared*, since ``rows // head_dim`` would split at
+    arbitrary offsets whenever ``head_dim`` is not the row stride (DeepSeek V3
+    reports the rope part only). Returns every match of the last tier tried, so
+    the caller can refuse to guess when a layout stays ambiguous.
+    """
+    matches: List[int] = []
+    for counts, strides in tiers:
+        matches = sorted({heads for heads in counts for stride in strides if rows == heads * stride})
+        if len(matches) == 1:
+            break
+    return matches
+
+
+def infer_head_block_counts(
+    model: "nn.Module",
+    head_group_size: int,
+    module_names: Sequence[str],
+) -> Dict[str, int]:
+    """Map parameter FQN to the number of row blocks for head-split Muon.
+
+    A weight is eligible when it lives in a direct child module named in
+    ``module_names`` of an attention module that declares both a head count and
+    a per-head dim. ``head_group_size`` is the number of heads per block.
+
+    Returns only params that end up with >1 block; anything whose head layout
+    cannot be pinned down, or whose head count is not divisible by
+    ``head_group_size``, is skipped with a warning and stays on full-matrix Muon.
+    """
+    if head_group_size < 1:
+        return {}
+    if not module_names:
+        raise ValueError(
+            "Head-split Muon needs an explicit list of attention projection module names "
+            "(head_group_size >= 1 with an empty module_names)."
+        )
+
+    allowed = set(module_names)
+    blocks: Dict[str, int] = {}
+    warned: set = set()
+
+    def _warn_once(key: Tuple[Any, ...], message: str) -> None:
+        if key not in warned:
+            warned.add(key)
+            logger.warning_rank0(f"[Muon] {message}")
+
+    for module_name, module in model.named_modules():
+        tiers = _head_layout_tiers(module)
+        head_counts, strides = tiers[-1]
+        for child_name, child in module.named_children():
+            if child_name not in allowed:
+                continue
+            for param_name, param in child.named_parameters(recurse=False):
+                if param.ndim != 2 or not param.requires_grad:
+                    continue
+                fqn = ".".join(part for part in (module_name, child_name, param_name) if part)
+                if not head_counts or not strides:
+                    _warn_once(
+                        (module.__class__.__name__, child_name, "undeclared"),
+                        f"head split skipped for {fqn}: {module.__class__.__name__} declares no head "
+                        "count / per-head dim, so row blocks cannot be validated against head boundaries.",
+                    )
+                    continue
+                rows = int(param.shape[0])
+                matches = _stacked_head_counts(rows, tiers)
+                if len(matches) != 1:
+                    _warn_once(
+                        (child_name, rows, tuple(head_counts), tuple(strides)),
+                        f"head split skipped for {fqn}: {rows} rows do not match exactly one "
+                        f"(head count x per-head dim) product, with head counts {head_counts} and "
+                        f"per-head dims {strides}.",
+                    )
+                    continue
+                num_heads = matches[0]
+                if num_heads % head_group_size != 0:
+                    _warn_once(
+                        (child_name, num_heads, head_group_size, "group"),
+                        f"head split skipped for {fqn}: {num_heads} heads are not divisible by "
+                        f"head_group_size={head_group_size}.",
+                    )
+                    continue
+                num_blocks = num_heads // head_group_size
+                if num_blocks > 1:
+                    blocks[fqn] = num_blocks
+
+    return blocks
+
+
 _KIND_LOCAL = "local"
 _KIND_FSDP_GATHER_2D = "fsdp_gather_2d"
 _KIND_MOE_LOCAL_3D = "moe_local_3d"
@@ -547,6 +692,7 @@ class DistributedMuon(Optimizer):
         adjust_lr_fn: Optional[str] = None,
         ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
+        head_blocks: int = 1,
     ) -> None:
         if not _MUON_AVAILABLE:
             raise RuntimeError(
@@ -564,6 +710,8 @@ class DistributedMuon(Optimizer):
             raise ValueError(f"Adjust learning rate function {adjust_lr_fn} is not supported")
         if ns_implementation not in NS_IMPLEMENTATIONS:
             raise ValueError(f"ns_implementation must be one of {NS_IMPLEMENTATIONS}, got {ns_implementation!r}")
+        if int(head_blocks) < 1:
+            raise ValueError(f"head_blocks must be >= 1 but is: {head_blocks}")
 
         defaults: Dict[str, Any] = {
             "lr": lr,
@@ -577,17 +725,71 @@ class DistributedMuon(Optimizer):
             "ns_implementation": ns_implementation,
             "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
+        # Only carried when splitting is on: as a default it would add a
+        # ``param_groups.<fqn>.head_blocks`` entry to every flattened optimizer
+        # state dict, which checkpoints written before this option lack.
+        if int(head_blocks) != 1:
+            defaults["head_blocks"] = int(head_blocks)
         super().__init__(params, defaults)
 
         for group in self.param_groups:
-            for p in group["params"]:
-                if not _is_muon_eligible_ndim(p):
+            self._validate_group(group)
+
+    @staticmethod
+    def _validate_group(group: Dict[str, Any]) -> None:
+        """Reject param layouts Muon cannot orthogonalize, at build time."""
+        head_blocks = int(group.get("head_blocks", 1))
+        if head_blocks < 1:
+            raise ValueError(f"head_blocks must be >= 1 but is: {head_blocks}")
+        for p in group["params"]:
+            if not _is_muon_eligible_ndim(p):
+                raise ValueError(
+                    "DistributedMuon supports only 2D and 3D parameters; "
+                    f"got param with shape {tuple(p.size())}. Route 1D/4D+ "
+                    "params (biases, norms, conv weights) to AdamW via "
+                    "split_muon_adamw_params."
+                )
+            if head_blocks > 1:
+                if p.ndim != 2:
                     raise ValueError(
-                        "DistributedMuon supports only 2D and 3D parameters; "
-                        f"got param with shape {tuple(p.size())}. Route 1D/4D+ "
-                        "params (biases, norms, conv weights) to AdamW via "
-                        "split_muon_adamw_params."
+                        "head_blocks > 1 only applies to 2D head-stacked attention "
+                        f"projections; got a {p.ndim}D param with shape {tuple(p.size())}."
                     )
+                if p.shape[0] % head_blocks != 0:
+                    raise ValueError(
+                        f"head_blocks={head_blocks} does not evenly divide the "
+                        f"{p.shape[0]} rows of a param with shape {tuple(p.size())}."
+                    )
+
+    def add_param_group(self, param_group: Dict[str, Any]) -> None:  # type: ignore[override]
+        super().add_param_group(param_group)
+        self._validate_group(self.param_groups[-1])
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:  # type: ignore[override]
+        """Restore optimizer state while keeping this run's head-split scope.
+
+        ``head_blocks`` describes how a matrix is sliced for orthogonalization,
+        not resumable state. Torch restores every param-group option from the
+        checkpoint, so without this a DCP resume (which rebuilds groups from the
+        live optimizer and then delegates here) would silently drop back to
+        full-matrix updates.
+        """
+        # ``None`` where the group carries no ``head_blocks`` at all, so an unsplit
+        # run does not gain the key (and its state dict keys) on resume.
+        configured = [group.get("head_blocks") for group in self.param_groups]
+        super().load_state_dict(state_dict)
+        restored = [group.get("head_blocks") for group in self.param_groups]
+        for group, blocks in zip(self.param_groups, configured):
+            if blocks is None:
+                group.pop("head_blocks", None)
+            else:
+                group["head_blocks"] = blocks
+        if restored != configured:
+            logger.warning_rank0(
+                f"[Muon] checkpoint head_blocks={[1 if b is None else b for b in restored]} disagrees "
+                f"with the configured {[1 if b is None else b for b in configured]}; "
+                "keeping the configured value."
+            )
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
@@ -607,12 +809,16 @@ class DistributedMuon(Optimizer):
             adjust_lr_fn = group["adjust_lr_fn"]
             ns_implementation = str(group.get("ns_implementation", "gram_quack"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
+            head_blocks = int(group.get("head_blocks", 1))
+            # Scope settings travel inside ns_kwargs so the all-to-all owner path
+            # reads them from one dict.
             ns_kwargs = {
                 "ns_coefficients": ns_coefficients,
                 "ns_steps": ns_steps,
                 "eps": eps,
                 "ns_implementation": ns_implementation,
                 "gram_ns_reset_iterations": gram_ns_reset_iterations,
+                "head_blocks": head_blocks,
             }
 
             # Keep at most one owner-assignment chunk live per mesh/dtype. This
@@ -664,6 +870,7 @@ class DistributedMuon(Optimizer):
                         lr=lr,
                         weight_decay=weight_decay,
                         adjust_lr_fn=adjust_lr_fn,
+                        head_blocks=head_blocks,
                     )
 
             for (mesh, _local_dtype), entries in a2a_buckets.items():
@@ -701,6 +908,7 @@ class DistributedMuon(Optimizer):
                 lr=lr,
                 weight_decay=weight_decay,
                 adjust_lr_fn=adjust_lr_fn,
+                head_blocks=int(ns_kwargs.get("head_blocks", 1)),
             )
         entries.clear()
 
@@ -713,8 +921,12 @@ class DistributedMuon(Optimizer):
         lr: float,
         weight_decay: float,
         adjust_lr_fn: Optional[str],
+        head_blocks: int = 1,
     ) -> None:
         lr_shape = p.shape[-2:] if p.ndim >= 2 else p.shape
+        if head_blocks > 1:
+            # Scale by the block shape NS actually saw, not the full matrix.
+            lr_shape = (lr_shape[0] // head_blocks, lr_shape[1])
         adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
 
         if weight_decay != 0.0:
@@ -848,18 +1060,21 @@ class DistributedMuon(Optimizer):
         eps: float,
         ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
+        head_blocks: int = 1,
     ) -> Tensor:
         """Run Newton-Schulz on ``update`` according to its layout kind."""
 
         def _ns(x: Tensor) -> Tensor:
-            return run_newton_schulz(
-                x,
+            batched = _split_row_blocks(x, head_blocks) if head_blocks > 1 else x
+            ortho = run_newton_schulz(
+                batched,
                 ns_coefficients=ns_coefficients,
                 ns_steps=ns_steps,
                 eps=eps,
                 ns_implementation=ns_implementation,
                 gram_ns_reset_iterations=gram_ns_reset_iterations,
             )
+            return ortho.reshape(x.shape) if head_blocks > 1 else ortho
 
         if kind == _KIND_LOCAL:
             return _ns(update)
