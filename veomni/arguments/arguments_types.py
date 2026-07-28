@@ -97,6 +97,18 @@ class OptimizerConfig:
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
     )
+    grad_clip_scope: Literal["per_module", "global"] = field(
+        default="per_module",
+        metadata={
+            "help": (
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
+            ),
+        },
+    )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
         default=None,

@@ -47,7 +47,6 @@ Division of labour
   optimizer step, and cascades the callback lifecycle into each module-trainer.
 """
 
-import math
 import os
 import random
 from collections import defaultdict
@@ -60,6 +59,7 @@ import torch.distributed as dist
 from ...arguments import OmniArguments
 from ...data import SeedOmniCollator
 from ...data.data_transform import build_data_transform
+from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.parallel_state import get_parallel_state
 from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
@@ -569,17 +569,19 @@ class OmniTrainer:
         return module_metrics
 
     def _clip_grad_norm(self) -> float:
-        """Clip each module-trainer's grads and combine into the global L2 grad norm.
+        """Clip grads across OmniModules according to ``grad_clip_scope``.
 
-        Each :class:`OmniModuleTrainer` clips the params of its own FSDP unit and
-        returns that module's grad norm; the whole-model norm is their L2
-        combination (sqrt of sum of squares). Empty (no module-trainers) → 0.0.
+        * ``per_module`` (default): each module clips to ``max_grad_norm``;
+          return ``sqrt(sum n_i^2)`` of per-module (pre-clip) norms.
+        * ``global``: measure unclipped, ``total=sqrt(sum n_i^2)``, then one
+          scale coeff for all modules (seedream ``gradient_clip_val`` semantics).
         """
-        max_grad_norm = self.base.args.train.optimizer.max_grad_norm
-        module_grad_norms = [
-            module_trainer._clip_grad_norm(max_grad_norm) for module_trainer in self.module_trainers.values()
-        ]
-        return math.sqrt(sum(g * g for g in module_grad_norms)) if module_grad_norms else 0.0
+        opt_cfg = self.base.args.train.optimizer
+        return omni_clip_grad_norm(
+            self.module_trainers,
+            opt_cfg.max_grad_norm,
+            grad_clip_scope=getattr(opt_cfg, "grad_clip_scope", "per_module"),
+        )
 
     # ── Callback delegators (trace via base; cascade ckpt into module-trainers) ─
     #

@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.distributed as dist
+from torch.distributed._tensor import DTensor
 
 from .fsdp2 import clip_grad_norm as fsdp2_clip_grad_norm
 from .fsdp2.clip_grad_norm import _finalize_total_norm, _fsdp2_reduce_group
@@ -100,11 +101,18 @@ def veomni_omni_module_clip_grad_norm(
     else:
         params = [p for p in model.parameters() if p.grad is not None]
         if params:
-            # FSDP2 grads are sharded -> reduce local shard sums over the fsdp group.
-            # DDP grads are replicated (and, under SP, already AVG-allreduced above).
-            reduce_groups = [("fsdp", ps.fsdp_group)] if ps.dp_mode == "fsdp2" else []
-            pth_sums.append(_fsdp2_reduce_group(params, norm_type, reduce_groups))
-            groups_to_clip.append(params)
+            # FSDP2 DTensor grads are sharded -> SUM local p-th powers over fsdp_group.
+            # Plain Tensor grads are full replicas (e.g. Omni connector under a process
+            # whose ParallelState is still fsdp2) — do NOT world-SUM those.
+            dt_params = [p for p in params if isinstance(p.grad, DTensor)]
+            dense_params = [p for p in params if not isinstance(p.grad, DTensor)]
+            if dt_params:
+                reduce_groups = [("fsdp", ps.fsdp_group)] if ps.dp_mode == "fsdp2" else []
+                pth_sums.append(_fsdp2_reduce_group(dt_params, norm_type, reduce_groups))
+                groups_to_clip.append(dt_params)
+            if dense_params:
+                pth_sums.append(_fsdp2_reduce_group(dense_params, norm_type, []))
+                groups_to_clip.append(dense_params)
 
     if not pth_sums:
         return 0.0
@@ -118,3 +126,61 @@ def veomni_omni_module_clip_grad_norm(
         torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm)
 
     return total_norm.item()
+
+
+def omni_clip_grad_norm(
+    module_trainers: dict,
+    max_grad_norm: float,
+    grad_clip_scope: str = "per_module",
+) -> float:
+    """Clip grads across OmniModule trainers according to ``grad_clip_scope``.
+
+    * ``per_module`` (default): each module ``_clip_grad_norm(max_grad_norm)``
+      independently; return ``sqrt(sum n_i^2)`` of the per-module (pre-clip)
+      norms for logging.
+    * ``global``: measure each module with ``max_norm=inf`` (no scale),
+      ``total = sqrt(sum n_i^2)``, then if ``total > max_grad_norm`` scale **all**
+      module grads by one coefficient — single-model / seedream
+      ``gradient_clip_val`` semantics.
+    """
+    trainers = list(module_trainers.values()) if isinstance(module_trainers, dict) else list(module_trainers)
+    if not trainers:
+        return 0.0
+
+    scope = grad_clip_scope or "per_module"
+    if scope == "per_module":
+        module_norms = [mt._clip_grad_norm(max_grad_norm) for mt in trainers]
+        return math.sqrt(sum(g * g for g in module_norms)) if module_norms else 0.0
+
+    if scope != "global":
+        raise ValueError(f"Unknown grad_clip_scope={scope!r}; expected 'per_module' or 'global'")
+
+    module_norms = [mt._clip_grad_norm(float("inf")) for mt in trainers]
+    total = math.sqrt(sum(g * g for g in module_norms)) if module_norms else 0.0
+    if max_grad_norm is not None and max_grad_norm > 0 and total > float(max_grad_norm):
+        coeff = float(max_grad_norm) / (total + 1e-6)
+        for mt in trainers:
+            with mt._scoped():
+                for p in mt.base.model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(coeff)
+    return total
+
+
+def global_clip_grad_norm_modules(modules, max_grad_norm: float) -> float:
+    """Global L2 clip over a list of ``nn.Module`` (align harness / unit tests).
+
+    Same math as ``omni_clip_grad_norm(..., grad_clip_scope='global')`` but for
+    plain modules that share the current :func:`get_parallel_state` (no per-module
+    trainer scope).
+    """
+    mods = [m for m in modules if m is not None]
+    norms = [float(veomni_omni_module_clip_grad_norm(m, float("inf"))) for m in mods]
+    total = math.sqrt(sum(g * g for g in norms)) if norms else 0.0
+    if max_grad_norm is not None and max_grad_norm > 0 and total > float(max_grad_norm):
+        coeff = float(max_grad_norm) / (total + 1e-6)
+        for m in mods:
+            for p in m.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(coeff)
+    return total
