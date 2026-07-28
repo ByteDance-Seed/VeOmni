@@ -187,8 +187,18 @@ def bwd(
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
 
+                # Read the row index straight from global memory and clamp it, instead of
+                # going through the safe_indices fragment. A fragment index would tie this
+                # copy to the fragment's inferred layout, which collapses the whole tile
+                # onto the handful of threads that own the BS axis; reading Indices
+                # directly lets layout inference pick a coalesced whole-CTA copy instead.
+                # Clamping is equivalent to substituting row 0: out-of-range candidates
+                # have their scores pre-set to -inf above, which absorbs the finite QK
+                # product from whichever row is fetched here, so their softmax weight is
+                # exactly zero. The dKV scatter stays mask-guarded, so no gradient is ever
+                # written to the clamped row.
                 for bi_i, d_i in T.Parallel(BS, D):
-                    KV_shared[bi_i, d_i] = KV[by, safe_indices[bi_i], d_i]
+                    KV_shared[bi_i, d_i] = KV[by, T.max(T.min(Indices[by, s_i, i_i * BS + bi_i], S_kv - 1), 0), d_i]
 
                 T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
@@ -282,6 +292,8 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     assert topk_idxs.is_contiguous() and lse.is_contiguous()
     B, S, H, D = q.shape
     unpadded_S_kv = kv.shape[1]
+    # The gather clamps candidate rows into [0, S_kv - 1], which needs a row to exist.
+    assert unpadded_S_kv > 0, "kv must have at least one row"
     topk = topk_idxs.shape[-1]
 
     # Pad topk to next multiple of block_size (kernel requires divisibility)
