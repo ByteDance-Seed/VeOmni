@@ -42,10 +42,10 @@ def sparse_mqa_fwd(
     num_stages=0,
     threads=256,
 ):
-    # The bounds-safe indirect gather depends on per-iteration register indices.
-    # TileLang 0.1.9 cannot legally software-pipeline that dependency, so keep
-    # this loop unpipelined (num_stages=0).
-    assert num_stages == 0, "bounds-safe sparse gathers do not support software pipelining"
+    # The KV rows are gathered through a data-dependent index, which TileLang 0.1.9
+    # cannot lower into a multi-stage async copy, so keep this loop unpipelined
+    # (num_stages=0).
+    assert num_stages == 0, "data-dependent sparse gathers do not support software pipelining"
     assert dim == tilelang.math.next_power_of_2(dim), f"dim must be power of 2, got {dim}"
     assert topk % block_I == 0, f"topk ({topk}) must be divisible by block_I ({block_I})"
     if sm_scale is None:
@@ -96,7 +96,6 @@ def sparse_mqa_fwd(
             O_shared = T.alloc_shared([H_per_block, D], dtype)
             Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
             mask = T.alloc_fragment([BI], "bool")
-            safe_indices = T.alloc_fragment([BI], indices_dtype)
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
@@ -124,10 +123,20 @@ def sparse_mqa_fwd(
                     mask[bi_i] = (
                         Indices[b_i, s_i, i_i * BI + bi_i] >= 0 and Indices[b_i, s_i, i_i * BI + bi_i] < seq_len_kv
                     )
-                    safe_indices[bi_i] = T.if_then_else(mask[bi_i], Indices[b_i, s_i, i_i * BI + bi_i], 0)
 
+                # Read the row index straight from global memory and clamp it, instead of
+                # going through a register fragment. A fragment index would tie this copy
+                # to the fragment's inferred layout, which collapses the whole tile onto
+                # the handful of threads that own the BI axis; reading Indices directly
+                # lets layout inference pick a coalesced whole-CTA copy instead.
+                # Clamping is equivalent to substituting row 0: out-of-range candidates
+                # have their scores pre-set to -inf below, which absorbs the finite QK
+                # product from whichever real row is fetched here, so their softmax
+                # weight is exactly zero and they contribute nothing to the PV GEMM.
                 for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[b_i, safe_indices[bi_i], d_i]
+                    KV_shared[bi_i, d_i] = KV[
+                        b_i, T.max(T.min(Indices[b_i, s_i, i_i * BI + bi_i], seq_len_kv - 1), 0), d_i
+                    ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
@@ -191,6 +200,8 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
     batch, seq_len, heads, dim = q.shape
     _, seq_len_kv, kv_dim = kv.shape
     assert kv_dim == dim
+    # The gather clamps candidate rows into [0, seq_len_kv - 1], which needs a row to exist.
+    assert seq_len_kv > 0, "kv must have at least one row"
     _, _, topk = topk_idxs.shape
 
     # Pad topk to next multiple of block_I (kernel requires divisibility)
