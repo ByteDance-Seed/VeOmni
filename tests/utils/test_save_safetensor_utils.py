@@ -52,24 +52,27 @@ def _call_get_model_save_state(model, fqn_to_index_mapping, fake_state):
         return get_model_save_state(model, fqn_to_index_mapping)
 
 
-def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets, fake_save_state):
+def _call_save_distributed(
+    model, save_path, fqn_to_index_mapping, model_assets, fake_save_state, use_native_consolidation=False
+):
     """
     Invoke _save_hf_safetensor_distributed with all deps mocked.
 
     Deferred imports are patched at their source modules;
     module-level imports are patched on save_safetensor_utils directly.
 
-    Returns (mock_get_state, mock_writer_cls, mock_dcp_save, mock_save_assets).
+    Returns (mock_get_state, mock_writer_cls, mock_dcp_save, mock_save_assets, mock_apply_patch).
     """
     mock_get_state = MagicMock(return_value=fake_save_state)
     mock_writer_cls = MagicMock()
     mock_dcp_save = MagicMock()
     mock_save_assets = MagicMock()
+    mock_apply_patch = MagicMock()
 
     with (
         # --- deferred imports: patch at source ---
         patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
-        patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+        patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", mock_apply_patch),
         # --- module-level imports: patch on consumer ---
         patch(f"{_MOD}.get_model_save_state", mock_get_state),
         patch(f"{_MOD}.dcp", MagicMock(save=mock_dcp_save)),
@@ -78,6 +81,7 @@ def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets,
         patch(f"{_MOD}.helper", MagicMock()),
         patch(f"{_MOD}.gc", MagicMock()),
         patch(f"{_MOD}.synchronize", MagicMock()),
+        patch(f"{_MOD}.is_torch_version_greater_than", return_value=use_native_consolidation),
     ):
         from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
 
@@ -88,7 +92,7 @@ def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets,
             model_assets=model_assets,
         )
 
-    return mock_get_state, mock_writer_cls, mock_dcp_save, mock_save_assets
+    return mock_get_state, mock_writer_cls, mock_dcp_save, mock_save_assets, mock_apply_patch
 
 
 # ===========================================================================
@@ -177,7 +181,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             "mtp_head.proj.weight": 1,
             "mtp_head.proj.bias": 1,
         }
-        _, writer_cls, _, _ = _call_save_distributed(
+        _, writer_cls, _, _, _ = _call_save_distributed(
             self.model,
             "/tmp/test",
             mapping.copy(),
@@ -189,7 +193,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
 
     def test_none_mapping_passed_through(self):
         fake = {"w": torch.randn(4, 4, dtype=torch.bfloat16)}
-        _, writer_cls, _, _ = _call_save_distributed(
+        _, writer_cls, _, _, _ = _call_save_distributed(
             self.model,
             "/tmp/test",
             None,
@@ -201,7 +205,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
     def test_no_filtering_when_all_keys_match(self):
         fake = {"a": torch.randn(2, 2, dtype=torch.bfloat16), "b": torch.randn(2, 2, dtype=torch.bfloat16)}
         mapping = {"a": 0, "b": 0}
-        _, writer_cls, _, _ = _call_save_distributed(
+        _, writer_cls, _, _, _ = _call_save_distributed(
             self.model,
             "/tmp/test",
             mapping.copy(),
@@ -216,7 +220,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             "int64_buffer": torch.randint(0, 8, (4, 4), dtype=torch.int64),
             "bool_buffer": torch.tensor([True, False]),
         }
-        _, _, dcp_save, _ = _call_save_distributed(
+        _, _, dcp_save, _, _ = _call_save_distributed(
             self.model,
             "/tmp/test",
             None,
@@ -227,6 +231,11 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         saved_state = dcp_save.call_args.kwargs["state_dict"]
         self.assertEqual(set(saved_state), {"weight", "int64_buffer", "bool_buffer"})
         self.assertEqual(saved_state["int64_buffer"].dtype, torch.int64)
+
+        from veomni.utils.import_utils import is_torch_version_greater_than
+
+        if is_torch_version_greater_than("2.12"):
+            return
 
         import json
         import tempfile
@@ -289,7 +298,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
     def test_model_assets_saved(self):
         fake = {"w": torch.randn(2, 2, dtype=torch.bfloat16)}
         assets = [MagicMock()]
-        _, _, _, save_assets = _call_save_distributed(
+        _, _, _, save_assets, _ = _call_save_distributed(
             self.model,
             "/tmp/test",
             None,
@@ -297,6 +306,18 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             fake,
         )
         save_assets.assert_called_once_with("/tmp/test", assets)
+
+    def test_compatibility_patch_applied_before_torch_2_12(self):
+        fake = {"w": torch.randn(2, 2, dtype=torch.bfloat16)}
+        *_, apply_patch = _call_save_distributed(self.model, "/tmp/test", None, None, fake)
+        apply_patch.assert_called_once_with()
+
+    def test_native_consolidation_used_from_torch_2_12(self):
+        fake = {"w": torch.randn(2, 2, dtype=torch.bfloat16)}
+        *_, apply_patch = _call_save_distributed(
+            self.model, "/tmp/test", None, None, fake, use_native_consolidation=True
+        )
+        apply_patch.assert_not_called()
 
 
 # ===========================================================================
