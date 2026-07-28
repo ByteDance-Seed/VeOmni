@@ -17,7 +17,6 @@
 from typing import Callable, NamedTuple
 
 import torch
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb
 
 
 def build_packed_compression_metadata(
@@ -82,7 +81,7 @@ def compress_packed_windows(
     packed_metadata: dict[str, torch.Tensor],
     *,
     overlap: bool,
-    apply_rope: Callable[..., torch.Tensor] = apply_rotary_pos_emb,
+    apply_rope: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
     """Compress complete windows without crossing packed sequence boundaries.
 
@@ -93,7 +92,9 @@ def compress_packed_windows(
 
     ``apply_rope`` is injected so callers in the generated modeling pass their
     module-global ``apply_rotary_pos_emb``, which ``device_patch.py`` may have
-    swapped for the fused Triton backend. Defaults to the eager reference.
+    swapped for the fused Triton backend. It is required rather than defaulted
+    to the eager reference: a defaulted call site would silently keep eager
+    while every other one is fused, which no test would catch.
     """
     if kv.shape[0] != 1:
         raise ValueError(f"Packed DeepSeek V4 compression expects batch size 1, got {kv.shape[0]}")

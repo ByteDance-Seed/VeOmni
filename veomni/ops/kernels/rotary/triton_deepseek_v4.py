@@ -203,15 +203,19 @@ def _is_supported(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsquee
         return False
     if not (cos.shape == sin.shape and cos.dtype == sin.dtype):
         return False
+    if cos.device != x.device or sin.device != x.device:
+        return False
     if cos.requires_grad or sin.requires_grad:
         return False
     batch, _, seqlen, headdim = x.shape
     rope_dim = 2 * cos.shape[-1]
     # ``nope_dim`` must be even for the ``rd ^ 1`` partner indexing to hold.
+    # A zero-width ``rope_dim`` is rejected so the fallback keeps matching eager,
+    # which raises on it rather than returning ``x`` unrotated.
     return (
         cos.shape[0] == batch
         and cos.shape[1] == seqlen
-        and rope_dim <= headdim
+        and 0 < rope_dim <= headdim
         and headdim <= _MAX_HEAD_DIM
         and (headdim - rope_dim) % 2 == 0
     )

@@ -1262,6 +1262,12 @@ def test_deepseek_v4_triton_rope_keeps_no_activations_for_backward():
         pytest.param(lambda x, cos, sin: (x[0], cos, sin, 1), id="x_not_4d"),
         pytest.param(lambda x, cos, sin: (x, cos.requires_grad_(True), sin, 1), id="cos_requires_grad"),
         pytest.param(lambda x, cos, sin: (x, cos[:, :-1], sin[:, :-1], 1), id="cos_seqlen_mismatch"),
+        # An odd nope_dim breaks the ``rd ^ 1`` interleaved-partner indexing, so
+        # the kernel would silently compute garbage rather than fail. This is the
+        # only guard standing between that layout and wrong numbers.
+        pytest.param(lambda x, cos, sin: (x[..., :-1], cos, sin, 1), id="odd_nope_dim"),
+        pytest.param(lambda x, cos, sin: (x, cos[..., :0], sin[..., :0], 1), id="empty_rope_dim"),
+        pytest.param(lambda x, cos, sin: (x, cos.cpu(), sin.cpu(), 1), id="cos_on_other_device"),
     ],
 )
 def test_deepseek_v4_triton_rope_falls_back_when_unsupported(monkeypatch, mutate):
@@ -1341,6 +1347,24 @@ def test_deepseek_v4_device_patch_selects_rotary_backend(monkeypatch):
     use("liger_kernel")
     with pytest.raises(ValueError, match="explicitly disabled"):
         apply_veomni_deepseek_v4_device_patch(generated_module())
+
+
+def test_deepseek_v4_device_patch_disables_wrong_signature_backends(monkeypatch):
+    """Neither registry default may bind: both take ``(q, k, cos, sin)``.
+
+    ``npu`` is asserted on the declared mapping rather than through dispatch,
+    because ``OpsImplementationConfig`` rejects ``npu`` at construction on a GPU
+    host, so the disabled branch is only reachable on Ascend.
+    """
+    from veomni.models.transformers.deepseek_v4 import device_patch
+
+    captured = {}
+    monkeypatch.setattr(device_patch, "apply_per_model_patches", lambda **kwargs: captured.update(kwargs))
+    device_patch.apply_veomni_deepseek_v4_device_patch(types.ModuleType("fake_deepseek_v4"))
+
+    backends = captured["extra_backends"]["rotary_pos_emb"]
+    assert backends["liger_kernel"] is None
+    assert backends["npu"] is None
 
 
 def _unpatched_rope(*args, **kwargs):
