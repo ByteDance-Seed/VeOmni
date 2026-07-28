@@ -143,7 +143,66 @@ def emit_mem_layer(
     print("AI4SE_MEM_LAYER " + json.dumps(payload, sort_keys=True), flush=True)
 
 
+_COMM_SEEN: Dict[str, int] = {}
+
+
+def emit_comm_layer(
+    *,
+    impl: str,
+    op: str,
+    payload_bytes_local: int,
+    payload_bytes_total: int,
+    shape: Optional[list] = None,
+    seq_len_local: Optional[int] = None,
+    depends_on_s: bool,
+    extra: Optional[Dict[str, Any]] = None,
+    layer_idx: Optional[int] = None,
+    once_per_step: bool = True,
+) -> None:
+    """Emit ``AI4SE_COMM_LAYER`` JSON (rank0). Used for INV-2 / Test-A comm evidence.
+
+    ``depends_on_s=False`` means payload volume is independent of sequence length
+    (KCP AG of ``hm``, serial P2P of ``S_final``). ``depends_on_s=True`` for
+    gather_full sequence all-gather (∝ S).
+    """
+    if not mem_probe_enabled():
+        return
+    try:
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    except Exception:
+        rank = 0
+    if rank != 0:
+        return
+
+    key = f"{_STEP}:comm:{op}:{layer_idx}"
+    if once_per_step:
+        if layer_idx is not None and layer_idx not in (0, 1, 2, 8, 16, 24, 32):
+            return
+        if key in _COMM_SEEN:
+            return
+        _COMM_SEEN[key] = 1
+
+    payload: Dict[str, Any] = {
+        "schema": "ai4se.comm_layer/v1",
+        "tag": "gdn_comm",
+        "impl": impl or _IMPL or os.environ.get("VEOMNI_GDN_CP_IMPL", ""),
+        "op": op,
+        "step": _STEP,
+        "layer_idx": layer_idx,
+        "payload_bytes_local": int(payload_bytes_local),
+        "payload_bytes_total": int(payload_bytes_total),
+        "shape": list(shape) if shape is not None else None,
+        "seq_len_local": seq_len_local,
+        "depends_on_s": bool(depends_on_s),
+        "ts": time.time(),
+    }
+    if extra:
+        payload.update(extra)
+    print("AI4SE_COMM_LAYER " + json.dumps(payload, sort_keys=True), flush=True)
+
+
 def reset_mem_probe_step(step: int) -> None:
-    global _STEP, _SEEN
+    global _STEP, _SEEN, _COMM_SEEN
     _STEP = int(step)
     _SEEN = {}
+    _COMM_SEEN = {}

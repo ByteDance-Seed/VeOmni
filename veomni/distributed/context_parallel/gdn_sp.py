@@ -295,6 +295,23 @@ class _CpGatherSequence(torch.autograd.Function):
             expected_total=tensor.size(seq_dim),
         )
 
+        try:
+            from .gdn_mem_probe import emit_comm_layer, mem_probe_enabled
+
+            if mem_probe_enabled():
+                local_bytes = int(tensor.numel()) * int(tensor.element_size())
+                emit_comm_layer(
+                    impl="gather_full_replicated",
+                    op="all_gather_sequence",
+                    payload_bytes_local=local_bytes,
+                    payload_bytes_total=local_bytes * int(cp_size),
+                    shape=list(tensor.shape),
+                    seq_len_local=int(tensor.size(seq_dim)),
+                    depends_on_s=True,
+                    extra={"seq_dim": int(seq_dim)},
+                )
+        except Exception:
+            pass
         gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
         dist.all_gather(gathered, tensor.contiguous(), group=group)
         return _packed_cp_restore(

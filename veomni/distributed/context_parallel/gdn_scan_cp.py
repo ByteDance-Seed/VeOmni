@@ -753,6 +753,23 @@ class _SerialSendFinalState(torch.autograd.Function):
                     "state_passing_serial: refusing to send non-finite S_final "
                     f"(cp_rank={cp_rank})"
                 )
+            try:
+                from .gdn_mem_probe import emit_comm_layer, mem_probe_enabled
+
+                if mem_probe_enabled():
+                    nbytes = int(payload.numel()) * int(payload.element_size())
+                    emit_comm_layer(
+                        impl="state_passing_serial",
+                        op="p2p_send_s_final",
+                        payload_bytes_local=nbytes,
+                        payload_bytes_total=nbytes,  # one hop; chain has (CP-1) hops
+                        shape=list(payload.shape),
+                        seq_len_local=None,
+                        depends_on_s=False,
+                        extra={"cp_rank": int(cp_rank), "cp_size": int(cp_size)},
+                    )
+            except Exception:
+                pass
             dist.send(payload, group_ranks[cp_rank + 1], group=group)
         return final_state
 

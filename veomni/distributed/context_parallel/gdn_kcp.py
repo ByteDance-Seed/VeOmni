@@ -25,6 +25,7 @@ validate P1 vs P0 with an independent tol (CP-C). Default ``gdn_cp_impl`` stays
 
 from __future__ import annotations
 
+import os
 from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
@@ -167,6 +168,23 @@ class _KcpAllGatherHm(torch.autograd.Function):
         ctx.cp_rank = int(cp_rank)
         if int(cp_size) <= 1:
             return local_hm.unsqueeze(0)
+        try:
+            from .gdn_mem_probe import emit_comm_layer, mem_probe_enabled
+
+            if mem_probe_enabled():
+                local_bytes = int(local_hm.numel()) * int(local_hm.element_size())
+                emit_comm_layer(
+                    impl="kcp",
+                    op="all_gather_hm",
+                    payload_bytes_local=local_bytes,
+                    payload_bytes_total=local_bytes * int(cp_size),
+                    shape=list(local_hm.shape),
+                    seq_len_local=None,  # hm has no S axis — INV-2
+                    depends_on_s=False,
+                    extra={"dtype": str(local_hm.dtype).replace("torch.", "")},
+                )
+        except Exception:
+            pass
         gathered = [torch.empty_like(local_hm) for _ in range(int(cp_size))]
         dist.all_gather(gathered, local_hm.contiguous(), group=group)
         return torch.stack(gathered, dim=0)
@@ -221,21 +239,20 @@ def resolve_kcp_initial_state(
             dtype=torch.float32,
         )
 
-    if int(cp_rank) < int(cp_size) - 1:
-        local_hm = local_affine_summary_recurrent(
-            key,
-            value,
-            g,
-            beta,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm=use_qk_l2norm,
-        )
+    # Opt-in probe only (VEOMNI_GDN_KCP_AFFINE_STUB=1, default off): skip O(S)
+    # eager token loop; keep correct hm shape so AG payload bytes still measure
+    # INV-2. Not for numerical gates / production (Mojo will replace the scan).
+    affine_stub = os.environ.get("VEOMNI_GDN_KCP_AFFINE_STUB", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if cu_seqlens is None:
+        n = int(key.shape[0])
     else:
-        # Shape probe without scan work.
-        if cu_seqlens is None:
-            n = int(key.shape[0])
-        else:
-            n = int(cu_seqlens.numel() - 1)
+        n = int(cu_seqlens.numel() - 1)
+    if affine_stub or int(cp_rank) >= int(cp_size) - 1:
         local_hm = torch.zeros(
             n,
             int(key.shape[2]),
@@ -243,6 +260,15 @@ def resolve_kcp_initial_state(
             v_dim + int(key.shape[3]),
             device=key.device,
             dtype=torch.float32,
+        )
+    else:
+        local_hm = local_affine_summary_recurrent(
+            key,
+            value,
+            g,
+            beta,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm=use_qk_l2norm,
         )
 
     ag_hm = all_gather_affine_hm(
