@@ -47,6 +47,7 @@ def build_ALL_OPS():
         ("_fused_moe_forward", moe._fused_moe_forward),
         ("_flash_attention_forward", attention.flash._flash_attention_forward),
         ("_flex_attention_forward", attention.flex._flex_attention_forward),
+        ("_magi_attention_forward", attention.magi._magi_attention_forward),
         ("_load_balancing_loss", load_balancing_loss._load_balancing_loss),
     ]
 

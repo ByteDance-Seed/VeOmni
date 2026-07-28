@@ -88,6 +88,8 @@ gpu = [
   "peft==0.18.1",
   "megatron-energon>=7.2.1",
   "hf_transfer",
+  "debugpy",
+  "magi-attention==1.1.1; sys_platform == 'linux'",
 ]
 
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
@@ -198,6 +200,7 @@ conflicts = [
 
 [tool.uv.sources]
 patchgen = { path = "patchgen-pkg", editable = true }
+magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 # Direct wheel URLs for gpu — pytorch index sometimes resolves cu128_full wheels
 # that drop nvidia-* deps and confuse uv into uninstalling them. Update both
 # Python versions and architectures when bumping torch.
@@ -280,10 +283,21 @@ name = "flash-qla"
 version = "0.1.0"
 requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
 
+[[tool.uv.dependency-metadata]]
+name = "magi-attention"
+version = "1.1.1"
+requires-dist = []
+
 # Seeds the build env (uv-created venvs are not seeded by default).
 [tool.uv.extra-build-dependencies]
 flash-attn-4 = ["setuptools", "wheel", "packaging", "ninja", "torch"]
 flash-qla = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+magi-attention = ["setuptools>=78.1.1", "wheel", "packaging>=24.2", "ninja", "torch", "versioningit"]
+
+[tool.uv.extra-build-variables]
+# MagiAttention v1.1.1 does not support magi_attn_comm or native FFA on
+# Ampere. Keep the core extension for the current A100 + CP=1/Ulysses path.
+magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}

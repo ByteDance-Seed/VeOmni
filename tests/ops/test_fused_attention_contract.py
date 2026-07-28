@@ -39,6 +39,7 @@ _FLASH_IMPLEMENTATIONS = (
     "veomni_flash_attention_4_with_sp",
 )
 _FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
+_MAGI_IMPLEMENTATION = "veomni_magi_attention_with_sp"
 
 
 class _FakeAttentionModule(nn.Module):
@@ -49,7 +50,11 @@ class _FakeAttentionModule(nn.Module):
 
 @pytest.mark.parametrize(
     "backend",
-    [veomni_attention.flash_attention_forward, veomni_attention.flex_attention_forward],
+    [
+        veomni_attention.flash_attention_forward,
+        veomni_attention.flex_attention_forward,
+        veomni_attention.magi_attention_forward,
+    ],
 )
 def test_fused_attention_forward_matches_backend_public_signatures(backend):
     fused_signature = inspect.signature(veomni_attention.fused_attention_forward)
@@ -78,7 +83,7 @@ def test_apply_veomni_attention_patch_registers_custom_facade_names(monkeypatch)
     veomni_attention.apply_veomni_attention_patch()
 
     assert patch_calls == ["hub_kernel_loader", "flex_mask_builder"]
-    for implementation in (*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION):
+    for implementation in (*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION, _MAGI_IMPLEMENTATION):
         assert ALL_ATTENTION_FUNCTIONS[implementation] is veomni_attention.fused_attention_forward
     assert ALL_ATTENTION_FUNCTIONS["flex_attention"] is hf_flex_attention_forward
 
@@ -172,7 +177,7 @@ def test_veomni_flex_attention_mask_builder_rejects_incomplete_ulysses_metadata(
         create_causal_mask(config, local_inputs_embeds, attention_mask, None)
 
 
-@pytest.mark.parametrize("implementation", [*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION])
+@pytest.mark.parametrize("implementation", [*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION, _MAGI_IMPLEMENTATION])
 def test_fused_attention_forward_dispatches_to_selected_adapter(monkeypatch, implementation):
     captured = {}
 
@@ -242,3 +247,11 @@ def test_veomni_ops_config_rewrites_flex_to_sp_aware_registration(monkeypatch):
     config = OpsImplementationConfig(attn_implementation="flex_attention")
 
     assert config.attn_implementation == _FLEX_IMPLEMENTATION
+
+
+def test_veomni_ops_config_rewrites_magi_to_sp_aware_registration(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+    config = OpsImplementationConfig(attn_implementation="magi_attention")
+
+    assert config.attn_implementation == _MAGI_IMPLEMENTATION

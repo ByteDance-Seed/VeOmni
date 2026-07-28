@@ -1,10 +1,10 @@
 # VeOmni Fused Attention Interface
 
-VeOmni registers sequence-parallel FlashAttention and FlexAttention adapters in
-Transformers' `ALL_ATTENTION_FUNCTIONS` registry. Models continue to select an
-attention implementation through `config._attn_implementation`; VeOmni's
-registered names all enter one model-facing facade and then dispatch to a
-backend-specific adapter.
+VeOmni registers sequence-parallel FlashAttention, FlexAttention, and
+MagiAttention FFA adapters in Transformers' `ALL_ATTENTION_FUNCTIONS`
+registry. Models continue to select an attention implementation through
+`config._attn_implementation`; VeOmni's registered names all enter one
+model-facing facade and then dispatch to a backend-specific adapter.
 
 ## Configuration
 
@@ -34,6 +34,7 @@ same way:
 | `flash_attention_3` | `veomni_flash_attention_3_with_sp` |
 | `flash_attention_4` | `veomni_flash_attention_4_with_sp` |
 | `flex_attention` | `veomni_flex_attention_with_sp` |
+| `magi_attention` | `veomni_magi_attention_with_sp` |
 
 The native Transformers `flex_attention` registry entry is left unchanged.
 Only the VeOmni-specific name routes through VeOmni's SP-aware facade.
@@ -47,18 +48,21 @@ ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
   -> fused_attention_forward(...)
        -> flash_attention_forward(...)
        -> flex_attention_forward(...)
+       -> magi_attention_forward(...)
 ```
 
 The facade resolves only VeOmni's private dispatch table; it does not look the
 name up in `ALL_ATTENTION_FUNCTIONS` again. This avoids recursive dispatch and
-keeps the Flash and Flex adapters independently testable.
+keeps the Flash, Flex, and Magi adapters independently testable.
 
 The backend compute functions are replaceable module-level slots:
 
 - `attention.flash._flash_attention_forward`, defaulting to Transformers'
   `_flash_attention_forward`;
 - `attention.flex._flex_attention_forward`, defaulting to Transformers'
-  `flex_attention_forward`.
+  `flex_attention_forward`;
+- `attention.magi._magi_attention_forward`, defaulting to a lazy import of
+  `magi_attention.api.flex_flash_attn_func`.
 
 All three public callables use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
@@ -77,6 +81,41 @@ does not use that integer metadata to reconstruct or alter visibility; the
 supplied BlockMask remains the sole mask authority. Calls without a native
 BlockMask are rejected. Dropout and remaining kernel validation are delegated
 to the pinned Transformers/PyTorch FlexAttention adapter.
+
+## MagiAttention mask and execution contract
+
+`magi_attention_forward` requires a caller-owned `MagiAttentionMask`:
+
+```python
+MagiAttentionMask(
+    q_ranges=...,       # int32 [num_ranges, 2]
+    k_ranges=...,       # int32 [num_ranges, 2]
+    attn_type_map=...,  # optional int32 [num_ranges]
+)
+```
+
+Query and key ranges are paired half-open token intervals. When
+`attn_type_map` is present, values mean `0=full`, `1=causal`,
+`2=inverse causal`, and `3=bidirectional causal`; `None` means full attention
+for every range. The mask constructor validates tensor structure and static
+range/type values once. The caller or model-specific mask builder must also
+ensure that every range endpoint is within the actual post-SP query/key
+sequence lengths. The tensors are then passed directly to MagiAttention's
+public non-distributed FFA API. The generic adapter does not infer ranges from
+dense masks or convert a FlexAttention `BlockMask`.
+
+The current adapter requires `cp_size == 1`, batch size 1, zero attention
+dropout, and NVIDIA SM90 or newer. It accepts SP1 or VeOmni Ulysses sequence
+parallelism, passes `scaling` as Magi's `softmax_scale`, and passes `softcap`.
+Standalone `sliding_window` metadata is rejected because all visibility must
+already be encoded by the range mask. MagiAttention's own FFA autograd
+implementation supplies backward; VeOmni does not add a custom autograd node.
+
+With Ulysses, the ranges describe the full sequence after the
+sequence-gather/head-scatter exchange and must be identical on every Ulysses
+rank. A future Magi Context Parallel implementation may reuse this mask
+carrier, but distributed dispatch/calc/undispatch and `cp_size > 1` are outside
+the current contract.
 
 ## Integrating a new patchgen model
 
@@ -123,7 +162,8 @@ the complete patchgen generation and drift-check workflow.
 
 ## Ulysses sequence parallelism
 
-When Ulysses is active, both backend adapters use the same transport helpers:
+When Ulysses is active, all three backend adapters use the same transport
+helpers:
 
 1. exchange local-sequence/global-head Q/K/V into
    full-sequence/local-head tensors;
@@ -132,7 +172,9 @@ When Ulysses is active, both backend adapters use the same transport helpers:
 
 The helpers preserve the existing FlashAttention GQA/KV-head repeat behavior.
 FlexAttention additionally restores its log-sum-exp tensor and slices a global
-one-dimensional `s_aux` tensor to the rank-local query heads.
+one-dimensional `s_aux` tensor to the rank-local query heads. MagiAttention
+restores the `[sequence, heads]` LSE returned by FFA to
+`[batch, heads, local_sequence]`.
 
 FlexAttention with Ulysses currently requires a head-broadcast BlockMask
 (`BlockMask.shape[1] == 1`). Local head indices restart at zero on every rank;

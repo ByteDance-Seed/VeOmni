@@ -123,7 +123,9 @@ def build_foundation_model(
             "flash_attention_3",
             "flash_attention_4",
             "flex_attention",
+            "magi_attention",
             "veomni_flex_attention_with_sp",
+            "veomni_magi_attention_with_sp",
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
             "veomni_flash_attention_4_with_sp",
@@ -231,6 +233,7 @@ def build_foundation_model(
 
     if attn_implementation not in (
         "veomni_flex_attention_with_sp",
+        "veomni_magi_attention_with_sp",
         "veomni_flash_attention_2_with_sp",
         "veomni_flash_attention_3_with_sp",
         "veomni_flash_attention_4_with_sp",
