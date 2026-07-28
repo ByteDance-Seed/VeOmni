@@ -674,6 +674,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             resolve_gdn_parallel_plan,
             scale_cp_repeated_parameter_grad,
         )
+        from veomni.distributed.context_parallel.gdn_kcp import resolve_kcp_initial_state
         from veomni.distributed.context_parallel.gdn_scan_cp import (
             align_gdn_varlen_for_mojo_gdr,
             apply_sample_bos_zero_s_init,
@@ -697,7 +698,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         gdn_head_parallel = gdn_plan.head_parallel_enabled
         gdn_cp_sequence = gdn_plan.cp_sequence_enabled
         gdn_impl = gdn_cp_impl_name(cp_size=gdn_plan.cp_size)
-        gdn_state_passing = gdn_cp_sequence and gdn_impl == GDN_CP_IMPL_STATE_PASSING_SERIAL
+        gdn_serial = gdn_cp_sequence and gdn_impl == GDN_CP_IMPL_STATE_PASSING_SERIAL
+        gdn_kcp = gdn_cp_sequence and gdn_impl == GDN_CP_IMPL_KCP
+        # serial + kcp share zigzag↔block + conv halo; only state resolve differs.
+        gdn_state_passing = gdn_serial or gdn_kcp
         gdn_gather_full = gdn_cp_sequence and not gdn_state_passing
         try:
             from veomni.distributed.context_parallel.gdn_mem_probe import (
@@ -721,10 +725,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 n = int(getattr(self, "_ai4se_mem_fwd", 0)) + 1
                 self._ai4se_mem_fwd = n
                 reset_mem_probe_step(n)
-        if gdn_cp_sequence and gdn_impl == GDN_CP_IMPL_KCP:
-            raise NotImplementedError(
-                "gdn_cp_impl=kcp is not implemented yet; use state_passing_serial or gather_full_replicated."
-            )
         if gdn_cp_sequence:
             log_gdn_cp_impl_once(cp_size=gdn_plan.cp_size)
         gdn_head_rank = gdn_plan.ulysses_rank if gdn_head_parallel else 0
@@ -985,29 +985,17 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             else:
                 gdn_cu = gdn_core_cu.npu() if hasattr(gdn_core_cu, "npu") else gdn_core_cu
                 if gdn_state_passing:
-                    state_template = make_gdn_state_template(query, value, cu_seqlens=gdn_core_cu)
-                    s_init = recv_serial_initial_state(
-                        cp_group=gdn_plan.cp_group,
-                        cp_size=gdn_plan.cp_size,
-                        cp_rank=gdn_plan.cp_rank,
-                        state_template=state_template,
-                    )
-                    # Fail-closed: sample BOS must not inherit previous-sample state.
-                    # Per-sample balanced CP ⇒ BOS only on cp_rank==0.
                     _bos = sample_bos_flags_for_per_sample_cp(
-                        num_seqs=int(state_template.shape[0]),
+                        num_seqs=int(
+                            (gdn_core_cu.numel() - 1)
+                            if gdn_core_cu is not None
+                            else query.shape[0]
+                        ),
                         cp_rank=gdn_plan.cp_rank,
-                    )
-                    s_init = apply_sample_bos_zero_s_init(s_init, sample_bos_on_rank=_bos)
-                    assert_serial_initial_state_contract(
-                        s_init,
-                        cp_rank=gdn_plan.cp_rank,
-                        sample_bos_on_rank=_bos,
-                        cu_seqlens=gdn_core_cu,
                     )
                     if not torch.isfinite(query).all() or not torch.isfinite(g).all():
                         raise RuntimeError(
-                            "state_passing_serial: non-finite q/g before GDR "
+                            f"{gdn_impl}: non-finite q/g before GDR "
                             f"(layer={self.layer_idx})"
                         )
                     # MR912 Mojo varlen wrapper refuses output_final_state when it
@@ -1023,22 +1011,79 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     ) = align_gdn_varlen_for_mojo_gdr(
                         query, key, value, g, beta, gdn_cu
                     )
-                    core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                        query_gdr,
-                        key_gdr,
-                        value_gdr,
-                        g=g_gdr,
-                        beta=beta_gdr,
-                        initial_state=s_init,
-                        output_final_state=True,
-                        use_qk_l2norm_in_kernel=True,
-                        cu_seqlens=gdn_cu_aligned,
-                    )
-                    core_attn_out = unpad_gdn_varlen_output(core_attn_out, gdr_unpad_index)
-                    if last_recurrent_state is None:
-                        raise RuntimeError(
-                            "state_passing_serial requires chunk_gated_delta_rule to return final_state."
+                    if gdn_kcp:
+                        # P1: local affine + AG{he,M} + prefix-merge (no serial P2P).
+                        s_init = resolve_kcp_initial_state(
+                            key_gdr,
+                            value_gdr,
+                            g_gdr,
+                            beta_gdr,
+                            cp_group=gdn_plan.cp_group,
+                            cp_size=gdn_plan.cp_size,
+                            cp_rank=gdn_plan.cp_rank,
+                            cu_seqlens=gdn_cu_aligned,
+                            use_qk_l2norm=True,
+                            sample_bos_on_rank=_bos,
                         )
+                        assert_serial_initial_state_contract(
+                            s_init,
+                            cp_rank=gdn_plan.cp_rank,
+                            sample_bos_on_rank=_bos,
+                            cu_seqlens=gdn_cu_aligned,
+                        )
+                        core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                            query_gdr,
+                            key_gdr,
+                            value_gdr,
+                            g=g_gdr,
+                            beta=beta_gdr,
+                            initial_state=s_init,
+                            output_final_state=False,
+                            use_qk_l2norm_in_kernel=True,
+                            cu_seqlens=gdn_cu_aligned,
+                        )
+                        core_attn_out = unpad_gdn_varlen_output(core_attn_out, gdr_unpad_index)
+                        _path = "kcp"
+                    else:
+                        state_template = make_gdn_state_template(
+                            query_gdr, value_gdr, cu_seqlens=gdn_cu_aligned
+                        )
+                        s_init = recv_serial_initial_state(
+                            cp_group=gdn_plan.cp_group,
+                            cp_size=gdn_plan.cp_size,
+                            cp_rank=gdn_plan.cp_rank,
+                            state_template=state_template,
+                        )
+                        s_init = apply_sample_bos_zero_s_init(s_init, sample_bos_on_rank=_bos)
+                        assert_serial_initial_state_contract(
+                            s_init,
+                            cp_rank=gdn_plan.cp_rank,
+                            sample_bos_on_rank=_bos,
+                            cu_seqlens=gdn_cu_aligned,
+                        )
+                        core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                            query_gdr,
+                            key_gdr,
+                            value_gdr,
+                            g=g_gdr,
+                            beta=beta_gdr,
+                            initial_state=s_init,
+                            output_final_state=True,
+                            use_qk_l2norm_in_kernel=True,
+                            cu_seqlens=gdn_cu_aligned,
+                        )
+                        core_attn_out = unpad_gdn_varlen_output(core_attn_out, gdr_unpad_index)
+                        if last_recurrent_state is None:
+                            raise RuntimeError(
+                                "state_passing_serial requires chunk_gated_delta_rule to return final_state."
+                            )
+                        last_recurrent_state = send_serial_final_state(
+                            last_recurrent_state,
+                            cp_group=gdn_plan.cp_group,
+                            cp_size=gdn_plan.cp_size,
+                            cp_rank=gdn_plan.cp_rank,
+                        )
+                        _path = "state_passing"
                     if mem_probe_enabled() and emit_mem_layer is not None:
                         emit_mem_layer(
                             "gdn_act_pre_gdr",
@@ -1051,23 +1096,14 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                                 "s_init": s_init,
                             },
                             layer_idx=int(getattr(self, "layer_idx", -1)),
-                            extra={"path": "state_passing"},
+                            extra={"path": _path},
                         )
                         emit_mem_layer(
                             "gdn_act_post_gdr",
-                            tensors={
-                                "core_attn_out": core_attn_out,
-                                "final_state": last_recurrent_state,
-                            },
+                            tensors={"core_attn_out": core_attn_out},
                             layer_idx=int(getattr(self, "layer_idx", -1)),
-                            extra={"path": "state_passing"},
+                            extra={"path": _path},
                         )
-                    last_recurrent_state = send_serial_final_state(
-                        last_recurrent_state,
-                        cp_group=gdn_plan.cp_group,
-                        cp_size=gdn_plan.cp_size,
-                        cp_rank=gdn_plan.cp_rank,
-                    )
                 else:
                     # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
                     if mem_probe_enabled() and emit_mem_layer is not None:
