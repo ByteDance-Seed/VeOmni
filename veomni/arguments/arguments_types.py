@@ -1331,6 +1331,24 @@ class DataloaderConfig:
         default=None,
         metadata={"help": "Per-worker torch thread count for dataloader subprocesses."},
     )
+    infinity: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "For worker-side dynamic batching, restart the upstream dataset iterator after exhaustion. "
+                "This option is used only when train.dyn_bsz=True and train.dyn_bsz_runtime='worker'."
+            )
+        },
+    )
+    infinity_padding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "For worker-side dynamic batching, emit padding micro batches after the upstream dataset and "
+                "buffer are exhausted. Training stops once all ranks emit only padding. Ignored when infinity=True."
+            )
+        },
+    )
     prefetch_factor: int = field(
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},

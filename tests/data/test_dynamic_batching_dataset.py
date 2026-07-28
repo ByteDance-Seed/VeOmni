@@ -628,8 +628,8 @@ def build_command(
         "--train.dyn_bsz_runtime=worker",
         f"--save_by_idx={str(save_by_idx).lower()}",
         f"--multi_sample_per_iteration={str(multi_sample_per_iteration).lower()}",
-        f"--infinity={str(infinity).lower()}",
-        f"--infinity_padding={str(infinity_padding).lower()}",
+        f"--data.dataloader.infinity={str(infinity).lower()}",
+        f"--data.dataloader.infinity_padding={str(infinity_padding).lower()}",
         "--train.seed=42",
         # Hardware-aware ops_implementation overrides; see test_datasets.py.
         *resolve_ops_overrides(None),
@@ -652,14 +652,12 @@ class TrainerTest(BaseTrainer):
         shuffle: bool,
         save_by_idx: bool,
         multi_sample_per_iteration: bool,
-        infinity: bool,
-        infinity_padding: bool,
     ):
         self.shuffle = shuffle
         self.save_by_idx = save_by_idx
         self.multi_sample_per_iteration = multi_sample_per_iteration
-        self.infinity = infinity
-        self.infinity_padding = infinity_padding
+        self.infinity = args.data.dataloader.infinity
+        self.infinity_padding = args.data.dataloader.infinity_padding
         self.saw_real_batch = False
         self.saw_padding_batch = False
         super().__init__(args)
@@ -715,8 +713,6 @@ class TrainerTest(BaseTrainer):
             dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             dyn_bsz_dataset_save_by_idx=self.save_by_idx,
-            infinity=self.infinity,
-            infinity_padding=self.infinity_padding,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
             **dataloader_kwargs,
@@ -871,8 +867,6 @@ def _main_distributed_test():
         _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--multi_sample_per_iteration", type=lambda x: x.lower() == "true", default=False)
-        _parser.add_argument("--infinity", type=lambda x: x.lower() == "true", default=False)
-        _parser.add_argument("--infinity_padding", type=lambda x: x.lower() == "true", default=False)
         test_args, remaining_argv = _parser.parse_known_args()
         sys.argv = [sys.argv[0]] + remaining_argv
 
@@ -882,8 +876,6 @@ def _main_distributed_test():
             shuffle=test_args.shuffle,
             save_by_idx=test_args.save_by_idx,
             multi_sample_per_iteration=test_args.multi_sample_per_iteration,
-            infinity=test_args.infinity,
-            infinity_padding=test_args.infinity_padding,
         )
         trainer.train()
         assert trainer.args.train.checkpoint.load_path is not None

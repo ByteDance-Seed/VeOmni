@@ -312,21 +312,25 @@ train_dataloader = build_dataloader(
     drop_last=args.data.dataloader.drop_last,  # dataloader drop last
     pin_memory=args.data.dataloader.pin_memory,  # dataloader pin memory
     prefetch_factor=args.data.dataloader.prefetch_factor, # dataloader prefetch factor
+    infinity=args.data.dataloader.infinity, # restart the source after exhaustion in worker-side dynamic batching
+    infinity_padding=args.data.dataloader.infinity_padding, # emit padding batches after worker exhaustion
     seed=args.train.seed, # random seed
     build_collate_fn=True,
     collate_fn_kwargs=collate_fn_kwargs, # kwargs for collate_fn
 )
 ```
 
-When worker-side dynamic batching is configured with `infinity=True`, exhausting
-the upstream dataset restarts its iterator without advancing the dataset epoch or
-calling `set_epoch()`. Consequently, epoch-seeded shufflers repeat the same
-permutation on every internal restart.
+When worker-side dynamic batching is configured with
+`data.dataloader.infinity=True`, exhausting the upstream dataset restarts its
+iterator without advancing the dataset epoch or calling `set_epoch()`.
+Consequently, epoch-seeded shufflers repeat the same permutation on every
+internal restart.
 
-When `infinity_padding=True`, each worker starts emitting padding batches after
-its upstream dataset is exhausted. These batches are excluded from loss weighting.
-The training loop stops once all ranks return only padding batches for the same
-training step.
+When `data.dataloader.infinity_padding=True`, each worker starts emitting padding
+batches after its upstream dataset is exhausted. These batches are excluded from
+loss weighting. The training loop stops once all ranks return only padding batches
+for the same training step. `infinity` takes precedence when both options are
+enabled.
 
 ### Collate Function
 VeOmni default supports a unified collate function for all tasks (text task, multimodal task, omni task, etc.) (source code: [veomni/data/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_collator.py)). The `MainCollator` handles: packing sequences, precompute position_ids & cu_seqlens & max_seqlens, and sequence parallel slice.
