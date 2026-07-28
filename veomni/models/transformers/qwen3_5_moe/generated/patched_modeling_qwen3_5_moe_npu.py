@@ -661,25 +661,93 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        # Modification: Ulysses / unified-SP all-to-all for linear attention heads.
-        # CP>1 uses unified SP + zigzag restore (not Ring). Ulysses-only unchanged.
+        # Modification: two-dimensional GDN parallelism.
+        # Ulysses shards heads; CP gathers/scatters sequence without changing heads.
         from veomni.distributed.context_parallel.gdn_sp import (
-            maybe_restore_canonical,
-            maybe_to_rank_major,
-            resolve_gdn_sp_group,
+            GDN_CP_IMPL_KCP,
+            GDN_CP_IMPL_STATE_PASSING_SERIAL,
+            cp_gather_sequence,
+            cp_scatter_sequence,
+            derive_gdn_local_cu_seqlens,
+            gdn_cp_impl_name,
+            log_gdn_cp_impl_once,
+            resolve_gdn_parallel_plan,
+            scale_cp_repeated_parameter_grad,
+        )
+        from veomni.distributed.context_parallel.gdn_scan_cp import (
+            align_gdn_varlen_for_mojo_gdr,
+            apply_sample_bos_zero_s_init,
+            assert_serial_initial_state_contract,
+            conv1d_halo_exchange_packed,
+            make_gdn_state_template,
+            recv_serial_initial_state,
+            repartition_block_to_zigzag_packed,
+            repartition_zigzag_to_block_packed,
+            sample_bos_flags_for_per_sample_cp,
+            send_serial_final_state,
+            trim_conv_halo_packed,
+            unpad_gdn_varlen_output,
+        )
+        from veomni.distributed.context_parallel.packed_sharding import (
+            reorder_sample_major_to_ulysses_rank_major,
+            reorder_ulysses_rank_major_to_sample_major,
         )
 
-        gdn_sp_group, gdn_sp_size, gdn_head_rank, gdn_need_zigzag = resolve_gdn_sp_group()
-        gdn_sp_enabled = gdn_sp_group is not None
-        cp_size_for_gdn = get_parallel_state().cp_size if gdn_need_zigzag else 1
-        if gdn_sp_enabled:
-            assert self.num_k_heads % gdn_sp_size == 0 and self.num_v_heads % gdn_sp_size == 0, (
-                f"SP size ({gdn_sp_size}) must divide num_k_heads ({self.num_k_heads}) "
-                f"and num_v_heads ({self.num_v_heads}) for gated deltanet LASP"
+        gdn_plan = resolve_gdn_parallel_plan()
+        gdn_head_parallel = gdn_plan.head_parallel_enabled
+        gdn_cp_sequence = gdn_plan.cp_sequence_enabled
+        gdn_impl = gdn_cp_impl_name(cp_size=gdn_plan.cp_size)
+        gdn_state_passing = gdn_cp_sequence and gdn_impl == GDN_CP_IMPL_STATE_PASSING_SERIAL
+        gdn_gather_full = gdn_cp_sequence and not gdn_state_passing
+        try:
+            from veomni.distributed.context_parallel.gdn_mem_probe import (
+                emit_mem_layer,
+                mem_probe_enabled,
+                mem_probe_set_context,
+                reset_mem_probe_step,
+            )
+        except Exception:  # pragma: no cover
+
+            def mem_probe_enabled() -> bool:  # type: ignore
+                return False
+
+            emit_mem_layer = None  # type: ignore
+            mem_probe_set_context = None  # type: ignore
+            reset_mem_probe_step = None  # type: ignore
+        if mem_probe_enabled():
+            if mem_probe_set_context is not None:
+                mem_probe_set_context(impl=str(gdn_impl))
+            if int(getattr(self, "layer_idx", 0) or 0) == 0 and reset_mem_probe_step is not None:
+                n = int(getattr(self, "_ai4se_mem_fwd", 0)) + 1
+                self._ai4se_mem_fwd = n
+                reset_mem_probe_step(n)
+        if gdn_cp_sequence and gdn_impl == GDN_CP_IMPL_KCP:
+            raise NotImplementedError(
+                "gdn_cp_impl=kcp is not implemented yet; use state_passing_serial or gather_full_replicated."
+            )
+        if gdn_cp_sequence:
+            log_gdn_cp_impl_once(cp_size=gdn_plan.cp_size)
+        gdn_head_rank = gdn_plan.ulysses_rank if gdn_head_parallel else 0
+        gdn_head_group = gdn_plan.ulysses_group if gdn_head_parallel else None
+        gdn_ulysses_local_cu = None
+        gdn_cp_local_cu = None
+        if gdn_cp_sequence:
+            if cu_seq_lens_q is None:
+                raise RuntimeError("CP-enabled packed GDN requires global cu_seq_lens_q metadata.")
+            gdn_ulysses_local_cu, gdn_cp_local_cu = derive_gdn_local_cu_seqlens(
+                cu_seq_lens_q,
+                ulysses_size=gdn_plan.ulysses_size,
+                cp_size=gdn_plan.cp_size,
+            )
+        if gdn_head_parallel:
+            assert self.num_k_heads % gdn_plan.ulysses_size == 0 and self.num_v_heads % gdn_plan.ulysses_size == 0, (
+                f"Ulysses size ({gdn_plan.ulysses_size}) must divide num_k_heads ({self.num_k_heads}) "
+                f"and num_v_heads ({self.num_v_heads}) for gated deltanet head parallel; "
+                f"CP size ({gdn_plan.cp_size}) is sequence-only"
             )
 
-            local_num_k_heads = self.num_k_heads // gdn_sp_size
-            local_num_v_heads = self.num_v_heads // gdn_sp_size
+            local_num_k_heads = self.num_k_heads // gdn_plan.ulysses_size
+            local_num_v_heads = self.num_v_heads // gdn_plan.ulysses_size
             local_key_dim = self.head_k_dim * local_num_k_heads
             local_value_dim = self.head_v_dim * local_num_v_heads
 
@@ -690,20 +758,46 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
             # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
-            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=gdn_sp_group)
-            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=gdn_sp_group)
-            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=gdn_sp_group)
+            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=gdn_head_group)
+            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=gdn_head_group)
+            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=gdn_head_group)
 
             b = b.reshape(batch_size, seq_len, self.num_v_heads)
             a = a.reshape(batch_size, seq_len, self.num_v_heads)
-            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=gdn_sp_group)
-            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=gdn_sp_group)
+            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=gdn_head_group)
+            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=gdn_head_group)
 
-            q_proj = maybe_restore_canonical(q_proj, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
-            k_proj = maybe_restore_canonical(k_proj, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
-            v_proj = maybe_restore_canonical(v_proj, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
-            b = maybe_restore_canonical(b, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
-            a = maybe_restore_canonical(a, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
+            if gdn_cp_sequence:
+                q_proj = reorder_ulysses_rank_major_to_sample_major(
+                    q_proj,
+                    gdn_ulysses_local_cu,
+                    ulysses_size=gdn_plan.ulysses_size,
+                    seq_dim=1,
+                )
+                k_proj = reorder_ulysses_rank_major_to_sample_major(
+                    k_proj,
+                    gdn_ulysses_local_cu,
+                    ulysses_size=gdn_plan.ulysses_size,
+                    seq_dim=1,
+                )
+                v_proj = reorder_ulysses_rank_major_to_sample_major(
+                    v_proj,
+                    gdn_ulysses_local_cu,
+                    ulysses_size=gdn_plan.ulysses_size,
+                    seq_dim=1,
+                )
+                b = reorder_ulysses_rank_major_to_sample_major(
+                    b,
+                    gdn_ulysses_local_cu,
+                    ulysses_size=gdn_plan.ulysses_size,
+                    seq_dim=1,
+                )
+                a = reorder_ulysses_rank_major_to_sample_major(
+                    a,
+                    gdn_ulysses_local_cu,
+                    ulysses_size=gdn_plan.ulysses_size,
+                    seq_dim=1,
+                )
 
             # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
             q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
@@ -715,7 +809,72 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             local_num_v_heads = self.num_v_heads
             local_key_dim = self.key_dim
             local_value_dim = self.value_dim
-            gdn_head_rank = 0
+            b = b.reshape(batch_size, seq_len, self.num_v_heads)
+            a = a.reshape(batch_size, seq_len, self.num_v_heads)
+
+        gdn_conv_cu = cu_seq_lens_q
+        gdn_core_cu = cu_seq_lens_q
+        if gdn_gather_full:
+            mixed_qkv = cp_gather_sequence(
+                mixed_qkv,
+                cp_group=gdn_plan.cp_group,
+                cp_size=gdn_plan.cp_size,
+                seq_dim=1,
+                cp_local_cu_seqlens=gdn_cp_local_cu,
+            )
+            b = cp_gather_sequence(
+                b,
+                cp_group=gdn_plan.cp_group,
+                cp_size=gdn_plan.cp_size,
+                seq_dim=1,
+                cp_local_cu_seqlens=gdn_cp_local_cu,
+            )
+            a = cp_gather_sequence(
+                a,
+                cp_group=gdn_plan.cp_group,
+                cp_size=gdn_plan.cp_size,
+                seq_dim=1,
+                cp_local_cu_seqlens=gdn_cp_local_cu,
+            )
+        elif gdn_state_passing:
+            # INV-5: zigzag→contiguous block permutation (still S/cp). Never gather S_full.
+            mixed_qkv = repartition_zigzag_to_block_packed(
+                mixed_qkv,
+                cp_local_cu_seqlens=gdn_cp_local_cu,
+                cp_group=gdn_plan.cp_group,
+                cp_size=gdn_plan.cp_size,
+                cp_rank=gdn_plan.cp_rank,
+                seq_dim=1,
+            )
+            b = repartition_zigzag_to_block_packed(
+                b,
+                cp_local_cu_seqlens=gdn_cp_local_cu,
+                cp_group=gdn_plan.cp_group,
+                cp_size=gdn_plan.cp_size,
+                cp_rank=gdn_plan.cp_rank,
+                seq_dim=1,
+            )
+            a = repartition_zigzag_to_block_packed(
+                a,
+                cp_local_cu_seqlens=gdn_cp_local_cu,
+                cp_group=gdn_plan.cp_group,
+                cp_size=gdn_plan.cp_size,
+                cp_rank=gdn_plan.cp_rank,
+                seq_dim=1,
+            )
+            gdn_conv_cu = gdn_cp_local_cu
+            gdn_core_cu = gdn_cp_local_cu
+
+        if mem_probe_enabled() and emit_mem_layer is not None:
+            emit_mem_layer(
+                "gdn_act_post_layout",
+                tensors={"mixed_qkv": mixed_qkv, "b": b, "a": a},
+                layer_idx=int(getattr(self, "layer_idx", -1)),
+                extra={
+                    "path": "state_passing" if gdn_state_passing else ("gather_full" if gdn_gather_full else "none"),
+                    "cp_size": int(gdn_plan.cp_size) if gdn_plan is not None else 1,
+                },
+            )
 
         if use_precomputed_states:
             # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
@@ -726,8 +885,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
                 cache_params.conv_states[self.layer_idx] = conv_state
             if self.causal_conv1d_fn is not None:
-                # Modification: shard conv1d weights per SP rank to match head-sharded channels.
-                if gdn_sp_enabled:
+                # Modification: shard conv1d weights per Ulysses rank.
+                if gdn_head_parallel:
                     conv_weight = self._get_local_conv1d_weight(
                         ulysses_rank=gdn_head_rank,
                         local_key_dim=local_key_dim,
@@ -735,16 +894,47 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     )
                 else:
                     conv_weight = self.conv1d.weight.squeeze(1)
-                # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
-                mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
-                    weight=conv_weight,
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    seq_idx=None,
-                    backend="triton",
-                    cu_seqlens=cu_seq_lens_q.npu(),
-                )[0]
+                if gdn_gather_full:
+                    conv_weight = scale_cp_repeated_parameter_grad(
+                        conv_weight,
+                        cp_size=gdn_plan.cp_size,
+                    )
+                if gdn_state_passing:
+                    mixed_qkv, gdn_conv_cu_halo = conv1d_halo_exchange_packed(
+                        mixed_qkv,
+                        cp_local_cu_seqlens=gdn_cp_local_cu,
+                        kernel_size=self.conv_kernel_size,
+                        cp_group=gdn_plan.cp_group,
+                        cp_size=gdn_plan.cp_size,
+                        cp_rank=gdn_plan.cp_rank,
+                        seq_dim=1,
+                    )
+                    mixed_qkv = self.causal_conv1d_fn(
+                        x=mixed_qkv,
+                        weight=conv_weight,
+                        bias=self.conv1d.bias,
+                        activation=self.activation,
+                        seq_idx=None,
+                        backend="triton",
+                        cu_seqlens=gdn_conv_cu_halo.npu() if hasattr(gdn_conv_cu_halo, "npu") else gdn_conv_cu_halo,
+                    )[0]
+                    mixed_qkv = trim_conv_halo_packed(
+                        mixed_qkv,
+                        cp_local_cu_seqlens_with_halo=gdn_conv_cu_halo,
+                        kernel_size=self.conv_kernel_size,
+                        seq_dim=1,
+                    )
+                else:
+                    # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
+                    mixed_qkv = self.causal_conv1d_fn(
+                        x=mixed_qkv,
+                        weight=conv_weight,
+                        bias=self.conv1d.bias,
+                        activation=self.activation,
+                        seq_idx=None,
+                        backend="triton",
+                        cu_seqlens=gdn_conv_cu.npu() if hasattr(gdn_conv_cu, "npu") else gdn_conv_cu,
+                    )[0]
             else:
                 raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
 
@@ -764,13 +954,19 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        # Modification: slice A_log/dt_bias for local V-heads under SP.
-        if gdn_sp_enabled:
+        # Modification: slice A_log/dt_bias for local V-heads under Ulysses.
+        if gdn_head_parallel:
             v_head_offset = gdn_head_rank * local_num_v_heads
             v_head_slice = slice(v_head_offset, v_head_offset + local_num_v_heads)
-            g = -self.A_log[v_head_slice].float().exp() * F.softplus(a.float() + self.dt_bias[v_head_slice])
+            a_log = self.A_log[v_head_slice]
+            dt_bias = self.dt_bias[v_head_slice]
         else:
-            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            a_log = self.A_log
+            dt_bias = self.dt_bias
+        if gdn_gather_full:
+            a_log = scale_cp_repeated_parameter_grad(a_log, cp_size=gdn_plan.cp_size)
+            dt_bias = scale_cp_repeated_parameter_grad(dt_bias, cp_size=gdn_plan.cp_size)
+        g = -a_log.float().exp() * F.softplus(a.float() + dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -783,21 +979,131 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
                     "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
                     "(and install flash-linear-attention) or 'flash_qla' (ships under the gpu extra, "
-                    "Hopper sm90 only) in OpsImplementationConfig."
+                    "Hopper sm90 only) in OpsImplementationConfig. "
+                    "On 910B4, bind chunk_gated_delta_rule_implementation='mojo'."
                 )
             else:
-                # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
-                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                    query,
-                    key,
-                    value,
-                    g=g,
-                    beta=beta,
-                    initial_state=None,
-                    output_final_state=cache_params is not None,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=cu_seq_lens_q.npu(),
-                )
+                gdn_cu = gdn_core_cu.npu() if hasattr(gdn_core_cu, "npu") else gdn_core_cu
+                if gdn_state_passing:
+                    state_template = make_gdn_state_template(query, value, cu_seqlens=gdn_core_cu)
+                    s_init = recv_serial_initial_state(
+                        cp_group=gdn_plan.cp_group,
+                        cp_size=gdn_plan.cp_size,
+                        cp_rank=gdn_plan.cp_rank,
+                        state_template=state_template,
+                    )
+                    # Fail-closed: sample BOS must not inherit previous-sample state.
+                    # Per-sample balanced CP ⇒ BOS only on cp_rank==0.
+                    _bos = sample_bos_flags_for_per_sample_cp(
+                        num_seqs=int(state_template.shape[0]),
+                        cp_rank=gdn_plan.cp_rank,
+                    )
+                    s_init = apply_sample_bos_zero_s_init(s_init, sample_bos_on_rank=_bos)
+                    assert_serial_initial_state_contract(
+                        s_init,
+                        cp_rank=gdn_plan.cp_rank,
+                        sample_bos_on_rank=_bos,
+                        cu_seqlens=gdn_core_cu,
+                    )
+                    if not torch.isfinite(query).all() or not torch.isfinite(g).all():
+                        raise RuntimeError(
+                            "state_passing_serial: non-finite q/g before GDR "
+                            f"(layer={self.layer_idx})"
+                        )
+                    # MR912 Mojo varlen wrapper refuses output_final_state when it
+                    # must internally pad to chunk=32. Pre-align so raw_gdr runs.
+                    (
+                        query_gdr,
+                        key_gdr,
+                        value_gdr,
+                        g_gdr,
+                        beta_gdr,
+                        gdn_cu_aligned,
+                        gdr_unpad_index,
+                    ) = align_gdn_varlen_for_mojo_gdr(
+                        query, key, value, g, beta, gdn_cu
+                    )
+                    core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                        query_gdr,
+                        key_gdr,
+                        value_gdr,
+                        g=g_gdr,
+                        beta=beta_gdr,
+                        initial_state=s_init,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=gdn_cu_aligned,
+                    )
+                    core_attn_out = unpad_gdn_varlen_output(core_attn_out, gdr_unpad_index)
+                    if last_recurrent_state is None:
+                        raise RuntimeError(
+                            "state_passing_serial requires chunk_gated_delta_rule to return final_state."
+                        )
+                    if mem_probe_enabled() and emit_mem_layer is not None:
+                        emit_mem_layer(
+                            "gdn_act_pre_gdr",
+                            tensors={
+                                "query": query_gdr,
+                                "key": key_gdr,
+                                "value": value_gdr,
+                                "g": g_gdr,
+                                "beta": beta_gdr,
+                                "s_init": s_init,
+                            },
+                            layer_idx=int(getattr(self, "layer_idx", -1)),
+                            extra={"path": "state_passing"},
+                        )
+                        emit_mem_layer(
+                            "gdn_act_post_gdr",
+                            tensors={
+                                "core_attn_out": core_attn_out,
+                                "final_state": last_recurrent_state,
+                            },
+                            layer_idx=int(getattr(self, "layer_idx", -1)),
+                            extra={"path": "state_passing"},
+                        )
+                    last_recurrent_state = send_serial_final_state(
+                        last_recurrent_state,
+                        cp_group=gdn_plan.cp_group,
+                        cp_size=gdn_plan.cp_size,
+                        cp_rank=gdn_plan.cp_rank,
+                    )
+                else:
+                    # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
+                    if mem_probe_enabled() and emit_mem_layer is not None:
+                        emit_mem_layer(
+                            "gdn_act_pre_gdr",
+                            tensors={
+                                "query": query,
+                                "key": key,
+                                "value": value,
+                                "g": g,
+                                "beta": beta,
+                            },
+                            layer_idx=int(getattr(self, "layer_idx", -1)),
+                            extra={"path": "gather_full" if gdn_gather_full else "dense"},
+                        )
+                    core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                        query,
+                        key,
+                        value,
+                        g=g,
+                        beta=beta,
+                        initial_state=None,
+                        output_final_state=cache_params is not None,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=gdn_cu,
+                    )
+                    if mem_probe_enabled() and emit_mem_layer is not None:
+                        emit_mem_layer(
+                            "gdn_act_post_gdr",
+                            tensors={
+                                "core_attn_out": core_attn_out,
+                                "final_state": last_recurrent_state,
+                            },
+                            layer_idx=int(getattr(self, "layer_idx", -1)),
+                            extra={"path": "gather_full" if gdn_gather_full else "dense"},
+                        )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
@@ -814,13 +1120,38 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
 
-        # Modification: gather attention output back to sequence-sharded layout before gated norm.
-        if gdn_sp_enabled:
-            core_attn_out = maybe_to_rank_major(
-                core_attn_out, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1
+        # Reverse CP layout before Ulysses restores full heads.
+        if gdn_gather_full:
+            core_attn_out = cp_scatter_sequence(
+                core_attn_out,
+                cp_group=gdn_plan.cp_group,
+                cp_size=gdn_plan.cp_size,
+                cp_rank=gdn_plan.cp_rank,
+                seq_dim=1,
+                cp_local_cu_seqlens=gdn_cp_local_cu,
             )
+        elif gdn_state_passing:
+            core_attn_out = repartition_block_to_zigzag_packed(
+                core_attn_out,
+                cp_local_cu_seqlens=gdn_cp_local_cu,
+                cp_group=gdn_plan.cp_group,
+                cp_size=gdn_plan.cp_size,
+                cp_rank=gdn_plan.cp_rank,
+                seq_dim=1,
+            )
+        if gdn_cp_sequence and gdn_head_parallel:
+            core_attn_out = reorder_sample_major_to_ulysses_rank_major(
+                core_attn_out,
+                gdn_ulysses_local_cu,
+                ulysses_size=gdn_plan.ulysses_size,
+                seq_dim=1,
+            )
+        if gdn_head_parallel:
             core_attn_out = gather_heads_scatter_seq(
-                core_attn_out, head_dim=2, seq_dim=1, group=gdn_sp_group
+                core_attn_out,
+                head_dim=2,
+                seq_dim=1,
+                group=gdn_head_group,
             )
 
         # reshape input data into 2D tensor
@@ -2382,7 +2713,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             if get_parallel_state().sp_enabled:
                 input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
                 dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-                input_ids = torch.cat(input_ids_list, dim=1)
+                input_ids = torch.cat(input_ids_list, dim=0)
             image_mask, video_mask = self.get_placeholder_mask(input_ids)
         # --- Patch.1 ---
 
