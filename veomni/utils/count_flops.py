@@ -23,6 +23,16 @@ logger = logging.get_logger(__name__)
 
 
 def get_device_flops(unit="T"):
+    """Peak dense BF16 FLOPS of the current device.
+
+    All entries follow one convention: SM count x per-SM dense BF16 FLOPs per clock
+    (2048 Ampere, 4096 Hopper, 8192 Blackwell) x tensor-core boost clock. NVIDIA
+    publishes that boost clock up to Hopper, so the datasheet numbers already match;
+    for Blackwell it is the clock the deployed part actually runs at (`nvidia-smi
+    --query-gpu=clocks.max.sm`), which is higher than the clock behind the datasheet.
+    H20 and 910B are throughput-capped SKUs the formula does not describe.
+    """
+
     def unit_convert(number, level):
         units = ["B", "K", "M", "G", "T", "P"]
         if number <= 0:
@@ -47,8 +57,10 @@ def get_device_flops(unit="T"):
         flops = 148e12
     elif "910B" in device_name or "910_93" in device_name:
         flops = 354e12
+    elif "GB200" in device_name:
+        flops = 2565e12
     elif "B200" in device_name:
-        flops = 2250e12
+        flops = 2382e12
     elif "GB300" in device_name:
         flops = 2500e12
     elif "B300" in device_name:
