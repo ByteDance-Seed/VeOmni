@@ -527,6 +527,7 @@ class DeepseekV4HCACompressor(nn.Module):
                 position_ids,
                 rate_metadata,
                 overlap=False,
+                apply_rope=apply_rotary_pos_emb,
             )
             compressed_kv = compressed.unsqueeze(1)
             candidates = CompressedCandidates(
@@ -679,6 +680,7 @@ class DeepseekV4Indexer(nn.Module):
                 position_ids,
                 rate_metadata,
                 overlap=True,
+                apply_rope=apply_rotary_pos_emb,
             )
             chunk_kv = chunk_gate = None
             first_window_position = 0
@@ -903,6 +905,7 @@ class DeepseekV4CSACompressor(nn.Module):
                 position_ids,
                 rate_metadata,
                 overlap=True,
+                apply_rope=apply_rotary_pos_emb,
             )
             compressed_kv = compressed.unsqueeze(1)
             top_k_indices = self.indexer(

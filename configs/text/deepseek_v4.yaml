@@ -12,7 +12,7 @@ model:
     mhc_implementation: tilelang
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel
-    rotary_pos_emb_implementation: eager
+    rotary_pos_emb_implementation: triton
 
 data:
   train_path: tulu-3-sft-mixture
