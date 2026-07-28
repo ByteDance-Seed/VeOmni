@@ -63,6 +63,8 @@ train:
     # Head-split Muon: heads per Newton-Schulz block (0 = full matrix), plus the
     # projections to split. q_b_proj benefits most: its [num_heads * qk_head_dim,
     # q_lora_rank] stack is rank-capped by q_lora_rank as a single matrix.
+    # The brackets below are YAML syntax; on the command line drop them and
+    # separate names with spaces: --train.optimizer.muon_head_split_modules q_b_proj
     # muon_head_group_size: 1
     # muon_head_split_modules: [q_b_proj]
     # MoE + EP: whole-expert Shard(0) when (num_experts/ep_size) % ep_fsdp_size == 0

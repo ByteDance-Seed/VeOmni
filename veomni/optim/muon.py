@@ -503,6 +503,11 @@ def _stacked_head_counts(rows: int, tiers: Sequence[Tuple[Sequence[int], Sequenc
     return matches
 
 
+def _is_splittable(param: Tensor) -> bool:
+    """Whether ``param`` is a trainable matrix, the only thing row blocks apply to."""
+    return param.ndim == 2 and param.requires_grad
+
+
 def infer_head_block_counts(
     model: "nn.Module",
     head_group_size: int,
@@ -514,9 +519,15 @@ def infer_head_block_counts(
     ``module_names`` of an attention module that declares both a head count and
     a per-head dim. ``head_group_size`` is the number of heads per block.
 
-    Returns only params that end up with >1 block; anything whose head layout
-    cannot be pinned down, or whose head count is not divisible by
-    ``head_group_size``, is skipped with a warning and stays on full-matrix Muon.
+    Returns only params that end up with >1 block. Every other listed param is
+    skipped with a warning and stays on full-matrix Muon: an unresolvable head
+    layout, a head count not divisible by ``head_group_size``, a group size that
+    covers every head, or a module owning no trainable matrix.
+
+    Raises when *no* listed name exists in the model: that is a config error
+    rather than a layout limit, and letting it through would train a full-matrix
+    run under a head-split label. A partial match is fine, so one list can cover
+    several architectures.
     """
     if head_group_size < 1:
         return {}
@@ -529,6 +540,8 @@ def infer_head_block_counts(
     allowed = set(module_names)
     blocks: Dict[str, int] = {}
     warned: set = set()
+    matched: set = set()
+    candidates: set = set()
 
     def _warn_once(key: Tuple[Any, ...], message: str) -> None:
         if key not in warned:
@@ -540,11 +553,25 @@ def infer_head_block_counts(
         head_counts, strides = tiers[-1]
         for child_name, child in module.named_children():
             if child_name not in allowed:
+                # Only suggest names that would really split at this group size.
+                for param in child.parameters(recurse=False):
+                    if _is_splittable(param):
+                        heads = _stacked_head_counts(int(param.shape[0]), tiers)
+                        if len(heads) == 1 and heads[0] % head_group_size == 0 and heads[0] > head_group_size:
+                            candidates.add(child_name)
                 continue
-            for param_name, param in child.named_parameters(recurse=False):
-                if param.ndim != 2 or not param.requires_grad:
-                    continue
-                fqn = ".".join(part for part in (module_name, child_name, param_name) if part)
+            matched.add(child_name)
+            child_fqn = ".".join(part for part in (module_name, child_name) if part)
+            splittable = [(name, p) for name, p in child.named_parameters(recurse=False) if _is_splittable(p)]
+            if not splittable:
+                _warn_once(
+                    (module.__class__.__name__, child_name, "no_matrix"),
+                    f"head split skipped for {child_fqn}: it owns no trainable 2D parameter (frozen, "
+                    "quantized, or wrapped so that the weight sits one level deeper, as under LoRA).",
+                )
+                continue
+            for param_name, param in splittable:
+                fqn = f"{child_fqn}.{param_name}"
                 if not head_counts or not strides:
                     _warn_once(
                         (module.__class__.__name__, child_name, "undeclared"),
@@ -571,8 +598,29 @@ def infer_head_block_counts(
                     )
                     continue
                 num_blocks = num_heads // head_group_size
-                if num_blocks > 1:
-                    blocks[fqn] = num_blocks
+                if num_blocks == 1:
+                    _warn_once(
+                        (child_name, num_heads, head_group_size, "single_block"),
+                        f"head split skipped for {fqn}: head_group_size={head_group_size} covers all "
+                        f"{num_heads} heads, so the single block is just full-matrix Muon.",
+                    )
+                    continue
+                blocks[fqn] = num_blocks
+
+    if not matched:
+        hint = ""
+        if any(name.startswith("[") or name.endswith("]") for name in allowed):
+            hint = (
+                " The names carry square brackets: that is YAML flow-sequence syntax, not part of the "
+                "module name. On the command line pass them unbracketed and space-separated, e.g. "
+                "--train.optimizer.muon_head_split_modules q_b_proj."
+            )
+        raise ValueError(
+            f"Head-split Muon found none of muon_head_split_modules={list(module_names)} in this model, "
+            f"so head_group_size={head_group_size} would silently leave every param on full-matrix Muon. "
+            f"Module names that would split at this group size: {sorted(candidates) or 'none'}. "
+            f"Set muon_head_group_size=0 to disable head splitting.{hint}"
+        )
 
     return blocks
 

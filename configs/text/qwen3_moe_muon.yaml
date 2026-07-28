@@ -52,6 +52,8 @@ train:
     # Head-split Muon: heads per Newton-Schulz block (0 = full matrix), plus the
     # projections to split. Qwen3's q_proj is only ~2x taller than wide and
     # k/v_proj are wide, so expect little effect; see docs/usage/basic_modules.md.
+    # The brackets below are YAML syntax; on the command line drop them and
+    # separate names with spaces: --train.optimizer.muon_head_split_modules q_proj k_proj v_proj
     # muon_head_group_size: 2
     # muon_head_split_modules: [q_proj, k_proj, v_proj]
     # Requires (num_experts / ep_size) % ep_fsdp_size == 0; otherwise falls back.

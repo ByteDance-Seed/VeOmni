@@ -187,3 +187,10 @@ Core files:
     - The model is only `to_empty()`-materialized; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
     - LoRA/PEFT must not set `skip_weights_load` (and the FSDP2 path raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
     - After DCP load, `empty_cache()` is called to reduce first-step NCCL OOM risk from allocator fragmentation on near-OOM MoE jobs.
+
+## Arguments
+
+27. **List arguments on the command line are space-separated and unbracketed**
+    - `_add_arguments_recursive()` in `veomni/arguments/parser.py` maps every `List[T]` field to `nargs="+"` with `type=T`, so `--train.optimizer.muon_head_split_modules [q_b_proj]` parses to the literal `['[q_b_proj]']`, not `['q_b_proj']`. `List[str]` accepts this silently; only numeric lists fail loudly on type conversion.
+    - YAML's `[a, b]` flow-sequence form is correct in config files and wrong on the command line. Since CLI overrides beat YAML, a correct config file can still be defeated by a copy-pasted CLI value. Unquoted brackets are also a shell glob character class.
+    - Consumers of name lists must therefore fail loudly when nothing matches: `infer_head_block_counts()` raises when no `muon_head_split_modules` entry exists in the model, because a silent full-matrix fallback mislabels the experiment. Warn only for real capability limits (unresolvable head layout, non-divisible head count), never for what is actually a typo.

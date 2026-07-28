@@ -577,9 +577,10 @@ def _build_muon_with_adamw(
             head_split_names.append(fqn)
         if not head_split_names:
             logger.warning_rank0(
-                f"[Muon] muon_head_group_size={head_group_size} matched no attention projection; "
-                f"every param stays on full-matrix Muon. Check muon_head_split_modules="
-                f"{list(head_split_modules)} against this architecture's attention module names."
+                f"[Muon] muon_head_group_size={head_group_size} matched muon_head_split_modules="
+                f"{list(head_split_modules)} but produced no split param, so every param stays on "
+                "full-matrix Muon. Each skipped projection has its own preceding [Muon] warning, unless "
+                "no_decay_modules / no_decay_params routed it to AdamW."
             )
 
     extra_parallel_aware = _should_build_extra_parallel_aware(model)

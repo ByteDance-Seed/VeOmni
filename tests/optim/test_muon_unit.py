@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import weakref
 from types import SimpleNamespace
 
@@ -91,6 +93,23 @@ def _attention_model(**kwargs) -> nn.Module:
     model.embed_tokens = nn.Embedding(8, 32)
     model.self_attn = _FakeAttention(**kwargs)
     return model
+
+
+@contextlib.contextmanager
+def _captured_muon_warnings():
+    """Collect ``[Muon]`` warnings; the veomni logger does not propagate to caplog."""
+    messages: list[str] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    logger, handler = logging.getLogger("veomni.optim.muon"), _Sink()
+    logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        logger.removeHandler(handler)
 
 
 def _head_split_muon(param: nn.Parameter, head_blocks: int, adjust_lr_fn=None, lr: float = 1.0) -> DistributedMuon:
@@ -526,6 +545,38 @@ class TestHeadSplitInference:
         with pytest.raises(ValueError, match="explicit list of attention projection module names"):
             infer_head_block_counts(_attention_model(), head_group_size=1, module_names=())
 
+    def test_module_list_matching_nothing_raises(self):
+        """A list that matches no module is a config error, not a full-matrix fallback."""
+        with pytest.raises(ValueError, match="found none of muon_head_split_modules") as excinfo:
+            infer_head_block_counts(_attention_model(), head_group_size=1, module_names=("wq_b",))
+        assert "'q_proj'" in str(excinfo.value)  # the candidate names are reported
+
+    def test_yaml_bracket_syntax_is_diagnosed(self):
+        """``--...muon_head_split_modules [q_b_proj]`` reaches us as one bracketed name."""
+        with pytest.raises(ValueError, match="square brackets"):
+            infer_head_block_counts(_attention_model(), head_group_size=1, module_names=("[q_proj]",))
+
+    def test_group_size_covering_all_heads_warns(self):
+        """A group size equal to the head count is a no-op, so it must not pass unremarked."""
+        with _captured_muon_warnings() as messages:
+            assert infer_head_block_counts(_attention_model(), head_group_size=8, module_names=("q_proj",)) == {}
+        assert any("single block is just full-matrix Muon" in m for m in messages)
+
+    def test_matched_module_without_trainable_matrix_warns(self):
+        """Frozen or wrapper-nested weights are a capability limit, not a config typo."""
+        model = _attention_model()
+        for name in _QKV_MODULES:
+            getattr(model.self_attn, name).weight.requires_grad_(False)
+
+        with _captured_muon_warnings() as messages:
+            assert infer_head_block_counts(model, head_group_size=1, module_names=_QKV_MODULES) == {}
+        assert any("owns no trainable 2D parameter" in m for m in messages)
+
+    def test_partial_match_is_accepted(self):
+        """One list may cover several architectures, so absent names alone are not fatal."""
+        blocks = infer_head_block_counts(_attention_model(), head_group_size=1, module_names=("q_proj", "q_b_proj"))
+        assert blocks == {"self_attn.q_proj.weight": 8}
+
     @pytest.mark.parametrize(
         "head_group_size, expected",
         [
@@ -720,6 +771,11 @@ class TestHeadSplitBuild:
     def test_group_size_without_module_list_raises(self):
         with pytest.raises(ValueError, match="requires muon_head_split_modules"):
             self._muon_groups_by_blocks(_attention_model(), head_group_size=1, head_split_modules=[])
+
+    def test_bracketed_module_list_raises_at_build_time(self):
+        """The CLI copy-paste bug must fail the build, not train as full-matrix Muon."""
+        with pytest.raises(ValueError, match="found none of muon_head_split_modules"):
+            self._muon_groups_by_blocks(_attention_model(), head_group_size=1, head_split_modules=["[q_proj]"])
 
     @pytest.mark.parametrize(
         "head_group_size, expected",

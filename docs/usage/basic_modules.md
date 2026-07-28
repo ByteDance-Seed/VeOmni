@@ -27,6 +27,15 @@
         --train.wandb.name your_experiment_name
     ```
 
+    List-valued arguments take **space-separated values without brackets**. The
+    YAML flow-sequence form is not command-line syntax: `[q_proj, k_proj]` is
+    parsed as the literal string elements `['[q_proj,', 'k_proj]']`, and bare
+    brackets are also a glob character class in an unquoted shell expansion.
+    ```bash
+    # YAML: muon_head_split_modules: [q_proj, k_proj]
+    --train.optimizer.muon_head_split_modules q_proj k_proj
+    ```
+
 ## Arguments
 **Default Parameter Access**:  
 VeOmni offers a unified argument management system, which can be easily extended to support custom arguments. About the default arguments explanation, you can refer to the [Config arguments Explanation](arguments.md). A basic argument example is defined in [`arguments_types.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/arguments/arguments_types.py).
@@ -414,7 +423,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
 | `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
 | `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
-| `muon_head_split_modules` | `[]` | Leaf module names to head-split, matched exactly against the children of an attention module. **Required** when `muon_head_group_size >= 1`; there is no default list. |
+| `muon_head_split_modules` | `[]` | Leaf module names to head-split, matched exactly against the children of an attention module. **Required** when `muon_head_group_size >= 1`; there is no default list. A list that matches nothing raises; a name that matches but cannot be split warns and falls back to full-matrix Muon. |
 
 On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `expert_zero_comm`). Whether zero-comm sharding actually activated is logged separately as `[muon_expert_zero_comm]` during parallelize.
 
@@ -434,6 +443,15 @@ train:
     type: muon
     muon_head_group_size: 1            # heads per block
     muon_head_split_modules: [q_b_proj]  # which projections to split
+```
+
+Overriding this from the command line needs the unbracketed form — the brackets
+above are YAML syntax, and copying them into a launch script yields the module
+name `[q_b_proj]`, which matches nothing:
+
+```bash
+--train.optimizer.muon_head_group_size 1 \
+--train.optimizer.muon_head_split_modules q_b_proj
 ```
 
 Whether this helps depends on the shape of the stacked matrix:
@@ -471,6 +489,12 @@ Mechanics worth knowing when running an A/B:
   `head_dim`/`qk_head_dim`, module attributes before config). MLA sets
   `config.head_dim` to the rope part only, so `rows // head_dim` would cut each
   head into pieces. Anything that cannot be resolved is skipped with a warning.
+- A name that matches **no** module is treated as a config error and raises,
+  because the update math would silently be full-matrix Muon under a head-split
+  label. Names that do match but whose layout cannot be validated only warn —
+  that is a capability limit, not a typo. Partial matches are fine, so a single
+  list may cover several architectures; use `muon_head_group_size: 0` to turn
+  head splitting off.
 - Params are grouped by block count into separate Muon param groups. With the
   option off, the optimizer state dict is unchanged, so existing checkpoints
   resume as before. Turning it on adds one `head_blocks` entry per split param;
