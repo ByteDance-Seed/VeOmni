@@ -21,16 +21,10 @@ from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import GetCnt, apply_async_activation_offload, get_offload_modules
 
 
-def test_offload_config_requires_modules_when_async_enabled():
-    with pytest.raises(ValueError, match="activation_offload_modules"):
-        OffloadConfig(enable_async_activation=True)
-
-    cfg = OffloadConfig(
-        enable_async_activation=True,
-        activation_offload_modules=["model.layers.{*}"],
-    )
+def test_offload_config_allows_no_modules_for_auto_discovery():
+    cfg = OffloadConfig(enable_async_activation=True)
     assert cfg.enable_async_activation is True
-    assert cfg.activation_offload_modules == ["model.layers.{*}"]
+    assert cfg.activation_offload_modules == []
 
 
 def test_offload_config_rejects_sync_and_async_activation_together():
@@ -94,3 +88,37 @@ def test_apply_async_activation_offload_rejects_unmatched_patterns():
 
     with pytest.raises(ValueError, match="did not match any model modules"):
         apply_async_activation_offload(model, ["model.layers.{*}"])
+
+
+def test_apply_async_activation_offload_auto_discovers_no_split_modules():
+    class DecoderLayer(nn.Module):
+        pass
+
+    class Toy(nn.Module):
+        _no_split_modules = ["DecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([DecoderLayer(), DecoderLayer()])
+
+    model = Toy()
+    apply_async_activation_offload(model, [])
+
+    assert [layer._veomni_offload_layer_idx for layer in model.layers] == [0, 1]
+    assert all(layer._veomni_offload_depth == 2 for layer in model.layers)
+
+
+@pytest.mark.parametrize(
+    "no_split_modules, error_match",
+    [
+        (None, "requires model._no_split_modules"),
+        (["MissingDecoderLayer"], "did not match any modules"),
+    ],
+)
+def test_apply_async_activation_offload_auto_discovery_fails_closed(no_split_modules, error_match):
+    model = nn.Sequential(nn.Linear(4, 4))
+    if no_split_modules is not None:
+        model._no_split_modules = no_split_modules
+
+    with pytest.raises(ValueError, match=error_match):
+        apply_async_activation_offload(model, [])

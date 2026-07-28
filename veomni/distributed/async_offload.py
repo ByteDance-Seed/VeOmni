@@ -325,6 +325,32 @@ def get_offload_modules(model, plan: List[str]):
     return matched_submodules
 
 
+def _get_no_split_offload_modules(model):
+    target_classes = set(getattr(model, "_no_split_modules", None) or [])
+    if not target_classes:
+        raise ValueError(
+            "Async activation offload auto-discovery requires model._no_split_modules when "
+            "activation_offload_modules is empty."
+        )
+
+    matched_submodules = [
+        [name, module, layer_idx, 0]
+        for layer_idx, (name, module) in enumerate(
+            (item for item in model.named_modules() if type(item[1]).__name__ in target_classes)
+        )
+    ]
+    if not matched_submodules:
+        raise ValueError(
+            "Async activation offload did not match any modules listed in model._no_split_modules: "
+            f"{sorted(target_classes)!r}"
+        )
+
+    depth = len(matched_submodules)
+    for matched_submodule in matched_submodules:
+        matched_submodule[-1] = depth
+    return matched_submodules
+
+
 def async_offload_modules(modules, prefetch=True, hidden_states_idx=0):
     """Apply async activation offload via class-level ``__call__`` patching.
 
@@ -446,9 +472,12 @@ def apply_async_activation_offload(model, activation_offload_modules: List[str])
       - Without GC: async offload intercepts hidden_states directly,
         intermediate activations stay on GPU.
     """
-    if not activation_offload_modules:
-        return
-    matched_modules = get_offload_modules(model, activation_offload_modules)
-    if not matched_modules:
-        raise ValueError(f"activation_offload_modules did not match any model modules: {activation_offload_modules!r}")
+    if activation_offload_modules:
+        matched_modules = get_offload_modules(model, activation_offload_modules)
+        if not matched_modules:
+            raise ValueError(
+                f"activation_offload_modules did not match any model modules: {activation_offload_modules!r}"
+            )
+    else:
+        matched_modules = _get_no_split_offload_modules(model)
     async_offload_modules(matched_modules)

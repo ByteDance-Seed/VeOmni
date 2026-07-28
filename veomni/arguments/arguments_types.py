@@ -466,7 +466,8 @@ class OffloadConfig:
             "help": (
                 "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
                 "More efficient than synchronous offload. Mutually exclusive with "
-                "`enable_activation`. Requires specifying `activation_offload_modules`."
+                "`enable_activation`. Uses `model._no_split_modules` when "
+                "`activation_offload_modules` is empty."
             )
         },
     )
@@ -487,13 +488,6 @@ class OffloadConfig:
                 "enable_activation and enable_async_activation are mutually exclusive; "
                 "select exactly one activation offload mode."
             )
-        if self.enable_async_activation and not self.activation_offload_modules:
-            raise ValueError(
-                "enable_async_activation requires at least one entry in "
-                "activation_offload_modules (e.g. ['model.layers.{*}'])."
-            )
-
-
 @dataclass
 class AcceleratorConfig:
     """train.accelerator.* — Parallelism and distributed-training topology."""
