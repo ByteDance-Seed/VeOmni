@@ -157,10 +157,23 @@ link, key changes, review verdict).
   the bot can reach, e.g. `LARK_NOTIFY_RECEIVER` (an `open_id` / `user_id` /
   `email` / `chat_id`) — the maintainer must have opened a chat with the bot or
   be in a shared group for DMs to deliver.
-- **How to send:** first `Read` `~/.agents/skills/lark-im/SKILL.md` and
-  `~/.agents/skills/lark-shared/SKILL.md`, then use `lark-cli im +messages-send`
-  (bot identity is the default). Use `lark-cli im +chat-search` to resolve a
-  `chat_id` when only a group name is known. Verify wiring with
-  `lark-cli doctor --offline` (`config_file` must be `pass`).
+- **How to send (verified):** first `Read` `~/.agents/skills/lark-im/SKILL.md` and
+  `~/.agents/skills/lark-shared/SKILL.md`. Self-check with `lark-cli doctor`
+  (`bot_identity` must be `pass` / `ok: true`) — if it fails, the secrets are
+  wrong (see below). Then send with the bot identity, e.g. to a group chat:
+
+  ```bash
+  lark-cli im +messages-send --as bot --chat-id "$LARK_NOTIFY_RECEIVER" \
+    --markdown "**PR review summary** ...markdown here..."
+  ```
+
+  Use `--chat-id` for an `oc_...` value and `--user-id` for an `ou_...` value
+  (do NOT also pass `--msg-type`; `--markdown` auto-infers `post`). Discover the
+  target group with `lark-cli im +chat-list --as bot` (the review bot lives in
+  the **Open-VeOmni-PR-Review** group).
+- **Verified config:** `LARK_BRAND` must be **`feishu`** (this app lives on
+  `open.feishu.cn`; `lark`/larksuite.com returns `invalid_client`). The four
+  Lark secrets are DISTINCT values — do not reuse the `cli_...` App ID for the
+  App Secret or the receiver.
 - **Gotcha:** `npm i -g` needs the user prefix `~/.npm-global` (set in
   `~/.npmrc`); the setup script exports it so it never hits `EACCES`.
