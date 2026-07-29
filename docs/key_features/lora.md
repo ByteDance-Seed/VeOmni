@@ -492,7 +492,7 @@ Config: [`configs/text/qwen3_moe_lora.yaml`](../../configs/text/qwen3_moe_lora.y
 
 ```yaml
 model:
-  model_path: Qwen3-30B-A3B-merge
+  model_path: Qwen3-30B-A3B
   ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: eager           # EP (ep_size > 1) REQUIRES fused_triton

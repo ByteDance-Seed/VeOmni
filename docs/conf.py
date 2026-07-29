@@ -2,7 +2,7 @@ import os
 import sys
 
 
-sys.path.insert(0, os.path.abspath("../.."))
+sys.path.insert(0, os.path.abspath(".."))
 
 # -- Project information -----------------------------------------------------
 version_file = "../veomni/_version.py"
@@ -32,7 +32,7 @@ master_doc = "index"
 
 language = "en"
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "README.md", "Thumbs.db", ".DS_Store"]
 
 pygments_style = "sphinx"
 
@@ -43,9 +43,13 @@ extensions = [
     "sphinx.ext.viewcode",
 ]
 
+autosectionlabel_prefix_document = True
+autosectionlabel_maxdepth = 2
+myst_heading_anchors = 4
+
 html_theme = "sphinx_book_theme"
 
-html_static_path = ["_static"]
+html_static_path = []
 html_logo = "./assets/logo.png"
 html_favicon = "./assets/icon.ico"
 html_theme_options = {
