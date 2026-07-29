@@ -28,9 +28,10 @@
     ```
 
     List-valued arguments take **space-separated values without brackets**. The
-    YAML flow-sequence form is not command-line syntax: `[q_proj, k_proj]` is
-    parsed as the literal string elements `['[q_proj,', 'k_proj]']`, and bare
-    brackets are also a glob character class in an unquoted shell expansion.
+    YAML flow-sequence form is not command-line syntax: `[q_proj, k_proj]` would
+    parse as the literal string elements `['[q_proj,', 'k_proj]']`, and bare
+    brackets are also a glob character class in an unquoted shell expansion. The
+    parser rejects bracketed list values rather than accepting them literally.
     ```bash
     # YAML: muon_head_split_modules: [q_proj, k_proj]
     --train.optimizer.muon_head_split_modules q_proj k_proj
@@ -446,8 +447,8 @@ train:
 ```
 
 Overriding this from the command line needs the unbracketed form — the brackets
-above are YAML syntax, and copying them into a launch script yields the module
-name `[q_b_proj]`, which matches nothing:
+above are YAML syntax, and copying them into a launch script is rejected by the
+argument parser:
 
 ```bash
 --train.optimizer.muon_head_group_size 1 \

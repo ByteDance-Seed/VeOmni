@@ -190,6 +190,7 @@ jobs:
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
+          uv run --frozen pytest -v -s -x tests/utils/test_arguments_parser.py
       - name: Run LoRA save/load test
         # peft ships under the `npu` extra, so the earlier
         # `uv sync --extra npu --group dev` step already installs it — no extra

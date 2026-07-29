@@ -17,7 +17,7 @@ import dataclasses
 import os
 from dataclasses import asdict, is_dataclass
 from enum import Enum
-from typing import Any, Dict, Literal, Type, TypeVar, Union, get_type_hints
+from typing import Any, Callable, Dict, Literal, Sequence, Type, TypeVar, Union, get_type_hints
 
 import yaml
 
@@ -44,6 +44,52 @@ def _string_to_bool(value: Union[bool, str]) -> bool:
     if value.lower() in ("no", "false", "f", "n", "0"):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def _is_pasted_yaml_sequence(values: Sequence[str]) -> bool:
+    """Whether a ``nargs="+"`` group is a YAML flow sequence copied from a config.
+
+    ``[a, b]`` reaches argparse as ``['[a,', 'b]']``, keeping both the wrapping
+    brackets and the separators. Requiring the separators too is what tells a
+    paste apart from values that merely contain brackets, such as the glob
+    ``data/part-[0-9]`` or the character class ``[qk]_proj``.
+    """
+    if not values or not values[0].startswith("[") or not values[-1].endswith("]"):
+        return False
+    return all(value.endswith(",") for value in values[:-1])
+
+
+class _ListArgumentAction(argparse.Action):
+    """Convert list elements, rejecting YAML list syntax on the command line.
+
+    ``nargs="+"`` consumes space-separated values, so a flow sequence or a
+    comma-joined value would land in a ``List[str]`` as literal element names --
+    silently, since any string is a valid element.
+    """
+
+    def __init__(self, *args: Any, item_type: Callable[[str], Any] = str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._item_type = item_type
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        flag = option_string or f"--{self.dest}"
+        if _is_pasted_yaml_sequence(values):
+            raise argparse.ArgumentError(
+                self,
+                f"{' '.join(values)!r} is YAML list syntax, not a command-line value. Pass the elements "
+                f"space-separated and unbracketed ({flag} first second); an empty list needs a config file",
+            )
+        converted = []
+        for value in values:
+            if "," in value:
+                raise argparse.ArgumentError(
+                    self, f"{value!r} contains a comma; list elements are separated by spaces, not commas"
+                )
+            try:
+                converted.append(self._item_type(value))
+            except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:
+                raise argparse.ArgumentError(self, f"invalid value {value!r}: {exc}") from exc
+        setattr(namespace, self.dest, converted)
 
 
 def _deep_update(source: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
@@ -98,9 +144,11 @@ def _add_arguments_recursive(parser: argparse.ArgumentParser, cls: Type[Any], pr
                 kwargs["nargs"] = "+"
                 list_item_type = field_type.__args__[0]
                 if list_item_type is bool:
-                    kwargs["type"] = _string_to_bool
-                else:
-                    kwargs["type"] = list_item_type
+                    list_item_type = _string_to_bool
+                # The action converts elements itself, so ``type`` stays unset:
+                # argparse applies ``type`` before the action can see the group.
+                kwargs["action"] = _ListArgumentAction
+                kwargs["item_type"] = list_item_type
             elif hasattr(field_type, "__origin__") and field_type.__origin__ is Literal:
                 kwargs["choices"] = list(field_type.__args__)
                 kwargs["type"] = type(field_type.__args__[0])

@@ -552,7 +552,7 @@ class TestHeadSplitInference:
         assert "'q_proj'" in str(excinfo.value)  # the candidate names are reported
 
     def test_yaml_bracket_syntax_is_diagnosed(self):
-        """``--...muon_head_split_modules [q_b_proj]`` reaches us as one bracketed name."""
+        """Defense in depth: the CLI parser rejects this, a quoted YAML value still reaches us."""
         with pytest.raises(ValueError, match="square brackets"):
             infer_head_block_counts(_attention_model(), head_group_size=1, module_names=("[q_proj]",))
 
