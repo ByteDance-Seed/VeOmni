@@ -177,3 +177,30 @@ link, key changes, review verdict).
   App Secret or the receiver.
 - **Gotcha:** `npm i -g` needs the user prefix `~/.npm-global` (set in
   `~/.npmrc`); the setup script exports it so it never hits `EACCES`.
+
+**Review-task flow (self-contained — works even on PR branches predating this
+doc):** on a review task, after posting the GitHub review comment, send a group
+summary. This does not rely on any repo file:
+
+1. Self-check: `lark-cli doctor`. If `bot_identity` is not `pass`, configure from
+   the injected secrets first:
+
+   ```bash
+   printf '%s' "$LARK_APP_SECRET" | lark-cli config init \
+     --app-id "$LARK_APP_ID" --app-secret-stdin --brand feishu
+   lark-cli config default-as bot
+   ```
+
+2. Send to the review group — the `$LARK_NOTIFY_RECEIVER` secret holds its
+   `oc_...` chat id (the **Open-VeOmni-PR-Review** group; discover via
+   `lark-cli im +chat-list --as bot` if unset). Use `--markdown`, no `--msg-type`:
+
+   ```bash
+   lark-cli im +messages-send --as bot --chat-id "$LARK_NOTIFY_RECEIVER" \
+     --markdown "<PR #, title, author, branch, link; one line per review
+     criterion (solves-problem / comments-docs-tests / cleanliness-conflicts);
+     overall verdict + 1-3 key issues>"
+   ```
+
+3. Confirm the response is `"ok": true`; if not, surface the error rather than
+   skipping silently.
