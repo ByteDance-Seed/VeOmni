@@ -1,0 +1,63 @@
+model:
+  model_path: Wan-AI/Wan2___2-TI2V-5B-Diffusers/transformer
+  condition_model_path: Wan-AI/Wan2___2-TI2V-5B-Diffusers
+  config_path: VeOmni/configs/model_configs/wan/wan2.2_i2v_5b.json
+
+ops_implementation:
+  rotary_pos_emb_implementation: eager
+  rms_norm_implementation: eager
+  swiglu_mlp_implementation: eager
+  cross_entropy_loss_implementation: eager
+  load_balancing_loss_implementation: eager
+  moe_implementation: eager
+
+data:
+  train_path: /home/d00897185/Tom-and-Jerry-VideoGeneration-Dataset-parquet
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  mm_configs:
+    fps: 1
+    max_frames: 33
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  dyn_bsz: false
+  init_device: meta
+  num_train_epochs: 10
+  training_task: online_training
+
+  gradient_checkpointing:
+    enable: true
+    debug: false
+
+accelerator:
+  ulysses_size: 1
+  fsdp_config:
+    fsdp_mode: fsdp2
+
+mixed_precision:
+  enable: true
+  param_dtype: bfloat16
+  reduce_dtype: bfloat16
+  buffer_dtype: bfloat16
+
+checkpoint:
+  output_dir: Wan2.2-I2V-5B
+
+train.checkpoint:
+  save_hf_weights: true
+
+optimizer:
+  type: adamw
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.007
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+wandb:
+  enable: false
+  project: veomni_dit
+  name: Wan2.2-I2V-5B

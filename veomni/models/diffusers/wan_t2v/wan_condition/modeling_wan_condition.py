@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from typing import Any
 
 import torch
@@ -12,14 +11,10 @@ from transformers import AutoTokenizer, PreTrainedModel, UMT5EncoderModel
 
 from .....distributed.parallel_state import get_parallel_state
 from .....utils import logging
-from .....utils.device import get_device_type
 from .configuration_wan_condition import WanTransformer3DConditionModelConfig
-
 
 logger = logging.get_logger(__name__)
 
-
-# T2V only
 class WanTransformer3DConditionModel(PreTrainedModel):
     config_class = WanTransformer3DConditionModelConfig
     supports_gradient_checkpointing = False
@@ -99,12 +94,18 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         return posterior.parameters
 
     def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        latents_mean = torch.tensor(self.vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        )
-        latents_std = torch.tensor(self.vae.config.latents_std, device=latents.device, dtype=latents.dtype).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        )
+        latents_mean = torch.tensor(
+            self.vae.config.latents_mean,
+            device=latents.device,
+            dtype=latents.dtype
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
+
+        latents_std = torch.tensor(
+            self.vae.config.latents_std,
+            device=latents.device,
+            dtype=latents.dtype
+        ).view(1, self.vae.config.z_dim, 1, 1, 1)
+
         return (latents - latents_mean) / latents_std
 
     @torch.no_grad()
@@ -125,7 +126,7 @@ class WanTransformer3DConditionModel(PreTrainedModel):
         )  # bs, seqlen, dim
         context_list = [u.unsqueeze(0) for u in prompt_embeds]
 
-        latents_list: list[list[torch.Tensor]] = []
+        latents_list: list[torch.Tensor] = []
         for sample_videos in videos:
             assert len(sample_videos) == 1, "Only one video per sample is supported for T2V"
             latents_list.append(self._encode_video_to_latents(sample_videos[0]))  # 1, c, f, h, w
@@ -145,8 +146,8 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             "latents": [],
         }
         for sample_latents, sample_context in zip(latents, context):
-            latents = DiagonalGaussianDistribution(sample_latents).mode()
-            latents = self._normalize_latents(latents).to(self.generator.device)
+            norm_latents = DiagonalGaussianDistribution(sample_latents).mode()
+            norm_latents = self._normalize_latents(norm_latents)
             noise = torch.randn(  # TODO: use randn_like(generator=self.generator) when updating to torch 2.10.0
                 latents.shape, dtype=latents.dtype, device=self.generator.device, generator=self.generator
             ).to(self.generator.device)
@@ -169,10 +170,60 @@ class WanTransformer3DConditionModel(PreTrainedModel):
             else:
                 sample_context = sample_context.to(latents.device)
 
-            packed_conditions["hidden_states"].append(noisy_latents)
+            if self.config.expand_timesteps:
+                # Wan2.2 I2V: flow-matching blend with position-dependent timesteps.
+                # First frame uses clean latent as condition (t=0);
+                # other frames use noisy latent at the sampled timestep.
+                condition = norm_latents[:, :, 0:1, :, :]
+                num_frames = norm_latents.shape[2]
+                latent_h = norm_latents.shape[3]
+                latent_w = norm_latents.shape[4]
+                first_frame_mask = torch.ones(
+                    1,
+                    1,
+                    num_frames,
+                    latent_h,
+                    latent_w,
+                    dtype=norm_latents.dtype,
+                    device=norm_latents.device,
+                )
+                first_frame_mask[:, :, 0] = 0
+
+                hidden_states = (1 - first_frame_mask) * condition + first_frame_mask * noisy_latents
+
+                # First frame has t=0 (clean condition). The correct velocity
+                # target at t=0 is zero because the flow has not started.
+                # Setting target=0 at frame 0 prevents the model from learning
+                # spurious outputs that corrupt other frames through attention.
+                training_target[:, :, 0, :, :] = 0.0
+
+                # Position-dependent timestep at post-patch resolution.
+                # Use integer division to match Conv3d output size exactly
+                # (avoids mismatch when latent spatial dims are odd).
+                p_t, p_h, p_w = self.config.patch_size
+                post_patch_f = num_frames // p_t
+                post_patch_h = latent_h // p_h
+                post_patch_w = latent_w // p_w
+                first_frame_mask_post = torch.ones(
+                    1,
+                    1,
+                    post_patch_f,
+                    post_patch_h,
+                    post_patch_w,
+                    dtype=norm_latents.dtype,
+                    device=norm_latents.device,
+                )
+                first_frame_mask_post[:, :, 0] = 0
+
+                temp_ts = (first_frame_mask_post[0, 0] * timestep).flatten()
+                timestep = temp_ts.unsqueeze(0).expand(norm_latents.shape[0], -1)
+            else:
+                hidden_states = noisy_latents
+
+            packed_conditions["hidden_states"].append(hidden_states)
             packed_conditions["timestep"].append(timestep)
             packed_conditions["encoder_hidden_states"].append(sample_context)
             packed_conditions["training_target"].append(training_target)
-            packed_conditions["latents"].append(latents)
+            packed_conditions["latents"].append(norm_latents)
 
         return packed_conditions
