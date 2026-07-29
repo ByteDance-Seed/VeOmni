@@ -103,8 +103,11 @@ def _all_to_all_single(
             .contiguous()
         )
 
+    # Materialize the input before allocating with empty_like: otherwise the output
+    # can inherit a non-contiguous stride that NCCL all_to_all_single rejects.
+    x = x.contiguous()
     output = torch.empty_like(x)
-    comm = dist.all_to_all_single(output, x.contiguous(), group=group, async_op=async_op)
+    comm = dist.all_to_all_single(output, x, group=group, async_op=async_op)
 
     if async_op:
 

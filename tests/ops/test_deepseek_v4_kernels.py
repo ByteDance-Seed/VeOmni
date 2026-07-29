@@ -411,7 +411,11 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
     from transformers import AutoConfig
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
-    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.models.transformers.deepseek_v4.packed_utils import (
+        build_packed_compression_metadata,
+        build_sparse_attention_indices,
+        mask_sparse_attention_indices,
+    )
 
     torch.manual_seed(5)
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
@@ -449,6 +453,48 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
             packed_sequence_slices=sequence_slices,
             packed_compression_metadata=packed_metadata,
         )
+        compact_result = compressor(
+            hidden_states,
+            q_residual,
+            position_ids,
+            None,
+            0,
+            packed_sequence_slices=sequence_slices,
+            packed_compression_metadata=packed_metadata,
+            return_topk_indices=True,
+        )
+        compact_kv, compact_bias, compact_indices = compact_result
+        torch.testing.assert_close(compact_kv, packed_kv)
+        torch.testing.assert_close(compact_bias, packed_bias)
+        if compressor_cls is modeling.DeepseekV4CSACompressor:
+            assert compact_indices is not None
+            valid = compact_indices >= 0
+            safe_indices = compact_indices.clamp_min(0).unsqueeze(1)
+            selected_bias = packed_bias.gather(-1, safe_indices)
+            assert (selected_bias[valid.unsqueeze(1)] == 0).all()
+
+            sliding_bias = hidden_states.new_full((1, 1, total_len, total_len), float("-inf"))
+            for start, end in sequence_slices:
+                for query_idx in range(start, end):
+                    window_start = max(start, query_idx - config.sliding_window + 1)
+                    sliding_bias[:, :, query_idx, window_start : query_idx + 1] = 0
+            full_bias = torch.cat((sliding_bias, packed_bias), dim=-1)
+            candidates = build_sparse_attention_indices(
+                batch_size=1,
+                seq_len=total_len,
+                sliding_window=config.sliding_window,
+                compressed_len=packed_kv.shape[2],
+                compressed_indices=compact_indices,
+                device=hidden_states.device,
+            )
+            filtered_indices = mask_sparse_attention_indices(full_bias, candidates)
+            for query_idx in range(total_len):
+                actual_indices = filtered_indices[0, query_idx]
+                actual_indices = actual_indices[actual_indices >= 0].sort().values
+                expected_indices = torch.where(full_bias[0, 0, query_idx] == 0)[0].to(torch.int32)
+                torch.testing.assert_close(actual_indices, expected_indices)
+        else:
+            assert compact_indices is None
 
         segment_outputs = []
         segment_biases = []
@@ -474,6 +520,45 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
             assert torch.isneginf(packed_bias[:, :, start:end, :kv_offset]).all()
             assert torch.isneginf(packed_bias[:, :, start:end, kv_end:]).all()
             kv_offset = kv_end
+
+
+def test_deepseek_v4_compact_sparse_indices_match_attention_mask():
+    from veomni.models.transformers.deepseek_v4.packed_utils import (
+        build_sparse_attention_indices,
+        mask_sparse_attention_indices,
+    )
+
+    seq_len, compressed_len, sliding_window = 6, 3, 3
+    attention_mask = torch.full((1, 1, seq_len, seq_len + compressed_len), float("-inf"))
+    segment_starts = (0, 0, 0, 3, 3, 3)
+    compressed_ranges = ((0, 1), (0, 1), (0, 2), (2, 2), (2, 2), (2, 3))
+    for query_idx, (segment_start, (compressed_start, compressed_end)) in enumerate(
+        zip(segment_starts, compressed_ranges, strict=True)
+    ):
+        window_start = max(segment_start, query_idx - sliding_window + 1)
+        attention_mask[0, 0, query_idx, window_start : query_idx + 1] = 0
+        attention_mask[
+            0,
+            0,
+            query_idx,
+            seq_len + compressed_start : seq_len + compressed_end,
+        ] = 0
+
+    candidates = build_sparse_attention_indices(
+        batch_size=1,
+        seq_len=seq_len,
+        sliding_window=sliding_window,
+        compressed_len=compressed_len,
+        compressed_indices=None,
+        device=attention_mask.device,
+    )
+    actual = mask_sparse_attention_indices(attention_mask, candidates)
+
+    for query_idx in range(seq_len):
+        actual_indices = actual[0, query_idx]
+        actual_indices = actual_indices[actual_indices >= 0].sort().values
+        expected_indices = torch.where(attention_mask[0, 0, query_idx] == 0)[0].to(torch.int32)
+        torch.testing.assert_close(actual_indices, expected_indices)
 
 
 def test_deepseek_v4_packed_causal_mask_blocks_previous_samples():

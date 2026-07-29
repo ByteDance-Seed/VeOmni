@@ -143,6 +143,28 @@ class OptimizerConfig:
             )
         },
     )
+    muon_head_group_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Attention heads per Newton-Schulz block for head-split Muon. "
+                "0 (default) orthogonalizes each projection as a single matrix; 1 is fully per-head; "
+                "g > 1 puts g heads in each block. Any value >= 1 also requires "
+                "muon_head_split_modules."
+            )
+        },
+    )
+    muon_head_split_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Leaf module names to head-split, matched exactly against the children of an "
+                "attention module, e.g. ['q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
+                "['q_proj', 'k_proj', 'v_proj'] for GQA. Required whenever "
+                "muon_head_group_size >= 1; see docs/usage/basic_modules.md."
+            )
+        },
+    )
     muon_expert_zero_comm: bool = field(
         default=False,
         metadata={
@@ -983,6 +1005,7 @@ class OpsImplementationConfig:
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
             "native-sparse",
         ]
     ] = field(
@@ -1071,6 +1094,8 @@ class OpsImplementationConfig:
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
+            "delegates heavy GDN compute to torch.ops.npu.*). "
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
@@ -1096,6 +1121,7 @@ class OpsImplementationConfig:
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
+                "flex_attention": "veomni_flex_attention_with_sp",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]

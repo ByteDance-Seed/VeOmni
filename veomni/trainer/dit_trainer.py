@@ -444,7 +444,7 @@ class DiTTrainer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = outputs.loss
-        loss_dict = {k: v / self.base.args.train.micro_batch_size for k, v in loss_dict.items()}
+        loss_dict = {k: v / self.base.num_micro_batches for k, v in loss_dict.items()}
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
