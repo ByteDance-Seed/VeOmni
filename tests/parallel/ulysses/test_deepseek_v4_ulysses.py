@@ -68,7 +68,7 @@ def _run_deepseek_v4_attention_sp_fw_bw(
 
     from transformers import AutoConfig
 
-    from veomni.distributed.parallel_state import init_parallel_state
+    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
@@ -191,6 +191,82 @@ def _run_deepseek_v4_attention_sp_fw_bw(
 
     dist.barrier()
     dist.destroy_process_group()
+    clear_parallel_state()
+
+
+def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_file: str) -> None:
+    """Compare partitioned Ulysses TileLang indexer indices with the full-query result."""
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
+    dist.init_process_group(
+        backend=get_dist_comm_backend(),
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    from transformers import AutoConfig
+
+    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+
+    init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
+    dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    torch.manual_seed(1)
+    indexer = dsv4.DeepseekV4CSACompressor(config).indexer.to(device=device_type, dtype=torch.bfloat16)
+    with torch.no_grad():
+        torch.nn.init.zeros_(indexer.position_bias)
+    _broadcast_module(indexer)
+
+    seq_len = 64
+    hidden_states = torch.randn(1, seq_len, config.hidden_size, device=device_type, dtype=torch.bfloat16)
+    q_residual = torch.randn(1, seq_len, config.q_lora_rank, device=device_type, dtype=torch.bfloat16)
+    dist.broadcast(hidden_states, src=0)
+    dist.broadcast(q_residual, src=0)
+
+    for packed in (False, True):
+        if packed:
+            position_ids = torch.cat((torch.arange(32), torch.arange(32))).to(device_type).unsqueeze(0)
+            sequence_slices = ((0, 32), (32, 64))
+            packed_metadata = build_packed_compression_metadata(
+                hidden_states,
+                position_ids,
+                sequence_slices,
+                tuple(config.compress_rates.values()),
+            )
+        else:
+            position_ids = torch.arange(seq_len, device=device_type).unsqueeze(0)
+            sequence_slices = None
+            packed_metadata = None
+
+        no_sp_state = SimpleNamespace(ulysses_enabled=False)
+        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            expected = indexer(
+                hidden_states,
+                q_residual,
+                position_ids,
+                None,
+                0,
+                packed_sequence_slices=sequence_slices,
+                packed_compression_metadata=packed_metadata,
+            )
+        actual = indexer(
+            hidden_states,
+            q_residual,
+            position_ids,
+            None,
+            0,
+            packed_sequence_slices=sequence_slices,
+            packed_compression_metadata=packed_metadata,
+        )
+        torch.testing.assert_close(actual.sort(dim=-1).values, expected.sort(dim=-1).values, rtol=0, atol=0)
+
+    dist.barrier()
+    dist.destroy_process_group()
+    clear_parallel_state()
 
 
 @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs >=2 devices")
@@ -223,6 +299,20 @@ def test_deepseek_v4_attention_ulysses_fw_bw_4gpu(world_size: int, seq_len: int,
         mp.spawn(
             _run_deepseek_v4_attention_sp_fw_bw,
             args=(world_size, init_file, seq_len, with_compressor),
+            nprocs=world_size,
+            join=True,
+        )
+
+
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs >=2 devices")
+def test_deepseek_v4_indexer_ulysses_partition_matches_full_query():
+    """Ulysses query partitioning preserves packed and unpacked TileLang index selection."""
+    world_size = 2
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "indexer")
+        mp.spawn(
+            _run_deepseek_v4_indexer_sp_equivalence,
+            args=(world_size, init_file),
             nprocs=world_size,
             join=True,
         )
