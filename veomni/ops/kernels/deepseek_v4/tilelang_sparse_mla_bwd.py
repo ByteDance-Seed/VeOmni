@@ -30,6 +30,31 @@ from tilelang import language as T
 KV_BLOCK = 1024
 
 
+def cta_threads(block_H, block_size):
+    """Pick the backward CTA width for a ``(block_H, block_size)`` tile.
+
+    The accumulator fragments are spread over the CTA's threads, so this sets their
+    per-thread register footprint. ``acc_dq`` alone is ``block_H * D`` floats: at
+    block_H=64 that is 256 registers per thread on 4 warps, past the 255-register
+    limit, so ptxas spills ~1.8 KB per thread. Doubling to 8 warps halves every
+    fragment and drops the spill to 72 B. It costs nothing in occupancy -- the tile
+    shapes do not depend on the CTA width, and at ~200 KB of shared memory per CTA
+    only one CTA fits per SM either way, so the wider CTA just doubles the resident
+    warps. Measured on one GB200 at D=512, topk=640, B=1, S=4096, S_kv=5120, bf16:
+    14.97 -> 7.68 ms for block_H=64, and 8.08 -> 5.92 ms for block_H=32.
+
+    The ceiling is the GEMM tiling. ``FullCol`` splits the ``block_size`` columns
+    over at most ``block_size // 8`` warps (the MMA n-tile is 8) and the remaining
+    warps divide ``block_H`` rows, so each warp's row tile is
+    ``block_H * (block_size // 8) / num_warps`` and a warp needs a whole 16-row MMA
+    tile. That bounds the width at ``block_size * block_H // 4``; exceeding it is a
+    hard TileLang assertion ("warp_row_tiles must be greater than 16"), not a slow
+    kernel. Past 256 the extra warps are a net loss anyway (measured: 5.43 ms at 512
+    vs 4.32 ms at 256 for block_H=64 with a 1024-length KV).
+    """
+    return min(256, block_size * block_H // 4)
+
+
 @tilelang.jit(out_idx=[-1])
 def preprocess(
     B,
@@ -114,7 +139,7 @@ def bwd(
     sm_scale=None,
     block_size=32,
     num_stages=0,
-    threads=128,
+    threads=None,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
@@ -141,6 +166,20 @@ def bwd(
     NH = padded_H // block_H
     BS = block_size
     NS = tilelang.cdiv(topk, block_size)
+
+    if threads is None:
+        threads = cta_threads(block_H, BS)
+    # Fail here rather than inside TileLang's MMA macro generator, which reports the
+    # violated warp tile with no hint of which kernel asked for it. The power-of-two
+    # requirement is separate from the bound: the row/column warp split must multiply
+    # back to the warp count, so e.g. 96 threads clears the bound and still fails.
+    assert threads % 32 == 0 and threads & (threads - 1) == 0, (
+        f"threads ({threads}) must be a power-of-two multiple of the 32-lane warp"
+    )
+    assert 4 * threads <= BS * block_H, (
+        f"threads ({threads}) exceeds the GEMM warp-tile bound {BS * block_H // 4} "
+        f"for block_H={block_H}, block_size={BS}"
+    )
 
     split_store = 2
 

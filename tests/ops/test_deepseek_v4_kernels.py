@@ -248,6 +248,82 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
         assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+    # dAttnSink is accumulated by an atomic under a replicated T.Parallel loop, so a
+    # lost replication guard would scale it by the warp count -- which cosine, being
+    # scale-invariant, cannot see.
+    torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "block_H, block_size, expected",
+    [
+        (16, 32, 128),
+        (32, 32, 256),
+        (64, 32, 256),
+        # block_size is a bwd parameter, so the bound has to follow it: at 16 the
+        # column split halves and block_H=32 no longer affords 8 warps.
+        (32, 16, 128),
+        (64, 16, 256),
+        # The one tile where the derived width drops below the historical 128, which
+        # was in fact illegal there -- two warps is all this tile can partition.
+        (16, 16, 64),
+    ],
+)
+def test_tilelang_bwd_cta_threads_respects_warp_tile_bound(block_H, block_size, expected):
+    """``cta_threads`` must stay inside the GEMM warp tile it derives its bound from.
+
+    A width above ``block_size * block_H // 4`` is a TileLang compile-time assertion
+    rather than a slow kernel, so this pins both the chosen values and the warp split
+    they come from. The production tile is (64, 32); (16, 32) is what every other
+    TileLang test in this file exercises, which is why it must stay at 128.
+    """
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.deepseek_v4 import tilelang_sparse_mla_bwd
+
+    threads = tilelang_sparse_mla_bwd.cta_threads(block_H, block_size)
+
+    assert threads == expected
+    assert threads % 32 == 0 and threads & (threads - 1) == 0
+    # Restate TileLang's own partition rather than the closed form above: it splits the
+    # columns over at most block_size // 8 warps and gives the rest to the rows, and an
+    # MMA row tile below 16 is a hard compile error.
+    num_warps = threads // 32
+    column_warps = min(num_warps, block_size // 8)
+    assert block_H // (num_warps // column_warps) >= 16
+
+
+def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile():
+    """Cover the head tile that gets the widened CTA; the rest of this file does not.
+
+    ``bwd`` derives its CTA width from ``block_H = min(64, max(next_power_of_2(H), 16))``,
+    and every other TileLang test here uses 8 heads, i.e. block_H=16, which keeps the
+    historical 128 threads. 32 heads is the smallest tile that actually widens to 256,
+    so without this case the wide path is never run.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+
+    torch.manual_seed(6)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 16, 32, 512, 64, 64
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    indices[..., -1] = -1
+    scale = dim**-0.5
+
+    actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+    expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+    grad = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+    actual.backward(grad)
+    for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+        assert actual_grad is not None and torch.isfinite(actual_grad).all()
+        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+    # The CTA width sets the replicate extent of the T.Parallel loop that atomically
+    # accumulates dAttnSink, so a lost replication guard would scale it by the warp
+    # count while leaving every cosine above intact.
+    torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
 
 
 def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monkeypatch):
