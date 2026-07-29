@@ -22,6 +22,7 @@
 
 import fnmatch
 from typing import List
+from weakref import WeakValueDictionary
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
@@ -31,17 +32,6 @@ from ..utils.device import create_event, create_stream, get_current_stream, swit
 
 
 logger = logging.get_logger(__name__)
-
-
-class _Singleton(type):
-    """Metaclass ensuring only one instance of an async-offload class exists."""
-
-    _instances = {}
-
-    def __call__(cls, *args, **kwargs):
-        if cls not in cls._instances:
-            cls._instances[cls] = super().__call__(*args, **kwargs)
-        return cls._instances[cls]
 
 
 def _module_name_match(pattern: str, name: str) -> bool:
@@ -55,9 +45,10 @@ def _module_name_match(pattern: str, name: str) -> bool:
 
 
 def base_check_fn(tensor) -> bool:
-    if isinstance(tensor._base, torch.nn.parameter.Parameter) or isinstance(tensor, torch.nn.parameter.Parameter):
+    if isinstance(tensor, torch.nn.parameter.Parameter) or tensor._base is not None:
         return False
-    if tensor.storage().size() <= 0:
+    storage_nbytes = tensor.untyped_storage().nbytes()
+    if storage_nbytes <= 0 or storage_nbytes != tensor.numel() * tensor.element_size():
         return False
     return True
 
@@ -109,12 +100,14 @@ class GetCnt:
 
 class SwapTensor:
     def __init__(self, tensor, key):
+        if tensor._base is not None or tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size():
+            raise ValueError("Async activation offload requires a tensor with private, dense storage.")
+
         self.tensor = tensor
         self.size = tensor.size()
-        self.storage_size = tensor.storage().size()
+        self.storage_nbytes = tensor.untyped_storage().nbytes()
         self.tensor_cpu = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True, device="cpu")
 
-        self.is_slice_tensor = tensor.storage().size() != tensor.numel()
         self.stat = "device"
         self.key = key
 
@@ -130,21 +123,20 @@ class SwapTensor:
         with torch.no_grad():
             with switch_to_specified_stream(stream):
                 stream.wait_event(forward_event)
-                if self.is_slice_tensor:
-                    self.tensor_cpu.copy_(self.tensor, non_blocking=True)
-                else:
-                    self.tensor_cpu.storage().copy_(self.tensor.storage(), non_blocking=True)
+                self.tensor_cpu.untyped_storage().copy_(self.tensor.untyped_storage(), non_blocking=True)
                 self.d2h_event.record()
-                self.stat = "host"
+                self.stat = "d2h"
 
     def wait_d2h_finished(self):
-        if self.stat != "host":
+        if self.stat != "d2h":
             return
         get_current_stream().wait_event(self.d2h_event)
-        self.tensor.storage().resize_(0)
+        self.tensor.untyped_storage().resize_(0)
         self.stat = "host"
 
     def launch_h2d(self, h2d_stream):
+        if self.stat == "h2d":
+            return
         if self.stat != "host":
             return
         backward_event = create_event()
@@ -153,25 +145,17 @@ class SwapTensor:
         with torch.no_grad():
             with switch_to_specified_stream(h2d_stream):
                 h2d_stream.wait_event(backward_event)
-                self.tensor.storage().resize_(self.storage_size)
-                if self.is_slice_tensor:
-                    self.tensor.copy_(self.tensor_cpu, non_blocking=True)
-                else:
-                    self.tensor.storage().copy_(self.tensor_cpu.storage(), non_blocking=True)
+                self.tensor.untyped_storage().resize_(self.storage_nbytes)
+                self.tensor.untyped_storage().copy_(self.tensor_cpu.untyped_storage(), non_blocking=True)
                 self.h2d_event.record()
-                self.stat = "device"
+                self.stat = "h2d"
 
 
-class OffloadItem:
-    def __init__(self, act=None, ref_cnt=0):
-        self.act = act
-        self.ref_cnt = ref_cnt
-
-
-class OffloadManager(metaclass=_Singleton):
+class OffloadManager:
     def __init__(self):
-        self.items = {}
-        self.npu_item = []
+        # Autograd owns packed SwapTensor objects until backward. Weak references
+        # let abandoned graphs release stale entries after a failed step.
+        self.items = WeakValueDictionary()
         self.getcnt = GetCnt()
         self.swap_stream = create_stream()
 
@@ -179,6 +163,10 @@ class OffloadManager(metaclass=_Singleton):
         return self.getcnt.get_cnt(block_idx)
 
     def reset_getcnt(self):
+        self.getcnt.reset()
+
+    def reset(self):
+        self.items.clear()
         self.getcnt.reset()
 
     def assert_exist(self, key):
@@ -190,21 +178,13 @@ class OffloadManager(metaclass=_Singleton):
 
     def put(self, key, act):
         if key in self.items:
-            self.items[key].act = act
-            self.items[key].ref_cnt += 1
-        else:
-            self.items[key] = OffloadItem(act, 1)
+            raise RuntimeError(f"Key {key} already exists in items")
+        self.items[key] = act
 
-    def put_npu_tensor(self, act):
-        self.npu_item.append(act)
-
-    def pop_npu_tensor(self):
-        return self.npu_item.pop()
-
-    def del_npu_tensor(self, prefix_key):
-        for key in self.items.keys():
+    def wait_d2h_finished(self, prefix_key):
+        for key in list(self.items.keys()):
             if key.startswith(prefix_key):
-                self.items[key].act.wait_d2h_finished()
+                self.items[key].wait_d2h_finished()
 
     def get_layer_items_keys(self, block_idx):
         block_tensor_nums = self.getcnt.get_layer_tensor_nums(block_idx)
@@ -218,11 +198,7 @@ class OffloadManager(metaclass=_Singleton):
 
     def get(self, key):
         self.assert_exist(key)
-        item = self.items[key]
-
-        act = item.act
-        item.ref_cnt -= 1
-        return act
+        return self.items[key]
 
     def prefetch_get(self, block_idx, h2d_stream, d2h_stream):
         prefetch_keys = self.getcnt.get_prefetch_keys(block_idx)
@@ -245,6 +221,7 @@ class async_save_on_cpu(saved_tensors_hooks):
         self,
         block_idx,
         depth,
+        manager,
         custom_check_fn=None,
         prefetch=True,
     ) -> None:
@@ -255,11 +232,11 @@ class async_save_on_cpu(saved_tensors_hooks):
             if (custom_check_fn is not None) and (not custom_check_fn(tensor)):
                 return tensor
 
-            key, after_block = OffloadManager().get_cnt(block_idx)
-            d2h_stream = OffloadManager().swap_stream
+            key, after_block = manager.get_cnt(block_idx)
+            d2h_stream = manager.swap_stream
 
             if after_block:
-                OffloadManager().del_npu_tensor("{}_".format(block_idx - 1))
+                manager.wait_d2h_finished("{}_".format(block_idx - 1))
 
             if block_idx == depth - 1:
                 return tensor
@@ -269,24 +246,25 @@ class async_save_on_cpu(saved_tensors_hooks):
             if block_idx < depth - 1:
                 swap_tensor.launch_d2h(d2h_stream)
 
-            OffloadManager().put(key, swap_tensor)
+            manager.put(key, swap_tensor)
             return swap_tensor
 
         def _unpack_from_cpu(swap_tensor) -> torch.Tensor:
             if isinstance(swap_tensor, torch.Tensor):
                 return swap_tensor
 
-            d2h_stream = OffloadManager().swap_stream
-            h2d_stream = OffloadManager().swap_stream
+            d2h_stream = manager.swap_stream
+            h2d_stream = manager.swap_stream
             swap_tensor.launch_h2d(h2d_stream)
 
             get_current_stream().wait_event(swap_tensor.h2d_event)
+            swap_tensor.stat = "device"
 
             block_idx, tensor_idx = swap_tensor.key.split("_")
-            OffloadManager().clear(swap_tensor.key)
+            manager.clear(swap_tensor.key)
 
             if prefetch:
-                OffloadManager().prefetch_get(int(block_idx), h2d_stream, d2h_stream)
+                manager.prefetch_get(int(block_idx), h2d_stream, d2h_stream)
             return swap_tensor.tensor
 
         super().__init__(_pack_to_cpu, _unpack_from_cpu)
@@ -352,16 +330,16 @@ def _get_no_split_offload_modules(model):
 
 
 def async_offload_modules(modules, prefetch=True, hidden_states_idx=0):
-    """Apply async activation offload via class-level ``__call__`` patching.
+    """Apply async activation offload via selected-instance ``__call__`` patching.
 
     For each module, per-instance attributes (``_veomni_offload_layer_idx``,
     ``_veomni_offload_depth``, ``_veomni_offload_hidden_states_idx``,
-    ``_veomni_offload_prefetch``) are set, then the module's class's
-    ``__call__`` is patched to wrap it with ``async_save_on_cpu`` context.
+    ``_veomni_offload_prefetch``) are set, then the instance is rebound to a
+    private subclass whose ``__call__`` wraps it with ``async_save_on_cpu``.
 
-    Class-level patching is required because Python's dunder-method dispatch
-    bypasses instance-level assignments: ``module(args)`` always resolves to
-    ``type(module).__call__``, never to ``module.__call__``.
+    A per-instance subclass is required because Python's dunder-method dispatch
+    bypasses instance-level assignments. It avoids mutating the original class,
+    so unselected modules and other models in the process remain unchanged.
 
     More importantly, class-level ``__call__`` patching places the
     ``async_save_on_cpu`` context **outside** the ``GradientCheckpointingLayer``
@@ -378,11 +356,6 @@ def async_offload_modules(modules, prefetch=True, hidden_states_idx=0):
     Intermediate activations are then handled by ``_checkpoint_hook`` (GC
     recomputation), requiring zero persistent GPU memory.
 
-    Each unique class is patched only once (guarded by
-    ``_veomni_async_offload_patched``).  Instances of the same class that lack
-    ``_veomni_offload_layer_idx`` (i.e., not in the offload plan) fall through
-    to the original ``__call__`` transparently.
-
     **Key uniqueness across multiple forward passes**: VLM models may invoke
     the same visual-block sequence twice per training step (image forward +
     video forward / FSDP dummy_forward).  ``GetCnt`` must produce unique keys
@@ -393,6 +366,7 @@ def async_offload_modules(modules, prefetch=True, hidden_states_idx=0):
     of resetting, so the second pass produces ``"0_1"``, ``"1_1"``, … rather
     than repeating ``"0_0"``, ``"1_0"``, ….
     """
+    manager = OffloadManager()
     for name, module, layer_idx, depth in modules:
         logger.info_rank0(
             f"Applying activation offload to module: {name}, offload idx: {layer_idx}, offload_layers_num: {depth}"
@@ -401,32 +375,31 @@ def async_offload_modules(modules, prefetch=True, hidden_states_idx=0):
         module._veomni_offload_depth = depth
         module._veomni_offload_hidden_states_idx = hidden_states_idx
         module._veomni_offload_prefetch = prefetch
-        _patch_class_call(type(module))
+        module._veomni_offload_manager = manager
+        _patch_instance_call(module)
 
 
-def _patch_class_call(cls):
-    """Patch ``cls.__call__`` to wrap with ``async_save_on_cpu`` context.
+def _patch_instance_call(module):
+    """Rebind one module to a private subclass wrapping ``__call__``.
 
-    The patched ``__call__`` reads per-instance config from ``self`` at call
-    time, so instances of the same class can have different offload settings.
-    Only patches each class once (tracked via ``_veomni_async_offload_patched``).
+    This keeps saved-tensor hooks outside gradient checkpointing without
+    permanently mutating the original module class.
     """
-    if getattr(cls, "_veomni_async_offload_patched", False):
+    cls = type(module)
+    if getattr(cls, "_veomni_async_offload_instance_class", False):
         return
 
     original_call = cls.__call__
 
     def patched_call(self, *args, **kwargs):
-        if not hasattr(self, "_veomni_offload_layer_idx"):
-            return original_call(self, *args, **kwargs)
-
         hidden_states_idx = getattr(self, "_veomni_offload_hidden_states_idx", 0)
         prefetch = getattr(self, "_veomni_offload_prefetch", True)
         layer_idx = self._veomni_offload_layer_idx
         depth = self._veomni_offload_depth
+        manager = self._veomni_offload_manager
 
-        if layer_idx == 0 and len(OffloadManager().items) == 0:
-            OffloadManager().reset_getcnt()
+        if layer_idx == 0 and not manager.items:
+            manager.reset_getcnt()
 
         try:
             hidden_states = args[hidden_states_idx] if len(args) > hidden_states_idx else None
@@ -448,23 +421,35 @@ def _patch_class_call(cls):
         ctx = async_save_on_cpu(
             block_idx=layer_idx,
             depth=depth,
+            manager=manager,
             custom_check_fn=check_fn,
             prefetch=prefetch,
         )
 
-        with ctx:
-            return original_call(self, *args, **kwargs)
+        try:
+            with ctx:
+                return original_call(self, *args, **kwargs)
+        except BaseException:
+            manager.reset()
+            raise
 
-    cls.__call__ = patched_call
-    cls._veomni_async_offload_patched = True
+    async_offload_cls = type(
+        f"AsyncOffload{cls.__name__}",
+        (cls,),
+        {
+            "__call__": patched_call,
+            "_veomni_async_offload_instance_class": True,
+        },
+    )
+    module.__class__ = async_offload_cls
 
 
 def apply_async_activation_offload(model, activation_offload_modules: List[str]):
     """Apply async activation offload to matched submodules.
 
-    Uses class-level ``__call__`` patching so that ``saved_tensors_hooks``
-    wraps the ``GradientCheckpointingLayer`` checkpoint boundary, correctly
-    intercepting hidden states saved for backward recomputation.
+    Uses a selected-instance ``__call__`` subclass so that
+    ``saved_tensors_hooks`` wraps the ``GradientCheckpointingLayer`` checkpoint
+    boundary without mutating the shared decoder class.
 
     Compatible with both GC-enabled and GC-disabled training:
       - With GC: async offload intercepts hidden_states (via _NoopSaveInputs),

@@ -488,6 +488,8 @@ class OffloadConfig:
                 "enable_activation and enable_async_activation are mutually exclusive; "
                 "select exactly one activation offload mode."
             )
+
+
 @dataclass
 class AcceleratorConfig:
     """train.accelerator.* — Parallelism and distributed-training topology."""
