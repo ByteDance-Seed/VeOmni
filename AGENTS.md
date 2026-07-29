@@ -140,3 +140,27 @@ multi-GPU/FSDP2/Ulysses/EP test. Those require the self-hosted GPU CI runners.
 - `make build` targets a non-existent `setup.py`; packaging is via
   `pyproject.toml` (`python -m build`), not `make build`.
 - Re-running `uv sync` is cheap and idempotent; prefer it over `pip install`.
+
+### Lark / Feishu notifications for PR review tasks
+
+When a cloud-agent **review task** is triggered by a new PR on the remote repo,
+notify the maintainer on Feishu/Lark with a short PR summary (title, author,
+link, key changes, review verdict).
+
+- **Provisioning:** `scripts/cloud/lark_notify_setup.sh` runs on VM startup (wired
+  into the environment update script). It installs `@larksuite/cli` globally to
+  `~/.npm-global` (on `PATH` via `~/.bashrc`), adds the `lark-shared` + `lark-im`
+  skills to `~/.agents/skills/`, and configures a **bot** identity. It is a
+  no-op (exit 0) when the Lark secrets are absent, so startup never breaks.
+- **Required secrets:** `LARK_APP_ID`, `LARK_APP_SECRET` (bot app credentials);
+  optional `LARK_BRAND` (`feishu` or `lark`, default `feishu`). Set a recipient
+  the bot can reach, e.g. `LARK_NOTIFY_RECEIVER` (an `open_id` / `user_id` /
+  `email` / `chat_id`) — the maintainer must have opened a chat with the bot or
+  be in a shared group for DMs to deliver.
+- **How to send:** first `Read` `~/.agents/skills/lark-im/SKILL.md` and
+  `~/.agents/skills/lark-shared/SKILL.md`, then use `lark-cli im +messages-send`
+  (bot identity is the default). Use `lark-cli im +chat-search` to resolve a
+  `chat_id` when only a group name is known. Verify wiring with
+  `lark-cli doctor --offline` (`config_file` must be `pass`).
+- **Gotcha:** `npm i -g` needs the user prefix `~/.npm-global` (set in
+  `~/.npmrc`); the setup script exports it so it never hits `EACCES`.
