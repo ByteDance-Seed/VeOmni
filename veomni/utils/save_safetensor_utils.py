@@ -94,13 +94,12 @@ def _save_hf_safetensor_distributed(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
-    # PyTorch 2.12+ provides the native DCP -> HuggingFace safetensors path used
-    # here. Keep the compatibility patch only for older supported releases;
-    # applying it to 2.12+ rejects otherwise-compatible PyTorch internals.
-    if not is_torch_version_greater_than("2.12"):
-        from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+    # Apply DCP consolidation patch just-in-time for HDFS FUSE compatibility
+    # and non-floating tensor dtypes. Torch 2.12 still needs this: upstream keeps
+    # r+b output opens and torch.finfo-based dtype sizing.
+    from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
 
-        apply_dcp_consolidation_patch()
+    apply_dcp_consolidation_patch()
 
     save_state = get_model_save_state(model, fqn_to_index_mapping, parallel_state=parallel_state)
 
