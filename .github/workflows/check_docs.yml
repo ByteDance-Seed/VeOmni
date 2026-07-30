@@ -9,6 +9,7 @@ on:
       - "tests/**"
       - "veomni/**"
       - "train.sh"
+      - ".readthedocs.yaml"
       - ".github/workflows/check_docs.yml"
   push:
     branches:
@@ -20,6 +21,7 @@ on:
       - "tests/**"
       - "veomni/**"
       - "train.sh"
+      - ".readthedocs.yaml"
       - ".github/workflows/check_docs.yml"
 
 concurrency:
