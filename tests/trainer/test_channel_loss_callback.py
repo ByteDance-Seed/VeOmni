@@ -144,11 +144,15 @@ def test_channel_loss_computer_aggregates_packed_logits_by_source():
             "source_id": 0,
             "loss_sum": pytest.approx(loss_0),
             "token_count": tokens_0,
+            "sample_count": 1,
+            "input_token_count": 3,
         },
         {
             "source_id": 1,
             "loss_sum": pytest.approx(loss_1),
             "token_count": tokens_1,
+            "sample_count": 1,
+            "input_token_count": 2,
         },
     ]
 
@@ -192,6 +196,27 @@ def test_channel_loss_computer_hidden_states_path_matches_logits_path():
     )
 
     assert hs_result == logits_result
+
+
+def test_channel_loss_computer_counts_attention_masked_input_tokens():
+    computer = ChannelLossComputer()
+    computer._source_ids = ["repoqa"]
+    computer._position_ids = torch.tensor([[0, 1, 2, 3]])
+
+    result = computer._compute_channel_loss(
+        logits=torch.randn(1, 4, 8),
+        labels=torch.tensor([[1, 2, 3, 4]]),
+        vocab_size=8,
+        hidden_states=None,
+        weights=None,
+        attention_mask=torch.tensor([[1, 1, 1, 0]]),
+        shift_labels=None,
+        ignore_index=IGNORE_INDEX,
+    )
+
+    assert result[0]["sample_count"].item() == 1
+    assert result[0]["input_token_count"].item() == 3
+    assert result[0]["token_count"].item() == 3
 
 
 def test_channel_loss_computer_counts_data_metrics_with_sequence_parallel():
@@ -393,6 +418,8 @@ def test_channel_loss_chunk_kernel_reuses_main_projection(monkeypatch):
     assert computer._result
     assert computer._result[0]["token_count"].item() == seq_len - 1
     assert computer._result[0]["loss_sum"].item() == pytest.approx(loss.item() * (seq_len - 1), rel=1e-6)
+    assert computer._result[0]["sample_count"].item() == 1
+    assert computer._result[0]["input_token_count"].item() == seq_len
 
 
 @pytest.mark.parametrize("capture_count", [0, 2])
@@ -2044,6 +2071,21 @@ def test_channel_loss_metric_name_is_source_qualified_from_first_emission():
     assert "channel_loss/train_a" not in metrics
 
 
+def test_channel_loss_builds_four_data_metrics_from_compact_counts():
+    cfg = ChannelLossConfig(enable=True)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
+    callback = ChannelLossCallback(trainer)
+
+    metrics = callback._build_data_metrics({7: (2, 11, 5)}, {7: "repoqa"})
+
+    assert metrics == {
+        "samples/source-i-7__repoqa": 2.0,
+        "input_tokens/source-i-7__repoqa": 11.0,
+        "label_tokens/source-i-7__repoqa": 5.0,
+        "label_tokens_per_sample/source-i-7__repoqa": 2.5,
+    }
+
+
 def test_channel_loss_metric_name_collision_registry_persists_across_steps():
     cfg = ChannelLossConfig(enable=True)
     trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
@@ -2157,6 +2199,10 @@ def test_channel_loss_callback_updates_trainer_metrics():
         0: (torch.tensor(6.0), torch.tensor(3)),
         1: (torch.tensor(3.0), torch.tensor(1)),
     }
+    callback.computer.step_data_totals = {
+        0: (torch.tensor(2), torch.tensor(10), torch.tensor(3)),
+        1: (torch.tensor(1), torch.tensor(4), torch.tensor(1)),
+    }
     callback._collect_step = True
 
     callback.on_step_end(TrainerState(global_step=1), loss=0.0, loss_dict={}, grad_norm=0.0)
@@ -2165,6 +2211,10 @@ def test_channel_loss_callback_updates_trainer_metrics():
     assert math.isclose(trainer.step_env_metrics["channel_loss/source-i-1__source-b"], 3.0)
     assert math.isclose(trainer.step_env_metrics["channel_loss_weighted/source-i-0__source_a"], 1.5)
     assert math.isclose(trainer.step_env_metrics["channel_tokens/source-i-1__source-b"], 1.0)
+    assert trainer.step_env_metrics["samples/source-i-0__source_a"] == 2.0
+    assert trainer.step_env_metrics["input_tokens/source-i-0__source_a"] == 10.0
+    assert trainer.step_env_metrics["label_tokens/source-i-0__source_a"] == 3.0
+    assert trainer.step_env_metrics["label_tokens_per_sample/source-i-0__source_a"] == 1.5
     assert trainer.step_train_metrics == trainer.step_env_metrics
 
 
@@ -2254,6 +2304,7 @@ def _strict_reduction_callback(*, source_name="source-a", with_totals=True):
     callback.computer.source_names = {0: source_name}
     if with_totals:
         callback.computer.step_totals = {0: (torch.tensor(1.0), torch.tensor(1))}
+        callback.computer.step_data_totals = {0: (torch.tensor(1), torch.tensor(2), torch.tensor(1))}
     return callback, trainer
 
 
@@ -2314,6 +2365,7 @@ def test_channel_loss_callback_strict_finishes_group_collectives_before_world_na
         "group-metadata",
         "group-loss",
         "group-token",
+        "group-data",
         "world-2",
     ]
     assert trainer.step_env_metrics == {}
@@ -2331,6 +2383,7 @@ def test_channel_loss_callback_strict_world_syncs_remote_group_reduction_failure
         "group-metadata",
         "group-loss",
         "group-token",
+        "group-data",
         "world-2",
     ]
     assert trainer.step_env_metrics == {}
@@ -2360,6 +2413,7 @@ def test_channel_loss_callback_strict_defers_cross_step_registry_conflict(monkey
         "group-metadata",
         "group-loss",
         "group-token",
+        "group-data",
         "world-2",
     ]
 

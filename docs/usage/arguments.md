@@ -352,6 +352,12 @@ NPU validation runs at two times:
 This is an observability-only side channel. It computes detached per-token CE
 from the model loss inputs, aggregates by packed-sequence source metadata, and
 adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics.
+Sampled steps also report `samples/<source-id>__<source>`,
+`input_tokens/<source-id>__<source>`, `label_tokens/<source-id>__<source>`, and
+`label_tokens_per_sample/<source-id>__<source>`. These four counters reuse the
+same packed-segment alignment and per-token observer capture as channel loss.
+They add only compact integer reductions proportional to the number of sources;
+they do not launch another projection, full-vocabulary CE, or observer workspace.
 This side channel does not change the returned training loss or gradients.
 The default `chunk_loss` backend reuses the main loss projection, but the detached
 per-token CE still needs a chunk-sized full-vocabulary workspace. Other fused-loss

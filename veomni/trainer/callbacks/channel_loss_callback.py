@@ -1012,7 +1012,7 @@ class ChannelLossComputer:
             parallel_state=descriptor.parallel_state if sp_enabled else None,
             capture_descriptor=descriptor,
             strict=self.strict,
-            include_data_stats=False,
+            include_data_stats=True,
             defer_sp=defer_sp,
         )
 
@@ -1915,10 +1915,12 @@ class ChannelLossCallback(Callback):
                 self._raise_if_strict_post_collective_failure(strict_reduction_errors)
             return
 
+        data_totals = self._reduce_step_data_totals(self.computer.step_data_totals, list(totals))
         if self.config.strict:
             self._raise_if_strict_post_collective_failure(strict_reduction_errors)
 
         metrics = self._build_metrics(totals, source_names)
+        metrics.update(self._build_data_metrics(data_totals, source_names))
         if not metrics:
             return
 
@@ -2028,6 +2030,41 @@ class ChannelLossCallback(Callback):
         )
         return totals, registered_names
 
+    def _reduce_step_data_totals(
+        self,
+        local_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        source_ids: list[ChannelKey],
+    ) -> dict[ChannelKey, tuple[int, int, int]]:
+        """Reduce compact integer counters without launching another CE observer."""
+
+        if not source_ids:
+            return {}
+
+        device = self._data_totals_device(local_totals)
+        counts = torch.zeros((len(source_ids), 3), dtype=torch.int64, device=device)
+        source_indices = {source_id: index for index, source_id in enumerate(source_ids)}
+        for source_id, (sample_count, input_token_count, label_token_count) in local_totals.items():
+            index = source_indices.get(source_id)
+            if index is None:
+                continue
+            counts[index] = torch.stack(
+                [
+                    torch.as_tensor(sample_count, dtype=torch.int64, device=device),
+                    torch.as_tensor(input_token_count, dtype=torch.int64, device=device),
+                    torch.as_tensor(label_token_count, dtype=torch.int64, device=device),
+                ]
+            )
+
+        ps = self.parallel_state
+        if ps.dp_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(counts, group=ps.dp_group)
+
+        values = counts.cpu().tolist()
+        return {
+            source_id: (int(values[index][0]), int(values[index][1]), int(values[index][2]))
+            for index, source_id in enumerate(source_ids)
+        }
+
     def _register_sources(
         self,
         source_ids: list[ChannelKey],
@@ -2087,6 +2124,16 @@ class ChannelLossCallback(Callback):
                 pass
         return torch.device("cpu")
 
+    def _data_totals_device(
+        self,
+        local_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> torch.device:
+        for counts in local_totals.values():
+            for count in counts:
+                if isinstance(count, torch.Tensor):
+                    return count.device
+        return self._totals_device({})
+
     def _build_metrics(
         self,
         totals: dict[ChannelKey, tuple[float, int]],
@@ -2104,6 +2151,30 @@ class ChannelLossCallback(Callback):
                 metrics[f"{self.config.weighted_loss_metric_prefix}/{name}"] = loss_sum / total_tokens
             if self.config.log_token_count:
                 metrics[f"{self.config.token_count_metric_prefix}/{name}"] = float(token_count)
+        return metrics
+
+    def _build_data_metrics(
+        self,
+        totals: dict[ChannelKey, tuple[int, int, int]],
+        source_names: dict[ChannelKey, str] | None = None,
+    ) -> dict[str, float]:
+        # Reuse the core metric suffix so every source has one stable identity
+        # across loss, token-count, and data-composition series.
+        metric_names = self._render_metric_names(
+            {source_id: (0.0, label_token_count) for source_id, (_, _, label_token_count) in totals.items()},
+            source_names,
+        )
+        metrics: dict[str, float] = {}
+        for source_id, (sample_count, input_token_count, label_token_count) in sorted(
+            totals.items(), key=lambda item: _channel_sort_key(item[0])
+        ):
+            if sample_count <= 0:
+                continue
+            name = metric_names[source_id]
+            metrics[f"samples/{name}"] = float(sample_count)
+            metrics[f"input_tokens/{name}"] = float(input_token_count)
+            metrics[f"label_tokens/{name}"] = float(label_token_count)
+            metrics[f"label_tokens_per_sample/{name}"] = label_token_count / sample_count
         return metrics
 
     def _render_metric_names(
