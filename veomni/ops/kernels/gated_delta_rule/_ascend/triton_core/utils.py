@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import itertools
@@ -95,8 +94,8 @@ def prepare_chunk_indices_list(
         num_chunks = (length + chunk_size - 1) // chunk_size
 
         for chunk_id in range(num_chunks):
-            indices.append((i))
-            indices.append((chunk_id))
+            indices.append(i)
+            indices.append(chunk_id)
 
     return indices
 
