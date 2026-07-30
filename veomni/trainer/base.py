@@ -520,6 +520,8 @@ class BaseTrainer(Stateful, ABC):
             dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
             dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+            dyn_bsz_buffer_policy=args.data.dyn_bsz_buffer_policy,
+            data_modality=args.data.data_modality,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
             save_steps=args.train.checkpoint.save_steps,
