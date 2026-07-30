@@ -39,6 +39,33 @@ WORKFLOWS = (
     REPO_ROOT / ".github/workflows/npu_unit_tests.yml",
 )
 INSTALL_COMMAND = "uv run --frozen python scripts/ci/install_triton_ascend.py"
+INSTALLER_PATH = "scripts/ci/install_triton_ascend.py"
+
+
+def _event_paths(workflow: str, event: str) -> set[str]:
+    """Return path filters for one block-style GitHub Actions event."""
+    lines = workflow.splitlines()
+    event_index = next((index for index, line in enumerate(lines) if line == f"  {event}:"), None)
+    if event_index is None:
+        return set()
+
+    for index in range(event_index + 1, len(lines)):
+        line = lines[index]
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and len(line) - len(line.lstrip()) <= 2:
+            break
+        if line != "    paths:":
+            continue
+
+        paths = set()
+        for path_line in lines[index + 1 :]:
+            path_stripped = path_line.strip()
+            if path_stripped and not path_stripped.startswith("#") and len(path_line) - len(path_line.lstrip()) <= 4:
+                break
+            if len(path_line) - len(path_line.lstrip()) == 6 and path_stripped.startswith("- "):
+                paths.add(path_stripped[2:].strip("\"'"))
+        return paths
+    return set()
 
 
 def validate_configuration() -> None:
@@ -51,10 +78,11 @@ def validate_configuration() -> None:
 
     for workflow_path in WORKFLOWS:
         workflow = workflow_path.read_text(encoding="utf-8")
-        if workflow.count(INSTALL_COMMAND) != 1:
+        if sum(line.strip() == INSTALL_COMMAND for line in workflow.splitlines()) != 1:
             raise RuntimeError(f"{workflow_path.name} must run the shared installer exactly once.")
-        if workflow.count("scripts/ci/install_triton_ascend.py") != 3:
-            raise RuntimeError(f"{workflow_path.name} must trigger on installer changes for push and pull requests.")
+        for event in ("push", "pull_request"):
+            if INSTALLER_PATH not in _event_paths(workflow, event):
+                raise RuntimeError(f"{workflow_path.name} must trigger {event} on installer changes.")
         if "--extra-index-url" in workflow or "triton-ascend.osinfra.cn/pypi/simple" in workflow:
             raise RuntimeError(f"{workflow_path.name} must not resolve Triton-Ascend from an extra index.")
 
@@ -65,8 +93,9 @@ def ensure_supported_platform() -> None:
     if current != ("Linux", "x86_64", (3, 11)):
         system, machine, python_version = current
         version = ".".join(map(str, python_version))
+        wheel_names = ", ".join(Path(urlparse(url).path).name for _name, _version, url, _sha256 in WHEELS)
         raise RuntimeError(
-            "Triton-Ascend CI wheels require Linux x86_64 with Python 3.11; "
+            f"The pinned Triton-Ascend wheels are cp311-only ({wheel_names}) and require Linux x86_64 with Python 3.11; "
             f"got {system} {machine} with Python {version}."
         )
 

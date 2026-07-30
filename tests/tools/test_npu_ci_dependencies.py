@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import call, patch
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALLER_PATH = REPO_ROOT / "scripts/ci/install_triton_ascend.py"
@@ -27,6 +29,36 @@ def test_triton_ascend_configuration_is_reproducible():
     ]
 
 
+def test_configuration_ignores_unrelated_installer_mentions(tmp_path):
+    installer = _load_installer()
+    workflows = []
+    for workflow_path in installer.WORKFLOWS:
+        copied_workflow = tmp_path / workflow_path.name
+        copied_workflow.write_text(
+            workflow_path.read_text(encoding="utf-8")
+            + "\n# See scripts/ci/install_triton_ascend.py.\n"
+            + "# uv run --frozen python scripts/ci/install_triton_ascend.py\n",
+            encoding="utf-8",
+        )
+        workflows.append(copied_workflow)
+
+    with patch.object(installer, "WORKFLOWS", tuple(workflows)):
+        installer.validate_configuration()
+
+
+def test_event_paths_rejects_nested_values():
+    installer = _load_installer()
+    workflow = """\
+on:
+  pull_request:
+    paths:
+      nested:
+        - scripts/ci/install_triton_ascend.py
+"""
+
+    assert installer._event_paths(workflow, "pull_request") == set()
+
+
 def test_installer_disables_dependency_resolution():
     installer = _load_installer()
 
@@ -40,3 +72,15 @@ def test_installer_disables_dependency_resolution():
         )
         for _name, _version, url, sha256 in installer.WHEELS
     ]
+
+
+def test_unsupported_python_error_names_cp311_wheels():
+    installer = _load_installer()
+
+    with (
+        patch.object(installer.platform, "system", return_value="Linux"),
+        patch.object(installer.platform, "machine", return_value="x86_64"),
+        patch.object(installer.sys, "version_info", (3, 12)),
+        pytest.raises(RuntimeError, match="cp311-only"),
+    ):
+        installer.ensure_supported_platform()
