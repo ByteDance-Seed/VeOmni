@@ -21,8 +21,6 @@ release = __version__
 
 
 # -- General configuration ---------------------------------------------------
-templates_path = ["_templates"]
-
 source_suffix = {
     ".rst": "restructuredtext",
     ".md": "markdown",

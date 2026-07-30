@@ -2,9 +2,29 @@ name: Check docs build
 
 on:
   pull_request:
+    paths:
+      - "docs/**"
+      - "configs/**"
+      - "tasks/**"
+      - "tests/**"
+      - "veomni/**"
+      - "train.sh"
+      - ".github/workflows/check_docs.yml"
   push:
     branches:
       - main
+    paths:
+      - "docs/**"
+      - "configs/**"
+      - "tasks/**"
+      - "tests/**"
+      - "veomni/**"
+      - "train.sh"
+      - ".github/workflows/check_docs.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -17,12 +37,14 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
-          cache-dependency-path: docs/requirements.txt
+          cache-dependency-path: |
+            docs/requirements.txt
+            docs/requirements-lock.txt
 
       - name: Install documentation dependencies
-        run: python -m pip install -r docs/requirements.txt
+        run: python -m pip install -r docs/requirements-lock.txt
 
       - name: Build documentation with warnings as errors
         run: make -C docs html SPHINXOPTS=-W
