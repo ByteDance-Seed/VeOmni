@@ -104,6 +104,45 @@ class VeomniFlopsCounter:
         # nn.Embedding is a table lookup, so only the lm_head matmul contributes FLOPs.
         return vocab_size * hidden_size
 
+    def _compute_qwen_dense_text_flops(self, config, tokens_sum, batch_seqlens):
+        """Compute raw text FLOPs shared by dense Qwen text and VL models."""
+        hidden_size = config.hidden_size
+        num_attention_heads = config.num_attention_heads
+        num_hidden_layers = config.num_hidden_layers
+        head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
+        q_size = num_attention_heads * head_dim
+        kv_size = config.num_key_value_heads * head_dim
+
+        mlp_N = hidden_size * config.intermediate_size * 3
+        attn_linear_N = hidden_size * (2 * q_size + 2 * kv_size)
+        lm_head_N = self._compute_lm_head_params(hidden_size, config.vocab_size)
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
+        dense_N_flops = 6 * dense_N * tokens_sum
+
+        seqlen_square_sum = sum(seqlen * seqlen for seqlen in batch_seqlens)
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        return dense_N_flops + attn_qkv_flops
+
+    def _compute_qwen3_moe_text_flops(self, config, tokens_sum, batch_seqlens):
+        """Compute raw text FLOPs shared by Qwen3 MoE text and VL models."""
+        hidden_size = config.hidden_size
+        num_attention_heads = config.num_attention_heads
+        num_hidden_layers = config.num_hidden_layers
+        head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
+        q_size = num_attention_heads * head_dim
+        kv_size = config.num_key_value_heads * head_dim
+
+        moe_gata_N = hidden_size * config.num_experts
+        moe_expertmlp_N = hidden_size * config.moe_intermediate_size * config.num_experts_per_tok * 3
+        attn_linear_N = hidden_size * (2 * q_size + 2 * kv_size)
+        lm_head_N = self._compute_lm_head_params(hidden_size, config.vocab_size)
+        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
+        dense_N_flops = 6 * moe_N * tokens_sum
+
+        seqlen_square_sum = sum(seqlen * seqlen for seqlen in batch_seqlens)
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        return dense_N_flops + attn_qkv_flops
+
     def _estimate_seed_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
@@ -307,40 +346,7 @@ class VeomniFlopsCounter:
         return flops_all_token * (1.0 / delta_time) / 1e12
 
     def _estimate_qwen3_moe_flops(self, tokens_sum, batch_seqlens, delta_time):
-        hidden_size = self.config.hidden_size
-        vocab_size = self.config.vocab_size
-        moe_intermediate_size = self.config.moe_intermediate_size
-        num_hidden_layers = self.config.num_hidden_layers
-        num_key_value_heads = self.config.num_key_value_heads
-        num_attention_heads = self.config.num_attention_heads
-        moe_intermediate_size = self.config.moe_intermediate_size
-        moe_num_expert = self.config.num_experts
-        moe_topk = self.config.num_experts_per_tok
-
-        head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        q_size = num_attention_heads * head_dim
-        k_size = num_key_value_heads * head_dim
-        v_size = num_key_value_heads * head_dim
-
-        # non-attn per layer parm
-        moe_gata_N = hidden_size * moe_num_expert
-        # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
-        moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
-        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
-        # non-attn all_layer parm
-        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + lm_head_N
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * moe_N * tokens_sum
-
-        # attn all_layer & all_token fwd & bwd flops
-        seqlen_square_sum = 0
-        for seqlen in batch_seqlens:
-            seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-
-        # all_layer & all_token fwd & bwk flops
-        flops_all_token = dense_N_flops + attn_qkv_flops
+        flops_all_token = self._compute_qwen3_moe_text_flops(self.config, tokens_sum, batch_seqlens)
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
@@ -421,36 +427,7 @@ class VeomniFlopsCounter:
         return flops_achieved
 
     def _estimate_qwen2_flops(self, tokens_sum, batch_seqlens, delta_time):
-        hidden_size = self.config.hidden_size
-        vocab_size = self.config.vocab_size
-        num_hidden_layers = self.config.num_hidden_layers
-        num_key_value_heads = self.config.num_key_value_heads
-        num_attention_heads = self.config.num_attention_heads
-        intermediate_size = self.config.intermediate_size
-
-        head_dim = hidden_size // num_attention_heads
-        q_size = num_attention_heads * head_dim
-        k_size = num_key_value_heads * head_dim
-        v_size = num_key_value_heads * head_dim
-
-        # non-attn per layer parm
-        # llama use SwiGelu, gate, having up and down linear layer in mlp
-        mlp_N = hidden_size * intermediate_size * 3
-        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
-        # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * dense_N * tokens_sum
-
-        # attn all_layer & all_token fwd & bwd flops
-        seqlen_square_sum = 0
-        for seqlen in batch_seqlens:
-            seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-
-        # all_layer & all_token fwd & bwd flops
-        flops_all_token = dense_N_flops + attn_qkv_flops
+        flops_all_token = self._compute_qwen_dense_text_flops(self.config, tokens_sum, batch_seqlens)
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
@@ -489,32 +466,8 @@ class VeomniFlopsCounter:
         return flops_achieved
 
     def _estimate_qwen2_vl_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
-        hidden_size = self.config.text_config.hidden_size
-        vocab_size = self.config.text_config.vocab_size
-        num_hidden_layers = self.config.text_config.num_hidden_layers
-        num_key_value_heads = self.config.text_config.num_key_value_heads
-        num_attention_heads = self.config.text_config.num_attention_heads
-        intermediate_size = self.config.text_config.intermediate_size
-
-        head_dim = hidden_size // num_attention_heads
-        q_size = num_attention_heads * head_dim
-        k_size = num_key_value_heads * head_dim
-        v_size = num_key_value_heads * head_dim
-
-        # non-attn per layer parm
-        mlp_N = hidden_size * intermediate_size * 3
-        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
-        # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * dense_N * tokens_sum
-
-        # attn all_layer & all_token fwd & bwd flops
-        seqlen_square_sum = 0
-        for seqlen in batch_seqlens:
-            seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        text_flops = self._compute_qwen_dense_text_flops(text_config, tokens_sum, batch_seqlens)
 
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
@@ -524,40 +477,12 @@ class VeomniFlopsCounter:
             vit_flops = 0
 
         # all_layer & all_token fwd & bwd flops
-        flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
+        flops_all_token = text_flops + vit_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
     def _estimate_qwen3_vl_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
-        # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
-        hidden_size = self.config.text_config.hidden_size
-        vocab_size = self.config.text_config.vocab_size
-        num_hidden_layers = self.config.text_config.num_hidden_layers
-        num_key_value_heads = self.config.text_config.num_key_value_heads
-        num_attention_heads = self.config.text_config.num_attention_heads
-        intermediate_size = self.config.text_config.intermediate_size
-
-        head_dim = hidden_size // num_attention_heads
-        q_size = num_attention_heads * head_dim
-        k_size = num_key_value_heads * head_dim
-        v_size = num_key_value_heads * head_dim
-
-        # non-attn per layer parm
-        mlp_N = hidden_size * intermediate_size * 3
-        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
-        # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * dense_N * tokens_sum
-
-        # qwen3_vl uses deepstack to merge visual embeds and text embeds, but it has no tensor operation.
-
-        # attn all_layer & all_token fwd & bwd flops
-        seqlen_square_sum = 0
-        for seqlen in batch_seqlens:
-            seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        text_flops = self._compute_qwen_dense_text_flops(self.config.text_config, tokens_sum, batch_seqlens)
 
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
@@ -567,47 +492,12 @@ class VeomniFlopsCounter:
             vit_flops = 0
 
         # all_layer & all_token fwd & bwd flops
-        flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
+        flops_all_token = text_flops + vit_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
     def _estimate_qwen3_vl_moe_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
-        # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
-        hidden_size = self.config.text_config.hidden_size
-        vocab_size = self.config.text_config.vocab_size
-        moe_intermediate_size = self.config.text_config.moe_intermediate_size
-        num_hidden_layers = self.config.text_config.num_hidden_layers
-        num_key_value_heads = self.config.text_config.num_key_value_heads
-        num_attention_heads = self.config.text_config.num_attention_heads
-        moe_intermediate_size = self.config.text_config.moe_intermediate_size
-        moe_num_expert = self.config.text_config.num_experts
-        moe_topk = self.config.text_config.num_experts_per_tok
-        head_dim = getattr(
-            self.config.text_config,
-            "head_dim",
-            self.config.text_config.hidden_size // self.config.text_config.num_attention_heads,
-        )
-        q_size = num_attention_heads * head_dim
-        k_size = num_key_value_heads * head_dim
-        v_size = num_key_value_heads * head_dim
-        # non-attn per layer parm
-        moe_gata_N = hidden_size * moe_num_expert
-        # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
-        moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk) * 3
-        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
-        # non-attn all_layer parm
-        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * (num_hidden_layers) + lm_head_N
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * moe_N * tokens_sum
-        # attn all_layer & all_token fwd & bwd flops
-        seqlen_square_sum = 0
-        for seqlen in batch_seqlens:
-            seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-        # all_layer & all_token fwd & bwk flops
-        flops_all_token = dense_N_flops + attn_qkv_flops
-        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+        text_flops = self._compute_qwen3_moe_text_flops(self.config.text_config, tokens_sum, batch_seqlens)
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
         if images_seqlens is not None:
@@ -615,7 +505,7 @@ class VeomniFlopsCounter:
         else:
             vit_flops = 0
         # all_layer & all_token fwd & bwd flops
-        flops_all_token = dense_N_flops + attn_qkv_flops + vit_flops
+        flops_all_token = text_flops + vit_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
@@ -740,13 +630,10 @@ class VeomniFlopsCounter:
         by 1 full attention layer.
 
         Full attention (Qwen3_5Attention) projections:
-            q_proj:  hidden_size -> num_attention_heads * head_dim  (output gate ignored, see note)
+            q_proj:  hidden_size -> 2 * num_attention_heads * head_dim (query + output gate)
             k_proj:  hidden_size -> num_key_value_heads * head_dim
             v_proj:  hidden_size -> num_key_value_heads * head_dim
             o_proj:  num_attention_heads * head_dim -> hidden_size
-
-        Note: q_proj actually outputs 2x (half query, half gate via sigmoid), but the gate
-        contribution is ignored here for consistency with existing qwen3_next estimation.
 
         GatedDeltaNet (Qwen3_5GatedDeltaNet) projections:
             in_proj_qkv:  hidden_size -> 2 * linear_k_size + linear_v_size
@@ -807,8 +694,8 @@ class VeomniFlopsCounter:
                 "The config may use an unsupported entry in `config.layer_types`."
             )
 
-        # Full attention: q_proj + k_proj + v_proj + o_proj
-        full_attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+        # Full attention: q_proj emits query and output-gate halves, while o_proj consumes only query-sized output.
+        full_attn_linear_N = hidden_size * (2 * q_size + k_size + v_size + q_size)
 
         # GatedDeltaNet linear projections and depthwise conv1d
         linear_k_size = config.linear_num_key_heads * config.linear_key_head_dim
