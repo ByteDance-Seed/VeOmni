@@ -59,6 +59,12 @@ def qwen3_5_counter():
 
 
 @pytest.fixture
+def qwen3_counter():
+    config = _load_toy_config("tests/toy_config/qwen3_toy")
+    return VeomniFlopsCounter(config)
+
+
+@pytest.fixture
 def qwen3_5_moe_counter():
     config = _load_toy_config("tests/toy_config/qwen3_5_moe_toy")
     return VeomniFlopsCounter(config)
@@ -110,13 +116,13 @@ class TestQwen35Flops:
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0)
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(105.419032756224, rel=1e-9)
+        assert flops == pytest.approx(106.965220982784, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(107.650266169344, rel=1e-9)
+        assert flops == pytest.approx(109.196454395904, rel=1e-9)
 
 
 class TestQwen35MoeFlops:
@@ -137,13 +143,40 @@ class TestQwen35MoeFlops:
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0)
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(16.68192141312, rel=1e-9)
+        assert flops == pytest.approx(16.888079843328, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(18.847925010432, rel=1e-9)
+        assert flops == pytest.approx(19.05408344064, rel=1e-9)
+
+
+class TestQwen3Flops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
+    def test_uses_explicit_head_dim_for_projection_shapes(self, qwen3_counter):
+        config = qwen3_counter.config
+        batch_seqlens = [12, 5]
+        tokens_sum = sum(batch_seqlens)
+        q_size = config.num_attention_heads * config.head_dim
+        kv_size = config.num_key_value_heads * config.head_dim
+
+        mlp_N = config.hidden_size * config.intermediate_size * 3
+        attn_linear_N = config.hidden_size * (2 * q_size + 2 * kv_size)
+        lm_head_N = config.hidden_size * config.vocab_size
+        dense_N = (mlp_N + attn_linear_N) * config.num_hidden_layers + lm_head_N
+        expected_flops = 6 * dense_N * tokens_sum
+        expected_flops += (
+            12
+            * sum(seqlen * seqlen for seqlen in batch_seqlens)
+            * config.head_dim
+            * config.num_attention_heads
+            * config.num_hidden_layers
+        )
+
+        flops, _ = qwen3_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+        assert flops == pytest.approx(expected_flops / 1e12, rel=1e-9)
 
 
 class TestGptOssFlops:
