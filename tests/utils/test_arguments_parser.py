@@ -53,7 +53,7 @@ def _parse_error(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
 
 
 class TestListArguments:
-    """``nargs="+"`` takes space-separated values; YAML list syntax must not slip through."""
+    """``nargs="+"`` takes space-separated values, and also accepts the YAML list spelling."""
 
     def test_space_separated_values(self, monkeypatch):
         args = _parse(monkeypatch, "--train.names", "q_proj", "k_proj")
@@ -77,24 +77,92 @@ class TestListArguments:
     def test_element_conversion_failure_is_reported(self, monkeypatch, capsys):
         assert "invalid value 'two'" in _parse_error(monkeypatch, capsys, "--train.sizes", "two")
 
-    def test_single_bracketed_value_is_rejected(self, monkeypatch, capsys):
+    def test_single_bracketed_value_is_one_element(self, monkeypatch):
         """``[q_b_proj]`` used to parse as the literal one-element list ``['[q_b_proj]']``."""
-        assert "is YAML list syntax" in _parse_error(monkeypatch, capsys, "--train.names", "[q_b_proj]")
+        args = _parse(monkeypatch, "--train.names", "[q_b_proj]")
+        assert args.train.names == ["q_b_proj"]
 
-    def test_bracketed_value_is_rejected_in_equals_form(self, monkeypatch, capsys):
-        assert "is YAML list syntax" in _parse_error(monkeypatch, capsys, "--train.names=[q_b_proj]")
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ("[q_proj, k_proj]",),  # shell-quoted, so argparse sees one token
+            ("[q_proj,", "k_proj]"),  # unquoted, so the shell splits on the space
+            ("[q_proj,k_proj]",),  # no space after the separator
+            ("[", "q_proj", ",", "k_proj", "]"),  # spaces around every separator
+        ],
+    )
+    def test_flow_sequence_spellings_agree(self, monkeypatch, argv):
+        """Whitespace inside a flow sequence is YAML's business, not the shell's."""
+        args = _parse(monkeypatch, "--train.names", *argv)
+        assert args.train.names == ["q_proj", "k_proj"]
 
-    def test_bracketed_value_split_across_tokens_is_rejected(self, monkeypatch, capsys):
-        assert "is YAML list syntax" in _parse_error(monkeypatch, capsys, "--train.names", "[q_proj,", "k_proj]")
+    def test_flow_sequence_in_equals_form(self, monkeypatch):
+        args = _parse(monkeypatch, "--train.names=[q_proj, k_proj]")
+        assert args.train.names == ["q_proj", "k_proj"]
 
-    def test_non_string_lists_are_rejected_the_same_way(self, monkeypatch, capsys):
-        """The element type must not decide whether the diagnosis is understandable."""
-        assert "is YAML list syntax" in _parse_error(monkeypatch, capsys, "--train.sizes", "[2]")
+    def test_empty_flow_sequence_clears_the_list(self, monkeypatch, tmp_path):
+        """The only way to empty a list set by a config file, since ``nargs="+"`` needs a value."""
+        config = tmp_path / "config.yaml"
+        config.write_text("train:\n  names: [q_proj]\n")
+
+        args = _parse(monkeypatch, str(config), "--train.names", "[]")
+        assert args.train.names == []
+
+    def test_non_string_flow_sequence_is_converted(self, monkeypatch):
+        args = _parse(monkeypatch, "--train.sizes", "[1, 2]")
+        assert args.train.sizes == [1, 2]
+
+    @pytest.mark.parametrize("value", ["['LayerNorm', 'bias']", '["LayerNorm", "bias"]'])
+    def test_quoted_elements_lose_their_quotes(self, monkeypatch, value):
+        """Quoting scalars is ordinary YAML, so a config copy-paste must survive it."""
+        args = _parse(monkeypatch, "--train.names", value)
+        assert args.train.names == ["LayerNorm", "bias"]
+
+    def test_bool_elements_are_not_resolved_by_yaml(self, monkeypatch):
+        """The field's element type owns conversion; YAML must not decide it first."""
+        args = _parse(monkeypatch, "--train.flags", "[true, no]")
+        assert args.train.flags == [True, False]
+
+    @pytest.mark.parametrize(
+        "argv, element",
+        [
+            (("[q_proj k_proj]",), "q_proj k_proj"),  # every comma forgotten
+            (("[q_proj", "k_proj]"), "q_proj k_proj"),  # same, unquoted
+            (("[q_proj, k_proj v_proj]",), "k_proj v_proj"),  # one comma forgotten
+        ],
+    )
+    def test_missing_comma_inside_brackets_is_rejected(self, monkeypatch, capsys, argv, element):
+        """YAML reads this as one longer element; the message must name that element."""
+        error = _parse_error(monkeypatch, capsys, "--train.names", *argv)
+        assert f"element {element!r}" in error
+
+    def test_whitespace_is_only_refused_inside_brackets(self, monkeypatch):
+        """Space separation cannot express a space, so an unbracketed value keeps it."""
+        args = _parse(monkeypatch, "--train.names", "a b")
+        assert args.train.names == ["a b"]
+
+    @pytest.mark.parametrize("value", ["[a,,b]", "[,]"])
+    def test_malformed_sequence_is_rejected(self, monkeypatch, capsys, value):
+        """YAML rejects these, so they must not silently drop the blank element."""
+        assert "contains a comma" in _parse_error(monkeypatch, capsys, "--train.names", value)
+
+    def test_nested_sequence_is_not_treated_as_a_list(self, monkeypatch, capsys):
+        """A nested list is not something a ``List[str]`` field can hold."""
+        assert "contains a comma" in _parse_error(monkeypatch, capsys, "--train.names", "[a, [b, c]]")
+
+    def test_mapping_stays_a_literal_element(self, monkeypatch):
+        """Not a list of scalars, and no comma to object to, so it is just a value."""
+        args = _parse(monkeypatch, "--train.names", "[a: b]")
+        assert args.train.names == ["[a: b]"]
+
+    def test_flow_sequence_element_failure_is_reported(self, monkeypatch, capsys):
+        """The element, not the whole group, is what the user has to fix."""
+        assert "invalid value 'two'" in _parse_error(monkeypatch, capsys, "--train.sizes", "[1, two]")
 
     @pytest.mark.parametrize("argv", [("q_proj,", "k_proj"), ("q_proj,k_proj",)])
-    def test_comma_separated_values_are_rejected(self, monkeypatch, capsys, argv):
-        """Stripping the brackets but keeping the commas is the next version of the mistake."""
-        assert "separated by spaces, not commas" in _parse_error(monkeypatch, capsys, "--train.names", *argv)
+    def test_comma_without_brackets_is_rejected(self, monkeypatch, capsys, argv):
+        """Under space separation ``a,b`` is one element, so a bare comma is always a mistake."""
+        assert "separated by spaces" in _parse_error(monkeypatch, capsys, "--train.names", *argv)
 
     @pytest.mark.parametrize(
         "argv",
@@ -104,12 +172,26 @@ class TestListArguments:
         ],
     )
     def test_unwrapped_brackets_inside_a_value_are_kept(self, monkeypatch, argv):
-        """A glob or character class is not a pasted sequence, whatever its position."""
+        """An inner bracket says these are bracketed values, not one bracketed sequence."""
         args = _parse(monkeypatch, "--train.names", *argv)
         assert args.train.names == list(argv)
 
+    def test_a_value_made_only_of_brackets_is_read_as_a_sequence(self, monkeypatch):
+        """Known cost of accepting YAML syntax: a glob that *is* a bracket group loses them.
+
+        Reachable only when the whole element is bracketed (``[0-9]*.parquet`` keeps
+        its brackets, as the case above shows).
+        """
+        args = _parse(monkeypatch, "--train.names", "[0-9]")
+        assert args.train.names == ["0-9"]
+
+    def test_quoting_inside_the_sequence_keeps_the_brackets(self, monkeypatch):
+        """The escape hatch for the case above, and the same one YAML itself offers."""
+        args = _parse(monkeypatch, "--train.names", '["[0-9]"]')
+        assert args.train.names == ["[0-9]"]
+
     def test_non_list_fields_still_accept_brackets(self, monkeypatch):
-        """The guard is scoped to lists; a path may legitimately contain brackets."""
+        """Flow-sequence handling is scoped to lists; a path may legitimately be bracketed."""
         args = _parse(monkeypatch, "--train.model_path", "/models/ckpt[0]")
         assert args.train.model_path == "/models/ckpt[0]"
 

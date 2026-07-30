@@ -17,7 +17,7 @@ import dataclasses
 import os
 from dataclasses import asdict, is_dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, Literal, Sequence, Type, TypeVar, Union, get_type_hints
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Type, TypeVar, Union, get_type_hints
 
 import yaml
 
@@ -46,25 +46,49 @@ def _string_to_bool(value: Union[bool, str]) -> bool:
     raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
-def _is_pasted_yaml_sequence(values: Sequence[str]) -> bool:
-    """Whether a ``nargs="+"`` group is a YAML flow sequence copied from a config.
+def _flow_sequence_elements(values: Sequence[str]) -> Optional[List[str]]:
+    """Elements of a YAML flow sequence, or ``None`` when the group is not one.
 
-    ``[a, b]`` reaches argparse as ``['[a,', 'b]']``, keeping both the wrapping
-    brackets and the separators. Requiring the separators too is what tells a
-    paste apart from values that merely contain brackets, such as the glob
-    ``data/part-[0-9]`` or the character class ``[qk]_proj``.
+    ``nargs="+"`` splits on whitespace, so ``[a, b]`` arrives as ``['[a,', 'b]']``
+    and the quoted ``'[a, b]'`` as a single token; joining the group back together
+    covers both spellings. YAML itself then reads the sequence, so quoting
+    (``'["LayerNorm"]'``) and malformed input (``'[a,,b]'``) mean the same thing on
+    the command line as in a config file -- a hand-rolled comma split would accept
+    only a subset of what the config files it mirrors allow. ``BaseLoader`` keeps
+    every scalar a string, leaving conversion to the field's own element type.
+
+    Whatever YAML rejects, or resolves to something that is not a list of scalars,
+    is not a pasted sequence but values that happen to be bracketed, such as the
+    glob group ``[qk]v_proj gate[0]``; those stay literal.
     """
-    if not values or not values[0].startswith("[") or not values[-1].endswith("]"):
-        return False
-    return all(value.endswith(",") for value in values[:-1])
+    joined = " ".join(values)
+    if not joined.startswith("[") or not joined.endswith("]"):
+        return None
+    try:
+        elements = yaml.load(joined, Loader=yaml.BaseLoader)
+    except (yaml.YAMLError, RecursionError):  # deeply nested brackets exhaust the recursive composer
+        return None
+    if not isinstance(elements, list) or not all(isinstance(element, str) for element in elements):
+        return None
+    return elements
 
 
 class _ListArgumentAction(argparse.Action):
-    """Convert list elements, rejecting YAML list syntax on the command line.
+    """Convert list elements, accepting both the space-separated and YAML spellings.
 
-    ``nargs="+"`` consumes space-separated values, so a flow sequence or a
-    comma-joined value would land in a ``List[str]`` as literal element names --
-    silently, since any string is a valid element.
+    ``nargs="+"`` consumes space-separated values, so ``[a, b]`` would otherwise
+    land in a ``List[str]`` as the literal elements ``'[a,'`` and ``'b]'`` --
+    silently, since any string is a valid element. The two separators must not be
+    mixed, so a comma is an error outside brackets and whitespace is an error
+    inside them -- ``[a b]`` is a legal one-element sequence to YAML, but on a
+    command line it is a list someone stopped converting halfway. Only the
+    bracketed form refuses whitespace; an element that really contains a space
+    can still be passed unbracketed, or from a config file.
+
+    Brackets need shell quoting. Unquoted, ``[q_proj]`` is a glob character class
+    that the shell may rewrite before argparse ever sees it; no parser can
+    recover from that, which is why consumers of name lists must also fail loudly
+    when nothing matches.
     """
 
     def __init__(self, *args: Any, item_type: Callable[[str], Any] = str, **kwargs: Any) -> None:
@@ -72,19 +96,28 @@ class _ListArgumentAction(argparse.Action):
         self._item_type = item_type
 
     def __call__(self, parser, namespace, values, option_string=None) -> None:
-        flag = option_string or f"--{self.dest}"
-        if _is_pasted_yaml_sequence(values):
-            raise argparse.ArgumentError(
-                self,
-                f"{' '.join(values)!r} is YAML list syntax, not a command-line value. Pass the elements "
-                f"space-separated and unbracketed ({flag} first second); an empty list needs a config file",
-            )
+        elements = _flow_sequence_elements(values)
+        if elements is None:
+            elements = list(values)
+            for value in elements:
+                if "," in value:
+                    raise argparse.ArgumentError(
+                        self,
+                        f"{value!r} contains a comma; list elements are separated by spaces, or wrapped in "
+                        "brackets as in a config file (shell-quoted, e.g. '[first, second]')",
+                    )
+        else:
+            for element in elements:
+                if any(character.isspace() for character in element):
+                    raise argparse.ArgumentError(
+                        self,
+                        f"element {element!r} in {' '.join(values)!r} contains whitespace, so a comma is "
+                        "missing: a bracketed list separates elements with commas. Add it, or drop the "
+                        "brackets and separate the values with spaces (an element that really contains a "
+                        "space has to be passed unbracketed)",
+                    )
         converted = []
-        for value in values:
-            if "," in value:
-                raise argparse.ArgumentError(
-                    self, f"{value!r} contains a comma; list elements are separated by spaces, not commas"
-                )
+        for value in elements:
             try:
                 converted.append(self._item_type(value))
             except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:

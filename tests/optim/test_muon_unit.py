@@ -552,7 +552,7 @@ class TestHeadSplitInference:
         assert "'q_proj'" in str(excinfo.value)  # the candidate names are reported
 
     def test_yaml_bracket_syntax_is_diagnosed(self):
-        """Defense in depth: the CLI parser rejects this, a quoted YAML value still reaches us."""
+        """Both parsers strip list brackets, so a name keeping them was quoted into the string."""
         with pytest.raises(ValueError, match="square brackets"):
             infer_head_block_counts(_attention_model(), head_group_size=1, module_names=("[q_proj]",))
 
@@ -773,7 +773,7 @@ class TestHeadSplitBuild:
             self._muon_groups_by_blocks(_attention_model(), head_group_size=1, head_split_modules=[])
 
     def test_bracketed_module_list_raises_at_build_time(self):
-        """The CLI copy-paste bug must fail the build, not train as full-matrix Muon."""
+        """A name no module can carry must fail the build, not train as full-matrix Muon."""
         with pytest.raises(ValueError, match="found none of muon_head_split_modules"):
             self._muon_groups_by_blocks(_attention_model(), head_group_size=1, head_split_modules=["[q_proj]"])
 

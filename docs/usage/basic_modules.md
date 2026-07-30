@@ -27,15 +27,23 @@
         --train.wandb.name your_experiment_name
     ```
 
-    List-valued arguments take **space-separated values without brackets**. The
-    YAML flow-sequence form is not command-line syntax: `[q_proj, k_proj]` would
-    parse as the literal string elements `['[q_proj,', 'k_proj]']`, and bare
-    brackets are also a glob character class in an unquoted shell expansion. The
-    parser rejects bracketed list values rather than accepting them literally.
+    List-valued arguments accept both **space-separated values** and the **YAML
+    flow-sequence form**, so a list can be copied out of a config file unchanged
+    (this covers the arguments generated from the config dataclasses; the
+    hand-rolled pre-parse in `tasks/data_sim.py` takes space-separated values
+    only). Quote the brackets: unquoted, `[q_proj]` is a shell glob character
+    class, and the shell rewrites it before the parser can see it. `'[]'` is the
+    only way to empty a list that a config file has set.
     ```bash
     # YAML: muon_head_split_modules: [q_proj, k_proj]
     --train.optimizer.muon_head_split_modules q_proj k_proj
+    --train.optimizer.muon_head_split_modules '[q_proj, k_proj]'  # same thing
     ```
+    The two separators must not be mixed: a comma outside brackets is an error,
+    and so is a missing comma inside them (`'[q_proj k_proj]'`), because each is
+    a single element under the other syntax. An element that is itself bracketed
+    (`'[0-9]'`) is read as list syntax and loses its brackets; quote it inside
+    the sequence (`'["[0-9]"]'`) or pass it unbracketed to keep them.
 
 ## Arguments
 **Default Parameter Access**:  
@@ -446,14 +454,20 @@ train:
     muon_head_split_modules: [q_b_proj]  # which projections to split
 ```
 
-Overriding this from the command line needs the unbracketed form — the brackets
-above are YAML syntax, and copying them into a launch script is rejected by the
-argument parser:
+Overriding this from the command line takes either spelling, but the bracketed
+one has to be quoted so the shell does not read it as a glob:
 
 ```bash
 --train.optimizer.muon_head_group_size 1 \
 --train.optimizer.muon_head_split_modules q_b_proj
+# or, copied straight from the config: --train.optimizer.muon_head_split_modules '[q_b_proj]'
 ```
+
+Names are matched against the *leaf child* of an attention module, not a
+parameter FQN, so every module with that name is split. In DeepSeek V4,
+`q_b_proj` covers both `self_attn.q_b_proj` and the DSA
+`compressor.indexer.q_b_proj` — both are genuine per-head stacks, but there is
+no way to select only one of them.
 
 Whether this helps depends on the shape of the stacked matrix:
 

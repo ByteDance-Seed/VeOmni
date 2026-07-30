@@ -611,9 +611,10 @@ def infer_head_block_counts(
         hint = ""
         if any(name.startswith("[") or name.endswith("]") for name in allowed):
             hint = (
-                " The names carry square brackets: that is YAML flow-sequence syntax, not part of the "
-                "module name. On the command line pass them unbracketed and space-separated, e.g. "
-                "--train.optimizer.muon_head_split_modules q_b_proj."
+                " The names carry square brackets, which are list syntax rather than part of a module "
+                "name. Brackets are only stripped from a value that is one bracketed list ('[a, b]'); "
+                "bracketing each name on its own ('[a]' '[b]'), or quoting the brackets inside a config "
+                "string, leaves them in the name."
             )
         raise ValueError(
             f"Head-split Muon found none of muon_head_split_modules={list(module_names)} in this model, "
