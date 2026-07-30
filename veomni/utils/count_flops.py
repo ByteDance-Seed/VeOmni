@@ -15,63 +15,12 @@
 
 from transformers import PretrainedConfig
 
+from ..lora.config import FUSED_MOE_LORA_MODULES, LORA_MODULES_BY_MODEL_TYPE
 from . import logging
 from .device import get_device_name
 
 
 logger = logging.get_logger(__name__)
-
-
-_DENSE_QWEN_LORA_MODULES = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
-_QWEN3_NEXT_LORA_MODULES = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "in_proj_qkvz",
-    "in_proj_ba",
-    "out_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
-_QWEN3_5_LORA_MODULES = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "in_proj_qkv",
-    "in_proj_z",
-    "in_proj_b",
-    "in_proj_a",
-    "out_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
-_FUSED_MOE_LORA_MODULES = ("gate_proj", "up_proj", "down_proj")
-_LORA_MODULES_BY_MODEL_TYPE = {
-    "qwen2": _DENSE_QWEN_LORA_MODULES,
-    "qwen2_vl": _DENSE_QWEN_LORA_MODULES,
-    "qwen2_5_vl": _DENSE_QWEN_LORA_MODULES,
-    "qwen3": _DENSE_QWEN_LORA_MODULES,
-    "qwen3_moe": _DENSE_QWEN_LORA_MODULES,
-    "qwen3_vl": _DENSE_QWEN_LORA_MODULES,
-    "qwen3_vl_moe": _DENSE_QWEN_LORA_MODULES,
-    "qwen3_next": _QWEN3_NEXT_LORA_MODULES,
-    "qwen3_5": _QWEN3_5_LORA_MODULES,
-    "qwen3_5_text": _QWEN3_5_LORA_MODULES,
-    "qwen3_5_moe": _QWEN3_5_LORA_MODULES,
-    "qwen3_5_moe_text": _QWEN3_5_LORA_MODULES,
-}
 
 
 def get_device_flops(unit="T"):
@@ -164,9 +113,16 @@ class VeomniFlopsCounter:
         lora_rank=None,
         lora_modules=None,
         module_shapes=None,
-        frozen_without_targets=False,
+        detached_without_targets=False,
     ):
-        """Count linear-layer work for full fine-tuning or LoRA."""
+        """Count linear-layer work for full fine-tuning or LoRA.
+
+        Full fine-tuning performs forward, input-gradient, and weight-gradient
+        matmuls (factor 6). A frozen LoRA base still needs its input gradient to
+        reach earlier adapters (factor 4). A fully frozen component whose inputs
+        need no gradients, such as an unadapted vision tower, is forward-only
+        (factor 2).
+        """
         if lora_rank is None:
             return 6 * base_params * tokens
 
@@ -176,7 +132,7 @@ class VeomniFlopsCounter:
             lora_rank * (module_shapes[module][0] + module_shapes[module][1]) * module_shapes[module][2]
             for module in matched_modules
         )
-        base_factor = 2 if frozen_without_targets and not matched_modules else 4
+        base_factor = 2 if detached_without_targets and not matched_modules else 4
         return (base_factor * base_params + 6 * lora_params) * tokens
 
     @staticmethod
@@ -188,10 +144,10 @@ class VeomniFlopsCounter:
         if isinstance(lora_rank, bool) or not isinstance(lora_rank, int) or lora_rank <= 0:
             raise ValueError(f"`lora_rank` must be a positive integer or None, got {lora_rank!r}.")
 
-        supported_modules = _LORA_MODULES_BY_MODEL_TYPE.get(model_type)
+        supported_modules = LORA_MODULES_BY_MODEL_TYPE.get(model_type)
         if supported_modules is None:
             raise ValueError(
-                f"LoRA FLOPs estimation supports Qwen model types {sorted(_LORA_MODULES_BY_MODEL_TYPE)}, "
+                f"LoRA FLOPs estimation supports Qwen model types {sorted(LORA_MODULES_BY_MODEL_TYPE)}, "
                 f"got {model_type!r}."
             )
         if lora_modules is None:
@@ -214,10 +170,10 @@ class VeomniFlopsCounter:
     @staticmethod
     def _expand_fused_moe_lora_modules(lora_modules):
         """A matched fused experts module always installs all three MLP adapters."""
-        if not lora_modules or not any(module in _FUSED_MOE_LORA_MODULES for module in lora_modules):
+        if not lora_modules or not any(module in FUSED_MOE_LORA_MODULES for module in lora_modules):
             return lora_modules
-        non_mlp_modules = [module for module in lora_modules if module not in _FUSED_MOE_LORA_MODULES]
-        return [*non_mlp_modules, *_FUSED_MOE_LORA_MODULES]
+        non_mlp_modules = [module for module in lora_modules if module not in FUSED_MOE_LORA_MODULES]
+        return [*non_mlp_modules, *FUSED_MOE_LORA_MODULES]
 
     def _compute_qwen_dense_text_flops(
         self,
@@ -711,7 +667,7 @@ class VeomniFlopsCounter:
             vit_flops = self._estimate_qwen3_vit_flop(
                 images_seqlens,
                 self.config.vision_config,
-                frozen=lora_rank is not None,
+                forward_only=lora_rank is not None,
             )
         else:
             vit_flops = 0
@@ -743,7 +699,7 @@ class VeomniFlopsCounter:
             vit_flops = self._estimate_qwen3_vit_flop(
                 images_seqlens,
                 self.config.vision_config,
-                frozen=lora_rank is not None,
+                forward_only=lora_rank is not None,
             )
         else:
             vit_flops = 0
@@ -752,7 +708,7 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_vit_flop(self, images_seqlens, config, frozen=False):
+    def _estimate_qwen3_vit_flop(self, images_seqlens, config, forward_only=False):
         """
         Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
         """
@@ -785,7 +741,7 @@ class VeomniFlopsCounter:
         dense_N = patch_embed_N + (mlp_N + attn_linear_N) * depth + deepstack_merger_N + merger_N
 
         # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = (2 if frozen else 6) * dense_N * tokens_sum
+        dense_N_flops = (2 if forward_only else 6) * dense_N * tokens_sum
 
         # In Qwen3 VL, full attention is used in all vision layers.
         full_attn_layer_num = depth
@@ -794,7 +750,7 @@ class VeomniFlopsCounter:
         seqlen_square_sum = 0
         for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attention_factor = 4 if frozen else 12
+        attention_factor = 4 if forward_only else 12
         attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
 
         vit_flops = dense_N_flops + attn_qkv_flops
@@ -854,7 +810,7 @@ class VeomniFlopsCounter:
             lora_rank=lora_rank,
             lora_modules=lora_modules,
             module_shapes=vision_module_shapes,
-            frozen_without_targets=True,
+            detached_without_targets=True,
         )
         vision_has_lora = any(module in vision_module_shapes for module in lora_modules or ())
         attention_factor = 12 if lora_rank is None or vision_has_lora else 4
@@ -1212,7 +1168,7 @@ class VeomniFlopsCounter:
             vit_flops = self._estimate_qwen3_vit_flop(
                 images_seqlens,
                 getattr(self.config, "vision_config", None),
-                frozen=lora_rank is not None,
+                forward_only=lora_rank is not None,
             )
         else:
             vit_flops = 0

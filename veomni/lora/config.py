@@ -28,6 +28,7 @@ import dataclasses
 import json
 import os
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
 
 from ..utils import logging
@@ -36,6 +37,59 @@ from ..utils import logging
 logger = logging.get_logger(__name__)
 
 ADAPTER_CONFIG_NAME = "adapter_config.json"
+
+QWEN2_LORA_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+QWEN3_NEXT_LORA_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "in_proj_qkvz",
+    "in_proj_ba",
+    "out_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+QWEN3_5_LORA_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "out_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+FUSED_MOE_LORA_MODULES = ("gate_proj", "up_proj", "down_proj")
+LORA_MODULES_BY_MODEL_TYPE = MappingProxyType(
+    {
+        "qwen2": QWEN2_LORA_MODULES,
+        "qwen2_vl": QWEN2_LORA_MODULES,
+        "qwen2_5_vl": QWEN2_LORA_MODULES,
+        "qwen3": QWEN2_LORA_MODULES,
+        "qwen3_moe": QWEN2_LORA_MODULES,
+        "qwen3_vl": QWEN2_LORA_MODULES,
+        "qwen3_vl_moe": QWEN2_LORA_MODULES,
+        "qwen3_next": QWEN3_NEXT_LORA_MODULES,
+        "qwen3_5": QWEN3_5_LORA_MODULES,
+        "qwen3_5_text": QWEN3_5_LORA_MODULES,
+        "qwen3_5_moe": QWEN3_5_LORA_MODULES,
+        "qwen3_5_moe_text": QWEN3_5_LORA_MODULES,
+    }
+)
 
 # Namespaced block inside adapter_config.json for VeOmni-only settings. PEFT's
 # ``LoraConfig.from_pretrained`` drops unknown top-level keys, so anything the

@@ -267,8 +267,8 @@ class TestQwen35LoraFlops:
             images_seqlens=images_seqlens,
         )
 
-        # The language-only LoRA API freezes the vision tower: forward-only
-        # ViT work is one third of the full forward-plus-backward estimate.
+        # Qwen3.5's supported LoRA targets do not match the vision tower, so its
+        # inputs and parameters require no gradients and it executes forward-only.
         assert lora_vl - lora_text == pytest.approx((full_vl - full_text) / 3, rel=1e-9)
 
 
@@ -673,6 +673,34 @@ class TestQwen2LoraFlops:
         ]
         expected = self._expected_flops(qwen3_config, batch_seqlens, 2.0, 8, default_modules)
         assert flops == pytest.approx(expected, rel=1e-9)
+
+    def test_frozen_lm_head_keeps_input_gradient_cost(self, qwen3_config):
+        batch_seqlens = [12, 5]
+        tokens_sum = sum(batch_seqlens)
+        larger_vocab_config = deepcopy(qwen3_config)
+        larger_vocab_config.vocab_size += 1
+
+        full_flops, _ = VeomniFlopsCounter(qwen3_config).estimate_flops(batch_seqlens, delta_time=1.0)
+        larger_full_flops, _ = VeomniFlopsCounter(larger_vocab_config).estimate_flops(
+            batch_seqlens,
+            delta_time=1.0,
+        )
+        lora_flops, _ = VeomniFlopsCounter(qwen3_config).estimate_flops(
+            batch_seqlens,
+            delta_time=1.0,
+            lora_rank=8,
+        )
+        larger_lora_flops, _ = VeomniFlopsCounter(larger_vocab_config).estimate_flops(
+            batch_seqlens,
+            delta_time=1.0,
+            lora_rank=8,
+        )
+
+        # A larger vocabulary adds one lm_head row. FFT computes forward, dX,
+        # and dW; LoRA freezes the head but still computes forward and dX.
+        one_head_row_flops = qwen3_config.hidden_size * tokens_sum / 1e12
+        assert larger_full_flops - full_flops == pytest.approx(6 * one_head_row_flops, rel=1e-9)
+        assert larger_lora_flops - lora_flops == pytest.approx(4 * one_head_row_flops, rel=1e-9)
 
     def test_qwen2_model_type(self, qwen3_config):
         qwen2_config = deepcopy(qwen3_config)
