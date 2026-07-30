@@ -146,6 +146,17 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
 
 
 def _synchronize_chunk_count(local_chunk_count: int) -> int:
+    """Synchronize the number of forward rounds for one packed micro-batch.
+
+    Dynamic batching can produce different segment counts on data-parallel
+    ranks, so this reduction cannot be cached across micro-batches. It runs
+    once per micro-batch, not once per decoder layer or chunk, and costs one
+    reduction per owning mesh dimension plus one device-to-host read.
+
+    No separate Ulysses-group reduction is needed because sequence-parallel
+    collation gives those ranks identical cumulative sequence metadata. The
+    owning FSDP or EP-FSDP mesh may already include fused SP ranks.
+    """
     parallel_state = get_parallel_state()
     mesh = None
     if getattr(parallel_state, "any_extra_parallel_enabled", False):
@@ -332,6 +343,8 @@ def _wrap_qwen3_vl_moe_routers(target_modules: list[nn.Module]) -> None:
             continue
         orig_forward = router.forward
 
+        # The wrapper is instance-scoped because only the selected model's
+        # routers should observe the per-forward ChunkMBS context.
         @wraps(orig_forward)
         def wrapped_forward(*args, __orig_forward=orig_forward, **kwargs):
             outputs = __orig_forward(*args, **kwargs)
@@ -549,8 +562,8 @@ class _VariableSplitAllToAll(torch.autograd.Function):
         dist.all_to_all_single(
             output,
             input_tensor.contiguous(),
-            output_split_sizes=output_splits,
-            input_split_sizes=input_splits,
+            output_split_sizes=list(output_splits),
+            input_split_sizes=list(input_splits),
             group=group,
         )
         return output
@@ -655,6 +668,9 @@ def _slice_sp_kwargs(
         if key in chunk_kwargs:
             chunk_kwargs[key] = max(seq_range.max_length, padding_length)
 
+    # apply_chunk_mbs restricts this path to _QWEN3_VL_DECODER_CLASSES, whose
+    # layers have no linear attention. Their collator still emits this
+    # compatibility alias, so do not forward it to the decoder.
     chunk_kwargs.pop("linear_attn_cu_seq_lens_q", None)
     return chunk_kwargs
 

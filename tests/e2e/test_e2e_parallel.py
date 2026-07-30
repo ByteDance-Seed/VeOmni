@@ -269,6 +269,18 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        False,  # chunk_mbs_enabled
+        id="qwen3vl",
+    ),
+    pytest.param(
+        "qwen3vl",
+        "./tests/toy_config/qwen3vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        True,  # chunk_mbs_enabled
+        id="qwen3vl-chunk-mbs",
     ),
     pytest.param(
         "qwen3vlmoe",
@@ -277,6 +289,18 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        False,  # chunk_mbs_enabled
+        id="qwen3vlmoe",
+    ),
+    pytest.param(
+        "qwen3vlmoe",
+        "./tests/toy_config/qwen3vlmoe_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        True,  # chunk_mbs_enabled
+        id="qwen3vlmoe-chunk-mbs",
     ),
     pytest.param(
         "qwen3_5_moe",
@@ -285,6 +309,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        False,  # chunk_mbs_enabled
         marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
@@ -294,6 +319,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        False,  # chunk_mbs_enabled
         marks=_qwen3_5_npu_skip,
     ),
 ]
@@ -540,7 +566,10 @@ def test_qwen2vl_parallel_align(
     )
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen3vl_test_cases)
+@pytest.mark.parametrize(
+    "model_name, config_path, is_moe, rtol, atol, max_sp_size, chunk_mbs_enabled",
+    qwen3vl_test_cases,
+)
 def test_qwen3vl_parallel_align(
     model_name: str,
     config_path: str,
@@ -548,9 +577,9 @@ def test_qwen3vl_parallel_align(
     rtol: float,
     atol: float,
     max_sp_size: int | None,
+    chunk_mbs_enabled: bool,
     request: pytest.FixtureRequest,
 ):
-    chunk_mbs_enabled = model_name in {"qwen3vl", "qwen3vlmoe"}
     dataset_fixture = "dummy_qwen3vl_chunk_mbs_dataset" if chunk_mbs_enabled else "dummy_qwen3vl_dataset"
     main(
         task_name="train_vlm_test",
