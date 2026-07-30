@@ -68,6 +68,14 @@ overrides = [
 ]
 
 [[manifest.dependency-metadata]]
+name = "create-block-mask-cuda"
+version = "0.1"
+
+[[manifest.dependency-metadata]]
+name = "flash-attn-cute"
+version = "0.0.2"
+
+[[manifest.dependency-metadata]]
 name = "flash-qla"
 version = "0.1.0"
 requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
@@ -75,6 +83,10 @@ requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
 [[manifest.dependency-metadata]]
 name = "magi-attention"
 version = "1.1.1"
+
+[[manifest.dependency-metadata]]
+name = "magi-to-hstu-cuda"
+version = "0.1"
 
 [[package]]
 name = "accelerate"
@@ -554,6 +566,11 @@ wheels = [
 ]
 
 [[package]]
+name = "create-block-mask-cuda"
+version = "0.1"
+source = { git = "https://github.com/demonatic/flash-attention.git?subdirectory=csrc%2Futils%2Fcreate_block_mask&rev=ee1d15159cda6f3f97bfab9e487da146a8254970#ee1d15159cda6f3f97bfab9e487da146a8254970" }
+
+[[package]]
 name = "cuda-bindings"
 version = "12.9.4"
 source = { registry = "https://pypi.org/simple" }
@@ -928,6 +945,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/1b/81/3f32c9f5eb427605d
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/47/3c44b8342d14d7d8e386b4c4363c283aaa2858c6aeb9ecf6f040307d627c/flash_attn_4-4.0.0b16-py3-none-any.whl", hash = "sha256:857bd84cd5884d41b7096826b31c16c281ddde269760bbd5dfafe19a4639b250", size = 340034, upload-time = "2026-06-03T09:45:40.893Z" },
 ]
+
+[[package]]
+name = "flash-attn-cute"
+version = "0.0.2"
+source = { git = "https://github.com/demonatic/flash-attention.git?subdirectory=flash_attn&rev=ee1d15159cda6f3f97bfab9e487da146a8254970#ee1d15159cda6f3f97bfab9e487da146a8254970" }
 
 [[package]]
 name = "flash-linear-attention"
@@ -1490,6 +1512,11 @@ wheels = [
 name = "magi-attention"
 version = "1.1.1"
 source = { git = "https://github.com/SandAI-org/MagiAttention.git?rev=d7ea8afd44c790b65fab68a04a6a0fdd5adbf182#d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
+
+[[package]]
+name = "magi-to-hstu-cuda"
+version = "0.1"
+source = { git = "https://github.com/demonatic/flash-attention.git?subdirectory=csrc%2Futils%2Fmagi_to_hstu&rev=ee1d15159cda6f3f97bfab9e487da146a8254970#ee1d15159cda6f3f97bfab9e487da146a8254970" }
 
 [[package]]
 name = "markdown-it-py"
@@ -4101,6 +4128,7 @@ gpu = [
     { name = "av", version = "14.2.0", source = { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }, marker = "(python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version < '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version < '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (python_full_version < '3.12' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "av", version = "14.4.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform != 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform == 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "av", version = "14.4.0", source = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }, marker = "(python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "create-block-mask-cuda", marker = "sys_platform == 'linux'" },
     { name = "cuda-python" },
     { name = "debugpy" },
     { name = "diffusers" },
@@ -4109,6 +4137,7 @@ gpu = [
     { name = "flash-attn-3", version = "3.0.0", source = { url = "https://download.pytorch.org/whl/cu130/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_34_aarch64.whl" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "flash-attn-3", version = "3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90", source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "flash-attn-4" },
+    { name = "flash-attn-cute", marker = "sys_platform == 'linux'" },
     { name = "flash-linear-attention" },
     { name = "flash-mla", version = "1.0.0+9241ae3", source = { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda130sm90asm100f-cp311-cp311-linux_aarch64.whl" }, marker = "(python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "flash-mla", version = "1.0.0+9241ae3", source = { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda130sm90asm100f-cp312-cp312-linux_aarch64.whl" }, marker = "(python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version < '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version < '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (python_full_version < '3.12' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
@@ -4121,6 +4150,7 @@ gpu = [
     { name = "librosa" },
     { name = "liger-kernel" },
     { name = "magi-attention", marker = "sys_platform == 'linux'" },
+    { name = "magi-to-hstu-cuda", marker = "sys_platform == 'linux'" },
     { name = "megatron-energon" },
     { name = "nvidia-cudnn-frontend" },
     { name = "nvidia-cusparselt-cu13" },
@@ -4237,6 +4267,7 @@ requires-dist = [
     { name = "av", marker = "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform != 'linux' and extra == 'gpu'", specifier = ">=14.2.0,<14.3" },
     { name = "av", marker = "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform != 'linux' and extra == 'gpu'", specifier = ">=14.3.0,<15.0" },
     { name = "blobfile", specifier = ">=3.0.0" },
+    { name = "create-block-mask-cuda", marker = "sys_platform == 'linux' and extra == 'gpu'", git = "https://github.com/demonatic/flash-attention.git?subdirectory=csrc%2Futils%2Fcreate_block_mask&rev=ee1d15159cda6f3f97bfab9e487da146a8254970" },
     { name = "cuda-python", marker = "extra == 'gpu'", specifier = "==13.0.3" },
     { name = "datasets", specifier = ">=2.20.0,<=2.21.0" },
     { name = "debugpy", marker = "extra == 'gpu'" },
@@ -4253,6 +4284,7 @@ requires-dist = [
     { name = "flash-attn-3", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'gpu'", url = "https://download.pytorch.org/whl/cu130/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_34_aarch64.whl" },
     { name = "flash-attn-3", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl" },
     { name = "flash-attn-4", marker = "extra == 'gpu'", specifier = "==4.0.0b16" },
+    { name = "flash-attn-cute", marker = "sys_platform == 'linux' and extra == 'gpu'", git = "https://github.com/demonatic/flash-attention.git?subdirectory=flash_attn&rev=ee1d15159cda6f3f97bfab9e487da146a8254970" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
     { name = "flash-mla", marker = "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda130sm90asm100f-cp311-cp311-linux_aarch64.whl" },
     { name = "flash-mla", marker = "(python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'gpu') or (python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'gpu') or (python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'gpu') or (python_full_version >= '3.13' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'gpu')" },
@@ -4272,6 +4304,7 @@ requires-dist = [
     { name = "librosa", marker = "extra == 'npu-aarch64'", specifier = ">=0.11.0,<0.12" },
     { name = "liger-kernel", marker = "extra == 'gpu'" },
     { name = "magi-attention", marker = "sys_platform == 'linux' and extra == 'gpu'", git = "https://github.com/SandAI-org/MagiAttention.git?rev=d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" },
+    { name = "magi-to-hstu-cuda", marker = "sys_platform == 'linux' and extra == 'gpu'", git = "https://github.com/demonatic/flash-attention.git?subdirectory=csrc%2Futils%2Fmagi_to_hstu&rev=ee1d15159cda6f3f97bfab9e487da146a8254970" },
     { name = "matplotlib", specifier = ">=3.7" },
     { name = "megatron-energon", marker = "extra == 'gpu'", specifier = ">=7.2.1" },
     { name = "megatron-energon", marker = "extra == 'npu'", specifier = ">=7.2.1" },

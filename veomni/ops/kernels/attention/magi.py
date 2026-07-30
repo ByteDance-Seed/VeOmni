@@ -20,7 +20,24 @@ from typing import Callable, Optional
 import torch
 
 from ....distributed.parallel_state import get_parallel_state
+from ....utils.device import get_gpu_compute_capability
 from .ulysses import prepare_ulysses_qkv, restore_ulysses_output
+
+
+try:
+    from flash_attn_cute.ffa_fa3 import flash_attn_interface as _magi_cutlass_backend
+except (ImportError, OSError, RuntimeError) as error:
+    _magi_cutlass_backend = None
+    _magi_cutlass_backend_error = error
+else:
+    _magi_cutlass_backend_error = None
+
+
+_MAGI_KERNEL_UNSUPPORTED = "unsupported"
+_MAGI_KERNEL_CUTLASS = "cutlass"
+_MAGI_KERNEL_CUTE_JIT = "cute_jit"
+_MAGI_CUTLASS_STACK_SIZE = 8192
+_prepared_default_magi_devices: set[torch.device] = set()
 
 
 @dataclass(frozen=True)
@@ -111,6 +128,95 @@ def _validate_attn_type_values(attn_type_map: torch.Tensor) -> None:
     _require_all(valid_types, "MagiAttentionMask attn_type_map values must be in [0, 3].")
 
 
+def _get_magi_kernel_mode(device: torch.device) -> str:
+    """Resolve the FA4 implementation selected by MagiAttention."""
+    if device.type != "cuda":
+        return _MAGI_KERNEL_UNSUPPORTED
+
+    compute_capability = get_gpu_compute_capability(device)
+    if 80 <= compute_capability < 100:
+        return _MAGI_KERNEL_CUTLASS
+    if compute_capability >= 100:
+        return _MAGI_KERNEL_CUTE_JIT
+    return _MAGI_KERNEL_UNSUPPORTED
+
+
+def _prepare_default_magi_kernel(device: torch.device) -> None:
+    """Prepare the hardware-specific FA4 implementation once per device."""
+    if device in _prepared_default_magi_devices:
+        return
+
+    kernel_mode = _get_magi_kernel_mode(device)
+    if kernel_mode == _MAGI_KERNEL_UNSUPPORTED:
+        compute_capability = get_gpu_compute_capability(device) if device.type == "cuda" else 0
+        hardware = f"SM{compute_capability}" if compute_capability else device.type
+        raise RuntimeError(
+            f"VeOmni `magi_attention` does not support {hardware}; "
+            "MagiAttention FFA requires an NVIDIA SM80 or newer GPU."
+        )
+
+    if kernel_mode == _MAGI_KERNEL_CUTLASS and _magi_cutlass_backend is None:
+        compute_capability = get_gpu_compute_capability(device)
+        build_arch = "sm80" if compute_capability < 90 else "sm90"
+        raise ImportError(
+            f"VeOmni `magi_attention` on SM{compute_capability} requires MagiAttention's "
+            "precompiled CUTLASS FFA backend. Run `uv sync --extra gpu --dev`, then "
+            f"`bash scripts/kernel/install_magi_sm80_sm90.sh {build_arch}`."
+        ) from _magi_cutlass_backend_error
+
+    if kernel_mode == _MAGI_KERNEL_CUTLASS:
+        _prepare_magi_cutlass_device(device)
+
+    # The CUTE DSL path needs no VeOmni setup. MagiAttention compiles and
+    # caches the SM100 kernel when ffa_fa4_func invokes flash_attn_cute.
+    _prepared_default_magi_devices.add(device)
+
+
+def _prepare_magi_cutlass_device(device: torch.device) -> None:
+    """Apply the MagiAttention 1.1.1 compatibility setup for SM80/SM90."""
+    _install_magi_tile_size_compatibility()
+    _ensure_magi_cutlass_stack_size(device)
+
+
+def _install_magi_tile_size_compatibility() -> None:
+    # MagiAttention 1.1.1 imports this helper from ``utils``, while the
+    # corresponding flash-attn-cute revision publishes it from ``tile_size``.
+    # Expose the expected name before importing MagiAttention so FA4AttnArg
+    # builds Q2K/K2Q metadata with the kernel's actual tile sizes.
+    from flash_attn_cute import tile_size as flash_attn_tile_size
+    from flash_attn_cute import utils as flash_attn_utils
+
+    if not hasattr(flash_attn_utils, "get_tile_sizes_by_backend"):
+        flash_attn_utils.get_tile_sizes_by_backend = flash_attn_tile_size.get_tile_sizes_by_backend
+
+
+def _ensure_magi_cutlass_stack_size(device: torch.device) -> None:
+    """Raise the CUDA thread stack limit required by CUTLASS FFA backward."""
+    try:
+        from cuda.bindings import runtime
+    except ImportError as error:
+        raise ImportError(
+            "VeOmni `magi_attention` on SM80/SM90 requires `cuda-bindings`; install VeOmni with the `gpu` extra."
+        ) from error
+
+    with torch.cuda.device(device):
+        get_error, current_stack_size = runtime.cudaDeviceGetLimit(runtime.cudaLimit.cudaLimitStackSize)
+        if get_error != runtime.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"Failed to query the CUDA device stack size: {get_error}.")
+        if current_stack_size >= _MAGI_CUTLASS_STACK_SIZE:
+            return
+
+        (set_error,) = runtime.cudaDeviceSetLimit(
+            runtime.cudaLimit.cudaLimitStackSize,
+            _MAGI_CUTLASS_STACK_SIZE,
+        )
+        if set_error != runtime.cudaError_t.cudaSuccess:
+            raise RuntimeError(
+                "Failed to configure the CUDA device stack required by MagiAttention "
+                f"CUTLASS arbitrary-mask backward: {set_error}."
+            )
+
+
 def _default_magi_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -122,16 +228,21 @@ def _default_magi_attention_forward(
     softmax_scale: float | None,
     softcap: float,
 ):
-    """Load and call MagiAttention's public non-distributed FFA API."""
+    """Load and call MagiAttention's architecture-portable FA4 facade."""
+    _prepare_default_magi_kernel(query.device)
+
     try:
-        from magi_attention.api import flex_flash_attn_func
+        from magi_attention.api import AttnForwardMeta
+        from magi_attention.functional import ffa_fa4_func
     except ImportError as error:
         raise ImportError(
             "VeOmni `magi_attention` requires the optional `magi-attention` package. "
             "Install VeOmni with the `gpu` extra."
         ) from error
 
-    return flex_flash_attn_func(
+    # MagiAttention dispatches this facade by query.device:
+    # SM80/SM90 -> precompiled ffa_fa3 CUTLASS; SM100+ -> CUTE DSL/JIT.
+    output, lse = ffa_fa4_func(
         query,
         key,
         value,
@@ -141,10 +252,11 @@ def _default_magi_attention_forward(
         softmax_scale=softmax_scale,
         softcap=softcap,
     )
+    return output, AttnForwardMeta(lse=lse, max_logits=None)
 
 
-# Module-level patch slot for MagiAttention's public FFA function. Keeping the
-# import in the default callable preserves CPU-safe VeOmni imports.
+# Module-level patch slot for MagiAttention's FA4 facade. Keeping the import in
+# the default callable preserves CPU-safe VeOmni imports.
 _magi_attention_forward: Callable = _default_magi_attention_forward
 
 

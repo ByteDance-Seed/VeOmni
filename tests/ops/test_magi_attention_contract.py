@@ -126,19 +126,28 @@ def test_magi_attention_preserves_backend_autograd(monkeypatch):
         assert torch.isfinite(tensor.grad).all()
 
 
-def test_default_magi_backend_lazily_calls_public_package_api(monkeypatch):
+def test_default_magi_backend_lazily_calls_package_fa4_facade(monkeypatch):
     captured = {}
 
-    def fake_ffa(query, key, value, **kwargs):
+    def fake_ffa_fa4(query, key, value, **kwargs):
         captured.update(query=query, key=key, value=value, kwargs=kwargs)
-        return "output", "meta"
+        return "output", "lse"
+
+    class FakeAttnForwardMeta:
+        def __init__(self, *, lse, max_logits):
+            self.lse = lse
+            self.max_logits = max_logits
 
     fake_package = ModuleType("magi_attention")
     fake_package.__path__ = []
     fake_api = ModuleType("magi_attention.api")
-    fake_api.flex_flash_attn_func = fake_ffa
+    fake_api.AttnForwardMeta = FakeAttnForwardMeta
+    fake_functional = ModuleType("magi_attention.functional")
+    fake_functional.ffa_fa4_func = fake_ffa_fa4
     monkeypatch.setitem(sys.modules, "magi_attention", fake_package)
     monkeypatch.setitem(sys.modules, "magi_attention.api", fake_api)
+    monkeypatch.setitem(sys.modules, "magi_attention.functional", fake_functional)
+    monkeypatch.setattr(magi_backend, "_prepare_default_magi_kernel", lambda device: None)
     query = torch.randn(8, 4, 16)
     key = torch.randn(8, 2, 16)
     value = torch.randn(8, 2, 16)
@@ -155,7 +164,9 @@ def test_default_magi_backend_lazily_calls_public_package_api(monkeypatch):
         softcap=30.0,
     )
 
-    assert result == ("output", "meta")
+    assert result[0] == "output"
+    assert result[1].lse == "lse"
+    assert result[1].max_logits is None
     assert captured["query"] is query
     assert captured["key"] is key
     assert captured["value"] is value
@@ -166,6 +177,76 @@ def test_default_magi_backend_lazily_calls_public_package_api(monkeypatch):
         "softmax_scale": 0.25,
         "softcap": 30.0,
     }
+
+
+@pytest.mark.parametrize(
+    ("compute_capability", "expected_mode"),
+    [
+        (75, magi_backend._MAGI_KERNEL_UNSUPPORTED),
+        (80, magi_backend._MAGI_KERNEL_CUTLASS),
+        (89, magi_backend._MAGI_KERNEL_CUTLASS),
+        (90, magi_backend._MAGI_KERNEL_CUTLASS),
+        (100, magi_backend._MAGI_KERNEL_CUTE_JIT),
+        (120, magi_backend._MAGI_KERNEL_CUTE_JIT),
+    ],
+)
+def test_magi_kernel_mode_follows_query_device(monkeypatch, compute_capability, expected_mode):
+    monkeypatch.setattr(magi_backend, "get_gpu_compute_capability", lambda device: compute_capability)
+
+    assert magi_backend._get_magi_kernel_mode(torch.device("cuda")) == expected_mode
+
+
+@pytest.mark.parametrize(("compute_capability", "build_arch"), [(80, "sm80"), (86, "sm80"), (90, "sm90")])
+def test_magi_cutlass_mode_reports_arch_specific_installer(monkeypatch, compute_capability, build_arch):
+    monkeypatch.setattr(magi_backend, "get_gpu_compute_capability", lambda device: compute_capability)
+    monkeypatch.setattr(magi_backend, "_magi_cutlass_backend", None)
+
+    with pytest.raises(
+        ImportError,
+        match=rf"install_magi_sm80_sm90\.sh {build_arch}",
+    ):
+        magi_backend._prepare_default_magi_kernel(torch.device("cuda"))
+
+
+def test_magi_cute_jit_mode_does_not_require_cutlass_backend(monkeypatch):
+    calls = 0
+
+    def fake_compute_capability(device):
+        nonlocal calls
+        calls += 1
+        return 100
+
+    monkeypatch.setattr(magi_backend, "get_gpu_compute_capability", fake_compute_capability)
+    monkeypatch.setattr(magi_backend, "_magi_cutlass_backend", None)
+    monkeypatch.setattr(magi_backend, "_prepared_default_magi_devices", set())
+
+    magi_backend._prepare_default_magi_kernel(torch.device("cuda"))
+    magi_backend._prepare_default_magi_kernel(torch.device("cuda"))
+
+    assert calls == 1
+    assert magi_backend._prepared_default_magi_devices == {torch.device("cuda")}
+
+
+def test_magi_cutlass_mode_prepares_device_once(monkeypatch):
+    prepared_devices = []
+    monkeypatch.setattr(magi_backend, "get_gpu_compute_capability", lambda device: 80)
+    monkeypatch.setattr(magi_backend, "_magi_cutlass_backend", object())
+    monkeypatch.setattr(magi_backend, "_prepared_default_magi_devices", set())
+    monkeypatch.setattr(
+        magi_backend,
+        "_prepare_magi_cutlass_device",
+        lambda device: prepared_devices.append(device),
+    )
+
+    magi_backend._prepare_default_magi_kernel(torch.device("cuda"))
+    magi_backend._prepare_default_magi_kernel(torch.device("cuda"))
+
+    assert prepared_devices == [torch.device("cuda")]
+
+
+def test_magi_unsupported_mode_fails_before_backend_call():
+    with pytest.raises(RuntimeError, match="does not support cpu"):
+        magi_backend._prepare_default_magi_kernel(torch.device("cpu"))
 
 
 @pytest.mark.parametrize(

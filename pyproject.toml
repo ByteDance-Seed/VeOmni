@@ -89,6 +89,12 @@ gpu = [
   "megatron-energon>=7.2.1",
   "hf_transfer",
   "debugpy",
+  # MagiAttention's public API and SM100+ CUTE DSL backend. SM80/SM90 require
+  # the architecture-specific CUTLASS overlay installed by scripts/kernel/.
+  # Companion packages use the flash-attention revision from MagiAttention 1.1.1.
+  "create-block-mask-cuda==0.1; sys_platform == 'linux'",
+  "flash-attn-cute==0.0.2; sys_platform == 'linux'",
+  "magi-to-hstu-cuda==0.1; sys_platform == 'linux'",
   "magi-attention==1.1.1; sys_platform == 'linux'",
 ]
 
@@ -201,6 +207,9 @@ conflicts = [
 [tool.uv.sources]
 patchgen = { path = "patchgen-pkg", editable = true }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
+create-block-mask-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/create_block_mask" }
+flash-attn-cute = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "flash_attn" }
+magi-to-hstu-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/magi_to_hstu" }
 # Direct wheel URLs for gpu — pytorch index sometimes resolves cu128_full wheels
 # that drop nvidia-* deps and confuse uv into uninstalling them. Update both
 # Python versions and architectures when bumping torch.
@@ -288,16 +297,36 @@ name = "magi-attention"
 version = "1.1.1"
 requires-dist = []
 
+[[tool.uv.dependency-metadata]]
+name = "create-block-mask-cuda"
+version = "0.1"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn-cute"
+version = "0.0.2"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "magi-to-hstu-cuda"
+version = "0.1"
+requires-dist = []
+
 # Seeds the build env (uv-created venvs are not seeded by default).
 [tool.uv.extra-build-dependencies]
+create-block-mask-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
 flash-attn-4 = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+flash-attn-cute = ["setuptools", "wheel"]
 flash-qla = ["setuptools", "wheel", "packaging", "ninja", "torch"]
 magi-attention = ["setuptools>=78.1.1", "wheel", "packaging>=24.2", "ninja", "torch", "versioningit"]
+magi-to-hstu-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
 
 [tool.uv.extra-build-variables]
-# MagiAttention v1.1.1 does not support magi_attn_comm or native FFA on
-# Ampere. Keep the core extension for the current A100 + CP=1/Ulysses path.
-magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
+# MagiAttention v1.1.1 supports FFA_FA4 on SM80, SM90, and SM100. Build the
+# complete supported matrix so cached wheels are portable across GPU hosts.
+magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "80,90,100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
+create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "80,90,100" }
+magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}

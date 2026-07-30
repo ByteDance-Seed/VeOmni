@@ -62,7 +62,13 @@ The backend compute functions are replaceable module-level slots:
 - `attention.flex._flex_attention_forward`, defaulting to Transformers'
   `flex_attention_forward`;
 - `attention.magi._magi_attention_forward`, defaulting to a lazy import of
-  `magi_attention.api.flex_flash_attn_func`.
+  MagiAttention's architecture-portable `functional.ffa_fa4_func`.
+
+The Magi default uses the package's existing `FA4AttnFunc` autograd node.
+VeOmni adds no custom autograd implementation. On SM80/SM90, its first use on
+each device also applies the MagiAttention 1.1.1 tile-helper compatibility
+alias and raises the CUDA thread stack limit required by arbitrary-mask
+backward. SM100 and newer retain MagiAttention's CUTE DSL/JIT path.
 
 All three public callables use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
@@ -105,8 +111,24 @@ public non-distributed FFA API. The generic adapter does not infer ranges from
 dense masks or convert a FlexAttention `BlockMask`.
 
 The current adapter requires `cp_size == 1`, batch size 1, zero attention
-dropout, and NVIDIA SM90 or newer. It accepts SP1 or VeOmni Ulysses sequence
+dropout, and NVIDIA SM80 or newer. It accepts SP1 or VeOmni Ulysses sequence
 parallelism, passes `scaling` as Magi's `softmax_scale`, and passes `softcap`.
+SM100+ uses the CUTE JIT backend installed by the `gpu` extra. SM80/SM90 uses
+the separately compiled BF16 CUTLASS backend, specialized for head dimensions
+64 and 128 and FFA function counts 1 and 3:
+
+```bash
+uv sync --extra gpu --dev
+bash scripts/kernel/install_magi_sm80_sm90.sh sm80  # A100 / SM8x
+# or: bash scripts/kernel/install_magi_sm80_sm90.sh sm90  # H100 / SM9x
+```
+
+Run the architecture-specific installer after the final uv sync, because an
+exact later sync removes the overlay package. Without the overlay, VeOmni
+imports normally and reports the required command only if `magi_attention` is
+selected on SM80/SM90. The precompiled profile does not include FP16; upstream
+FFA rejects FP16 inputs with its build-capability guard.
+
 Standalone `sliding_window` metadata is rejected because all visibility must
 already be encoded by the range mask. MagiAttention's own FFA autograd
 implementation supplies backward; VeOmni does not add a custom autograd node.
