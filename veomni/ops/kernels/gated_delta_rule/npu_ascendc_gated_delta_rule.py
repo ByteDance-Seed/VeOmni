@@ -35,8 +35,6 @@ the backend is selected).
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 from ._ascend.flash_gated_delta_rule import flash_gated_delta_rule
@@ -48,11 +46,11 @@ def chunk_gated_delta_rule(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: Optional[float] = None,
-    initial_state: Optional[torch.Tensor] = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
     **kwargs,
 ):
     # q/k/v arrive as [B, T, H, D]; the AscendC entry wants [B, H, T, D].
