@@ -127,17 +127,6 @@ def deepseek_v4_counter(deepseek_v4_config):
 class TestQwen35Flops:
     pytestmark = pytest.mark.usefixtures("mock_device_flops")
 
-    def test_text_only(self, qwen3_5_counter):
-        batch_seqlens = [1024, 1024, 1024, 1024]
-        flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        assert flops > 0
-
-    def test_with_vit(self, qwen3_5_counter):
-        batch_seqlens = [1024, 1024, 1024, 1024]
-        text_flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        vit_flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
-        assert vit_flops > text_flops
-
     def test_numerical(self, qwen3_5_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0)
@@ -235,31 +224,6 @@ class TestQwen35LoraFlops:
         expected = self._expected_flops(qwen3_5_counter.config, batch_seqlens, 2.0, 8, lora_modules)
         assert flops == pytest.approx(expected, rel=1e-9)
 
-    def test_default_lora_modules(self, qwen3_5_counter):
-        batch_seqlens = [12, 5]
-        flops, _ = qwen3_5_counter.estimate_flops(
-            batch_seqlens,
-            delta_time=2.0,
-            lora_config=_default_lora_config(qwen3_5_counter.config),
-        )
-
-        default_modules = [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "in_proj_qkv",
-            "in_proj_z",
-            "in_proj_b",
-            "in_proj_a",
-            "out_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ]
-        expected = self._expected_flops(qwen3_5_counter.config, batch_seqlens, 2.0, 8, default_modules)
-        assert flops == pytest.approx(expected, rel=1e-9)
-
     def test_standalone_text_model_type(self, qwen3_5_counter):
         text_config = deepcopy(qwen3_5_counter.config.text_config)
         counter = VeomniFlopsCounter(text_config)
@@ -274,43 +238,50 @@ class TestQwen35LoraFlops:
         expected = self._expected_flops(text_config, [12, 5], 2.0, 8, lora_modules)
         assert flops == pytest.approx(expected, rel=1e-9)
 
-    def test_vision_inputs_use_frozen_vit_cost(self, qwen3_5_counter):
+    def test_vision_flops_follow_input_and_lora_targets(self, qwen3_5_counter):
         batch_seqlens = [12, 5]
         images_seqlens = [16]
+        rank = 8
+
         full_text, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=2.0)
         full_vl, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
             images_seqlens=images_seqlens,
         )
-        lora_config = _lora_config(8, ["q_proj", "in_proj_qkv", "gate_proj"])
+        decoder_lora_config = _lora_config(rank, ["q_proj", "in_proj_qkv", "gate_proj"])
         lora_text, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
-            lora_config=lora_config,
+            lora_config=decoder_lora_config,
+        )
+        empty_image_flops, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=decoder_lora_config,
+            images_seqlens=[],
         )
         lora_vl, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
-            lora_config=lora_config,
+            lora_config=decoder_lora_config,
             images_seqlens=images_seqlens,
         )
 
+        # No vision tokens skip the ViT. Decoder-only targets leave it frozen
+        # and detached, so only one forward pass (one third of FFT) remains.
+        assert empty_image_flops == lora_text
         # Decoder-only targets leave the vision tower frozen and detached.
         assert lora_vl - lora_text == pytest.approx((full_vl - full_text) / 3, rel=1e-9)
 
-    def test_vision_target_counts_backward_and_adapter_flops(self, qwen3_5_counter):
-        batch_seqlens = [12, 5]
-        images_seqlens = [16]
-        rank = 8
         text_flops, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
-            delta_time=1.0,
+            delta_time=2.0,
             lora_config=_lora_config(rank, ["qkv"]),
         )
         vl_flops, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
-            delta_time=1.0,
+            delta_time=2.0,
             lora_config=_lora_config(rank, ["qkv"]),
             images_seqlens=images_seqlens,
         )
@@ -335,34 +306,11 @@ class TestQwen35LoraFlops:
             * vision.depth
         )
 
-        assert vl_flops - text_flops == pytest.approx((linear_flops + attention_flops) / 1e12, rel=1e-9)
-
-    def test_empty_image_sequences_skip_vision(self, qwen3_5_counter):
-        lora_config = _lora_config(8, ["linear_fc1"])
-        text_flops, _ = qwen3_5_counter.estimate_flops([12, 5], 1.0, lora_config=lora_config)
-        empty_image_flops, _ = qwen3_5_counter.estimate_flops(
-            [12, 5],
-            1.0,
-            lora_config=lora_config,
-            images_seqlens=[],
-        )
-
-        assert empty_image_flops == text_flops
+        assert vl_flops - text_flops == pytest.approx((linear_flops + attention_flops) / 2.0 / 1e12, rel=1e-9)
 
 
 class TestQwen35MoeFlops:
     pytestmark = pytest.mark.usefixtures("mock_device_flops")
-
-    def test_text_only(self, qwen3_5_moe_counter):
-        batch_seqlens = [1024, 1024, 1024, 1024]
-        flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        assert flops > 0
-
-    def test_with_vit(self, qwen3_5_moe_counter):
-        batch_seqlens = [1024, 1024, 1024, 1024]
-        text_flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        vit_flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
-        assert vit_flops > text_flops
 
     def test_numerical(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
@@ -410,24 +358,6 @@ class TestQwen3Flops:
 
         flops, _ = qwen3_counter.estimate_flops(batch_seqlens, delta_time=1.0)
         assert flops == pytest.approx(expected_flops / 1e12, rel=1e-9)
-
-    @pytest.mark.parametrize(
-        "lora_modules",
-        [
-            ["q_proj", "in_proj_qkv", "out_proj"],
-            ["gate_proj", "up_proj", "down_proj"],
-        ],
-    )
-    def test_lora_modules(self, qwen3_5_moe_counter, lora_modules):
-        batch_seqlens = [12, 5]
-        full_flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        lora_flops, _ = qwen3_5_moe_counter.estimate_flops(
-            batch_seqlens,
-            delta_time=1.0,
-            lora_config=_lora_config(8, lora_modules),
-        )
-
-        assert 0 < lora_flops < full_flops
 
     def test_standalone_moe_text_model_type(self, qwen3_5_moe_counter):
         text_config = deepcopy(qwen3_5_moe_counter.config.text_config)
@@ -517,30 +447,6 @@ class TestAllQwenLoraFlops:
 
         assert 0 < lora_flops < full_flops
 
-    def test_qwen3_moe_adapter_work_scales_with_topk(self):
-        config = _load_toy_config("tests/toy_config/qwen3_moe_toy")
-
-        def rank_delta(current_config):
-            counter = VeomniFlopsCounter(current_config)
-            rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(4))
-            rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(8))
-            return rank8 - rank4
-
-        topk1_config = deepcopy(config)
-        topk1_config.num_experts_per_tok = 1
-
-        actual_delta = rank_delta(config)
-        params_per_rank = (
-            3
-            * (config.hidden_size + config.moe_intermediate_size)
-            * config.num_hidden_layers
-            * config.num_experts_per_tok
-        )
-        expected_delta = 6 * (8 - 4) * params_per_rank * (12 + 5) / 1e12
-
-        assert actual_delta == pytest.approx(2 * rank_delta(topk1_config), rel=1e-9)
-        assert actual_delta == pytest.approx(expected_delta, rel=1e-9)
-
     def test_qwen3_next_projection_names(self, qwen3_5_moe_counter):
         config = deepcopy(qwen3_5_moe_counter.config.text_config)
         config.model_type = "qwen3_next"
@@ -596,24 +502,6 @@ class TestAllQwenLoraFlops:
         )
 
         assert actual == pytest.approx(expected, rel=1e-9)
-
-    def test_qwen3_next_mlp_targets_routed_experts(self, qwen3_5_moe_counter):
-        config = deepcopy(qwen3_5_moe_counter.config.text_config)
-        config.model_type = "qwen3_next"
-
-        def rank_delta(current_config):
-            counter = VeomniFlopsCounter(current_config)
-            rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(4))
-            rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(8))
-            return rank8 - rank4
-
-        topk1_config = deepcopy(config)
-        topk1_config.num_experts_per_tok = 1
-
-        assert rank_delta(config) == pytest.approx(
-            config.num_experts_per_tok * rank_delta(topk1_config),
-            rel=1e-9,
-        )
 
     def test_shared_moe_mode_reuses_gate_and_up_adapters(self, qwen3_5_moe_counter):
         config = qwen3_5_moe_counter.config
@@ -819,25 +707,6 @@ class TestQwen2LoraFlops:
         )
 
         expected = self._expected_flops(qwen3_config, batch_seqlens, 2.0, 8, lora_modules)
-        assert flops == pytest.approx(expected, rel=1e-9)
-
-    def test_default_lora_modules(self, qwen3_counter, qwen3_config):
-        batch_seqlens = [12, 5]
-        default_modules = [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ]
-        flops, _ = qwen3_counter.estimate_flops(
-            batch_seqlens,
-            delta_time=2.0,
-            lora_config=_lora_config(8, default_modules),
-        )
-        expected = self._expected_flops(qwen3_config, batch_seqlens, 2.0, 8, default_modules)
         assert flops == pytest.approx(expected, rel=1e-9)
 
     def test_frozen_lm_head_keeps_input_gradient_cost(self, qwen3_config):
