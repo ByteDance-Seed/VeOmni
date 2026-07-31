@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import patch
-
-from transformers import AutoConfig
 
 from veomni.lora.config import (
     FUSED_MOE_LORA_MODULES,
@@ -22,6 +21,7 @@ from veomni.lora.config import (
     VIT_LORA_MODULES_BY_MODEL_TYPE,
     VeOmniLoraConfig,
 )
+from veomni.models.auto import build_config
 from veomni.utils.count_flops import VeomniFlopsCounter
 
 
@@ -47,6 +47,15 @@ MODELS = [
 ROUTED_MOE_TYPES = {"qwen3_moe", "qwen3_vl_moe", "qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"}
 SHARED_EXPERT_TYPES = {"qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"}
 ROUTED_EXPERT_TARGETS = ["*.mlp.experts.gate_up_proj", "*.mlp.experts.down_proj"]
+
+
+def require_positive_finite_flops(value: float, *, model_name: str, mode: str, rank: int | None = None) -> None:
+    if not math.isfinite(value) or value <= 0:
+        rank_context = "" if rank is None else f", rank={rank}"
+        raise RuntimeError(
+            f"Invalid FLOPs for {model_name}: mode={mode}{rank_context}, value={value!r}. "
+            "The model config or LoRA targets are not supported by the FLOP estimator."
+        )
 
 
 def get_lora_configs(model_type: str, rank: int) -> dict[str, VeOmniLoraConfig]:
@@ -82,10 +91,19 @@ def get_lora_configs(model_type: str, rank: int) -> dict[str, VeOmniLoraConfig]:
 
 
 def compare_model(model_name: str, model_id: str, model_type: str, architecture: str) -> None:
-    # AutoConfig downloads only the small config metadata, never model weights.
-    counter = VeomniFlopsCounter(AutoConfig.from_pretrained(model_id))
+    # Exercise VeOmni's production config registry/replacement path while still
+    # downloading only the small config metadata, never model weights.
+    config = build_config(model_id)
+    if config.model_type != model_type:
+        raise RuntimeError(
+            f"Unexpected model type for {model_name} ({model_id}): "
+            f"loaded {config.model_type!r}, expected {model_type!r}."
+        )
+
+    counter = VeomniFlopsCounter(config)
     input_kwargs = {"images_seqlens": IMAGES_SEQLENS} if getattr(counter.config, "vision_config", None) else {}
     full_flops, _ = counter.estimate_flops(BATCH_SEQLENS, DELTA_TIME, **input_kwargs)
+    require_positive_finite_flops(full_flops, model_name=model_name, mode="Full fine-tuning")
 
     print(f"\n{model_name} ({model_id}; {architecture})")
     print("=" * 78)
@@ -101,6 +119,7 @@ def compare_model(model_name: str, model_id: str, model_type: str, architecture:
                 lora_config=lora_config,
                 **input_kwargs,
             )
+            require_positive_finite_flops(flops, model_name=model_name, mode=label, rank=rank)
             print(f"{label:<24} {rank:>6} {flops:>16.6f} {flops / full_flops * 100:>11.2f}%")
 
 
