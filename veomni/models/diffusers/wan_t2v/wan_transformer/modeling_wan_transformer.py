@@ -461,6 +461,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     config_class = WanTransformer3DModelConfig
     supports_gradient_checkpointing = True
     _supports_flash_attn = True
+    _no_split_modules = ["WanTransformerBlock"]
 
     def __init__(self, config: WanTransformer3DModelConfig, **kwargs):
         PreTrainedModel.__init__(self, config, **kwargs)
