@@ -855,9 +855,6 @@ class _MapStyleSamplerWrapper(IterableDataset):
         rank: This process's data-parallel rank.
         shuffle: Whether to shuffle indices with ``seed + epoch`` each epoch.
         seed: Base random seed shared by all ranks.
-        drop_last: If True, drop tail samples to make the dataset evenly divisible
-            across ranks; otherwise pad by wrapping around (same as
-            ``DistributedSampler``).
     """
 
     def __init__(
@@ -867,7 +864,6 @@ class _MapStyleSamplerWrapper(IterableDataset):
         rank: int = 0,
         shuffle: bool = True,
         seed: int = 0,
-        drop_last: bool = False,
     ) -> None:
         if num_replicas <= 0:
             raise ValueError(f"num_replicas must be positive, got {num_replicas}")
@@ -878,15 +874,12 @@ class _MapStyleSamplerWrapper(IterableDataset):
         self.rank = rank
         self.shuffle = shuffle
         self.seed = seed
-        self.drop_last = drop_last
         self.epoch = 0
+        self._dataset_size = len(self.dataset)
         # Set by DynamicBatchingSizeDataset.save_by_idx; when True, yield (sample, global_idx).
         self.output_index_for_resume = False
 
-        if self.drop_last and len(self.dataset) % self.num_replicas != 0:
-            self.num_samples = math.ceil((len(self.dataset) - self.num_replicas) / self.num_replicas)
-        else:
-            self.num_samples = math.ceil(len(self.dataset) / self.num_replicas)
+        self.num_samples = math.ceil(self._dataset_size / self.num_replicas)
         self.total_size = self.num_samples * self.num_replicas
 
         self._yielded = 0
@@ -898,43 +891,47 @@ class _MapStyleSamplerWrapper(IterableDataset):
         """Number of samples assigned to this rank (across all of its workers)."""
         return self.num_samples
 
-    def _rank_indices(self) -> list:
+    def _rank_indices(self) -> torch.Tensor:
         """Compute this rank's global indices, mirroring ``DistributedSampler.__iter__``."""
         if self.shuffle:
             g = torch.Generator()
             g.manual_seed(self.seed + self.epoch)
-            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+            indices = torch.randperm(self._dataset_size, generator=g)
         else:
-            indices = list(range(len(self.dataset)))
+            indices = torch.arange(self._dataset_size)
 
-        if not self.drop_last:
-            # Pad by wrapping around so every rank gets the same number of samples.
-            padding_size = self.total_size - len(indices)
+        # Pad by wrapping around so every rank gets the same number of samples.
+        padding_size = self.total_size - len(indices)
+        if padding_size > 0:
             if padding_size <= len(indices):
-                indices += indices[:padding_size]
+                padding = indices[:padding_size]
             else:
-                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
-        else:
-            indices = indices[: self.total_size]
+                padding = indices.repeat(math.ceil(padding_size / len(indices)))[:padding_size]
+            indices = torch.cat((indices, padding))
         assert len(indices) == self.total_size
 
         return indices[self.rank : self.total_size : self.num_replicas]
 
     def __iter__(self):
+        if not self._just_resumed:
+            self._yielded = 0
+        else:
+            self._just_resumed = False
+            if hasattr(self.dataset, "_just_resumed"):
+                self.dataset._just_resumed = False
+
+        return self._iter()
+
+    def _iter(self):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
         # Strided worker split keeps per-worker counts balanced (difference <= 1).
-        indices = self._rank_indices()[worker_id::num_workers]
-
-        if not self._just_resumed:
-            self._yielded = 0
-        else:
-            if self._yielded > len(indices):
-                raise RuntimeError(
-                    f"Restored yielded count {self._yielded} exceeds this worker's {len(indices)} assigned samples."
-                )
-            self._just_resumed = False
+        indices = self._rank_indices()[worker_id::num_workers].tolist()
+        if self._yielded > len(indices):
+            raise RuntimeError(
+                f"Restored yielded count {self._yielded} exceeds this worker's {len(indices)} assigned samples."
+            )
 
         for idx in indices[self._yielded :]:
             self._yielded += 1
@@ -948,16 +945,47 @@ class _MapStyleSamplerWrapper(IterableDataset):
         """Refetch a sample by global dataset index (used by ``save_by_idx`` resume)."""
         return self.dataset[idx]
 
+    def _sampler_fingerprint(self) -> Dict[str, Any]:
+        return {
+            "num_replicas": self.num_replicas,
+            "seed": self.seed,
+            "dataset_size": self._dataset_size,
+            "shuffle": self.shuffle,
+        }
+
     def state_dict(self) -> Dict[str, Any]:
-        return {"epoch": self.epoch, "yielded": self._yielded}
+        return {
+            "epoch": self.epoch,
+            "yielded": self._yielded,
+            **self._sampler_fingerprint(),
+        }
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        missing_keys = self._sampler_fingerprint().keys() - state_dict.keys()
+        if missing_keys:
+            raise RuntimeError(
+                f"Cannot restore _MapStyleSamplerWrapper: checkpoint is missing sampler fingerprint fields "
+                f"{sorted(missing_keys)}."
+            )
+
+        mismatches = []
+        for key, current_value in self._sampler_fingerprint().items():
+            checkpoint_value = state_dict[key]
+            if checkpoint_value != current_value:
+                mismatches.append(f"{key}: checkpoint={checkpoint_value!r}, current={current_value!r}")
+        if mismatches:
+            raise RuntimeError(
+                f"Cannot restore _MapStyleSamplerWrapper with a different sampler setup: {'; '.join(mismatches)}"
+            )
+
         self.epoch = state_dict["epoch"]
         self._yielded = state_dict["yielded"]
         self._just_resumed = True
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
+        if hasattr(self.dataset, "set_epoch") and callable(self.dataset.set_epoch):
+            self.dataset.set_epoch(epoch)
 
 
 class DynamicBatchingSizeDataset(IterableDataset):
@@ -1095,21 +1123,13 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self.dataset.output_index_for_resume = value
 
     def __iter__(self):
-        """Iterate over the dataset and yield dynamically batched micro batches.
+        """
+        Iterate over the dataset and yield dynamically batched micro batches.
 
         Buffers samples from the underlying dataset and yields micro batches when
         the buffer contains enough samples and tokens. Each yielded batch is collated
         using the dynamic_batching_collate_fn.
-
-        Yields:
-            Collated micro batch when buffer conditions are met.
-
-        Raises:
-            Exception: Re-raises any exception other than StopIteration encountered
-                during iteration.
         """
-        self._data_iter = iter(self.dataset)
-
         if not self._just_resumed:
             # Clear buffer state on new iteration unless we just resumed from a checkpoint,
             # in which case we want to keep the buffer contents.
@@ -1117,8 +1137,15 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self._buffer_of_output_index = []
             self._buffer_token_count = 0
             self._buffer_physical_token_count = 0
+            if hasattr(self.dataset, "_just_resumed"):
+                self.dataset._just_resumed = False
         else:
             self._just_resumed = False
+
+        return self._iter()
+
+    def _iter(self):
+        self._data_iter = iter(self.dataset)
 
         while True:
             try:
@@ -1352,7 +1379,6 @@ class DynamicBatchingSizeDataset(IterableDataset):
         assert self._buffer_physical_token_count == sum(
             item[2] if len(item) > 2 else item[1] for item in self._buffer
         ), "buffer_physical_token_count does not match the sum of physical lengths in buffer"
-        del state_dict["buffer"]
 
         if "dynamic_batch_upstream_dataset_state" in state_dict:
             self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])

@@ -541,6 +541,8 @@ def test_save_load_state_dict(save_by_idx):
         ("iterable", True, True, False),
         ("iterable", True, True, True),
         ("mapping", True, True, False),
+        ("mapping", True, True, True),
+        ("mapping", True, False, False),
     ],
 )
 def test_dynamic_batching_dataset_distributed(dataset_type, shuffle, save_by_idx, multi_sample_per_iteration):
@@ -660,13 +662,16 @@ class TrainerTest(BaseTrainer):
         args = self.args
         transform = multi_sample_transform if self.multi_sample_per_iteration else single_sample_transform
         if self.dataset_type == "mapping":
-            self.train_dataset = ShardedMappingDataset(size=DATASET_SIZE, transform=transform)
+            self.train_dataset = ShardedMappingDataset(
+                size=DATASET_SIZE, transform=transform, sample_length_range=(6, 7)
+            )
         else:
             self.train_dataset = ShardedIterableDataset(
                 size=DATASET_SIZE,
                 shuffle=self.shuffle,
                 seed=args.train.seed,
                 transform=transform,
+                sample_length_range=(6, 7),
             )
         effective_dataset_size = DATASET_SIZE * (2 if self.multi_sample_per_iteration else 1)
         args.compute_train_steps(effective_dataset_size)

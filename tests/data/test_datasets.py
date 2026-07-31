@@ -4,9 +4,7 @@ import random
 import subprocess
 import sys
 from functools import partial
-from types import SimpleNamespace
 from typing import Any, Dict, List
-from unittest.mock import patch
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -16,7 +14,6 @@ import torch
 import yaml
 from tools import resolve_ops_overrides
 from torch.utils.data import DistributedSampler
-from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PretrainedConfig
 from utils import (
     DummyDataset,
@@ -30,6 +27,7 @@ from utils import (
 
 from veomni.arguments import parse_args
 from veomni.data.data_collator import MainCollator
+from veomni.data.data_loader import DistributedDataloader
 from veomni.data.dataset import DynamicBatchingSizeDataset, _MapStyleSamplerWrapper
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
@@ -337,11 +335,6 @@ def test_native_dataset(dataset_type: str, dyn_bsz: bool, dummy_native_dataset_c
     assert result.returncode == 0
 
 
-# ---------------------------------------------------------------------------
-# _MapStyleSamplerWrapper unit tests (CPU-only, no torch.distributed init:
-# DistributedSampler is constructed with explicit num_replicas / rank).
-# ---------------------------------------------------------------------------
-
 _WRAPPER_DATASET_SIZE = 50
 _WRAPPER_MICRO_BATCH_SEQ_LENGTH = 64
 _WRAPPER_READY_THRESHOLD = 4
@@ -356,55 +349,45 @@ def _wrapper_take_first(micro_batches):
     return micro_batches[0]
 
 
-def _wrapper_worker_info(worker_id, num_workers):
-    return None if num_workers == 1 else SimpleNamespace(id=worker_id, num_workers=num_workers)
+def _assert_batch_stream_equal(got_batches, want_batches):
+    assert len(got_batches) == len(want_batches)
+    for got, want in zip(got_batches, want_batches):
+        assert got.keys() == want.keys()
+        for key in got:
+            if torch.is_tensor(got[key]):
+                assert torch.equal(got[key], want[key]), f"mismatch in {key}"
 
 
 @pytest.mark.parametrize("shuffle", [False, True])
-@pytest.mark.parametrize("drop_last", [False, True])
 @pytest.mark.parametrize("num_replicas", [1, 2, 4])
 @pytest.mark.parametrize("epoch", [0, 3])
-def test_map_style_sampler_wrapper_rank_parity(shuffle, drop_last, num_replicas, epoch):
+def test_map_style_sampler_wrapper_rank_parity(shuffle, num_replicas, epoch):
     """Per-rank index assignment must be bit-identical to ``DistributedSampler``."""
     dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
     seed = 7
     for rank in range(num_replicas):
         wrapper = _MapStyleSamplerWrapper(
-            dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed, drop_last=drop_last
+            dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
         )
         wrapper.set_epoch(epoch)
         sampler = DistributedSampler(
-            dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed, drop_last=drop_last
+            dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
         )
         sampler.set_epoch(epoch)
-        assert wrapper._rank_indices() == list(sampler)
+        assert wrapper._rank_indices().tolist() == list(sampler)
         assert len(wrapper) == sampler.num_samples
 
 
-@pytest.mark.parametrize("num_workers", [1, 8])
-def test_map_style_sampler_wrapper_worker_split(num_workers):
-    """Workers of one rank read disjoint, balanced, strided shares of the rank's indices."""
-    dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
-    wrapper = _MapStyleSamplerWrapper(dataset, num_replicas=2, rank=1, shuffle=True, seed=0)
-    rank_indices = wrapper._rank_indices()
-
-    seen_per_worker = []
-    for worker_id in range(num_workers):
-        worker_wrapper = copy.deepcopy(wrapper)  # real workers iterate their own copy
-        worker_wrapper.output_index_for_resume = True
-        # The wrapper binds get_worker_info via a direct import, so patch it in its own module.
-        with patch("veomni.data.dataset.get_worker_info", return_value=_wrapper_worker_info(worker_id, num_workers)):
-            seen_per_worker.append([idx for _, idx in worker_wrapper])
-
-    counts = [len(seen) for seen in seen_per_worker]
-    assert max(counts) - min(counts) <= 1
-    assert sorted(idx for seen in seen_per_worker for idx in seen) == sorted(rank_indices)
-    for worker_id, seen in enumerate(seen_per_worker):
-        assert seen == rank_indices[worker_id::num_workers]
-
-
 def _build_wrapper_pipeline(num_workers, save_by_idx):
-    """mapping dataset -> _MapStyleSamplerWrapper -> DynamicBatchingSizeDataset -> StatefulDataLoader."""
+    """mapping dataset -> _MapStyleSamplerWrapper -> DynamicBatchingSizeDataset -> DistributedDataloader."""
     dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
     wrapper = _MapStyleSamplerWrapper(dataset, num_replicas=2, rank=0, shuffle=True, seed=11)
     dynamic_ds = DynamicBatchingSizeDataset(
@@ -415,65 +398,103 @@ def _build_wrapper_pipeline(num_workers, save_by_idx):
         get_length_fn=_wrapper_get_length,
         save_by_idx=save_by_idx,
     )
-    return StatefulDataLoader(dynamic_ds, batch_size=1, num_workers=num_workers, collate_fn=_wrapper_take_first)
+    return DistributedDataloader(dynamic_ds, batch_size=1, num_workers=num_workers, collate_fn=_wrapper_take_first)
 
 
-@pytest.mark.parametrize("num_workers", [0, 2])
-@pytest.mark.parametrize("save_by_idx", [False, True])
-def test_map_style_sampler_wrapper_resume(num_workers, save_by_idx):
-    """An interrupted+resumed run reproduces the uninterrupted batch stream exactly.
+def test_map_style_sampler_wrapper_resume():
+    """Checkpoint resume preserves the full worker-side dynamic-batching pipeline."""
+    for num_workers in (0, 2):
+        for save_by_idx in (False, True):
+            # Use an uninterrupted epoch as the reference stream for all resume checks.
+            golden_dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+            golden_dataloader.set_epoch(2)
+            golden = list(golden_dataloader)
+            assert len(golden) > 4, "test setup must produce enough micro batches"
+            epoch_boundary_state = golden_dataloader.state_dict()
 
-    Exercises both the wrapper's own state_dict/load_state_dict (skip the consumed prefix
-    of the deterministic permutation) and its composition with StatefulDataLoader's
-    per-worker snapshots and DynamicBatchingSizeDataset's upstream-state nesting.
-    """
-    golden = list(_build_wrapper_pipeline(num_workers, save_by_idx))
-    assert len(golden) > 4, "test setup must produce enough micro batches"
+            # Case 1: A mid-epoch save/resume must reproduce the uninterrupted stream exactly.
+            dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+            dataloader.set_epoch(2)
+            it = iter(dataloader)
+            head = [next(it) for _ in range(3)]
+            dataloader_state = dataloader.state_dict()
+            del it, dataloader
 
-    dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
-    it = iter(dataloader)
-    head = [next(it) for _ in range(3)]
-    state = dataloader.state_dict()
-    del it, dataloader
+            resumed_dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+            resumed_dataloader.load_state_dict(dataloader_state)
+            resumed_dataloader.set_epoch(2)
+            batches = head + list(resumed_dataloader)
+            _assert_batch_stream_equal(batches, golden)
 
-    resumed = _build_wrapper_pipeline(num_workers, save_by_idx)
-    resumed.load_state_dict(state)
-    batches = head + list(resumed)
+            # Case 2: Re-saving before consuming a restored batch must preserve the pending resume state.
+            resaved_dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+            resaved_dataloader.load_state_dict(dataloader_state)
+            resaved_dataloader.set_epoch(2)
+            resaved_state = resaved_dataloader.state_dict()
+            del resaved_dataloader
 
-    assert len(batches) == len(golden)
-    for got, want in zip(batches, golden):
-        assert got.keys() == want.keys()
-        for key in got:
-            if torch.is_tensor(got[key]):
-                assert torch.equal(got[key], want[key]), f"mismatch in {key}"
+            resumed_from_resaved = _build_wrapper_pipeline(num_workers, save_by_idx)
+            resumed_from_resaved.load_state_dict(resaved_state)
+            resumed_from_resaved.set_epoch(2)
+            resaved_batches = head + list(resumed_from_resaved)
+            _assert_batch_stream_equal(resaved_batches, golden)
+
+            # Case 3: An epoch-boundary checkpoint with an empty buffer must start the next epoch cleanly.
+            next_epoch_dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+            next_epoch_dataloader.load_state_dict(epoch_boundary_state)
+            iter(
+                next_epoch_dataloader
+            )  # check _load_checkpoint() of checkpoint_callback.py for more details on why we need to call iter() when the checkpoint is saved at the epoch boundary
+            next_epoch_dataloader.set_epoch(3)
+            next_epoch_batches = list(next_epoch_dataloader)
+
+            full_next_epoch_dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+            full_next_epoch_dataloader.set_epoch(3)
+            full_next_epoch_batches = list(full_next_epoch_dataloader)
+            _assert_batch_stream_equal(next_epoch_batches, full_next_epoch_batches)
+
+            # Case 4: An epoch-boundary checkpoint with a non-empty buffer must start the next epoch cleanly.
+            buffered_boundary_dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+            buffered_boundary_dataloader.load_state_dict(dataloader_state)
+            iter(buffered_boundary_dataloader)
+            buffered_boundary_dataloader.set_epoch(3)
+            buffered_next_epoch_batches = list(buffered_boundary_dataloader)
+            _assert_batch_stream_equal(buffered_next_epoch_batches, full_next_epoch_batches)
+
+            # Case 5: Starting a new epoch after materializing an unconsumed restored iterator must reset pending state.
+            materialized_dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+            materialized_dataloader.load_state_dict(dataloader_state)
+            materialized_dataloader.set_epoch(2)
+            restored_it = iter(materialized_dataloader)
+            del restored_it
+            materialized_dataloader.set_epoch(3)
+            materialized_next_epoch_batches = list(materialized_dataloader)
+            _assert_batch_stream_equal(materialized_next_epoch_batches, full_next_epoch_batches)
 
 
-def test_map_style_sampler_wrapper_state_dict_after_resume_before_iter():
-    """state_dict() right after load_state_dict() but before __iter__ must report the
-    restored progress, not 0.
-    """
-    dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
-    kwargs = dict(num_replicas=2, rank=0, shuffle=True, seed=5)
+def test_map_style_sampler_wrapper_rejects_incompatible_resume_state():
+    """Restoring a different sampler configuration must fail instead of changing the sample stream."""
+    source = _MapStyleSamplerWrapper(
+        ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE),
+        num_replicas=2,
+        rank=0,
+        shuffle=True,
+        seed=5,
+    )
+    state = source.state_dict()
 
-    src = _MapStyleSamplerWrapper(dataset, **kwargs)
-    src.set_epoch(2)
-    it = iter(src)
-    consumed = 3
-    for _ in range(consumed):
-        next(it)
-    state = src.state_dict()
-    assert state == {"epoch": 2, "yielded": consumed}
+    incompatible = _MapStyleSamplerWrapper(
+        ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE - 1),
+        num_replicas=1,
+        rank=0,
+        shuffle=False,
+        seed=6,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=r"num_replicas.*seed.*dataset_size.*shuffle",
+    ):
+        incompatible.load_state_dict(state)
 
-    # Resume, then query state BEFORE iterating: must still reflect the restored progress.
-    resumed = _MapStyleSamplerWrapper(dataset, **kwargs)
-    resumed.load_state_dict(state)
-    assert resumed.state_dict() == state  # used to return yielded == 0
-
-    # And the resumed iteration actually skips the already-consumed prefix.
-    full = _MapStyleSamplerWrapper(dataset, **kwargs)
-    full.set_epoch(2)
-    full.output_index_for_resume = True
-    resumed.output_index_for_resume = True
-    full_indices = [idx for _, idx in full]
-    resumed_indices = [idx for _, idx in resumed]
-    assert resumed_indices == full_indices[consumed:]
+    with pytest.raises(RuntimeError, match="missing sampler fingerprint fields"):
+        source.load_state_dict({"epoch": 0, "yielded": 0})
