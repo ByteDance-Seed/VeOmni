@@ -11,7 +11,7 @@ model:
     moe_implementation: eager
 
 data:
-  train_path: /home/d00897185/Tom-and-Jerry-VideoGeneration-Dataset-parquet
+  train_path: /Tom-and-Jerry-VideoGeneration-Dataset-parquet
   source_name: Tom-and-Jerry-VideoGeneration-Dataset
   mm_configs:
     fps: 1
