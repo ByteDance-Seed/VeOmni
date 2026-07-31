@@ -8,6 +8,7 @@ import torch
 
 from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from .masking import build_mot_attention_metadata
 
 
 _VALID_IMG_TAGS = frozenset({"und", "gen", "edit"})
@@ -58,56 +59,19 @@ class PackedSpan:
 class PackedConversation:
     """Result of packing an embedded conversation batch for MoT.
 
-    Packed tensors concatenate all samples. ``sample_splits`` and
-    ``sample_attn_modes`` preserve their logical attention boundaries, while
-    ``spans`` maps model outputs back to the original carrier items.
+    Packed tensors concatenate all samples. ``sample_splits`` preserves their
+    document/span boundaries for attention metadata. ``spans`` uses global
+    packed offsets to map model outputs back to the original carrier items.
+    Token type 0 selects the understanding expert and type 1 the generation
+    expert.
     """
 
     packed_sequence: torch.Tensor
     sample_splits: list[list[int]]
-    sample_attn_modes: list[list[str]]
+    packed_attention_metadata: torch.Tensor
     packed_position_ids: torch.Tensor
     packed_token_type_ids: torch.Tensor
     spans: list[PackedSpan]
-
-
-def build_mot_attention_mask(
-    sample_splits: list[list[int]],
-    sample_attn_modes: list[list[str]],
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build BAGEL's packed causal/full/noise visibility mask.
-
-    The layout metadata is produced by :func:`preprocess_mot_inputs`. Each
-    packed sample occupies an isolated diagonal block. Within a sample, every
-    span can attend to preceding clean spans and to itself according to its
-    mode. Noise spans never become key/value context for later spans.
-    """
-    total_length = sum(sum(split_lens) for split_lens in sample_splits)
-    visible = torch.zeros((total_length, total_length), device=device, dtype=torch.bool)
-    sample_start = 0
-
-    for split_lens, attn_modes in zip(sample_splits, sample_attn_modes, strict=True):
-        clean_spans: list[tuple[int, int]] = []
-        span_start = sample_start
-        for length, mode in zip(split_lens, attn_modes, strict=True):
-            span_end = span_start + length
-            for clean_start, clean_end in clean_spans:
-                visible[span_start:span_end, clean_start:clean_end] = True
-
-            if mode == "causal":
-                visible[span_start:span_end, span_start:span_end].fill_(True).tril_()
-            else:
-                visible[span_start:span_end, span_start:span_end] = True
-
-            if mode != "noise":
-                clean_spans.append((span_start, span_end))
-            span_start = span_end
-
-        sample_start = span_start
-
-    return visible.unsqueeze(0).unsqueeze(0).contiguous()
 
 
 def preprocess_mot_inputs(
@@ -119,8 +83,11 @@ def preprocess_mot_inputs(
 ) -> PackedConversation | None:
     """Preprocess already-embedded carrier items into MoT packed inputs.
 
-    Text and image spans route through the understanding expert. Output spans
-    route through the generation expert. Packed layout stays local to MoT.
+    Text and SigLIP spans route through the understanding expert. VAE latent
+    spans and output spans route through the generation expert. Attention mode
+    and expert routing are deliberately computed separately: a clean VAE
+    conditioning image still uses the generation expert. Packed layout stays
+    local to MoT.
     """
 
     if not conversation_list:
@@ -140,6 +107,8 @@ def preprocess_mot_inputs(
         sample_attn_modes: list[str] = []
         sample_position_cursor = 0
 
+        # Dummy carrier items are handled separately as zero-gradient anchors;
+        # only real user/assistant embeddings participate in packed attention.
         items = list(
             iter_desired_items(
                 [sample],
@@ -150,6 +119,9 @@ def preprocess_mot_inputs(
         item_index = 0
         while item_index < len(items):
             if _is_vision_marker_triplet_at(items, item_index):
+                # Treat <image_start>, image tokens, and <image_end> as one
+                # logical attention span while preserving three writeback
+                # ranges and routing only the image tokens to the gen expert.
                 span_items = (items[item_index], items[item_index + 1], items[item_index + 2])
                 span_values = [
                     _mot_value_for_item(item, device=device, dtype=dtype, hidden_size=hidden_size)
@@ -173,6 +145,8 @@ def preprocess_mot_inputs(
             if length == 0:
                 continue
 
+            # sequence_cursor is global across the packed batch; positions
+            # restart independently for each logical document.
             indexes = torch.arange(sequence_cursor, sequence_cursor + length, device=device, dtype=torch.long)
             position_ids, sample_position_cursor = _mot_position_ids_for_span(
                 item,
@@ -213,7 +187,11 @@ def preprocess_mot_inputs(
     return PackedConversation(
         packed_sequence=packed_sequence,
         sample_splits=sample_splits_by_sample,
-        sample_attn_modes=sample_attn_modes_by_sample,
+        packed_attention_metadata=build_mot_attention_metadata(
+            sample_splits_by_sample,
+            sample_attn_modes_by_sample,
+            device=device,
+        ),
         packed_position_ids=torch.cat(position_parts, dim=0).to(device=device, dtype=torch.long),
         packed_token_type_ids=torch.cat(token_type_parts, dim=0).to(device=device, dtype=torch.long),
         spans=spans,
@@ -246,6 +224,7 @@ def _mot_position_ids_for_span(
     length: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, int]:
+    """Assign BAGEL positions and return the next document-local position."""
     meta_position_ids = item.meta.get("position_ids")
     if torch.is_tensor(meta_position_ids):
         position_ids = meta_position_ids.detach().to(device=device, dtype=torch.long).reshape(-1)
@@ -254,12 +233,15 @@ def _mot_position_ids_for_span(
         next_start = max(start + 1, int(position_ids.max().item()) + 1) if length else start
         return position_ids, next_start
 
+    # All latent/image tokens in one span share a position; text remains AR
+    # sequential. Thus a whole image advances the logical position only once.
     if item.type in {"image", "output"}:
         return torch.full((length,), start, device=device, dtype=torch.long), start + 1
     return torch.arange(start, start + length, device=device, dtype=torch.long), start + length
 
 
 def _mot_attn_mode_for_item(item: ConversationItem) -> str:
+    """Classify visibility independently from MoT expert routing."""
     if item.type == "output":
         return "noise"
     if item.type == "image":
@@ -284,6 +266,7 @@ def _mot_attn_mode_for_item(item: ConversationItem) -> str:
 
 
 def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> torch.Tensor:
+    """Return packed rows routed through the generation expert."""
     item = span.item
     if item.type == "output":
         return indexes
@@ -296,14 +279,9 @@ def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> 
     if tag == "und":
         raise ValueError(f"BAGEL Qwen2-MoT received VAE image with incompatible {_IMG_TAG_KEY}: {tag!r}.")
 
-    if tag is None:
-        # Inference VAE prompt context is conditioning, not a generation target.
-        return indexes.new_empty(0)
-    if tag == "edit":
-        # Edit VAE context tokens are conditioning, not generation targets.
-        return indexes.new_empty(0)
-
-    # ``gen`` VAE images are true generation targets.
+    # Expert routing follows token modality, independently of whether the VAE
+    # latent is clean conditioning (untagged/edit) or a noised generation
+    # target. Marker tokens remain on the understanding path.
     if span.is_image_triplet:
         primary_start = span.primary_start
         primary_end = primary_start + span.primary_length
@@ -312,6 +290,8 @@ def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> 
 
 
 def _is_vision_marker_triplet_at(items: list[ConversationItem], index: int) -> bool:
+    # Source equality prevents unrelated one-token text items around an image
+    # from being mistaken for BAGEL's encoder-specific marker pair.
     if index + 2 >= len(items):
         return False
     start, image, end = items[index], items[index + 1], items[index + 2]
@@ -350,6 +330,5 @@ def _text_item_length(item: ConversationItem) -> int | None:
 __all__ = [
     "PackedConversation",
     "PackedSpan",
-    "build_mot_attention_mask",
     "preprocess_mot_inputs",
 ]
