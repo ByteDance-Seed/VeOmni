@@ -73,20 +73,39 @@ QWEN3_5_LORA_MODULES = (
     "up_proj",
     "down_proj",
 )
+QWEN2_VIT_LORA_MODULES = ("qkv", "proj", "fc1", "fc2", "mlp.0", "mlp.2")
+QWEN2_5_VIT_LORA_MODULES = ("qkv", "proj", "gate_proj", "up_proj", "down_proj", "mlp.0", "mlp.2")
+QWEN3_VIT_LORA_MODULES = ("qkv", "proj", "linear_fc1", "linear_fc2")
+VIT_LORA_MODULES_BY_MODEL_TYPE = MappingProxyType(
+    {
+        "qwen2_vl": QWEN2_VIT_LORA_MODULES,
+        "qwen2_5_vl": QWEN2_5_VIT_LORA_MODULES,
+        "qwen3_vl": QWEN3_VIT_LORA_MODULES,
+        "qwen3_vl_moe": QWEN3_VIT_LORA_MODULES,
+        "qwen3_5": QWEN3_VIT_LORA_MODULES,
+        "qwen3_5_moe": QWEN3_VIT_LORA_MODULES,
+    }
+)
 FUSED_MOE_LORA_MODULES = ("gate_proj", "up_proj", "down_proj")
+
+
+def _merge_module_names(*module_groups: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(module for group in module_groups for module in group))
+
+
 LORA_MODULES_BY_MODEL_TYPE = MappingProxyType(
     {
         "qwen2": QWEN2_LORA_MODULES,
-        "qwen2_vl": QWEN2_LORA_MODULES,
-        "qwen2_5_vl": QWEN2_LORA_MODULES,
+        "qwen2_vl": _merge_module_names(QWEN2_LORA_MODULES, QWEN2_VIT_LORA_MODULES),
+        "qwen2_5_vl": _merge_module_names(QWEN2_LORA_MODULES, QWEN2_5_VIT_LORA_MODULES),
         "qwen3": QWEN2_LORA_MODULES,
         "qwen3_moe": QWEN2_LORA_MODULES,
-        "qwen3_vl": QWEN2_LORA_MODULES,
-        "qwen3_vl_moe": QWEN2_LORA_MODULES,
+        "qwen3_vl": _merge_module_names(QWEN2_LORA_MODULES, QWEN3_VIT_LORA_MODULES),
+        "qwen3_vl_moe": _merge_module_names(QWEN2_LORA_MODULES, QWEN3_VIT_LORA_MODULES),
         "qwen3_next": QWEN3_NEXT_LORA_MODULES,
-        "qwen3_5": QWEN3_5_LORA_MODULES,
+        "qwen3_5": _merge_module_names(QWEN3_5_LORA_MODULES, QWEN3_VIT_LORA_MODULES),
         "qwen3_5_text": QWEN3_5_LORA_MODULES,
-        "qwen3_5_moe": QWEN3_5_LORA_MODULES,
+        "qwen3_5_moe": _merge_module_names(QWEN3_5_LORA_MODULES, QWEN3_VIT_LORA_MODULES),
         "qwen3_5_moe_text": QWEN3_5_LORA_MODULES,
     }
 )

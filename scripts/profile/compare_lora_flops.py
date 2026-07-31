@@ -16,7 +16,12 @@ from unittest.mock import patch
 
 from transformers import AutoConfig
 
-from veomni.lora.config import FUSED_MOE_LORA_MODULES, LORA_MODULES_BY_MODEL_TYPE, VeOmniLoraConfig
+from veomni.lora.config import (
+    FUSED_MOE_LORA_MODULES,
+    LORA_MODULES_BY_MODEL_TYPE,
+    VIT_LORA_MODULES_BY_MODEL_TYPE,
+    VeOmniLoraConfig,
+)
 from veomni.utils.count_flops import VeomniFlopsCounter
 
 
@@ -46,8 +51,11 @@ ROUTED_EXPERT_TARGETS = ["*.mlp.experts.gate_up_proj", "*.mlp.experts.down_proj"
 
 def get_lora_configs(model_type: str, rank: int) -> dict[str, VeOmniLoraConfig]:
     supported_modules = LORA_MODULES_BY_MODEL_TYPE[model_type]
+    vision_modules = VIT_LORA_MODULES_BY_MODEL_TYPE.get(model_type, ())
     mlp_modules = [module for module in supported_modules if module in FUSED_MOE_LORA_MODULES]
-    attention_modules = [module for module in supported_modules if module not in FUSED_MOE_LORA_MODULES]
+    attention_modules = [
+        module for module in supported_modules if module not in FUSED_MOE_LORA_MODULES and module not in vision_modules
+    ]
     target_parameters = ROUTED_EXPERT_TARGETS if model_type in ROUTED_MOE_TYPES else None
     shared_mlp_modules = mlp_modules if model_type in SHARED_EXPERT_TYPES or target_parameters is None else None
 
@@ -60,11 +68,17 @@ def get_lora_configs(model_type: str, rank: int) -> dict[str, VeOmniLoraConfig]:
             moe_mode="independent" if routed_targets else None,
         )
 
-    return {
-        "LoRA all": make_config([*attention_modules, *(shared_mlp_modules or [])], target_parameters),
+    configs = {
+        "LoRA all": make_config(
+            list(dict.fromkeys([*attention_modules, *(shared_mlp_modules or []), *vision_modules])),
+            target_parameters,
+        ),
         "LoRA attention": make_config(attention_modules),
         "LoRA MLP": make_config(shared_mlp_modules, target_parameters),
     }
+    if vision_modules:
+        configs["LoRA vision"] = make_config(list(vision_modules))
+    return configs
 
 
 def compare_model(model_name: str, model_id: str, model_type: str, architecture: str) -> None:

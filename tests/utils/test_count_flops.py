@@ -283,7 +283,7 @@ class TestQwen35LoraFlops:
             delta_time=2.0,
             images_seqlens=images_seqlens,
         )
-        lora_config = _default_lora_config(qwen3_5_counter.config)
+        lora_config = _lora_config(8, ["q_proj", "in_proj_qkv", "gate_proj"])
         lora_text, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
@@ -296,9 +296,58 @@ class TestQwen35LoraFlops:
             images_seqlens=images_seqlens,
         )
 
-        # Qwen3.5's supported LoRA targets do not match the vision tower, so its
-        # inputs and parameters require no gradients and it executes forward-only.
+        # Decoder-only targets leave the vision tower frozen and detached.
         assert lora_vl - lora_text == pytest.approx((full_vl - full_text) / 3, rel=1e-9)
+
+    def test_vision_target_counts_backward_and_adapter_flops(self, qwen3_5_counter):
+        batch_seqlens = [12, 5]
+        images_seqlens = [16]
+        rank = 8
+        text_flops, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=1.0,
+            lora_config=_lora_config(rank, ["qkv"]),
+        )
+        vl_flops, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=1.0,
+            lora_config=_lora_config(rank, ["qkv"]),
+            images_seqlens=images_seqlens,
+        )
+
+        vision = qwen3_5_counter.config.vision_config
+        tokens_sum = sum(images_seqlens)
+        dim = vision.hidden_size
+        merger_hidden_size = dim * vision.spatial_merge_size**2
+        patch_embed_params = (
+            dim * vision.in_channels * vision.temporal_patch_size * vision.patch_size * vision.patch_size
+        )
+        block_params = dim * (2 * vision.intermediate_size + 4 * dim) * vision.depth
+        merger_params = merger_hidden_size * (merger_hidden_size + vision.out_hidden_size)
+        adaptable_base_params = block_params + merger_params
+        lora_params = rank * (dim + 3 * dim) * vision.depth
+        linear_flops = (2 * patch_embed_params + 4 * adaptable_base_params + 6 * lora_params) * tokens_sum
+        attention_flops = (
+            12
+            * sum(seqlen * seqlen for seqlen in images_seqlens)
+            * (dim // vision.num_heads)
+            * vision.num_heads
+            * vision.depth
+        )
+
+        assert vl_flops - text_flops == pytest.approx((linear_flops + attention_flops) / 1e12, rel=1e-9)
+
+    def test_empty_image_sequences_skip_vision(self, qwen3_5_counter):
+        lora_config = _lora_config(8, ["linear_fc1"])
+        text_flops, _ = qwen3_5_counter.estimate_flops([12, 5], 1.0, lora_config=lora_config)
+        empty_image_flops, _ = qwen3_5_counter.estimate_flops(
+            [12, 5],
+            1.0,
+            lora_config=lora_config,
+            images_seqlens=[],
+        )
+
+        assert empty_image_flops == text_flops
 
 
 class TestQwen35MoeFlops:
@@ -661,6 +710,34 @@ class TestAllQwenLoraFlops:
         expected_vision_flops = (linear_flops + attention_flops) / 1e12
 
         assert vl_flops - text_flops == pytest.approx(expected_vision_flops, rel=1e-9)
+
+    def test_qwen3_vl_deepstack_merger_lora(self):
+        config = _load_toy_config("tests/toy_config/qwen3vl_toy")
+        counter = VeomniFlopsCounter(config)
+        batch_seqlens = [12, 5]
+        images_seqlens = [16]
+
+        rank4_flops, _ = counter.estimate_flops(
+            batch_seqlens,
+            1.0,
+            lora_config=_lora_config(4, ["linear_fc1"]),
+            images_seqlens=images_seqlens,
+        )
+        rank8_flops, _ = counter.estimate_flops(
+            batch_seqlens,
+            1.0,
+            lora_config=_lora_config(8, ["linear_fc1"]),
+            images_seqlens=images_seqlens,
+        )
+
+        vision = config.vision_config
+        merger_hidden_size = vision.hidden_size * vision.spatial_merge_size**2
+        params_per_rank = (vision.hidden_size + vision.intermediate_size) * vision.depth + 2 * merger_hidden_size * (
+            1 + len(vision.deepstack_visual_indexes)
+        )
+        expected_delta = 6 * (8 - 4) * params_per_rank * sum(images_seqlens) / 1e12
+
+        assert rank8_flops - rank4_flops == pytest.approx(expected_delta, rel=1e-9)
 
 
 class TestQwen2LoraFlops:

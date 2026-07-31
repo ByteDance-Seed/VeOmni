@@ -128,10 +128,15 @@ class VeomniFlopsCounter:
         module_shapes = module_shapes or {}
         target_modules = lora_config.target_modules or []
         matched_modules = [module for module in target_modules if module in module_shapes]
-        lora_params = sum(
-            lora_config.r * (module_shapes[module][0] + module_shapes[module][1]) * module_shapes[module][2]
-            for module in matched_modules
-        )
+        lora_params = 0
+        for module in matched_modules:
+            shape_groups = module_shapes[module]
+            if isinstance(shape_groups, tuple):
+                shape_groups = (shape_groups,)
+            lora_params += sum(
+                lora_config.r * (in_features + out_features) * count
+                for in_features, out_features, count in shape_groups
+            )
         base_factor = 2 if detached_without_targets and not matched_modules else 4
         return (base_factor * base_params + 6 * lora_params) * tokens
 
@@ -641,7 +646,7 @@ class VeomniFlopsCounter:
 
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
+        if images_seqlens:
             vit_flops = self._estimate_qwen_vit_flop(
                 images_seqlens,
                 self.config.vision_config,
@@ -672,11 +677,11 @@ class VeomniFlopsCounter:
 
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
+        if images_seqlens:
             vit_flops = self._estimate_qwen3_vit_flop(
                 images_seqlens,
                 self.config.vision_config,
-                forward_only=lora_config is not None,
+                lora_config=lora_config,
             )
         else:
             vit_flops = 0
@@ -702,11 +707,11 @@ class VeomniFlopsCounter:
         )
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
+        if images_seqlens:
             vit_flops = self._estimate_qwen3_vit_flop(
                 images_seqlens,
                 self.config.vision_config,
-                forward_only=lora_config is not None,
+                lora_config=lora_config,
             )
         else:
             vit_flops = 0
@@ -715,9 +720,9 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_vit_flop(self, images_seqlens, config, forward_only=False):
+    def _estimate_qwen3_vit_flop(self, images_seqlens, config, lora_config=None):
         """
-        Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
+        Estimate the FLOPs of the Qwen3-family vision encoder.
         """
 
         if config is None:
@@ -743,12 +748,40 @@ class VeomniFlopsCounter:
         merger_N = (out_hidden_size + (dim * (spatial_merge_size**2))) * (dim * (spatial_merge_size**2))
 
         # Qwen3 VL uses deep stack, one merger for every deepstack layer
-        deepstack_merger_N = merger_N * len(config.deepstack_visual_indexes)
+        merger_count = 1 + len(getattr(config, "deepstack_visual_indexes", ()))
+        deepstack_merger_N = merger_N * (merger_count - 1)
         # non-attn all_layer parm
         dense_N = patch_embed_N + (mlp_N + attn_linear_N) * depth + deepstack_merger_N + merger_N
 
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = (2 if forward_only else 6) * dense_N * tokens_sum
+        vision_module_shapes = {
+            "qkv": (dim, 3 * dim, depth),
+            "proj": (dim, dim, depth),
+            "linear_fc1": [
+                (dim, mlp_hidden_dim, depth),
+                (dim * spatial_merge_size**2, dim * spatial_merge_size**2, merger_count),
+            ],
+            "linear_fc2": [
+                (mlp_hidden_dim, dim, depth),
+                (dim * spatial_merge_size**2, out_hidden_size, merger_count),
+            ],
+        }
+        target_modules = lora_config.target_modules if lora_config is not None else ()
+        vision_has_lora = any(module in vision_module_shapes for module in target_modules or ())
+
+        if lora_config is None:
+            dense_N_flops = 6 * dense_N * tokens_sum
+        elif not vision_has_lora:
+            dense_N_flops = 2 * dense_N * tokens_sum
+        else:
+            # Patch embedding is Conv3d and is not adapted by VeOmni's linear LoRA.
+            adaptable_base_N = dense_N - patch_embed_N
+            dense_N_flops = 2 * patch_embed_N * tokens_sum
+            dense_N_flops += self._compute_linear_flops(
+                adaptable_base_N,
+                tokens_sum,
+                lora_config=lora_config,
+                module_shapes=vision_module_shapes,
+            )
 
         # In Qwen3 VL, full attention is used in all vision layers.
         full_attn_layer_num = depth
@@ -757,7 +790,7 @@ class VeomniFlopsCounter:
         seqlen_square_sum = 0
         for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attention_factor = 4 if forward_only else 12
+        attention_factor = 12 if lora_config is None or vision_has_lora else 4
         attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
 
         vit_flops = dense_N_flops + attn_qkv_flops
@@ -804,13 +837,28 @@ class VeomniFlopsCounter:
         # non-attn all_layer parm
         dense_N = (mlp_N + attn_linear_N) * depth + patch_embed_and_merger_N
 
-        vision_module_shapes = {}
-        if not is_qwen2_vl:
-            vision_module_shapes = {
-                "gate_proj": (dim, mlp_hidden_dim, depth),
-                "up_proj": (dim, mlp_hidden_dim, depth),
-                "down_proj": (mlp_hidden_dim, dim, depth),
-            }
+        merger_hidden_size = dim * spatial_merge_size**2
+        vision_module_shapes = {
+            "qkv": (dim, 3 * dim, depth),
+            "proj": (dim, dim, depth),
+            "mlp.0": (merger_hidden_size, merger_hidden_size, 1),
+            "mlp.2": (merger_hidden_size, out_hidden_size, 1),
+        }
+        if is_qwen2_vl:
+            vision_module_shapes.update(
+                {
+                    "fc1": (dim, mlp_hidden_dim, depth),
+                    "fc2": (mlp_hidden_dim, dim, depth),
+                }
+            )
+        else:
+            vision_module_shapes.update(
+                {
+                    "gate_proj": (dim, mlp_hidden_dim, depth),
+                    "up_proj": (dim, mlp_hidden_dim, depth),
+                    "down_proj": (mlp_hidden_dim, dim, depth),
+                }
+            )
         dense_N_flops = self._compute_linear_flops(
             dense_N,
             tokens_sum,
@@ -1170,11 +1218,11 @@ class VeomniFlopsCounter:
 
         # vit flops (Qwen3-VL ViT)
         images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
+        if images_seqlens:
             vit_flops = self._estimate_qwen3_vit_flop(
                 images_seqlens,
                 getattr(self.config, "vision_config", None),
-                forward_only=lora_config is not None,
+                lora_config=lora_config,
             )
         else:
             vit_flops = 0
