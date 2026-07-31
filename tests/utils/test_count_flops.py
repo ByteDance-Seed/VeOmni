@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
+from veomni.lora.config import LORA_MODULES_BY_MODEL_TYPE, VeOmniLoraConfig
 from veomni.utils.count_flops import VeomniFlopsCounter, get_device_flops
 
 
@@ -34,6 +35,27 @@ def _to_namespace(value):
 def _load_toy_config(config_dir):
     with Path(config_dir, "config.json").open(encoding="utf-8") as fp:
         return _to_namespace(json.load(fp))
+
+
+def _lora_config(rank, target_modules=None, target_parameters=None, moe_mode=None):
+    return VeOmniLoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        target_modules=target_modules,
+        target_parameters=target_parameters,
+        moe_mode=moe_mode,
+    )
+
+
+def _default_lora_config(config, rank=8):
+    return _lora_config(rank, list(LORA_MODULES_BY_MODEL_TYPE[config.model_type]))
+
+
+ROUTED_EXPERT_TARGETS = ["*.mlp.experts.gate_up_proj", "*.mlp.experts.down_proj"]
+
+
+def _routed_lora_config(rank, target_modules=None, moe_mode="independent"):
+    return _lora_config(rank, target_modules, ROUTED_EXPERT_TARGETS, moe_mode)
 
 
 @pytest.fixture
@@ -207,8 +229,7 @@ class TestQwen35LoraFlops:
         flops, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
-            lora_rank=8,
-            lora_modules=lora_modules,
+            lora_config=_lora_config(8, lora_modules),
         )
 
         expected = self._expected_flops(qwen3_5_counter.config, batch_seqlens, 2.0, 8, lora_modules)
@@ -216,7 +237,11 @@ class TestQwen35LoraFlops:
 
     def test_default_lora_modules(self, qwen3_5_counter):
         batch_seqlens = [12, 5]
-        flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=2.0, lora_rank=8)
+        flops, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=_default_lora_config(qwen3_5_counter.config),
+        )
 
         default_modules = [
             "q_proj",
@@ -243,8 +268,7 @@ class TestQwen35LoraFlops:
         flops, _ = counter.estimate_flops(
             [12, 5],
             delta_time=2.0,
-            lora_rank=8,
-            lora_modules=lora_modules,
+            lora_config=_lora_config(8, lora_modules),
         )
 
         expected = self._expected_flops(text_config, [12, 5], 2.0, 8, lora_modules)
@@ -259,11 +283,16 @@ class TestQwen35LoraFlops:
             delta_time=2.0,
             images_seqlens=images_seqlens,
         )
-        lora_text, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=2.0, lora_rank=8)
+        lora_config = _default_lora_config(qwen3_5_counter.config)
+        lora_text, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=lora_config,
+        )
         lora_vl, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
-            lora_rank=8,
+            lora_config=lora_config,
             images_seqlens=images_seqlens,
         )
 
@@ -289,14 +318,22 @@ class TestQwen35MoeFlops:
     def test_numerical(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(16.888079843328, rel=1e-9)
+        text_config = qwen3_5_moe_counter.config.text_config
+        shared_expert_gate_flops = (
+            6 * text_config.hidden_size * text_config.num_hidden_layers * sum(batch_seqlens) / 1e12
+        )
+        # The embedding lookup is excluded. The shared-expert scalar gate is
+        # an ordinary trainable linear and follows the FFT factor-six convention.
+        assert flops == pytest.approx(16.888079843328 + shared_expert_gate_flops, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
-        # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(19.05408344064, rel=1e-9)
+        text_config = qwen3_5_moe_counter.config.text_config
+        shared_expert_gate_flops = (
+            6 * text_config.hidden_size * text_config.num_hidden_layers * sum(batch_seqlens) / 1e12
+        )
+        assert flops == pytest.approx(19.05408344064 + shared_expert_gate_flops, rel=1e-9)
 
 
 class TestQwen3Flops:
@@ -338,8 +375,7 @@ class TestQwen3Flops:
         lora_flops, _ = qwen3_5_moe_counter.estimate_flops(
             batch_seqlens,
             delta_time=1.0,
-            lora_rank=8,
-            lora_modules=lora_modules,
+            lora_config=_lora_config(8, lora_modules),
         )
 
         assert 0 < lora_flops < full_flops
@@ -348,17 +384,19 @@ class TestQwen3Flops:
         text_config = deepcopy(qwen3_5_moe_counter.config.text_config)
         counter = VeomniFlopsCounter(text_config)
 
-        flops, _ = counter.estimate_flops([12, 5], delta_time=1.0, lora_rank=8)
+        flops, _ = counter.estimate_flops(
+            [12, 5],
+            delta_time=1.0,
+            lora_config=_default_lora_config(text_config),
+        )
 
         assert flops > 0
 
     def test_routed_expert_lora_scales_with_topk(self, qwen3_5_moe_counter):
-        modules = ["gate_proj", "up_proj", "down_proj"]
-
         def rank_delta(config):
             counter = VeomniFlopsCounter(config)
-            rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_rank=4, lora_modules=modules)
-            rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_rank=8, lora_modules=modules)
+            rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(4))
+            rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(8))
             return rank8 - rank4
 
         topk1_config = deepcopy(qwen3_5_moe_counter.config)
@@ -395,15 +433,13 @@ class TestAllQwenLoraFlops:
             all_mlp_flops, _ = counter.estimate_flops(
                 [12, 5],
                 1.0,
-                lora_rank=8,
-                lora_modules=["gate_proj", "up_proj", "down_proj"],
+                lora_config=_routed_lora_config(8),
             )
-            for module in ("gate_proj", "up_proj", "down_proj"):
+            for target_parameter in ROUTED_EXPERT_TARGETS:
                 single_target_flops, _ = counter.estimate_flops(
                     [12, 5],
                     1.0,
-                    lora_rank=8,
-                    lora_modules=[module],
+                    lora_config=_lora_config(8, target_parameters=[target_parameter], moe_mode="independent"),
                 )
                 assert single_target_flops == pytest.approx(all_mlp_flops, rel=1e-9)
 
@@ -423,18 +459,22 @@ class TestAllQwenLoraFlops:
         kwargs = {"images_seqlens": [16]} if hasattr(config, "vision_config") else {}
 
         full_flops, _ = counter.estimate_flops([12, 5], delta_time=1.0, **kwargs)
-        lora_flops, _ = counter.estimate_flops([12, 5], delta_time=1.0, lora_rank=8, **kwargs)
+        lora_flops, _ = counter.estimate_flops(
+            [12, 5],
+            delta_time=1.0,
+            lora_config=_default_lora_config(config),
+            **kwargs,
+        )
 
         assert 0 < lora_flops < full_flops
 
     def test_qwen3_moe_adapter_work_scales_with_topk(self):
         config = _load_toy_config("tests/toy_config/qwen3_moe_toy")
-        modules = ["gate_proj", "up_proj", "down_proj"]
 
         def rank_delta(current_config):
             counter = VeomniFlopsCounter(current_config)
-            rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_rank=4, lora_modules=modules)
-            rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_rank=8, lora_modules=modules)
+            rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(4))
+            rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(8))
             return rank8 - rank4
 
         topk1_config = deepcopy(config)
@@ -458,8 +498,8 @@ class TestAllQwenLoraFlops:
         counter = VeomniFlopsCounter(config)
         modules = ["q_proj", "in_proj_qkvz", "in_proj_ba", "out_proj", "gate_proj"]
 
-        rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_rank=4, lora_modules=modules)
-        rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_rank=8, lora_modules=modules)
+        rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_lora_config(4, modules))
+        rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_lora_config(8, modules))
 
         full_layers = sum(layer_type == "full_attention" for layer_type in config.layer_types)
         linear_layers = sum(layer_type == "linear_attention" for layer_type in config.layer_types)
@@ -471,10 +511,7 @@ class TestAllQwenLoraFlops:
             + (config.hidden_size + 2 * linear_k_size + 2 * linear_v_size) * linear_layers
             + (config.hidden_size + 2 * config.linear_num_value_heads) * linear_layers
             + (linear_v_size + config.hidden_size) * linear_layers
-            + 3
-            * (config.hidden_size + config.moe_intermediate_size)
-            * config.num_hidden_layers
-            * config.num_experts_per_tok
+            + (config.hidden_size + config.shared_expert_intermediate_size) * config.num_hidden_layers
         )
         expected_delta = 6 * (8 - 4) * params_per_rank * (12 + 5) / 1e12
 
@@ -493,6 +530,7 @@ class TestAllQwenLoraFlops:
             config.hidden_size * config.num_experts
             + config.hidden_size * config.moe_intermediate_size * config.num_experts_per_tok * 3
             + config.hidden_size * config.shared_expert_intermediate_size * 3
+            + config.hidden_size
         ) * config.num_hidden_layers
         base_N = moe_N + attn_linear_N + config.hidden_size * config.vocab_size
         q_size = config.num_attention_heads * head_dim
@@ -505,8 +543,7 @@ class TestAllQwenLoraFlops:
         actual, _ = counter.estimate_flops(
             batch_seqlens,
             1.0,
-            lora_rank=rank,
-            lora_modules=["q_proj"],
+            lora_config=_lora_config(rank, ["q_proj"]),
         )
 
         assert actual == pytest.approx(expected, rel=1e-9)
@@ -514,12 +551,11 @@ class TestAllQwenLoraFlops:
     def test_qwen3_next_mlp_targets_routed_experts(self, qwen3_5_moe_counter):
         config = deepcopy(qwen3_5_moe_counter.config.text_config)
         config.model_type = "qwen3_next"
-        modules = ["gate_proj", "up_proj", "down_proj"]
 
         def rank_delta(current_config):
             counter = VeomniFlopsCounter(current_config)
-            rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_rank=4, lora_modules=modules)
-            rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_rank=8, lora_modules=modules)
+            rank4, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(4))
+            rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_config=_routed_lora_config(8))
             return rank8 - rank4
 
         topk1_config = deepcopy(config)
@@ -529,6 +565,59 @@ class TestAllQwenLoraFlops:
             config.num_experts_per_tok * rank_delta(topk1_config),
             rel=1e-9,
         )
+
+    def test_shared_moe_mode_reuses_gate_and_up_adapters(self, qwen3_5_moe_counter):
+        config = qwen3_5_moe_counter.config
+        text_config = config.text_config
+        batch_seqlens = [12, 5]
+
+        rank4, _ = VeomniFlopsCounter(config).estimate_flops(
+            batch_seqlens,
+            1.0,
+            lora_config=_routed_lora_config(4, moe_mode="shared"),
+        )
+        rank8, _ = VeomniFlopsCounter(config).estimate_flops(
+            batch_seqlens,
+            1.0,
+            lora_config=_routed_lora_config(8, moe_mode="shared"),
+        )
+
+        params_per_rank = (
+            (text_config.hidden_size + text_config.moe_intermediate_size)
+            * text_config.num_hidden_layers
+            * (2 + text_config.num_experts_per_tok)
+        )
+        expected_delta = 6 * (8 - 4) * params_per_rank * sum(batch_seqlens) / 1e12
+        assert rank8 - rank4 == pytest.approx(expected_delta, rel=1e-9)
+
+    def test_shared_and_routed_expert_adapters_are_additive(self, qwen3_5_moe_counter):
+        counter = qwen3_5_moe_counter
+        batch_seqlens = [12, 5]
+        attention_modules = ["q_proj"]
+        shared_modules = ["q_proj", "gate_proj", "up_proj", "down_proj"]
+
+        attention, _ = counter.estimate_flops(
+            batch_seqlens,
+            1.0,
+            lora_config=_lora_config(8, attention_modules),
+        )
+        shared, _ = counter.estimate_flops(
+            batch_seqlens,
+            1.0,
+            lora_config=_lora_config(8, shared_modules),
+        )
+        routed, _ = counter.estimate_flops(
+            batch_seqlens,
+            1.0,
+            lora_config=_routed_lora_config(8, attention_modules),
+        )
+        combined, _ = counter.estimate_flops(
+            batch_seqlens,
+            1.0,
+            lora_config=_routed_lora_config(8, shared_modules),
+        )
+
+        assert combined - attention == pytest.approx((shared - attention) + (routed - attention), rel=1e-9)
 
     def test_qwen25_vl_matching_vision_mlp_modules(self):
         config = _load_toy_config("tests/toy_config/qwen25vl_toy")
@@ -541,14 +630,12 @@ class TestAllQwenLoraFlops:
         text_flops, _ = counter.estimate_flops(
             batch_seqlens,
             1.0,
-            lora_rank=rank,
-            lora_modules=modules,
+            lora_config=_lora_config(rank, modules),
         )
         vl_flops, _ = counter.estimate_flops(
             batch_seqlens,
             1.0,
-            lora_rank=rank,
-            lora_modules=modules,
+            lora_config=_lora_config(rank, modules),
             images_seqlens=images_seqlens,
         )
 
@@ -651,8 +738,7 @@ class TestQwen2LoraFlops:
         flops, _ = qwen3_counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
-            lora_rank=8,
-            lora_modules=lora_modules,
+            lora_config=_lora_config(8, lora_modules),
         )
 
         expected = self._expected_flops(qwen3_config, batch_seqlens, 2.0, 8, lora_modules)
@@ -660,8 +746,6 @@ class TestQwen2LoraFlops:
 
     def test_default_lora_modules(self, qwen3_counter, qwen3_config):
         batch_seqlens = [12, 5]
-        flops, _ = qwen3_counter.estimate_flops(batch_seqlens, delta_time=2.0, lora_rank=8)
-
         default_modules = [
             "q_proj",
             "k_proj",
@@ -671,6 +755,11 @@ class TestQwen2LoraFlops:
             "up_proj",
             "down_proj",
         ]
+        flops, _ = qwen3_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=_lora_config(8, default_modules),
+        )
         expected = self._expected_flops(qwen3_config, batch_seqlens, 2.0, 8, default_modules)
         assert flops == pytest.approx(expected, rel=1e-9)
 
@@ -688,12 +777,12 @@ class TestQwen2LoraFlops:
         lora_flops, _ = VeomniFlopsCounter(qwen3_config).estimate_flops(
             batch_seqlens,
             delta_time=1.0,
-            lora_rank=8,
+            lora_config=_default_lora_config(qwen3_config),
         )
         larger_lora_flops, _ = VeomniFlopsCounter(larger_vocab_config).estimate_flops(
             batch_seqlens,
             delta_time=1.0,
-            lora_rank=8,
+            lora_config=_default_lora_config(larger_vocab_config),
         )
 
         # A larger vocabulary adds one lm_head row. FFT computes forward, dX,
@@ -707,7 +796,11 @@ class TestQwen2LoraFlops:
         qwen2_config.model_type = "qwen2"
         counter = VeomniFlopsCounter(qwen2_config)
 
-        flops, _ = counter.estimate_flops([12, 5], delta_time=2.0, lora_rank=8)
+        flops, _ = counter.estimate_flops(
+            [12, 5],
+            delta_time=2.0,
+            lora_config=_default_lora_config(qwen2_config),
+        )
         assert flops > 0
 
     def test_qwen3_explicit_head_dim_for_full_and_lora(self, qwen3_config):
@@ -721,8 +814,7 @@ class TestQwen2LoraFlops:
         lora_flops, _ = counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
-            lora_rank=8,
-            lora_modules=lora_modules,
+            lora_config=_lora_config(8, lora_modules),
         )
 
         tokens_sum = sum(batch_seqlens)
@@ -745,36 +837,80 @@ class TestQwen2LoraFlops:
         assert full_flops == pytest.approx(expected_full, rel=1e-9)
         assert lora_flops == pytest.approx(expected_lora, rel=1e-9)
 
-    @pytest.mark.parametrize("lora_rank", [0, -1, 1.5, True])
-    def test_invalid_lora_rank(self, qwen3_counter, lora_rank):
-        with pytest.raises(ValueError, match="positive integer"):
-            qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_rank=lora_rank)
-
     @pytest.mark.parametrize(
-        ("lora_modules", "error_match"),
+        ("lora_config", "error_match"),
         [
-            ([], "must not be empty"),
-            (["q_proj", "q_proj"], "must not contain duplicates"),
-            (["q_proj", "unknown_proj"], "Unsupported qwen3"),
-            ("q_proj", "must be a list"),
+            (_lora_config(8, ["q_proj", "q_proj"]), "must not contain duplicates"),
+            (_lora_config(8, ["q_proj", "unknown_proj"]), "Unsupported qwen3"),
+            (_lora_config(8, "q_proj"), "does not support regex-string"),
         ],
     )
-    def test_invalid_lora_modules(self, qwen3_counter, lora_modules, error_match):
+    def test_invalid_lora_config(self, qwen3_counter, lora_config, error_match):
         with pytest.raises(ValueError, match=error_match):
             qwen3_counter.estimate_flops(
                 [12, 5],
                 delta_time=2.0,
-                lora_rank=8,
-                lora_modules=lora_modules,
+                lora_config=lora_config,
             )
 
-    def test_lora_modules_require_rank(self, qwen3_counter):
-        with pytest.raises(ValueError, match="requires a positive"):
-            qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_modules=["q_proj"])
+    def test_lora_config_requires_config_type(self, qwen3_counter):
+        with pytest.raises(TypeError, match="VeOmniLoraConfig"):
+            qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_config={"r": 8})
+
+    def test_loose_lora_arguments_are_not_part_of_api(self, qwen3_counter):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_rank=8)
+
+    def test_non_moe_model_rejects_target_parameters(self, qwen3_counter):
+        with pytest.raises(ValueError, match="not supported for non-MoE"):
+            qwen3_counter.estimate_flops(
+                [12, 5],
+                delta_time=2.0,
+                lora_config=_routed_lora_config(8),
+            )
+
+    def test_unsupported_target_parameter_is_rejected(self):
+        counter = VeomniFlopsCounter(_load_toy_config("tests/toy_config/qwen3_moe_toy"))
+        with pytest.raises(ValueError, match="fused routed-expert"):
+            counter.estimate_flops(
+                [12, 5],
+                delta_time=2.0,
+                lora_config=_lora_config(8, target_parameters=["*.mlp.experts.router_weight"]),
+            )
+
+    def test_non_flop_lora_fields_are_ignored(self, qwen3_counter):
+        target_modules = ["q_proj"]
+        baseline, _ = qwen3_counter.estimate_flops(
+            [12, 5],
+            delta_time=2.0,
+            lora_config=_lora_config(8, target_modules),
+        )
+        ignored_fields, _ = qwen3_counter.estimate_flops(
+            [12, 5],
+            delta_time=2.0,
+            lora_config=VeOmniLoraConfig(
+                r=8,
+                lora_alpha=256,
+                target_modules=target_modules,
+                exclude_modules=["q_proj"],
+                lora_dropout=0.5,
+                bias="all",
+                use_rslora=True,
+                init_lora_weights=False,
+                rank_pattern={".*q_proj": 64},
+                alpha_pattern={".*q_proj": 512},
+            ),
+        )
+
+        assert ignored_fields == baseline
 
     def test_lora_rejects_unsupported_model_type(self, gpt_oss_counter):
         with pytest.raises(ValueError, match="supports Qwen model types"):
-            gpt_oss_counter.estimate_flops([12, 5], delta_time=2.0, lora_rank=8)
+            gpt_oss_counter.estimate_flops(
+                [12, 5],
+                delta_time=2.0,
+                lora_config=_lora_config(8, ["q_proj"]),
+            )
 
 
 class TestGptOssFlops:

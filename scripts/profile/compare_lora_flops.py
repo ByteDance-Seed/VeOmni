@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from transformers import AutoConfig
 
-from veomni.lora.config import FUSED_MOE_LORA_MODULES, LORA_MODULES_BY_MODEL_TYPE
+from veomni.lora.config import FUSED_MOE_LORA_MODULES, LORA_MODULES_BY_MODEL_TYPE, VeOmniLoraConfig
 from veomni.utils.count_flops import VeomniFlopsCounter
 
 
@@ -31,6 +31,7 @@ MODELS = [
     ("Qwen3 0.6B", "Qwen/Qwen3-0.6B", "qwen3", "dense GQA + QK norm"),
     ("Qwen3 32B", "Qwen/Qwen3-32B", "qwen3", "dense GQA + QK norm"),
     ("Qwen3 30B-A3B", "Qwen/Qwen3-30B-A3B", "qwen3_moe", "MoE; 3B active"),
+    ("Qwen3-Next 80B-A3B", "Qwen/Qwen3-Next-80B-A3B-Instruct", "qwen3_next", "hybrid MoE; 3B active"),
     ("Qwen2.5-VL 3B", "Qwen/Qwen2.5-VL-3B-Instruct", "qwen2_5_vl", "dense VLM"),
     ("Qwen3-VL 2B", "Qwen/Qwen3-VL-2B-Instruct", "qwen3_vl", "dense VLM"),
     ("Qwen3.5 9B", "Qwen/Qwen3.5-9B", "qwen3_5", "hybrid dense VLM"),
@@ -38,15 +39,31 @@ MODELS = [
     ("Qwen3.5 35B-A3B", "Qwen/Qwen3.5-35B-A3B", "qwen3_5_moe", "hybrid MoE VLM; 3B active"),
 ]
 
+ROUTED_MOE_TYPES = {"qwen3_moe", "qwen3_vl_moe", "qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"}
+SHARED_EXPERT_TYPES = {"qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"}
+ROUTED_EXPERT_TARGETS = ["*.mlp.experts.gate_up_proj", "*.mlp.experts.down_proj"]
 
-def get_module_groups(model_type: str) -> dict[str, list[str]]:
+
+def get_lora_configs(model_type: str, rank: int) -> dict[str, VeOmniLoraConfig]:
     supported_modules = LORA_MODULES_BY_MODEL_TYPE[model_type]
     mlp_modules = [module for module in supported_modules if module in FUSED_MOE_LORA_MODULES]
     attention_modules = [module for module in supported_modules if module not in FUSED_MOE_LORA_MODULES]
+    target_parameters = ROUTED_EXPERT_TARGETS if model_type in ROUTED_MOE_TYPES else None
+    shared_mlp_modules = mlp_modules if model_type in SHARED_EXPERT_TYPES or target_parameters is None else None
+
+    def make_config(target_modules, routed_targets=None):
+        return VeOmniLoraConfig(
+            r=rank,
+            lora_alpha=rank,
+            target_modules=target_modules,
+            target_parameters=routed_targets,
+            moe_mode="independent" if routed_targets else None,
+        )
+
     return {
-        "LoRA all": list(supported_modules),
-        "LoRA attention": attention_modules,
-        "LoRA MLP": mlp_modules,
+        "LoRA all": make_config([*attention_modules, *(shared_mlp_modules or [])], target_parameters),
+        "LoRA attention": make_config(attention_modules),
+        "LoRA MLP": make_config(shared_mlp_modules, target_parameters),
     }
 
 
@@ -54,8 +71,6 @@ def compare_model(model_name: str, model_id: str, model_type: str, architecture:
     # AutoConfig downloads only the small config metadata, never model weights.
     counter = VeomniFlopsCounter(AutoConfig.from_pretrained(model_id))
     input_kwargs = {"images_seqlens": IMAGES_SEQLENS} if getattr(counter.config, "vision_config", None) else {}
-    module_groups = get_module_groups(model_type)
-
     full_flops, _ = counter.estimate_flops(BATCH_SEQLENS, DELTA_TIME, **input_kwargs)
 
     print(f"\n{model_name} ({model_id}; {architecture})")
@@ -65,12 +80,11 @@ def compare_model(model_name: str, model_id: str, model_type: str, architecture:
     print(f"{'Full fine-tuning':<24} {'-':>6} {full_flops:>16.6f} {100:>11.2f}%")
 
     for rank in LORA_RANKS:
-        for label, modules in module_groups.items():
+        for label, lora_config in get_lora_configs(model_type, rank).items():
             flops, _ = counter.estimate_flops(
                 BATCH_SEQLENS,
                 DELTA_TIME,
-                lora_rank=rank,
-                lora_modules=modules,
+                lora_config=lora_config,
                 **input_kwargs,
             )
             print(f"{label:<24} {rank:>6} {flops:>16.6f} {flops / full_flops * 100:>11.2f}%")
