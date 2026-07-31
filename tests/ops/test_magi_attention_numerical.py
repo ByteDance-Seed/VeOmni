@@ -13,7 +13,11 @@
 # limitations under the License.
 
 import copy
+import gc
 import importlib.util
+import json
+import os
+import statistics
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +30,14 @@ from torch.nn.attention.flex_attention import create_block_mask
 from veomni.ops.kernels.attention import flash as flash_backend
 from veomni.ops.kernels.attention import flex as flex_backend
 from veomni.ops.kernels.attention import magi as magi_backend
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    empty_cache,
+    get_device_type,
+    get_gpu_compute_capability,
+    get_torch_device,
+    synchronize,
+)
 
 
 _MASK_CASES = ("causal", "full", "bagel_mixed")
@@ -36,16 +47,11 @@ def _is_magi_ffa_available() -> bool:
     if not IS_CUDA_AVAILABLE or importlib.util.find_spec("magi_attention") is None:
         return False
 
-    compute_capability = get_gpu_compute_capability()
-    if 80 <= compute_capability < 100:
-        return magi_backend._magi_cutlass_backend is not None
-    return compute_capability >= 100 and importlib.util.find_spec("flash_attn_cute") is not None
+    return get_gpu_compute_capability() >= 100 and importlib.util.find_spec("flash_attn_cute") is not None
 
 
 _MAGI_FFA_AVAILABLE = _is_magi_ffa_available()
-_MAGI_FFA_REASON = (
-    "MagiAttention requires SM80+ and its hardware backend; run the SM80/SM90 installer after the gpu sync"
-)
+_MAGI_FFA_REASON = "MagiAttention requires an NVIDIA SM100+ GPU and the CUTE DSL/JIT backend from the gpu extra"
 
 _QUERY_HEADS = 4
 _KV_HEADS = 2
@@ -57,6 +63,9 @@ _BAGEL_QUERY_HEADS = 28
 _BAGEL_KV_HEADS = 4
 _BAGEL_HEAD_DIM = 128
 _BAGEL_SEQUENCE_LENGTH = 4096
+_RUN_PROFILE = os.environ.get("RUN_MAGI_ATTENTION_PROFILE") == "1"
+_PROFILE_SEQUENCE_LENGTHS = (4096, 8192, 20000)
+_PROFILE_ITERATIONS = 5
 
 
 class _AttentionModule(nn.Module):
@@ -403,7 +412,14 @@ class _BagelLikeAttentionLayer(nn.Module):
         self.v_proj = nn.Linear(_BAGEL_HIDDEN_SIZE, _BAGEL_KV_HEADS * _BAGEL_HEAD_DIM, bias=True)
         self.o_proj = nn.Linear(_BAGEL_QUERY_HEADS * _BAGEL_HEAD_DIM, _BAGEL_HIDDEN_SIZE, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor, attention_mask, *, backend: str):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask,
+        *,
+        backend: str,
+        sdpa_backend: SDPBackend = SDPBackend.MATH,
+    ):
         batch_size, sequence_length, _ = hidden_states.shape
         query = (
             self.q_proj(hidden_states)
@@ -438,7 +454,12 @@ class _BagelLikeAttentionLayer(nn.Module):
         scaling = _BAGEL_HEAD_DIM**-0.5
 
         if backend == "sdpa":
-            with sdpa_kernel(backends=[SDPBackend.MATH]):
+            enable_gqa = sdpa_backend == SDPBackend.MATH
+            if not enable_gqa:
+                repeat_count = query.shape[1] // key.shape[1]
+                key = key.repeat_interleave(repeat_count, dim=1)
+                value = value.repeat_interleave(repeat_count, dim=1)
+            with sdpa_kernel(backends=[sdpa_backend]):
                 output = F.scaled_dot_product_attention(
                     query,
                     key,
@@ -446,9 +467,19 @@ class _BagelLikeAttentionLayer(nn.Module):
                     attn_mask=attention_mask,
                     dropout_p=0.0,
                     scale=scaling,
-                    enable_gqa=True,
+                    enable_gqa=enable_gqa,
                 ).transpose(1, 2)
             lse = None
+        elif backend == "flex":
+            output, lse = flex_backend.flex_attention_forward(
+                self,
+                query,
+                key,
+                value,
+                attention_mask,
+                scaling=scaling,
+                kernel_options={"BACKEND": "TRITON"},
+            )
         elif backend == "magi":
             output, lse = magi_backend.magi_attention_forward(
                 self,
@@ -525,3 +556,186 @@ def test_bagel_like_magi_layer_matches_math_sdpa(monkeypatch):
             atol=gradient_atol,
             msg=lambda message, gradient_name=name: f"{gradient_name}: {message}",
         )
+
+
+def _profile_bagel_like_iteration(
+    layer: _BagelLikeAttentionLayer,
+    hidden_states: torch.Tensor,
+    attention_mask,
+    output_gradient: torch.Tensor,
+    *,
+    backend: str,
+    sdpa_backend: SDPBackend = SDPBackend.MATH,
+) -> tuple[float, bool]:
+    device_api = get_torch_device()
+    synchronize()
+    start = device_api.Event(enable_timing=True)
+    end = device_api.Event(enable_timing=True)
+    start.record()
+    output, lse = layer(
+        hidden_states,
+        attention_mask,
+        backend=backend,
+        sdpa_backend=sdpa_backend,
+    )
+    gradients = torch.autograd.grad(output, (hidden_states, *layer.parameters()), output_gradient)
+    end.record()
+    synchronize()
+
+    finite = bool(torch.isfinite(output).all().item()) and all(
+        bool(torch.isfinite(gradient).all().item()) for gradient in gradients
+    )
+    if lse is not None:
+        finite = finite and bool(torch.isfinite(lse).all().item())
+    elapsed_ms = start.elapsed_time(end)
+    del output, lse, gradients
+    return elapsed_ms, finite
+
+
+def _profile_bagel_like_backend(sequence_length: int, backend: str) -> dict[str, object]:
+    device_api = get_torch_device()
+    gc.collect()
+    empty_cache()
+
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    torch.manual_seed(12001 + sequence_length)
+    layer = _BagelLikeAttentionLayer().to(device=device, dtype=dtype).train()
+    generator = torch.Generator(device=device).manual_seed(12002 + sequence_length)
+    hidden_states = torch.randn(
+        (1, sequence_length, _BAGEL_HIDDEN_SIZE),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+        requires_grad=True,
+    )
+    output_gradient = torch.randn(
+        hidden_states.shape,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+
+    if backend == "efficient_attention":
+        attention_mask = _build_dense_mask("bagel_mixed", sequence_length, device)
+        layer_backend = "sdpa"
+        sdpa_backend = SDPBackend.EFFICIENT_ATTENTION
+        mask_kind = "dense_bool"
+    elif backend == "flex_attention":
+        dense_mask = _build_dense_mask("bagel_mixed", sequence_length, device)
+        attention_mask = _build_flex_mask(dense_mask)
+        layer_backend = "flex"
+        sdpa_backend = SDPBackend.MATH
+        mask_kind = "native_BlockMask"
+        torch.compiler.reset()
+    elif backend == "magi_attention":
+        attention_mask = _build_magi_mask("bagel_mixed", sequence_length, device)
+        layer_backend = "magi"
+        sdpa_backend = SDPBackend.MATH
+        mask_kind = "MagiAttentionMask"
+    else:
+        raise ValueError(f"Unsupported profiling backend: {backend}")
+
+    device_api.reset_peak_memory_stats()
+    first_iteration_ms, first_finite = _profile_bagel_like_iteration(
+        layer,
+        hidden_states,
+        attention_mask,
+        output_gradient,
+        backend=layer_backend,
+        sdpa_backend=sdpa_backend,
+    )
+    first_iteration_peak_allocated_gib = device_api.max_memory_allocated() / 1024**3
+    post_first_warmup_ms, warmup_finite = _profile_bagel_like_iteration(
+        layer,
+        hidden_states,
+        attention_mask,
+        output_gradient,
+        backend=layer_backend,
+        sdpa_backend=sdpa_backend,
+    )
+
+    gc.collect()
+    empty_cache()
+    device_api.reset_peak_memory_stats()
+    steady_state_times_ms = []
+    all_finite = first_finite and warmup_finite
+    for _ in range(_PROFILE_ITERATIONS):
+        elapsed_ms, iteration_finite = _profile_bagel_like_iteration(
+            layer,
+            hidden_states,
+            attention_mask,
+            output_gradient,
+            backend=layer_backend,
+            sdpa_backend=sdpa_backend,
+        )
+        steady_state_times_ms.append(elapsed_ms)
+        all_finite = all_finite and iteration_finite
+
+    return {
+        "backend": backend,
+        "mask": mask_kind,
+        "first_iteration_ms": first_iteration_ms,
+        "first_iteration_peak_allocated_gib": first_iteration_peak_allocated_gib,
+        "post_first_warmup_ms": post_first_warmup_ms,
+        "steady_state_iterations": _PROFILE_ITERATIONS,
+        "steady_state_times_ms": steady_state_times_ms,
+        "steady_state_median_ms": statistics.median(steady_state_times_ms),
+        "peak_allocated_gib": device_api.max_memory_allocated() / 1024**3,
+        "all_outputs_and_gradients_finite": all_finite,
+    }
+
+
+@pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)
+@pytest.mark.skipif(
+    not _RUN_PROFILE,
+    reason="Set RUN_MAGI_ATTENTION_PROFILE=1 to run the BAGEL-like CUDA profile",
+)
+@pytest.mark.benchmark
+@pytest.mark.parametrize("sequence_length", _PROFILE_SEQUENCE_LENGTHS)
+def test_bagel_like_layer_profiles_efficient_sdpa_flex_and_magi(sequence_length):
+    device_api = get_torch_device()
+    try:
+        efficient_result = _profile_bagel_like_backend(sequence_length, "efficient_attention")
+        flex_result = _profile_bagel_like_backend(sequence_length, "flex_attention")
+        magi_result = _profile_bagel_like_backend(sequence_length, "magi_attention")
+    except device_api.OutOfMemoryError as error:
+        free_bytes, total_bytes = device_api.mem_get_info()
+        pytest.fail(
+            json.dumps(
+                {
+                    "sequence_length": sequence_length,
+                    "error": str(error),
+                    "allocated_gib": device_api.memory_allocated() / 1024**3,
+                    "reserved_gib": device_api.memory_reserved() / 1024**3,
+                    "free_gib": free_bytes / 1024**3,
+                    "total_gib": total_bytes / 1024**3,
+                },
+                indent=2,
+            )
+        )
+
+    result = {
+        "sequence_length": sequence_length,
+        "dtype": str(torch.bfloat16),
+        "batch_size": 1,
+        "hidden_size": _BAGEL_HIDDEN_SIZE,
+        "query_heads": _BAGEL_QUERY_HEADS,
+        "kv_heads": _BAGEL_KV_HEADS,
+        "head_dim": _BAGEL_HEAD_DIM,
+        "efficient_attention": efficient_result,
+        "flex_attention": flex_result,
+        "magi_attention": magi_result,
+        "flex_speedup_vs_efficient": (
+            efficient_result["steady_state_median_ms"] / flex_result["steady_state_median_ms"]
+        ),
+        "magi_speedup_vs_efficient": (
+            efficient_result["steady_state_median_ms"] / magi_result["steady_state_median_ms"]
+        ),
+        "magi_speedup_vs_flex": flex_result["steady_state_median_ms"] / magi_result["steady_state_median_ms"],
+    }
+    print(f"BAGEL-like mixed-visibility profile:\n{json.dumps(result, indent=2)}")
+
+    assert efficient_result["all_outputs_and_gradients_finite"]
+    assert flex_result["all_outputs_and_gradients_finite"]
+    assert magi_result["all_outputs_and_gradients_finite"]

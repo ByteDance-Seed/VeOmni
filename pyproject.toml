@@ -89,9 +89,6 @@ gpu = [
   "megatron-energon>=7.2.1",
   "hf_transfer",
   "debugpy",
-  # MagiAttention's public API and SM100+ CUTE DSL backend. SM80/SM90 require
-  # the architecture-specific CUTLASS overlay installed by scripts/kernel/.
-  # Companion packages use the flash-attention revision from MagiAttention 1.1.1.
   "create-block-mask-cuda==0.1; sys_platform == 'linux'",
   "flash-attn-cute==0.0.2; sys_platform == 'linux'",
   "magi-to-hstu-cuda==0.1; sys_platform == 'linux'",
@@ -322,10 +319,10 @@ magi-attention = ["setuptools>=78.1.1", "wheel", "packaging>=24.2", "ninja", "to
 magi-to-hstu-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
 
 [tool.uv.extra-build-variables]
-# MagiAttention v1.1.1 supports FFA_FA4 on SM80, SM90, and SM100. Build the
-# complete supported matrix so cached wheels are portable across GPU hosts.
-magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "80,90,100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
-create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "80,90,100" }
+# VeOmni exposes only MagiAttention's SM100+ CUTE DSL/JIT path. FFA kernels
+# compile lazily at runtime; CP communication remains outside the CP1 scope.
+magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
+create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100" }
 magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
 [tool.setuptools.dynamic]

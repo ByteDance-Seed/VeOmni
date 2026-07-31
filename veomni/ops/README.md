@@ -70,45 +70,23 @@ own Triton RMSNorm/rotary. See the per-model table below.
 | `triton` | Triton + CUDA | Validated by the model `extra_backends` registration |
 | `flash_attention_2/3/4` | `flash-attn` / `flash-attn-interface` / `flash-attn.cute` | Validated in `OpsImplementationConfig.__post_init__` |
 | `flex_attention` | PyTorch FlexAttention | Native `BlockMask`; compiled CUDA execution for training |
-| `magi_attention` | `magi-attention==1.1.1`, NVIDIA SM80+ | Native `MagiAttentionMask`; CP1 FFA with optional Ulysses. SM80/SM90 need the CUTLASS overlay below; SM100+ uses CUTE JIT. |
+| `magi_attention` | `magi-attention==1.1.1`, NVIDIA SM100+ | Native `MagiAttentionMask`; CP1 FFA with optional Ulysses through the CUTE DSL/JIT backend. |
 | `moe_implementation=fused_triton` | Triton, SM70+ | `is_fused_moe_available()` |
 | `moe_implementation=fused_quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
 | `moe_implementation=fused_npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
 | `mhc_implementation=tilelang` | `tile-kernels==1.0.0`, BF16, NVIDIA SM90+ | `KernelSpec(HardwareRequirement(..., min_compute_capability=90))` |
 
-#### Installing the MagiAttention hardware backend
+#### Installing MagiAttention
 
-The GPU extra always installs MagiAttention and its SM100+ CUTE DSL backend:
+The GPU extra installs MagiAttention and its SM100+ CUTE DSL/JIT backend:
 
 ```bash
 uv sync --extra gpu --dev
 ```
 
-That command is sufficient on SM100 and newer GPUs. On SM80/SM90, install the
-architecture-specific CUTLASS backend after the sync and before running a model
-with `attn_implementation: magi_attention`:
-
-```bash
-# A100 / other SM8x hosts
-bash scripts/kernel/install_magi_sm80_sm90.sh sm80
-
-# H100 / other SM9x hosts
-bash scripts/kernel/install_magi_sm80_sm90.sh sm90
-```
-
-The script also accepts `auto` (the default) or `sm80,sm90`. It builds only
-BF16 kernels for head dimensions `64` and `128` and Magi FFA function counts
-`1,3`; selecting one architecture avoids compiling the other architecture.
-FP16 inputs are rejected by the upstream FFA kernel guard. The script validates
-that the GPU extra and a CUDA toolkit matching PyTorch are available before
-building. `MAX_JOBS` and `NVCC_THREADS` can be overridden to tune source-level
-and ptxas split compilation; `NVCC_THREADS` defaults to `4`. Increasing it can
-substantially increase host-memory usage for arbitrary-mask backward kernels.
-
-`ffa-fa3` is an environment overlay rather than a locked uv dependency. An
-exact later `uv sync` removes it, so rerun the installer after the final sync.
-If the overlay is missing, VeOmni remains importable and raises an actionable
-`ImportError` only when `magi_attention` is selected on SM80/SM90.
+SM80 and SM90 are not supported by VeOmni's MagiAttention adapter; selecting
+`magi_attention` on those devices raises a hardware-requirement error before
+loading the backend.
 
 ### Per-model PER_MODEL coverage
 

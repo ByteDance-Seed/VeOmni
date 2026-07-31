@@ -444,10 +444,8 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         rank = dist.get_rank(group)
         device = torch.device(get_device_type(), rank)
         compute_capability = get_gpu_compute_capability(device)
-        if compute_capability < 80:
-            self.skipTest("MagiAttention's default FFA backend requires SM80 or newer GPUs")
-        if compute_capability < 100 and magi_backend._magi_cutlass_backend is None:
-            self.skipTest("MagiAttention's SM80/SM90 CUTLASS backend is not installed")
+        if compute_capability < 100:
+            self.skipTest("MagiAttention's supported CUTE DSL/JIT backend requires SM100 or newer GPUs")
 
         original_get_parallel_state = magi_backend.get_parallel_state
         try:
