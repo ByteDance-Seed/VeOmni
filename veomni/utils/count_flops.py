@@ -97,6 +97,7 @@ class VeomniFlopsCounter:
         }
 
         self.config = config
+        self._warned_lora_validation_errors = set()
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
@@ -141,30 +142,30 @@ class VeomniFlopsCounter:
         return (base_factor * base_params + 6 * lora_params) * tokens
 
     @staticmethod
-    def _validate_lora_config(model_type, lora_config):
+    def _get_lora_validation_error(model_type, lora_config):
         if lora_config is None:
             return None
         if not isinstance(lora_config, VeOmniLoraConfig):
-            raise TypeError(f"`lora_config` must be a VeOmniLoraConfig or None, got {type(lora_config).__name__}.")
+            return f"`lora_config` must be a VeOmniLoraConfig or None, got {type(lora_config).__name__}."
 
         supported_modules = LORA_MODULES_BY_MODEL_TYPE.get(model_type)
         if supported_modules is None:
-            raise ValueError(
+            return (
                 f"LoRA FLOPs estimation supports Qwen model types {sorted(LORA_MODULES_BY_MODEL_TYPE)}, "
                 f"got {model_type!r}."
             )
 
         target_modules = lora_config.target_modules or []
         if isinstance(target_modules, str):
-            raise ValueError("LoRA FLOPs estimation does not support regex-string `target_modules`.")
+            return "LoRA FLOPs estimation does not support regex-string `target_modules`."
         if not isinstance(target_modules, list) or not all(isinstance(module, str) for module in target_modules):
-            raise ValueError("`lora_config.target_modules` must be a list of projection names or None.")
+            return "`lora_config.target_modules` must be a list of projection names or None."
         if len(target_modules) != len(set(target_modules)):
-            raise ValueError(f"`lora_config.target_modules` must not contain duplicates, got {target_modules!r}.")
+            return f"`lora_config.target_modules` must not contain duplicates, got {target_modules!r}."
 
         unsupported_modules = set(target_modules) - set(supported_modules)
         if unsupported_modules:
-            raise ValueError(
+            return (
                 f"Unsupported {model_type} LoRA modules: {sorted(unsupported_modules)}. "
                 f"Supported modules: {list(supported_modules)}."
             )
@@ -173,21 +174,21 @@ class VeomniFlopsCounter:
         if not isinstance(target_parameters, list) or not all(
             isinstance(pattern, str) for pattern in target_parameters
         ):
-            raise ValueError("`lora_config.target_parameters` must be a list of parameter patterns or None.")
+            return "`lora_config.target_parameters` must be a list of parameter patterns or None."
         if target_parameters:
             supported_moe_types = {"qwen3_moe", "qwen3_vl_moe", "qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"}
             if model_type not in supported_moe_types:
-                raise ValueError(f"`target_parameters` is not supported for non-MoE model type {model_type!r}.")
+                return f"`target_parameters` is not supported for non-MoE model type {model_type!r}."
             supported_suffixes = ("gate_up_proj", "down_proj")
             unsupported_patterns = [
                 pattern for pattern in target_parameters if not pattern.endswith(supported_suffixes)
             ]
             if unsupported_patterns:
-                raise ValueError(
+                return (
                     "LoRA FLOPs estimation only supports fused routed-expert target parameters ending in "
                     f"{supported_suffixes}, got {unsupported_patterns!r}."
                 )
-        return lora_config
+        return None
 
     @staticmethod
     def _compute_routed_moe_lora_flops(config, tokens, lora_config):
@@ -1249,7 +1250,8 @@ class VeomniFlopsCounter:
                 Qwen models. FLOPs estimation reads only ``r``, ``target_modules``,
                 ``target_parameters``, and ``moe_mode``. Other fields and their arithmetic effects
                 are intentionally ignored. A vision tower without a matching target is counted as
-                frozen, forward-only work.
+                frozen, forward-only work. Unsupported LoRA configurations emit a warning and
+                return zero achieved FLOPs instead of interrupting training.
             images_seqlens (List[int], optional): Vision-token sequence lengths for multimodal
                 models.
 
@@ -1257,7 +1259,16 @@ class VeomniFlopsCounter:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
             promised_flops (float): The expected FLOPS of the current device.
         """
-        lora_config = self._validate_lora_config(self.config.model_type, lora_config)
+        lora_validation_error = self._get_lora_validation_error(self.config.model_type, lora_config)
+        if lora_validation_error is not None:
+            if lora_validation_error not in self._warned_lora_validation_errors:
+                logger.warning_rank0(
+                    "LoRA FLOPs are unavailable: %s Returning zero FLOPs so training can continue.",
+                    lora_validation_error,
+                )
+                self._warned_lora_validation_errors.add(lora_validation_error)
+            return 0, get_device_flops()
+
         kwargs = {}
         if lora_config is not None:
             kwargs["lora_config"] = lora_config

@@ -922,38 +922,54 @@ class TestQwen2LoraFlops:
             (_lora_config(8, "q_proj"), "does not support regex-string"),
         ],
     )
-    def test_invalid_lora_config(self, qwen3_counter, lora_config, error_match):
-        with pytest.raises(ValueError, match=error_match):
-            qwen3_counter.estimate_flops(
+    def test_invalid_lora_config_returns_zero(self, qwen3_counter, lora_config, error_match):
+        with patch("veomni.utils.count_flops.logger.warning_rank0") as warning:
+            flops, promised_flops = qwen3_counter.estimate_flops(
                 [12, 5],
                 delta_time=2.0,
                 lora_config=lora_config,
             )
 
-    def test_lora_config_requires_config_type(self, qwen3_counter):
-        with pytest.raises(TypeError, match="VeOmniLoraConfig"):
-            qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_config={"r": 8})
+        assert flops == 0
+        assert promised_flops == 1000.0
+        assert error_match in warning.call_args.args[1]
+
+    def test_invalid_lora_config_type_returns_zero(self, qwen3_counter):
+        with patch("veomni.utils.count_flops.logger.warning_rank0") as warning:
+            flops, promised_flops = qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_config={"r": 8})
+
+        assert flops == 0
+        assert promised_flops == 1000.0
+        assert "VeOmniLoraConfig" in warning.call_args.args[1]
 
     def test_loose_lora_arguments_are_not_part_of_api(self, qwen3_counter):
         with pytest.raises(TypeError, match="unexpected keyword argument"):
             qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_rank=8)
 
-    def test_non_moe_model_rejects_target_parameters(self, qwen3_counter):
-        with pytest.raises(ValueError, match="not supported for non-MoE"):
-            qwen3_counter.estimate_flops(
+    def test_non_moe_target_parameters_return_zero(self, qwen3_counter):
+        with patch("veomni.utils.count_flops.logger.warning_rank0") as warning:
+            flops, promised_flops = qwen3_counter.estimate_flops(
                 [12, 5],
                 delta_time=2.0,
                 lora_config=_routed_lora_config(8),
             )
 
-    def test_unsupported_target_parameter_is_rejected(self):
+        assert flops == 0
+        assert promised_flops == 1000.0
+        assert "not supported for non-MoE" in warning.call_args.args[1]
+
+    def test_unsupported_target_parameter_returns_zero(self):
         counter = VeomniFlopsCounter(_load_toy_config("tests/toy_config/qwen3_moe_toy"))
-        with pytest.raises(ValueError, match="fused routed-expert"):
-            counter.estimate_flops(
+        with patch("veomni.utils.count_flops.logger.warning_rank0") as warning:
+            flops, promised_flops = counter.estimate_flops(
                 [12, 5],
                 delta_time=2.0,
                 lora_config=_lora_config(8, target_parameters=["*.mlp.experts.router_weight"]),
             )
+
+        assert flops == 0
+        assert promised_flops == 1000.0
+        assert "fused routed-expert" in warning.call_args.args[1]
 
     def test_non_flop_lora_fields_are_ignored(self, qwen3_counter):
         target_modules = ["q_proj"]
@@ -981,9 +997,35 @@ class TestQwen2LoraFlops:
 
         assert ignored_fields == baseline
 
-    def test_lora_rejects_unsupported_model_type(self, gpt_oss_counter):
-        with pytest.raises(ValueError, match="supports Qwen model types"):
-            gpt_oss_counter.estimate_flops(
+    def test_lora_unsupported_model_type_returns_zero(self, gpt_oss_counter):
+        with patch("veomni.utils.count_flops.logger.warning_rank0") as warning:
+            flops, promised_flops = gpt_oss_counter.estimate_flops(
+                [12, 5],
+                delta_time=2.0,
+                lora_config=_lora_config(8, ["q_proj"]),
+            )
+
+        assert flops == 0
+        assert promised_flops == 1000.0
+        assert "supports Qwen model types" in warning.call_args.args[1]
+
+    def test_lora_validation_warning_is_emitted_once(self, qwen3_counter):
+        lora_config = _lora_config(8, ["warning_once_unknown_proj"])
+
+        with patch("veomni.utils.count_flops.logger.warning_rank0") as warning:
+            qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_config=lora_config)
+            qwen3_counter.estimate_flops([12, 5], delta_time=2.0, lora_config=lora_config)
+
+        warning.assert_called_once()
+
+    def test_valid_lora_does_not_hide_estimator_errors(self, qwen3_counter):
+        def fail_estimation(*args, **kwargs):
+            raise RuntimeError("estimator failure")
+
+        qwen3_counter.estimate_func["qwen3"] = fail_estimation
+
+        with pytest.raises(RuntimeError, match="estimator failure"):
+            qwen3_counter.estimate_flops(
                 [12, 5],
                 delta_time=2.0,
                 lora_config=_lora_config(8, ["q_proj"]),
