@@ -2,15 +2,71 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
 
 
+def _build_denoise_index_layout(
+    key_values_lens: torch.Tensor,
+    query_len: int,
+    *,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Build attention-space and query-space indexes for stacked CFG branches."""
+    query_indexes: list[torch.Tensor] = []
+    key_value_indexes: list[torch.Tensor] = []
+    text_indexes: list[torch.Tensor] = []
+    vae_token_indexes: list[torch.Tensor] = []
+    # Attention indexes address the merged [branch cache, branch query]
+    # layout. Expert indexes address the query-only tensor, so they use a
+    # separate cursor that does not include cached rows.
+    attention_offset = 0
+    query_offset = 0
+    for key_values_len in key_values_lens.tolist():
+        key_values_len = int(key_values_len)
+        key_value_indexes.append(
+            torch.arange(attention_offset, attention_offset + key_values_len, device=device, dtype=torch.long)
+        )
+        query_indexes.append(
+            torch.arange(
+                attention_offset + key_values_len,
+                attention_offset + key_values_len + query_len,
+                device=device,
+                dtype=torch.long,
+            )
+        )
+        text_indexes.append(
+            torch.tensor([query_offset, query_offset + query_len - 1], device=device, dtype=torch.long)
+        )
+        vae_token_indexes.append(
+            torch.arange(query_offset + 1, query_offset + query_len - 1, device=device, dtype=torch.long)
+        )
+        attention_offset += key_values_len + query_len
+        query_offset += query_len
+
+    return {
+        "packed_query_indexes": torch.cat(query_indexes, dim=0),
+        "packed_key_value_indexes": (
+            torch.cat(key_value_indexes, dim=0)
+            if key_value_indexes
+            else torch.empty(0, device=device, dtype=torch.long)
+        ),
+        "packed_text_indexes": torch.cat(text_indexes, dim=0),
+        "packed_vae_token_indexes": torch.cat(vae_token_indexes, dim=0),
+    }
+
+
 @dataclass
 class MotCacheContext:
+    """KV-cache state for one logical inference branch.
+
+    FA receives all active branches in one packed call. Each branch therefore
+    keeps its own cache plus the indexes needed to place that cache in the
+    temporary packed ``[past, query]`` attention layout.
+    """
+
     name: str
     _cache: Any | None = None
     _key_values_lens: torch.Tensor | None = None
@@ -56,38 +112,23 @@ class MotCacheContext:
         self._packed_key_value_indexes = packed_key_value_indexes
         self._next_position_ids = next_position_ids
 
-    def snapshot(
+    def install_cache(
         self,
         *,
         cache: Any,
-        key_values_lens: torch.Tensor | None,
-        packed_key_value_indexes: torch.Tensor | None,
+        cache_len: int,
         next_position_id: torch.Tensor,
-        empty_cache_factory: Callable[[], Any],
         device: torch.device,
     ) -> None:
-        self._cache = empty_cache_factory() if cache is None else deepcopy(cache)
-        if key_values_lens is None:
-            self._key_values_lens = torch.zeros(1, device=device, dtype=torch.int32)
-        else:
-            self._key_values_lens = key_values_lens.detach().clone().to(device=device, dtype=torch.int32)
-        if packed_key_value_indexes is None:
-            self._packed_key_value_indexes = torch.empty(0, device=device, dtype=torch.long)
-        else:
-            self._packed_key_value_indexes = (
-                packed_key_value_indexes.detach().clone().to(device=device, dtype=torch.long)
-            )
-        self._next_position_ids = next_position_id.detach().reshape(1).to(device=device, dtype=torch.long)
-
-    def ensure_empty(self, *, empty_cache_factory: Callable[[], Any], device: torch.device) -> None:
-        if self._cache is None:
-            self._cache = empty_cache_factory()
-        if self._key_values_lens is None:
-            self._key_values_lens = torch.zeros(1, device=device, dtype=torch.int32)
-        if self._packed_key_value_indexes is None:
-            self._packed_key_value_indexes = torch.empty(0, device=device, dtype=torch.long)
-        if self._next_position_ids is None:
-            self._next_position_ids = torch.zeros(1, device=device, dtype=torch.long)
+        """Install one contiguous cache extracted from the packed Flex prefill."""
+        if cache_len < 0:
+            raise ValueError(f"BAGEL {self.name} branch cache length must be non-negative.")
+        self._set_cache_state(
+            cache=cache,
+            key_values_lens=torch.tensor([cache_len], device=device, dtype=torch.int32),
+            packed_key_value_indexes=torch.arange(cache_len, device=device, dtype=torch.long),
+            next_position_ids=next_position_id.detach().reshape(1).to(device=device, dtype=torch.long),
+        )
 
     def append_packed_query(
         self,
@@ -95,15 +136,10 @@ class MotCacheContext:
         cache: Any,
         query_lens: torch.Tensor,
         device: torch.device,
-        next_position_ids: torch.Tensor | None = None,
     ) -> None:
+        """Advance the main AR cache after a successful one-branch decode."""
         self.require_ready()
         next_key_values_lens = self._key_values_lens + query_lens
-
-        if next_position_ids is None:
-            next_position_ids = self._next_position_ids + query_lens
-        else:
-            next_position_ids = next_position_ids.detach().reshape(1).to(device=device, dtype=torch.long)
 
         self._set_cache_state(
             cache=cache,
@@ -113,7 +149,7 @@ class MotCacheContext:
                 device=device,
                 dtype=torch.long,
             ),
-            next_position_ids=next_position_ids,
+            next_position_ids=self._next_position_ids + query_lens,
         )
 
     # ── Cache accessors ──────────────────────────────────
@@ -133,6 +169,7 @@ class MotCacheContext:
         return int(self._key_values_lens.sum().item())
 
     def repeated_position_ids(self, query_len: int, *, device: torch.device) -> torch.Tensor:
+        """Use one logical position for every token in a denoise image span."""
         if self._next_position_ids is None:
             raise RuntimeError(f"BAGEL {self.name} branch position ids are not initialized.")
         return self._next_position_ids.reshape(1).expand(query_len).to(device=device)
@@ -142,29 +179,30 @@ class MotCacheContext:
         query_len: int,
         *,
         device: torch.device,
-        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build sequential positions and cache-relative indexes for AR decode."""
         self.require_ready()
         cache_len = self.cache_len()
         query_lens = torch.tensor([query_len], device=device, dtype=torch.int32)
         packed_query_indexes = torch.arange(cache_len, cache_len + query_len, device=device, dtype=torch.long)
-
-        if position_ids is None:
-            packed_position_ids = self._next_position_ids.reshape(1) + torch.arange(
-                query_len,
-                device=device,
-                dtype=torch.long,
-            )
-        else:
-            packed_position_ids = position_ids.detach().to(device=device, dtype=torch.long).reshape(-1)
-            if int(packed_position_ids.numel()) != query_len:
-                raise ValueError("BAGEL branch query position_ids length must match query_len.")
+        packed_position_ids = self._next_position_ids.reshape(1) + torch.arange(
+            query_len,
+            device=device,
+            dtype=torch.long,
+        )
 
         return query_lens, packed_query_indexes, packed_position_ids
 
 
 @dataclass
 class MotGenerationState:
+    """Scheduling state shared by Qwen2-MoT inference graph invocations.
+
+    ``main`` is the conditional prompt, ``cfg_text`` is a prefix of ``main``,
+    and ``cfg_img`` is the text-only document used for image CFG. The state
+    also remembers the branch layout between denoise and velocity collection.
+    """
+
     _infer_mode: str = "und"
     _velocity_buffer: dict[str, torch.Tensor] = field(default_factory=dict)
     _pending_denoise_branches: tuple[str, ...] | None = None
@@ -183,6 +221,8 @@ class MotGenerationState:
         self._cfg_img.reset()
 
     def update_infer_mode(self, generation_kwargs: dict[str, Any]) -> str:
+        # Later graph steps omit infer_type, so the mode is sticky until the
+        # graph resets this module's local inference state.
         if "infer_type" in generation_kwargs:
             infer_type = str(generation_kwargs["infer_type"])
             if infer_type not in {"infer_und", "infer_gen", "infer_edit"}:
@@ -191,10 +231,6 @@ class MotGenerationState:
         else:
             infer_mode = self._infer_mode or "und"
         self._infer_mode = infer_mode
-        return self._infer_mode
-
-    @property
-    def infer_mode(self) -> str:
         return self._infer_mode
 
     # ── CFG cache contexts ──────────────────────────────────
@@ -228,9 +264,6 @@ class MotGenerationState:
         if cfg_img_scale > 1.0 and cfg_text_scale <= 1.0:
             raise ValueError("cfg_img_scale > 1.0 requires cfg_text_scale > 1.0")
 
-    def cfg_text_requested(self, generation_kwargs: dict[str, object]) -> bool:
-        return float(generation_kwargs.get("cfg_text_scale", 1.0)) > 1.0
-
     def cfg_img_requested(self, generation_kwargs: dict[str, object]) -> bool:
         return float(generation_kwargs.get("cfg_img_scale", 1.0)) > 1.0
 
@@ -246,6 +279,7 @@ class MotGenerationState:
         device: torch.device,
         dtype: torch.dtype,
     ) -> dict[str, Any]:
+        """Stack active CFG branches into one span-wise FlashAttention call."""
         query = query.to(device=device, dtype=dtype)
         query_len = int(query.shape[0])
         if query_len < 3:
@@ -263,33 +297,10 @@ class MotGenerationState:
             [context.repeated_position_ids(query_len, device=device) for context in contexts],
             dim=0,
         )
+        index_layout = _build_denoise_index_layout(key_values_lens, query_len, device=device)
 
-        query_indexes: list[torch.Tensor] = []
-        key_value_indexes: list[torch.Tensor] = []
-        text_indexes: list[torch.Tensor] = []
-        vae_token_indexes: list[torch.Tensor] = []
-        attention_offset = 0
-        query_offset = 0
-        for key_values_len in key_values_lens.tolist():
-            key_values_len = int(key_values_len)
-            key_value_indexes.append(
-                torch.arange(attention_offset, attention_offset + key_values_len, device=device, dtype=torch.long)
-            )
-            query_indexes.append(
-                torch.arange(
-                    attention_offset + key_values_len,
-                    attention_offset + key_values_len + query_len,
-                    device=device,
-                    dtype=torch.long,
-                )
-            )
-            text_indexes.append(torch.tensor([query_offset, query_offset + query_len - 1], device=device))
-            vae_token_indexes.append(
-                torch.arange(query_offset + 1, query_offset + query_len - 1, device=device, dtype=torch.long)
-            )
-            attention_offset += key_values_len + query_len
-            query_offset += query_len
-
+        # The flow connector preserves row order but does not carry branch
+        # labels, so collect_velocity must replay this exact layout.
         self._pending_denoise_branches = branches
         self._pending_denoise_query_len = query_len
         return {
@@ -297,15 +308,8 @@ class MotGenerationState:
             "query_lens": query_lens,
             "key_values_lens": key_values_lens,
             "packed_query_position_ids": packed_query_position_ids,
-            "packed_query_indexes": torch.cat(query_indexes, dim=0),
-            "packed_key_value_indexes": (
-                torch.cat(key_value_indexes, dim=0)
-                if key_value_indexes
-                else torch.empty(0, device=device, dtype=torch.long)
-            ),
-            "packed_text_indexes": torch.cat(text_indexes, dim=0),
-            "packed_vae_token_indexes": torch.cat(vae_token_indexes, dim=0),
             "past_key_values": self._merged_branch_cache(contexts, key_values_lens, empty_cache_factory),
+            **index_layout,
         }
 
     def collect_velocity(
@@ -316,6 +320,7 @@ class MotGenerationState:
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Split stacked velocities by branch and apply BAGEL CFG equations."""
         branches = self._pending_denoise_branches
         query_len = self._pending_denoise_query_len
         if branches is None or query_len is None:
@@ -346,10 +351,12 @@ class MotGenerationState:
     def _denoise_branches_for_timestep(
         self, generation_kwargs: dict[str, object], timestep: object
     ) -> tuple[str, ...]:
+        self.validate_cfg_request(generation_kwargs)
+        cfg_text_active = self._cfg_text_active(generation_kwargs, timestep)
         branches = ["main"]
-        if self._cfg_text_active(generation_kwargs, timestep):
+        if cfg_text_active:
             branches.append("cfg_text")
-        if self._cfg_img_active(generation_kwargs, timestep):
+        if cfg_text_active and self.cfg_img_requested(generation_kwargs):
             branches.append("cfg_img")
         return tuple(branches)
 
@@ -358,6 +365,8 @@ class MotGenerationState:
         if cfg_text_scale <= 1.0:
             return False
 
+        # CFG is enabled only for the configured open-left, closed-right
+        # diffusion-time interval, matching official BAGEL scheduling.
         interval = generation_kwargs.get("cfg_interval", (0.0, 1.0))
         if interval is None:
             lower, upper = 0.0, 1.0
@@ -375,10 +384,6 @@ class MotGenerationState:
         else:
             t = float(timestep)
         return t > lower and t <= upper
-
-    def _cfg_img_active(self, generation_kwargs: dict[str, object], timestep: object) -> bool:
-        self.validate_cfg_request(generation_kwargs)
-        return self.cfg_img_requested(generation_kwargs) and self._cfg_text_active(generation_kwargs, timestep)
 
     def _strip_denoise_query_markers(self, velocity: torch.Tensor) -> torch.Tensor:
         if int(velocity.shape[0]) < 3:
@@ -410,6 +415,8 @@ class MotGenerationState:
         cfg_renorm_min = float(generation_kwargs.get("cfg_renorm_min", 0.0))
         cfg_renorm_type = str(generation_kwargs.get("cfg_renorm_type", "global"))
 
+        # Text guidance first moves from the text-unconditional branch toward
+        # main; optional image guidance then moves from cfg_img toward it.
         guided = cfg_text_velocity + cfg_text_scale * (main_velocity - cfg_text_velocity)
         if cfg_renorm_type == "text_channel":
             norm_main = torch.norm(main_velocity, dim=-1, keepdim=True)
@@ -443,6 +450,8 @@ class MotGenerationState:
         key_values_lens: torch.Tensor,
         empty_cache_factory: Callable[[], Any],
     ) -> Any:
+        # Concatenation order must match preprocess_parallel_denoise_inputs:
+        # main, then cfg_text, then cfg_img when those branches are active.
         merged_cache = empty_cache_factory()
         for layer_idx in merged_cache.key_cache:
             key_parts = []

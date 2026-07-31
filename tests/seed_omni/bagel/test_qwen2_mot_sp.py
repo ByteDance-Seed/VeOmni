@@ -151,7 +151,7 @@ def _forward_carrier(
             input_shapes.append(
                 (
                     tuple(inputs["packed_sequence"].shape),
-                    tuple(inputs["attention_mask"].shape),
+                    tuple(inputs["packed_attention_metadata"].shape),
                 )
             )
         outputs = model(**inputs)
@@ -191,11 +191,12 @@ def _qwen2_mot_sp_worker() -> None:
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     config_kwargs = {
         **tiny_bagel_qwen2_cfg(),
-        "hidden_size": 112,
-        "intermediate_size": 224,
+        # FlexAttention's Triton kernel requires head_dim >= 16.
+        "hidden_size": 448,
+        "intermediate_size": 896,
         "num_attention_heads": 28,
         "num_key_value_heads": 4,
-        "attn_implementation": "veomni_flash_attention_2_with_sp",
+        "attn_implementation": "veomni_flex_attention_with_sp",
     }
     torch.manual_seed(9102)
     reference = (
@@ -231,7 +232,7 @@ def _qwen2_mot_sp_worker() -> None:
 
     reference_hidden = _forward_carrier(reference, reference_conversation, non_sp_state)
     sp_hidden = _forward_carrier(sequence_parallel, sp_conversation, sp_state, input_shapes)
-    assert input_shapes == [((7, hidden_size), (1, 1, 26, 26))]
+    assert input_shapes == [((7, hidden_size), (3, 28))]
     assert sequence_parallel._metric_full_seqlens["forward"] == expected_sample_lengths
     assert torch.isfinite(reference_hidden).all()
     assert torch.isfinite(sp_hidden).all()

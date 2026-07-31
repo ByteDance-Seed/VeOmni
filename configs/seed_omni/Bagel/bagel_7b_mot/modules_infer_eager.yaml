@@ -34,6 +34,8 @@ bagel_flow_connector:
 bagel_qwen2_mot:
   model:
     model_path: bagel_qwen2_mot
+    ops_implementation:
+      attn_implementation: flex_attention
   accelerator:
     fsdp_config:
       fsdp_mode: eager
