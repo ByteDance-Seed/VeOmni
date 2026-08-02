@@ -123,3 +123,12 @@ def test_empty_ignored_set_is_short_circuit():
     _assert_ignored_params_not_in_sharded_submodules(model, set())
     _assert_ignored_params_not_in_sharded_submodules(model, None)
 
+
+def test_hunyuan_image_3_plan_declares_vae_patterns():
+    """Regression: HI3's plan must declare vae.* so a future refactor cannot silently
+    lose the FP32 replicated-VAE contract without the CI catching it."""
+    pytest.importorskip("transformers")
+    from veomni.models.transformers.hunyuan_image_3.parallel_plan import get_parallel_plan
+
+    plan = get_parallel_plan()
+    assert "vae.*" in plan.fsdp_ignored_param_fqn_patterns
