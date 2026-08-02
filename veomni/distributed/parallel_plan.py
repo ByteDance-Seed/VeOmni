@@ -14,7 +14,7 @@
 
 
 from dataclasses import dataclass
-from typing import Dict, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -48,12 +48,56 @@ class SpecInfo:
 
 
 class ParallelPlan:
-    def __init__(self, extra_parallel_plan: Dict[str, Dict[str, Shard]]):
+    def __init__(
+        self,
+        extra_parallel_plan: Dict[str, Dict[str, Shard]],
+        fsdp_ignored_param_fqn_patterns: Optional[List[str]] = None,
+    ):
+        """
+        Args:
+            extra_parallel_plan: Per-ExtraParallel (e.g. ``"ep"``) shard plan.
+            fsdp_ignored_param_fqn_patterns: Glob-style FQN patterns whose params are
+                excluded from the root FSDP2 sharding *and* from its mixed-precision
+                casts -- e.g. a frozen FP32 sub-encoder that must stay replicated FP32
+                on every rank so BF16 does not perturb downstream numerics. Matched
+                params must not live inside a nested-sharded submodule, since
+                ``ignored_params`` is only honored by the outermost ``fully_shard``
+                (``parallelize_model_fsdp2`` asserts this). They enter DCP as plain
+                (non-DTensor) tensors saved replicated per rank, so the model must
+                re-apply its own dtype/mode invariants after a load.
+        """
         self.extra_parallel_plan = extra_parallel_plan
         self.extra_parallel_fsdp_no_shard_module = {
             para_name: {".".join(list(plan.keys())[0].split(".")[:-1])}
             for para_name, plan in self.extra_parallel_plan.items()
         }
+        self.fsdp_ignored_param_fqn_patterns = fsdp_ignored_param_fqn_patterns or []
+
+    def get_fsdp_ignored_params(self, model: nn.Module) -> Optional[set]:
+        """Resolve ``fsdp_ignored_param_fqn_patterns`` against the model's live
+        parameters. Returns ``None`` when nothing was declared, so the caller keeps its
+        default (no ``ignored_params``) root-shard path."""
+        if not self.fsdp_ignored_param_fqn_patterns:
+            return None
+        matched: set = set()
+        matched_fqns: List[str] = []
+        for fqn, param in model.named_parameters():
+            for pattern in self.fsdp_ignored_param_fqn_patterns:
+                if check_fqn_match(pattern, fqn):
+                    matched.add(param)
+                    matched_fqns.append(fqn)
+                    break
+        if not matched:
+            logger.warning_rank0(
+                f"fsdp_ignored_param_fqn_patterns={self.fsdp_ignored_param_fqn_patterns} "
+                f"matched 0 parameters on {type(model).__name__} -- declared but unused."
+            )
+        else:
+            logger.info_rank0(
+                f"FSDP2 root ignored_params (from ParallelPlan): {len(matched)} params "
+                f"matched by {self.fsdp_ignored_param_fqn_patterns} -- e.g. {matched_fqns[:3]}"
+            )
+        return matched
 
     def apply(self, model: nn.Module, extra_parallel_fsdp_device_mesh: Dict[str, DeviceMesh]):
         """
