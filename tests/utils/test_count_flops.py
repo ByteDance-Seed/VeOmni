@@ -600,3 +600,58 @@ class TestDeepseekV4Flops:
         compressed_flops, _ = VeomniFlopsCounter(compressed_config).estimate_flops(batch_seqlens, delta_time=1.0)
 
         assert compressed_flops < baseline_flops
+
+
+@pytest.fixture
+def hunyuan_image_3_real_base_config():
+    """The real HunyuanImage-3 Base geometry (83B total / ~12.2B active per token)."""
+    return SimpleNamespace(
+        model_type="hunyuan_image_3_moe",
+        hidden_size=4096,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        attention_head_dim=128,
+        num_experts=64,
+        moe_topk=8,
+        moe_intermediate_size=3072,
+        vocab_size=133120,
+        component_policy={"lm_head": "absent"},
+    )
+
+
+class TestHunyuanImage3Flops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
+    def test_matches_hand_derived_active_params(self, hunyuan_image_3_real_base_config):
+        """Pin the counter against the hand-derived closed form for HI3 Base.
+
+        ``6 * active_params * tokens`` (~12.2B active params/token) plus a
+        ``12 * S**2 * H * L`` attention term. If the counter drifts from it,
+        every reported MFU number for this model silently shifts.
+        """
+        counter = VeomniFlopsCounter(hunyuan_image_3_real_base_config)
+        seq_len, global_batch_size = 4138, 16
+        batch_seqlens = [seq_len] * global_batch_size
+
+        flops, _ = counter.estimate_flops(batch_seqlens, delta_time=1.0)
+
+        active_params = 12.222201856e9  # 32 layers x (router + 9 experts + QKVO)
+        tokens = seq_len * global_batch_size
+        expected = 6 * active_params * tokens + 12 * tokens * seq_len * 4096 * 32
+        assert flops * 1e12 == pytest.approx(expected, rel=1e-12)
+
+    def test_absent_lm_head_is_not_counted(self, hunyuan_image_3_real_base_config):
+        """T2I never builds ``lm_head``; billing its 133k-vocab matmul inflates MFU."""
+        counter = VeomniFlopsCounter(hunyuan_image_3_real_base_config)
+        with_head_config = deepcopy(hunyuan_image_3_real_base_config)
+        with_head_config.component_policy = {"lm_head": "trainable"}
+        with_head_counter = VeomniFlopsCounter(with_head_config)
+
+        batch_seqlens = [4138]
+        flops, _ = counter.estimate_flops(batch_seqlens, delta_time=1.0)
+        with_head_flops, _ = with_head_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert with_head_flops > flops
+        lm_head_flops = 6 * 133120 * 4096 * 4138
+        assert (with_head_flops - flops) * 1e12 == pytest.approx(lm_head_flops, rel=1e-12)

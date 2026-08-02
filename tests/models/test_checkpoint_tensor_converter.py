@@ -38,6 +38,10 @@ from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     convert_deepseek_v4_fqn_to_index_mapping,
     create_deepseek_v4_checkpoint_tensor_converter,
 )
+from veomni.models.transformers.hunyuan_image_3.checkpoint_tensor_converter import (
+    HunyuanImage3CheckpointTensorConverter,
+)
+from veomni.models.transformers.hunyuan_image_3.component_policy import HunyuanImage3ComponentPolicy
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
@@ -1300,4 +1304,153 @@ class TestQwen3OmniMoeConverterIntegration:
         assert gate_up_res is not None and torch.equal(gate_up_res.tensor, gate_up)
         assert down_res is not None and torch.equal(down_res.tensor, down)
         # Nothing was buffered.
+        assert converter.finalize() == []
+
+
+# ---------------------------------------------------------------------------
+# HunyuanImage 3: official per-expert split -> fused runtime layout.
+# ---------------------------------------------------------------------------
+
+HY3_NUM_EXPERTS = 4
+HY3_HIDDEN = 8
+HY3_INTERMEDIATE = 6
+
+
+def _hy3_converter():
+    # Only vae_encoder='frozen' deviates from the T2I default recipe; the absent
+    # components matter here because the converter must SKIP their checkpoint keys.
+    policy = HunyuanImage3ComponentPolicy.from_dict({"vae_encoder": "frozen"})
+    return HunyuanImage3CheckpointTensorConverter(
+        num_experts=HY3_NUM_EXPERTS,
+        hidden_size=HY3_HIDDEN,
+        intermediate_size=HY3_INTERMEDIATE,
+        component_policy=policy,
+    )
+
+
+def _hy3_official_experts(prefix="model.layers.3.mlp", seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    official = {}
+    for expert in range(HY3_NUM_EXPERTS):
+        official[f"{prefix}.experts.{expert}.gate_and_up_proj.weight"] = torch.randn(
+            2 * HY3_INTERMEDIATE, HY3_HIDDEN, generator=generator
+        )
+        official[f"{prefix}.experts.{expert}.down_proj.weight"] = torch.randn(
+            HY3_HIDDEN, HY3_INTERMEDIATE, generator=generator
+        )
+    return prefix, official
+
+
+class TestHunyuanImage3ConverterCanHandle:
+    def setup_method(self):
+        self.converter = _hy3_converter()
+
+    def test_matches_split_expert_and_renamed_keys(self):
+        assert self.converter.can_handle("model.layers.0.mlp.experts.7.gate_and_up_proj.weight")
+        assert self.converter.can_handle("model.layers.0.mlp.experts.7.down_proj.weight")
+        assert self.converter.can_handle("model.wte.weight")
+        assert self.converter.can_handle("model.ln_f.weight")
+
+    def test_matches_keys_of_components_the_policy_drops(self):
+        # These must be claimed so convert() can skip them; leaving them
+        # unclaimed would try to load weights into modules that were never built.
+        assert self.converter.can_handle("lm_head.weight")
+        assert self.converter.can_handle("vae.decoder.conv_in.weight")
+
+    def test_rejects_unrelated_keys(self):
+        assert not self.converter.can_handle("model.layers.0.self_attn.qkv_proj.weight")
+        assert not self.converter.can_handle("model.layers.0.mlp.experts.gate_up_proj")
+
+
+class TestHunyuanImage3ConverterConvert:
+    def setup_method(self):
+        self.converter = _hy3_converter()
+
+    def test_renames_are_applied(self):
+        for official, runtime in (
+            ("model.wte.weight", "model.embed_tokens.weight"),
+            ("model.ln_f.weight", "model.norm.weight"),
+        ):
+            tensor = torch.randn(4, 4)
+            result = self.converter.convert(official, tensor)
+            assert result is not None and result.name == runtime
+            assert torch.equal(result.tensor, tensor)
+
+    def test_absent_components_are_skipped(self):
+        assert self.converter.convert("lm_head.weight", torch.randn(4, 4)) is None
+        assert self.converter.convert("vae.decoder.conv_in.weight", torch.randn(4, 4)) is None
+
+    def test_experts_stack_and_swap_gate_up_halves(self):
+        """The two hardest transforms, asserted against the official layout directly.
+
+        Official stores each expert separately as ``[up, gate]``; the fused runtime
+        parameter is ``[E, 2I, H]`` holding ``[gate, up]``. Checking each half against
+        its source catches a regression in either one -- a round-trip comparison
+        would not, since compensating bugs cancel.
+        """
+        prefix, official = _hy3_official_experts()
+        runtime = {}
+        for name, tensor in official.items():
+            converted = self.converter.convert(name, tensor)
+            if converted is not None:
+                runtime[converted.name] = converted.tensor
+
+        assert set(runtime) == {f"{prefix}.experts.gate_up_proj", f"{prefix}.experts.down_proj"}
+        gate_up = runtime[f"{prefix}.experts.gate_up_proj"]
+        down = runtime[f"{prefix}.experts.down_proj"]
+        assert gate_up.shape == (HY3_NUM_EXPERTS, 2 * HY3_INTERMEDIATE, HY3_HIDDEN)
+        assert down.shape == (HY3_NUM_EXPERTS, HY3_HIDDEN, HY3_INTERMEDIATE)
+
+        for expert in range(HY3_NUM_EXPERTS):
+            source = official[f"{prefix}.experts.{expert}.gate_and_up_proj.weight"]
+            torch.testing.assert_close(gate_up[expert, :HY3_INTERMEDIATE], source[HY3_INTERMEDIATE:], rtol=0, atol=0)
+            torch.testing.assert_close(gate_up[expert, HY3_INTERMEDIATE:], source[:HY3_INTERMEDIATE], rtol=0, atol=0)
+            torch.testing.assert_close(
+                down[expert], official[f"{prefix}.experts.{expert}.down_proj.weight"], rtol=0, atol=0
+            )
+
+    def test_fused_tensor_is_emitted_only_once_the_set_is_complete(self):
+        prefix, official = _hy3_official_experts()
+        keys = [f"{prefix}.experts.{e}.down_proj.weight" for e in range(HY3_NUM_EXPERTS)]
+        for name in keys[:-1]:
+            assert self.converter.convert(name, official[name]) is None
+        assert self.converter.convert(keys[-1], official[keys[-1]]) is not None
+
+    def test_duplicate_expert_is_rejected(self):
+        prefix, official = _hy3_official_experts()
+        name = f"{prefix}.experts.0.down_proj.weight"
+        self.converter.convert(name, official[name])
+        with pytest.raises(ValueError, match="Duplicate expert tensor"):
+            self.converter.convert(name, official[name])
+
+    def test_expert_id_outside_range_is_rejected(self):
+        with pytest.raises(ValueError, match="outside"):
+            self.converter.convert(
+                f"model.layers.0.mlp.experts.{HY3_NUM_EXPERTS}.down_proj.weight",
+                torch.randn(HY3_HIDDEN, HY3_INTERMEDIATE),
+            )
+
+    def test_wrong_shape_is_rejected(self):
+        with pytest.raises(ValueError, match="Unexpected shape"):
+            self.converter.convert(
+                "model.layers.0.mlp.experts.0.down_proj.weight",
+                torch.randn(HY3_HIDDEN, HY3_INTERMEDIATE + 1),
+            )
+
+
+class TestHunyuanImage3ConverterFinalize:
+    def test_incomplete_expert_set_fails_loudly(self):
+        """A truncated shard set must not silently leave the fused param unwritten."""
+        converter = _hy3_converter()
+        prefix, official = _hy3_official_experts()
+        name = f"{prefix}.experts.0.down_proj.weight"
+        converter.convert(name, official[name])
+        with pytest.raises(RuntimeError, match="incomplete expert sets"):
+            converter.finalize()
+
+    def test_complete_conversion_finalizes_clean(self):
+        converter = _hy3_converter()
+        _, official = _hy3_official_experts()
+        for name, tensor in official.items():
+            converter.convert(name, tensor)
         assert converter.finalize() == []
