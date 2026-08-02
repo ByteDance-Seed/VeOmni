@@ -94,6 +94,7 @@ class VeomniFlopsCounter:
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
             "gpt_oss": self._estimate_gpt_oss_flops,
+            "hunyuan_image_3_moe": self._estimate_hunyuan_image_3_flops,
         }
 
         self.config = config
@@ -502,6 +503,55 @@ class VeomniFlopsCounter:
         )
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
+
+    def _estimate_hunyuan_image_3_flops(self, tokens_sum, batch_seqlens, delta_time):
+        """Estimate HunyuanImage 3 training FLOPs.
+
+        Same shape as :meth:`_estimate_qwen3_moe_flops`, except: ``lm_head`` is
+        skipped when the component policy marks it absent, because counting a
+        133k-vocab projection the T2I model never builds would overstate active
+        params by ~4%; and the two Generalized Causal Attention calls together
+        touch each (query, key) pair at most once, so ``seqlen**2`` is still the
+        right upper bound.
+
+        Like the other counters here this ignores recompute, so MFU under
+        activation checkpointing is a conservative floor.
+        """
+        hidden_size = self.config.hidden_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_attention_heads = self.config.num_attention_heads
+        num_key_value_heads = self.config.num_key_value_heads
+        moe_intermediate_size = self.config.moe_intermediate_size
+        moe_num_expert = self.config.num_experts
+        # Routed experts per token plus the one always-on shared MLP.
+        experts_per_token = self.config.moe_topk + 1
+
+        head_dim = getattr(self.config, "attention_head_dim", hidden_size // num_attention_heads)
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        router_N = hidden_size * moe_num_expert
+        # SwiGLU: gate_proj + up_proj + down_proj per active expert.
+        expert_mlp_N = hidden_size * moe_intermediate_size * experts_per_token * 3
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+
+        component_policy = getattr(self.config, "component_policy", None) or {}
+        if component_policy.get("lm_head", "absent") == "absent":
+            head_N = 0
+        else:
+            head_N = self._compute_lm_head_params(hidden_size, self.config.vocab_size)
+
+        non_attn_N = (router_N + expert_mlp_N + attn_linear_N) * num_hidden_layers + head_N
+        dense_N_flops = 6 * non_attn_N * tokens_sum
+
+        seqlen_square_sum = 0
+        for seqlen in batch_seqlens:
+            seqlen_square_sum += seqlen * seqlen
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        flops_all_token = dense_N_flops + attn_qkv_flops
+        return flops_all_token * (1.0 / delta_time) / 1e12
 
     @staticmethod
     def _compute_sliding_attention_score_sum(batch_seqlens, sliding_window):
