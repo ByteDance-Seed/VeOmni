@@ -81,6 +81,7 @@ from .callbacks import (
     CheckpointerCallback,
     EnvironMeterCallback,
     EvaluateCallback,
+    FlowStepContextCallback,
     HFLoraCkptCallback,
     HuggingfaceCkptCallback,
     MoERouterMonitorCallback,
@@ -649,6 +650,7 @@ class BaseTrainer(Stateful, ABC):
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.channel_loss_callback = ChannelLossCallback(self)
+        self.flow_step_context_callback = FlowStepContextCallback(self)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
         # ChannelLossComputer receives that same cached state. Shared objects
@@ -658,7 +660,12 @@ class BaseTrainer(Stateful, ABC):
         # ``channel_loss_callback`` is ordered after the meter (which resets
         # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
         # logs them), so its per-source metrics survive into the logged payload.
+        #
+        # ``flow_step_context_callback`` writes into the micro-batches, so it goes
+        # first: every other ``on_step_begin`` observer then sees the same dicts
+        # the forward will consume.
         self._callbacks = [
+            self.flow_step_context_callback,
             self.environ_meter_callback,
             self.tqdm_callback,
             self.channel_loss_callback,
