@@ -74,6 +74,8 @@ def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="SM90 or later"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp8_weight_quant(torch.empty(0))
 
 
 def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
@@ -90,6 +92,8 @@ def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp8_weight_quant(torch.empty(0))
 
 
 def _require_tilelang_cuda():
@@ -628,7 +632,7 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
 
 
-def _fp8_weight_quant_reference(x, block_size=128):
+def _fp8_weight_quant_reference(x, block_size=128, round_scale=False):
     """Bit-exact torch model of the TileLang block-wise FP8 weight quantizer.
 
     Both compute the scale in FP32 from the tile amax, so the divide, the
@@ -636,7 +640,8 @@ def _fp8_weight_quant_reference(x, block_size=128):
     """
     rows, cols = x.shape
     tiles = x.float().contiguous().view(rows // block_size, block_size, cols // block_size, block_size)
-    scales = tiles.abs().amax(dim=(1, 3)).clamp_min(1e-4) / 448.0
+    amax = tiles.abs().amax(dim=(1, 3)).clamp_min(1e-4)
+    scales = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0))) if round_scale else amax / 448.0
     quantized = (tiles / scales[:, None, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     return quantized.view(rows, cols), scales
 
@@ -655,6 +660,15 @@ def _weight_quant_test_input():
     tiles[4][7, 11] = 500.0  # lone outlier: the tile scale must absorb it
     rows = [torch.cat(tiles[:3], dim=1), torch.cat(tiles[3:], dim=1)]
     return torch.cat(rows, dim=0).to(device=DEVICE, dtype=torch.bfloat16)
+
+
+def _tiles_above_amax_floor():
+    """Mask of the _weight_quant_test_input tiles whose amax clears the 1e-4 floor.
+
+    The other two tiles keep the floor scale, so they neither saturate nor
+    stretch to the FP8 range and have to be excluded from range assertions.
+    """
+    return torch.tensor([[True, False, False], [True, True, True]], device=DEVICE)
 
 
 def test_tilelang_fp8_weight_quant_matches_reference():
@@ -678,8 +692,7 @@ def test_tilelang_fp8_weight_quant_matches_reference():
     # its own. The two tiles whose amax falls under the 1e-4 clamp keep the
     # floor scale instead and therefore stay far below saturation.
     tile_amax = quantized.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
-    saturated = torch.tensor([[True, False, False], [True, True, True]], device=DEVICE)
-    assert torch.equal(tile_amax == 448.0, saturated)
+    assert torch.equal(tile_amax == 448.0, _tiles_above_amax_floor())
     assert tile_amax[0, 1] == 0.0
     assert 0.0 < tile_amax[0, 2] < 1.0
     assert scales[0, 1] == 1e-4 / 448.0
@@ -708,6 +721,83 @@ def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
     assert torch.equal(transposed_scales, scales)
 
 
+def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+    reference_quantized, reference_scales = _fp8_weight_quant_reference(x, round_scale=True)
+
+    assert quantized.shape == x.shape
+    assert quantized.dtype == torch.float8_e4m3fn
+    assert scales.shape == (2, 3)
+    assert scales.dtype == torch.float8_e8m0fnu
+    # E8M0 stores the exponent alone, so a power-of-two scale survives the cast
+    # bit for bit and matches the FP32 value the kernel divided by.
+    assert torch.equal(scales.float().log2(), scales.float().log2().round())
+    assert torch.equal(scales.float(), reference_scales)
+    assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
+    assert not quantized.float().isnan().any()
+
+    # Rounding the scale up costs at most one binade of range, so unlike the
+    # FP32 mode no tile saturates, yet every tile above the amax floor still
+    # reaches at least half of the FP8 max.
+    tile_amax = quantized.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    assert (tile_amax <= 448.0).all()
+    assert (tile_amax[_tiles_above_amax_floor()] >= 224.0).all()
+
+
+def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
+    """scale_fmt decides how the scale is computed, scale_dtype only how it is stored."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    _, exact_scales = fp8_weight_quant(x, block_size=128)
+    rounded_quantized, rounded_scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0")
+    e8m0_quantized, e8m0_scales = fp8_weight_quant(
+        x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu
+    )
+
+    assert rounded_scales.dtype == torch.float32
+    assert torch.equal(rounded_scales, e8m0_scales.float())
+    assert torch.equal(rounded_quantized.view(torch.uint8), e8m0_quantized.view(torch.uint8))
+    # Rounding goes upward and never overshoots by a full binade.
+    assert (rounded_scales >= exact_scales).all()
+    assert (rounded_scales < 2.0 * exact_scales).all()
+
+
+def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
+    """An amax that already divides to a power of two must not gain a binade."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = torch.zeros(128, 128, device=DEVICE, dtype=torch.bfloat16)
+    x[3, 5] = 56.0  # 448 * 2**-3, exact in BF16, so ceil(log2(amax / 448)) == -3
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+
+    assert scales.shape == (1, 1)
+    assert scales.float().item() == 0.125
+    assert quantized.float()[3, 5] == 448.0
+
+
+def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+
+    dequantized = quantized.float().view(2, 128, 3, 128) * scales.float()[:, None, :, None]
+    dequantized = dequantized.view(x.shape)
+    # Rounding the scale up spends up to one of E4M3's 3 mantissa bits, so the
+    # round-trip budget is twice the ~2^-4 of the exact-scale mode.
+    tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    tolerance = (tile_amax / 8.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
+    assert ((dequantized - x.float()).abs() <= tolerance).all()
+
+
 def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
@@ -718,3 +808,9 @@ def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.float32))
     with pytest.raises(AssertionError, match="divisible by block_size"):
         fp8_weight_quant(torch.empty(128, 200, device=DEVICE, dtype=torch.bfloat16))
+    with pytest.raises(AssertionError, match="float32 and float8_e8m0fnu"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float16)
+    # An E8M0 scale cannot represent the unrounded FP32 scale the kernel would
+    # divide by, so the pairing has to be rejected instead of drifting.
+    with pytest.raises(AssertionError, match="powers of two"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)

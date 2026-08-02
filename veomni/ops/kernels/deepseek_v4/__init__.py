@@ -105,11 +105,13 @@ def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 def fp8_weight_quant(
     x: torch.Tensor,
     block_size: int = 128,
+    scale_fmt: str | None = None,
+    scale_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_tilelang_sm90()
     from .act_quant import fp8_weight_quant as impl
 
-    return impl(x, block_size)
+    return impl(x, block_size, scale_fmt, scale_dtype)
 
 
 __all__ = [

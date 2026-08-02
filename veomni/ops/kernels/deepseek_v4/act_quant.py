@@ -173,8 +173,12 @@ def fp8_weight_quant_kernel(
     M,
     N,
     block_size=128,
+    scale_dtype=FP32,
+    round_scale=False,
 ):
-    """Block-wise ``block_size x block_size`` FP8 quantization, one tile per CTA."""
+    """Block-wise ``block_size x block_size`` FP8 quantization, one tile per CTA.
+    round_scale=True rounds each tile scale up to a power of two (MXFP).
+    """
     assert M % block_size == 0 and N % block_size == 0
     fp8_min = -448.0
     fp8_max = 448.0
@@ -184,7 +188,7 @@ def fp8_weight_quant_kernel(
     def fp8_weight_quant_kernel_(
         X: T.Tensor[(M, N), BF16],
         Y: T.Tensor[(M, N), FP8],
-        S: T.Tensor[(M // block_size, N // block_size), FP32],
+        S: T.Tensor[(M // block_size, N // block_size), scale_dtype],
     ):
         with T.Kernel(N // block_size, M // block_size, threads=128) as (bx, by):
             x_shared = T.alloc_shared((block_size, block_size), BF16)
@@ -196,7 +200,11 @@ def fp8_weight_quant_kernel(
             T.copy(X[by * block_size, bx * block_size], x_shared)
             T.reduce_absmax(x_shared, amax_row_local, dim=1)
             T.reduce_absmax(amax_row_local, scale_local, dim=0)
-            scale_local[0] = T.max(scale_local[0], 1e-4) * fp8_max_inv
+            scale_local[0] = T.max(scale_local[0], 1e-4)
+            if round_scale:
+                scale_local[0] = fast_round_scale(scale_local[0], fp8_max_inv)
+            else:
+                scale_local[0] = scale_local[0] * fp8_max_inv
             T.copy(scale_local, scale_shared)
 
             for i, j in T.Parallel(block_size, block_size):
@@ -204,7 +212,7 @@ def fp8_weight_quant_kernel(
 
             T.copy(y_shared, Y[by * block_size, bx * block_size])
             if T.get_thread_binding(0) == 0:
-                S[by, bx] = scale_shared[0]
+                S[by, bx] = T.Cast(scale_dtype, scale_shared[0])
 
     return fp8_weight_quant_kernel_
 
@@ -212,24 +220,48 @@ def fp8_weight_quant_kernel(
 def fp8_weight_quant(
     x: torch.Tensor,
     block_size: int = 128,
+    scale_fmt: str | None = None,
+    scale_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-wise ``block_size x block_size`` FP8 quantization of a 2D weight.
 
+    Args:
+        x (torch.Tensor): The bfloat16 weight to quantize.
+        block_size (int): Side length of the square quantization tile.
+        scale_fmt (str | None): When set, tile scales are rounded up to a power
+            of two, as the MXFP formats require. DeepSeek V4 uses ``"ue8m0"``.
+        scale_dtype (torch.dtype): Storage dtype of the returned scales, either
+            ``torch.float32`` or ``torch.float8_e8m0fnu``. E8M0 carries no
+            mantissa, so it is only usable together with ``scale_fmt``.
+
     Returns:
         weight (torch.float8_e4m3fn): Quantized weight, same shape as ``x``.
-        scale (torch.float32): One scale per ``block_size x block_size`` tile.
+        scale (``scale_dtype``): One scale per ``block_size x block_size`` tile.
     """
     assert x.dim() == 2, f"fp8_weight_quant expects a 2D weight, got shape {tuple(x.shape)}"
     assert x.dtype == torch.bfloat16, f"fp8_weight_quant expects a bfloat16 weight, got {x.dtype}"
+    assert scale_dtype in (torch.float32, torch.float8_e8m0fnu), (
+        f"fp8_weight_quant supports float32 and float8_e8m0fnu scales, got {scale_dtype}"
+    )
+    # Without rounding, the stored E8M0 scale would differ from the FP32 scale
+    # the kernel divides by, so dequantization would silently drift.
+    assert scale_dtype != torch.float8_e8m0fnu or scale_fmt is not None, (
+        'float8_e8m0fnu scales only represent powers of two: pass scale_fmt (DeepSeek V4 uses "ue8m0")'
+    )
     M, N = x.shape
     assert M % block_size == 0 and N % block_size == 0, (
         f"weight shape {(M, N)} is not divisible by block_size {block_size}"
     )
     z = x.contiguous()
     y = torch.empty_like(z, dtype=torch.float8_e4m3fn)
-    s = z.new_empty((M // block_size, N // block_size), dtype=torch.float32)
-    kernel = fp8_weight_quant_kernel(M, N, block_size)
-    print(kernel.get_kernel_source())
+    s = z.new_empty((M // block_size, N // block_size), dtype=scale_dtype)
+    kernel = fp8_weight_quant_kernel(
+        M,
+        N,
+        block_size,
+        scale_dtype=scale_dtype,
+        round_scale=scale_fmt is not None,
+    )
     kernel(z, y, s)
     return y, s
 
