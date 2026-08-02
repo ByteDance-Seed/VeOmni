@@ -121,6 +121,18 @@ class DataCollateInfo:
         default=1,
         metadata={"help": "sp_pad scale of a sequence in batch. Default is 1"},
     )
+    pack_mode: str = field(
+        default="cat",
+        metadata={
+            "help": (
+                'How to combine per-sample tensors at collate time. "cat" (default) does '
+                'torch.cat along ``pack_dim``. "list" keeps the raw per-sample list and skips '
+                "SP pad/slice, for keys whose per-sample semantics must survive collate (e.g. "
+                "HunyuanImage 3's ``hy3_pixel_values`` -- one image per sample flowing into the "
+                "online VAE encoder)."
+            )
+        },
+    )
 
     def __post_init__(self):
         assert self.pack_dim is not None, "pack_dim must be specified"
@@ -132,6 +144,10 @@ class DataCollateInfo:
         assert (self.sp_pad_value is None) == (self.sp_pad_scale is None), (
             "sp_pad_value and sp_pad_scale must be specified together or None"
         )
+        if self.pack_mode not in ("cat", "list"):
+            raise ValueError(f"pack_mode must be 'cat' or 'list', got {self.pack_mode!r}.")
+        if self.pack_mode == "list" and self.sp_slice:
+            raise ValueError("pack_mode='list' is incompatible with sp_slice=True.")
 
 
 # pack_dim, sp_slice, sp_pad_value, sp_pad_scale
@@ -284,6 +300,12 @@ class PackingCollator(DataCollator):
             else:
                 pack_dim = collate_info.pack_dim
 
+                # list mode keeps the per-sample list; a model metadata hook
+                # decides whether to stack or loop (e.g. HI3's
+                # ``hy3_pixel_values`` -> online VAE encoder).
+                if collate_info.pack_mode == "list":
+                    continue
+
                 # first token of packed sequence must be IGNORE_INDEX
                 if key == "labels" and not self.seq_classification:
                     for i in range(1, len(batch[key])):
@@ -386,6 +408,11 @@ class SequenceParallelCollator(DataCollator):
         for key in batch.keys():
             collate_info: DataCollateInfo = self.collate_infos.get(key, None)
             if collate_info is None:
+                continue
+            # list-mode keys hold per-sample data consumed by a model metadata
+            # hook, not SP-sliced tensor ops, so they skip both sp_pad and
+            # sp_slice.
+            if collate_info.pack_mode == "list":
                 continue
             pack_dim = collate_info.pack_dim
             sp_slice = collate_info.sp_slice
