@@ -37,6 +37,7 @@ from torch.distributed.tensor import DTensor
 from veomni.distributed import parallel_state
 
 from ..utils import logging
+from ..utils.device import get_device_id, get_device_type
 
 
 if TYPE_CHECKING:
@@ -283,8 +284,13 @@ def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]
     """
     ps = parallel_state.get_parallel_state()
     params = model.state_dict()
+    device_type = get_device_type()
+    device = torch.device(device_type, get_device_id()) if device_type != "cpu" else torch.device("cpu")
     for name, param in params.items():
-        unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
+        # With ``CPUOffloadPolicy`` the sharded DTensor local shard lives on CPU, so an
+        # unstaged ``full_tensor()`` all-gathers over gloo and hands CPU tensors to the
+        # consumers (EP broadcast, quantization kernels), which require device tensors.
+        unsharded_tensor = param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
 
         is_expert_layer = "mlp.experts." in name
         is_proj = any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])
