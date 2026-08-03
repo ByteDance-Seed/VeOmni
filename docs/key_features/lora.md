@@ -137,6 +137,46 @@ else:
     self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
 ```
 
+### 2.1 LoRA MFU and FLOPs accounting
+
+`EnvironMeterCallback` passes the effective `VeOmniLoraConfig` from the wrapped model to
+`VeomniFlopsCounter`, so the reported FLOPs and MFU reflect the work performed by LoRA
+training instead of using the full-fine-tuning estimate. Full-fine-tuning accounting is
+unchanged when no LoRA config is present.
+
+LoRA FLOPs estimation currently supports only the Qwen-family model types registered in
+`LORA_MODULES_BY_MODEL_TYPE`. An unsupported model or LoRA target emits a warning and
+reports zero achieved FLOPs and zero MFU rather than interrupting training or reporting a
+misleading value. `scripts/profile/compare_lora_flops.py` exercises this path against real
+Hugging Face Qwen configs and compares full fine-tuning with several LoRA target sets and
+ranks.
+
+> `VLMTrainer` does not currently initialize LoRA. The vision accounting described below
+> is included for a future VLM LoRA capability and is not an indication that VLM LoRA
+> training is available today.
+
+For Qwen VLM configurations, vision-tower accounting uses the vision-token sequence lengths
+collected from the current batch and follows this logic:
+
+1. If the batch has no vision tokens, ViT FLOPs are zero.
+2. If the batch has vision tokens but none of `target_modules` matches a supported ViT
+   module, the ViT is treated as frozen and only its forward-pass FLOPs are counted.
+3. If at least one target matches a supported ViT module, the ViT is treated as participating
+   in LoRA training: base forward/input-gradient work and the matched LoRA forward/backward
+   work are counted.
+
+The native LoRA implementation currently adapts two kinds of weights:
+
+- `nn.Linear` modules selected through `target_modules`.
+- Fused routed-MoE expert weights, represented as 3-D `nn.Parameter`s and selected through
+  `target_parameters`.
+
+The MoE experts are not `nn.Embedding` layers. The FLOPs estimator counts adapter work for
+both supported categories above. Within the ViT, only matched linear layers receive LoRA
+FLOPs; non-linear projections such as Qwen's `Conv3d` patch embedding do not. If native LoRA
+later supports another module type such as `Conv3d`, `VeomniFlopsCounter` and its module-shape
+tables must be updated at the same time or MFU will be underestimated.
+
 ---
 
 ## 3. Weight Loading with LoRA
