@@ -87,6 +87,21 @@ def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
     return Shard(dim) if dim is not None else None
 
 
+def _move_buffers_to_device(model: nn.Module, device: str) -> None:
+    """Place every buffer on ``device``.
+
+    ``CPUOffloadPolicy`` only offloads parameters, gradients and optimizer states:
+    ``fully_shard`` puts buffers on the FSDP device once at wrap time and never stages
+    them again. Meta init defers that move, so a CPU materialization leaves buffers such
+    as the DeepSeek-V4 hash-router ``tid2eid`` table or rotary ``inv_freq`` on CPU while
+    the activations are on the accelerator.
+    """
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if buffer is not None and buffer.device.type != device:
+                module._buffers[name] = buffer.to(device)
+
+
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
     """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``."""
     parallel_plan = getattr(model, "get_parallel_plan", None)
@@ -177,12 +192,12 @@ def parallelize_model_fsdp2(
     #        Apply embed parallelism (slice embed tensors [64,H] -> [16,H])
     if parallel_state.any_extra_parallel_enabled:
         parallel_plan = get_runtime_parallel_plan(model)
-        assert parallel_plan is not None, (
-            "ExtraParallel needs parallel plan defined in the model! \
+        assert (
+            parallel_plan is not None
+        ), "ExtraParallel needs parallel plan defined in the model! \
             Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
             Please see tests/utils/test_extra_parallel_clip_grad_norm.py::test_clip_grad_norm_fsdp2_ep2_emb4 \
             for example of expert parallelism + embed parallelism."
-        )
         # Add SpecInfo to extra_parallel modules,
         #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
@@ -309,9 +324,9 @@ def parallelize_model_fsdp2(
         modules_to_ignore_in_mixed_precision = None
 
     if modules_to_ignore_in_mixed_precision:
-        assert isinstance(modules_to_ignore_in_mixed_precision, tuple), (
-            "modules_to_ignore_in_mixed_precision needs to be a tuple!"
-        )
+        assert isinstance(
+            modules_to_ignore_in_mixed_precision, tuple
+        ), "modules_to_ignore_in_mixed_precision needs to be a tuple!"
         mp_ignored_classes = modules_to_ignore_in_mixed_precision
         fsdp_kwargs_without_mp = dict(fsdp_kwargs)
         fsdp_kwargs_without_mp.pop("mp_policy", None)
@@ -449,9 +464,9 @@ def parallelize_model_fsdp2(
     fully_shard(model, **root_fsdp_kwargs)
 
     # configure manual prefetching when needed
-    need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
-    ) and kwargs.pop("enable_forward_prefetch", True)
+    need_manual_prefetch = (parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None) and kwargs.pop(
+        "enable_forward_prefetch", True
+    )
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
         next_blocks = blocks[1:] + [None]
@@ -555,6 +570,9 @@ def parallelize_model_fsdp2(
                     adapter_path=adapter_path,
                     fqn_to_index_mapping=fqn_to_index_mapping,
                 )
+
+    if materialize_device == "cpu":
+        _move_buffers_to_device(model, get_device_type())
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
