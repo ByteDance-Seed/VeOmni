@@ -411,8 +411,11 @@ class DeepseekV4CheckpointTensorConverter:
             param = param.to(torch.bfloat16)
             if fp4_quantize:
                 weight, scale = fp4_act_quant(param, block_size=32, inplace=False)
+                weight = weight.view(torch.int8)
             else:
-                weight, scale = fp8_weight_quant(param, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+                weight, scale = fp8_weight_quant(
+                    param, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu
+                )
 
             export_weight_names.add(origin)
             export_weight_names.add(scale_name)
