@@ -71,7 +71,6 @@ from veomni.models.transformers.hunyuan_image_3.vae import HunyuanImage3VAE
 
 # Additional import blocks for patches
 from veomni.ops.dispatch import OpSlot
-from veomni.ops.kernels.attention.reference import dense_gca_attention_forward
 from veomni.schedulers.flow_matching import flow_matching_loss, prepare_reference_flow_batch
 from veomni.utils.model_outputs import HunyuanImage3ReferenceOutput
 
@@ -264,18 +263,23 @@ class HunYuanMoEV1Attention(nn.Module):
         else:
             dense_mask = None
         if dense_mask is not None:
-            # Correctness oracle: the dense edge mask the two-call decomposition
-            # below encodes, built from the same packed metadata. Test-only
-            # (O(T^2)); selected by ``dense_reference_attention`` on the compiled
-            # metadata, never by the collator.
-            attention_output, attention_weights = dense_gca_attention_forward(
-                self,
+            # Correctness oracle: run PyTorch SDPA against the dense edge mask
+            # the two-call decomposition below encodes, built from the same
+            # packed metadata. Test-only (O(T^2)); selected by
+            # ``dense_reference_attention`` on the compiled metadata, never by
+            # the collator. ``enable_gqa=True`` (torch>=2.5) expands the K/V
+            # head groups internally so we do not materialise a repeated tensor.
+            edge_mask = dense_mask if dense_mask.dim() == 4 else dense_mask.unsqueeze(1)
+            attention_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
                 value_states,
-                dense_mask,
-                scaling=self.scaling,
+                attn_mask=edge_mask,
+                scale=self.scaling,
+                enable_gqa=True,
             )
+            attention_output = attention_output.transpose(1, 2).contiguous()
+            attention_weights = None
         elif gca_metadata is not None:
             # Production fast path: two-call varlen GCA. When Ulysses SP is active
             # each rank arrives with a sequence shard and the full head set; the
