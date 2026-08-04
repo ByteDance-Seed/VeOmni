@@ -1030,11 +1030,12 @@ class OpsImplementationConfig:
             "flash_attention_3",
             "flash_attention_4",
             "flex_attention",
+            "aiter",
             "native-sparse",
         ]
     ] = field(
         default="flash_attention_2",
-        metadata={"help": "Attention implementation."},
+        metadata={"help": "Attention implementation. 'aiter' uses AMD's aiter (ROCm) flash-attention kernels."},
     )
     moe_implementation: str = field(
         default="fused_triton",
@@ -1146,6 +1147,7 @@ class OpsImplementationConfig:
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
                 "flex_attention": "veomni_flex_attention_with_sp",
+                "aiter": "veomni_flash_attention_aiter_with_sp",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
