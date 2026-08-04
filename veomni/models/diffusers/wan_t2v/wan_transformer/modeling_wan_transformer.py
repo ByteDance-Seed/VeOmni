@@ -54,7 +54,9 @@ def wan_eager_attention_forward(
 
 class WanAttentionKernelModule:
     def __init__(self, config: SimpleNamespace, attn: WanAttention):
-        target_dtype = attn.to_q.weight.dtype
+        # Read via ``parameters()`` so LoRA-wrapped projections (``LoraLinear``,
+        # which has no ``.weight`` attribute) resolve like a plain ``nn.Linear``.
+        target_dtype = next(attn.to_q.parameters()).dtype
         if target_dtype == torch.float32:
             target_dtype = torch.bfloat16
         self.config = SimpleNamespace(
@@ -125,10 +127,17 @@ def _assert_wan_flash_attention_bf16(
         "key": key.dtype,
         "value": value.dtype,
     }
+
+    # Resolve the projection weight dtype via ``parameters()`` rather than
+    # ``.weight`` so LoRA-wrapped projections (``LoraLinear``, which has no
+    # ``.weight`` attribute) are handled the same as plain ``nn.Linear``.
+    def _proj_dtype(module):
+        return next(module.parameters()).dtype
+
     weight_dtypes = {
-        "to_q.weight": attn.to_q.weight.dtype,
-        "to_k.weight": attn.to_k.weight.dtype,
-        "to_v.weight": attn.to_v.weight.dtype,
+        "to_q.weight": _proj_dtype(attn.to_q),
+        "to_k.weight": _proj_dtype(attn.to_k),
+        "to_v.weight": _proj_dtype(attn.to_v),
     }
     assert all(dtype == torch.bfloat16 for dtype in tensor_dtypes.values()), (
         f"Wan flash-attention expects bf16 Q/K/V tensors, got {tensor_dtypes}."
@@ -264,7 +273,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         if hidden_states_img is not None:
             hidden_states_out = hidden_states_out + hidden_states_img
 
-        hidden_states_out = hidden_states_out.type_as(attn.to_out[0].weight)
+        hidden_states_out = hidden_states_out.type_as(next(attn.to_out[0].parameters()))
         hidden_states_out = attn.to_out[0](hidden_states_out)
         hidden_states_out = attn.to_out[1](hidden_states_out)
         return hidden_states_out
