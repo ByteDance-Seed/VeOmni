@@ -147,6 +147,23 @@ precomputed_max_seqlen = vit_metadata.get("max_seqlen")
 A model whose ViT runs `dummy_forward` (FSDP path for ranks with no real images)
 builds the same `vit_metadata` sub-dict host-side from its Python-int `t/h/w`.
 
+### Merged image+video call (SP disabled)
+
+With SP disabled, Model.forward runs the vision tower **exactly once per rank
+per step**: a mixed image+video micro-batch is served by ONE merged ViT call —
+`cat(pixel_values, pixel_values_videos)` + `cat` of the grids — and the feature
+stream is split back at `pixel_values.shape[0] // spatial_merge_unit`. The
+per-modality metadata is combined host-side by the `merge_image_video_vit_kwargs`
+helper (grid lists concatenated; video `cu_seqlens` offset by the image
+patch-row total; `max_seqlen = max(...)`); if either side lacks metadata the
+merged call passes `{"vit_metadata": {}}` and the ViT falls back to rebuilding
+from the merged grid. Ranks with a single modality make one real call; ranks
+with neither make one `dummy_forward` (FSDP only). With SP enabled the
+historical two-slot layout (image slot + video slot, each real-or-dummy → two
+calls per rank) is kept, because the collator SP-slices the two pixel streams
+per rank independently and cat-ing rank-local slices would misorder the global
+vision sequence.
+
 ## Producer flow (collator pipeline)
 
 ```

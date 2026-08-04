@@ -394,12 +394,53 @@ def qwen3_vl_moe_model_forward_patched(
 
     fake_deepstack = None
 
-    if pixel_values is not None:
-        image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
+    # --- Patch.7: Exactly-once vision tower execution (SP disabled) ---
+    # Under FSDP every rank must run the vision tower the same number of times
+    # per step, or the param all-gather / grad reduce-scatter collectives
+    # desync across ranks with different modality mixes. The historical layout
+    # ran the tower twice per step (image slot + video slot, each real or
+    # dummy). With SP disabled we now run it exactly ONCE per rank: a single
+    # merged image+video call here (ViT attention is segmented per frame via
+    # cu_seqlens, so cat-ing the two pixel streams is numerically identical to
+    # two calls; the deepstack mergers emit one row per merged token, so the
+    # per-layer deepstack streams split at the same row count), a
+    # single-modality call below, or a single dummy (Patch.4). Besides
+    # dropping the wasted dummy, the merged call saves one full vision-tower
+    # FSDP all-gather on mixed batches.
+    # With SP enabled the collator SP-slices the two pixel streams per rank
+    # *independently*, so cat-ing the rank-local slices would feed the vision
+    # tower's sequence exchange in the wrong global order; the two-slot layout
+    # (constant two calls per rank, still collective-aligned) is kept there.
+    image_embeds = None
+    video_embeds = None
+    if not get_parallel_state().sp_enabled and pixel_values is not None and pixel_values_videos is not None:
+        merged_pixel_values = torch.cat(
+            [pixel_values.type(self.visual.dtype), pixel_values_videos.type(self.visual.dtype)], dim=0
         )
-        image_embeds = image_outputs.pooler_output
-        deepstack_image_embeds = image_outputs.deepstack_features
+        merged_grid_thw = torch.cat([image_grid_thw, video_grid_thw], dim=0)
+        merged_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
+            merged_pixel_values,
+            merged_grid_thw,
+            return_dict=True,
+            **merge_image_video_vit_kwargs(image_vit_kwargs, video_vit_kwargs),  # noqa: F821 defined via add_helper
+        )
+        # The ViT merger emits one feature row per `spatial_merge_unit` pixel
+        # rows, so the image share of the merged streams is a pure shape
+        # computation — no host-device sync.
+        n_image_features = pixel_values.shape[0] // self.visual.spatial_merge_unit
+        image_embeds = merged_outputs.pooler_output[:n_image_features]
+        video_embeds = merged_outputs.pooler_output[n_image_features:]
+        deepstack_image_embeds = [embed[:n_image_features] for embed in merged_outputs.deepstack_features]
+        deepstack_video_embeds = [embed[n_image_features:] for embed in merged_outputs.deepstack_features]
+    # --- Patch.7 ---
+
+    if pixel_values is not None:
+        if image_embeds is None:
+            image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
+            )
+            image_embeds = image_outputs.pooler_output
+            deepstack_image_embeds = image_outputs.deepstack_features
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
@@ -435,8 +476,10 @@ def qwen3_vl_moe_model_forward_patched(
             ]
         # --- Patch.1 ---
 
-    elif get_parallel_state().fsdp_enabled:
+    elif get_parallel_state().sp_enabled and get_parallel_state().fsdp_enabled:
         # --- Patch.4 ---
+        # Per-slot dummies only under SP (two-slot layout); with SP disabled a
+        # single trailing dummy keeps the once-per-rank invariant (Patch.7).
         fake_vision = self.visual.dummy_forward()
         fake_embeds = fake_vision.pooler_output.mean() * 0.0
         fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -445,11 +488,12 @@ def qwen3_vl_moe_model_forward_patched(
         # --- Patch.4 ---
 
     if pixel_values_videos is not None:
-        video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
-        )
-        video_embeds = video_outputs.pooler_output
-        deepstack_video_embeds = video_outputs.deepstack_features
+        if video_embeds is None:
+            video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
+                pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
+            )
+            video_embeds = video_outputs.pooler_output
+            deepstack_video_embeds = video_outputs.deepstack_features
 
         # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
@@ -484,14 +528,31 @@ def qwen3_vl_moe_model_forward_patched(
             ]
         # --- Patch.1 ---
 
-    elif get_parallel_state().fsdp_enabled:
+    elif get_parallel_state().sp_enabled and get_parallel_state().fsdp_enabled:
         # --- Patch.4 ---
+        # SP-only for the same reason as the image-slot dummy above.
         fake_vision = self.visual.dummy_forward()
         fake_embeds = fake_vision.pooler_output.mean() * 0.0
         fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds + fake_embeds
         fake_deepstack = fake_vision.deepstack_features
         # --- Patch.4 ---
+
+    # --- Patch.7: Single dummy for vision-less ranks (SP disabled) ---
+    # Exactly-once counterpart of the per-slot dummies above: with SP disabled
+    # a rank with neither images nor videos runs the vision tower once so its
+    # FSDP collectives stay aligned with ranks that ran one real call.
+    if (
+        not get_parallel_state().sp_enabled
+        and get_parallel_state().fsdp_enabled
+        and pixel_values is None
+        and pixel_values_videos is None
+    ):
+        fake_vision = self.visual.dummy_forward()
+        fake_embeds = fake_vision.pooler_output.mean() * 0.0
+        inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        fake_deepstack = fake_vision.deepstack_features
+    # --- Patch.7 ---
 
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:

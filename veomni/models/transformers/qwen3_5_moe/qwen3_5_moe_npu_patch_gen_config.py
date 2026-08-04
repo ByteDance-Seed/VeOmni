@@ -64,6 +64,7 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     _Qwen3_5MoeFakeForPosID,
     collate_multimodal_metadata,
     get_position_id,
+    merge_image_video_vit_kwargs,
     mm_token_type_ids_from_input_ids,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
@@ -175,6 +176,7 @@ config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
 config.add_helper(mm_token_type_ids_from_input_ids)
 config.add_helper(get_position_id)
 config.add_helper(collate_multimodal_metadata)
+config.add_helper(merge_image_video_vit_kwargs)
 config.add_helper(_Qwen3_5MoeFakeForPosID)
 
 

@@ -224,6 +224,32 @@ def collate_multimodal_metadata(batch, sp_pad):
         batch["multimodal_metadata"] = md
 
 
+def merge_image_video_vit_kwargs(image_vit_kwargs, video_vit_kwargs):
+    """Merge the per-modality collator ViT metadata for a single merged
+    image+video ViT call (image stream first, matching the pixel/grid cat
+    order in Model.forward).
+
+    Falls back to an empty metadata dict when either side lacks precomputed
+    metadata, letting the ViT forward rebuild cu_seqlens from the merged grid.
+    All inputs are host-side (CPU int32 tensors / Python ints / lists), so the
+    merge itself never triggers a host-device sync.
+    """
+    image_md = image_vit_kwargs["vit_metadata"]
+    video_md = video_vit_kwargs["vit_metadata"]
+    keys = ("grid_thw_list", "cu_seqlens", "max_seqlen")
+    if any(md[k] is None for md in (image_md, video_md) for k in keys):
+        return {"vit_metadata": {}}
+    return {
+        "vit_metadata": {
+            "grid_thw_list": image_md["grid_thw_list"] + video_md["grid_thw_list"],
+            # Both are CPU int32 tensors from `collate_multimodal_metadata`;
+            # offset the video segment boundaries by the image patch-row total.
+            "cu_seqlens": torch.cat([image_md["cu_seqlens"], video_md["cu_seqlens"][1:] + image_md["cu_seqlens"][-1]]),
+            "max_seqlen": max(image_md["max_seqlen"], video_md["max_seqlen"]),
+        }
+    }
+
+
 # ================================================================
 # Helper: _Qwen3_5FakeForPosID  (emitted into the generated file via
 # add_helper). Picklable fake `self` used by `get_position_id_func`.
@@ -2237,11 +2263,48 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
 
-        if pixel_values is not None:
-            image_outputs: BaseModelOutputWithPooling = self.get_image_features(
-                pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
+        # --- Patch.7: Exactly-once vision tower execution (SP disabled) ---
+        # Under FSDP every rank must run the vision tower the same number of times
+        # per step, or the param all-gather / grad reduce-scatter collectives
+        # desync across ranks with different modality mixes. The historical layout
+        # ran the tower twice per step (image slot + video slot, each real or
+        # dummy). With SP disabled we now run it exactly ONCE per rank: a single
+        # merged image+video call here (ViT attention is segmented per frame via
+        # cu_seqlens, so cat-ing the two pixel streams is numerically identical to
+        # two calls), a single-modality call below, or a single dummy (Patch.2).
+        # Besides dropping the wasted dummy, the merged call saves one full
+        # vision-tower FSDP all-gather on mixed batches.
+        # With SP enabled the collator SP-slices the two pixel streams per rank
+        # *independently*, so cat-ing the rank-local slices would feed the vision
+        # tower's sequence exchange in the wrong global order; the two-slot layout
+        # (constant two calls per rank, still collective-aligned) is kept there.
+        image_embeds = None
+        video_embeds = None
+        if not get_parallel_state().sp_enabled and pixel_values is not None and pixel_values_videos is not None:
+            merged_pixel_values = torch.cat(
+                [pixel_values.type(self.visual.dtype), pixel_values_videos.type(self.visual.dtype)], dim=0
             )
-            image_embeds = image_outputs.pooler_output
+            merged_grid_thw = torch.cat([image_grid_thw, video_grid_thw], dim=0)
+            merged_outputs: BaseModelOutputWithPooling = self.get_image_features(
+                merged_pixel_values,
+                merged_grid_thw,
+                return_dict=True,
+                **merge_image_video_vit_kwargs(image_vit_kwargs, video_vit_kwargs),  # noqa: F821 defined via add_helper
+            )
+            # The ViT merger emits one feature row per `spatial_merge_unit` pixel
+            # rows, so the image share of the merged stream is a pure shape
+            # computation — no host-device sync.
+            n_image_features = pixel_values.shape[0] // self.visual.spatial_merge_unit
+            image_embeds = merged_outputs.pooler_output[:n_image_features]
+            video_embeds = merged_outputs.pooler_output[n_image_features:]
+        # --- Patch.7 ---
+
+        if pixel_values is not None:
+            if image_embeds is None:
+                image_outputs: BaseModelOutputWithPooling = self.get_image_features(
+                    pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
+                )
+                image_embeds = image_outputs.pooler_output
 
             # --- Patch.1: Shard image_embeds for sequence parallel scatter ---
             if get_parallel_state().sp_enabled:
@@ -2268,10 +2331,12 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
                 image_mask = image_mask[:, rank_start:rank_end]
             # --- Patch.1 ---
-        elif get_parallel_state().fsdp_enabled:
+        elif get_parallel_state().sp_enabled and get_parallel_state().fsdp_enabled:
             # --- Patch.2: Dummy forward to prevent FSDP reduce-scatter hang on uneven multimodal batches ---
             # add dummy ViT forward to avoid FSDP reduce-scatter hang
-            # when some ranks get None pixel_values while others get valid pixel_values
+            # when some ranks get None pixel_values while others get valid pixel_values.
+            # Per-slot dummies only under SP (two-slot layout); with SP disabled a
+            # single trailing dummy keeps the once-per-rank invariant (Patch.7).
             vision_output = self.visual.dummy_forward()
             fake_embeds = vision_output.pooler_output
             fake_embeds = fake_embeds.mean() * 0.0
@@ -2280,10 +2345,11 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             # --- Patch.2 ---
 
         if pixel_values_videos is not None:
-            video_outputs: BaseModelOutputWithPooling = self.get_video_features(
-                pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
-            )
-            video_embeds = video_outputs.pooler_output
+            if video_embeds is None:
+                video_outputs: BaseModelOutputWithPooling = self.get_video_features(
+                    pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
+                )
+                video_embeds = video_outputs.pooler_output
 
             # --- Patch.1: Shard video_embeds for sequence parallel scatter ---
             # sequence parallel patch for video embeds
@@ -2309,16 +2375,32 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
                 video_mask = video_mask[:, rank_start:rank_end]
             # --- Patch.1 ---
-        elif get_parallel_state().fsdp_enabled:
+        elif get_parallel_state().sp_enabled and get_parallel_state().fsdp_enabled:
             # --- Patch.2: Dummy forward for video encoder to avoid FSDP hang ---
             # add dummy ViT forward to avoid FSDP reduce-scatter hang
-            # when some ranks get None pixel_values_videos while others get valid pixel_values_videos
+            # when some ranks get None pixel_values_videos while others get valid pixel_values_videos.
+            # SP-only for the same reason as the image-slot dummy above.
             vision_output = self.visual.dummy_forward()
             fake_embeds = vision_output.pooler_output
             fake_embeds = fake_embeds.mean() * 0.0
             fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds + fake_embeds
             # --- Patch.2 ---
+
+        # --- Patch.7: Single dummy for vision-less ranks (SP disabled) ---
+        # Exactly-once counterpart of the per-slot dummies above: with SP disabled
+        # a rank with neither images nor videos runs the vision tower once so its
+        # FSDP collectives stay aligned with ranks that ran one real call.
+        if (
+            not get_parallel_state().sp_enabled
+            and get_parallel_state().fsdp_enabled
+            and pixel_values is None
+            and pixel_values_videos is None
+        ):
+            vision_output = self.visual.dummy_forward()
+            fake_embeds = vision_output.pooler_output.mean() * 0.0
+            inputs_embeds = inputs_embeds + fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        # --- Patch.7 ---
 
         # --- Patch.1: Final transpose back to standard sequence-sharded layout ---
         if get_parallel_state().sp_enabled:
