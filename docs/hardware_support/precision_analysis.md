@@ -188,9 +188,9 @@ Configure compare.json:
 
 ```json
 {
-  "npu_path": "/data_dump/step0/rank0/dump.json",
-  "bench_path": "/gpu_data_dump/step0/rank0/dump.json",
-  "stack_path": "/home/data2/ltt/mirro/mirro4huawei/data_dump/step0/rank0/stack.json",
+  "npu_path": "./npu_data_dump/step0/rank0/dump.json",
+  "bench_path": "./gpu_data_dump/step0/rank0/dump.json",
+  "stack_path": "./npu_data_dump/step0/rank0/stack.json",
   "is_print_compare_log": true
 }
 ```

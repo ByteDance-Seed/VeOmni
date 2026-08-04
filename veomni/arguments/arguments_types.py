@@ -32,7 +32,10 @@ logger = logging.get_logger(__name__)
 #   ├── optimizer.*          → OptimizerConfig
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
+#   ├── channel_loss.*       → ChannelLossConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
+#   ├── torch_compile.*      → TorchCompileConfig
+#   ├── chunk_mbs_config.*   → ChunkMBSConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
@@ -95,12 +98,14 @@ class OptimizerConfig:
         metadata={"help": "Clip value for gradient norm."},
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
-    muon_lr: float = field(
-        default=2e-2,
+    muon_lr: Optional[float] = field(
+        default=None,
         metadata={
             "help": (
                 "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
-                "Per Moonlight, ~25x the AdamW lr is a common starting point."
+                "If unset: inherits train.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
+                "(default); uses 25x train.optimizer.lr when muon_adjust_lr_fn=original "
+                "(Moonlight-style starting point)."
             )
         },
     )
@@ -138,6 +143,28 @@ class OptimizerConfig:
             )
         },
     )
+    muon_head_group_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Attention heads per Newton-Schulz block for head-split Muon. "
+                "0 (default) orthogonalizes each projection as a single matrix; 1 is fully per-head; "
+                "g > 1 puts g heads in each block. Any value >= 1 also requires "
+                "muon_head_split_modules."
+            )
+        },
+    )
+    muon_head_split_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Leaf module names to head-split, matched exactly against the children of an "
+                "attention module, e.g. ['q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
+                "['q_proj', 'k_proj', 'v_proj'] for GQA. Required whenever "
+                "muon_head_group_size >= 1; see docs/usage/basic_modules.md."
+            )
+        },
+    )
     muon_expert_zero_comm: bool = field(
         default=False,
         metadata={
@@ -145,6 +172,28 @@ class OptimizerConfig:
                 "Use whole-expert Shard(0) for Muon under FSDP+ExtraParallel when "
                 "(num_experts/ep_size) %% ep_fsdp_size == 0; otherwise fall back "
                 "to the default hidden-dim sharding path."
+            )
+        },
+    )
+    muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
+        default="gram_quack",
+        metadata={
+            "help": (
+                "Newton-Schulz implementation used by Muon. "
+                "'std': torch.optim.Muon-compatible Newton-Schulz; "
+                "'gram': pure-PyTorch Dao-AILab Gram Newton-Schulz; "
+                "'gram_quack' (default): Dao-AILab Gram-NS with quack CuTeDSL GEMM kernels "
+                "(Hopper/Blackwell). If quack/package is missing, falls back to gram."
+            )
+        },
+    )
+    muon_gram_ns_reset_iterations: List[int] = field(
+        default_factory=lambda: [2],
+        metadata={
+            "help": (
+                "Restart indices for Gram Newton-Schulz (applied immediately before "
+                "those iteration indices). Default [2] matches Dao-AILab guidance "
+                "for 5-step schedules."
             )
         },
     )
@@ -217,6 +266,91 @@ class ProfileConfig:
 
 
 @dataclass
+class ChannelLossConfig:
+    """train.channel_loss.* — Per-channel causal-LM loss logging."""
+
+    enable: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable detached per-channel cross-entropy logging. This is an observability-only "
+                "side channel and does not change the training objective."
+            )
+        },
+    )
+    interval: int = field(
+        default=10,
+        metadata={
+            "help": (
+                "Compute and log channel loss every N optimizer steps. The detached fused-loss "
+                "fallback recomputes the LM-head projection on sampled steps; use 1 to sample every step."
+            )
+        },
+    )
+    source_id_keys: List[str] = field(
+        default_factory=lambda: ["channel_id", "source_id", "dataset_id", "ds_idx"],
+        metadata={
+            "help": (
+                "Batch metadata keys to read as channel/source IDs. The first key found in each "
+                "micro-batch is used. Values should be one per packed sequence."
+            )
+        },
+    )
+    source_name_keys: List[str] = field(
+        default_factory=lambda: ["channel_name", "source_name", "dataset_name", "data_name"],
+        metadata={
+            "help": (
+                "Batch metadata keys to read as display names for channel/source IDs. Values should "
+                "align with source_id_keys when provided."
+            )
+        },
+    )
+    extra_strip_keys: List[str] = field(
+        default_factory=lambda: ["cur_token_num"],
+        metadata={
+            "help": (
+                "Extra metadata keys to remove from each micro-batch before model forward when "
+                "channel loss is enabled."
+            )
+        },
+    )
+    loss_metric_prefix: str = field(
+        default="channel_loss",
+        metadata={"help": "Metric prefix for per-channel average CE."},
+    )
+    weighted_loss_metric_prefix: str = field(
+        default="channel_loss_weighted",
+        metadata={"help": "Metric prefix for per-channel CE weighted by all logged tokens in the step."},
+    )
+    token_count_metric_prefix: str = field(
+        default="channel_tokens",
+        metadata={"help": "Metric prefix for per-channel supervised token counts."},
+    )
+    log_weighted_loss: bool = field(
+        default=True,
+        metadata={"help": "Log loss_sum / total_step_tokens for each channel."},
+    )
+    log_token_count: bool = field(
+        default=True,
+        metadata={"help": "Log supervised token count for each channel."},
+    )
+    strict: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Raise when enabled but a micro-batch has no configured source ID, or when "
+                "source metadata cannot be aligned with packed segments. Default False skips "
+                "micro-batches with missing or mismatched metadata."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.interval < 1:
+            raise ValueError("train.channel_loss.interval must be at least 1.")
+
+
+@dataclass
 class GradientCheckpointingConfig:
     """train.gradient_checkpointing.* — Activation recomputation settings."""
 
@@ -233,6 +367,29 @@ class GradientCheckpointingConfig:
     enable_reentrant: bool = field(
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
+    )
+    early_stop: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. "
+                "PyTorch ignores this option when enable_reentrant=True."
+            )
+        },
+    )
+
+
+@dataclass
+class ChunkMBSConfig:
+    """train.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable ChunkMBS for packed-sequence decoder layers."},
+    )
+    chunk_mbs: int = field(
+        default=1,
+        metadata={"help": "Number of packed samples per layer chunk."},
     )
 
 
@@ -406,6 +563,23 @@ class CheckpointConfig:
         default=False,
         metadata={"help": "Whether to save checkpoint asynchronously."},
     )
+    dcp_save_to_lowest_rank: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Route each replicated DCP shard to the lowest global rank that holds it, instead "
+                "of load-balancing writes across all replica holders. Useful on a non-shared "
+                "filesystem (each node writes to local disk): it concentrates the deduplicated copy "
+                "onto the lowest-ranked replica group instead of scattering writes across all "
+                "replicas. In the standard HSDP layout (FSDP shard within a node, replication "
+                "across nodes) that lowest replica group lives on one node, so that node holds a "
+                "complete checkpoint. Only affects replicated data (the FSDP/HSDP replicate dim); "
+                "unique expert/tensor/pipeline-parallel shards are never deduplicated and stay "
+                "distributed. Trades write parallelism for locality, so leave False when output_dir "
+                "is shared."
+            )
+        },
+    )
     load_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to checkpoint to resume from."},
@@ -429,6 +603,38 @@ class CheckpointConfig:
     save_hf_weights: bool = field(
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
+    )
+
+
+@dataclass
+class TorchCompileConfig:
+    """train.torch_compile.* — Per-block torch.compile options."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
+    )
+    backend: Optional[str] = field(
+        default="inductor",
+        metadata={"help": "Backend passed to torch.compile."},
+    )
+    mode: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Mode passed to torch.compile. Leave as None to use the inductor default. "
+                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
+                "train.accelerator.fsdp_config.reshard_after_forward=False."
+            )
+        },
+    )
+    fullgraph: bool = field(
+        default=True,
+        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
+    )
+    dynamic: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
     )
 
 
@@ -503,6 +709,12 @@ class TrainingArguments:
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
+    ep_sharded_stream_load: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+        },
+    )
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
@@ -531,10 +743,6 @@ class TrainingArguments:
         default=42,
         metadata={"help": "Random seed."},
     )
-    enable_compile: bool = field(
-        default=False,
-        metadata={"help": "Enable torch compile."},
-    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
@@ -554,7 +762,10 @@ class TrainingArguments:
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
+    channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
+    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
+    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
@@ -563,6 +774,8 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
+        if self.chunk_mbs_config.chunk_mbs < 1:
+            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs_config.chunk_mbs}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -631,6 +844,14 @@ class TrainingArguments:
                     "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
                     f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
                 )
+
+        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
+        # instead of silently ignoring the flag.
+        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
+            "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
+            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+        )
 
     def _derive_batch_config(self):
         acc = self.accelerator
@@ -710,10 +931,9 @@ class TrainingArguments:
 # always allowed implicitly. A value not in ``_NPU_ALLOWED[field]`` raises on
 # NPU; a value in ``_NPU_REQUIRED[field]`` raises off NPU.
 #
-# Hardcoded (not inferred from ``BackendSpec.requires``) because the name
-# ``"triton"`` is reused with different hardware semantics — NPU
-# triton-ascend for load-balancing loss vs. CUDA-only mainline triton for
-# DeepSeek-V3 RMSNorm / RoPE.
+# Hardcoded (not inferred from ``BackendSpec.requires``) because backend names
+# alone do not capture per-model and per-hardware compatibility. The NPU
+# default-normalization step runs before this allow-list validation.
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
@@ -747,29 +967,35 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton / fused_triton); they raise on
-    NPU. NPU users must pin every per-op field to an NPU-supported value, or
-    ``"eager"`` when the op has no NPU kernel. Per-op fields are ``str`` so
-    third-party backends can register without changing this dataclass.
+    Defaults are GPU-optimal (Liger / Triton / fused_triton). On NPU, values
+    still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
+    are automatically mapped to NPU-compatible or eager implementations;
+    explicit non-default overrides are validated and unsupported values raise.
+    Per-op fields are ``str`` so third-party backends can register without
+    changing this dataclass.
 
     NPU validation runs at two times:
 
     - **Config-parse time** (``__post_init__``) for ops registered in the
       legacy per-model registry: ``rms_norm``, ``rotary_pos_emb``,
-      ``swiglu_mlp``, ``load_balancing_loss``, plus ``cross_entropy_loss``
-      and ``moe``. Errors fire immediately with a model-agnostic allow-list.
+      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
+      model-agnostic allow-list.
     - **Model-build time** (``OpSlot.bind`` via ``KERNEL_REGISTRY.resolve``)
       for Qwen3.5-only ops: ``rms_norm_gated``, ``causal_conv1d``,
       ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
       patched modeling module, so config-parse-time validation would force
       every NPU user to override them even when training non-Qwen3.5 models.
-      The kernel's ``HardwareRequirement`` raises if a non-eager value is
-      requested on NPU; the varlen (``dyn_bsz=True``) caveat is documented
-      in the field metadata.
+      All three ship both a GPU (``fla``) and an NPU (``npu``) backend; the
+      kernel's ``HardwareRequirement`` raises only when the requested value has
+      no backend for the current hardware. The varlen (``dyn_bsz=True``) caveat
+      is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
-    ``"triton"`` (CUDA ``triton`` / NPU ``triton-ascend``).
+    ``"triton"`` (CUDA ``triton``). Load-balancing loss has a CUDA Triton
+    backend; on NPU, values equal to the dataclass default are normalized to
+    ``"eager"`` before registry binding.
     """
 
     attn_implementation: Optional[
@@ -779,6 +1005,7 @@ class OpsImplementationConfig:
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
             "native-sparse",
         ]
     ] = field(
@@ -790,7 +1017,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
             "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'eager'. "
-            "Hardware mismatch raises at config validation. Legacy 'fused' "
+            "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
+            "incompatible non-default overrides raise. Legacy 'fused' "
             "auto-resolves to fused_quack/fused_npu with a deprecation warning."
         },
     )
@@ -831,8 +1059,8 @@ class OpsImplementationConfig:
     load_balancing_loss_implementation: str = field(
         default="triton",
         metadata={
-            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA "
-            "or 'triton-ascend' on NPU — raises at validation if missing) | 'eager'."
+            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA) | 'eager'. "
+            "On NPU, config normalization maps the default 'triton' value to 'eager'."
         },
     )
     rms_norm_gated_implementation: str = field(
@@ -851,7 +1079,9 @@ class OpsImplementationConfig:
             "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
+            "matching backend raises at OpSlot bind time."
         },
     )
     chunk_gated_delta_rule_implementation: str = field(
@@ -863,16 +1093,26 @@ class OpsImplementationConfig:
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
+            "delegates heavy GDN compute to torch.ops.npu.*). "
+            "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    dsa_indexer_backend: Literal["eager", "cudnn"] = field(
+    dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention top-k indexer backend."},
+        metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
     )
-    dsa_attention_backend: Literal["eager", "flashmla_cudnn"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention backend."},
+        metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
+    )
+    mhc_implementation: Literal["eager", "tilelang"] = field(
+        default="eager",
+        metadata={
+            "help": "Manifold-constrained Hyper-Connection implementation. 'tilelang' enables the "
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
+        },
     )
 
     def __post_init__(self):
@@ -881,6 +1121,7 @@ class OpsImplementationConfig:
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
+                "flex_attention": "veomni_flex_attention_with_sp",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
@@ -907,7 +1148,7 @@ class OpsImplementationConfig:
     def _apply_npu_default_fallback(self):
         """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
 
-        When running on NPU, fields still at their GPU default are silently
+        When running on NPU, fields still at their GPU default are automatically
         swapped to the NPU fallback from ``_NPU_DEFAULT_FALLBACK``. Explicit
         user overrides (non-default values) are left untouched and will be
         caught by ``_validate_implementations`` if unsupported.
@@ -972,7 +1213,7 @@ class OpsImplementationConfig:
         if self.load_balancing_loss_implementation == "triton" and not is_package_available("triton"):
             raise ValueError(
                 "load_balancing_loss_implementation='triton' requires the 'triton' package "
-                "(or 'triton-ascend' on NPU). Install it or set the field to 'eager'."
+                "on CUDA. Install it or set the field to 'eager'."
             )
 
 
@@ -1136,6 +1377,8 @@ class DataloaderConfig:
 class DataArguments:
     """data.* — Dataset paths, tokenization, and batching."""
 
+    supports_torch_compile = True
+
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
@@ -1237,6 +1480,40 @@ class VeOmniArguments:
             else:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
+
+        if self.train.chunk_mbs_config.enable:
+            if self.train.pad_to_length:
+                raise ValueError("train.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
+            if self.train.gradient_checkpointing.enable and self.train.gradient_checkpointing.enable_reentrant:
+                raise ValueError(
+                    "train.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
+                    "Set train.gradient_checkpointing.enable_reentrant=False."
+                )
+            if self.data.data_type == "dpo":
+                raise ValueError("train.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
+
+        if self.train.torch_compile.enable:
+            if self.train.chunk_mbs_config.enable:
+                raise ValueError(
+                    "train.chunk_mbs_config.enable is not supported with train.torch_compile.enable yet. "
+                    "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
+                )
+            if not getattr(self.data, "supports_torch_compile", True):
+                raise ValueError(
+                    "train.torch_compile.enable currently supports text trainers only. "
+                    "Multimodal/DiT/Omni data pipelines do not implement pad_to_length for static packed shapes yet."
+                )
+            if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
+                raise ValueError(
+                    "train.torch_compile.enable currently supports text data only; "
+                    f"got data.data_type={self.data.data_type!r}."
+                )
+            if not self.train.dyn_bsz or not self.train.pad_to_length:
+                raise ValueError(
+                    "train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True. "
+                    "Variable packed lengths trigger recompilation and prevent stable CUDA Graph replay when enabled; "
+                    "see https://github.com/ByteDance-Seed/VeOmni/issues/401."
+                )
 
     def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:

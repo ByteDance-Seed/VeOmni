@@ -2195,7 +2195,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             if get_parallel_state().sp_enabled:
                 input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
                 dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-                input_ids = torch.cat(input_ids_list, dim=0)
+                input_ids = torch.cat(input_ids_list, dim=1)
             image_mask, video_mask = self.get_placeholder_mask(input_ids)
         # --- Patch.1 ---
 

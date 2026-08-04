@@ -61,8 +61,13 @@ Core entry points:
    - Underlying primitive: `_SeqAllToAll` (autograd-aware `all_to_all_tensor`).
    - Async variants in `async_ulysses*.py` for DiT and pipelined QKV/output projections.
    - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
-   - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks.
-   - Process groups: `comm.py` sets `ulysses_sequence_parallel_group`, `context_parallel_group`, `unified_sequence_parallel_group` from the device mesh.
+   - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks (optional `group=` arg; defaults to the current state's unified SP group).
+   - Process groups: `comm.py` has NO group globals. Its getters (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, `get_data_parallel_group`) resolve from the *current* `ParallelState`'s device mesh (`get_parallel_state().{ulysses,sp,cp,dp}_group`) — exactly how `fsdp_group` already worked. `set_ulysses_sequence_parallel_group(group)` survives ONLY as a unit-test injection seam (`_ULYSSES_SP_GROUP_OVERRIDE`, `None` in production); no production code calls it. Meshless SP is unsupported — `ParallelState.__post_init__` raises if `sp_enabled and device_mesh is None`; always build via `init_parallel_state`.
+   - Local parallel state: `BaseTrainer._setup()` calls `init_parallel_state(name="base")` **before** seed/determinism env vars (`NCCL_DETERMINISTIC`, etc.). Initialization caches by topology and registers under `name`; duplicate name → warn and return existing. Trainers do not store the ParallelState object or name — use `use_parallel_state("base")` / `get_parallel_state_by_name("base")`. `clear_parallel_state()` after `destroy_process_group()`.
+   - **Build scope**: `_setup()` (registers `"base"`) → one `with use_parallel_state("base"):` around the whole build sequence. Do NOT re-wrap individual build helpers.
+   - **Run scope (per-op, not whole `train_step`)**: each ambient-dependent op gets its own wrap with `"base"` — `model` forward, `postforward`/`mean_global_loss`, `loss.backward()`, `veomni_clip_grad_norm`. When an API takes explicit `group=`, pass `get_parallel_state_by_name("base").sp_group` and skip ambient.
+   - **Callbacks**: cache `Callback.parallel_state` at construction (ChannelLossComputer too). Hook dispatch must not depend on ambient ParallelState.
+   - See `docs/design/local_parallel_state.md`.
 
 ### Expert Parallel (MoE)
 
@@ -138,25 +143,47 @@ Core files:
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
 
+18. **Distributed HF safetensors consolidation must support non-floating tensors**
+    - PyTorch 2.9–2.11 computes consolidated tensor byte sizes with `torch.finfo`, which crashes for valid integer and boolean buffers such as DeepSeek V4 `tid2eid`.
+    - `apply_dcp_consolidation_patch()` in `veomni/checkpoint/dcp_consolidation.py` replaces the metadata parser with `Tensor.element_size()` and verifies the upstream private-function source hash before patching.
+    - Offline DCP-to-HF conversion may cast `save_dtype` only onto floating tensors; integer and boolean buffers must retain their original dtype, and shard-size planning must use their original element sizes.
+    - Do not remove this patch during torch upgrades until the new upstream consolidator is verified with sharded integer-tensor save/load coverage.
+
 ## Code Quality
 
-18. **Ruff must pass before commit**
+19. **Ruff must pass before commit**
     - `make quality` runs `ruff check` and `ruff format --check`.
     - Pre-commit hooks enforce this automatically (`pre-commit run --all-files`).
 
-19. **All comments and docstrings must be in English**
+20. **All comments and docstrings must be in English**
     - No Chinese or other non-English text in code comments. This is enforced by project convention.
 
-20. **PR title must follow format: `[{modules}] {type}: {description}`**
+21. **PR title must follow format: `[{modules}] {type}: {description}`**
     - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (single source of truth).
     - CI checks PR titles automatically on every PR.
 
 ## Hardware
 
-21. **NPU (Ascend) code paths require guards**
+22. **NPU (Ascend) code paths require guards**
     - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
     - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/` — they must not be imported on GPU-only environments.
 
-22. **Device-agnostic code must use `veomni.utils.device` helpers**
-    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
-    - Direct CUDA calls break NPU compatibility.
+23. **Device-agnostic code must use `veomni.utils.device` helpers**
+   - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
+   - Direct CUDA calls break NPU compatibility.
+
+## Trainer Extensions
+
+24. **Trainer callback lifecycle changes must cover composed trainers**
+   - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
+   - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
+
+25. **Module-level OpSlots are shared by every model instance**
+   - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
+   - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
+
+26. **DCP full resume skips HF weight materialization**
+    - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `skip_weights_load=True` into `build_parallelize_model` / `parallelize_model_fsdp2`.
+    - The model is only `to_empty()`-materialized; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
+    - LoRA/PEFT must not set `skip_weights_load` (and the FSDP2 path raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
+    - After DCP load, `empty_cache()` is called to reduce first-step NCCL OOM risk from allocator fragmentation on near-OOM MoE jobs.

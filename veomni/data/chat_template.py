@@ -96,6 +96,95 @@ class DefaultTemplate(ChatTemplate):
         )
 
 
+@CHAT_TEMPLATE_REGISTRY.register("tokenizer")
+class TokenizerTemplate(ChatTemplate):
+    """Use a prefix-stable native chat template with assistant-only labels."""
+
+    def _update_prefix_labels(self, previous_ids: List[int], current_ids: List[int], labels: List[int]) -> None:
+        """Validate that adding a message preserved the previously rendered prefix."""
+        previous_length = len(previous_ids)
+        if current_ids[:previous_length] != previous_ids:
+            raise ValueError(
+                "The tokenizer chat template structurally rewrote an earlier conversation prefix; "
+                "the generic tokenizer template requires prefix-stable rendering."
+            )
+
+    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        input_ids: List[int] = []
+        labels: List[int] = []
+        previous_length = 0
+
+        for end, message in enumerate(messages, start=1):
+            encoded = self.tokenizer.apply_chat_template(
+                messages[:end],
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=True,
+            )
+            current_ids = encoded["input_ids"]
+            current_length = len(current_ids)
+            if current_length < previous_length:
+                raise ValueError(
+                    "The tokenizer chat template shortened the conversation after adding a message; "
+                    "assistant-only loss masking requires monotonic message boundaries."
+                )
+
+            self._update_prefix_labels(input_ids, current_ids, labels)
+
+            loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
+            new_ids = current_ids[previous_length:]
+            labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
+            input_ids = current_ids
+            previous_length = current_length
+
+        input_ids = input_ids[-max_seq_len:]
+        labels = labels[-max_seq_len:]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+            "labels": labels,
+        }
+
+    def get_jinja_template(self) -> str:
+        if not self.tokenizer.chat_template:
+            raise ValueError("The tokenizer does not define a native chat template.")
+        return self.tokenizer.chat_template
+
+
+@CHAT_TEMPLATE_REGISTRY.register("gpt_oss")
+class GptOssTokenizerTemplate(TokenizerTemplate):
+    """GPT-OSS native template with its terminal assistant-token rewrite."""
+
+    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
+        super().__init__(tokenizer)
+        self.return_token_id = tokenizer.convert_tokens_to_ids("<|return|>")
+        self.end_token_id = tokenizer.convert_tokens_to_ids("<|end|>")
+        if self.return_token_id == tokenizer.unk_token_id or self.end_token_id == tokenizer.unk_token_id:
+            raise ValueError("The GPT-OSS chat template requires <|return|> and <|end|> tokenizer tokens.")
+
+    def _update_prefix_labels(self, previous_ids: List[int], current_ids: List[int], labels: List[int]) -> None:
+        previous_length = len(previous_ids)
+        rewritten_positions = [index for index in range(previous_length) if previous_ids[index] != current_ids[index]]
+        if not rewritten_positions:
+            return
+
+        is_terminal_rewrite = (
+            rewritten_positions == [previous_length - 1]
+            and len(current_ids) > previous_length
+            and previous_ids[-1] == self.return_token_id
+            and current_ids[previous_length - 1] == self.end_token_id
+            and self.return_token_id not in current_ids[previous_length:]
+        )
+        if not is_terminal_rewrite:
+            raise ValueError(
+                "The GPT-OSS tokenizer chat template structurally rewrote an earlier conversation prefix; "
+                "only the terminal <|return|>-to-<|end|> substitution is supported."
+            )
+
+        if labels[-1] != IGNORE_INDEX:
+            labels[-1] = self.end_token_id
+
+
 @CHAT_TEMPLATE_REGISTRY.register("llama2")
 class Llama2Template(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:

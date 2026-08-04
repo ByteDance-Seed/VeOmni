@@ -21,8 +21,8 @@ from .launch_utils import find_free_port
 # ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton) and
 # raise on NPU at config validation time, so every NPU test must override
 # every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
-# ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3, Qwen-VL family) pin specific
-# fields to ``eager`` where the model has no NPU kernel.
+# ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3/V4, Qwen-VL family) pin
+# specific fields to ``eager`` where the model has no NPU kernel.
 _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "attn_implementation": "flash_attention_2",
     "moe_implementation": "fused_npu",
@@ -39,6 +39,14 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v3": {
         # batch-invariant RMSNorm + deterministic RoPE are GPU-only Triton
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    "deepseek_v4": {
+        # DeepSeek-V4 attention is eager-only and its clamped SwiGLU requires
+        # swiglu_limit support that the NPU fused-MoE kernel does not yet have.
+        "attn_implementation": "eager",
+        "moe_implementation": "eager",
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
@@ -103,6 +111,14 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
+    # DeepSeek-V4 attention and partial interleaved RoPE are eager-only. MoE
+    # uses the GPU-default fused_triton backend, while weighted/unweighted
+    # RMSNorm and the shared-expert MLP use their default Liger OpSlots.
+    "deepseek_v4": {
+        "attn_implementation": "eager",
+        "moe_implementation": "fused_triton",
+        "rotary_pos_emb_implementation": "eager",
+    },
 }
 
 
@@ -117,9 +133,10 @@ def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
     """Return ``--model.ops_implementation.X=Y`` flags for the active hardware.
 
     On GPU returns per-model overrides for models whose patched ops disable a
-    default backend (currently Wan); empty otherwise — dataclass defaults are
-    GPU-optimal. On NPU returns the NPU-supported backend per op, with
-    per-model eager fallbacks for ops without an NPU kernel for that model.
+    default backend (for example Wan's RoPE and DeepSeek-V4's eager-only
+    attention); empty otherwise — dataclass defaults are GPU-optimal. On NPU
+    returns the NPU-supported backend per op, with per-model eager fallbacks for
+    ops without an NPU kernel for that model.
     """
     if not is_torch_npu_available():
         overrides = _GPU_PER_MODEL_OVERRIDES.get(model_name, {}) if model_name else {}

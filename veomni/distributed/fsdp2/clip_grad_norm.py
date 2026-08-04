@@ -1,10 +1,10 @@
+import itertools
 import math
 from typing import List
 
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
-from torch.utils._foreach_utils import _device_has_foreach_support, _has_foreach_support
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
@@ -12,7 +12,6 @@ from ..parallel_state import get_parallel_state
 
 
 logger = get_logger(__name__)
-_LOCAL_NORM_CHUNK_SIZE = 128
 
 
 def clip_grad_norm(
@@ -110,9 +109,33 @@ def extra_parallel_fsdp2_clip_grad_norm(
         for para in ps.extra_parallel_names
     }
 
-    # Build param groups for ExtraParallel params and non-ExtraParallel params (filter out params without grads)
+    # ``LoraSharedExperts`` Mode-2 LoRA params live on the same inner ``ep_fsdp``
+    # FSDP mesh as the EP-sharded base experts (the optimizer cannot place them
+    # in the ``non_extra_parallel`` bucket without crossing meshes — see the
+    # comment near ``_ep_replicated_lora_param_ids`` in
+    # ``veomni/optim/optimizer.py``), but they are *replicated* across the EP
+    # group rather than EP-sliced. Including them in the EP-mesh all-reduce path
+    # below would sum their squared norms once per EP rank, inflating the global
+    # grad norm by ~``sqrt(ep_size)`` for the shared-LoRA bucket and breaking
+    # EP=1/EP=N grad-norm parity. Split them off into a separate
+    # ``extra_parallel_replicated_params`` bucket whose reduction skips the
+    # ``ep`` group (only the ``ep_fsdp`` reduction stays — that one is a no-op
+    # at ``ep_fsdp_size=1`` but is the right shape if it grows in the future).
+    ep_replicated_ids: set[int] = getattr(model, "_ep_replicated_lora_param_ids", set())
     extra_parallel_params = {
-        para: [p for p in model._extra_parallel_param_groups.get(para, []) if p.grad is not None]
+        para: [
+            p
+            for p in model._extra_parallel_param_groups.get(para, [])
+            if p.grad is not None and id(p) not in ep_replicated_ids
+        ]
+        for para in ps.extra_parallel_names
+    }
+    extra_parallel_replicated_params = {
+        para: [
+            p
+            for p in model._extra_parallel_param_groups.get(para, [])
+            if p.grad is not None and id(p) in ep_replicated_ids
+        ]
         for para in ps.extra_parallel_names
     }
     non_extra_parallel_params: List[torch.nn.Parameter] = [
@@ -150,16 +173,54 @@ def extra_parallel_fsdp2_clip_grad_norm(
             extra_parallel_total[para] = para_total
             logger.debug_rank0(f"{para} total grad norm: {para_total}")
 
+    # Replicated-across-Para subgroup (currently only Mode-2 shared LoRA on the
+    # ``ep`` mesh): reduce ONLY across para_fsdp -- skipping the ``para`` (e.g.
+    # ``ep``) reduction prevents double-counting since every Para rank holds the
+    # same gradient.
+    extra_parallel_replicated_total = {
+        para: torch.tensor(0.0, device=torch.device(get_device_type()), dtype=torch.float32)
+        for para in ps.extra_parallel_names
+    }
+    for para in ps.extra_parallel_names:
+        if len(extra_parallel_replicated_params[para]) > 0:
+            para_total = _fsdp2_reduce_group(
+                params=extra_parallel_replicated_params[para],
+                norm_type=norm_type,
+                reduce_groups=[
+                    (f"{para}_fsdp", extra_parallel_fsdp_group[para]),
+                ],
+            )
+            extra_parallel_replicated_total[para] = para_total
+            logger.debug_rank0(f"{para} replicated total grad norm: {para_total}")
+
     if math.isinf(norm_type):
-        total_norm = torch.maximum(non_extra_parallel_total, *extra_parallel_total.values())
+        # ``torch.maximum`` is a 2-arg elementwise op, not variadic. Unpacking
+        # ``*extra_parallel_total.values(), *extra_parallel_replicated_total.values()``
+        # silently worked only when the combined dict size was 1 (single
+        # ``extra_parallel_names`` entry + only one of the two buckets
+        # populated). Reduce iteratively so the path holds for any number
+        # of parallelism axes (``ep`` + ``emb`` + ...) and for the Mode-2
+        # shared-LoRA case where both ``extra_parallel_total["ep"]`` and
+        # ``extra_parallel_replicated_total["ep"]`` are populated.
+        total_norm = non_extra_parallel_total
+        for t in itertools.chain(extra_parallel_total.values(), extra_parallel_replicated_total.values()):
+            total_norm = torch.maximum(total_norm, t)
     else:
-        total_norm = _finalize_total_norm(non_extra_parallel_total + sum(extra_parallel_total.values()), norm_type)
+        total_norm = _finalize_total_norm(
+            non_extra_parallel_total
+            + sum(extra_parallel_total.values())
+            + sum(extra_parallel_replicated_total.values()),
+            norm_type,
+        )
 
     _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
 
-    # Apply the same clip coefficient to both groups
+    # Apply the same clip coefficient to all groups
     for para in ps.extra_parallel_names:
         torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
+        torch.nn.utils.clip_grads_with_norm_(
+            extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach
+        )
     torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm
@@ -183,26 +244,9 @@ def _raise_if_nonfinite(total_norm: torch.Tensor, norm_type: float, error_if_non
 
 
 def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
-    """Compute the local p-th norm sum with bounded fp32 grad materialization."""
+    """Compute the local p-th norm sum without materializing fp32 gradients."""
     reduce_device = torch.device(get_device_type())
     res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
-
-    # Materializing every grad as fp32 at once can OOM on large models, so keep
-    # foreach acceleration local to bounded same-device chunks.
-    chunks: dict[torch.device, list[torch.Tensor]] = {}
-
-    def flush_chunk(device: torch.device) -> None:
-        nonlocal res
-        chunk = chunks.get(device)
-        if not chunk:
-            return
-        chunk_fp32 = [g.to(torch.float32) for g in chunk]
-        if _has_foreach_support(chunk_fp32, device) or _device_has_foreach_support(device):
-            norm_pows = torch._foreach_pow_(torch._foreach_norm(chunk_fp32, p), p)
-        else:
-            norm_pows = [torch.linalg.vector_norm(g, p).pow(p) for g in chunk_fp32]
-        res = res + torch.sum(torch.stack(norm_pows)).to(reduce_device)
-        chunk.clear()
 
     with torch.no_grad():
         for param in params:
@@ -212,13 +256,17 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
             if isinstance(g, DTensor):
                 g = g.to_local()
             g = g.detach()
-            chunk = chunks.setdefault(g.device, [])
-            chunk.append(g)
-            if len(chunk) >= _LOCAL_NORM_CHUNK_SIZE:
-                flush_chunk(g.device)
-
-        for device in list(chunks):
-            flush_chunk(device)
+            # ``dtype`` controls accumulation inside the reduction kernel. In
+            # contrast, ``g.to(float32)`` creates a full-size temporary, which
+            # can exceed the remaining VRAM for multi-billion-element experts.
+            if g.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                norm = torch.linalg.vector_norm(g, ord=p, dtype=torch.float32)
+            else:
+                # Preserve the previous implementation's behavior for wider
+                # or uncommon dtypes. The memory-sensitive training dtypes
+                # above use in-kernel FP32 accumulation without this copy.
+                norm = torch.linalg.vector_norm(g.to(torch.float32), ord=p)
+            res = res + norm.pow(p).to(device=reduce_device, dtype=torch.float32)
     return res
 
 

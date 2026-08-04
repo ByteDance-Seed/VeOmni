@@ -30,10 +30,10 @@ import json
 import os
 import queue
 import threading
-import warnings
 from abc import ABC
 from collections import defaultdict
-from dataclasses import asdict
+from contextlib import nullcontext
+from dataclasses import asdict, fields
 from typing import Any, Callable, Dict, List
 
 import torch
@@ -56,14 +56,17 @@ from ..data import (
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
+from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import init_parallel_state
+from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
+from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
+from ..utils.checkpoint_utils import should_skip_hf_weight_load
 from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -74,6 +77,7 @@ from ..utils.device import (
 from ..utils.loss_utils import count_loss_token, mean_global_loss
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
+    ChannelLossCallback,
     CheckpointerCallback,
     EnvironMeterCallback,
     EvaluateCallback,
@@ -195,10 +199,21 @@ class VeOmniIter:
         return {}
 
 
+def _resolve_muon_lr(optimizer_cfg) -> float:
+    """Resolve Muon LR, inheriting AdamW lr under match_rms_adamw when unset."""
+    if optimizer_cfg.muon_lr is not None:
+        return float(optimizer_cfg.muon_lr)
+    adamw_lr = float(optimizer_cfg.lr)
+    if optimizer_cfg.muon_adjust_lr_fn == "match_rms_adamw":
+        return adamw_lr
+    # original: Moonlight-style ~25x AdamW lr starting point
+    return 25.0 * adamw_lr
+
+
 def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
     """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
     return {
-        "lr": optimizer_cfg.muon_lr,
+        "lr": _resolve_muon_lr(optimizer_cfg),
         "momentum": optimizer_cfg.muon_momentum,
         "nesterov": optimizer_cfg.muon_nesterov,
         "weight_decay": optimizer_cfg.muon_weight_decay,
@@ -206,6 +221,15 @@ def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
         "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
         "eps": optimizer_cfg.muon_eps,
         "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
+        "ns_implementation": optimizer_cfg.muon_ns_implementation,
+        "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
+        # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
+        "head_group_size": int(optimizer_cfg.muon_head_group_size),
+        "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
+        # Surface for startup summary only; not a DistributedMuon ctor kwarg.
+        "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
+        "adamw_lr": float(optimizer_cfg.lr),
+        "muon_lr_explicit": optimizer_cfg.muon_lr is not None,
     }
 
 
@@ -288,28 +312,38 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
+        # ``_setup`` registers ParallelState ("base") before seed/determinism so
+        # device-mesh process groups are created with default NCCL settings —
+        # matching pre-registry init order (avoids L20 SIGSEGV when
+        # NCCL_DETERMINISTIC=1 is set before mesh construction).
         self._setup()
-        # build model
-        self._build_model()
-        # freeze module and print trainable parameters
-        self._freeze_model_module()
-        # build model assets (config, tokenizer, processor, chat_template)
-        self._build_model_assets()
-        # build dataset and dataloader
-        self._build_data_transform()
-        self._build_dataset()
-        self._build_collate_fn()
-        self._build_dataloader()
+        # Every build step below reads the current ParallelState via
+        # ``get_parallel_state()`` (meta-init, FSDP2/TP/EP wrap + weight load,
+        # EP-/muon-aware optimizer, SP-aware data pipeline). Scope the whole
+        # build under the registered name (a no-op for the single-model case:
+        # the global already equals the registered ``"base"`` state).
+        with use_parallel_state("base"):
+            # build model
+            self._build_model()
+            # freeze module and print trainable parameters
+            self._freeze_model_module()
+            # build model assets (config, tokenizer, processor, chat_template)
+            self._build_model_assets()
+            # build dataset and dataloader
+            self._build_data_transform()
+            self._build_dataset()
+            self._build_collate_fn()
+            self._build_dataloader()
 
-        # Parallelize model
-        self._build_parallelized_model()
-        # Build optimizer and lr scheduler
-        self._build_optimizer()
-        self._build_lr_scheduler()
-        # Build training context
-        self._build_training_context()
-        # Initialize callbacks
-        self._init_callbacks()
+            # Parallelize model
+            self._build_parallelized_model()
+            # Build optimizer and lr scheduler
+            self._build_optimizer()
+            self._build_lr_scheduler()
+            # Build training context
+            self._build_training_context()
+            # Initialize callbacks
+            self._init_callbacks()
 
     def _setup(self):
         # log args
@@ -326,21 +360,9 @@ class BaseTrainer(Stateful, ABC):
 
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
-        # Initialize parallel state
-        init_parallel_state(
-            dp_size=self.args.train.accelerator.dp_size,
-            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
-            dp_shard_size=self.args.train.accelerator.dp_shard_size,
-            tp_size=self.args.train.accelerator.tp_size,
-            pp_size=self.args.train.accelerator.pp_size,
-            cp_size=self.args.train.accelerator.cp_size,
-            ulysses_size=self.args.train.accelerator.ulysses_size,
-            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
-            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
-            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
-            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
-            async_enabled=self.args.train.accelerator.enable_async,
-        )
+        # Register ParallelState before seed/determinism env vars. Mesh creation
+        # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
+        self.register_parallel_state("base")
 
         # Set random seed
         helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
@@ -359,6 +381,24 @@ class BaseTrainer(Stateful, ABC):
         # Gradient checkpointing debug
         set_checkpoint_debug_enabled(self.args.train.gradient_checkpointing.debug)
 
+    def register_parallel_state(self, name: str = "base"):
+        """Register this trainer's ParallelState under ``name`` in the registry."""
+        init_parallel_state(
+            dp_size=self.args.train.accelerator.dp_size,
+            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
+            dp_shard_size=self.args.train.accelerator.dp_shard_size,
+            tp_size=self.args.train.accelerator.tp_size,
+            pp_size=self.args.train.accelerator.pp_size,
+            cp_size=self.args.train.accelerator.cp_size,
+            ulysses_size=self.args.train.accelerator.ulysses_size,
+            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
+            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
+            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
+            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
+            async_enabled=self.args.train.accelerator.enable_async,
+            name=name,
+        )
+
     def _build_model(self):
         logger.info_rank0("Build model")
         self.model = build_foundation_model(
@@ -372,48 +412,52 @@ class BaseTrainer(Stateful, ABC):
         self.model_config = self.model.config
 
     def _setup_lora(self):
-        """Wrap ``self.model`` with PEFT LoRA if ``lora_config`` is configured.
+        """Wrap ``self.model`` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.
 
-        Handles two cases:
-        - Resume: ``lora_config["lora_adapter"]`` is set → use
-          ``PeftModel.from_pretrained`` so the PEFT config is read from disk.
-          Actual adapter *weights* are loaded later during parallelization.
-        - Scratch: only ``rank``, ``alpha``, ``lora_modules`` are set →
-          use ``get_peft_model``.
+        A single native path handles both dense ``nn.Linear`` LoRA
+        (``lora_modules`` / ``target_modules``) and MoE expert LoRA
+        (``target_parameters``, wrapper flavour selected by
+        ``share_expert_lora``). On resume (``lora_config['lora_adapter']`` set)
+        the wrappers are rebuilt from the on-disk ``adapter_config.json`` (MoE
+        mode lives in its ``veomni_lora`` block); otherwise a fresh adapter is
+        initialised from the yaml config. Either way the actual adapter
+        *weights* are streamed in later during parallelization
+        (``build_parallelize_model`` with ``adapter_path``).
+
+        Recognised ``lora_config`` keys (in addition to ``rank`` / ``alpha`` /
+        ``lora_adapter`` / ``is_trainable``): ``lora_modules`` (aka
+        ``target_modules``), ``target_parameters``, ``share_expert_lora``,
+        ``use_rslora``, ``lora_dropout``, ``bias``, ``exclude_modules``,
+        ``rank_pattern``, ``alpha_pattern``, ``modules_to_save`` — see
+        :class:`veomni.lora.VeOmniLoraConfig`.
+
+        Fused-MoE models (Qwen3-MoE family) may list the semantic expert module
+        names ``gate_proj`` / ``up_proj`` / ``down_proj`` in ``lora_modules``;
+        these are auto-mapped to the model's fused expert ``target_parameters``
+        (see :func:`veomni.lora.resolve_fused_moe_lora_targets`). Dense models
+        keep those names as ordinary ``nn.Linear`` LoRA targets.
         """
         lora_config = self.args.model.lora_config
         if not bool(lora_config):
             return
 
+        from ..lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
+
         lora_adapter_path = lora_config.get("lora_adapter", None)
         if lora_adapter_path is not None:
-            logger.info_rank0(f"Wrapping model with PeftModel from {lora_adapter_path}.")
-            from peft import PeftModel
-
-            # When init_device="meta" the base model params are meta tensors.
-            # PeftModel.from_pretrained tries to copy loaded weights into the meta
-            # adapter params — a no-op that PyTorch warns about.
-            # Actual adapter weights are loaded later via adapter_path during parallelization.
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="copying from a non-meta parameter")
-                self.model = PeftModel.from_pretrained(
-                    self.model,
-                    lora_adapter_path,
-                    is_trainable=lora_config.get("is_trainable", True),
-                )
-        else:
-            logger.info_rank0("Initialising LoRA adapter from scratch.")
-            from peft import LoraConfig, get_peft_model
-
-            peft_cfg = LoraConfig(
-                r=lora_config["rank"],
-                lora_alpha=lora_config["alpha"],
-                target_modules=lora_config["lora_modules"],
+            logger.info_rank0(f"Wrapping model with VeOmniLoraModel from {lora_adapter_path}.")
+            self.model = VeOmniLoraModel.from_pretrained(
+                self.model,
+                lora_adapter_path,
+                is_trainable=lora_config.get("is_trainable", True),
             )
-            logger.info_rank0(f"LoraConfig: {peft_cfg.to_dict()}.")
-            self.model = get_peft_model(self.model, peft_cfg)
-
-        self.model.print_trainable_parameters()
+        else:
+            # Rewrite semantic MoE module names onto fused expert parameters
+            # before building the config (no-op for dense models / plain configs).
+            resolved_config = resolve_fused_moe_lora_targets(self.model, lora_config)
+            cfg = VeOmniLoraConfig.from_yaml(resolved_config)
+            logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
+            self.model = VeOmniLoraModel(self.model, cfg)
 
     def _freeze_model_module(self):
         self._setup_lora()
@@ -498,12 +542,28 @@ class BaseTrainer(Stateful, ABC):
 
         if args.model.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
+        if args.train.chunk_mbs_config.enable:
+            kwargs["chunk_mbs_config"] = args.train.chunk_mbs_config
+
+        # A full non-LoRA resume already contains model weights. Skip the HF
+        # materialization pass to avoid a second peak (HF load then checkpoint
+        # overwrite) that can OOM large MoE jobs. LoRA resumes still need the HF base.
+        skip_hf_weight_load = should_skip_hf_weight_load(
+            args.train.checkpoint.load_path,
+            args.model.lora_config,
+        )
+        if skip_hf_weight_load:
+            logger.info_rank0(
+                f"Checkpoint resume enabled (load_path={args.train.checkpoint.load_path}); "
+                "skipping HF weight materialization before checkpoint restore."
+            )
 
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
+            should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
@@ -511,11 +571,16 @@ class BaseTrainer(Stateful, ABC):
                 set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),
             enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
+            early_stop=args.train.gradient_checkpointing.early_stop,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
+            ep_sharded_stream_load=args.train.ep_sharded_stream_load,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
+            compile_config=CompileConfig(
+                **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
+            ),
             **kwargs,
         )
         self.model.train()
@@ -569,64 +634,52 @@ class BaseTrainer(Stateful, ABC):
             self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
+        self.channel_loss_callback = ChannelLossCallback(self)
+        # Ordered dispatch list. Callbacks own their ParallelState explicitly:
+        # each captured it at construction (``Callback.parallel_state``), and
+        # ChannelLossComputer receives that same cached state. Shared objects
+        # (EnvironMeter, DCP checkpointer) are handed the state directly, so
+        # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
+        #
+        # ``channel_loss_callback`` is ordered after the meter (which resets
+        # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
+        # logs them), so its per-source metrics survive into the logged payload.
+        self._callbacks = [
+            self.environ_meter_callback,
+            self.tqdm_callback,
+            self.channel_loss_callback,
+            self.wandb_callback,
+            self.profile_callback,
+            self.checkpointer_callback,
+            self.hf_ckpt_callback,
+            self.evaluate_callback,
+            self.moe_monitor_callback,
+        ]
         self.state = TrainerState()
 
     def on_train_begin(self):
-        self.environ_meter_callback.on_train_begin(self.state)
-        self.tqdm_callback.on_train_begin(self.state)
-        self.wandb_callback.on_train_begin(self.state)
-        self.profile_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
-        self.hf_ckpt_callback.on_train_begin(self.state)
-        self.evaluate_callback.on_train_begin(self.state)
-        self.moe_monitor_callback.on_train_begin(self.state)
+        for callback in self._callbacks:
+            callback.on_train_begin(self.state)
 
     def on_train_end(self):
-        self.environ_meter_callback.on_train_end(self.state)
-        self.tqdm_callback.on_train_end(self.state)
-        self.wandb_callback.on_train_end(self.state)
-        self.profile_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
-        self.hf_ckpt_callback.on_train_end(self.state)
-        self.evaluate_callback.on_train_end(self.state)
-        self.moe_monitor_callback.on_train_end(self.state)
+        for callback in self._callbacks:
+            callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
-        self.environ_meter_callback.on_epoch_begin(self.state)
-        self.tqdm_callback.on_epoch_begin(self.state)
-        self.wandb_callback.on_epoch_begin(self.state)
-        self.profile_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
-        self.hf_ckpt_callback.on_epoch_begin(self.state)
-        self.evaluate_callback.on_epoch_begin(self.state)
+        for callback in self._callbacks:
+            callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
-        self.environ_meter_callback.on_epoch_end(self.state)
-        self.tqdm_callback.on_epoch_end(self.state)
-        self.wandb_callback.on_epoch_end(self.state)
-        self.profile_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
-        self.hf_ckpt_callback.on_epoch_end(self.state)
-        self.evaluate_callback.on_epoch_end(self.state)
+        for callback in self._callbacks:
+            callback.on_epoch_end(self.state)
 
-    def on_step_begin(self, micro_batches=None):
-        self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.tqdm_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.wandb_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.profile_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.evaluate_callback.on_step_begin(self.state, micro_batches=micro_batches)
+    def on_step_begin(self, micro_batches=None, **kwargs):
+        for callback in self._callbacks:
+            callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.tqdm_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.wandb_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.profile_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.evaluate_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        for callback in self._callbacks:
+            callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -644,6 +697,8 @@ class BaseTrainer(Stateful, ABC):
                 return {k: _to_device(vv) for k, vv in v.items()}
             return v
 
+        chunk_mbs_config = getattr(self.args.train, "chunk_mbs_config", None)
+        self._chunk_mbs_ranges = build_chunk_mbs_ranges(micro_batch, chunk_mbs_config)
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
@@ -663,21 +718,44 @@ class BaseTrainer(Stateful, ABC):
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        micro_batch = self.preforward(micro_batch)
+        channel_loss_callback = getattr(self, "channel_loss_callback", None)
+        micro_step_context = (
+            channel_loss_callback.micro_step_context(self.state, micro_batch)
+            if channel_loss_callback is not None
+            else nullcontext()
+        )
+        with micro_step_context:
+            micro_batch = self.preforward(micro_batch)
+            if channel_loss_callback is not None:
+                channel_loss_callback.strip_model_inputs(micro_batch)
 
-        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+            chunk_ranges = getattr(self, "_chunk_mbs_ranges", None)
+            channel_forward_context = (
+                channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
+            )
+            with (
+                use_parallel_state("base"),
+                chunk_mbs_context(chunk_ranges),
+                self.model_fwd_context,
+                set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
+                channel_forward_context,
+            ):
+                outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-        loss: torch.Tensor
-        loss_dict: Dict[str, torch.Tensor]
-        loss, loss_dict = self.postforward(outputs, micro_batch)
+            with use_parallel_state("base"):
+                loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        # Backward pass
-        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            loss.backward()
+            # Backward pass
+            with (
+                use_parallel_state("base"),
+                chunk_mbs_context(chunk_ranges),
+                self.model_bwd_context,
+                set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
+            ):
+                loss.backward()
 
-        del micro_batch
-        return loss, loss_dict
+            del micro_batch
+            return loss, loss_dict
 
     def model_reshard(self, micro_step: int, num_micro_steps: int):
         """Reshard model after backward pass."""
@@ -726,6 +804,7 @@ class BaseTrainer(Stateful, ABC):
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
+            mark_compile_step_begin(getattr(self.model, "_veomni_compile_uses_cuda_graphs", False))
             self.model_reshard(micro_step, num_micro_steps)
             self._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
@@ -738,8 +817,9 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
+        with use_parallel_state("base"):
+            grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.optimizer.step()
@@ -765,6 +845,7 @@ class BaseTrainer(Stateful, ABC):
 
         synchronize()
         dist.destroy_process_group()
+        clear_parallel_state()
 
     def train(self):
         args: VeOmniArguments = self.args

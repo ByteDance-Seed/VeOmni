@@ -1,4 +1,5 @@
 from veomni.arguments import parse_args
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.trainer.base_rl_trainer import BaseRLTrainer
 from veomni.trainer.text_trainer import TextTrainer, VeOmniArguments
 
@@ -12,26 +13,29 @@ class TextRLTrainer(TextTrainer):
         self.base = BaseRLTrainer.__new__(BaseRLTrainer)
         self.base.args = args
 
-        self.base._setup()
-        self.base._build_model()
-        self.base._freeze_model_module()
+        self.base._setup()  # registers ParallelState("base") before seed
+        # All build steps read the current ParallelState via ``get_parallel_state()``,
+        # so scope the whole build under this trainer's own state (see BaseTrainer).
+        with use_parallel_state("base"):
+            self.base._build_model()
+            self.base._freeze_model_module()
 
-        # rewrite build_model_assets to support chat_template for conversation dataset
-        self._build_model_assets()
+            # rewrite build_model_assets to support chat_template for conversation dataset
+            self._build_model_assets()
 
-        # rewrite build_data_transform to support conversation dataset
-        self._build_data_transform()
+            # rewrite build_data_transform to support conversation dataset
+            self._build_data_transform()
 
-        self.base._build_dataset()
-        self.base._build_collate_fn()
-        self.base._build_dataloader()
-        self.base._build_parallelized_model()
-        self.base._build_optimizer()
-        self.base._build_lr_scheduler()
-        self.base._build_training_context()
-        self.base._init_callbacks()
+            self.base._build_dataset()
+            self.base._build_collate_fn()
+            self.base._build_dataloader()
+            self.base._build_parallelized_model()
+            self.base._build_optimizer()
+            self.base._build_lr_scheduler()
+            self.base._build_training_context()
+            self.base._init_callbacks()
 
-        self.base._build_preforward_postforward()
+            self.base._build_preforward_postforward()
 
     def train(self):
         super().train()

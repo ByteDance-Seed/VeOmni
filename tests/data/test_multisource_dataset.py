@@ -98,7 +98,7 @@ class TrainerTest(BaseTrainer):
     multisource_weights = [0.5, 0.5]
 
     def _setup(self):
-        self.device = setup_test_distributed(self.args)
+        self.device, _ = setup_test_distributed(self.args)
 
         self.multisource_datasets = [DummyDataset(size=100, dataset_name=name) for name in self.multisource_names]
         self.multisource_paths = [dataset.save_path for dataset in self.multisource_datasets]

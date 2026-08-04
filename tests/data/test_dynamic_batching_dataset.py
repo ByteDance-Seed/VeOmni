@@ -633,7 +633,7 @@ class TrainerTest(BaseTrainer):
         super().__init__(args)
 
     def _setup(self):
-        self.device = setup_test_distributed(self.args)
+        self.device, _ = setup_test_distributed(self.args)
 
     def _freeze_model_module(self):
         pass

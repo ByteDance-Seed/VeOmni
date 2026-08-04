@@ -16,6 +16,7 @@
 from .arguments_types import (
     AcceleratorConfig,
     CheckpointConfig,
+    ChunkMBSConfig,
     DataArguments,
     DataloaderConfig,
     FSDPConfig,
@@ -27,6 +28,7 @@ from .arguments_types import (
     OpsImplementationConfig,
     OptimizerConfig,
     ProfileConfig,
+    TorchCompileConfig,
     TrainingArguments,
     VeOmniArguments,
     WandbConfig,

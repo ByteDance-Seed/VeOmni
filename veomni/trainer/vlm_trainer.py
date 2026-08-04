@@ -21,6 +21,7 @@ import torch
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.parallel_state import use_parallel_state
 from ..models import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
@@ -67,6 +68,7 @@ class VLMTrainingArguments(TrainingArguments):
 
 @dataclass
 class VLMMDataArguments(DataArguments):
+    supports_torch_compile = False
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
@@ -101,34 +103,40 @@ class VLMTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()
+        self.base._setup()  # registers ParallelState("base") before seed
 
-        # rewrite build model to support data balancing
-        self._build_model()
+        # All build steps read the current ParallelState via ``get_parallel_state()``
+        # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
+        # scope the whole build under this trainer's own state. No-op for the
+        # single-model case; keeps each module building over its own mesh once
+        # multiple modules build separately.
+        with use_parallel_state("base"):
+            # rewrite build model to support data balancing
+            self._build_model()
 
-        # rewrite freeze_model_module to support freeze multimodal encoder, etc.
-        self._freeze_model_module()
+            # rewrite freeze_model_module to support freeze multimodal encoder, etc.
+            self._freeze_model_module()
 
-        # rewrite build_model_assets to support chat_template and processor for multimodal datasets
-        self._build_model_assets()
+            # rewrite build_model_assets to support chat_template and processor for multimodal datasets
+            self._build_model_assets()
 
-        # rewrite build_data_transform to support multimodal transform
-        self._build_data_transform()
+            # rewrite build_data_transform to support multimodal transform
+            self._build_data_transform()
 
-        self.base._build_dataset()
+            self.base._build_dataset()
 
-        # rewrite build_collate_fn to support multimodal collate_fn
-        self._build_collate_fn()
+            # rewrite build_collate_fn to support multimodal collate_fn
+            self._build_collate_fn()
 
-        self.base._build_dataloader()
-        self.base._build_parallelized_model()
+            self.base._build_dataloader()
+            self.base._build_parallelized_model()
 
-        # rewrite build_optimizer to support different lr param groups
-        self._build_optimizer()
+            # rewrite build_optimizer to support different lr param groups
+            self._build_optimizer()
 
-        self.base._build_lr_scheduler()
-        self.base._build_training_context()
-        self.base._init_callbacks()
+            self.base._build_lr_scheduler()
+            self.base._build_training_context()
+            self.base._init_callbacks()
 
     def _build_model(self):
         args: VeOmniVLMArguments = self.base.args
@@ -234,12 +242,16 @@ class VLMTrainer:
                 else:
                     other_params.append(param)
 
-        param_groups = [
-            {"params": vit_params, "lr": args.train.vit_lr},
-            {"params": other_params, "lr": args.train.optimizer.lr},
-        ]
+        # Only create groups that have trainable params. An empty vit group
+        # (freeze_vit=true) has no optimizer state under DCP and would raise
+        # KeyError: 'betas' on the first step after resume. VLMRLTrainer
+        # inherits this method, so the guard covers both trainers.
+        param_groups = []
+        if vit_params:
+            param_groups.append({"params": vit_params, "lr": args.train.vit_lr})
+        if other_params:
+            param_groups.append({"params": other_params, "lr": args.train.optimizer.lr})
 
-        # Build optimizer
         self.base.optimizer = build_optimizer(
             self.base.model,
             lr=args.train.optimizer.lr,
@@ -303,8 +315,9 @@ class VLMTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
+        with use_parallel_state("base"):
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()

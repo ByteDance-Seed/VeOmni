@@ -15,7 +15,9 @@ This guide provides comprehensive information for using VeOmni framework with As
 
 ## Key Updates
 
-2026/5/11: VeOmni provides images of the version of Ascend Cann9.0.0.
+2026/7/14: VeOmni main uses PyTorch and torch_npu 2.10.0.
+
+2026/5/11: VeOmni provides images based on Ascend CANN 9.0.0.
 
 2025/12/23: VeOmni supports training on Ascend NPU.
 
@@ -34,12 +36,12 @@ Product Hardware Support List
 
 ## Installation
 
-VeOmni supports two installation methods for Ascend NPUs: `uv` (recommended for faster installation) and `pip`. Note that ARM architecture machines only support `pip` installation.
+VeOmni supports two installation methods for Ascend NPUs: `uv` (recommended for faster installation) and `pip`.
 
 ### Installation Options
 
 - **x86 Architecture**: Supports both `uv` and `pip` installation methods
-- **ARM Architecture**: Only supports `pip` installation method
+- **ARM Architecture**: Supports both `uv` and `pip` through the `npu_aarch64` extra
 
 ### Detailed Installation Guide
 
@@ -62,26 +64,29 @@ The following table shows the supported software versions for VeOmni when runnin
 | VeOmni Version | PyTorch | torch_npu | CANN Version | Python Version |
 |----------------|-------- | -----------|--------------|----------------|
 | 0.1.0 | 2.7.1                | 2.7.1             | 8.3rc2/9.0.0      | 3.11           |
-| main  | In-development    | In-development | In-development | In-development |
+| main  | 2.10.0 | 2.10.0 | 9.0.0 (CI) | 3.11/3.12 |
+
+Repository Docker definitions also cover CANN 8.3.RC2. Treat the PyTorch,
+torch_npu, CANN, and `triton-ascend` versions as one compatibility set and
+validate non-CI combinations on the target hardware.
 
 ## Supported Models
 
 VeOmni supports a wide range of models on Ascend NPUs, including large language models, multimodal models, and diffusion models. Below is a comprehensive list of supported models with their features:
 
-| Model                | Model Size       | Support | FSDP1 | FSDP2 | EP | SP | Note                                           |
-|----------------------|------------------|---------|-------|-------|----|----|------------------------------------------------|
-| [Qwen3](../examples/qwen3.md) | 8B              | ✅       |       | ✅     |    | ✅   |
-|                      | 30B               | ✅       |       | ✅     | ✅    | ✅   |
-| [Qwen3.5](../examples/qwen3.md) | 9B    |          |         | ✅    |      |✅    | supporting   |
-|                      | 35B-A3B              |         |       | ✅     |✅    |✅    |  supporting                                   |
-| [Qwen3-VL](../examples/qwen3_vl.md) | 8B               | ✅       |       | ✅     |    | ✅  |                               |
-|                      | 30B              | ✅       |       | ✅     | ✅  | ✅  |                                                |
-| [Wan2.1](../examples/wan2.1.md)    | 1.3B              | ✅       | ✅     |       |    | ✅  | prototype                              |
-| [Qwen3Omni](../examples/qwen3_omni_moe.md)    | 30B              | ✅       |   | ✅        |    | ✅  | prototype                              |
+| Model | Model Size | Support | FSDP2 | EP | SP | Note |
+|---|---|---|---|---|---|---|
+| [Qwen3](../examples/qwen3.md) | 8B | ✅ | ✅ | | ✅ | |
+| | 30B | ✅ | ✅ | ✅ | ✅ | |
+| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | Requires explicit GatedDeltaNet NPU kernels; generic NPU E2E coverage pending |
+| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Requires explicit GatedDeltaNet NPU kernels; generic NPU E2E coverage pending |
+| [Qwen3-VL](../examples/qwen3_vl.md) | 8B | ✅ | ✅ | | ✅ | |
+| | 30B | ✅ | ✅ | ✅ | ✅ | |
+| [Wan2.1](../examples/wan2.1.md) | 1.3B | ✅ | ✅ | | ✅ | Prototype |
+| [Qwen3-Omni](../examples/qwen3_omni_moe.md) | 30B | ✅ | ✅ | | ✅ | Prototype |
 
 **Legend:**
-- **FSDP1**: Fully Sharded Data Parallel version 1
-- **FSDP2**: Fully Sharded Data Parallel version 2 (recommended)
+- **FSDP2**: PyTorch composable Fully Sharded Data Parallel, the only FSDP backend supported by VeOmni
 - **EP**: Expert Parallel - for MoE models
 - **SP**: Sequence Parallel - enables longer sequence training
 

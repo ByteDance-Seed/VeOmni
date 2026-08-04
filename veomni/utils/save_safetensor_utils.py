@@ -26,7 +26,7 @@ from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
 from veomni.models.module_utils import _save_state_dict
 from veomni.utils import helper
-from veomni.utils.device import synchronize
+from veomni.utils.device import IS_NPU_AVAILABLE, synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
 
 
@@ -37,6 +37,7 @@ logger = helper.create_logger(__name__)
 def get_model_save_state(
     model: torch.nn.Module,
     fqn_to_index_mapping: Optional[Dict[str, int]],
+    parallel_state=None,
 ) -> Dict[str, torch.Tensor]:
     """Build a flat state dict suitable for HuggingFace safetensors saving.
 
@@ -48,7 +49,7 @@ def get_model_save_state(
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
-    save_state = ModelState(model).state_dict()
+    save_state = ModelState(model, parallel_state=parallel_state).state_dict()
 
     # Convert float32 tensors to bfloat16 on a copy of the state dict,
     # so the original model parameters remain unchanged.
@@ -85,6 +86,7 @@ def _save_hf_safetensor_distributed(
     save_path: str,
     fqn_to_index_mapping: Optional[Dict[str, int]],
     model_assets: Optional[Sequence],
+    parallel_state=None,
 ):
     """Distributed HuggingFace safetensors save using HuggingFaceStorageWriter (PyTorch >= 2.9).
 
@@ -99,7 +101,7 @@ def _save_hf_safetensor_distributed(
 
     apply_dcp_consolidation_patch()
 
-    save_state = get_model_save_state(model, fqn_to_index_mapping)
+    save_state = get_model_save_state(model, fqn_to_index_mapping, parallel_state=parallel_state)
 
     # Filter fqn_to_index_mapping to only include keys that exist in save_state.
     # This is necessary when training excludes certain modules (e.g., MTP) but the original
@@ -175,6 +177,7 @@ def save_hf_safetensor(
     # Distributed only
     model: Optional[torch.nn.Module] = None,
     fqn_to_index_mapping: Optional[Dict[str, int]] = None,
+    parallel_state=None,
 ):
     """Save model weights in HuggingFace safetensors format.
 
@@ -205,7 +208,14 @@ def save_hf_safetensor(
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-    use_distributed = is_torch_version_greater_than("2.9") and ckpt_manager == "dcp"
+    # Disable the distributed `HuggingFaceStorageWriter` path on NPU.  Under
+    # HSDP replicate ranks independently cast fp32->bf16 on-device and write
+    # per-rank safetensors files.  When the casts are not bit-exact (~1 ULP on
+    # Ascend 910B) the consolidation step bakes in whichever rank's data it
+    # reads last, causing an intermittent mismatch against the fp32 DCP
+    # checkpoint.  Route through the legacy rank-0 path until the underlying
+    # fp32->bf16 determinism issue is resolved in the NPU stack.
+    use_distributed = is_torch_version_greater_than("2.9") and ckpt_manager == "dcp" and not IS_NPU_AVAILABLE
 
     # Ensure all GPU operations are complete before reading tensor data for saving
     synchronize()
@@ -218,7 +228,9 @@ def save_hf_safetensor(
         from veomni.models.checkpoint_tensor_loading import resolve_fqn_to_index_mapping_for_save
 
         fqn_to_index_mapping = resolve_fqn_to_index_mapping_for_save(model, fqn_to_index_mapping)
-        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
+        _save_hf_safetensor_distributed(
+            model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
+        )
     else:
         # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
@@ -247,9 +259,22 @@ def save_lora_adapter_with_dcp(
     All ranks must call this function. It performs:
     1. Extract LoRA-only state from the live model.
     2. Save with ``dcp.save`` in parallel to a temporary DCP directory.
-    3. Consolidate on rank 0 into ``adapter_model.bin`` and ``adapter_config.json``.
+    3. Consolidate on rank 0 into ``adapter_model.safetensors`` and ``adapter_config.json``.
+
+    The consolidated adapter is written as **safetensors** (not a pickled ``.bin``)
+    so a per-rank ExtraParallel-slice reader (``load_model_weights_ep_sharded`` under
+    ``is_peft_model``) can stream only each rank's expert rows of an *independent*
+    MoE-LoRA adapter instead of every rank reading the whole gathered ``[E, ...]``
+    tensor. ``load_adapter_state_dict`` already prefers ``adapter_model.safetensors``.
     """
-    from peft import get_peft_model_state_dict
+    from veomni.lora import is_veomni_lora_model
+    from veomni.lora.state_dict import get_lora_state_dict
+
+    if not is_veomni_lora_model(model):
+        raise TypeError(
+            f"save_lora_adapter_with_dcp expects a VeOmniLoraModel, got {type(model).__name__}. "
+            "LoRA is served exclusively by the native veomni.lora stack."
+        )
 
     synchronize()
     if dist.is_initialized():
@@ -259,8 +284,44 @@ def save_lora_adapter_with_dcp(
     dcp_save_path = os.path.join(save_path, dcp_subdir)
     os.makedirs(dcp_save_path, exist_ok=True)
 
-    lora_state = get_peft_model_state_dict(model)
+    lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
     lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
+
+    # Restore the EP shard dim before DCP sees the LoRA tensors. After
+    # ``ParallelPlan.apply`` the EP-sharded params are stored as plain
+    # local tensors (then wrapped by FSDP only along the FSDP mesh), so
+    # ``get_peft_model_state_dict`` returns FSDP-only DTensors whose
+    # data is the EP-local chunk. DCP would happily save these as-is
+    # and ``ckpt_to_state_dict`` would consolidate only across FSDP,
+    # leaving each rank's per-expert LoRA at ``[E_local, ...]`` instead
+    # of the global ``[E, ...]``. Re-wrap every Shard()-placed tensor
+    # as a 2-D (FSDP+EP) DTensor so DCP gathers both dimensions.
+    # Mirrors what ``ModelState.get_state_dict_with_extra_parallel_dim_preprocess``
+    # does for the regular checkpoint path.
+    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
+    if fqn2spec_info is not None:
+        from torch.distributed._tensor import Shard as _ShardPlacement
+
+        from ..checkpoint.dcp_checkpointer import restore_extra_parallel_dim
+
+        # ``get_peft_model_state_dict`` strips the adapter name from keys
+        # (``...gate_proj.lora_A.default.weight`` -> ``...gate_proj.lora_A.weight``)
+        # while ``_fqn2spec_info`` is built from ``model.named_parameters()``
+        # and keeps the adapter name. Re-insert it (matching the save's
+        # ``adapter_name``) when looking up the spec, otherwise no LoRA
+        # tensor matches and the EP gather is silently skipped.
+        for name in list(lora_state):
+            spec = fqn2spec_info.get(name)
+            if spec is None and name.endswith(".weight"):
+                spec_key = f"{name[: -len('.weight')]}.{adapter_name}.weight"
+                spec = fqn2spec_info.get(spec_key)
+            if spec is not None and isinstance(spec.placement, _ShardPlacement) and spec.para_fsdp_mesh is not None:
+                lora_state[name] = restore_extra_parallel_dim(
+                    lora_state[name],
+                    spec.para_fsdp_mesh,
+                    spec.para_fsdp_mesh[f"{spec.para_name}_fsdp"],
+                )
+
     # ckpt_to_state_dict's DCP conversion path only recognizes keys starting with "model.".
     # Prefix LoRA keys temporarily for DCP save so consolidation can reuse existing conversion logic.
     dcp_lora_state = {k if k.startswith("model.") else f"model.{k}": v for k, v in lora_state.items()}
@@ -285,12 +346,16 @@ def save_lora_adapter_with_dcp(
             save_checkpoint_path=dcp_save_path,
             ckpt_manager="dcp",
         )
-        adapter_model_file = os.path.join(save_path, "adapter_model.bin")
-        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=False)
+        # safetensors needs contiguous, non-aliased tensors; consolidation returns
+        # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
+        consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
+        adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
+        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
 
-        if not hasattr(model, "peft_config") or adapter_name not in model.peft_config:
-            raise ValueError(f"Cannot find peft config for adapter '{adapter_name}' on model.")
-        model.peft_config[adapter_name].save_pretrained(save_path)
+        # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
+        # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
+        # separate sidecar).
+        model.get_lora_config().save_pretrained(save_path)
 
         shutil.rmtree(dcp_save_path, ignore_errors=True)
         logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")

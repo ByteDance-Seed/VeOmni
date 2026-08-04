@@ -41,7 +41,7 @@ RUN echo "Setting timezone to CST (China Standard Time)..." && \
 
 # Install apt packages.
 RUN apt-get update -y \
-    && apt-get install -y sudo ffmpeg curl wget vim \
+    && apt-get install -y sudo ffmpeg curl wget vim openssh-server \
     && apt-get clean
 
 # Add tiger user, remove default user

@@ -66,7 +66,7 @@ def pad_tensor(x: Tensor, dim: int, padding_size: int, padding_value: int = 0) -
 def unpad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
     slc = [slice(None)] * len(x.shape)
     slc[dim] = slice(0, -padding_size)
-    return x[slc]
+    return x[tuple(slc)]
 
 
 def remove_last_rank_padding(x: Tensor, dim: int, unpad_dim_size: int, group: ProcessGroup = None) -> Tensor:
@@ -81,7 +81,7 @@ def remove_last_rank_padding(x: Tensor, dim: int, unpad_dim_size: int, group: Pr
     assert (pad + x.shape[dim]) % sp_world == 0
     slc = [slice(None)] * len(x.shape)
     slc[dim] = slice(0, -pad)
-    return x[slc]
+    return x[tuple(slc)]
 
 
 def has_overlap(x1, x2, y1, y2) -> Tuple[bool, int]:

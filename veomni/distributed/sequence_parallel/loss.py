@@ -18,23 +18,31 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from .comm import (
-    get_unified_sequence_parallel_group,
-    get_unified_sequence_parallel_world_size,
-)
+from .comm import get_unified_sequence_parallel_group
 
 
 class ReduceLoss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx: torch.autograd.Function, loss: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        ctx: torch.autograd.Function,
+        loss: torch.Tensor,
+        num_valid_tokens: torch.Tensor,
+        group=None,
+    ) -> torch.Tensor:
+        # ``group`` defaults to the comm-global unified SP group (single-model
+        # path). SeedOmni V2 passes each module's OWN SP group so heterogeneous
+        # per-module SP reduces over the right ranks (the comm-global unified
+        # group is just the last-built module's and would be wrong here).
+        if group is None:
+            group = get_unified_sequence_parallel_group()
         loss = torch.where(num_valid_tokens > 0, loss, torch.zeros_like(loss))
 
         local_num_tokens = num_valid_tokens.detach().clone()
         loss *= num_valid_tokens
-        group = get_unified_sequence_parallel_group()
         dist.all_reduce(loss, group=group)
         dist.all_reduce(num_valid_tokens, group=group)
         ctx.save_for_backward(local_num_tokens, num_valid_tokens)
+        ctx.sp_world_size = dist.get_world_size(group) if group else 1
 
         # FIX: When ALL ranks in the SP group have zero valid tokens,
         # global num_valid_tokens = 0 after all_reduce, causing 0/0 = NaN.
@@ -46,19 +54,14 @@ class ReduceLoss(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: torch.autograd.Function, grad_output: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         local_num_tokens, global_num_tokens = ctx.saved_tensors
 
         # FIX: Mirror the forward guard — zero grad when global tokens = 0,
         # preventing NaN grad_output from corrupting downstream parameters.
-        grad_output = (
-            get_unified_sequence_parallel_world_size()
-            * local_num_tokens
-            * grad_output
-            / global_num_tokens.clamp(min=1)
-        )
-        return grad_output, None
+        grad_output = ctx.sp_world_size * local_num_tokens * grad_output / global_num_tokens.clamp(min=1)
+        return grad_output, None, None
 
 
-def reduce_sequence_parallel_loss(loss: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
-    return ReduceLoss.apply(loss, num_valid_tokens)
+def reduce_sequence_parallel_loss(loss: torch.Tensor, num_valid_tokens: torch.Tensor, group=None) -> torch.Tensor:
+    return ReduceLoss.apply(loss, num_valid_tokens, group)

@@ -12,7 +12,7 @@ This document provides in-depth implementation details for each patch applied in
 > are unchanged; what has changed is *where* the patches are declared
 > (declarative patchgen config emitted into `generated/`) rather than applied
 > at import time. See
-> [docs/transformers_v5/patchgen.md](../../transformers_v5/patchgen.md) and
+> [the patchgen design guide](../../design/patchgen.md) and
 > the `veomni-migrate-transformers-v5` agent skill for the current flow.
 
 ---

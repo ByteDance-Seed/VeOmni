@@ -77,6 +77,9 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
     from transformers import PretrainedConfig
 
+    from ..distributed.parallel_state import ParallelState
+    from ..lora import VeOmniLoraConfig
+
 
 logger = logging.get_logger(__name__)
 
@@ -86,8 +89,13 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     if "cu_seq_lens_q" in micro_batch:
         # packed micro batch
-        seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        tail_padding_length = micro_batch.get("tail_padding_length")
+        seqlens = valid_seqlens_from_cu_seqlens(
+            micro_batch["cu_seq_lens_q"],
+            tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
+        ).tolist()
         return seqlens
+
     elif "attention_mask" in micro_batch:
         # unpacked sample
         attention_mask = micro_batch["attention_mask"]
@@ -170,12 +178,15 @@ class EnvironMeter:
         data_path: str = "",
         empty_cache_steps: int = 500,
         gc_steps: int = 0,
+        parallel_state: Optional["ParallelState"] = None,
     ) -> None:
         self.config = config
         self.global_batch_size = global_batch_size
         self.enable_multisource = enable_multisource
         self.empty_cache_steps = empty_cache_steps
         self.gc_steps = gc_steps
+
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.world_size = dist.get_world_size()
         self.consume_tokens = 0
         self.consume_chunks = 0
@@ -189,13 +200,19 @@ class EnvironMeter:
                     "`dataloader` and `data_path` is required for `EnvironMeter` with multi-source dataloader."
                 )
 
-            self.multisource_tracker = MultiSourceInfoTracker(dataloader=dataloader, data_path=data_path)
+            self.multisource_tracker = MultiSourceInfoTracker(
+                dataloader=dataloader, data_path=data_path, parallel_state=self.parallel_state
+            )
 
         # for internal use
         if VALID_CONFIG_TYPE is not None and isinstance(config, VALID_CONFIG_TYPE):
             self.estimate_flops = FlopsCounter(config).estimate_flops
+            self.supports_lora_flops = False
         else:
-            self.estimate_flops = VeomniFlopsCounter(config).estimate_flops
+            flops_counter = VeomniFlopsCounter(config)
+            self.estimate_flops = flops_counter.estimate_flops
+            self.supports_lora_flops = True
+        self._warned_unsupported_lora_flops = False
 
         if self.gc_steps > 0:
             gc.disable()
@@ -229,17 +246,36 @@ class EnvironMeter:
         else:  # dit diffusers model
             self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
-    def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
-        if len(self.images_seqlens) > 0:
-            flops_achieved, flops_promised = self.estimate_flops(
-                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens
-            )
-        else:
-            flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
+    def step(
+        self,
+        delta_time: float,
+        global_step: int,
+        lora_config: Optional["VeOmniLoraConfig"] = None,
+    ) -> Dict[str, Any]:
+        flops_kwargs = {}
+        if self.images_seqlens:
+            flops_kwargs["images_seqlens"] = self.images_seqlens
+        lora_flops_unavailable = lora_config is not None and not self.supports_lora_flops
+        if lora_config is not None:
+            if self.supports_lora_flops:
+                flops_kwargs["lora_config"] = lora_config
+            elif not self._warned_unsupported_lora_flops:
+                logger.warning_rank0(
+                    "LoRA FLOPs are unavailable because the configured FLOP counter does not accept "
+                    "VeOmniLoraConfig. Returning zero FLOPs so training can continue."
+                )
+                self._warned_unsupported_lora_flops = True
+        flops_achieved, flops_promised = self.estimate_flops(
+            self.batch_seqlens,
+            delta_time,
+            **flops_kwargs,
+        )
+        if lora_flops_unavailable:
+            flops_achieved = 0
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
-            group=get_parallel_state().dp_group,
+            group=self.parallel_state.dp_group,
         )
         flops_promised = flops_promised * self.world_size
         mfu = flops_achieved / flops_promised if flops_promised else 0
@@ -315,8 +351,14 @@ class MultiSourceInfoTracker:
     Tracks the statistics about the weighted multi-source dataset.
     """
 
-    def __init__(self, dataloader: Optional["DataLoader"], data_path: str) -> None:
+    def __init__(
+        self,
+        dataloader: Optional["DataLoader"],
+        data_path: str,
+        parallel_state: Optional["ParallelState"] = None,
+    ) -> None:
         self.dataloader = dataloader
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.accumulate_counter = dict()
         self.batch_idx = 0
         self.multisource_config = parse_multisource_config(data_path)
@@ -338,8 +380,8 @@ class MultiSourceInfoTracker:
         for ds_idx, seq_len in zip(batch_ds_idx, batch_seqlens):
             counter[ds_idx].increment(seq_len, 1)
 
-        counter_list: List[Dict[int, MultiSourceCounterItem]] = [None for _ in range(get_parallel_state().dp_size)]
-        dist.all_gather_object(counter_list, counter, group=get_parallel_state().dp_group)
+        counter_list: List[Dict[int, MultiSourceCounterItem]] = [None for _ in range(self.parallel_state.dp_size)]
+        dist.all_gather_object(counter_list, counter, group=self.parallel_state.dp_group)
 
         global_counter = defaultdict(MultiSourceCounterItem)
         for counter in counter_list:
@@ -355,7 +397,7 @@ class MultiSourceInfoTracker:
         global_comsumed_samples = sum([item.num_samples for item in self.accumulate_counter.values()])
 
         if hasattr(self.dataloader, "update_consumed_tokens") and (
-            not get_parallel_state().tp_enabled or get_parallel_state().tp_rank == 0
+            not self.parallel_state.tp_enabled or self.parallel_state.tp_rank == 0
         ):  # update at every dp rank
             if self.boundary_type == "token":
                 self.dataloader.update_consumed_tokens((self.batch_idx, global_consumed_tokens))

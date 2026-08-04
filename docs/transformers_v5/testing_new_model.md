@@ -50,10 +50,11 @@ pytest.param(
 ),
 ```
 
-The `id=` string is used as a key for:
-- Test node naming (`pytest -k <id>`)
-- Looking up custom weight sync functions in `weight_sync_adapters.py` (only
-  needed if the model has non-standard state dict keys)
+The `id=` string controls test node naming (`pytest -k <id>`). Patchgen model
+tests load matching in-memory state dicts directly. If an on-disk HuggingFace
+checkpoint needs key or tensor-layout conversion, implement a
+`CheckpointTensorConverter` and cover it in
+`tests/models/test_checkpoint_tensor_converter.py`.
 
 ### Filtering unsupported modes
 

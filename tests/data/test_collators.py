@@ -99,8 +99,8 @@ def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_sampl
     exp_attn = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.long)
     exp_pos = torch.tensor([[0, 1, 2, 0, 1, 0, 0, 0]], dtype=torch.long)
     exp_labels = torch.tensor([[2, 3, 4, IGNORE_INDEX, 2, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]], dtype=torch.long)
-    exp_cu_seq_lens = torch.tensor([0, 3, 5, 6, 7, 8], dtype=torch.int32)
-    exp_linear_attn_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
+    # pad_to_length tail is coalesced for both FA and linear-attn cu-seqlens.
+    exp_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
     exp_max_length = 3
 
     assert torch.equal(out["input_ids"], exp_input_ids)
@@ -109,7 +109,8 @@ def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_sampl
     assert torch.equal(out["labels"], exp_labels)
     assert torch.equal(out["cu_seq_lens_q"], exp_cu_seq_lens)
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
-    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_linear_attn_cu_seq_lens)
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_cu_seq_lens)
+    assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
 
@@ -138,8 +139,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     exp_attn = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.long)
     exp_pos = torch.tensor([[0, 1, 2, 0]], dtype=torch.long)
     exp_labels = torch.tensor([[3, 4, IGNORE_INDEX, 2]], dtype=torch.long)
-    exp_cu_seq_lens = torch.tensor([0, 3, 5, 6, 7, 8], dtype=torch.int32)
-    exp_linear_attn_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
+    exp_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
     exp_max_length = 3
 
     assert torch.equal(out["input_ids"], exp_input_ids)
@@ -148,7 +148,8 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert torch.equal(out["labels"], exp_labels)
     assert torch.equal(out["cu_seq_lens_q"], exp_cu_seq_lens)
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
-    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_linear_attn_cu_seq_lens)
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_cu_seq_lens)
+    assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
 
@@ -161,8 +162,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     exp_attn = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.long)
     exp_pos = torch.tensor([[1, 0, 0, 0]], dtype=torch.long)
     exp_labels = torch.tensor([[IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]], dtype=torch.long)
-    exp_cu_seq_lens = torch.tensor([0, 3, 5, 6, 7, 8], dtype=torch.int32)
-    exp_linear_attn_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
+    exp_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
     exp_max_length = 3
 
     assert torch.equal(out["input_ids"], exp_input_ids)
@@ -171,7 +171,8 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert torch.equal(out["labels"], exp_labels)
     assert torch.equal(out["cu_seq_lens_q"], exp_cu_seq_lens)
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
-    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_linear_attn_cu_seq_lens)
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_cu_seq_lens)
+    assert int(out["tail_padding_length"]) == 3
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
 

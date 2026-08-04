@@ -58,6 +58,17 @@ KERNEL_REGISTRY.register(
     )
 )
 
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_kernel",
+        op_name="rms_norm",
+        variant="unweighted",
+        factory=_liger_rms_norm_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="LigerKernel fused unweighted RMSNorm",
+    )
+)
+
 
 # ── Liger RMSNorm (Qwen3.5 variant: offset=1.0, zeros init) ──────────────────
 

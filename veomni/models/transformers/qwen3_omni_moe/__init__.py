@@ -11,7 +11,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....lora.target_mapping import convert_fused_moe_lora_targets
+from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+
+
+def _convert_qwen3_omni_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "thinker.model.layers.*.mlp.experts.gate_up_proj",
+        "thinker.model.layers.*.mlp.experts.down_proj",
+    )
+
+
+def _convert_qwen3_omni_moe_thinker_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "model.layers.*.mlp.experts.gate_up_proj",
+        "model.layers.*.mlp.experts.down_proj",
+    )
+
+
+def _convert_qwen3_omni_moe_text_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "layers.*.mlp.experts.gate_up_proj",
+        "layers.*.mlp.experts.down_proj",
+    )
 
 
 @MODEL_CONFIG_REGISTRY.register("qwen3_omni_moe")
@@ -41,11 +70,19 @@ def register_qwen3_omni_moe_modeling(architecture: str):
         convert_qwen3_omni_moe_fqn_to_index_mapping,
         create_qwen3_omni_moe_checkpoint_tensor_converter,
     )
-    from .generated.patched_modeling_qwen3_omni_moe_gpu import (
-        Qwen3OmniMoeForConditionalGeneration,
-        Qwen3OmniMoeThinkerForConditionalGeneration,
-        Qwen3OmniMoeThinkerTextModel,
-    )
+
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_omni_moe_npu import (
+            Qwen3OmniMoeForConditionalGeneration,
+            Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeThinkerTextModel,
+        )
+    else:
+        from .generated.patched_modeling_qwen3_omni_moe_gpu import (
+            Qwen3OmniMoeForConditionalGeneration,
+            Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeThinkerTextModel,
+        )
 
     # The thinker text submodel is also loadable standalone (e.g. when the
     # registry dispatches on architecture == "...ThinkerTextModel"), so the
@@ -57,6 +94,15 @@ def register_qwen3_omni_moe_modeling(architecture: str):
     ):
         model_cls._create_checkpoint_tensor_converter = staticmethod(create_qwen3_omni_moe_checkpoint_tensor_converter)
         model_cls._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_omni_moe_fqn_to_index_mapping)
+    Qwen3OmniMoeForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_omni_moe_wrapped_lora_targets_to_parameters
+    )
+    Qwen3OmniMoeThinkerForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_omni_moe_thinker_lora_targets_to_parameters
+    )
+    Qwen3OmniMoeThinkerTextModel._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_omni_moe_text_lora_targets_to_parameters
+    )
 
     if "ThinkerTextModel" in architecture:
         return Qwen3OmniMoeThinkerTextModel

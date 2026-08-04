@@ -119,6 +119,9 @@ bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
 ### 3.4 Online Workflow
 
 Pass raw Parquet videos directly during training. The VAE and text encoder run each step.
+The default config already sets `data.mm_configs.fps: 24` and
+`data.mm_configs.max_frames: 81`. Because `mm_configs` is a dictionary, change these values
+in the YAML file rather than using dotted CLI overrides for its entries.
 
 ```shell
 NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
@@ -126,8 +129,6 @@ NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lo
     --model.condition_model_path ./Wan2.1-T2V-1.3B-Diffusers \
     --data.train_path            ./Tom-and-Jerry-VideoGeneration-Dataset-parquet \
     --data.source_name           Tom-and-Jerry-VideoGeneration-Dataset \
-    --data.mm_configs.fps        24 \
-    --data.mm_configs.max_frames 81 \
     --train.training_task        online_training \
     --train.global_batch_size    4 \
     --train.micro_batch_size     1 \
@@ -141,7 +142,7 @@ NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lo
 
 ## 4. Training Configuration
 
-The default LoRA config (`configs/dit_new/wan_lora.yaml`) targets the attention and feed-forward projections:
+The default LoRA config (`configs/dit/wan2.1_I2V_1.3B_lora.yaml`) targets the attention and feed-forward projections:
 
 ```yaml
 model:

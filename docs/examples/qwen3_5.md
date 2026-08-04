@@ -94,7 +94,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.max_steps 20 \
-    --train.checkpoint.output_dir /mnt/local/localcache00
+    --train.checkpoint.output_dir ./exp/qwen3_5_9b_sft
 ```
 
 Qwen3.5-35B-A3B. 8X80GB GPU will likely OOM due to the model size. Use 8X192GB GPU or more GPUs.
@@ -107,8 +107,31 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.global_batch_size 16 \
-    --train.checkpoint.output_dir /mnt/local/localcache00
+    --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
+
+## ChunkMBS
+
+Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,
+then runs each `Qwen3_5DecoderLayer` chunk sequentially while keeping the outer FSDP2 layer invocation intact. The
+same token ranges are used by both full-attention and GatedDeltaNet layers, so every ChunkMBS cut must be present in
+both cumulative-length tensors; their internal boundaries may differ.
+
+The example config exposes the feature but keeps it disabled by default:
+
+```yaml
+train:
+  chunk_mbs_config:
+    enable: true
+    chunk_mbs: 2
+```
+
+`chunk_mbs` is the number of packed samples per layer chunk, not a token count or `train.micro_batch_size`.
+ChunkMBS may be combined with non-reentrant gradient checkpointing. It currently does not support Qwen3.5-MoE,
+Ulysses SP, TP/PP, `torch.compile`, `pad_to_length`, DPO, or RL training. See
+[ChunkMBSConfig](../usage/arguments.md#chunkmbsconfig) for the complete support boundary.
+The model-level automated tests cover decoder routing, metadata slicing, outputs, and gradients on CPU. Real
+FlashAttention, FLA, and NPU fused-kernel execution requires separate accelerator validation.
 
 ## Ulysses Sequence Parallelism
 
@@ -116,17 +139,19 @@ Qwen3.5 supports Ulysses sequence parallelism for both its softmax attention lay
 linear attention (GatedDeltaNet) layers. This enables training with longer sequences by
 distributing the sequence across multiple GPUs.
 
-To enable Ulysses SP, set `ulysses_parallel_size` in your config. The total GPU count must
-equal `data_parallel_size * ulysses_parallel_size`.
+To enable Ulysses SP, set `train.accelerator.ulysses_size`. VeOmni derives the effective
+data-parallel size from the world size and the other parallel dimensions; set
+`train.accelerator.dp_shard_size` only when you need to pin the FSDP shard degree explicitly.
+For the example below, the total GPU count is `dp_shard_size * ulysses_size = 4 * 2 = 8`.
 
 ```shell
 # Example: 8 GPUs, dp=4, sp=2
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.data_parallel_size 4 \
-    --train.ulysses_parallel_size 2 \
-    --train.attn_implementation flash_attention_3
+    --train.accelerator.dp_shard_size 4 \
+    --train.accelerator.ulysses_size 2 \
+    --model.ops_implementation.attn_implementation flash_attention_3
 ```
 
 ### Requirements
@@ -136,17 +161,42 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 - [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) installed
   (for GatedDeltaNet triton kernels).
 - `num_k_heads` and `num_v_heads` (linear attention head counts) must be divisible by
-  `ulysses_parallel_size`.
+  `ulysses_size`.
 
 ### Selecting linear-attention kernels
 
 GatedDeltaNet has three OpSlot-driven kernels: `rms_norm_gated`, `causal_conv1d`, and
-`chunk_gated_delta_rule`. Each defaults to `auto`, which resolves to:
+`chunk_gated_delta_rule`. All three default to `fla`. Recommended value per platform:
 
 - **GPU** — `fla` (the FLA Triton kernels shipped under the `gpu` extra; required for
   varlen training).
-- **NPU** — `eager` (no FLA / FlashQLA backend is registered for Ascend today; varlen
-  training raises at runtime).
+- **NPU** — `npu` (vendored MindSpeed-MM Triton kernels for all three ops; needs the
+  `triton-ascend` package — see below). Not auto-selected — the default `fla`
+  requires a GPU and raises on NPU, so set the fields explicitly:
+
+```yaml
+model:
+  ops_implementation:
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu
+```
+
+Install `triton-ascend` on the NPU host. VeOmni main pins PyTorch and
+`torch_npu` 2.10.0; the corresponding CANN 9.0.0 stack uses v3.2.1:
+
+```bash
+pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+```
+
+See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
+for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
+and `triton-ascend` on a mutually compatible release set.
+
+> **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
+> (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`
+> rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
+> from upstream MindSpeed-MM.
 
 To switch `chunk_gated_delta_rule` to QwenLM's [`flash-qla`](https://github.com/QwenLM/FlashQLA)
 kernel (already shipped under the `gpu` extra), set the field explicitly:
@@ -156,6 +206,58 @@ model:
   ops_implementation:
     chunk_gated_delta_rule_implementation: flash_qla
 ```
+
+#### `npu_ascendc` — AscendC fused backend (NPU, `chunk_gated_delta_rule` only)
+
+`npu_ascendc` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
+compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
+package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
+`_ascend/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
+Set only `chunk_gated_delta_rule` to `npu_ascendc`; keep `rms_norm_gated` / `causal_conv1d` on `npu`:
+
+```yaml
+model:
+  ops_implementation:
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu_ascendc
+```
+
+A ready-to-run MoE-VL training config wired for this backend (plus `fused_npu` MoE and
+Ulysses SP) is provided at
+[`configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml`](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml).
+
+`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It supports Ascend
+910B (A2) / 910_93 (A3), both non-arch35 chips where the `solve_tril` step runs the vendored
+Triton kernel (the arch35 native path is gated behind `is_arch35()`). arch35 (`Ascend910_95` /
+`Ascend950`) is not supported end-to-end: the vendored `causal_conv1d` raises there (see above).
+
+The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
+bundle `fla_npu`:
+
+- A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
+- A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
+
+To build on a bare host instead, install from the
+[`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources:
+
+```bash
+git clone https://github.com/flashserve/flash-linear-attention-npu
+cd flash-linear-attention-npu
+git checkout c2e3d83f
+
+source /usr/local/Ascend/cann/set_env.sh          # source your actual CANN path
+
+# --soc must match the chip: {ascend910b, ascend910_93, ascend950}
+bash build.sh --soc=ascend910b --pkg --vendor_name=fla_npu
+bash build_out/fla-npu_*.run
+cd torch_custom/fla_npu/ && bash build.sh
+
+pip list | grep fla_npu   # verify it is installed
+```
+
+If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error at
+`OpSlot.bind()` time (pointing back to the install step or to `npu` / `eager`).
 
 ### How It Works
 

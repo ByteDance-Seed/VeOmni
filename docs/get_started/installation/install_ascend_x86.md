@@ -2,13 +2,15 @@
 
 ## Required Environment
 
-CANN == 8.3.RC1
+Use a CANN installation compatible with the selected hardware and
+`torch-npu==2.10.0`. VeOmni provides repository images for CANN 8.3.RC2 and
+9.0.0; see the [NPU version compatibility table](../../hardware_support/get_started_npu.md#version-compatibility).
 
 ## Prepare CANN
 
 Choose one of the following methods to use CANN:
 
-1. Install CANN according to the [official documentation](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_quick.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
+1. Install CANN according to the [official documentation](https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_quick.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
 2. Download and use [the CANN image](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)
 
@@ -27,7 +29,7 @@ uv sync --locked --extra npu
 source .venv/bin/activate
 ```
 
-`npu` is a single full superset for x86 Ascend: torch 2.7.1+cpu / torch-npu,
+`npu` is a single full superset for x86 Ascend: torch 2.10.0+cpu / torch-npu 2.10.0,
 diffusion / audio / video / LoRA deps, and `megatron-energon`. CUDA-only
 kernels (FA3 / FA4 / FlashQLA) are intentionally absent. See
 [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
@@ -52,7 +54,7 @@ pip install transformers==5.9.0
 pip install datasets==2.21.0
 ```
 
-### Set up CANN environment before installing torchcodec
+### Set up the CANN environment
 Make sure CANN_path is set to your CANN installation directory, e.g., export CANN_path=/usr/local/Ascend
 ```bash
 source $CANN_path/ascend-toolkit/set_env.sh
@@ -72,32 +74,6 @@ To enable the NPU chunked cross-entropy loss, set
 > install time; expect eager-level numbers for sequence-classification
 > losses during profiling.
 
-### Video/Audio Processing Dependencies (Optional)
-
-For video/audio processing capabilities, you need to install torchcodec separately. Follow these steps:
-
-```bash
-# Clone the torchcodec repository
-cd ..
-git clone https://github.com/meta-pytorch/torchcodec.git
-cd torchcodec
-
-# Checkout to a specific version for compatibility
-git checkout v0.5.0
-
-# Copy the installation script to the torchcodec source directory
-cp ../VeOmni/docs/get_started/installation/install_torchcodec_Ascend.sh .
-
-# Note: Ensure Python is installed as a shared library (required for compiling C++ extensions)
-# The installation script will automatically verify this requirement
-
-# Run the installation script (replace with your actual CANN path)
-bash install_torchcodec_Ascend.sh $CANN_path/ascend-toolkit/set_env.sh
-
-# Verify installation
-pip show torchcodec
-
-# Test torchcodec import
-python -c "from torchcodec.decoders import VideoDecoder; print('Success')"
-# If the terminal outputs'Success', it indicates that the torchcodec installation was successful. If an error message is output, it indicates that the installation was not successful
-```
+The x86 `npu` extra already installs the supported `torchcodec==0.10.0`
+wheel. No separate source build is required; install FFmpeg as shown above
+when video or audio decoding is needed.

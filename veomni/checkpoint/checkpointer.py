@@ -61,6 +61,8 @@ class CheckpointerBase(ABC):
         save_async: Optional[bool],
         global_steps: Optional[int],
         trainable_only: bool = False,
+        save_to_lowest_rank: bool = False,
+        parallel_state=None,
     ):
         return
 
@@ -70,6 +72,7 @@ class CheckpointerBase(ABC):
         path: str,
         state: Dict[str, Any],
         trainable_only: bool = False,
+        parallel_state=None,
     ):
         return
 

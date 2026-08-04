@@ -1,19 +1,25 @@
-"""Unit tests for DistributedCheckpointer internals.
+"""Unit tests for distributed checkpoint and resume behavior.
 
 Covers: OptimizerState (no placeholder synthesis), key normalization,
-extra-state persistence, allow_partial_load planner, and trainer
-step-counting correctness.  Tests marked ``xfail`` document known
+extra-state persistence, allow_partial_load planner, skip-HF resume, and
+trainer step-counting correctness. Tests marked ``xfail`` document known
 in-tree bugs — they become regression guards once the fix lands.
 """
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 
+from veomni.distributed import torch_parallelize
+from veomni.distributed.torch_parallelize import build_parallelize_model, parallelize_model_fsdp2
+from veomni.models.module_utils import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
+from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +76,7 @@ class TestOptimizerStateNoFill:
 
 
 class TestAllowPartialLoad:
-    """DistributedCheckpointer.load() must pass allow_partial_load=True
-    to DCP so checkpoints saved without placeholder state can be loaded."""
+    """DCP load may be partial for optimizer state, but not full model state."""
 
     def test_load_uses_allow_partial_load_planner(self):
         from veomni.checkpoint.dcp_checkpointer import DefaultLoadPlanner
@@ -102,6 +107,158 @@ class TestAllowPartialLoad:
         planner = mock_dcp.load.call_args.kwargs.get("planner")
         assert planner is not None, "load must pass a planner"
         assert planner.allow_partial_load is True, "load must use DefaultLoadPlanner(allow_partial_load=True)"
+        assert planner.strict_model is True, "full-model load must reject missing model keys"
+
+    @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
+    def test_full_model_load_rejects_missing_checkpoint_key(self, mock_gps, tmp_path):
+        from torch.distributed.checkpoint import CheckpointException
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        torch.distributed.checkpoint.save({"model": {"weight": torch.full((2, 2), 7.0)}}, checkpoint_id=tmp_path)
+
+        model = nn.Linear(2, 2)
+        with pytest.raises(CheckpointException, match=r"model\.bias"):
+            DistributedCheckpointer.load(path=str(tmp_path), state={"model": model})
+
+    @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
+    def test_trainable_only_model_load_allows_missing_frozen_key(self, mock_gps, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        torch.distributed.checkpoint.save({"model": {"weight": torch.full((2, 2), 7.0)}}, checkpoint_id=tmp_path)
+
+        model = nn.Linear(2, 2)
+        with torch.no_grad():
+            model.bias.fill_(11.0)
+        DistributedCheckpointer.load(path=str(tmp_path), state={"model": model}, trainable_only=True)
+
+        torch.testing.assert_close(model.weight, torch.full_like(model.weight, 7.0))
+        torch.testing.assert_close(model.bias, torch.full_like(model.bias, 11.0))
+
+
+# ---------------------------------------------------------------------------
+# Full DCP resume: skip redundant HF weight materialization
+# ---------------------------------------------------------------------------
+
+
+class TestSkipHfWeightLoadOnResume:
+    def test_skip_hf_weight_load_when_full_non_lora_resume(self):
+        assert should_skip_hf_weight_load("/tmp/ckpt/global_step_200", {}) is True
+        assert should_skip_hf_weight_load("/tmp/ckpt/global_step_200", None) is True
+
+    def test_keep_hf_weight_load_for_fresh_or_lora(self):
+        assert should_skip_hf_weight_load(None, {}) is False
+        assert should_skip_hf_weight_load("/tmp/ckpt/global_step_200", {"r": 8}) is False
+
+    def test_parallelize_apis_expose_should_skip_hf_weight_load(self):
+        assert "should_skip_hf_weight_load" in inspect.signature(build_parallelize_model).parameters
+        assert "should_skip_hf_weight_load" in inspect.signature(parallelize_model_fsdp2).parameters
+
+    def test_build_parallelize_model_forwards_should_skip_hf_weight_load(self, monkeypatch):
+        model = MagicMock()
+        parallelized_model = MagicMock()
+        parallelize_fsdp2 = MagicMock(return_value=parallelized_model)
+        parallel_state = SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="fsdp2")
+        monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: parallel_state)
+        monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", parallelize_fsdp2)
+
+        result = build_parallelize_model(
+            model,
+            mixed_precision=SimpleNamespace(enable=False),
+            enable_gradient_checkpointing=False,
+            should_skip_hf_weight_load=True,
+        )
+
+        assert result is parallelized_model
+        assert parallelize_fsdp2.call_args.kwargs["should_skip_hf_weight_load"] is True
+
+    def test_dcp_resume_preserves_nonpersistent_buffers_and_forward(self, monkeypatch, tmp_path):
+        class ModelWithDerivedBuffer(nn.Module):
+            _no_split_modules = []
+
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+                self.register_buffer("scale", torch.tensor([0.25, 2.0]), persistent=False)
+
+            def forward(self, x):
+                return (x @ self.weight) * self.scale
+
+            def init_weights(self):
+                raise AssertionError("DCP resume must not initialize model parameters")
+
+        original = ModelWithDerivedBuffer()
+        assert "scale" not in original.state_dict()
+        inputs = torch.tensor([[2.0, -1.0]])
+        expected_output = original(inputs)
+        checkpoint_dir = tmp_path / "dcp"
+        dcp.save({"model": original}, checkpoint_id=checkpoint_dir)
+
+        with init_empty_weights():
+            resumed = ModelWithDerivedBuffer()
+        assert resumed.weight.is_meta
+        assert not resumed.scale.is_meta
+        parallel_state = SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None)
+        monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: parallel_state)
+        monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+        monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
+
+        resumed = parallelize_model_fsdp2(
+            resumed,
+            weights_path="unused-hf-path",
+            mixed_precision=SimpleNamespace(enable=False),
+            should_skip_hf_weight_load=True,
+            init_device="meta",
+        )
+        dcp.load({"model": resumed}, checkpoint_id=checkpoint_dir)
+
+        torch.testing.assert_close(resumed.scale, original.scale, rtol=0, atol=0)
+        torch.testing.assert_close(resumed(inputs), expected_output, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("parallelize", [build_parallelize_model, parallelize_model_fsdp2])
+    def test_parallelize_apis_reject_renamed_skip_weights_load(self, parallelize):
+        with pytest.raises(TypeError, match="'skip_weights_load' was renamed to 'should_skip_hf_weight_load'"):
+            parallelize(MagicMock(), skip_weights_load=True)
+
+
+# ---------------------------------------------------------------------------
+# Save planner: dcp_save_to_lowest_rank wiring
+# ---------------------------------------------------------------------------
+
+
+class TestSaveToLowestRank:
+    """execute_save() must forward ``save_to_lowest_rank`` to DCP's
+    DefaultSavePlanner, defaulting to False (stock load-balanced writes)."""
+
+    def test_config_default_is_false(self):
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        assert CheckpointConfig().dcp_save_to_lowest_rank is False
+
+    @pytest.mark.parametrize("flag", [False, True])
+    @patch("veomni.checkpoint.dcp_checkpointer.synchronize")
+    @patch("veomni.checkpoint.dcp_checkpointer.empty_cache")
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    @patch("veomni.checkpoint.dcp_checkpointer.dcp")
+    def test_execute_save_forwards_flag_to_planner(self, mock_dcp, mock_dist, mock_ec, mock_sync, flag):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = False
+        mock_dcp.save = MagicMock()
+
+        DistributedCheckpointer.execute_save(
+            save_state={"model": MagicMock()},
+            storage_writer=MagicMock(),
+            save_async=False,
+            save_to_lowest_rank=flag,
+        )
+
+        mock_dcp.save.assert_called_once()
+        planner = mock_dcp.save.call_args.kwargs.get("planner")
+        assert planner is not None, "save must pass a planner"
+        assert planner.dedup_save_to_lowest_rank is flag
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +333,75 @@ class TestWaitForPendingSave:
 
         future.result.assert_called_once()
         mock_dist.barrier.assert_not_called()
+
+
+class TestDcpToHfDtypeConversion:
+    def test_save_dtype_only_casts_floating_tensors(self):
+        import tempfile
+
+        import torch.distributed.checkpoint as dcp
+
+        from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
+
+        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+        if fp8_dtype is None:
+            pytest.skip("torch.float8_e4m3fn is unavailable")
+
+        state_dict = {
+            "model.weight": torch.ones(4, dtype=torch.float32),
+            "model.tid2eid": torch.arange(8, dtype=torch.int64),
+            "model.flag": torch.tensor([True, False]),
+            "model.fp8": torch.tensor([1.0, 2.0], dtype=fp8_dtype),
+        }
+
+        with tempfile.TemporaryDirectory() as checkpoint_path:
+            dcp.save(state_dict, checkpoint_id=checkpoint_path)
+            bf16_shards, bf16_total_size, _ = _get_sharding_plan(
+                checkpoint_path,
+                shard_size=5,
+                save_dtype="bfloat16",
+            )
+            native_shards, native_total_size, _ = _get_sharding_plan(
+                checkpoint_path,
+                shard_size=5,
+                save_dtype=None,
+            )
+
+            bf16_state = {}
+            for shard in bf16_shards:
+                bf16_state.update(_process_shard(shard, checkpoint_path, save_dtype="bfloat16"))
+
+            native_state = {}
+            for shard in native_shards:
+                native_state.update(_process_shard(shard, checkpoint_path, save_dtype=None))
+
+        expected_bf16_size = 0
+        expected_native_size = 0
+        for tensor in state_dict.values():
+            expected_native_size += tensor.numel() * tensor.element_size()
+            output_element_size = (
+                torch.empty((), dtype=torch.bfloat16).element_size()
+                if tensor.is_floating_point()
+                else tensor.element_size()
+            )
+            expected_bf16_size += tensor.numel() * output_element_size
+
+        assert bf16_total_size == expected_bf16_size
+        assert native_total_size == expected_native_size
+        assert len(bf16_shards) == 4
+        assert len(native_shards) == 3
+        assert set(native_shards[0]) == {"flag", "fp8"}
+
+        assert bf16_state["weight"].dtype == torch.bfloat16
+        assert bf16_state["fp8"].dtype == torch.bfloat16
+        assert bf16_state["tid2eid"].dtype == torch.int64
+        assert bf16_state["flag"].dtype == torch.bool
+        torch.testing.assert_close(bf16_state["tid2eid"], state_dict["model.tid2eid"])
+
+        assert native_state["weight"].dtype == torch.float32
+        assert native_state["fp8"].dtype == fp8_dtype
+        assert native_state["tid2eid"].dtype == torch.int64
+        assert native_state["flag"].dtype == torch.bool
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +534,7 @@ class TestGlobalStepInflation:
                     save_async=False,
                     load_path=None,
                     manager="dcp",
+                    dcp_save_to_lowest_rank=False,
                 ),
                 accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")),
                 global_rank=0,
@@ -362,6 +589,17 @@ class TestNormalizeKey:
         from veomni.checkpoint.dcp_checkpointer import _normalize_key
 
         assert _normalize_key("model.embed_tokens.weight") == "embed_tokens.weight"
+
+    def test_peft_lora_base_model_key(self):
+        # GAP-5: ``save_lora_adapter_with_dcp`` re-prefixes already-PEFT-prefixed
+        # keys with ``model.`` so the DCP filter keeps them; on read the leading
+        # ``model.`` is stripped back to the standard PEFT adapter layout.
+        from veomni.checkpoint.dcp_checkpointer import _normalize_key
+
+        assert (
+            _normalize_key("model.base_model.model.layers.0.self_attn.q_proj.lora_A.weight")
+            == "base_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        )
 
 
 # ---------------------------------------------------------------------------
