@@ -14,11 +14,19 @@
 
 """OmniInferencer — SeedOmni V2 inference driver.
 
-Standalone from :class:`OmniTrainer`.  Each sub-module is built by its own
-:class:`~veomni.trainer.omni.omni_module_inferencer.OmniModuleInferencer`
-(default: eager ``from_pretrained`` + ``device_map='auto'``).  Per-module FSDP2
-is opt-in via the module's YAML ``train.accelerator.fsdp_config`` block — see
-``infer_*.yaml`` ``modules:`` overrides deep-merged into ``train.yaml``.
+Standalone from :class:`OmniTrainer`, and like it holds exactly one model
+handle: ``self.model``.  Which of the two SeedOmni build paths produces it
+depends on whether any module opts into a distributed build via its YAML
+``accelerator.fsdp_config`` block (see ``infer_*.yaml`` ``modules:``
+overrides deep-merged into the launcher base):
+
+* all-``eager`` (the inference default) — no VeOmni infrastructure is needed, so
+  the handle is a plain composed ``PreTrainedModel`` from
+  :meth:`OmniModel.from_pretrained`, with standard ``PreTrainedModel``
+  sub-modules placed by ``device_map``.
+* any FSDP2 / DDP / ExtraParallel module — the handle is an
+  :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+  composing one :class:`ModuleRuntime` per module.
 """
 
 from __future__ import annotations
@@ -31,36 +39,29 @@ import torch
 import torch.distributed as dist
 
 from ...arguments import OmniArguments
-from ...data.multimodal.image_utils import load_image
-from ...distributed.parallel_state import is_parallel_state_registered
-from ...models.seed_omni import build_conversation
+from ...models.seed_omni.accelerator import OmniModelRuntime
 from ...models.seed_omni.graphs import GraphProfiler
-from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
-from ...models.seed_omni.utils.conversation import ConversationItem
+from ...models.seed_omni.modeling_omni import OmniModel
+from ...models.seed_omni.processing import OmniProcessor
+from ...omni_arguments.arguments_types import OmniModuleRuntimeArguments
 from ...utils import helper
-from ..base import BaseTrainer
-from .omni_module_inferencer import OmniModuleInferencer
 from .omni_trainer import OmniTrainer
 
 
 logger = helper.create_logger(__name__)
 
 
-def _module_needs_distributed(mod_cfg: dict[str, Any]) -> bool:
-    """True when a module's inference YAML opts into a distributed build (FSDP2 / ExtraParallel / DDP).
+def _module_needs_distributed(module_args: OmniModuleRuntimeArguments) -> bool:
+    """True when a module opts into a distributed build (FSDP2 / ExtraParallel / DDP).
 
     A module needs an initialised process group + its own :class:`ParallelState`
     whenever it is **not** a single-process ``eager`` load — i.e. ``fsdp2``
     (incl. expert-parallel ``ep`` / vocab-parallel ``emb``) or ``ddp`` (a replicated backbone alongside
     the sharded modules). ``eager`` is the inference default
-    (``OmniConfig._resolve_default_accelerator``) and loads via
-    ``device_map`` without any collectives.
+    (``build_module_runtime_args``) and loads via ``device_map`` without collectives.
     """
-    fsdp_config = mod_cfg.get("train", {}).get("accelerator", {}).get("fsdp_config", {})
-    if "fsdp_mode" not in fsdp_config:
-        return False
-    fsdp_mode = fsdp_config.get("fsdp_mode")
-    return bool(fsdp_mode and str(fsdp_mode).lower() not in ("eager"))
+    fsdp_mode = module_args.accelerator.fsdp_config.fsdp_mode
+    return bool(fsdp_mode and str(fsdp_mode).lower() not in ("eager",))
 
 
 @dataclass
@@ -72,87 +73,75 @@ class InferenceRequest:
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
-class OmniInferencer(OmniTrainer):
-    """SeedOmni V2 inference driver — one :class:`OmniModuleInferencer` per module."""
+class OmniInferencer:
+    """SeedOmni V2 inference driver over a single model handle."""
 
-    module_inferencers: dict[str, OmniModuleInferencer]
+    model: OmniModel | OmniModelRuntime
+    processor: OmniProcessor
 
     def __init__(self, args: OmniArguments):
-        self.base = BaseTrainer.__new__(BaseTrainer)
-        self.base.args = args
+        self.args = args
 
-        # Resolve the inference OmniConfig up front (modules + generation graph):
-        # the per-module merged accelerators tell us whether any module opts into
-        # FSDP + extra-parallel — which requires a distributed (torchrun)
-        # launch with an initialised process group + default ParallelState.
-        self.omni_config = args.load_omni_infer_config()
-        if not self.omni_config.has_generation_graph():
-            raise ValueError("OmniConfig has no generation_graph — inference requires an infer graph scenario.")
+        self.checkpoint_root = args.model.model_path
+        self.omni_model_runtime = args.resolve_model(for_inference=True)
 
         self._distributed = any(
-            _module_needs_distributed(self.omni_config.modules[name]) for name in self.omni_config.module_names
+            _module_needs_distributed(self.omni_model_runtime.modules[name])
+            for name in self.omni_model_runtime.module_names
         )
         if self._distributed:
-            # Initialize the process group and default ParallelState.
-            self.base._setup()
+            self.device = OmniTrainer.setup_distributed(args)
         helper.set_seed(args.infer.seed)
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved
-        # during load_omni_infer_config when left unset).
-        args.infer.output_dir = os.path.join(args.infer.output_dir, args.infer.infer_type)
-        logger.info_rank0(f"OmniInferencer: model_path = {args.infer.model_path or args.model.model_path}")
-        logger.info_rank0(f"OmniInferencer: scenario = {args.infer.infer_type}")
+        # during resolve_model(for_inference=True) when left unset).
+        infer_type = args.model.launcher_config("infer_type")
+        args.infer.output_dir = os.path.join(args.infer.output_dir, infer_type)
+        logger.info_rank0(f"OmniInferencer: model_path = {self.checkpoint_root}")
+        logger.info_rank0(f"OmniInferencer: scenario = {infer_type}")
         logger.info_rank0(f"OmniInferencer: output_dir = {args.infer.output_dir}")
 
     @property
-    def model(self) -> OmniModel:
-        return self.base.model
-
-    @property
     def modules(self) -> dict[str, torch.nn.Module]:
-        return self.base.model.modules_dict
-
-    @property
-    def args(self) -> OmniArguments:
-        return self.base.args
+        return self.model.modules_dict
 
     def _build_model(self) -> None:
-        omni_config = self.omni_config  # resolved in __init__
+        """Build ``self.model`` — bare HF :class:`OmniModel` or :class:`OmniModelRuntime`.
 
-        self.module_names = omni_config.module_names
-        self.module_inferencers: dict[str, OmniModuleInferencer] = {}
-        modules: dict[str, torch.nn.Module] = {}
+        With every module on ``fsdp_mode: eager`` there are no collectives and no
+        per-module meta-init to orchestrate, so the graph runs on a plain
+        composed ``PreTrainedModel`` loaded straight from the split checkpoint —
+        the same object a non-VeOmni user gets from
+        :meth:`OmniModel.from_pretrained`.  The launcher's
+        :class:`OmniModelRuntimeArguments` is projected onto an :class:`OmniConfig` here
+        so ``model.model_config.modules`` overrides (graphs, per-module
+        ``model_config``) still apply.
 
-        for name in self.module_names:
-            module_config = omni_config.module_config(name)
-            module_inferencer = OmniModuleInferencer(
-                module_config,
-                module_name=name,
-            )
-            self.module_inferencers[name] = module_inferencer
-            modules[name] = module_inferencer.model
-            logger.info_rank0(
-                f"OmniInferencer: built module-inferencer '{name}' from {module_config.model.model_path}"
-            )
-
-        self.base.model = OmniModel(omni_config, modules)
-
+        As soon as one module needs FSDP2 / DDP / ExtraParallel, every module is
+        built by its own :class:`ModuleRuntime` under its own
+        :class:`ParallelState` and the handle becomes the VeOmni runtime.
+        """
+        self.module_names = self.omni_model_runtime.module_names
         if self._distributed:
-            # Only distributed (FSDP / extra-parallel) modules register a
-            # ParallelState under their name (``OmniModuleInferencer._setup`` ->
-            # ``init_parallel_state(name=...)``); eager modules do not and stay
-            # unscoped. Query the registry directly — the old ``parallel_state``
-            # attribute was dropped in the registry refactor, so a ``hasattr``
-            # check silently matched nothing and left every node running under
-            # the default (world) state, corrupting emb/EP collectives.
-            registered_names = [name for name in self.module_inferencers if is_parallel_state_registered(name)]
-            if registered_names:
-                self.base.model.set_module_parallel_state_names(registered_names)
-        self.base.model_config = omni_config
-        logger.info_rank0(
-            f"OmniInferencer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
-        )
+            self.model = OmniModelRuntime.from_model_runtime(
+                self.omni_model_runtime,
+                train=self.args.train,
+                for_inference=True,
+            )
+        else:
+            self.model = OmniModel.from_pretrained(
+                self.checkpoint_root,
+                config=self.omni_model_runtime.to_hf_config(),
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            ).eval()
+            logger.info_rank0(
+                f"OmniInferencer: eager load of {len(self.module_names)} module(s) ({self.module_names}) "
+                f"from {self.checkpoint_root}."
+            )
+        self.processor = OmniProcessor.from_composed_model(self.model)
+        self.model_config = self.model.config
 
     # ── Inference entry point ─────────────────────────────────────────────────
 
@@ -161,12 +150,13 @@ class OmniInferencer(OmniTrainer):
         infer_args = self.args.infer
         generation_kwargs = dict(infer_args.generation_kwargs)
         requested_infer_type = generation_kwargs.get("infer_type")
-        if requested_infer_type is not None and requested_infer_type != infer_args.infer_type:
+        active_infer_type = self.args.model.launcher_config("infer_type")
+        if requested_infer_type is not None and requested_infer_type != active_infer_type:
             raise ValueError(
-                "`infer.generation_kwargs.infer_type` conflicts with `infer.infer_type`: "
-                f"{requested_infer_type!r} != {infer_args.infer_type!r}."
+                "`infer.generation_kwargs.infer_type` conflicts with `model.model_config.infer_type`: "
+                f"{requested_infer_type!r} != {active_infer_type!r}."
             )
-        generation_kwargs["infer_type"] = infer_args.infer_type
+        generation_kwargs["infer_type"] = active_infer_type
         return generation_kwargs
 
     def generate(self) -> dict[str, Any]:
@@ -175,7 +165,7 @@ class OmniInferencer(OmniTrainer):
         assert infer_args.prompt, "--infer.prompt is required (use a non-empty string)."
         request = InferenceRequest(
             prompt=infer_args.prompt,
-            images=[load_image(p) for p in infer_args.images],
+            images=list(infer_args.images),
             generation_kwargs=self._runtime_generation_kwargs(),
         )
         ctx = self._run(request)
@@ -198,7 +188,7 @@ class OmniInferencer(OmniTrainer):
             return
         os.makedirs(output_dir, exist_ok=True)
 
-        reply = _extract_generated_text(self.model.generated)
+        reply = _extract_generated_text(ctx["generated"])
         reply_path = os.path.join(output_dir, "reply.txt")
         with open(reply_path, "w", encoding="utf-8") as f:
             f.write(reply + ("\n" if reply and not reply.endswith("\n") else ""))
@@ -208,7 +198,7 @@ class OmniInferencer(OmniTrainer):
 
         images_out = [
             item["value"]
-            for item in self.model.generated
+            for item in ctx["generated"]
             if isinstance(item, dict) and item.get("type") == "image" and item.get("value") is not None
         ]
         for idx, image in enumerate(images_out):
@@ -226,60 +216,28 @@ class OmniInferencer(OmniTrainer):
         if not reply and not images_out:
             logger.warning_rank0("finalize: FSM produced no reply and no images.")
 
-    def _preprocess_request(
-        self,
-        conversation: list[ConversationItem],
-        generation_kwargs: dict[str, Any] | None = None,
-    ) -> None:
-        """Run every module's CPU preprocessor over the request once, before the FSM.
+    def _begin_graph_trace(self) -> GraphProfiler | None:
+        """Open a per-request FSM trace on the VeOmni runtime handle.
 
-        The inference twin of training's :class:`SeedOmniCollator` pass: each module
-        contributes the same :meth:`build_cpu_preprocessor` (chat-template + tokenize
-        for text, image/video patchify for vision). ``inference=True`` flips the
-        train/infer-only bits — image modules skip the FSDP-anchor dummy and text
-        encoders append the assistant generation prompt; ``generation_kwargs`` is
-        forwarded so a module can vary its prep by the request's decoding options (no
-        current module needs it). After this each module's ``generate`` only packs →
-        encodes → scatters the preprocessed items, exactly like the training forward.
-
-        Order is FIXED and SERIAL: preprocessors run one-by-one over the single-sample
-        request (wrapped as a batch of one) in ``module_names`` order — i.e. the
-        config ``modules:`` declaration order, identical to the training collator — so
-        a module whose prep depends on an earlier one's output (e.g. text chat-template
-        after a vision tower patchifies its image items) stays correct.
+        Inference always traces (there is no train-step window to gate on). The
+        bare-HF handle has no profiler hook — :meth:`finalize` then writes an
+        empty trace.
         """
-        batched = [conversation]
-        for name in self.module_names:
-            module = _unwrap_module(self.modules[name])
-            builder = getattr(module, "build_cpu_preprocessor", None)
-            preprocessor = builder() if builder is not None else None
-            if preprocessor is not None:
-                preprocessor(batched, inference=True, generation_kwargs=generation_kwargs)
+        if isinstance(self.model, OmniModelRuntime):
+            return self.model.begin_request_trace(self.args.train.graph_profile)
+        return None
 
     def _run(self, req: InferenceRequest) -> dict[str, Any]:
-        for module in self.modules.values():
-            if hasattr(module, "reset_global_inference_state"):
-                module.reset_global_inference_state()
-            elif hasattr(module, "reset_local_inference_state"):
-                module.reset_local_inference_state()
-
-        conversation = build_conversation(prompt=req.prompt, images=req.images)
-        self._preprocess_request(conversation, req.generation_kwargs)
-        request_dict: dict[str, Any] = {
-            "conversation_list": conversation,
-        }
+        request_dict = self.processor(
+            text=req.prompt,
+            images=req.images or None,
+            inference=True,
+        )
         self.model.reset()
-        # Inference always emits a per-request trace (no train-step window), so —
-        # unlike the trainer — this is ungated.
-        profiler = GraphProfiler.from_config(self.args.graph_profile)
+        profiler = self._begin_graph_trace()
         with torch.no_grad():
-            ctx = self.model.generate(
-                request=request_dict,
-                profiler=profiler,
-                generation_kwargs=req.generation_kwargs,
-            )
-        ctx["profiler"] = profiler
-        return ctx
+            generated = self.model.generate(request_dict, generation_kwargs=req.generation_kwargs)
+        return {"generated": generated, "profiler": profiler}
 
 
 def _extract_generated_text(generated: list[dict[str, Any]]) -> str:
@@ -298,6 +256,5 @@ def _extract_generated_text(generated: list[dict[str, Any]]) -> str:
 
 __all__ = [
     "OmniInferencer",
-    "OmniModuleInferencer",
     "InferenceRequest",
 ]

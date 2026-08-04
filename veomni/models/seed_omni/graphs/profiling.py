@@ -28,7 +28,7 @@ from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_torch_devi
 
 
 if TYPE_CHECKING:
-    from ....arguments.arguments_types_omni import OmniGraphProfileArguments
+    from ....arguments import OmniGraphProfileArguments
 
 
 class GraphProfiler:
@@ -50,7 +50,7 @@ class GraphProfiler:
 
     @classmethod
     def from_config(cls, config: OmniGraphProfileArguments) -> GraphProfiler:
-        """Build from the ``graph_profile`` args (the ``enable_*`` detail switches).
+        """Build from ``train.graph_profile`` args (the ``enable_*`` detail switches).
 
         Shared by the trainer and the inferencer so the field list lives in one
         place; each caller keeps its own gating (train step window vs. always-on

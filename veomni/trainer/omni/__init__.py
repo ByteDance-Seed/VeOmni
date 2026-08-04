@@ -12,30 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 trainer / inferencer package.
+"""SeedOmni V2 training / inference orchestrators (independent from V1 ``BaseTrainer``)."""
 
-Split into four modules:
-
-* :mod:`~veomni.trainer.omni.omni_module_trainer` — per-module training unit
-  (:class:`OmniModuleTrainer`) + its per-module checkpoint callbacks.
-* :mod:`~veomni.trainer.omni.omni_trainer` — orchestrator (:class:`OmniTrainer`)
-  + multi-optimizer / multi-scheduler proxies + the global-state callback.
-* :mod:`~veomni.trainer.omni.omni_module_inferencer` — per-module inference
-  builder (:class:`OmniModuleInferencer`).
-* :mod:`~veomni.trainer.omni.omni_inferencer` — inference driver
-  (:class:`OmniInferencer`) + :class:`InferenceRequest`.
-"""
-
+from ...models.seed_omni.accelerator import OmniModelRuntime
+from ...models.seed_omni.accelerator.checkpoint import OmniModuleCheckpointManager
+from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime, OmniModuleRuntime
+from ...omni_arguments.model_runtime import build_module_runtime_args
+from ..callbacks.omni_callbacks import (
+    OmniGlobalStateCallback,
+    OmniModuleDcpCallback,
+    OmniModuleHfCallback,
+    OmniRootAssetsCallback,
+)
 from .omni_inferencer import InferenceRequest, OmniInferencer
-from .omni_module_inferencer import OmniModuleInferencer
-from .omni_module_trainer import OmniModuleTrainer
-from .omni_trainer import OmniTrainer
+from .omni_trainer import MultiLRScheduler, MultiOptimizer, OmniTrainer
 
+
+OmniModuleTrainer = ModuleRuntime
 
 __all__ = [
     "OmniTrainer",
+    "ModuleRuntime",
+    "OmniModuleRuntime",
     "OmniModuleTrainer",
+    "OmniModuleCheckpointManager",
+    "OmniModelRuntime",
     "OmniInferencer",
-    "OmniModuleInferencer",
     "InferenceRequest",
+    "build_module_runtime_args",
+    "MultiOptimizer",
+    "MultiLRScheduler",
+    "OmniModuleDcpCallback",
+    "OmniModuleHfCallback",
+    "OmniGlobalStateCallback",
+    "OmniRootAssetsCallback",
 ]

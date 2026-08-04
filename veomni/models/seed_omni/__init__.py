@@ -35,6 +35,7 @@ from .modules import (
     read_hf_model_type,
     read_model_type,
 )
+from .processing import AutoProcessor, OmniProcessor
 from .utils.conversation import build_conversation
 
 
@@ -42,6 +43,8 @@ __all__ = [
     # Core
     "OmniConfig",
     "OmniModel",
+    "AutoProcessor",
+    "OmniProcessor",
     "ModuleMixin",
     "MetricMeterMixin",
     "OfflineEncodingConfigMixin",

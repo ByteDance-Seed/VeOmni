@@ -85,7 +85,7 @@ Key knobs (override on the CLI):
 - `--model.model_path` — split-checkpoint root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
 - `--data.max_seq_len` — packed sequence length.
-- `--train.optimizer.lr` — learning rate.
+- `--model.optimizer.lr` — learning rate (global default; override per module in `modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
 

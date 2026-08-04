@@ -90,7 +90,7 @@ as ``forward`` so DDP/FSDP pre/post-forward hooks still run.
 
 Usage
 -----
-  >>> fsm = GenerationGraph(config["generation_graph"])
+  >>> fsm = GenerationGraph(config.generation_graph)
   >>> fsm.reset()
   >>> ctx = {"input_ids": ..., "attention_mask": ...}
   >>> while not fsm.is_done():
@@ -270,13 +270,13 @@ class GenerationGraph:
 
     def __init__(
         self,
-        fsm_config: Dict,
+        generation_graph: Dict,
     ):
         # `done` is reserved — auto-injected below.  Users must NOT redeclare
         # it; doing so silently lets a custom body/transitions override the
         # framework's terminal semantics, which is exactly the kind of magic
         # we are trying to avoid.
-        if DONE_STATE_NAME in fsm_config["states"]:
+        if DONE_STATE_NAME in generation_graph["states"]:
             raise ValueError(
                 f"State name '{DONE_STATE_NAME}' is reserved and auto-injected by the framework. "
                 f"Remove the explicit `{DONE_STATE_NAME}:` block from your generation_graph YAML — "
@@ -286,15 +286,17 @@ class GenerationGraph:
         # The pre-existing `done_state` config knob is gone — the framework
         # always uses `DONE_STATE_NAME`.  If the user still has it lying
         # around, reject loudly so they migrate cleanly.
-        if "done_state" in fsm_config:
+        if "done_state" in generation_graph:
             raise ValueError(
                 "`generation_graph.done_state` is no longer configurable — the terminal state "
                 f"is hardcoded to '{DONE_STATE_NAME}'. Remove the `done_state:` line from your "
                 "generation_graph YAML."
             )
 
-        self._initial: str = fsm_config["initial"]
-        self._states: Dict[str, _State] = {name: _State(name, spec) for name, spec in fsm_config["states"].items()}
+        self._initial: str = generation_graph["initial"]
+        self._states: Dict[str, _State] = {
+            name: _State(name, spec) for name, spec in generation_graph["states"].items()
+        }
 
         # Inject the built-in terminal state.  Empty body, no outgoing
         # transitions: the FSM "rests" here and the orchestrator picks up the

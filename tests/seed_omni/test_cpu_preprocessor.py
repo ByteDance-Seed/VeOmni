@@ -769,6 +769,9 @@ def test_vqvae_preprocessor_normalizes_only_assistant_images():
 
 
 def test_collator_runs_preprocessors_in_order():
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
+    from veomni.models.seed_omni.processing import OmniProcessor
+
     preprocessors = [
         JanusTextEncoderCPUPreprocessor(_janus_template()),
         JanusSiglipCPUPreprocessor(
@@ -778,7 +781,13 @@ def test_collator_runs_preprocessors_in_order():
             FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
         ),
     ]
-    collator = SeedOmniCollator(cpu_preprocessors=tuple(preprocessors))
+    config = OmniConfig(
+        modules={"a": {"subfolder": "a"}},
+        training_graph=[{"from": "a", "to": "end"}],
+        generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
+    )
+    processor = OmniProcessor(config, tuple(preprocessors))
+    collator = SeedOmniCollator(processor=processor)
     features = [{"conversation_list": _raw_image_sample()}, {"conversation_list": _raw_text_sample()}]
     batch = collator(features)
     assert set(batch.keys()) == {"conversation_list"}

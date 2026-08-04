@@ -26,7 +26,7 @@ framework changes.
 
 ```mermaid
 flowchart LR
-    YAML[("YAML config<br/>modules<br/>training_graph / generation_graph")] --> CFG[OmniConfig]
+    YAML[("YAML config<br/>modules<br/>training_graph / generation_graphs")] --> CFG[OmniConfig]
     CFG --> TR[OmniTrainer<br/><i>build + FSDP wrap each module</i>]
     TR --> OM[OmniModel<br/><i>graph runtime</i>]
     OM --> M1[janus_siglip]
@@ -97,23 +97,24 @@ token, an image patch, or a VQ token — the mixin does not distinguish modaliti
 A module only ever produces **time-independent** quantities (tokens + theoretical
 FLOPs); all timing / MFU lives at the orchestrator.
 
-#### Optional graph profiler (`graph_profile.*`, `GraphProfiler`)
+#### Optional graph profiler (`train.graph_profile.*`, `GraphProfiler`)
 
 SeedOmni also has a lightweight graph profiler for execution-path records and
 optional graph-node timing. This is separate from `train.profile.*`, which owns
-PyTorch profiler traces. The graph profiler is configured at the Omni root:
+PyTorch profiler traces. The graph profiler is configured under `train`:
 
 ```yaml
-graph_profile:
-  enable_wall_time: true    # append wall_ms=...
-  enable_cuda_events: true  # append cuda_ms=...
-  enable_memory: true       # append peak_allocated_gb / peak_reserved_gb
-  train_start_step: 1       # training only: save global steps 1-10
-  train_end_step: 10
+train:
+  graph_profile:
+    enable_wall_time: true    # append wall_ms=...
+    enable_cuda_events: true  # append cuda_ms=...
+    enable_memory: true       # append peak_allocated_gb / peak_reserved_gb
+    train_start_step: 1       # training only: save global steps 1-10
+    train_end_step: 10
 ```
 
 Inference always writes the graph path to `<output_dir>/<infer_type>/trace.txt`;
-the `graph_profile.enable_*` switches only add suffix fields to those node lines.
+the `train.graph_profile.enable_*` switches only add suffix fields to those node lines.
 Training writes rank-0 graph traces only when any detail switch is enabled,
 under `train.checkpoint.output_dir/graph_trace`.
 
@@ -392,7 +393,9 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
      order; modules move data via the conversation list.
    - `modules_infer.yaml` (optional) — per-module inference overrides.
    - `graph_infer_*.yaml` — one `generation_graph` (FSM) per scenario, mapped
-     under `infer.infer_graph`.
+     under `infer.infer_graph`. `OmniConfig` loads **all** of them into
+     `generation_graphs` and `infer.infer_type` selects the active one, so an
+     exported checkpoint keeps serving every scenario.
 
 5. **Honour the contracts:**
    - Return at most one scalar `_loss` per node (token-mean reduced).
@@ -425,7 +428,8 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `graphs/graph.py` | shared `NodeDef` / `EdgeDef` / `END` |
 | `graphs/training_graph.py` | DAG view (topological forward order) |
 | `graphs/generation_graph.py` | FSM view (states / transitions / signals) |
-| `configuration_omni.py` | parse + merge the YAML into `OmniConfig` |
+| `configuration_omni.py` | `OmniConfig` — plain `PretrainedConfig`, checkpoint read/write only |
+| `omni_arguments/model_runtime.py` | parse + merge the launcher YAML into `OmniModelRuntimeArguments`; `.to_hf_config()` projects it onto `OmniConfig` |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
 | `modules/<family>/<sub>/` | per-module `configuration.py`, `modulemixin.py`, `modeling.py` [, `processing.py`] |
 | `veomni/trainer/omni/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |

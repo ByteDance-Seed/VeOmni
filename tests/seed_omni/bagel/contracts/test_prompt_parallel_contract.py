@@ -90,7 +90,7 @@ def _materialized_prompt() -> tuple[list[ConversationItem], ConversationItem, Co
 
 
 def test_bagel_edit_prompt_graph_exposes_independent_prompt_producers() -> None:
-    graph_config = yaml.safe_load((_BAGEL_CONFIG_DIR / "graph_infer_edit.yaml").read_text())["generation_graph"]
+    graph_config = yaml.safe_load((_BAGEL_CONFIG_DIR / "graph_infer_edit.yaml").read_text())
     prompt_body = graph_config["states"]["prompt_encode"]["body"]
 
     assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body

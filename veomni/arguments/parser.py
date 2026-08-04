@@ -136,6 +136,18 @@ def _add_arguments_recursive(parser: argparse.ArgumentParser, cls: Type[Any], pr
             parser.add_argument(f"--{arg_name}", **kwargs)
 
 
+def _infer_dataclass_from_field(field_info: dataclasses.Field) -> Type[Any] | None:
+    """When a field is typed ``Any`` but has a dataclass ``default_factory``, infer the target type."""
+    if field_info.default_factory is dataclasses.MISSING:
+        return None
+    try:
+        default_instance = field_info.default_factory()
+    except Exception:
+        return None
+    default_cls = type(default_instance)
+    return default_cls if is_dataclass(default_cls) else None
+
+
 def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
     """
     Recursively convert a dictionary into Dataclass instances.
@@ -163,6 +175,12 @@ def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
         # Prefer resolved type hint, unwrap Optional[T] / T | None
         field_type = type_hints.get(field_name, field_info.type)
         field_type = _unwrap_optional(field_type)
+
+        if field_type is Any and isinstance(raw_value, dict):
+            inferred = _infer_dataclass_from_field(field_info)
+            if inferred is not None:
+                field_values[field_name] = _instantiate_recursive(inferred, raw_value)
+                continue
 
         # If the field expects a Dataclass and we have a dict, recurse
         if is_dataclass(field_type) and isinstance(raw_value, dict):

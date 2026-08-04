@@ -29,13 +29,12 @@ A module only ever produces **time-independent** quantities:
 
 * :meth:`metric_meter_add` accumulates this module's token lengths — the per-module
   analogue of ``EnvironMeter.add``.  The
-  :class:`~veomni.trainer.omni.omni_module_trainer.OmniModuleTrainer` calls it right after
+  :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` calls it right after
   ``pre_forward`` (when the real input tensors are in hand), passing the node's
   ``method`` + the forward ``data``.  A module reports its tokens by calling
-  :meth:`ModuleMixin.metric_meter_set_seqlens
-  <veomni.models.seed_omni.mixins.modulemixin.ModuleMixin.metric_meter_set_seqlens>`
-  inside its ``pre_forward`` **before any SP slice** (that setter lives on
-  ``ModuleMixin`` so the hooks calling it resolve statically; token domains differ
+  :meth:`MetricMeterMixin.metric_meter_set_seqlens` inside its ``pre_forward``
+  **before any SP slice** (that setter lives on ``MetricMeterMixin`` so only
+  metered modules stash; token domains differ
   — text seq len vs image patches vs VQ tokens — and some call-sites aren't
   counted, e.g. a VQ codec counts on ``encode`` and stashes nothing on
   ``decode``). The default :meth:`metric_meter_token_lengths` simply drains that
@@ -60,7 +59,7 @@ mis-count at module granularity).
 Opt-in is by **multiple inheritance**, NOT by ``ModuleMixin`` (``ModuleMixin``
 does *not* inherit ``MetricMeterMixin``). A module that wants metering defines its own
 ``XxxMetricMeterMixin(MetricMeterMixin)`` implementing just ``estimate_flops`` (token
-lengths come from the ``ModuleMixin.metric_meter_set_seqlens`` stash via the default
+lengths come from :meth:`metric_meter_set_seqlens` via the default
 ``metric_meter_token_lengths``), and its concrete model multi-inherits it, e.g.::
 
     class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, PreTrainedModel): ...
@@ -80,6 +79,25 @@ MetricMeterResult = Tuple[float, List[int]]
 
 class MetricMeterMixin:
     """Optional per-module token + theoretical-FLOPs meter for SeedOmni V2."""
+
+    def metric_meter_set_seqlens(self, method: str, seqlens: List[int]) -> None:
+        """Stash the FULL (pre-SP-slice) per-sample token lengths for call-site ``method``.
+
+        **Call this inside a ``pre_forward`` hook, BEFORE any SP gather/slice.**
+        Only modules that mix in ``MetricMeterMixin`` should call this; the default
+        :meth:`metric_meter_token_lengths` drains the stash at step end.
+
+        Why pre-slice / full-sample: under uniform SP the ``pre_forward`` hook
+        slices to this rank's ``1/sp_size`` shard, so a length read *after* the
+        slice would under-count by ~``sp``. Stash the FULL (pre-slice) per-sample
+        lengths here — before the slice branch — instead: ``OmniEnvironMeter`` sums
+        tokens+FLOPs over the ``dp_group`` (which excludes the SP ranks that all
+        hold the same replicated sample), so the full-sample value counted once per
+        DP shard reconstructs the true global total, matching the non-SP run.
+        """
+        if not hasattr(self, "_metric_full_seqlens"):
+            self._metric_full_seqlens: Dict[str, List[int]] = {}
+        self._metric_full_seqlens[method] = [int(s) for s in seqlens]
 
     def _metric_meter_seqlen_buffer(self) -> List[int]:
         # Lazily initialised so an implementing module never has to touch its own
@@ -107,9 +125,7 @@ class MetricMeterMixin:
         """Per-sample token lengths this module processed for call-site ``method``.
 
         Canonical path: drain the FULL, SP-invariant lengths a module stashed via
-        :meth:`ModuleMixin.metric_meter_set_seqlens
-        <veomni.models.seed_omni.mixins.modulemixin.ModuleMixin.metric_meter_set_seqlens>`
-        in its ``pre_forward``. A call-site that stashed nothing (e.g. a VQ codec's
+        :meth:`metric_meter_set_seqlens` in its ``pre_forward``. A call-site that
         ``decode``) returns ``[]`` and contributes nothing — so ``data`` is unused.
 
         This unified stash replaces the old per-module readers that measured the

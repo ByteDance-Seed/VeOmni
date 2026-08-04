@@ -12,6 +12,7 @@ from tests.seed_omni.bagel.contracts.helpers import (
     model_cls,
     tiny_bagel_qwen2_cfg,
 )
+from veomni.models.seed_omni.accelerator import OmniModelRuntime
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.graphs.profiling import GraphProfiler
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
@@ -28,14 +29,18 @@ from veomni.models.seed_omni.modules.bagel.sources import (
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
+def _make_veomni_runtime(cfg, modules):
+    model = OmniModel(cfg, modules).eval()
+    return OmniModelRuntime(model), model
+
+
 def test_bagel_infer_gen_denoise_signal_smoke():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_modules=bagel_cfg_dir() / "modules_infer_eager.yaml",
         infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
-    model = OmniModel(
+    runtime, model = _make_veomni_runtime(
         cfg,
         {
             "bagel_text_encoder": _InferGenTextEncoder(),
@@ -44,10 +49,11 @@ def test_bagel_infer_gen_denoise_signal_smoke():
             "bagel_flow_connector": _InferGenBagelFlow(),
             "bagel_vae": _InferGenBagelVAE(),
         },
-    ).eval()
+    )
     profiler = GraphProfiler()
-    ctx = model.generate(
-        {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]},
+    request = {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]}
+    generated = runtime.generate(
+        request,
         profiler=profiler,
         generation_kwargs={
             "max_new_tokens": 8,
@@ -62,19 +68,18 @@ def test_bagel_infer_gen_denoise_signal_smoke():
     assert any("transition: query_denoise -> velocity_collect" in entry for entry in trace)
     assert any("transition: velocity_collect -> image_decode" in entry for entry in trace)
     assert any("transition: image_decode -> done" in entry for entry in trace)
-    assert any(item["type"] == "image" for item in model.generated)
-    assert "timestep" not in ctx["conversation_list"][-1].meta
+    assert any(item["type"] == "image" for item in generated)
+    assert "timestep" not in request["conversation_list"][-1].meta
 
 
 def test_bagel_infer_gen_user_image_runs_siglip_context_only():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_modules=bagel_cfg_dir() / "modules_infer_eager.yaml",
         infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
     siglip = _CountingInferGenBagelSiglip()
-    model = OmniModel(
+    runtime, model = _make_veomni_runtime(
         cfg,
         {
             "bagel_text_encoder": _InferGenTextEncoder(),
@@ -83,19 +88,20 @@ def test_bagel_infer_gen_user_image_runs_siglip_context_only():
             "bagel_flow_connector": _InferGenBagelFlow(),
             "bagel_vae": _InferGenBagelVAE(),
         },
-    ).eval()
-    ctx = model.generate(
-        {
-            "conversation_list": [
-                ConversationItem(
-                    type="image",
-                    value=Image.new("RGB", (1, 1)),
-                    role="user",
-                    source=BAGEL_SIGLIP_CONTEXT,
-                ),
-                ConversationItem(type="text", value="prompt", role="user"),
-            ]
-        },
+    )
+    request = {
+        "conversation_list": [
+            ConversationItem(
+                type="image",
+                value=Image.new("RGB", (1, 1)),
+                role="user",
+                source=BAGEL_SIGLIP_CONTEXT,
+            ),
+            ConversationItem(type="text", value="prompt", role="user"),
+        ]
+    }
+    generated = runtime.generate(
+        request,
         generation_kwargs={
             "max_new_tokens": 8,
             "do_sample": False,
@@ -105,20 +111,19 @@ def test_bagel_infer_gen_user_image_runs_siglip_context_only():
     )
 
     assert siglip.calls == 1
-    assert all(item.source != BAGEL_VAE_CONTEXT for item in ctx["conversation_list"])
-    assert torch.equal(ctx["conversation_list"][0].value[0], torch.zeros(8))
-    assert torch.equal(ctx["conversation_list"][0].value[1:], torch.ones(3, 8))
-    assert any(item["type"] == "image" for item in model.generated)
+    assert all(item.source != BAGEL_VAE_CONTEXT for item in request["conversation_list"])
+    assert torch.equal(request["conversation_list"][0].value[0], torch.zeros(8))
+    assert torch.equal(request["conversation_list"][0].value[1:], torch.ones(3, 8))
+    assert any(item["type"] == "image" for item in generated)
 
 
 def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_modules=bagel_cfg_dir() / "modules_infer_eager.yaml",
         infer_graph_path=bagel_cfg_dir() / "graph_infer_edit.yaml",
     )
-    model = OmniModel(
+    runtime, model = _make_veomni_runtime(
         cfg,
         {
             "bagel_text_encoder": _InferGenTextEncoder(),
@@ -127,26 +132,27 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
             "bagel_flow_connector": _InferEditBagelFlow(),
             "bagel_vae": _InferEditBagelVAE(),
         },
-    ).eval()
+    )
     profiler = GraphProfiler()
-    ctx = model.generate(
-        {
-            "conversation_list": [
-                ConversationItem(
-                    type="image",
-                    value=Image.new("RGB", (1, 1)),
-                    role="user",
-                    source=BAGEL_VAE_CONTEXT,
-                ),
-                ConversationItem(
-                    type="image",
-                    value=Image.new("RGB", (1, 1)),
-                    role="user",
-                    source=BAGEL_SIGLIP_CONTEXT,
-                ),
-                ConversationItem(type="text", value="prompt", role="user"),
-            ]
-        },
+    request = {
+        "conversation_list": [
+            ConversationItem(
+                type="image",
+                value=Image.new("RGB", (1, 1)),
+                role="user",
+                source=BAGEL_VAE_CONTEXT,
+            ),
+            ConversationItem(
+                type="image",
+                value=Image.new("RGB", (1, 1)),
+                role="user",
+                source=BAGEL_SIGLIP_CONTEXT,
+            ),
+            ConversationItem(type="text", value="prompt", role="user"),
+        ]
+    }
+    generated = runtime.generate(
+        request,
         profiler=profiler,
         generation_kwargs={
             "max_new_tokens": 8,
@@ -160,18 +166,17 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
     assert any("transition: prompt_encode -> query_denoise" in entry for entry in trace)
     assert not any("transition: prompt_encode -> text_ar" in entry for entry in trace)
     assert any("transition: image_decode -> done" in entry for entry in trace)
-    assert any(item["type"] == "image" for item in model.generated)
-    assert "timestep" not in ctx["conversation_list"][-1].meta
+    assert any(item["type"] == "image" for item in generated)
+    assert "timestep" not in request["conversation_list"][-1].meta
 
 
 def test_bagel_infer_gen_cfg_text_branch_signal_smoke():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_modules=bagel_cfg_dir() / "modules_infer_eager.yaml",
         infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
-    model = OmniModel(
+    runtime, model = _make_veomni_runtime(
         cfg,
         {
             "bagel_text_encoder": _InferGenTextEncoder(),
@@ -180,10 +185,11 @@ def test_bagel_infer_gen_cfg_text_branch_signal_smoke():
             "bagel_flow_connector": _InferGenBagelFlow(),
             "bagel_vae": _InferGenBagelVAE(),
         },
-    ).eval()
+    )
     profiler = GraphProfiler()
-    ctx = model.generate(
-        {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]},
+    request = {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]}
+    generated = runtime.generate(
+        request,
         profiler=profiler,
         generation_kwargs={
             "max_new_tokens": 8,
@@ -200,18 +206,17 @@ def test_bagel_infer_gen_cfg_text_branch_signal_smoke():
     assert any(
         "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
     )
-    assert any(item["type"] == "image" for item in model.generated)
-    assert "timestep" not in ctx["conversation_list"][-1].meta
+    assert any(item["type"] == "image" for item in generated)
+    assert "timestep" not in request["conversation_list"][-1].meta
 
 
 def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_modules=bagel_cfg_dir() / "modules_infer_eager.yaml",
         infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
-    model = OmniModel(
+    runtime, model = _make_veomni_runtime(
         cfg,
         {
             "bagel_text_encoder": _InferGenTextEncoder(),
@@ -220,10 +225,11 @@ def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
             "bagel_flow_connector": _InferGenBagelFlow(),
             "bagel_vae": _InferGenBagelVAE(),
         },
-    ).eval()
+    )
     profiler = GraphProfiler()
-    ctx = model.generate(
-        {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]},
+    request = {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]}
+    generated = runtime.generate(
+        request,
         profiler=profiler,
         generation_kwargs={
             "max_new_tokens": 12,
@@ -240,8 +246,8 @@ def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
     assert any(
         "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
     )
-    assert any(item["type"] == "image" for item in model.generated)
-    assert "timestep" not in ctx["conversation_list"][-1].meta
+    assert any(item["type"] == "image" for item in generated)
+    assert "timestep" not in request["conversation_list"][-1].meta
 
 
 def test_bagel_qwen2_mot_cfg_text_context_snapshot_is_internal():

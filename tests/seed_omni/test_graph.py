@@ -6,9 +6,12 @@ import re
 from types import SimpleNamespace
 
 import pytest
+import torch.nn as nn
 
-from veomni.arguments.arguments_types_omni import OmniGraphProfileArguments
+from veomni.arguments import OmniGraphProfileArguments
 from veomni.models.seed_omni import EdgeDef, NodeDef
+from veomni.models.seed_omni.accelerator import OmniModelRuntime
+from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs import profiling
 from veomni.models.seed_omni.graphs.executor import execute_generation_node, execute_train_node
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
@@ -16,7 +19,8 @@ from veomni.models.seed_omni.graphs.graph import END
 from veomni.models.seed_omni.graphs.profiling import GraphProfiler
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
-from veomni.trainer.callbacks import GraphProfileCallback
+from veomni.models.seed_omni.modeling_omni import OmniModel
+from veomni.trainer.callbacks.omni_callbacks import GraphProfileCallback
 from veomni.trainer.omni.omni_trainer import OmniTrainer
 
 
@@ -111,14 +115,14 @@ def _understanding_only_edges() -> list[dict]:
 
 
 def test_missing_edges_raises():
-    with pytest.raises(ValueError, match="non-empty `edges`"):
-        TrainingGraph(edges=[])
+    with pytest.raises(ValueError, match="non-empty `training_graph`"):
+        TrainingGraph([])
 
 
 def test_duplicate_edge_raises():
     with pytest.raises(ValueError, match="Duplicate edge"):
         TrainingGraph(
-            edges=[
+            [
                 {"from": "vision_encoder", "to": "run_ar"},
                 {"from": "vision_encoder", "to": "run_ar"},
             ]
@@ -127,7 +131,7 @@ def test_duplicate_edge_raises():
 
 def test_single_node_with_only_end_edge():
     """``[{from: ar_llm, to: end}]`` derives exactly one real node."""
-    g = TrainingGraph(edges=[{"from": "ar_llm", "to": "end"}])
+    g = TrainingGraph([{"from": "ar_llm", "to": "end"}])
     assert g.execution_order == ["ar_llm.forward"]
     assert g.sources == ["ar_llm.forward"] and g.sinks == ["ar_llm.forward"]
 
@@ -136,14 +140,14 @@ def test_single_node_with_only_end_edge():
 
 
 def test_understanding_only_topological_order():
-    g = TrainingGraph(edges=_understanding_only_edges())
+    g = TrainingGraph(_understanding_only_edges())
     assert g.execution_order[-1] == "run_ar.forward"
     assert set(g.execution_order[:-1]) == {"vision_encoder.forward", "vq_decoder.forward"}
 
 
 def test_janus_joint_topological_order():
     """vq_decoder appears as TWO nodes; topo must place them on either side of run_ar."""
-    g = TrainingGraph(edges=_janus_joint_edges())
+    g = TrainingGraph(_janus_joint_edges())
     order = g.execution_order
     assert order.index("vq_decoder.gen_loss") > order.index("run_ar.forward")
     assert order.index("run_ar.forward") > order.index("vq_decoder.encode")
@@ -153,7 +157,7 @@ def test_janus_joint_topological_order():
 def test_cycle_in_active_set_raises():
     with pytest.raises(ValueError, match="Circular dependency"):
         TrainingGraph(
-            edges=[
+            [
                 {"from": "vq_decoder", "to": "ar_llm"},
                 {"from": "ar_llm", "to": "vq_decoder"},
             ]
@@ -164,14 +168,14 @@ def test_cycle_in_active_set_raises():
 
 
 def test_sources_and_sinks_understanding_only():
-    g = TrainingGraph(edges=_understanding_only_edges())
+    g = TrainingGraph(_understanding_only_edges())
     assert set(g.sources) == {"vision_encoder.forward", "vq_decoder.forward"}
     # run_ar's only outgoing edge targets `end`, so it's a sink.
     assert g.sinks == ["run_ar.forward"]
 
 
 def test_sources_and_sinks_janus_joint():
-    g = TrainingGraph(edges=_janus_joint_edges())
+    g = TrainingGraph(_janus_joint_edges())
     assert set(g.sources) == {"vision_encoder.forward", "vq_decoder.encode"}
     # vq_decoder.gen_loss is the only sink (its only outgoing edge goes to `end`).
     assert g.sinks == ["vq_decoder.gen_loss"]
@@ -181,7 +185,7 @@ def test_sources_and_sinks_janus_joint():
 
 
 def test_module_and_method_lookup():
-    g = TrainingGraph(edges=_janus_joint_edges())
+    g = TrainingGraph(_janus_joint_edges())
     assert g.module_of("vq_decoder.encode") == "vq_decoder"
     assert g.method_of("vq_decoder.encode") == "encode"
     assert g.module_of("vq_decoder.gen_loss") == "vq_decoder"
@@ -190,7 +194,7 @@ def test_module_and_method_lookup():
 
 
 def test_module_lookup_raises_for_unknown():
-    g = TrainingGraph(edges=_janus_joint_edges())
+    g = TrainingGraph(_janus_joint_edges())
     with pytest.raises(KeyError):
         g.module_of("not_a_node")
 
@@ -198,7 +202,7 @@ def test_module_lookup_raises_for_unknown():
 # ── Execution lifecycle (cursor + step + maybe_transition) ────────────────────
 
 
-class _FakeOmniModule(ModuleMixin):
+class _FakeOmniModule(nn.Module, ModuleMixin):
     """Minimal stand-in for an OmniModule: callable (→ forward) + pre/post hooks.
 
     ``__call__`` delegates to ``self.forward`` so the non-``forward`` alias trick
@@ -206,6 +210,7 @@ class _FakeOmniModule(ModuleMixin):
     """
 
     def __init__(self, name: str):
+        super().__init__()
         self.name = name
 
     def pre_forward(self, method, **kwargs):
@@ -243,7 +248,7 @@ def _fake_modules(g: TrainingGraph) -> dict:
 
 
 def test_cursor_lifecycle():
-    g = TrainingGraph(edges=_understanding_only_edges())
+    g = TrainingGraph(_understanding_only_edges())
     assert not g.is_done()
     assert g.current_node_name == g.execution_order[0]
     # Walk the cursor manually.
@@ -260,8 +265,8 @@ def test_cursor_lifecycle():
 
 
 def test_plan_loop_flows_carrier_in_topological_order():
-    """Driving iter_nodes() + execute_train_node mirrors OmniModel.forward; carrier accretes per node."""
-    g = TrainingGraph(edges=_understanding_only_edges())
+    """Driving iter_nodes() + execute_train_node mirrors OmniModelRuntime.forward."""
+    g = TrainingGraph(_understanding_only_edges())
     modules = _fake_modules(g)
     batch = {"conversation_list": []}
     profiler = GraphProfiler()
@@ -273,6 +278,47 @@ def test_plan_loop_flows_carrier_in_topological_order():
     assert batch["conversation_list"][-1] == "run_ar.forward"
     assert set(batch["conversation_list"]) == {"vision_encoder.forward", "vq_decoder.forward", "run_ar.forward"}
     assert [t for t in trace if t.startswith("forward:")] == [f"forward:{n}" for n in g.execution_order]
+
+
+def _minimal_generation_graph(module: str = "run_ar") -> dict:
+    return {
+        "initial": "run",
+        "states": {
+            "run": {
+                "body": [{"from": module, "to": "end"}],
+                "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+            }
+        },
+    }
+
+
+def _minimal_generation_graphs(module: str = "run_ar") -> dict:
+    return {"infer_gen": _minimal_generation_graph(module)}
+
+
+def test_omni_model_runtime_forward_matches_manual_executor():
+    """OmniModelRuntime.forward must match the manual executor loop."""
+    edges = _understanding_only_edges()
+    g = TrainingGraph(edges)
+    modules = _fake_modules(g)
+    config = OmniConfig(
+        modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
+        training_graph=edges,
+        generation_graphs=_minimal_generation_graphs(),
+    )
+    model = OmniModel(config, modules)
+    runtime = OmniModelRuntime(model)
+
+    batch_runtime: dict = {"conversation_list": []}
+    batch_manual: dict = {"conversation_list": []}
+    profiler = GraphProfiler()
+
+    runtime.forward(batch_runtime, profiler=profiler)
+    g.reset()
+    for node in g.iter_nodes():
+        execute_train_node(modules, node, batch_manual, profiler=GraphProfiler())
+
+    assert batch_runtime == batch_manual
 
 
 def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
@@ -303,20 +349,25 @@ def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
 def _make_graph_profile_callback(output_dir, *, global_rank=0, **profile_kwargs):
     """A GraphProfileCallback wired to a stub OmniTrainer (no full trainer init)."""
     profile = OmniGraphProfileArguments(**profile_kwargs)
+    edges = _understanding_only_edges()
+    g = TrainingGraph(edges)
+    modules = _fake_modules(g)
+    config = OmniConfig(
+        modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
+        training_graph=edges,
+        generation_graphs=_minimal_generation_graphs(),
+    )
+    model = OmniModel(config, modules)
     trainer = OmniTrainer.__new__(OmniTrainer)
-    trainer.base = SimpleNamespace(
-        args=SimpleNamespace(
+    trainer.args = SimpleNamespace(
+        train=SimpleNamespace(
+            global_rank=global_rank,
             graph_profile=profile,
-            train=SimpleNamespace(
-                global_rank=global_rank,
-                checkpoint=SimpleNamespace(output_dir=str(output_dir)),
-            ),
+            checkpoint=SimpleNamespace(output_dir=str(output_dir)),
         ),
     )
-    callback = GraphProfileCallback.__new__(GraphProfileCallback)
-    callback.trainer = trainer
-    trainer.graph_profiler = None
-    return callback, trainer
+    trainer.model = OmniModelRuntime(model, module_runtimes={}, module_parallel_state_names=())
+    return GraphProfileCallback(trainer), trainer
 
 
 def test_graph_profile_callback_saves_training_graph_profile(tmp_path):
@@ -328,7 +379,7 @@ def test_graph_profile_callback_saves_training_graph_profile(tmp_path):
 
     # Step begin builds + binds the profiler for the step's forwards to consume.
     callback.on_step_begin(state)
-    profiler = trainer.graph_profiler
+    profiler = trainer.model.step_profiler
     assert profiler is not None
     with profiler.node("forward:run_ar.forward"):
         pass
@@ -338,7 +389,7 @@ def test_graph_profile_callback_saves_training_graph_profile(tmp_path):
     trace_path = output_dir / "graph_trace" / "step_000003_rank_0.txt"
     assert trace_path.exists()
     assert "forward:run_ar.forward | wall_ms=" in trace_path.read_text()
-    assert trainer.graph_profiler is None
+    assert trainer.model.step_profiler is None
 
 
 def test_graph_profile_callback_is_gated_outside_step_window(tmp_path):
@@ -347,17 +398,17 @@ def test_graph_profile_callback_is_gated_outside_step_window(tmp_path):
         output_dir, enable_wall_time=True, train_start_step=2, train_end_step=3
     )
 
-    # global_step outside [train_start_step, train_end_step] → no profiler bound,
-    # and end is a no-op (no trace file written).
+    # global_step outside [train_start_step, train_end_step] → callback skips init,
+    # and flush is a no-op (no trace file written).
     callback.on_step_begin(SimpleNamespace(global_step=5))
-    assert trainer.graph_profiler is None
+    assert trainer.model.step_profiler is None
     callback.on_step_end(SimpleNamespace(global_step=5))
     assert not (output_dir / "graph_trace").exists()
 
 
 def test_execute_train_node_dispatches_non_forward_method_via_wrapper():
     """A dotted ``module.encode`` node must run the module's ``encode`` (alias trick)."""
-    g = TrainingGraph(edges=[{"from": "vq_decoder.encode", "to": "end"}])
+    g = TrainingGraph([{"from": "vq_decoder.encode", "to": "end"}])
     modules = _fake_modules(g)
     node = next(g.iter_nodes())
     batch = execute_train_node(modules, node, {"conversation_list": []})
@@ -376,7 +427,7 @@ def test_execute_train_node_unwraps_ddp_style_wrapper():
         def __call__(self, **kwargs):
             return self.module.forward(**kwargs)
 
-    g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    g = TrainingGraph([{"from": "run_ar", "to": "end"}])
     inner = _FakeOmniModule("run_ar")
     node = next(g.iter_nodes())
     batch = execute_train_node({"run_ar": _DDPWrap(inner)}, node, {"conversation_list": []})
@@ -460,7 +511,7 @@ def test_execute_train_node_applies_module_scope():
         scoped.append(name)
         yield
 
-    g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    g = TrainingGraph([{"from": "run_ar", "to": "end"}])
     node = next(g.iter_nodes())
     execute_train_node(_fake_modules(g), node, {"conversation_list": []}, scope_fn=scope_fn)
     assert scoped == ["run_ar"]
@@ -473,14 +524,14 @@ def test_execute_train_node_merges_loss_into_batch():
             out["_loss"] = 1.5
             return out
 
-    g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    g = TrainingGraph([{"from": "run_ar", "to": "end"}])
     node = next(g.iter_nodes())
     batch = execute_train_node({"run_ar": _LossModule("run_ar")}, node, {"conversation_list": []})
     assert batch["_loss"] == 1.5
 
 
 def test_execute_train_node_raises_for_missing_module():
-    g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    g = TrainingGraph([{"from": "run_ar", "to": "end"}])
     node = next(g.iter_nodes())
     with pytest.raises(KeyError, match="missing from modules dict"):
         execute_train_node({}, node, {"conversation_list": []})
@@ -490,7 +541,7 @@ def test_execute_train_node_raises_for_missing_module():
 
 
 def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
-    g = TrainingGraph(edges=_janus_joint_edges())
+    g = TrainingGraph(_janus_joint_edges())
     out = g.to_mermaid(title="Janus Joint Training")
 
     # Frontmatter, ELK renderer hint, then LR flowchart.
@@ -525,7 +576,7 @@ def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
 
 
 def test_to_mermaid_always_draws_data_pseudo_node():
-    g = TrainingGraph(edges=_janus_joint_edges())
+    g = TrainingGraph(_janus_joint_edges())
     out = g.to_mermaid()
     assert "data[(data)]" in out
     assert "data -.-> vision_encoder_forward" in out
@@ -551,3 +602,47 @@ def test_generation_graph_mermaid_stacks_state_body_nodes():
     assert "flowchart LR" in out
     assert "subgraph state_prompt [prompt]\n        direction TB" in out
     assert "prompt__encoder_encode --> prompt__decoder_decode" in out
+
+
+class _DdpStyleWrapper(nn.Module):
+    """Minimal DDP-shaped wrapper: hooks live on ``.module``."""
+
+    def __init__(self, inner: nn.Module):
+        super().__init__()
+        self.module = inner
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+def test_named_omni_modules_unwraps_ddp_style_wrapper():
+    edges = _understanding_only_edges()
+    g = TrainingGraph(edges)
+    raw_modules = _fake_modules(g)
+    wrapped_modules = {name: _DdpStyleWrapper(mod) for name, mod in raw_modules.items()}
+    config = OmniConfig(
+        modules={name: {"subfolder": name} for name in raw_modules},
+        training_graph=edges,
+        generation_graphs=_minimal_generation_graphs(),
+    )
+    model = OmniModel(config, wrapped_modules)
+
+    resolved = dict(model.named_omni_modules())
+    assert set(resolved) == set(raw_modules)
+    for name, raw in resolved.items():
+        assert raw is raw_modules[name]
+        assert not isinstance(raw, _DdpStyleWrapper)
+
+
+def test_named_omni_modules_skips_non_modulemixin():
+    class _PlainModule(nn.Module):
+        def forward(self, x):
+            return x
+
+    config = OmniConfig(
+        modules={"plain": {"subfolder": "plain"}},
+        training_graph=[{"from": "plain", "to": "end"}],
+        generation_graphs=_minimal_generation_graphs("plain"),
+    )
+    model = OmniModel(config, {"plain": _PlainModule()})
+    assert list(model.named_omni_modules()) == []

@@ -1,15 +1,13 @@
 # SeedOmni V2 架构设计
 
-> **Schema note (current)**: SeedOmni V2 不再使用独立的 `nodes:` / `edges:` 池。`training_graph`（训练）与 `generation_graph.states.<name>.body`（推理）都是**扁平的 edge 列表**，每个 edge 的端点直接写成 `module[.method]` 字符串——裸 module 在训练默认 `.forward`、推理默认 `.generate`；带点的 `module.method` 原样使用。node 的身份就是其规范化的 `"<module>.<method>"`。本文档下方残留的 `nodes:` / `edges:` 池示例与 `output:` / `as:` 路由字段均已废弃，请以扁平 edge 列表 + `module[.method]` 端点为准（edge 仅声明拓扑顺序，数据通过共享 `conversation_list` / `ctx` 流动）。
->
-> SeedOmni V2 (`veomni/models/seed_omni/`) 重写——把固定的 `Encoder → Foundation → Decoder` 三元结构换成**显式图声明**的模块化系统。`ModuleMixin` 是共享 mixin 基类；每个子模型再写 `XxxModuleMixin(ModuleMixin)`（`modulemixin.py`）并与 HuggingFace `PreTrainedModel` 多继承（`modeling.py`）。`training_graph` 是一条条 edge（`{from, to}`，端点为 `module[.method]`），node 由 endpoints 自动并出；同一 module 可挂多个 method。每个 node 必有出边——指向另一个 node 或保留关键字 `end`（虚拟终点），保证图无孤岛、无环。训练执行序由 topo sort 推导（可视化时画出 forward queue + `data` 伪节点）；推理由 FSM 驱动，每个 state 的 `body` 也是一条条内联 edge，可无限循环（text→image→text→image→...）。**数据完全 model-agnostic**：raw_batch 起点只有 `conversation_list`（list of dict，含 type / value / role / loss_mask），chat template / tokenize / image processor / boundary marker 注入全部由对应 module 在 forward 阶段自管——同一份数据可同时喂给任意 ug 模型；每个 module 的 `forward(**kwargs) -> Dict` 返回 dict 被框架按 edge.output 立刻写回 raw_batch（data 100% 走 raw_batch、module 之间不互相返回值）；collator helper / SP slice 由各 module 自己在 pre_forward 中按需调用（ViT 切 image batch、text encoder 切 sequence，各管各的）。loss 按 `_loss` 后缀隐式收集——每个 module 一次 forward 内部把所有 micro-batch 跑完，`post_forward` 自己做 token-level mean，OmniModel 顶层只把各 module 的标量 `_loss` 加起来。并行采用全局单一 `ParallelState`，OmniModel 顶层单次 `build_parallelize_model` 包装，`ParallelPlan` 由子模块递归聚合。生命周期上 weights 走 `build_foundation_model` + `build_parallelize_model`（多模块 path dict）、save 由各 module-trainer 的 `OmniModuleHfCallback` / `OmniModuleLoraCallback` 写到各 subfolder（config + 可选 processor/tokenizer 资产）。**配置拆分**：`base.yaml`（`model.model_path` + `model.modules` + `model.train_graph` + 顶层 `accelerator` + `infer` 块）→ `OmniConfig.from_omni_args` 合并 train/infer module 覆盖并解析相对 `model.model_path`。**FSM 转移**：只有 `module_signal` 与 `default` 两种 condition；text 侧由 `JanusTextEncoder` 通过 `module._tokenizer` 解析后发出 `start_image_gen` / `text_done` 等信号。**不保留 V1 兼容**。
+> SeedOmni V2 (`veomni/models/seed_omni/`) 重写——把固定的 `Encoder → Foundation → Decoder` 三元结构换成**显式图声明**的模块化系统。`ModuleMixin` 是共享 mixin 基类；每个子模型再写 `XxxModuleMixin(ModuleMixin)`（`modulemixin.py`）并与 HuggingFace `PreTrainedModel` 多继承（`modeling.py`）。`training_graph` 是一条条 edge（`{from, to}`，端点为 `module[.method]`），node 由 endpoints 自动并出；同一 module 可挂多个 method。每个 node 必有出边——指向另一个 node 或保留关键字 `end`（虚拟终点），保证图无孤岛、无环。训练执行序由 topo sort 推导（可视化时画出 forward queue + `data` 伪节点）；推理由 FSM 驱动，每个 state 的 `body` 也是一条条内联 edge，可无限循环（text→image→text→image→...）。**数据完全 model-agnostic**：raw_batch 起点只有 `conversation_list`（list of dict，含 type / value / role / loss_mask），chat template / tokenize / image processor / boundary marker 注入全部由对应 module 在 forward 阶段自管——同一份数据可同时喂给任意 ug 模型；每个 module 的 `forward(**kwargs) -> Dict` 返回 dict 被框架写回共享 `raw_batch`（data 100% 走 raw_batch、module 之间不互相返回值）；collator helper / SP slice 由各 module 自己在 pre_forward 中按需调用（ViT 切 image batch、text encoder 切 sequence，各管各的）。loss 按 `_loss` 后缀隐式收集——每个 module 一次 forward 内部把所有 micro-batch 跑完，`post_forward` 自己做 token-level mean，OmniModel 顶层只把各 module 的标量 `_loss` 加起来。并行采用全局单一 `ParallelState`，OmniModel 顶层单次 `build_parallelize_model` 包装，`ParallelPlan` 由子模块递归聚合。生命周期上 weights 走 `build_foundation_model` + `build_parallelize_model`（多模块 path dict）、save 由各 module-trainer 的 `OmniModuleHfCallback` / `OmniModuleLoraCallback` 写到各 subfolder（config + 可选 processor/tokenizer 资产）。**配置拆分**：`base.yaml`（`model.model.model_path` + `model.model.model_config.modules` + `model.model.model_config.train_graph` + `model.accelerator` + `infer` 块）→ `OmniArguments.resolve_model()`（`omni_arguments/model_runtime.py`）合并 train/infer module 覆盖并解析相对 `model.model.model_path`，产出 runtime config（`OmniModelRuntimeArguments`）；`.to_hf_config()` 才投影成 HF `OmniConfig`。**FSM 转移**：只有 `module_signal` 与 `default` 两种 condition；text 侧由 `JanusTextEncoder` 通过 `module._tokenizer` 解析后发出 `start_image_gen` / `text_done` 等信号。**不保留 V1 兼容**。
 
 ## 总纲（不变量）
 
 1. **`module` ≠ `node` ≠ `edge`**：实例 / 调用 / 数据流，三层各司其职。
 2. **一个 module instance 可挂任意多个 node**；同 method 也可承担多个角色（按 kwargs 自分派）。
 3. **训练 = DAG（一次拓扑遍历），推理 = FSM（含环、按状态转移循环）**。
-4. **永远不自动推导"图结构本身"**：`edges` 必须 config 显式给出。但**执行顺序可由 topo sort 从 edges 推导**——可视化训练图时画出 forward queue；FSM 因含环不可推导执行序，只可视化状态转移图。
+4. **永远不自动推导"图结构本身"**：edge 列表必须 config 显式给出。但**执行顺序可由 topo sort 从 edges 推导**——可视化训练图时画出 forward queue；FSM 因含环不可推导执行序，只可视化状态转移图。
 
 ## 背景与问题
 
@@ -56,29 +54,31 @@ Tuna-2 https://github.com/facebookresearch/tuna-2
 
 两套执行语义分开实现：`OmniModel.forward()` 跑 DAG 遍历，`OmniModel.generate()` 跑状态机。
 
-### 核心思路：nodes（call-site）+ edges（数据依赖）+ end（虚拟终点）
+### 核心思路：扁平 edge 列表 + `end`（虚拟终点）
 
-去掉 encoder / foundation / decoder 的固定角色，用两个平级的池子 + 一个保留关键字描述整张图：
+去掉 encoder / foundation / decoder 的固定角色，用**扁平 edge 列表**描述整张图——每条 edge 只有两个端点 `{from, to}`，端点是 `module[.method]` 字符串：
 
-- **`nodes:`** 图节点池——每个 entry 是一个 call-site，对应一次 `module.method` 调用。同一 module 可以挂多个 node（如 VAE 的 `encode` 与 `decode`，共享一份参数但是图上两个独立节点）。不指定 `method` 时**训练默认 `forward`、推理默认 `generate_step`**。
-- **`edges:`** 图边池——每条边把上游 node 输出 dict 里的某个 key 路由到下游 node 的某个 kwarg：`{from: A, output: k, to: B, as: m}`。
-- **`end`：保留关键字**——所有 sink（如 `*_loss` 产出位）必须有一条 `to: end` 的边。**任何 node 至少有一条出边**，无孤岛；自环 / 任何环严格禁止（自环= for-loop，应在模块内部实现）。
+- **裸 module 名**（如 `janus_siglip`）→ 训练默认 `.forward`，推理默认 `.generate`
+- **带点 method**（如 `janus_vqvae.encode`、`janus_text_encoder.emit_image_start`）→ 训推都调该 method
+- **`end`** — 保留关键字，所有 sink 必须有一条 `to: end` 的边。**任何 node 至少有一条出边**，无孤岛；自环 / 任何环严格禁止（自环 = for-loop，应在模块内部实现）
 
-**nodes 与 edges 是独立命名空间**：FSM body 只查 edges 池、edges 的 `from`/`to` 只查 nodes 池（外加 `end` 关键字），名字可以重名互不冲突。
+**node 由 edge endpoints 自动并出**：node 的身份是其规范化的 `"<module>.<method>"` 字符串，无需独立的 `nodes:` 池。同一 module 可以挂多个 method 端点（如 `janus_vqvae.encode` 与 `janus_vqvae.decode`），共享一份参数但是图上两个独立节点。
 
-激活子集 `training_graph` 只列 `edges`，nodes 由 edge endpoints 自动并出；执行顺序由 edges 拓扑序自动推导（**这是唯一的"自动"**，结构本身仍要显式给出）。`generation_graph.states.<name>.body` 同样只列 edges。
+edge **只声明拓扑顺序**，不携带 `output:` / `as:` 路由字段——数据通过共享 `conversation_list` / `raw_batch` / `ctx` 流动，各 module 从 carrier 按自己的 input keys 取。
+
+`graph_train.yaml` **就是** training DAG 的 edge 列表（顶层无 wrapper key）；`graph_infer_*.yaml` **就是** 一张 FSM（顶层 `initial:` + `states:`），每个 state 的 `body` 也是内联 edge 列表。
 
 ```
-modules pool             nodes pool                                edges pool
-─────────────────────    ─────────────────────────────────         ────────────────────────────────────────────────
-janus_siglip      ──→    vit_encode   → siglip.forward             vit_to_llama:        vit_encode → janus_llama
-janus_vqvae       ──→    vae_encode   → vqvae.encode               vae_enc_to_llama:    vae_encode → janus_llama
-janus_text_encoder  ──→    vae_decode   → vqvae.decode               tok_enc_to_llama:    tok_encode → janus_llama
-janus_llama       ──→    tok_encode   → text_encoder.encode          llama_to_tok_decode: janus_llama → tok_decode
-                         tok_decode   → text_encoder.decode          llama_to_vae_decode: janus_llama → vae_decode
-                         janus_llama  → ar_llm.forward             tok_decode_to_end:   tok_decode → end  (lm_loss)
-                                                                   vae_decode_to_end:   vae_decode → end  (gen_loss)
-                                                                   ↑ to: end 是 sink 锚（拓扑标记）；loss 仍按 _loss 后缀收集
+modules pool                    graph_train.yaml（扁平 edge 列表）
+─────────────────────           ────────────────────────────────────────────────
+janus_siglip      ──→            - {from: janus_siglip,              to: janus_llama}
+janus_vqvae       ──→            - {from: janus_vqvae.encode,        to: janus_llama}
+janus_text_encoder──→            - {from: janus_text_encoder.encode, to: janus_llama}
+janus_llama       ──→            - {from: janus_llama,               to: janus_text_encoder.decode}
+                                 - {from: janus_llama,               to: janus_vqvae.decode}
+                                 - {from: janus_text_encoder.decode, to: end}
+                                 - {from: janus_vqvae.decode,        to: end}
+                                 ↑ to: end 是 sink 锚（拓扑标记）；loss 仍按 _loss 后缀收集
 ```
 
 ---
@@ -136,23 +136,43 @@ class JanusTextEncoder(JanusTextEncoderModuleMixin, TextEncoder):
 |------|------|
 | **Launcher**（`base.yaml`） | VeOmni 训练 / 推理共用入口：`model.model_path`（split checkpoint 根）、`model.modules` / `model.train_graph`、顶层 `accelerator`（v2 把 accelerator 从 `train` 提到与 `model`/`data`/`train` 平级）、`train.*` / `data.*`，以及 `infer` 块（`infer.modules` / `infer.infer_graph`（scenario → infer YAML）/ `infer.infer_type` / `infer.generation_kwargs` / 可选 `infer.model_path`） |
 | **Train modules**（`modules_train.yaml`） | 每个 module 的训练覆盖（`model` / `train` / `accelerator`）。``modules.*.model.model_path`` 写**相对**子目录名（如 `janus_siglip`）或绝对路径 |
-| **Train graph**（`graph_train.yaml`） | `training_graph`（扁平 edge 列表，端点为 `module[.method]`） |
+| **Train graph**（`graph_train.yaml`） | 文件本身**就是**扁平 edge 列表（顶层无 wrapper key），端点为 `module[.method]` |
 | **Infer modules**（`modules_infer.yaml`，可选） | 每个 module 的推理覆盖，与 train modules **按模块名 deep-merge**；默认每个 module 走 eager 加载 |
-| **Infer graph**（`graph_infer_*.yaml`） | 每个场景一个 `generation_graph`，由 `infer.infer_graph` 映射 |
+| **Infer graph**（`graph_infer_*.yaml`） | 一个文件一个场景，文件本身**就是**那张 FSM（顶层 `initial:` / `states:`，无 wrapper key），由 `infer.infer_graph` 映射 |
 
-运行时加载（训练 / 推理均通过 `OmniConfig.from_omni_args`，由 `OmniArguments.load_omni_config()` / `load_omni_infer_config()` 调用）：
+运行时加载（训练 / 推理均通过 `veomni.omni_arguments.model_runtime`，由 `OmniArguments.resolve_model()` 调用；推理时传 `for_inference=True`）：
 
 ```python
-cfg = OmniConfig.from_omni_args(
-    global_args=args._to_base_args(),    # OmniArguments -> VeOmniArguments base
-    model_path="/tmp/janus_1.3b_split",
-    modules="configs/seed_omni/Janus/janus_1.3b/modules_train.yaml",
-    train_graph="configs/seed_omni/Janus/janus_1.3b/graph_train.yaml",
-    # 推理时改传 infer_modules / infer_graph / generation_kwargs
-)
+from veomni.arguments import OmniArguments
+
+args = OmniArguments(...)  # 或 parse_omni_args(...)
+runtime_cfg = args.resolve_model(for_inference=True)
+
+cfg = runtime_cfg.to_hf_config()     # 需要 HF checkpoint 形态时才转
 ```
 
-`from_omni_args` 把 train / infer 的 module 覆盖合并到 launcher `global_args` 上，并把相对 `model.model_path` join 到 `model_path` 根目录；module 块顶层的 `accelerator` 会被 lift 到 `train.accelerator`。
+### runtime config vs `OmniConfig`
+
+**`resolve_omni_model()` 返回的是 runtime config（`OmniModelRuntimeArguments`），不是 `OmniConfig`。**
+保留 launcher 的全部信息：拆分 checkpoint 根目录 `model_path`、deep-merge 后的每模块块
+（含绝对路径与 `accelerator` / `train` 设置）、以及全部图。**这里不丢任何东西。**
+
+投影到 checkpoint 形态的 `OmniConfig`（只留 `subfolder` + 可选 `model.model_config`）是一步
+**显式**转换 `.to_hf_config()`，只在真正需要 HF 产物的地方调用：
+
+- `OmniModelRuntime.from_model_runtime()` / `OmniInferencer` —— `OmniModel` 是 `PreTrainedModel`，
+  需要它来 save assets / `save_pretrained`；
+- `scripts/seed_omni/export_omni_checkpoint.py` —— 要写出 HF checkpoint。
+
+只读图的消费者（如 `scripts/visualize_omni_graph.py`）直接用 runtime config，不需要转换。
+
+`OmniConfig` 本身（`configuration_omni.py`）是纯 HF `PretrainedConfig`，
+不 import `veomni.arguments`。
+
+**所有场景都会被载入** `cfg.generation_graphs`（`{infer_type: FSM}`），`cfg.infer_type` 只决定哪个生效，
+`cfg.generation_graph` 属性返回激活的那张图（runtime config 与 `OmniConfig` 都有这组属性）。因此一份导出的
+checkpoint 能同时服务 gen / und / edit——换场景只需改 `config.infer_type` 再重建模型（`OmniModel` 在
+`__init__` 绑定单张 FSM，不支持已建模型上热切换）。
 
 图可视化（一条命令出四张图）：
 
@@ -166,10 +186,10 @@ python scripts/visualize_omni_graph.py configs/seed_omni/Janus/janus_1.3b/base.y
 | Section | 职责 |
 |---|---|
 | `modules` | 模型实例池：name → launcher args 深合并后的 per-module 配置块（含 `model.model_path`）。**不写 model_type** |
-| `training_graph` | 扁平 edge 列表（`{from, to}`，端点为 `module[.method]` 字符串）；`TrainingGraph` 据 endpoints 自动并出 nodes、按 topo 排序（DAG 视图）。无独立 `nodes` / `edges` 池 |
-| `generation_graph` | 推理 FSM；`states.<name>.body` 是一条条内联 `{from, to}` edge（端点 `module[.method]`，裸 module 默认 `.generate`）（FSM 视图） |
+| `graph_train.yaml` | 文件本身就是扁平 edge 列表（`{from, to}`，端点为 `module[.method]` 字符串）；`TrainingGraph` 据 endpoints 自动并出 nodes、按 topo 排序（DAG 视图） |
+| `graph_infer_*.yaml` | 文件本身就是推理 FSM（顶层 `initial:` + `states:`）；每个 state.body 是内联 `{from, to}` edge（裸 module 默认 `.generate`） |
 
-同一个 module 可以挂多个 node，每次以不同 method 被调用，但**模型实例不拆分**——`janus_vqvae.encode` 和 `janus_vqvae.decode` 是图上两个独立节点，共享一个 `JanusVQDecoder` 实例；同一个 method 也可以承担训练 + 推理两条 input pathway，靠 kwargs 自分派（`vae_decode` 是这种统一 head 的典型例子）。
+同一个 module 可以挂多个 method 端点，但**模型实例不拆分**——`janus_vqvae.encode` 和 `janus_vqvae.decode` 是图上两个独立 node，共享一个 `JanusVQDecoder` 实例；同一个 method 也可以承担训练 + 推理两条 input pathway，靠 kwargs 自分派（`janus_vqvae.decode` 是这种统一 head 的典型例子）。
 
 > **`text_encoder`：model-specific 的 chat-template + wte + lm_head 模块。** 这一层是 V2 数据流的核心枢纽：
 > - **Tokenizer 资产** 住在 ``modules/<family>/text_encoder/tokenizer/``；build 时挂到 ``module._tokenizer``，special-token id **不落 config**；
@@ -189,86 +209,71 @@ modules:
   janus_llama:        {model: {model_path: janus_llama}}
   janus_text_encoder: {model: {model_path: janus_text_encoder}}
 
-# ── 图节点池（每个 entry 是一次 module.method 调用）─────────────────
-#
-# {module: X}              → 训练用 X.forward / 推理用 X.generate_step
-# {module: X.method}       → 训推都用 X.method（dotted 简写）
-# {module: X, method: m}   → 同上（等价展开）
-nodes:
-  vit_encode:  {module: janus_siglip}                          # conversation_list[image*] → image_embeds + 注入 boi/eoi item
-  vae_encode:  {module: janus_vqvae,      method: encode}      # conversation_list[vq_image*] → gen_embeds + vq_token_ids
-  vae_decode:  {module: janus_vqvae,      method: decode}      # 统一 VQ head（见下方说明）
-  tok_encode:  {module: janus_text_encoder, method: encode}      # conversation_list → split conversation_list (value=inputs_embeds) + flat input_ids/labels/attention_mask
-  tok_decode:  {module: janus_text_encoder, method: decode}      # 统一 text head（见下方说明）
-  janus_llama: {module: janus_llama}                           # inputs_embeds + image embeds → splice → hidden_states
+# ── graph_train.yaml：文件本身就是 training DAG 的 edge 列表 ────────
+# 每个端点是 module[.method] 字符串；裸 module → .forward
+- { from: janus_siglip,              to: janus_llama }
+- { from: janus_vqvae.encode,        to: janus_llama }
+- { from: janus_text_encoder.encode, to: janus_llama }
+- { from: janus_llama,               to: janus_text_encoder.decode }
+- { from: janus_llama,               to: janus_vqvae.decode }
+- { from: janus_text_encoder.decode, to: end }
+- { from: janus_vqvae.decode,        to: end }
 
-# ── 图边池（数据依赖；to: end 表示 sink）────────────────────────────
-#
-# {from: A, output: k, to: B, as: m}
-#   声明 A 的返回 dict 中 k 字段是 B 的依赖；A 一旦执行，k 被框架按 as=m
-#   写回 raw_batch（如果 as 缺省则按 output=k 写回）；B 执行时从 raw_batch
-#   按自己的 input keys 取。raw_batch 全局透明，edge 是依赖契约 + 拓扑
-#   标记，不是数据通道。
-# {from: A, output: k, to: end}
-#   sink 边——保证图无孤岛；loss 数值仍由 *_loss 后缀隐式收集。
-edges:
-  # ── 训练数据边
-  vit_to_llama:       {from: vit_encode,  output: image_embeds,  to: janus_llama, as: und_image_embeds}
-  vae_enc_to_llama:   {from: vae_encode,  output: gen_embeds,    to: janus_llama, as: gen_image_embeds}
-  tok_enc_to_llama:   {from: tok_encode,  output: inputs_embeds, to: janus_llama, as: inputs_embeds}
-  llama_to_tok_decode:{from: janus_llama, output: hidden_states, to: tok_decode,  as: hidden_states}
-  llama_to_vae_decode:{from: janus_llama, output: hidden_states, to: vae_decode,  as: hidden_states}
-  vae_tok_to_decode:  {from: vae_encode,  output: vq_token_ids,  to: vae_decode,  as: gt_token_ids}
+# ── graph_infer_gen.yaml：文件本身就是一张 FSM ────────────────────
+# 顶层 initial + states；每个 state.body 是内联 edge 列表
+initial: prompt_encode
 
-  # ── 训练 sink 边（to: end，保证无孤岛；loss 仍按 _loss 后缀收集）
-  tok_decode_to_end:  {from: tok_decode,  output: lm_loss,       to: end}
-  vae_decode_to_end:  {from: vae_decode,  output: gen_loss,      to: end}
+states:
+  prompt_encode:
+    body:
+      - { from: janus_siglip,       to: janus_llama }
+      - { from: janus_text_encoder, to: janus_llama }
+      - { from: janus_llama,        to: end }
+    transitions:
+      - { condition: { type: default }, next_state: image_vq_start }
 
-  # ── 推理反馈边
-  vae_decode_to_llama:{from: vae_decode,  output: embed,         to: janus_llama, as: inputs_embeds}
-  # 推理时 decode 产出的 (B,1) step token 由框架 append 到 ctx["input_ids"]；
-  # 下一步 tok_encode 在有 past_key_values 时只 embed input_ids[:, -1:]。
+  image_vq_start:
+    body:
+      - { from: janus_text_encoder.emit_image_start, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: image_vq }
 
-# ── 训练 DAG（只列 edges；nodes 由 endpoints 自动并出，topo 推执行序）
-training_graph:
-  edges:
-    - vit_to_llama
-    - vae_enc_to_llama
-    - tok_enc_to_llama
-    - llama_to_tok_decode
-    - llama_to_vae_decode
-    - vae_tok_to_decode
-    - tok_decode_to_end
-    - vae_decode_to_end
+  image_vq:
+    body:
+      - { from: janus_llama, to: janus_vqvae }
+      - { from: janus_vqvae, to: janus_llama }
+    transitions:
+      - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
-# ── 推理图（FSM）；state.body 也只列 edges
-generation_graph:
-  initial: text_ar
-  states: { ... }                 # 见 "推理：生成图" 节
+  image_vq_end:
+    body:
+      - { from: janus_text_encoder.emit_image_end, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: done }
 ```
 
 **只改 config 即可完成模块替换**：
 - 把 `janus_llama` 的 `model.model_path` 指向其他 backbone 子目录 → 换了 backbone（`model_type` 自动从新 path 的 config.json 读）
 - 把 `janus_siglip` 改成另一份 vision encoder ckpt → 换了 vision encoder
-- 新增 `talker` 模块 + 对应 node/edges → 支持 Qwen-Omni 风格的双 LLM
+- 新增 `talker` 模块 + 对应 edge 端点 → 支持 Qwen-Omni 风格的双 LLM
 
 ### 3. `OmniModel`：两套执行语义
 
 ```python
 class OmniModel(PreTrainedModel, GenerationMixin):
     modules_dict: nn.ModuleDict          # 模块实例（一份 module 一个 key）
-    graph:        TrainingGraph          # 训练 DAG（节点 = call-site，边 = 数据依赖）
-    fsm:          GenerationGraph        # 推理 FSM（基于同一对 nodes/edges 池）
+    graph:        TrainingGraph          # 训练 DAG（端点 = module[.method]）
+    fsm:          GenerationGraph        # 推理 FSM（state.body = 内联 edge 列表）
 
     # ── 训练路径：node DAG 一次遍历 ──────────────────────────────────────
     def forward(self, **batch) -> OmniOutput:
         node_outputs = {}                  # 索引 = node 名
         losses = {}
-        for n in self.graph.execution_order:            # 由 edges topo 推出的 node 序
-            module_name = self.graph.module_of(n)
-            method      = self.graph.method_of(n)       # 默认 forward
+        for endpoint in self.graph.execution_order:   # 由 edge topo 推出的 node 序
+            module_name = self.graph.module_of(endpoint)
+            method      = self.graph.method_of(endpoint)  # 默认 forward
             module      = self.modules_dict[module_name]
-            inputs      = batch   # edges 仅声明拓扑顺序，无 per-node 路由；共享 conversation_list 载体
+            inputs      = batch   # edge 仅声明拓扑顺序；共享 conversation_list 载体
             # 一次调用内部把本 step 的所有 micro-batch 跑完：模块 forward
             # 自己迭代 micro-batches → 累加 token-sum loss / 累加 token_count →
             # post_forward 里做一次 token-level mean，吐出标量 `*_loss`
@@ -276,15 +281,15 @@ class OmniModel(PreTrainedModel, GenerationMixin):
                 outputs = module(**inputs)              # 走 FSDP 包装层
             else:
                 outputs = getattr(_unwrap(module), method)(**inputs)  # 直调 raw module
-            node_outputs[n] = outputs
+            node_outputs[endpoint] = outputs
             # _loss 后缀隐式收集；此时每个 _loss 已经是 mean 后的标量
-            losses |= {f"{n}/{k}": v for k, v in outputs.items() if k.endswith("_loss")}
+            losses |= {f"{endpoint}/{k}": v for k, v in outputs.items() if k.endswith("_loss")}
         # 顶层只把各 module 已 mean 的标量 loss 求和（无须再加权）
         total_loss = sum(losses.values()) if losses else None
         return OmniOutput(
             losses=losses,
             total_loss=total_loss,
-            **{f"{n}_out": o for n, o in node_outputs.items()},
+            **{f"{ep}_out": o for ep, o in node_outputs.items()},
         )
 
     # ── 推理路径：状态机分发 ────────────────────────────────────────────
@@ -320,62 +325,61 @@ class OmniModel(PreTrainedModel, GenerationMixin):
 
 ## 训练数据流
 
-训练时 teacher forcing，AR LLM 一次 forward 处理完整序列，整体是个 node DAG。每个 node 跑一遍 `forward`：返回 dict 被框架立刻按 edge.output 写回 raw_batch；下游 module 从同一 raw_batch 按自己的 input keys 取。同一 module 可以挂多个 node，分别调不同 method。
+训练时 teacher forcing，AR LLM 一次 forward 处理完整序列，整体是个 node DAG。每个 node 跑一遍 `forward`：返回 dict 被框架写回共享 raw_batch；下游 module 从同一 raw_batch 按自己的 input keys 取。同一 module 可以挂多个 method 端点（如 `janus_vqvae.encode` / `janus_vqvae.decode`），共享一份参数。
 
 ```mermaid
 flowchart TD
     data["data[(data)]"]
 
-    subgraph exec ["OmniModel.forward — training_graph.edges 拓扑一次遍历"]
-        vit["vit_encode<br/><i>janus_siglip.forward</i><br/>← conversation_list<br/>→ {image_embeds, conversation_list (+ boi/eoi items)}"]
-        vae_e["vae_encode<br/><i>janus_vqvae.encode</i><br/>← conversation_list<br/>→ {gen_embeds, vq_token_ids, conversation_list (+ boi/eoi items)}"]
-        tok_e["tok_encode<br/><i>text_encoder.encode</i><br/>← conversation_list (含 boundary markers)<br/>→ {conversation_list (split, value=inputs_embeds), input_ids, labels, attention_mask}"]
-        ar["janus_llama<br/><i>janus_llama.forward</i><br/>← conversation_list (split)<br/>← und_image_embeds (vit)<br/>← gen_image_embeds (vae_encode)<br/>← labels / attention_mask (tok_encode)<br/>splice: 按 segment 顺序替换 placeholder → N patch tokens<br/>→ {hidden_states}"]
-        tok_d["tok_decode<br/><i>text_encoder.decode</i><br/>← hidden_states<br/>← labels (raw_batch)<br/>→ {_loss}  scalar, post_forward 内 token-mean"]
-        vae_d["vae_decode<br/><i>janus_vqvae.decode</i><br/>← hidden_states<br/>← gt_token_ids (vae_encode)<br/>→ {_loss}  scalar, post_forward 内 token-mean"]
+    subgraph exec ["OmniModel.forward — training_graph 拓扑一次遍历"]
+        siglip["janus_siglip<br/><i>.forward</i><br/>← conversation_list<br/>→ {image_embeds, conversation_list (+ boi/eoi items)}"]
+        vae_enc["janus_vqvae.encode<br/><i>.encode</i><br/>← conversation_list<br/>→ {gen_embeds, vq_token_ids, conversation_list (+ boi/eoi items)}"]
+        tok_enc["janus_text_encoder.encode<br/><i>.encode</i><br/>← conversation_list (含 boundary markers)<br/>→ {conversation_list (split, value=inputs_embeds), input_ids, labels, attention_mask}"]
+        ar["janus_llama<br/><i>.forward</i><br/>← conversation_list (split)<br/>← image embeds (siglip)<br/>← gen embeds (vqvae.encode)<br/>← labels / attention_mask (text_encoder.encode)<br/>splice: 按 segment 顺序替换 placeholder → N patch tokens<br/>→ {hidden_states}"]
+        tok_dec["janus_text_encoder.decode<br/><i>.decode</i><br/>← hidden_states<br/>← labels (raw_batch)<br/>→ {_loss}  scalar, post_forward 内 token-mean"]
+        vae_dec["janus_vqvae.decode<br/><i>.decode</i><br/>← hidden_states<br/>← gt_token_ids (vqvae.encode)<br/>→ {_loss}  scalar, post_forward 内 token-mean"]
         endN((end))
     end
 
-    data -.-> vit & vae_e & tok_e
-    vit -.modify.-> data
-    vae_e -.modify.-> data
-    tok_e -.modify.-> data
-    vit -->|"as: und_image_embeds"| ar
-    vae_e -->|"as: gen_image_embeds"| ar
-    tok_e -->|"as: inputs_embeds"| ar
-    ar -->|"as: hidden_states"| tok_d
-    ar -->|"as: hidden_states"| vae_d
-    vae_e -->|"as: gt_token_ids"| vae_d
-    tok_d -.->|"to: end (_loss)"| endN
-    vae_d -.->|"to: end (_loss)"| endN
+    data -.-> siglip & vae_enc & tok_enc
+    siglip -.modify.-> data
+    vae_enc -.modify.-> data
+    tok_enc -.modify.-> data
+    siglip --> ar
+    vae_enc --> ar
+    tok_enc --> ar
+    ar --> tok_dec
+    ar --> vae_dec
+    tok_dec -.->|"to: end (_loss)"| endN
+    vae_dec -.->|"to: end (_loss)"| endN
 ```
 
-**Forward queue 由 topo sort 自动推导**——`scripts/visualize_omni_graph.py`（传入 launcher YAML）会基于 `training_graph.edges` 跑 Kahn topo sort，并画 **`data[(data)]` 伪节点**指向所有 source node（表示 kwargs 来自共享 batch dict）。注意 **`tok_encode` 必须等 `vit_encode` / `vae_encode` 完成**——它们对 `conversation_list` 的修改（插入 boi/eoi marker item）是 `tok_encode` 拼接 chat template 时的必要前置：
+**Forward queue 由 topo sort 自动推导**——`scripts/visualize_omni_graph.py`（传入 launcher YAML）会基于 `training_graph` edge 列表跑 Kahn topo sort，并画 **`data[(data)]` 伪节点**指向所有 source node（表示 kwargs 来自共享 batch dict）。注意 **`janus_text_encoder.encode` 必须等 `janus_siglip` / `janus_vqvae.encode` 完成**——它们对 `conversation_list` 的修改（插入 boi/eoi marker item）是 `janus_text_encoder.encode` 拼接 chat template 时的必要前置：
 
 ```
 forward queue:
-  1. vit_encode    (no deps; reads conversation_list, mutates it with boi/eoi)
-  2. vae_encode    (no deps; reads conversation_list, mutates it with boi/eoi)
-  3. tok_encode    (waits: vit_encode, vae_encode; reads mutated conversation_list)
-  4. janus_llama   (waits: vit_encode, vae_encode, tok_encode)
-  5. tok_decode    (waits: janus_llama)
-  6. vae_decode    (waits: janus_llama, vae_encode)
+  1. janus_siglip              (no deps; reads conversation_list, mutates it with boi/eoi)
+  2. janus_vqvae.encode        (no deps; reads conversation_list, mutates it with boi/eoi)
+  3. janus_text_encoder.encode (waits: siglip + vqvae.encode; reads mutated conversation_list)
+  4. janus_llama               (waits: siglip + vqvae.encode + text_encoder.encode)
+  5. janus_text_encoder.decode (waits: janus_llama)
+  6. janus_vqvae.decode        (waits: janus_llama + vqvae.encode)
   → end            (sink)
 ```
 
-> 注：vit_encode / vae_encode 之间互不依赖（都只读 conversation_list 的不同 item type），它们对 conversation_list 的修改在不同位置（`image` item 处 vs `vq_image` item 处），插入操作满足交换律。框架不强求两者的相对顺序，但相对 `tok_encode` 必须都在它之前。
+> 注：`janus_siglip` / `janus_vqvae.encode` 之间互不依赖（都只读 conversation_list 的不同 item type），它们对 conversation_list 的修改在不同位置（`image` item 处 vs `vq_image` item 处），插入操作满足交换律。框架不强求两者的相对顺序，但相对 `janus_text_encoder.encode` 必须都在它之前。
 
 无环要求保证 topo sort 可解；任何环（含自环）会在 `TrainingGraph` 构造时直接报错。
 
-**关于 janus_vqvae 的双角色——靠两个 node 表达**：
+**关于 janus_vqvae 的双角色——靠两个 method 端点表达**：
 
-- `vae_encode` (`janus_vqvae.encode`)：吃 `gen_image_patches`，吐 `gen_embeds` 喂给 `janus_llama`。同时把 `vq_token_ids` 通过 `vae_tok_to_decode` 边送给下游做 ground truth。
-- `vae_decode` (`janus_vqvae.decode`)：**统一 VQ head**——同一个 node 同时承担训练 loss 和推理反馈：
-  - 训练：吃 `janus_llama.hidden_states` 和 `vae_encode.vq_token_ids` → 吐标量 `gen_loss`（走 `generation_head` + CE，`post_forward` 内已做 token-level mean）
+- `janus_vqvae.encode`：从 `conversation_list` 读 vq_image item，产出 gen embeds 喂给 `janus_llama`，并把 ground-truth token ids 写回 carrier 供 decode 用。
+- `janus_vqvae.decode`：**统一 VQ head**——同一个 node 同时承担训练 loss 和推理反馈：
+  - 训练：吃 `janus_llama.hidden_states` 和 encode 阶段写回的 ground-truth token ids → 吐标量 `gen_loss`（走 `generation_head` + CE，`post_forward` 内已做 token-level mean）
   - 推理：吃 `janus_llama` 采样的 `token_id` → 吐 `embed`（走 `generation_embeddings` + `aligner`）
   - 两条路径互不干扰，按 kwargs 分派——HF 风格的 "input present → run, absent → skip / dummy"
 
-两个 node 共享同一个 `JanusVQDecoder` 实例（同一份参数），但**图论上是两个独立节点**，分别在 `janus_llama` 之前和之后执行——没有环、没有"同模块跑两次"的特殊处理，就是标准 DAG。
+两个 method 端点共享同一个 `JanusVQDecoder` 实例（同一份参数），但**图论上是两个独立 node**（`janus_vqvae.encode` / `janus_vqvae.decode`），分别在 `janus_llama` 之前和之后执行——没有环、没有"同模块跑两次"的特殊处理，就是标准 DAG。
 
 **端点边 (`to: end`) 与 loss 收集**：
 
@@ -383,9 +387,9 @@ forward queue:
 - loss 仍由 `*_loss` **后缀**隐式收集：OmniModel 扫描每个 module 的输出 dict，把 `_loss` 后缀键（已经是 module 内部 token-level mean 后的标量）收齐求和。
 - 因此即便某个 sink 边漏写了，只要模块输出有 `_loss` 后缀键就还会被收集——但**强烈建议每个 sink 都补一条 `to: end` 边**，保证拓扑完整，避免可视化丢节点。
 
-**Dummy forward**：node 一旦进了 `training_graph.edges`，**必跑一遍 forward**——data 全 0 / dummy 也必须走完整张图，避免 FSDP backward hang。模块自己在 `pre_forward` / `forward` 里写 dummy 路径（输入为 None / 全 0 时构造形状一致的 dummy tensor、loss 标量为 0），保证计算图静态一致。
+**Dummy forward**：node 一旦出现在 `training_graph` edge 列表里，**必跑一遍 forward**——data 全 0 / dummy 也必须走完整张图，避免 FSDP backward hang。模块自己在 `pre_forward` / `forward` 里写 dummy 路径（输入为 None / 全 0 时构造形状一致的 dummy tensor、loss 标量为 0），保证计算图静态一致。
 
-**训推一致性**：训练用 teacher forcing（ground truth VQ embeds 直接送入 `janus_llama`），推理用 `image_vq` body loop（`janus_llama` 采样 vq_token_id → 同一个 `vae_decode` node 走推理路径产 embed → 下一步 input）。训练和推理共用同一份参数、同一个 node、同一个 `decode` 方法，仅 kwargs 不同。
+**训推一致性**：训练用 teacher forcing（ground truth VQ embeds 直接送入 `janus_llama`），推理用 `image_vq` body loop（`janus_llama` 采样 vq_token_id → 同一个 `janus_vqvae` module 走 generate 路径产 embed → 下一步 input）。训练和推理共用同一份参数、同一个 module，仅 method / kwargs 不同。
 
 ### Q：同一个模块在数据流上出现两次怎么办？
 
@@ -394,29 +398,17 @@ forward queue:
 **做法：声明两个 node，共享一个 module 实例。**
 
 ```yaml
-modules:
-  image_codec: {model: {model_path: /path/to/image_codec}}
-  ar_llm:      {model: {model_path: /path/to/ar_llm}}
-
-nodes:
-  img_encode: {module: image_codec, method: encode}     # 第一次调用：raw image → embeds
-  ar_llm:     {module: ar_llm}
-  img_decode: {module: image_codec, method: decode}     # 第二次调用：hidden_states → image
-
-edges:
-  img_to_ar:    {from: img_encode, output: embeds, to: ar_llm, as: image_embeds}
-  ar_to_img:    {from: ar_llm, output: hidden_states, to: img_decode, as: hidden_states}
-  img_dec_end:  {from: img_decode, output: gen_loss, to: end}
-
-training_graph:
-  edges: [img_to_ar, ar_to_img, img_dec_end]
+# graph_train.yaml — 文件本身就是 edge 列表
+- { from: image_codec.encode, to: ar_llm }
+- { from: ar_llm,              to: image_codec.decode }
+- { from: image_codec.decode, to: end }
 ```
 
-`OmniModel.modules_dict["image_codec"]` 只 init 一次、参数只一份；`module_of("img_encode") == module_of("img_decode") == "image_codec"`，两个 node 通过 module 名拿到的是**同一个 Python 对象**。反向传播时两次调用的梯度自动累加到同一份参数上，就是普通的 weight sharing，没有任何 magic。
+`OmniModel.modules_dict["image_codec"]` 只 init 一次、参数只一份；`janus_vqvae.encode` 和 `janus_vqvae.decode` 是图上两个独立 node（规范 endpoint `"image_codec.encode"` / `"image_codec.decode"`），但 `module_of()` 解析到的是**同一个 Python 对象**。反向传播时两次调用的梯度自动累加到同一份参数上，就是普通的 weight sharing，没有任何 magic。
 
-为什么不允许"一个 node 跑多次"：那会让图带环，`from`/`to` 失去唯一性，loss key（`{node}/{loss_name}`）失去唯一性，拓扑排序退化成"输入到齐就跑"的数据流调度，且 torch.compile / FSDP2 都假设 sub-module 调用顺序在一次 forward 中静态可枚举。把它写成两个 node，等价于**显式静态展开**那次循环——表达力一样，YAML 多几行，换来全程纯 DAG。
+为什么不允许"一个 node 跑多次"：那会让图带环，endpoint 失去唯一性，loss key 失去唯一性，拓扑排序退化成"输入到齐就跑"的数据流调度，且 torch.compile / FSDP2 都假设 sub-module 调用顺序在一次 forward 中静态可枚举。把它写成两个 method 端点，等价于**显式静态展开**那次循环——表达力一样，YAML 多几行，换来全程纯 DAG。
 
-至于"自回归推理时 image_codec 在每个 token step 都被调用"这种**时序上的重复**——交给 FSM：训练图保持静态 DAG，FSM 在每个 step 内执行一段 body 序列（也只是 edges），整段 body 由外层步数循环驱动，不会污染 DAG 的"每个 node 跑一次"语义。
+至于"自回归推理时 image_codec 在每个 token step 都被调用"这种**时序上的重复**——交给 FSM：训练图保持静态 DAG，FSM 在每个 step 内执行一段 body edge 序列，整段 body 由外层步数循环驱动，不会污染 DAG 的"每个 node 跑一次"语义。
 
 ---
 
@@ -424,72 +416,66 @@ training_graph:
 
 ### 核心统一抽象
 
-推理和训练的本质差异在于：训练时 edges 做**一次拓扑遍历**，推理时 state.body 做**N 步循环**。两者都**只列 edges**——edge 自带 from/to 节点信息，激活的 nodes 由 endpoints 自动并出。
+推理和训练的本质差异在于：训练时 edge 列表做**一次拓扑遍历**，推理时 state.body 做**N 步循环**。两者都是**扁平 edge 列表**——端点是 `module[.method]` 字符串，激活的 nodes 由 endpoints 自动并出。
 
 **FSM 一步执行规则**：
 
-- 按 `state.body` 列出的 edges 顺序遍历；遇到 `from` 节点首次时**执行该节点**（method 为默认时 → 调 `generate_step`；显式 method → 直调），module forward 返回 dict 被框架按 edge.output 立刻**写回 ctx**（推理时 `ctx == raw_batch`）。
-- 该 edge 同时声明下游期望的 kwarg 名（`as: ...`）；如果 `as != output`，等价于 `ctx[as] = ctx[output]` 的别名重命名。
-- 同 step 内同一节点不重复执行——后续命中的 edge 只做依赖声明 / 别名映射。
-- **module 之间不直接传值**：下游 module 执行时，它的 kwargs 由框架从 `ctx` 按 edge 声明的 input key（即上游 edge.as 或下游本身声明的 key）取得，跟训练时一样。
+- 按 `state.body` 列出的 edge 顺序遍历；遇到 `from` endpoint 首次时**执行该 node**（裸 module → `.generate`；显式 method → 直调），module 返回 dict 被框架**写回 ctx**（推理时 `ctx == raw_batch`）。
+- 同 step 内同一 endpoint 不重复执行。
+- **module 之间不直接传值**：下游 module 从共享 `ctx` / `conversation_list` 按自己的 input keys 取，跟训练时一样。edge 只声明拓扑顺序，不携带 `output:` / `as:` 路由字段。
 
 典型形态：
 
-- **单节点循环**：文本 AR（`tok_encode → janus_llama → tok_decode`，variable 步）；DiT（`dit` 循环 forward，1 步）
-- **多节点串接 + 反馈循环**：VQ 图像生成（`janus_llama → vae_decode → 反馈回 janus_llama`，循环 576 步）
+- **单节点循环**：文本 AR（`janus_text_encoder → janus_llama`，variable 步）；DiT（`bagel_dit` 循环 forward，1 步）
+- **多节点串接 + 反馈循环**：VQ 图像生成（`janus_llama → janus_vqvae → 反馈回 janus_llama`，循环 576 步）
 
 ```
-训练时：training_graph.edges → 拓扑排序 → 一次 forward 遍历
-推理时：state.body (edges)   → 按序执行 (node 首次激活 / edge 路由) → 循环 N 步
+训练时：graph_train.yaml（edge 列表） → 拓扑排序 → 一次 forward 遍历
+推理时：state.body（edge 列表）       → 按序执行 (endpoint 首次激活) → 循环 N 步
 ```
 
 ### 状态机定义
 
 ```yaml
-generation_graph:
-  initial: text_ar
+# graph_infer_interleave.yaml — 文件本身就是 FSM（text → image → text 循环）
+initial: prompt_encode
 
-  states:
+states:
+  prompt_encode:
+    body:
+      - { from: janus_siglip,       to: janus_llama }
+      - { from: janus_text_encoder, to: janus_llama }
+      - { from: janus_llama,        to: end }
+    transitions:
+      - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
+      - { condition: { type: module_signal, key: text_done },        next_state: done }
 
-    # ── 文本生成：每步 tok_encode → janus_llama → tok_decode ────
-    text_ar:
-      body:
-        - tok_enc_to_llama       # tok_encode 执行 → inputs_embeds 路由到 janus_llama
-        - llama_to_tok_decode    # janus_llama 执行（generate_step）→ hidden_states 路由到 tok_decode
-        - tok_decode_sink        # leaf；框架在 step 末 append decode 的 input_ids
-      transitions:
-        # text_decoder 采样后在 return dict 写 module_signal；YAML 不出现 token id
-        - {condition: {type: module_signal, key: start_image_gen}, next_state: image_vq_start}
-        - {condition: {type: module_signal, key: text_done}, next_state: done}
-        - {condition: {type: module_signal, key: start_video}, next_state: video_dit}  # 其他 family 示例
+  image_vq_start:
+    body:
+      - { from: janus_text_encoder.emit_image_start, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: image_vq }
 
-    # ── 边界 token bridge（Janus：emit_image_start + 一次 AR）────
-    image_vq_start:
-      body: [emit_start_to_ar, emit_start_sink, ar_run_sink]
-      transitions:
-        - {condition: {type: default}, next_state: image_vq}   # body 跑一次即转移
+  image_vq:
+    body:
+      - { from: janus_llama, to: janus_vqvae }
+      - { from: janus_vqvae, to: janus_llama }
+    transitions:
+      - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
-    # ── VQ 图像生成：每步 janus_llama → vae_decode → 反馈 ───────
-    image_vq:
-      body:
-        - llama_to_vae_decode
-        - vae_decode_to_llama
-      # 无步数预算——循环直到 vae_decode 内部 grid 跑满并 raise image_complete
-      transitions:
-        - {condition: {type: module_signal, key: image_complete}, next_state: image_vq_end}
+  image_vq_end:
+    body:
+      - { from: janus_text_encoder.emit_image_end, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: text_ar }
 
-    image_vq_end:
-      body: [emit_end_to_ar, emit_end_sink, ar_run_sink]
-      transitions:
-        - {condition: {type: default}, next_state: text_ar}
-
-    # ── DiT 图像/视频生成：每步只执行 dit ─────────────────────────
-    video_dit:
-      body:
-        - dit_to_end
-      # DiT 模块内部完成整轮去噪后 raise 完成信号；FSM 不数步数
-      transitions:
-        - {condition: {type: module_signal, key: video_complete}, next_state: text_ar}
+  text_ar:
+    body:
+      - { from: janus_text_encoder, to: janus_llama }
+      - { from: janus_llama,        to: end }
+    transitions:
+      - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
+      - { condition: { type: module_signal, key: text_done },        next_state: done }
 ```
 
 ### FSM 转移条件
@@ -519,11 +505,11 @@ KV 状态完全 module-specific：
 class GenerationGraph:
     """
     每次推理 step：
-      1. 按 state.body 顺序遍历 edges：edge.from 首次命中时调 module.method
-         （forward → generate_step），写 outputs 到 ctx；edge 把 ctx[output] → ctx[as]
+      1. 按 state.body 顺序遍历 edges：edge.from endpoint 首次命中时调 module.method
+         （裸 module → .generate），写 outputs 到 ctx
       2. 检查所有转移条件（first-match）
       3. 若触发转移，更新 _current_state
-    （无步数预算——是否结束 state 完全取决于模块 raise 的 module_signal 或 always）
+    （无步数预算——是否结束 state 完全取决于模块 raise 的 module_signal 或 default）
     """
     _current_state: str
 ```
@@ -534,7 +520,7 @@ class GenerationGraph:
 stateDiagram-v2
     [*] --> text_ar : 开始推理
 
-    text_ar : text_ar\nbody: tok_encode→janus_llama→tok_decode
+    text_ar : text_ar\nbody: janus_text_encoder→janus_llama
     text_ar --> text_ar : 普通文本 token
     text_ar --> image_vq_start : module_signal start_image_gen
     text_ar --> video_dit : module_signal start_video
@@ -543,7 +529,7 @@ stateDiagram-v2
     image_vq_start : image_vq_start\nemit_image_start + 1 AR step
     image_vq_start --> image_vq : always
 
-    image_vq : image_vq\nbody: janus_llama→vae_decode (反馈循环)
+    image_vq : image_vq\nbody: janus_llama→janus_vqvae (反馈循环)
     image_vq --> image_vq_end : module_signal image_complete
 
     image_vq_end : image_vq_end\nemit_image_end + 1 AR step
@@ -559,172 +545,141 @@ stateDiagram-v2
 
 ### Seed-Omni（AR + VQ 图像生成）
 
-两个模块各出现两次，共享一份参数：
+两个 module 各出现两次（通过 method 端点），共享一份参数：
 
-* `janus_vqvae` 挂 `vae_encode`（teacher-forcing embeds + ground-truth tokens）和 `vae_decode`（**统一 VQ head**——训练算 `gen_loss`、推理 hidden→sample→embed）。
-* `text_encoder` 挂 `tok_encode` / `tok_decode`。推理-only 节点 `emit_image_start` / `emit_image_end` 由 `JanusTextEncoder` 提供。
+* `janus_vqvae.encode` / `janus_vqvae.decode`（**统一 VQ head**——训练算 `gen_loss`、推理 hidden→sample→embed）。
+* `janus_text_encoder.encode` / `janus_text_encoder.decode`。推理-only method `emit_image_start` / `emit_image_end` 由 `JanusTextEncoder` 提供。
 
 `janus_llama` 自身不再持有 `wte` / `lm_head`——就是个纯 backbone（`inputs_embeds → hidden_states`）。
 
 `scripts/convert_model.py` 把原始 Janus checkpoint 拆成 4 份 module 子目录：`janus_siglip/`、`janus_vqvae/`、`janus_text_encoder/`（含 tokenizer 资产）、`janus_llama/`。YAML 里 ``model.model_path`` 写相对名（如 `janus_siglip`），launcher 的 ``model.model_path`` 指向 split 根。
 
 ```yaml
-# model.model_path 相对 launcher model.model_path
+# graph_train.yaml — 文件本身就是 edge 列表
+- { from: janus_siglip,              to: janus_llama }
+- { from: janus_vqvae.encode,        to: janus_llama }
+- { from: janus_text_encoder.encode, to: janus_llama }
+- { from: janus_llama,               to: janus_text_encoder.decode }
+- { from: janus_llama,               to: janus_vqvae.decode }
+- { from: janus_text_encoder.decode, to: end }
+- { from: janus_vqvae.decode,        to: end }
 
-modules:
-  janus_siglip:       {model: {model_path: janus_siglip}}
-  janus_vqvae:        {model: {model_path: janus_vqvae}}
-  janus_text_encoder: {model: {model_path: janus_text_encoder}}
-  janus_llama:        {model: {model_path: janus_llama}}
-
-nodes:
-  vit_encode:  {module: janus_siglip}                          # conversation_list[image*] + 注入 boi/eoi item
-  vae_encode:  {module: janus_vqvae,      method: encode}      # conversation_list[vq_image*] → gen_embeds + vq_token_ids
-  tok_encode:  {module: janus_text_encoder, method: encode}      # conversation_list → split conversation_list (value=inputs_embeds segment) + input_ids/labels/mask
-  janus_llama: {module: janus_llama}                           # inputs_embeds + multimodal splice → hidden_states
-  tok_decode:  {module: janus_text_encoder, method: decode}      # 训练: +labels → lm_loss
-                                                               # 推理: hidden → sample → next id
-  vae_decode:  {module: janus_vqvae,      method: decode}      # 训练: +gt → gen_loss
-                                                               # 推理: hidden → sample → vq_id + embed
-
-edges:
-  # ── 训练数据边
-  vit_to_llama:        {from: vit_encode,  output: image_embeds,  to: janus_llama, as: und_image_embeds}
-  vae_enc_to_llama:    {from: vae_encode,  output: gen_embeds,    to: janus_llama, as: gen_image_embeds}
-  tok_enc_to_llama:    {from: tok_encode,  output: inputs_embeds, to: janus_llama, as: inputs_embeds}
-  llama_to_tok_decode: {from: janus_llama, output: hidden_states, to: tok_decode,  as: hidden_states}
-  llama_to_vae_decode: {from: janus_llama, output: hidden_states, to: vae_decode,  as: hidden_states}
-  vae_tok_to_decode:   {from: vae_encode,  output: vq_token_ids,  to: vae_decode,  as: gt_token_ids}
-  # ── 训练 sink 边（保证图无孤岛；loss 仍按 _loss 后缀收集）
-  tok_decode_to_end:   {from: tok_decode,  output: lm_loss,       to: end}
-  vae_decode_to_end:   {from: vae_decode,  output: gen_loss,      to: end}
-  # ── 推理反馈边
-  vae_decode_to_llama: {from: vae_decode,  output: embed,         to: janus_llama, as: inputs_embeds}
-  # decode/emit 的 (B,1) input_ids 由框架 append；tok_encode 有 KV 时只 embed 最后一列
-
-training_graph:
-  edges:
-    - vit_to_llama
-    - vae_enc_to_llama
-    - tok_enc_to_llama
-    - llama_to_tok_decode
-    - llama_to_vae_decode
-    - vae_tok_to_decode
-    - tok_decode_to_end
-    - vae_decode_to_end
-
-generation_graph:
-  initial: text_ar
-  states:
-    text_ar:
-      body: [tok_enc_to_llama, llama_to_tok_decode, tok_decode_sink]
-      transitions:
-        - {condition: {type: module_signal, key: start_image_gen}, next_state: image_vq_start}
-        - {condition: {type: module_signal, key: text_done}, next_state: done}
-    image_vq_start:
-      body: [emit_start_to_ar, emit_start_sink, ar_run_sink]
-      transitions:
-        - {condition: {type: default}, next_state: image_vq}
-    image_vq:
-      body: [llama_to_vae_decode, vae_decode_to_llama]
-      transitions:
-        - {condition: {type: module_signal, key: image_complete}, next_state: image_vq_end}
-    image_vq_end:
-      body: [emit_end_to_ar, emit_end_sink, ar_run_sink]
-      transitions:
-        - {condition: {type: default}, next_state: text_ar}
+# graph_infer_interleave.yaml — 文件本身就是 FSM
+initial: prompt_encode
+states:
+  prompt_encode:
+    body:
+      - { from: janus_siglip,       to: janus_llama }
+      - { from: janus_text_encoder, to: janus_llama }
+      - { from: janus_llama,        to: end }
+    transitions:
+      - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
+      - { condition: { type: module_signal, key: text_done },        next_state: done }
+  image_vq_start:
+    body:
+      - { from: janus_text_encoder.emit_image_start, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: image_vq }
+  image_vq:
+    body:
+      - { from: janus_llama, to: janus_vqvae }
+      - { from: janus_vqvae, to: janus_llama }
+    transitions:
+      - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
+  image_vq_end:
+    body:
+      - { from: janus_text_encoder.emit_image_end, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: text_ar }
+  text_ar:
+    body:
+      - { from: janus_text_encoder, to: janus_llama }
+      - { from: janus_llama,        to: end }
+    transitions:
+      - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
+      - { condition: { type: module_signal, key: text_done },        next_state: done }
 ```
 
 ### Qwen-Omni（thinker + talker 双 LLM + 音频）
 
-两个 LLM 各配一份 `text_encoder`（`tie_word_embeddings=true` 时 encode/decode 共用一矩阵；下面省略 thinker / talker 各自的 `tok_encode` / `tok_decode` 两节点和对应 edges，结构同 Seed-Omni）。
+两个 LLM 各配一份 `text_encoder`（`tie_word_embeddings=true` 时 encode/decode 共用一矩阵）。
 
 ```yaml
-# tokenizer 跟随 thinker_text_encoder 和 talker_text_encoder（两个 text encoder 用不同 vocab 时各自带一份）
+# graph_train.yaml — 文件本身就是 edge 列表（thinker + talker 双 LLM 骨架）
+- { from: qwen_vision,                 to: thinker_llm }
+- { from: qwen_audio,                  to: thinker_llm }
+- { from: thinker_text_encoder.encode, to: thinker_llm }
+- { from: thinker_llm,                 to: thinker_text_encoder.decode }
+- { from: thinker_llm,                 to: talker_llm }
+- { from: talker_text_encoder.encode,  to: talker_llm }
+- { from: talker_llm,                  to: talker_text_encoder.decode }
+- { from: thinker_text_encoder.decode, to: end }
+- { from: talker_text_encoder.decode,  to: end }
 
-modules:
-  qwen_vision:          {model: {model_path: /path/to/qwen_vision}}
-  qwen_audio:           {model: {model_path: /path/to/qwen_audio}}
-  thinker_text_encoder: {model: {model_path: /path/to/thinker_text_encoder}}
-  thinker_llm:          {model: {model_path: /path/to/thinker_llm}}
-  talker_text_encoder:  {model: {model_path: /path/to/talker_text_encoder}}
-  talker_llm:           {model: {model_path: /path/to/talker_llm}}
-  codec2wav:            {model: {model_path: /path/to/codec_decoder}}
-
-nodes:
-  vision_encode: {module: qwen_vision}
-  audio_encode:  {module: qwen_audio}
-  thinker_llm:   {module: thinker_llm}
-  talker_llm:    {module: talker_llm}
-  # 每个 LLM 自己的 tok_encode / tok_decode 略（结构同 Seed-Omni）
-
-edges:
-  vision_to_thinker: {from: vision_encode, output: image_embeds, to: thinker_llm, as: vision_embeds}
-  audio_to_thinker:  {from: audio_encode,  output: audio_embeds, to: thinker_llm, as: audio_embeds}
-  thinker_to_talker: {from: thinker_llm,   output: hidden_states, to: talker_llm,  as: thinker_hidden_states}
-  # tok_*/sink 略
-
-training_graph:
-  edges: [vision_to_thinker, audio_to_thinker, thinker_to_talker, ...]
-
-generation_graph:
-  initial: thinking
-  states:
-    thinking:
-      body: [tok_enc_to_thinker, thinker_to_tok_dec, thinker_tok_dec_to_input]
-      transitions:
-        - {condition: {type: module_signal, key: start_speaking}, next_state: speaking}
-    speaking:
-      body: [thinker_to_talker, talker_to_tok_dec, talker_tok_dec_to_input]
-      transitions:
-        - {condition: {type: module_signal, key: resume_thinking}, next_state: thinking}
-        - {condition: {type: module_signal, key: text_done}, next_state: done}
+# graph_infer.yaml — 文件本身就是 FSM
+initial: thinking
+states:
+  thinking:
+    body:
+      - { from: thinker_text_encoder, to: thinker_llm }
+      - { from: thinker_llm,          to: end }
+    transitions:
+      - { condition: { type: module_signal, key: start_speaking }, next_state: speaking }
+  speaking:
+    body:
+      - { from: thinker_llm,         to: talker_llm }
+      - { from: talker_text_encoder, to: talker_llm }
+      - { from: talker_llm,          to: end }
+    transitions:
+      - { condition: { type: module_signal, key: resume_thinking }, next_state: thinking }
+      - { condition: { type: module_signal, key: text_done },       next_state: done }
 ```
 
-`thinker_llm` 内部决定如何将 `vision_embeds`、`audio_embeds` merge 进 embedding；`talker_llm` 内部决定如何用 `thinker_hidden_states` 作为 cross-attention key。**与 vllm-omni 中 thinker2talker `custom_process_input_func` 对应，但移入模块内部。**
+`thinker_llm` 内部决定如何将 vision/audio embeds merge 进 embedding；`talker_llm` 内部决定如何用 thinker hidden states 作为 cross-attention key。**与 vllm-omni 中 thinker2talker `custom_process_input_func` 对应，但移入模块内部。**
 
 ### BAGEL（AR + DiT 图像生成）
 
 ```yaml
-# tokenizer 跟随 bagel_text_encoder module
+# graph_train.yaml — 文件本身就是 edge 列表（来自 configs/seed_omni/Bagel/bagel_7b_mot/）
+- { from: bagel_text_encoder.encode,            to: bagel_qwen2_mot }
+- { from: bagel_siglip_navit,                   to: bagel_qwen2_mot }
+- { from: bagel_vae.encode,                     to: bagel_flow_connector.embed_latent }
+- { from: bagel_flow_connector.embed_latent,    to: bagel_qwen2_mot }
+- { from: bagel_qwen2_mot,                      to: bagel_text_encoder.decode }
+- { from: bagel_qwen2_mot,                      to: bagel_flow_connector.decode_velocity }
+- { from: bagel_text_encoder.decode,            to: end }
+- { from: bagel_flow_connector.decode_velocity, to: end }
 
-modules:
-  bagel_siglip:       {model: {model_path: /path/to/bagel_siglip}}
-  bagel_text_encoder: {model: {model_path: /path/to/bagel_text_encoder}}
-  bagel_llama:        {model: {model_path: /path/to/bagel_llama}}
-  bagel_dit:          {model: {model_path: /path/to/bagel_dit}}
-
-nodes:
-  vision_encode: {module: bagel_siglip}
-  tok_encode:    {module: bagel_text_encoder, method: encode}
-  bagel_llama:   {module: bagel_llama}
-  tok_decode:    {module: bagel_text_encoder, method: decode}
-  bagel_dit:     {module: bagel_dit}
-
-edges:
-  vit_to_llama:    {from: vision_encode, output: image_embeds,  to: bagel_llama, as: vision_embeds}
-  tok_enc_to_llama:{from: tok_encode,    output: inputs_embeds, to: bagel_llama, as: inputs_embeds}
-  llama_to_tok_d:  {from: bagel_llama,   output: hidden_states, to: tok_decode,  as: hidden_states}
-  llama_to_dit:    {from: bagel_llama,   output: hidden_states, to: bagel_dit,   as: condition}
-  tok_dec_to_end:  {from: tok_decode,    output: lm_loss,       to: end}
-  dit_to_end:      {from: bagel_dit,     output: dit_loss,      to: end}
-
-training_graph:
-  edges: [vit_to_llama, tok_enc_to_llama, llama_to_tok_d, llama_to_dit, tok_dec_to_end, dit_to_end]
-
-generation_graph:
-  initial: text_ar
-  states:
-    text_ar:
-      body: [tok_enc_to_llama, llama_to_tok_d, tok_dec_to_input]
-      transitions:
-        - {condition: {type: module_signal, key: start_image_gen}, next_state: image_dit}
-    image_dit:
-      # DiT 模块自己解析 AR 生成的 "<image w=1024 h=768>" 决定去噪步数 /
-      # 分辨率，完成后 raise image_complete；FSM 不数步数。
-      body: [llama_to_dit, dit_to_end]
-      transitions:
-        - {condition: {type: module_signal, key: image_complete}, next_state: text_ar}
+# graph_infer_gen.yaml — 文件本身就是 FSM
+initial: prompt_encode
+states:
+  prompt_encode:
+    body:
+      - { from: bagel_text_encoder, to: bagel_qwen2_mot }
+      - { from: bagel_siglip_navit,  to: bagel_qwen2_mot }
+      - { from: bagel_qwen2_mot,    to: end }
+    transitions:
+      - { condition: { type: default }, next_state: query_denoise }
+  query_denoise:
+    body:
+      - { from: bagel_flow_connector.prepare_denoise_query, to: bagel_text_encoder.encode_image_markers }
+      - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot.denoise_branch }
+      - { from: bagel_qwen2_mot.denoise_branch,      to: end }
+    transitions:
+      - { condition: { type: default }, next_state: velocity_collect }
+  velocity_collect:
+    body:
+      - { from: bagel_flow_connector.decode_velocity_from_hidden, to: bagel_qwen2_mot.collect_velocity }
+      - { from: bagel_qwen2_mot.collect_velocity,                 to: bagel_flow_connector.advance_denoise }
+      - { from: bagel_flow_connector.advance_denoise,             to: end }
+    transitions:
+      - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
+      - { condition: { type: default }, next_state: query_denoise }
+  image_decode:
+    body:
+      - { from: bagel_vae.decode_generated, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: done }
 ```
 
 ---
@@ -733,43 +688,37 @@ generation_graph:
 
 V2 框架中不存在 `offline_embedding` / `offline_training` / `online_training` 三种特殊模式的概念。它们只是**三份不同的 `training_graph` 配置**加上**不同的数据集格式**：
 
-| 场景 | training_graph.edges | 数据集格式 | raw_batch 起点 | 产出 |
+| 场景 | graph_train.yaml（edge 列表） | 数据集格式 | raw_batch 起点 | 产出 |
 |------|---------------------------|--------|--------|------|
-| **A. 生成 embedding** | 激活前置模块到断点 module 的 edges + sink edge 到 end | 原始 jsonl + 多模态文件 | `{conversation_list}` | trainer 收集断点 module 输出，dump 成 pickle dataset |
-| **B. 离线训练 DiT** | 只列 dit 子图的 edges + sink | 上一步 dump 出来的 **pickle dataset**（已含 pre-computed tensors） | `{condition: <Tensor>, dit_target: <Tensor>, ...}`（直接含张量字段，**无 conversation_list**） | dit_loss |
-| **C. 在线全图训练** | 全部 edges | 原始 jsonl + 多模态文件 | `{conversation_list}` | 各 module 的 _loss 求和 |
+| **A. 生成 embedding** | 激活前置 module 到断点 module 的 edge 列表 + sink edge 到 end | 原始 jsonl + 多模态文件 | `{conversation_list}` | trainer 收集断点 module 输出，dump 成 pickle dataset |
+| **B. 离线训练 DiT** | 只列 dit 子图的 edge 列表 + sink | 上一步 dump 出来的 **pickle dataset**（已含 pre-computed tensors） | `{condition: <Tensor>, dit_target: <Tensor>, ...}`（直接含张量字段，**无 conversation_list**） | dit_loss |
+| **C. 在线全图训练** | 全部 edge 列表 | 原始 jsonl + 多模态文件 | `{conversation_list}` | 各 module 的 _loss 求和 |
 
 ```yaml
-# ── 场景 A：生成 condition embedding（只跑到 bagel_llama，保存 hidden_states）
-training_graph:
-  edges:
-    - vit_to_llama        # 端点并出 {vision_encode, bagel_llama}
-    - tok_enc_to_llama    # 并出 {tok_encode, bagel_llama}
-    - llama_to_end        # sink：保证 bagel_llama 不是孤岛
-# 数据集：原始 jsonl + 多模态文件，正常进 multimodal_transform.py + collator → conversation_list
-# trainer 逻辑：从 OmniModel.forward() 输出里读 raw_batch['hidden_states']，
-#              连同 sample id、原始 metadata 一起 pickle 到磁盘
-#              （建议字段：{'condition': hidden_states, 'sample_id': ..., 'meta': ...}）
+# ── 场景 A：生成 condition embedding（只跑到 bagel_qwen2_mot，保存 hidden_states）
+# graph_train_offline_cache.yaml — 文件本身就是 edge 列表
+- { from: bagel_text_encoder.encode, to: bagel_qwen2_mot }
+- { from: bagel_siglip_navit,        to: bagel_qwen2_mot }
+- { from: bagel_qwen2_mot,           to: end }
+# 数据集：原始 jsonl + 多模态文件 → conversation_list
+# trainer 从 OmniModel.forward() 输出里读 raw_batch['hidden_states'] 并 pickle 到磁盘
 
-# ── 场景 B：用预存 pickle 训练 DiT
-training_graph:
-  edges: [dit_to_end]    # 端点并出 {bagel_dit}
+# ── 场景 B：用预存 pickle 训练 flow connector
+# graph_train_with_cache.yaml — 只列 flow connector 相关 edge
+- { from: bagel_vae.online_process,             to: bagel_flow_connector.embed_latent }
+- { from: bagel_flow_connector.embed_latent,    to: bagel_qwen2_mot }
+- { from: bagel_qwen2_mot,                      to: bagel_flow_connector.decode_velocity }
+- { from: bagel_flow_connector.decode_velocity, to: end }
 # 数据集：场景 A dump 出来的 pickle（已含 pre-computed condition 字段）
-# Dataset 直接读 pickle，dataloader 把 N 条 sample 包成 batch:
-#   raw_batch = {'condition': <Tensor>, 'dit_target': <Tensor>, ...}
-# **注意**：raw_batch 起点不再是 conversation_list——这是离线场景的特殊性
-# bagel_dit.forward() 按自己的 input keys 从 raw_batch 拿 condition 即可，
-# 完全跳过 vit/text_encoder 等前置 module（它们不在 training_graph.edges 里就不会跑）
+# raw_batch 起点不再是 conversation_list——离线场景的特殊性
 
 # ── 场景 C：在线全图训练
-training_graph:
-  edges: [vit_to_llama, tok_enc_to_llama, llama_to_tok_d, llama_to_dit, tok_dec_to_end, dit_to_end]
-# 数据集：原始图文数据 → conversation_list
+# graph_train.yaml — 完整 edge 列表（见 BAGEL 示例）
 ```
 
 **关键不变量**：
-- raw_batch 是 mutable dict，**起点 schema 由 dataset 决定**——在线场景下 dataset 输出 conversation_list；离线场景下 dataset 输出已 pickle 好的张量字典。两种 schema 都通过相同的 OmniModel.forward 入口，只是 training_graph.edges 决定走哪些 module。
-- **跳过前置 module 的方法 = 不在 training_graph.edges 里列它**——`TrainingGraph` 据 endpoints 自动并出 active node 集合，没列的 module 不会被实例化、也不会跑 forward；离线场景下连 vit/text_encoder 实例都不会被构造（节省显存）。
+- raw_batch 是 mutable dict，**起点 schema 由 dataset 决定**——在线场景下 dataset 输出 conversation_list；离线场景下 dataset 输出已 pickle 好的张量字典。两种 schema 都通过相同的 OmniModel.forward 入口，只是 `graph_train.yaml` edge 列表决定走哪些 module。
+- **跳过前置 module 的方法 = 不在 graph_train.yaml edge 列表里列它**——`TrainingGraph` 据 endpoints 自动并出 active node 集合，没列的 module 不会被实例化、也不会跑 forward；离线场景下连 vit/text_encoder 实例都不会被构造（节省显存）。
 - **OfflineEmbeddingSaver 是 trainer 层的工具，模型不感知**——`OmniModel` 本身没有任何 mode 切换，所有 mode 差异都封在"哪份 training_graph 配置 + 哪份 dataset"。
 - **Pickle 格式由 saver / loader 协议决定**：scripts/`save_offline_embeddings.py`（场景 A 之后）输出 pickle；scripts 里的 OfflineDataset 类负责加载 pickle 并按 batch 喂出。两边的 schema 约定（字段名 / 张量 dtype）跟训练 yaml 里 dit module 的 input keys 对齐。
 
@@ -789,8 +738,7 @@ training_graph:
   的 `weights_path={name: path}` dispatch）。
 - ExtraParallel（`emb`/`ep`）切分仍由各子模块 `get_parallel_plan()` 贡献，但应用在该模块自己的 mesh 上。
 
-per-module 拓扑通过 `modules_{train,infer}.yaml` 里每个模块的 `accelerator:` 块声明（被 `OmniConfig`
-lift 到 `train.accelerator`）。
+per-module 拓扑通过 `modules_{train,infer}.yaml` 里每个模块的 `accelerator:` 块声明。
 
 | 层级 | 职责 |
 |------|------|
@@ -803,7 +751,7 @@ lift 到 `train.accelerator`）。
 
 ### 拓扑判定与 `ep` 去重
 
-`AcceleratorConfig.__post_init__` 总会追加一个 `ep` 维；而 `OmniConfig.module_config` 会
+`AcceleratorConfig.__post_init__` 总会追加一个 `ep` 维；而 `build_module_runtime_args` 会
 `_instantiate_recursive` 重新实例化 accelerator，于是 per-module accelerator 末尾会出现**两个 `ep`**。
 建 mesh / 比拓扑前必须 `_dedup_extra_parallel(acc)` 折叠这个重复（真实的 `emb`+`ep` 布局会保留）：
 
@@ -1370,7 +1318,8 @@ veomni/models/seed_omni/                    # 整个目录完全重写，不保�
 ├── graph.py                                # NodeDef / EdgeDef：节点 / 边的共享数据类型 + end 关键字
 ├── training_graph.py                       # TrainingGraph：DAG 视图，按 edges topo 推执行序
 ├── generation_graph.py                     # GenerationGraph：FSM 视图，按 state.body (edges) 分发
-├── configuration_omni.py                   # OmniConfig + _init / from_dict（train+infer YAML 合并，相对 model_path 解析）
+├── configuration_omni.py                   # OmniConfig：纯 HF PretrainedConfig（checkpoint 读写 + graph sidecar）
+├── omni_arguments/model_runtime.py         # resolve_omni_model / build_omni_model_runtime：launcher YAML -> OmniModelRuntimeArguments；.to_hf_config() 投影成 HF OmniConfig
 ├── modeling_omni.py                        # OmniModel：DAG forward + FSM generate + parallel plan 聚合 + 多模块 build/load/save
 └── modules/                                # 每个子模块：configuration + modulemixin + modeling [+ processing]
     ├── base/                                # 跨 family 复用的轻量模块
@@ -1434,17 +1383,17 @@ veomni/models/seed_omni/                    # 整个目录完全重写，不保�
 
 5. **Loss mean 在 module 内部完成**：每个 module 一次 `forward` 把所有 micro-batch 跑完，`post_forward` 内部按 token-sum / token-count 做 token-level mean，吐出标量 `*_loss`。**外层只求和**——这样既保证 token-level 加权正确性（不同 micro-batch 的 token 数不同时不会退化为 batch-weighted），又让 OmniModel 协议简单（单键 `_loss`，无需 `*_loss_token_count`）。
 
-6. **nodes / edges 平级、独立命名空间**：FSM body 只查 edges 池、edges.from/to 只查 nodes 池（外加 `end` 关键字），名字可以重名。两个平级池让结构与图论一致，错配字段在解析阶段就报错。
+6. **endpoint 即 node**：edge 端点是 `module[.method]` 字符串，node 身份是其规范化的 `"<module>.<method>"`。无独立 `nodes:` / `edges:` 池，无 `output:` / `as:` 路由字段。
 
 7. **无孤岛、无环**：每个 node 至少一条出边（指向另一 node 或 `end`）；任何环（含自环）严格禁止——自环=for-loop，应在模块内部实现。
 
-8. **node 与 module 解耦**：图节点是 **node**（YAML 中 `nodes:` 池 key），不是 module。同一 module 可挂多个 node（`vae_encode` / `vae_decode`），module 实例只有一份，参数共享。**同一个 method 也可承担多重角色**——VQ head 的 `decode` 训练吃 `hidden+gt` 出 loss、推理吃 `hidden` 采样、吃 `token_id` lookup，按 kwargs 自分派。
+8. **node 与 module 解耦**：图 node 是 **endpoint**（`module[.method]` 字符串），不是 module 实例。同一 module 可挂多个 method 端点（`janus_vqvae.encode` / `janus_vqvae.decode`），module 实例只有一份，参数共享。**同一个 method 也可承担多重角色**——VQ head 的 `decode` 训练出 loss、推理采样产 embed，按 kwargs 自分派。
 
-9. **method 默认值**：node 不指定 `method:` 时，**训练默认 `forward`、推理默认 `generate_step`**。训练时 `forward` 走 FSDP 包装层，其他 method 直调 raw module（FSDP2 透明）；推理时 `generate_step` 是 FSM 的 next-token 采样入口。
+9. **method 默认值**：裸 module 端点时，**训练默认 `.forward`、推理默认 `.generate`**。训练时 `forward` 走 FSDP 包装层，其他 method 直调 raw module（FSDP2 透明）。
 
 10. **配置层不写 `model_type`**：YAML modules 池只写相对 `model.model_path`，`model_type` 由 HF AutoConfig 从子目录 `config.json` 读出。
 
-11. **training_graph / generation_graph 同构**：两者都基于同一组 `nodes:` / `edges:` 池，`training_graph` 只列 edges 子集（一次 DAG 遍历），`generation_graph.states.<name>.body` 也只列 edges 子集（FSM 一步循环执行）。**激活 nodes 由 edges endpoints 自动并出，执行序由 topo sort 推导**——这是框架唯一的"自动"，结构本身仍要显式给出。
+11. **training / generation graph 同构**：`graph_train.yaml` 文件本身就是 edge 列表（一次 DAG 遍历）；`graph_infer_*.yaml` 文件本身就是 FSM，每个 state.body 也是内联 edge 列表。**激活 nodes 由 endpoints 自动并出，执行序由 topo sort 推导**——这是框架唯一的"自动"，结构本身仍要显式给出。
 
 12. **state 步数完全由模块控制**：AR / VQ / DiT 的循环步数不在 YAML 表达——模块的推理方法（`generate_step` 或显式 method）内部实现无论是 next-token 采样还是完整去噪循环，对状态机均透明；何时结束一个 state 由模块 raise 的 `module_signal`（AR/反馈循环）或 `always`（单趟 bridge）决定。框架不持有任何步数预算。
 
@@ -1454,7 +1403,7 @@ veomni/models/seed_omni/                    # 整个目录完全重写，不保�
 
 15. **数据流单一抽象 raw_batch；起点 conversation_list**：raw_batch 是 mutable dict，初始只含一个 key `conversation_list`（`list[list[dict]]`，每个 item dict 含 `type` / `value` / `role` / `loss_mask`）。其他所有衍生字段（input_ids、image_embeds、attention_mask、labels、position_ids、hidden_states、...）由各 module 在 forward 阶段产出并通过返回 dict 写回 raw_batch。multimodal_transform.py 工具层只做基础 IO + resize（path → tensor 填回 item.value），不做 chat template 拼接、不做 tokenize、不做 image processor。同一份数据可同时喂给任意 ug 模型——chat template / tokenize / image processor / boundary marker 注入全部由对应 module 自管。
 
-16. **module forward = kwargs + Dict 返回；data 100% 走 raw_batch**：每个 module 的 `forward` 仍是 `forward(**kwargs) -> Dict[str, Any]` 风格（HF 兼容、单测纯函数）；OmniModel 收到返回 dict 后**立刻按 edge.output 写回 raw_batch**，**不通过 edge 通道传给下游 module**。下游从同一 raw_batch 按自己声明的 input keys 取。这等价于"data 完全走 raw_batch、module 之间不互相返回"，但保留了 kwargs API 和 edge 显式契约。collator helper / SP slice 由各 module 在自己 `pre_forward` 中按需调用——没有全局 collator final-step、没有全局 SP slice 节点；ViT 切 image batch 维、text encoder 切 sequence 维，各管各的。
+16. **module forward = kwargs + Dict 返回；data 100% 走 raw_batch**：每个 module 的 `forward` 仍是 `forward(**kwargs) -> Dict[str, Any]` 风格（HF 兼容、单测纯函数）；OmniModel 收到返回 dict 后**写回 raw_batch**，**不通过 edge 通道传给下游 module**。下游从同一 raw_batch 按自己声明的 input keys 取。edge 只声明拓扑顺序，不携带 `output:` / `as:` 路由字段。collator helper / SP slice 由各 module 在自己 `pre_forward` 中按需调用。
 
 17. **Sampling state 是 per-request runtime ctx，不进 graph**：`temperature` / `top_p` / `cfg_weight` 等通过 `generation_kwargs` 写入 ctx，由 backbone / text_encoder 消费。CFG batch 2x 平铺、`build_cfg_uncond_inputs` 等是 backbone `modulemixin` 可选能力。`parallel_size` 是 module config 字段（非 sampling 参数）。
 
@@ -1464,7 +1413,7 @@ veomni/models/seed_omni/                    # 整个目录完全重写，不保�
 
 20. **FSM 转移完全由模块驱动，state 无步数预算**：state body 跑一次后持续循环，直到某条转移触发——"跑多少步、何时结束 state" 由模块决定，不由 YAML 的步数预算控制（框架已无 `token_length` 概念）。AR 循环靠 `module_signal`：模块在 return dict 写语义化一次性 flag（`image_complete`、`start_image_gen`、`text_done` …），YAML 用 `{type: module_signal, key: K}`，框架 pop key 防 stale；单趟 bridge / leaf state（prompt encode、emit `<boi>`/`<eoi>`）靠 `{type: default}`（catch-all 无条件匹配，body 跑一次即转移；与 `module_signal` 并列时必须排在最后做 fallback，否则框架报错）。框架只有 `module_signal` 与 `default` 两种 condition，不在 YAML 硬编码 vocab id。
 
-21. **配置拆分：base launcher + 拆分的 module / graph 文件**：`base.yaml` 管 `model.model_path` / `model.modules` / `model.train_graph` / 顶层 `accelerator` / 训练超参 / `infer` 块；`modules_train.yaml` 管每模块训练覆盖，`graph_train.yaml` 管 `training_graph`；`modules_infer.yaml`（可选）覆盖推理模块（按模块名 deep-merge，默认 eager），`graph_infer_*.yaml` 提供 `generation_graph`。加载走 `OmniConfig.from_omni_args(global_args, model_path, modules, train_graph, infer_modules, infer_graph, generation_kwargs)`，由 `OmniArguments.load_omni_config()` / `load_omni_infer_config()` 调用。`visualize_omni_graph.py` 与 trainer 共用 `from_omni_args` 路径。
+21. **配置拆分：base launcher + 拆分的 module / graph 文件**：`base.yaml` 管 `model.model.model_path` / `model.model.model_config.modules` / `model.model.model_config.train_graph` / `model.accelerator` / 训练超参 / `infer` 块；`modules_train.yaml` 管每模块训练覆盖，`graph_train.yaml` 本身就是 training DAG 的 edge 列表；`modules_infer.yaml`（可选）覆盖推理模块（按模块名 deep-merge，默认 eager），`graph_infer_*.yaml` 本身就是一张 generation FSM。graph 文件顶层不再包 `training_graph:` / `generation_graph:` —— 文件即 graph（checkpoint sidecar 例外，它要用 key 承载多场景 map）。加载走 `OmniArguments.resolve_model()`（底层 `resolve_omni_model`，见 `omni_arguments/model_runtime.py`），返回 **runtime config**（`OmniModelRuntimeArguments`）；需要 HF checkpoint 形态时再显式 `.to_hf_config()`。`infer_graph` 传整张场景 map，全部载入 `generation_graphs`，`infer_type` 选激活项。`visualize_omni_graph.py` 与 trainer 共用这条路径（且只需 build 一次 config 就能画出全部场景的 FSM；可视化只读图，直接用 runtime config 不做转换）。
 
 ---
 

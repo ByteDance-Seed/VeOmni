@@ -11,7 +11,7 @@ Scope
 Full end-to-end (real Janus weights) inference is covered by
 ``tasks/infer/infer_omni.py`` and the broader integration suite; this file
 stays runnable without GPU / weights and assumes the caller passes a
-well-formed :class:`~veomni.arguments.arguments_types_omni.OmniArguments`
+well-formed :class:`~veomni.omni_arguments.OmniArguments`
 (no construction-time defensive checks to pin).
 """
 
@@ -59,13 +59,13 @@ def test_inference_request_is_a_plain_dataclass():
 
 def test_inferencer_injects_resolved_infer_type_into_runtime_kwargs():
     inferencer = OmniInferencer.__new__(OmniInferencer)
-    inferencer.base = SimpleNamespace(
-        args=SimpleNamespace(
-            infer=SimpleNamespace(
-                infer_type="infer_gen",
-                generation_kwargs={"temperature": 0.5},
-            )
-        )
+    inferencer.args = SimpleNamespace(
+        model=SimpleNamespace(
+            launcher_config=lambda key: "infer_gen" if key == "infer_type" else None,
+        ),
+        infer=SimpleNamespace(
+            generation_kwargs={"temperature": 0.5},
+        ),
     )
 
     kwargs = inferencer._runtime_generation_kwargs()
@@ -76,13 +76,13 @@ def test_inferencer_injects_resolved_infer_type_into_runtime_kwargs():
 
 def test_inferencer_rejects_conflicting_runtime_infer_type():
     inferencer = OmniInferencer.__new__(OmniInferencer)
-    inferencer.base = SimpleNamespace(
-        args=SimpleNamespace(
-            infer=SimpleNamespace(
-                infer_type="infer_gen",
-                generation_kwargs={"infer_type": "infer_und"},
-            )
-        )
+    inferencer.args = SimpleNamespace(
+        model=SimpleNamespace(
+            launcher_config=lambda key: "infer_gen" if key == "infer_type" else None,
+        ),
+        infer=SimpleNamespace(
+            generation_kwargs={"infer_type": "infer_und"},
+        ),
     )
 
     with pytest.raises(ValueError, match="conflicts"):
@@ -122,56 +122,73 @@ def test_module_exports_inferencer_and_request():
     import veomni.trainer.omni.omni_inferencer as module
 
     assert "OmniInferencer" in module.__all__
-    assert "OmniModuleInferencer" in module.__all__
     assert "InferenceRequest" in module.__all__
 
 
 def test_module_needs_distributed_only_when_declared_non_eager():
+    from veomni.arguments.parser import _instantiate_recursive
+    from veomni.omni_arguments import OmniModuleRuntimeArguments
     from veomni.trainer.omni.omni_inferencer import _module_needs_distributed
 
-    # No accelerator block → eager default → single-process.
-    assert not _module_needs_distributed({"model": {"weights_path": "janus_siglip"}})
     # fsdp2 / ddp need a distributed (torchrun) launch + own ParallelState.
     assert _module_needs_distributed(
-        {
-            "model": {"weights_path": "janus_siglip"},
-            "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}},
-        }
+        _instantiate_recursive(
+            OmniModuleRuntimeArguments,
+            {
+                "model_path": "janus_siglip",
+                "accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}},
+            },
+        )
     )
     assert _module_needs_distributed(
-        {
-            "model": {"weights_path": "janus_llama"},
-            "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}},
-        }
+        _instantiate_recursive(
+            OmniModuleRuntimeArguments,
+            {
+                "model_path": "janus_llama",
+                "accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}},
+            },
+        )
     )
-    # eager is the only single-process load (the inference default). fsdp_mode is
-    # now Literal["ddp", "fsdp2", "eager"] — FSDP1 / "none" were removed.
     assert not _module_needs_distributed(
-        {
-            "model": {"weights_path": "janus_siglip"},
-            "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}},
-        }
+        _instantiate_recursive(
+            OmniModuleRuntimeArguments,
+            {
+                "model_path": "janus_siglip",
+                "accelerator": {"fsdp_config": {"fsdp_mode": "eager"}},
+            },
+        )
     )
 
 
-def test_omni_config_module_config_merges_model_and_train_blocks():
+def test_build_module_args_from_checkpoint_module_entry():
     from veomni.models.seed_omni.configuration_omni import OmniConfig
+    from veomni.omni_arguments.model_runtime import build_module_args
 
     omni_config = OmniConfig.from_dict(
         {
             "modules": {
                 "janus_siglip": {
-                    "model": {
-                        "model_path": "/tmp/global/janus_siglip",
-                        "model_config": {"freeze": True},
-                    },
-                    "data": {"train_path": "/tmp/unused"},
-                    "train": {"init_device": "meta"},
+                    "subfolder": "janus_siglip",
+                    "model_path": "/tmp/global/janus_siglip",
+                    "model_config": {"freeze": True},
+                    "accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}},
                 }
-            }
+            },
+            "training_graph": [{"from": "janus_siglip", "to": "end"}],
+            "generation_graphs": {
+                "infer_gen": {
+                    "initial": "run",
+                    "states": {
+                        "run": {
+                            "body": [{"from": "janus_siglip", "to": "end"}],
+                            "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                        }
+                    },
+                }
+            },
         }
     )
-    module_args = omni_config.module_config("janus_siglip")
-    assert module_args.model.model_path == "/tmp/global/janus_siglip"
-    assert module_args.model.model_config == {"freeze": True}
-    assert module_args.train.init_device == "meta"
+    module_args = build_module_args(omni_config, "janus_siglip")
+    assert module_args.model_path == "/tmp/global/janus_siglip"
+    assert module_args.model_config == {"freeze": True}
+    assert module_args.accelerator.fsdp_config.fsdp_mode == "ddp"

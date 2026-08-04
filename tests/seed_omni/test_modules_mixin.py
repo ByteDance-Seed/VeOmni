@@ -8,8 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.arguments import OmniArguments, OmniModelArguments
-from veomni.arguments.arguments_types import DataArguments
+from veomni.arguments import OmniArguments, OmniDataArguments
 from veomni.models.seed_omni import (
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
@@ -18,6 +17,7 @@ from veomni.models.seed_omni import (
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.omni_arguments import OmniModelRuntimeArguments, build_omni_model_runtime
 
 
 def _config_cls(model_type: str):
@@ -40,33 +40,46 @@ def _patch_local_loss_reducer(monkeypatch):
     return vqvae_modeling
 
 
+def _omni_base_args(*, model_path: str = ""):
+    return OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=model_path or ".",
+            model_config={
+                "modules": str(_janus_cfg_dir() / "modules_train.yaml"),
+                "train_graph": str(_janus_cfg_dir() / "graph_train.yaml"),
+            },
+        ),
+        data=OmniDataArguments(train_path=""),
+    )._to_module_global_args()
+
+
 def _load_omni_config(
     *,
     model_path: str = "",
     modules_path: Path,
     train_graph_path: Path | None = None,
-    infer_modules: dict | None = None,
     infer_graph_path: Path | None = None,
     generation_kwargs: dict | None = None,
 ) -> OmniConfig:
-    model_args = OmniModelArguments(
-        model_path=model_path or ".",
-        config_path=model_path or ".",
-        modules=str(modules_path),
-    )
+    model_path = model_path or "."
+    model_config = {"modules": str(modules_path)}
+    if train_graph_path is not None:
+        model_config["train_graph"] = str(train_graph_path)
     base = OmniArguments(
-        model=model_args,
-        data=DataArguments(train_path=""),
-    )._to_base_args()
-    return OmniConfig.from_omni_args(
+        model=OmniModelRuntimeArguments(
+            model_path=model_path,
+            model_config=model_config,
+        ),
+        data=OmniDataArguments(train_path="."),
+    )._to_module_global_args()
+    return build_omni_model_runtime(
         global_args=base,
         model_path=model_path,
-        modules=str(modules_path),
+        train_modules=str(modules_path),
         train_graph=str(train_graph_path) if train_graph_path else None,
-        infer_modules=infer_modules,
         infer_graph=str(infer_graph_path) if infer_graph_path else None,
         generation_kwargs=generation_kwargs,
-    )
+    ).to_hf_config()
 
 
 # ── Tiny configs used everywhere ──────────────────────────────────────────────
@@ -520,10 +533,11 @@ def test_janus_train_yaml_loads_with_v2_module_names():
     cfg = _load_omni_config(
         modules_path=_janus_cfg_dir() / "modules_train.yaml",
         train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
+        infer_graph_path=_janus_cfg_dir() / "graph_infer_gen.yaml",
     )
 
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
-    assert cfg.modules["janus_siglip"]["model"]["model_path"] == "janus_siglip"
+    assert cfg.modules["janus_siglip"]["subfolder"] == "janus_siglip"
     # training_graph is a flat list of `{from, to}` edges; endpoints are
     # self-describing `module[.method]` strings.
     assert isinstance(cfg.training_graph, list) and cfg.training_graph
@@ -543,13 +557,12 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = _load_omni_config(
         modules_path=_janus_cfg_dir() / "modules_train.yaml",
         train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
-        infer_modules=_janus_cfg_dir() / "modules_infer_fsdp.yaml",
         infer_graph_path=_janus_cfg_dir() / infer_graph,
     )
     # Training vocabulary still present.
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
     # Generation graph painted on top.
-    assert cfg.has_generation_graph()
+    assert cfg.generation_graph is not None
     assert "states" in cfg.generation_graph
     # `done` is framework-injected — must NOT be authored in YAML.
     assert "done" not in cfg.generation_graph["states"], (
@@ -574,31 +587,27 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
             )
 
 
-def test_init_deep_merges_infer_module_overrides():
-    """Infer module overrides patch the training modules per module name."""
-    infer_modules = {
-        "janus_siglip": {
-            "accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "full_shard": False}},
-            "model": {"model_config": {"freeze": True}},
-        }
-    }
+def test_init_applies_eager_defaults_for_inference():
+    """Inference applies all-eager defaults on top of ``model.model_config.modules``."""
+    from veomni.omni_arguments.model_runtime import build_module_runtime_args
 
-    cfg = _load_omni_config(
+    runtime_args = build_module_runtime_args(
+        global_args=_omni_base_args(model_path="/tmp/janus"),
         model_path="/tmp/janus",
-        modules_path=_janus_cfg_dir() / "modules_train.yaml",
-        train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
-        infer_modules=infer_modules,
-        infer_graph_path=_janus_cfg_dir() / "graph_infer_gen.yaml",
+        modules={
+            "janus_siglip": {
+                "model_path": "janus_siglip",
+                "accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "full_shard": False}},
+            },
+            "janus_llama": {"model_path": "janus_llama"},
+        },
+        for_inference=True,
     )
 
-    siglip = cfg.modules["janus_siglip"]
-    assert siglip["model"]["model_path"] == "/tmp/janus/janus_siglip"
-    # Top-level per-module `accelerator` is lifted under `train.accelerator`.
-    assert siglip["train"]["accelerator"]["fsdp_config"]["fsdp_mode"] == "fsdp2"
-    assert siglip["train"]["accelerator"]["fsdp_config"]["full_shard"] is False
-    assert siglip["model"]["model_config"]["freeze"] is True
-    llama_train = cfg.modules["janus_llama"]["train"]["accelerator"]["fsdp_config"]
-    assert llama_train["fsdp_mode"] == "eager"
+    siglip = runtime_args["janus_siglip"]
+    assert siglip.model_path == "/tmp/janus/janus_siglip"
+    assert siglip.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    assert runtime_args["janus_llama"].accelerator.fsdp_config.fsdp_mode == "eager"
 
 
 def test_init_resolves_relative_module_paths():
@@ -607,14 +616,24 @@ def test_init_resolves_relative_module_paths():
         model_path=root,
         modules_path=_janus_cfg_dir() / "modules_train.yaml",
         train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
-        infer_modules=_janus_cfg_dir() / "modules_infer_fsdp.yaml",
         infer_graph_path=_janus_cfg_dir() / "graph_infer_gen.yaml",
     )
 
-    assert cfg.modules["janus_siglip"]["model"]["model_path"] == f"{root}/janus_siglip"
-    assert cfg.modules["janus_text_encoder"]["model"]["model_path"] == f"{root}/janus_text_encoder"
-    assert cfg.has_generation_graph()
+    assert cfg.modules["janus_siglip"]["subfolder"] == "janus_siglip"
+    assert cfg.modules["janus_text_encoder"]["subfolder"] == "janus_text_encoder"
+    assert cfg.generation_graph is not None
     assert cfg.generation_graph["initial"] == "prompt_encode"
+
+    from veomni.omni_arguments.model_runtime import build_module_runtime_args
+
+    runtime_args = build_module_runtime_args(
+        global_args=_omni_base_args(model_path=root),
+        model_path=root,
+        modules=str(_janus_cfg_dir() / "modules_infer_fsdp.yaml"),
+        for_inference=True,
+    )
+    assert runtime_args["janus_siglip"].model_path == f"{root}/janus_siglip"
+    assert runtime_args["janus_text_encoder"].model_path == f"{root}/janus_text_encoder"
 
 
 def _qwen3_cfg_dir() -> Path:
@@ -625,10 +644,11 @@ def test_qwen3_train_yaml_loads_with_v2_module_names():
     cfg = _load_omni_config(
         modules_path=_qwen3_cfg_dir() / "modules_train.yaml",
         train_graph_path=_qwen3_cfg_dir() / "graph_train.yaml",
+        infer_graph_path=_qwen3_cfg_dir() / "graph_infer.yaml",
     )
 
     assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
-    assert cfg.modules["qwen3_text_encoder"]["model"]["model_path"] == "qwen3_text_encoder"
+    assert cfg.modules["qwen3_text_encoder"]["subfolder"] == "qwen3_text_encoder"
     assert isinstance(cfg.training_graph, list) and cfg.training_graph
     endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
     assert "qwen3_text_encoder.encode" in endpoints and "qwen3_llm" in endpoints
@@ -641,6 +661,6 @@ def test_qwen3_train_plus_infer_merges_generation_graph():
         infer_graph_path=_qwen3_cfg_dir() / "graph_infer.yaml",
     )
     assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
-    assert cfg.has_generation_graph()
+    assert cfg.generation_graph is not None
     assert cfg.generation_graph["initial"] == "text_ar"
     assert "done" not in cfg.generation_graph["states"]

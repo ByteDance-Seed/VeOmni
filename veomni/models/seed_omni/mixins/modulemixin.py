@@ -28,7 +28,13 @@ Hooks (all optional except training-graph ``forward``)
 ``generate`` / ``generate_step`` — one FSM inference step.
 ``dummy_inputs`` — FSDP-aligned zero tensors when a modality is absent.
 ``reset_*_inference_state`` / ``finalize`` — inference lifecycle.
-``get_parallel_plan`` / ``get_assets`` — build and checkpoint.
+``get_assets`` — checkpoint sidecars.
+
+Parallel / acceleration hooks (``get_parallel_plan``, ``build_cpu_preprocessor``,
+``customized_build_parallelize_model``, …) belong on the per-module **runtime**
+(:class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`)
+or on optional family mixins — not on this base class.  Per-module token metering
+uses :class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin`.
 
 Training nodes must emit at most one token-mean ``_loss``; ``OmniModel``
 sums them.  See ``docs/seed_omni/seed_omni_v2.md`` for the full contract.
@@ -93,8 +99,9 @@ class CPUPreprocessor:
 
     A module whose ``pre_forward`` does heavy **CPU** input preparation (e.g. a
     text encoder's chat-template + tokenize, a vision tower's image normalize)
-    can move that work off the main/GPU process by returning one of these from
-    :meth:`ModuleMixin.build_cpu_preprocessor`.  The :class:`OmniModuleTrainer`
+    can move that work off the main/GPU process by returning one of these from a
+    family-specific module mixin (e.g. ``XxxModuleMixin.build_cpu_preprocessor``).
+    The :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`
     orchestrator collects the active graph-node modules' preprocessors and runs
     them inside :class:`~veomni.data.data_collator.SeedOmniCollator` — which
     executes in the DataLoader worker — so the work overlaps with GPU compute via
@@ -132,21 +139,27 @@ class CPUPreprocessor:
 
 
 class ModuleMixin:
-    """Unified SeedOmni V2 mixin for both training and inference hooks.
+    """SeedOmni V2 graph mixin — training/inference hooks for ``OmniModel`` graphs.
 
-    A module opts into the optional per-module training trace separately, by
-    multi-inheriting its own ``XxxMetricMeterMixin(MetricMeterMixin)`` on the concrete model
-    (``ModuleMixin`` itself does **not** inherit ``MetricMeterMixin``).  See
-    :class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin`.
+    This base class owns only graph-facing hooks (``pre_forward`` / ``post_forward`` /
+    ``forward`` / ``generate*`` / ``finalize`` / …).  Parallel build, FSDP plans,
+    and metric metering live elsewhere:
+
+    * :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
+      (or a customized runtime subclass) — ``customized_build_parallelize_model``.
+    * Optional family mixins / the wrapped HF model — ``get_parallel_plan``,
+      ``build_cpu_preprocessor``.
+    * :class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin`
+      — ``metric_meter_set_seqlens`` and step metering.
     """
 
     # Generic / combined processor (e.g. an HF ``XxxProcessor`` wrapping several
     # modalities). Single-modality modules instead declare the specific slots
     # below (``image_processor_class`` / ``video_processor_class`` / ...).
+    # The tokenizer has no slot: it is built from the checkpoint dir when present.
     processor_class: Optional[Type[Any]] = None
     image_processor_class: Optional[Type[Any]] = None
     video_processor_class: Optional[Type[Any]] = None
-    tokenizer_class: Optional[Type[Any]] = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Route construction through the HF base, then init omni state.
@@ -203,7 +216,8 @@ class ModuleMixin:
         site. A module opts into sequence parallelism by branching on
         ``get_parallel_state().sp_size > 1`` *inside* this hook (after stashing
         the full pre-slice seqlens for the meter via
-        :meth:`metric_meter_set_seqlens`): every rank of the SP group holds the
+        :meth:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin.metric_meter_set_seqlens`
+        when it also mixes in ``MetricMeterMixin``): every rank of the SP group holds the
         SAME replicated sample, so it slices its inputs to this rank's
         ``1/sp_size`` chunk (+ any per-shard precompute such as ``cu_seqlens``);
         the paired :meth:`post_forward` hook all-gathers the output shards back to
@@ -217,31 +231,6 @@ class ModuleMixin:
         if name is None:
             return kwargs
         return getattr(self, name)(**kwargs)
-
-    def metric_meter_set_seqlens(self, method: str, seqlens: List[int]) -> None:
-        """Stash the FULL (pre-SP-slice) per-sample token lengths for call-site ``method``.
-
-        **Call this inside a ``pre_forward`` hook, BEFORE any SP gather/slice.** It
-        is the single, uniform way a module reports its tokens for the optional
-        per-module meter — even AR backbones use it (built from their
-        ``cu_seqlens``) instead of a custom reader. It lives on ``ModuleMixin``
-        (not ``MetricMeterMixin``) purely so the ``pre_forward`` hooks that call it
-        resolve statically; the value is only ever *consumed* by
-        :meth:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin.metric_meter_token_lengths`
-        (a no-op stash on a non-metered module — nothing drains it).
-
-        Why pre-slice / full-sample: under uniform SP the ``pre_forward`` hook
-        slices to this rank's ``1/sp_size`` shard, so a length read *after* the
-        slice would under-count by ~``sp``. Stash the FULL (pre-slice) per-sample
-        lengths here — before the slice branch — instead: ``OmniEnvironMeter`` sums
-        tokens+FLOPs over the ``dp_group`` (which excludes the SP ranks that all
-        hold the same replicated sample), so the full-sample value counted once per
-        DP shard reconstructs the true global total, matching the non-SP run. (See
-        constraints.md 7c.)
-        """
-        if not hasattr(self, "_metric_full_seqlens"):
-            self._metric_full_seqlens: Dict[str, List[int]] = {}
-        self._metric_full_seqlens[method] = [int(s) for s in seqlens]
 
     def forward(self, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
         """Training forward pass.
@@ -271,70 +260,6 @@ class ModuleMixin:
         if name is None:
             return outputs
         return getattr(self, name)(**outputs)
-
-    def build_cpu_preprocessor(self) -> Optional["CPUPreprocessor"]:
-        """Optional: return a picklable, weight-free :class:`CPUPreprocessor`.
-
-        Default ``None`` = this module does no worker-side input-prep.  Override
-        on a module whose ``pre_forward`` has heavy **CPU** work (tokenize /
-        image normalize): build a :class:`CPUPreprocessor` from this module's
-        already-loaded assets (``self._tokenizer`` / ``self._image_processor`` /
-        config ints — never ``self`` / weights) and return it.  The orchestrator
-        collects these from the active graph-node modules and runs them inside
-        the worker-side collator, so the work overlaps with GPU compute and the
-        module's ``pre_forward`` becomes a thin consumer.
-        """
-        return None
-
-    def get_parallel_plan(self) -> Optional[Any]:
-        """Return a per-module VeOmni parallel plan, or ``None`` for default."""
-        return None
-
-    def customized_build_parallelize_model(
-        self, *, weights_path: Optional[str], args: Any, **kwargs: Any
-    ) -> Optional[Any]:
-        """Optional override: the module owns its OWN parallelize + weight-load
-        (+ optional param offload), bypassing VeOmni's generic
-        ``build_parallelize_model`` / weight loader.
-
-        Motivation
-        ----------
-        The generic path (``BaseTrainer._build_parallelized_model`` ->
-        ``build_parallelize_model`` -> FSDP2 wrap + ``load_model_weights`` /
-        ``rank0_load_and_broadcast_weights``) materializes every parameter on GPU
-        (as an FSDP shard or a rank-0 broadcast buffer) and has no hook for
-        bespoke loading such as per-layer streaming CPU offload of very large
-        (e.g. EP-sharded MoE expert) weights that do not fit on GPU even when
-        sharded. A module with such a need implements this hook to do its own
-        meta-init-aware load / shard / offload and return the ready model.
-
-        Contract
-        --------
-        * Called by :class:`OmniModuleTrainer` AFTER meta-init, INSIDE this
-          module's ``use_parallel_state`` scope — so ``get_parallel_state()``
-          returns THIS module's device mesh, and ``self.config`` /
-          ``self.get_parallel_plan()`` are available.
-        * When it returns a module, that module is used verbatim: the override
-          owns EVERYTHING (parallelize/FSDP-or-not, weight load, param offload,
-          gradient checkpointing, dtype/mixed-precision). VeOmni does not
-          post-process it.
-        * When it returns ``None`` (the default), the trainer falls back to the
-          generic ``build_parallelize_model`` path — behavior is unchanged for
-          every module that does not override this.
-
-        Args:
-            weights_path: This module's split-checkpoint snapshot dir
-                (``args.model.model_path``), or ``None`` for random init.
-            args: The (per-module) ``VeOmniArguments`` — read fsdp / mixed
-                precision / gradient-checkpointing config from
-                ``args.train.accelerator`` as needed.
-
-        Returns:
-            A fully parallelized + weight-loaded ``nn.Module`` ready to
-            train/infer, or ``None`` to use the generic path.
-        """
-        del weights_path, args, kwargs
-        return None
 
     def get_assets(self) -> List[Any]:
         """Module-owned auxiliary artefacts to save alongside the weights."""
@@ -381,34 +306,35 @@ class ModuleMixin:
         from ...auto import build_tokenizer
 
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        # Each per-module asset is loaded only when its class slot is declared,
-        # via the declared class (e.g. the image processor reads
-        # ``preprocessor_config.json`` rather than auto-detecting — a module dir
-        # may also hold a ``video_preprocessor_config.json`` which would confuse
-        # auto-resolution). The tokenizer is built by ``build_tokenizer``.
+        # A processor is loaded only when the module declares its class slot, and
+        # through that class (the image processor reads ``preprocessor_config.json``
+        # rather than auto-detecting — a module dir may also hold a
+        # ``video_preprocessor_config.json`` which would confuse auto-resolution).
         # On failure the attr is set to ``None`` (best-effort; surfaced lazily by
         # the module when the modality is actually used).
-        # ``set attr`` is the public name so the tokenizer goes through its
-        # property setter (which may build chat markers / token ids); ``none attr``
-        # is the private storage zeroed on failure. For processors the two match.
-        #   (set attr, none attr, class attr, build_via_tokenizer)
-        asset_specs = [
-            ("_processor", "_processor", "processor_class", False),
-            ("_image_processor", "_image_processor", "image_processor_class", False),
-            ("_video_processor", "_video_processor", "video_processor_class", False),
-            ("tokenizer", "_tokenizer", "tokenizer_class", True),
-        ]
-        for set_attr, none_attr, class_attr, build_via_tokenizer in asset_specs:
-            if getattr(cls, class_attr, None) is None:
+        for attr, class_attr in (
+            ("_processor", "processor_class"),
+            ("_image_processor", "image_processor_class"),
+            ("_video_processor", "video_processor_class"),
+        ):
+            asset_class = getattr(cls, class_attr, None)
+            if asset_class is None:
                 continue
             try:
-                if build_via_tokenizer:
-                    asset = build_tokenizer(pretrained_model_name_or_path)
-                else:
-                    asset = getattr(cls, class_attr).from_pretrained(pretrained_model_name_or_path)
-                setattr(model, set_attr, asset)
+                setattr(model, attr, asset_class.from_pretrained(pretrained_model_name_or_path))
             except Exception:
-                setattr(model, none_attr, None)
+                setattr(model, attr, None)
+
+        # The tokenizer has no class slot, so it is always attempted from the
+        # checkpoint dir — same rule as
+        # :meth:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime._load_module_assets`,
+        # so the eager path and the VeOmni runtime path agree on what a module carries.
+        # Assigned through the public name so the property setter runs (it may build
+        # chat markers / token ids); the private slot is zeroed on failure.
+        try:
+            model.tokenizer = build_tokenizer(pretrained_model_name_or_path)
+        except Exception:
+            model._tokenizer = None
         return model
 
     def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:

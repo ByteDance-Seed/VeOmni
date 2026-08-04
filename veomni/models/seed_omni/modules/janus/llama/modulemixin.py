@@ -271,10 +271,12 @@ class JanusLlamaModuleMixin(ModuleMixin):
 
     @staticmethod
     def _tail_hidden_from_forward(hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-            hidden_states = hidden_states.squeeze(0)
-            return hidden_states[-1:].contiguous()
-        return hidden_states[:, -1:, :].contiguous()
+        """Return the last-token hidden state as ``[B, 1, H]`` for VQVAE sampling."""
+        if hidden_states.dim() == 3:
+            return hidden_states[:, -1:, :].contiguous()
+        if hidden_states.dim() == 2:
+            return hidden_states.unsqueeze(1).contiguous()
+        raise TypeError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
 
 
 def _fold_fsdp_dummy_anchors(

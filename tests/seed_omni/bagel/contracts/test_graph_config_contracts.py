@@ -10,6 +10,7 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
+        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
 
     assert set(cfg.modules) == {
@@ -48,7 +49,7 @@ def test_bagel_train_graph_fan_in_execution_order():
 
 def test_bagel_infer_gen_graph_uses_siglip_context_without_vae_context():
     data = yaml.safe_load((bagel_cfg_dir() / "graph_infer_gen.yaml").read_text())
-    prompt_body = data["generation_graph"]["states"]["prompt_encode"]["body"]
+    prompt_body = data["states"]["prompt_encode"]["body"]
 
     assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
     assert {"from": "bagel_siglip_navit", "to": "bagel_qwen2_mot"} in prompt_body
@@ -60,10 +61,11 @@ def test_bagel_offline_cache_yaml_loads_encode_only_vae():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train_offline_cache.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train_offline_cache.yaml",
+        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
 
     assert set(cfg.modules) == {"bagel_vae"}
-    assert cfg.module_config("bagel_vae").model.model_config == {"support_cache": True}
+    assert cfg.module_model_config("bagel_vae") == {"support_cache": True}
     assert cfg.training_graph == [{"from": "bagel_vae.offline_encode", "to": "end"}]
 
 
@@ -71,6 +73,7 @@ def test_bagel_train_with_cache_yaml_loads_process_only_vae():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train_with_cache.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train_with_cache.yaml",
+        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
 
     assert set(cfg.modules) == {
@@ -80,7 +83,7 @@ def test_bagel_train_with_cache_yaml_loads_process_only_vae():
         "bagel_flow_connector",
         "bagel_vae",
     }
-    assert cfg.module_config("bagel_vae").model.model_config == {"support_cache": True}
+    assert cfg.module_model_config("bagel_vae") == {"support_cache": True}
     endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
     assert "bagel_vae.online_process" in endpoints
     assert "bagel_vae.encode" not in endpoints
@@ -111,7 +114,6 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_modules=bagel_cfg_dir() / "modules_infer_eager.yaml",
         infer_graph_path=bagel_cfg_dir() / infer_graph,
     )
     assert set(cfg.modules) == {
@@ -121,7 +123,7 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
         "bagel_flow_connector",
         "bagel_vae",
     }
-    assert cfg.has_generation_graph()
+    assert cfg.generation_graph is not None
     assert cfg.generation_graph["initial"] == "prompt_encode"
     assert "done" not in cfg.generation_graph["states"]
     assert any(
@@ -141,12 +143,12 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
     ["graph_infer_und.yaml", "graph_infer_gen.yaml", "graph_infer_edit.yaml"],
 )
 def test_bagel_infer_graph_yaml_is_graph_only(infer_graph: str):
+    """The file *is* the FSM — no wrapper key, and no runtime knobs smuggled alongside."""
     data = yaml.safe_load((bagel_cfg_dir() / infer_graph).read_text())
 
-    assert "generation_graph" in data
-    assert "generation_kwargs" not in data
+    assert set(data) == {"initial", "states"}
 
 
 def _bagel_train_edges() -> list[dict]:
-    data = yaml.safe_load((bagel_cfg_dir() / "graph_train.yaml").read_text())
-    return data["training_graph"]
+    """The training graph file *is* the edge list."""
+    return yaml.safe_load((bagel_cfg_dir() / "graph_train.yaml").read_text())

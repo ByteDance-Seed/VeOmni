@@ -17,7 +17,7 @@
 Unlike single-model trainers (BaseTrainer / VLMTrainer), OmniModel is a
 *composition* of several independent OmniModule sub-models (Janus: siglip /
 vqvae / text_encoder / llama).  Each sub-model is backed by its **own**
-:class:`~veomni.trainer.omni.omni_module_trainer.OmniModuleTrainer` — which (by
+:class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` — which (by
 composition over a bare ``BaseTrainer``) reuses the base per-model build helpers
 (``_build_model`` / ``_setup_lora`` / ``_build_parallelized_model`` /
 ``_build_optimizer`` / ``_build_lr_scheduler``) to give that module its own FSDP2
@@ -25,61 +25,79 @@ unit, optimizer, lr-scheduler, **checkpoint callback** and on-disk snapshot.
 
 :class:`OmniTrainer` then **strings the module-trainers together**: it owns the
 *global* concerns once (distributed ``_setup``, the shared data pipeline, trace
-metering, the train loop) and drives the graph — composing the sub-models into
-one ``OmniModel``, running the DAG forward, a single ``loss.backward()`` (the
-autograd graph connects every FSDP2 unit), and the per-module optimizer step.
-Its ``on_{train,epoch,step}_*`` cascade into every module-trainer so each runs
-its own checkpoint save/resume.
+metering, the train loop) and drives the graph through its single model handle
+``self.model`` — an :class:`OmniModelRuntime` composing the sub-models — running
+the DAG forward, a single ``loss.backward()`` (the autograd graph connects every
+FSDP2 unit), and the per-module optimizer step.  Its ``on_{train,epoch,step}_*``
+cascade into every module-trainer so each runs its own checkpoint save/resume.
 
 Division of labour
 ------------------
-* :class:`~veomni.trainer.omni.omni_module_trainer.OmniModuleTrainer` (per
-  module): ``_build_model`` → ``_freeze_model_module`` →
+* :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` (per
+  module): ``_build_model`` → freeze + LoRA inside :class:`ModuleRuntime` →
   ``_build_parallelized_model`` (FSDP2 wrap + weight load) → ``_init_callbacks``
-  (its own per-module DCP callback), then ``_build_optimizer`` /
-  ``_build_lr_scheduler`` (called by the orchestrator once ``args.train_steps``
-  is known).  Saves / resumes itself when the orchestrator cascades ``on_*``
-  into it.
+  (its own per-module DCP callback).  Optimizer is built inside each
+  :class:`ModuleRuntime` at compose time; lr-scheduler is built in
+  :meth:`OmniTrainer._build_multi_lr_scheduler` once ``train_steps`` is known from the dataset.
+* :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+  (``self.model``): composes the module runtimes into one :class:`OmniModel` and
+  owns the graph loops, ParallelState scoping, graph tracing and metric metering.
 * :class:`OmniTrainer` (orchestrator): global ``_setup`` + data pipeline + trace
-  callbacks + train loop; builds the module-trainers, composes ``OmniModel``,
-  aggregates their optimizers / schedulers behind :class:`MultiOptimizer` /
-  :class:`MultiLRScheduler`, owns the graph forward/backward + the global
-  optimizer step, and cascades the callback lifecycle into each module-trainer.
+  callbacks + train loop; builds the model handle, aggregates the per-module
+  optimizers / schedulers behind :class:`MultiOptimizer` /
+  :class:`MultiLRScheduler`, owns the forward/backward + the global optimizer
+  step, and cascades the callback lifecycle into each module-trainer.
 """
 
+import json
 import math
 import os
-import random
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List
+from dataclasses import asdict
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping
 
-import numpy as np
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import set_checkpoint_debug_enabled
 
 from ...arguments import OmniArguments
-from ...data import SeedOmniCollator
+from ...arguments.parser import save_args
+from ...data import build_dataloader, build_dataset
 from ...data.data_transform import build_data_transform
-from ...distributed.parallel_state import get_parallel_state
-from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
-from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
+from ...distributed.chunk_mbs import build_chunk_mbs_ranges
+from ...distributed.offloading import build_activation_offloading_context
+from ...distributed.parallel_state import init_parallel_state
+from ...models.seed_omni.accelerator import OmniModelRuntime
+from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime
+from ...models.seed_omni.collator import build_seed_omni_collator
 from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
+from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging
-from ...utils.device import synchronize
-from ...utils.model_utils import pretty_print_trainable_parameters
-from ..base import BaseTrainer
+from ...utils.device import get_device_type, get_dist_comm_backend, get_torch_device, synchronize
+from ...utils.omni_helper import OmniEnvironMeter
+from ..base import VeOmniIter
 from ..callbacks import (
     Callback,
+    EvaluateCallback,
+    MoERouterMonitorCallback,
+    ProfileTraceCallback,
+    TqdmCallback,
+    TrainerState,
+    WandbTraceCallback,
+)
+from ..callbacks.omni_callbacks import (
     GraphProfileCallback,
     OmniEnvironMeterCallback,
+    OmniGlobalStateCallback,
+    OmniModuleDcpCallback,
+    OmniModuleHfCallback,
+    OmniRootAssetsCallback,
 )
-from .context import format_active_contexts, setup_veomni_context, veomni_context
-from .omni_module_trainer import OmniModuleTrainer
 
 
 if TYPE_CHECKING:
     from ...models.seed_omni.configuration_omni import OmniConfig
-
+    from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 
 logger = logging.get_logger(__name__)
 
@@ -156,97 +174,61 @@ class MultiLRScheduler:
                 sched.load_state_dict(state[name])
 
 
-# ── Orchestrator's global resume state ──────────────────────────────────────────
+def cascade_module_reshard(
+    module_runtimes: Mapping[str, ModuleRuntime],
+    micro_step: int,
+    num_micro_steps: int,
+) -> None:
+    """Cascade grad-accum FSDP2 reshard intent into every :class:`ModuleRuntime`.
 
-
-class OmniGlobalStateCallback(Callback):
-    """Save / resume the **module-agnostic** global state, once, on the orchestrator.
-
-    Holds exactly what is *not* per-model: ``global_step`` + dataloader position
-    + environ-meter + the single torch RNG.  Written to
-    ``<save_path>/global_step_{N}/trainer_state.pt`` on rank-0 and read back at
-    ``on_train_begin`` (the per-module callbacks restore their own weights /
-    optimizer / lr_scheduler from their ``<module>/`` DCPs).
+    First micro-step keeps params gathered (``reshard=False``); last micro-step
+    reshards (``reshard=True``); middle steps are no-ops. Matches
+    :meth:`BaseTrainer.model_reshard` but fans out per omni module.
     """
+    if num_micro_steps <= 1:
+        return
+    if micro_step == 0:
+        reshard = False
+    elif micro_step == num_micro_steps - 1:
+        reshard = True
+    else:
+        return
+    for module_runtime in module_runtimes.values():
+        module_runtime._model_reshard(reshard)
 
-    def __init__(self, trainer: "OmniTrainer") -> None:
-        super().__init__(trainer)
-        args = trainer.base.args
-        self.every_n_steps = args.train.checkpoint.save_steps
-        self.every_n_epochs = args.train.checkpoint.save_epochs
-        self._last_saved_step: int = -1
 
-    def on_step_end(self, state, **kwargs) -> None:
-        if self.every_n_steps and state.global_step % self.every_n_steps == 0:
-            self._save(state.global_step)
+def build_module_lr_schedulers(module_runtimes: Mapping[str, ModuleRuntime], train_steps: int) -> None:
+    """Build each :class:`ModuleRuntime`'s lr-scheduler once ``train_steps`` is known."""
+    for module_runtime in module_runtimes.values():
+        if not module_runtime.has_trainable_parameters:
+            continue
+        module_runtime._train_steps = train_steps
+        if module_runtime.lr_scheduler is None:
+            module_runtime._build_lr_scheduler()
 
-    def on_epoch_end(self, state, **kwargs) -> None:
-        if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
-            if state.global_step != self._last_saved_step:
-                self._save(state.global_step)
 
-    def on_train_begin(self, state, **kwargs) -> None:
-        self._load()
-
-    def _state_path(self, root: str, global_step: int) -> str:
-        return os.path.join(root, f"global_step_{global_step}", "trainer_state.pt")
-
-    def _save(self, global_step: int) -> None:
-        base = self.trainer.base
-        args = base.args
-        if args.train.global_rank == 0:
-            state_path = self._state_path(args.train.checkpoint.save_path, global_step)
-            # Create the step dir here: callback order vs. per-module DCP saves
-            # is not guaranteed, so we can't assume it already exists.
-            os.makedirs(os.path.dirname(state_path), exist_ok=True)
-            torch.save(
-                {
-                    "global_step": global_step,
-                    "train_dataloader": base.train_dataloader.state_dict()
-                    if base.train_dataloader is not None
-                    else {},
-                    "environ_meter": base.environ_meter.state_dict(),
-                    "torch_rng_state": torch.get_rng_state(),
-                    "numpy_rng_state": np.random.get_state(),
-                    "python_rng_state": random.getstate(),
-                },
-                state_path,
-            )
-        if dist.is_initialized():
-            dist.barrier()
-        self._last_saved_step = global_step
-
-    def _load(self) -> None:
-        base = self.trainer.base
-        args = base.args
-        load_path = args.train.checkpoint.load_path
-        if load_path is None:
-            return
-        trainer_state_path = os.path.join(load_path, "trainer_state.pt")
-        if not os.path.exists(trainer_state_path):
-            return
-        ts = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
-        base.state.global_step = ts["global_step"]
-        base.start_epoch = base.state.global_step // args.train_steps
-        base.start_step = base.state.global_step % args.train_steps
-        if base.train_dataloader is not None and ts.get("train_dataloader"):
-            base.train_dataloader.load_state_dict(ts["train_dataloader"])
-        if ts.get("environ_meter") is not None:
-            base.environ_meter.load_state_dict(ts["environ_meter"])
-        torch.set_rng_state(ts["torch_rng_state"])
-        if ts.get("numpy_rng_state") is not None:
-            np.random.set_state(ts["numpy_rng_state"])
-        if ts.get("python_rng_state") is not None:
-            random.setstate(ts["python_rng_state"])
-        if base.start_step == 0 and base.train_dataloader is not None:
-            iter(base.train_dataloader)
+def build_omni_model(
+    global_args: OmniArguments,
+) -> OmniModelRuntime:
+    """Build one VeOmni-managed composed model — the trainer's ``self.model``."""
+    model_runtime = global_args.resolve_model()
+    for name in model_runtime.module_names:
+        module_args = model_runtime.modules[name]
+        module_args.model_config = dict(module_args.model_config or {})
+        module_args.model_config["train_type"] = global_args.train.train_type
+    return OmniModelRuntime.from_model_runtime(
+        model_runtime,
+        train=global_args.train,
+        train_steps=global_args._train_steps,
+        for_inference=False,
+    )
 
 
 # ── OmniTrainer ────────────────────────────────────────────────────────────────
 
 
 class OmniTrainer:
-    """Orchestrator for OmniModel V2 — one :class:`OmniModuleTrainer` per module.
+    """Orchestrator for OmniModel V2 — one :class:`ModuleRuntime` per module.
 
     Composition over inheritance (mirrors :class:`VLMTrainer`): instead of
     subclassing :class:`BaseTrainer`, we hold a bare ``BaseTrainer`` instance in
@@ -254,416 +236,408 @@ class OmniTrainer:
     data pipeline, callbacks/metering, the train loop) and drive its private
     ``_build_*`` / ``on_*`` helpers one-by-one.
 
-    Each OmniModule sub-model is built + owned by its own
-    :class:`OmniModuleTrainer` (``self.module_trainers``); this orchestrator
-    composes their models into one ``OmniModel`` (``self.base.model``) and
-    aggregates their per-module optimizers / schedulers behind
-    :class:`MultiOptimizer` / :class:`MultiLRScheduler` (``self.base.optimizer``
-    / ``self.base.lr_scheduler``).
+    There is exactly **one** model handle: ``self.model``, an
+    :class:`OmniModelRuntime`.  It composes one :class:`ModuleRuntime` per
+    OmniModule (``self.model.module_runtimes``) into a clean :class:`OmniModel`
+    and adds the graph loops, ParallelState scoping, graph tracing and metric
+    metering; the bare :class:`OmniModel` surface (``config`` / ``modules_dict``
+    / ``save_pretrained``) is forwarded, so shared callbacks read ``self.model``
+    unchanged.  Training requires the runtime — only it exposes the graph loops.
 
-    Canonical ``BaseTrainer`` state (``model`` / ``optimizer`` / ``lr_scheduler``
-    / ``state`` / dataloaders / **trace** callbacks) lives on ``self.base``.
-    Omni-specific bookkeeping that is **not** part of ``BaseTrainer``'s interface
-    (``omni_config`` / ``module_names`` / ``module_trainers`` / per-module
-    ``optimizers`` / ``lr_schedulers``) lives directly on ``self``.
+    Canonical training state (``model`` / ``optimizer`` / ``lr_scheduler`` /
+    ``state`` / dataloaders / per-step trace metrics) lives on ``self``.  A
+    future student+teacher trainer holds two handles by calling
+    :func:`build_omni_model` twice.
 
-    Checkpointing is **not** owned here: each :class:`OmniModuleTrainer` builds
+    Checkpointing is **not** owned here: each :class:`ModuleRuntime` builds
     its own :class:`OmniModuleHfCallback` / :class:`OmniModuleLoraCallback` and the
     orchestrator's ``on_*`` cascade drives them; the orchestrator keeps only trace
     / metering callbacks.
     """
 
-    # Composition: the underlying single-model trainer. Holds all
-    # BaseTrainer-declared state (model / optimizer / lr_scheduler / state /
-    # checkpointer / dataloaders / callbacks); accessed as ``self.base.*``.
-    base: BaseTrainer
+    args: OmniArguments
+    state: TrainerState
+    start_step: int = 0
+    start_epoch: int = 0
 
-    # OmniModel V2 bookkeeping — not part of BaseTrainer's interface, so it
-    # lives directly on the wrapper rather than on ``self.base``.
-    omni_config: "OmniConfig"  # parsed modules / nodes / edges / training graph
-    module_names: List[str]  # ordered names of every declared module
-    module_trainers: Dict[str, OmniModuleTrainer]  # one composition wrapper per module
-    optimizers: Dict[str, torch.optim.Optimizer]  # one per trainable module (aggregated into base.optimizer)
-    lr_schedulers: Dict[str, Any]  # one per trainable module (aggregated into base.lr_scheduler)
+    device: torch.device
+    model: OmniModelRuntime
+    data_transform: Any
+    train_dataset: Any
+    collate_fn: Any
+    train_dataloader: Any
+    data_iterator: Any | None = None
+    optimizer: MultiOptimizer
+    lr_scheduler: MultiLRScheduler
+
+    # ── Per-step trace state (written by omni_callbacks / shared callbacks) ───
+
+    # OmniEnvironMeterCallback.__init__: per-module MFU/token roll-up engine.
+    # OmniGlobalStateCallback: resume meter multisource cursor.
+    environ_meter: OmniEnvironMeter | None = None
+    # OmniEnvironMeterCallback.on_step_end: env metrics (MFU, tokens, memory, …).
+    # WandbTraceCallback.on_step_end: logged to wandb.
+    # ChannelLossCallback.on_step_end: merged with channel-loss keys.
+    step_env_metrics: Dict[str, Any] | None = None
+    # OmniEnvironMeterCallback.on_step_end: training metrics (loss, grad_norm, lr, …).
+    # TqdmCallback.on_step_end: progress-bar postfix.
+    # WandbTraceCallback / ChannelLossCallback: read merged step_env_metrics too.
+    step_train_metrics: Dict[str, Any] | None = None
+    LOG_SAMPLE: bool = True
+    offline_cache_writer: SeedOmniOfflineCacheWriter | None = None
+
+    @property
+    def model_config(self) -> "OmniConfig":
+        """Shared trace callbacks read ``trainer.model_config`` — alias of ``model.config``."""
+        return self.model.config
 
     def __init__(self, args: OmniArguments):
-        # BaseTrainer.__init__ is NOT called here; we call its private
-        # helpers one-by-one so the (overridden) build sequence is explicit.
-        self.base = BaseTrainer.__new__(BaseTrainer)
-        self.base.args = args
-
-        self.base._setup()
+        self.args = args
+        self.device = self.setup_distributed(args)
 
         self._build_model()
-        # Right after the module-trainers exist (the reshard cascade needs them);
-        # everything else the context builders read comes from args.
-        self._setup_context()
-        self._validate_uniform_sp()
-        self._freeze_model_module()
-        self._build_model_assets()
-        self._build_data_transform()
-        self.base._build_dataset()
-        self._build_collate_fn()
-        self.base._build_dataloader()
+        self._build_step_contexts()
+        self._build_data()
         self._build_offline_cache_writer()
-        self._build_optimizer()
-        self._build_lr_scheduler()
+        self._build_multi_optimizer()
+        self._build_multi_lr_scheduler()
         self._init_callbacks()
+
+    @staticmethod
+    def setup_distributed(args: OmniArguments) -> torch.device:
+        """Init process group, device, seed, and register orchestrator ParallelState."""
+        logger.info_rank0(json.dumps(asdict(args), indent=2))
+
+        device_str = f"{get_device_type()}:{args.train.local_rank}"
+        get_torch_device().set_device(device_str)
+        device = torch.device(device_str)
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend=get_dist_comm_backend())
+
+        logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
+
+        acc = args.model.accelerator
+        init_parallel_state(
+            dp_size=acc.dp_size,
+            dp_replicate_size=acc.dp_replicate_size,
+            dp_shard_size=acc.dp_shard_size,
+            tp_size=acc.tp_size,
+            pp_size=acc.pp_size,
+            cp_size=acc.cp_size,
+            ulysses_size=acc.ulysses_size,
+            extra_parallel_sizes=acc.extra_parallel_sizes,
+            extra_parallel_placement_innermost=acc.extra_parallel_placement_innermost,
+            extra_parallel_names=acc.extra_parallel_names,
+            dp_mode=acc.fsdp_config.fsdp_mode,
+            async_enabled=acc.enable_async,
+            name="base",
+        )
+
+        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+        helper.enable_high_precision_for_bf16()
+
+        if args.train.local_rank == 0:
+            helper.enable_third_party_logging()
+
+        if args.train.global_rank == 0:
+            save_args(args, args.train.checkpoint.output_dir)
+
+        set_checkpoint_debug_enabled(args.train.gradient_checkpointing.debug)
+        return device
+
+    def destroy_distributed(self) -> None:
+        """Tear down the process group."""
+        from ...distributed.parallel_state import clear_parallel_state
+        from ...utils.device import is_nccl_backend
+
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        backend = dist.get_backend()
+        helper.empty_cache()
+        dist.barrier()
+
+        if is_nccl_backend(backend) and os.getenv("VEOMNI_DESTROY_NCCL_ON_EXIT", "0") != "1":
+            logger.info_rank0(
+                "Skipping explicit NCCL process-group destroy on normal trainer exit. "
+                "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
+            )
+            return
+
+        synchronize()
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+    def _build_data(self) -> None:
+        """Build transform → dataset (fixes ``train_steps``) → dataloader."""
+        self._build_data_transform()
+        self._build_train_dataset()
+        self._build_train_dataloader()
+
+    def _build_data_transform(self) -> None:
+        self.data_transform = build_data_transform(self.args.data.data_type, **self.args.data.mm_configs)
+
+    def _build_train_dataset(self) -> None:
+        args: OmniArguments = self.args
+        train_dataset = build_dataset(
+            dataset_name=args.data.dataset_name,
+            transform=self.data_transform,
+            seed=args.train.seed,
+            **asdict(args.data),
+        )
+        dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+        if args.data.datasets_type == "mapping":
+            dataset_length = dataset_length / args.model.accelerator.dp_size
+        args.compute_train_steps(dataset_length)
+        self.train_dataset = train_dataset
+
+    def _build_train_dataloader(self) -> None:
+        args = self.args
+        self.collate_fn = build_seed_omni_collator(self.model)
+        dataloader_kwargs = asdict(args.data.dataloader)
+        dataloader_type = dataloader_kwargs.pop("type")
+        dataloader_kwargs.pop("use_background_prefetcher", None)
+        self.train_dataloader = build_dataloader(
+            dataloader_type=dataloader_type,
+            dataset=self.train_dataset,
+            micro_batch_size=args.train.micro_batch_size,
+            global_batch_size=args.train.global_batch_size,
+            dataloader_batch_size=args.train.dataloader_batch_size,
+            max_seq_len=args.data.max_seq_len,
+            train_steps=args.train_steps,
+            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+            bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+            dyn_bsz=args.train.dyn_bsz,
+            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
+            dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+            seed=args.train.seed,
+            collate_fn=self.collate_fn,
+            save_steps=args.train.checkpoint.save_steps,
+            **dataloader_kwargs,
+        )
 
     # ── Build: per-module trainers + compose ───────────────────────────────────
 
     def _build_model(self):
-        """Build one :class:`OmniModuleTrainer` (FSDP2) per declared module."""
-        base = self.base
-        args: OmniArguments = base.args
-
-        self.omni_config = args.load_omni_config()
-        self.module_names = self.omni_config.module_names
-        self.module_trainers: Dict[str, OmniModuleTrainer] = {}
-
-        modules: Dict[str, torch.nn.Module] = {}
-        for name in self.module_names:
-            module_config = self.omni_config.module_config(name)
-            module_config.model.model_config = dict(module_config.model.model_config or {})
-            module_config.model.model_config["train_type"] = args.train.train_type
-            module_trainer = OmniModuleTrainer(module_config, module_name=name)
-            self.module_trainers[name] = module_trainer
-            modules[name] = module_trainer.base.model
-            logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {module_config.model.model_path}")
-
-        model = OmniModel(self.omni_config, modules)
-        # Each module trainer registered its ParallelState under its module name in
-        # the global registry (init_parallel_state(name=...)); hand the model the
-        # set of names so module_context re-enters each by name.
-        model.set_module_parallel_state_names(self.module_trainers.keys())
-        base.model_config = self.omni_config
-
-        base.model = model
-        logger.info_rank0(
-            f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
-        )
-
-    # ── Uniform sequence-parallel size ─────────────────────────────────────────
-
-    def _validate_uniform_sp(self):
-        """Enforce a single, uniform SP size across the outer trainer + all modules.
-
-        SeedOmni runs classic single-pass Ulysses: the outer dataloader replicates
-        each shard across the SP group (``dp_size = world / sp_size``) and every SP
-        module slices that replicated sample to its ``1/sp_size`` chunk. This only
-        works if the outer mesh and every module share ONE SP size — a module at a
-        different ``ulysses_size`` would form a mismatched process group and slice
-        against the wrong replication factor. Fail loudly at build time.
-        """
-        outer_sp = get_parallel_state().sp_size
-        mismatched = {
-            name: module_trainer.parallel_state.sp_size
-            for name, module_trainer in self.module_trainers.items()
-            if module_trainer.parallel_state.sp_size != outer_sp
-        }
-        if mismatched:
-            raise ValueError(
-                "OmniTrainer requires a uniform sequence-parallel size: every module's "
-                f"ulysses_size must equal the outer trainer's ({outer_sp}). Mismatched "
-                f"modules (name: sp_size): {mismatched}. Set the outer "
-                "top-level `accelerator.ulysses_size` (NOT `train.accelerator.*`, which "
-                "OmniArguments overwrites) and drop per-module SP overrides (or set them "
-                "all to the same value)."
-            )
-        logger.info_rank0(f"OmniTrainer: uniform sequence-parallel size = {outer_sp}.")
-
-    # ── Freeze (aggregate report) ───────────────────────────────────────────────
-
-    def _freeze_model_module(self):
-        """Report aggregate trainable params over the composed model.
-
-        Per-module freeze (``requires_grad=False``) and LoRA wrapping already
-        happened inside each :class:`OmniModuleTrainer`; here we only print the
-        composed-model view + memory, mirroring the position of
-        ``_freeze_model_module`` in the base build order.
-        """
-        pretty_print_trainable_parameters(self.base.model)
-        helper.print_device_mem_info("VRAM usage after building model")
-
-    # ── Build: assets ───────────────────────────────────────────────────────────
-
-    def _build_model_assets(self):
-        # Per-module assets (processor / tokenizer) are loaded in each
-        # :class:`OmniModuleTrainer`; the orchestrator only snapshots OmniConfig.
-        self.base.model_assets = [self.omni_config]
-
-    # —— Build: data_transform ───────────────────────────────────────────────────────────
-    def _build_data_transform(self):
-        mm_configs = getattr(self.base.args.data, "mm_configs", None) or {}
-        self.base.data_transform = build_data_transform(self.base.args.data.data_type, **mm_configs)
-
-    # ── Build: collator ─────────────────────────────────────────────────────────
-
-    def _build_collate_fn(self):
-        """list-only ``SeedOmniCollator`` for SeedOmni data types.
-
-        Collects each active module's optional worker-side CPU preprocessor
-        (tokenize / image normalize) and hands them to the collator, so that
-        heavy CPU input-prep runs inside the DataLoader worker (overlapping with
-        GPU compute via prefetch) instead of blocking the main process inside
-        each module's ``pre_forward``. Modules without one contribute nothing.
-        Assets (tokenizer / processor) are already loaded by
-        ``_build_model_assets`` which runs before this in ``__init__``.
-        """
-        # Collected (and later applied) in a FIXED, SERIAL order — the config
-        # ``modules:`` declaration order, since ``module_trainers`` preserves
-        # ``omni_config.module_names`` insertion order. The collator runs them
-        # one-by-one in this order, so a module whose prep depends on an earlier
-        # module's output (e.g. text chat-template after a vision tower patchifies
-        # its image items) must be declared after that module. Inference mirrors
-        # this exactly (see ``OmniInferencer._preprocess_request``).
-        cpu_preprocessors = []
-        for name, module_trainer in self.module_trainers.items():
-            model = _unwrap_module(module_trainer.base.model)
-            builder = getattr(model, "build_cpu_preprocessor", None)
-            preprocessor = builder() if builder is not None else None
-            if preprocessor is not None:
-                cpu_preprocessors.append(preprocessor)
-                logger.info_rank0(
-                    f"OmniTrainer: module '{name}' contributes worker-side "
-                    f"CPU preprocessor {type(preprocessor).__name__}."
-                )
-        self.base.collate_fn = SeedOmniCollator(cpu_preprocessors=tuple(cpu_preprocessors))
-        logger.info_rank0(
-            f"OmniTrainer: SeedOmniCollator with {len(cpu_preprocessors)} worker-side CPU preprocessor(s) "
-            f"for data_type={self.base.args.data.data_type!r}."
-        )
+        self.model = build_omni_model(global_args=self.args)
 
     def _build_offline_cache_writer(self):
-        args: OmniArguments = self.base.args
-        self.offline_cache_writer = None
+        args: OmniArguments = self.args
         if args.train.train_type == "offline_cache":
             self.offline_cache_writer = SeedOmniOfflineCacheWriter(args.train.offline_cache_dir)
 
-    # ── Build: per-module optimizers + schedulers (drive the module-trainers) ──
+    # ── Aggregate per-module optimizers / schedulers ───────────────────────────
 
-    def _build_optimizer(self):
-        """Call each module-trainer's :meth:`OmniModuleTrainer._build_optimizer` + aggregate.
-
-        The build lives on the module-trainer; here we only invoke it and
-        collect the result.  ``build_optimizer`` only ever puts ``requires_grad``
-        params into the optimizer, so a partially-frozen module just trains its
-        remaining params.  A fully-frozen module is skipped. Aggregated behind
-        :class:`MultiOptimizer` (``allow_empty`` for ``offline_cache`` when every
-        module is frozen).
-        """
-        base = self.base
-        self.optimizers: Dict[str, torch.optim.Optimizer] = {}
-        for name, module_trainer in self.module_trainers.items():
-            if module_trainer.has_trainable_parameters:
-                module_trainer._build_optimizer()
-                self.optimizers[name] = module_trainer.base.optimizer
-        base.optimizer = MultiOptimizer(
-            self.optimizers,
-            allow_empty=base.args.train.train_type == "offline_cache",
+    def _build_multi_optimizer(self) -> None:
+        """Wrap per-module optimizers in :class:`MultiOptimizer`."""
+        optimizers = {
+            name: module_runtime.optimizer
+            for name, module_runtime in self.model.module_runtimes.items()
+            if module_runtime.optimizer is not None
+        }
+        self.optimizer = MultiOptimizer(
+            optimizers,
+            allow_empty=self.args.train.train_type == "offline_cache",
         )
-        logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
+        logger.info_rank0(f"OmniTrainer: wired {len(optimizers)} optimizer(s): {list(optimizers)}.")
 
-    def _build_lr_scheduler(self):
-        """Call each module-trainer's :meth:`OmniModuleTrainer._build_lr_scheduler` + aggregate.
+    def _build_multi_lr_scheduler(self) -> None:
+        """Build per-module lr-schedulers and wrap them in :class:`MultiLRScheduler`."""
+        build_module_lr_schedulers(self.model.module_runtimes, self.args.train_steps)
+        lr_schedulers = {
+            name: module_runtime.lr_scheduler
+            for name, module_runtime in self.model.module_runtimes.items()
+            if module_runtime.lr_scheduler is not None
+        }
+        self.lr_scheduler = MultiLRScheduler(lr_schedulers)
 
-        Module-trainer schedulers read ``args.train_steps`` (fixed by the shared
-        dataset); propagate the global value into each module-trainer's private
-        args copy before invoking the build. An empty map is fine
-        (``get_last_lr`` → ``[0.0]``), e.g. fully-frozen ``offline_cache``.
+    # ── Step-level training contexts (explicit split, mirrors BaseTrainer) ───
+
+    def _build_step_contexts(self) -> None:
+        """Build reusable forward/backward context managers from ``args`` (once, at init).
+
+        Each context is entered explicitly in :meth:`forward_backward_step` /
+        :meth:`offline_cache_step` so the train loop reads as a recipe. Grad-accum
+        FSDP reshard is handled imperatively via :func:`cascade_module_reshard`.
         """
-        base = self.base
-        self.lr_schedulers: Dict[str, Any] = {}
-        for name, module_trainer in self.module_trainers.items():
-            if module_trainer.has_trainable_parameters:
-                module_trainer.base.args._train_steps = base.args._train_steps
-                module_trainer._build_lr_scheduler()
-                self.lr_schedulers[name] = module_trainer.base.lr_scheduler
-        base.lr_scheduler = MultiLRScheduler(self.lr_schedulers)
+        args = self.args
+        offload = args.model.accelerator.offload_config
+        enable_activation = bool(offload and offload.enable_activation)
+        self.fwd_activation_offload_ctx, self.bwd_activation_offload_ctx = build_activation_offloading_context(
+            enable_activation=enable_activation,
+            enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+            activation_gpu_limit=offload.activation_gpu_limit if offload else 0.0,
+        )
+        self.batch_invariant_context = set_batch_invariant_mode(enabled=self.args.train.enable_batch_invariant_mode)
+        logger.info_rank0(
+            "OmniTrainer: step contexts — "
+            f"activation_offload={enable_activation}, "
+            f"batch_invariant={args.train.enable_batch_invariant_mode}"
+        )
 
-    # ── Step-level context registry setup (config → context.py) ───────────────
+    def _cascade_module_reshard(self, micro_step: int, num_micro_steps: int) -> None:
+        cascade_module_reshard(self.model.module_runtimes, micro_step, num_micro_steps)
 
-    def _setup_context(self):
-        """Hand the step-level context registry the live args (once, at init).
-
-        Single-model trainers build their activation-offloading contexts on
-        ``BaseTrainer`` (``BaseTrainer._build_training_context``, left untouched).
-        The Omni path instead hands the live args (plus ``module_trainers`` for the
-        reshard cascade) to the step-level context registry
-        (:func:`~veomni.trainer.omni.context.setup_veomni_context`), and the
-        registry's factories read what they need off the args and build their own
-        contexts (activation offloading, batch-invariant, and the per-module
-        reshard cascade). ``self.base._build_training_context`` is intentionally
-        NOT called for the Omni trainer.
-
-        After wiring, the resolved active contexts are logged as a
-        ``stage → contexts`` table so each run's actual context wiring is visible.
-        """
-        setup_veomni_context(self.base.args, self.module_trainers)
-
-        # Log what got wired, per execution stage this run actually runs: the
-        # offline-cache path only encodes (one forward, no backward); every other
-        # train_type runs the train forward + backward. Read from args so this
-        # doesn't depend on the later-built writer.
-        args: OmniArguments = self.base.args
-        if args.train.train_type == "offline_cache":
-            stages = [("forward", "offline_cache")]
-        else:
-            stages = [("forward", "train"), ("backward", "train")]
-        logger.info_rank0("OmniTrainer: wired step contexts\n" + format_active_contexts(stages))
-
-    # ── Callbacks (orchestrator owns trace; each module owns its checkpoint) ───
+    # ── Callbacks (orchestrator owns trace + per-module checkpoint scheduling) ─
 
     def _init_callbacks(self):
-        """Build the orchestrator's trace callbacks + the global-state saver.
-
-        Per-model checkpointing (DCP / HF / LoRA) is **not** the orchestrator's
-        job: each :class:`OmniModuleTrainer` owns its own callbacks (built in its
-        ``__init__``), driven by the ``on_*`` cascade below.  We reuse
-        ``base._init_callbacks`` for the metering / logging / profiling stack,
-        then repurpose the single-model checkpoint slots: ``checkpointer_callback``
-        becomes the module-agnostic :class:`OmniGlobalStateCallback` (step /
-        dataloader / environ-meter / rng), and ``hf_ckpt_callback`` is a no-op
-        (per-module HF/LoRA lives on each module-trainer).
-        """
-        base = self.base
-        base._init_callbacks()
-        # The single-model EnvironMeterCallback can't meter OmniModel (no single
-        # model_type for FLOPs, entry batch carries only conversation_list).
-        # Swap in the per-module metric meter, which delegates token / FLOPs / MFU
-        # to each module's MetricMeterMixin and merges them under ``trace/<module>/``.
-        base.environ_meter_callback = OmniEnvironMeterCallback(self)
-        base.checkpointer_callback = OmniGlobalStateCallback(self)
-        base.hf_ckpt_callback = Callback(base)
-        # Owns the per-step graph-profiler lifecycle (build on on_step_begin, save
-        # on on_step_end); sets/reads ``self.graph_profiler`` (consumed by the forward).
-        base.graph_profile_callback = GraphProfileCallback(self)
-        base._callbacks = [
-            base.environ_meter_callback,
-            base.tqdm_callback,
-            base.wandb_callback,
-            base.profile_callback,
-            base.graph_profile_callback,
-            base.checkpointer_callback,
-            base.hf_ckpt_callback,
-            base.evaluate_callback,
-            base.moe_monitor_callback,
+        """Build orchestrator trace callbacks + global / per-module checkpoint schedulers."""
+        self.environ_meter_callback = OmniEnvironMeterCallback(self)
+        self.tqdm_callback = TqdmCallback(self)
+        self.wandb_callback = WandbTraceCallback(self)
+        self.profile_callback = ProfileTraceCallback(self)
+        self.graph_profile_callback = GraphProfileCallback(self)
+        self.omni_root_assets_callback = OmniRootAssetsCallback(self)
+        self.checkpointer_callback = OmniGlobalStateCallback(self)
+        self.module_dcp_callback = OmniModuleDcpCallback(self)
+        self.module_hf_ckpt_callback = OmniModuleHfCallback(self)
+        self.hf_ckpt_callback = Callback(self)
+        self.evaluate_callback = EvaluateCallback(self)
+        self.moe_monitor_callback = MoERouterMonitorCallback(self)
+        self._callback_handlers = [
+            self.environ_meter_callback,
+            self.tqdm_callback,
+            self.wandb_callback,
+            self.profile_callback,
+            self.graph_profile_callback,
+            self.omni_root_assets_callback,
+            self.checkpointer_callback,
+            self.module_dcp_callback,
+            self.module_hf_ckpt_callback,
+            self.hf_ckpt_callback,
+            self.evaluate_callback,
+            self.moe_monitor_callback,
         ]
+        self.state = TrainerState()
 
-    # ── Metric metering + grad-norm helpers ───────────────────────────────────
+    def _callbacks(self, stage: str, **kwargs) -> None:
+        # Publish the stage on the state so save paths can branch on it without a
+        # ``stage`` argument threaded through every layer.
+        self.state.stage = stage
+        for callback in self._callback_handlers:
+            getattr(callback, f"on_{stage}")(self.state, **kwargs)
 
-    def _collect_metric_meter(self) -> Dict[str, MetricMeterResult]:
-        """Gather every metered module's ``(theoretical_flops, seqlens)``.
+    # —— Callback helpers ──────────────────────────────────────────────────────
+    def collect_step_metrics(self) -> Dict[str, "MetricMeterResult"]:
+        """Fan out metric collection to every composed model handle."""
+        return self.model.collect_step_metrics()
 
-        Each :class:`OmniModuleTrainer` stashed its time-independent contribution
-        in its own ``on_step_end``; here we only read the results.  The meter
-        (:class:`~veomni.utils.omni_helper.OmniEnvironMeter`) sums the FLOPs and merges the token
-        lengths, then applies the single whole-graph time to get the overall
-        achieved FLOPs / MFU.  Non-metered modules contribute nothing.
+    def save_model_assets(self) -> None:
+        """Export the omni-root HF layout (config + graphs + module sidecars, no weights)."""
+        args: OmniArguments = self.args
+        if args.train.global_rank == 0:
+            save_directory = args.train.checkpoint.model_assets_dir
+            self.model.save_pretrained(save_directory, save_module_weights=False)
+            logger.info_rank0(f"OmniTrainer: saved OmniModel assets to {save_directory}.")
+        if dist.is_initialized():
+            dist.barrier()
+
+    def load(self) -> None:
+        """Resume every composed model's module checkpoints.
+
+        Today that is ``self.model`` only; a student+teacher trainer extends this
+        to ``self.student.load()`` / ``self.teacher.load()``.
         """
-        module_metrics: Dict[str, MetricMeterResult] = {}
-        for name, module_trainer in self.module_trainers.items():
-            result = module_trainer._collect_metric_meter()
-            if result is not None:
-                module_metrics[name] = result
-        return module_metrics
+        self.model.load()
+
+    def save_dcp(self, state: TrainerState) -> None:
+        """Write every composed model's distributed checkpoint (train resume).
+
+        Scheduling (every-N-steps / epochs) stays in the checkpoint callbacks;
+        this method only fans out to the model handles.
+        """
+        self.model.save_dcp(state)
+
+    def save_hf_or_lora(self, state: TrainerState) -> None:
+        """Export every composed model's HF weights / LoRA adapter."""
+        self.model.save_hf_or_lora(state)
+
+    def init_graph_profile(self) -> None:
+        """Open a graph profiler on every composed model handle for this step.
+
+        Scheduling (enabled flags / rank / step window) is owned by
+        :class:`GraphProfileCallback`.  Each handle keeps its own
+        :attr:`~OmniModelRuntime.step_profiler` so student/teacher do not share one.
+        """
+        profile = self.args.train.graph_profile
+        self.model.begin_step_trace(profile)
+
+    def flush_graph_profile(self, state: TrainerState) -> None:
+        """Write and clear every composed model's step graph profiler (no-op if idle)."""
+        args = self.args
+        self.model.flush_step_trace(
+            state.global_step,
+            output_dir=args.train.checkpoint.output_dir,
+            rank=args.train.global_rank,
+            tag="model",
+        )
+
+    # ── Grad-norm helpers ─────────────────────────────────────────────────────
 
     def _clip_grad_norm(self) -> float:
         """Clip each module-trainer's grads and combine into the global L2 grad norm.
 
-        Each :class:`OmniModuleTrainer` clips the params of its own FSDP unit and
+        Each :class:`ModuleRuntime` clips the params of its own FSDP unit and
         returns that module's grad norm; the whole-model norm is their L2
         combination (sqrt of sum of squares). Empty (no module-trainers) → 0.0.
         """
-        max_grad_norm = self.base.args.train.optimizer.max_grad_norm
         module_grad_norms = [
-            module_trainer._clip_grad_norm(max_grad_norm) for module_trainer in self.module_trainers.values()
+            module_runtime._clip_grad_norm(module_runtime.args.optimizer.max_grad_norm)
+            for module_runtime in self.model.module_runtimes.values()
         ]
         return math.sqrt(sum(g * g for g in module_grad_norms)) if module_grad_norms else 0.0
 
-    # ── Callback delegators (trace via base; cascade ckpt into module-trainers) ─
-    #
-    # ``base.on_*`` fires the orchestrator's trace callbacks (its checkpoint
-    # callbacks were neutralised in ``_init_callbacks``); we then cascade the
-    # same lifecycle into every module-trainer so each runs its own checkpoint
-    # callback (the global ``base.state`` is the single source of step / epoch).
+    def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
+        def _to_device(v: Any) -> Any:
+            if isinstance(v, torch.Tensor):
+                return v.to(self.device, non_blocking=True)
+            if isinstance(v, dict):
+                return {k: _to_device(vv) for k, vv in v.items()}
+            return v
 
-    def on_train_begin(self):
-        self.base.on_train_begin()
-        for module_trainer in self.module_trainers.values():
-            module_trainer.on_train_begin(self.base.state)
-
-    def on_train_end(self):
-        self.base.on_train_end()
-        for module_trainer in self.module_trainers.values():
-            module_trainer.on_train_end(self.base.state)
-
-    def on_epoch_begin(self):
-        self.base.on_epoch_begin()
-        for module_trainer in self.module_trainers.values():
-            module_trainer.on_epoch_begin(self.base.state)
-
-    def on_epoch_end(self):
-        self.base.on_epoch_end()
-        for module_trainer in self.module_trainers.values():
-            module_trainer.on_epoch_end(self.base.state)
-
-    def on_step_begin(self, micro_batches=None):
-        # Only the orchestrator's meter starts here (records the single
-        # whole-graph start time + multi-source ds_idx). Module-trainers do NOT
-        # run on_step_begin: per-module token counting happens inside their
-        # ``forward`` (right after each module's pre_forward), and per-module
-        # timing is meaningless (see OmniEnvironMeter).
-        self.base.on_step_begin(micro_batches=micro_batches)
-
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        # Module-trainers first: each stashes its per-module metric contribution
-        # (``metric_meter_collect`` → theoretical_flops + seqlens) + runs its checkpoint
-        # callbacks. The orchestrator's metric callback (inside ``base.on_step_end``)
-        # then reads those results, so module-trainers must run *before* it.
-        for module_trainer in self.module_trainers.values():
-            module_trainer.on_step_end(self.base.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self._chunk_mbs_ranges = build_chunk_mbs_ranges(
+            micro_batch, getattr(self.args.train, "chunk_mbs_config", None)
+        )
+        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
+        if getattr(self, "LOG_SAMPLE", True):
+            helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
+            self.LOG_SAMPLE = False
+        return micro_batch
 
     # ── Main entrypoints: forward/backward → step → train loop ─────────────────
 
     def forward_backward_step(self, micro_batch: Dict[str, Any], *, micro_step: int = 0, num_micro_steps: int = 1):
         """One gradient-accumulation micro-batch over the training DAG.
 
-        ``OmniModel.forward`` returns ``{"loss", "losses"}`` where ``loss`` is
-        the summed per-node ``_loss``; a single backward then propagates across
-        every FSDP2 unit. The step-level concerns (activation offloading,
-        batch-invariant mode, and the grad-accum ``model_reshard`` cascade) are
-        composed by :func:`veomni_context`.
+        ``OmniModelRuntime.forward`` returns ``{"loss", "losses"}`` where ``loss``
+        is the summed per-node ``_loss``; a single backward then propagates across
+        every FSDP2 unit.
         """
-        base = self.base
-        micro_batch = base.preforward(micro_batch)
+        micro_batch = self.preforward(micro_batch)
+        self._cascade_module_reshard(micro_step, num_micro_steps)
 
-        # ``graph_profiler`` is bound once per step by GraphProfileCallback.on_step_begin
-        # (None outside the profiling window); the same profiler spans every micro-batch.
-        with veomni_context("forward", "train", micro_step, num_micro_steps):
-            result: Dict[str, Any] = base.model(profiler=self.graph_profiler, **micro_batch)
+        # Forward: spill activations to CPU (if enabled) + batch-invariant ops.
+        with self.fwd_activation_offload_ctx, self.batch_invariant_context:
+            result: Dict[str, Any] = self.model.forward(micro_batch)
 
         total_loss: torch.Tensor = result["loss"]
-        if total_loss is None:
-            raise RuntimeError(
-                "OmniModel.forward produced no loss — no training node emitted a `_loss`. "
-                "Check that the training data + per-module training forwards are wired (D4/D5)."
-            )
         loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
 
-        with veomni_context("backward", "train", micro_step, num_micro_steps):
+        # Backward: separate offload hook stack (may differ from forward when GC is on).
+        with self.bwd_activation_offload_ctx, self.batch_invariant_context:
             total_loss.backward()
 
         del micro_batch
         return total_loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> None:
-        base = self.base
-        base.state.global_step += 1
+        self.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
-        self.on_step_begin(micro_batches=micro_batches)
+        self._callbacks(stage="step_begin", micro_batches=micro_batches)
         synchronize()
 
         total_loss = 0.0
@@ -679,84 +653,92 @@ class OmniTrainer:
                 total_loss_dict[k] += v.item() / num_micro_steps
 
         grad_norm = self._clip_grad_norm()
-        base.optimizer.step()
-        base.lr_scheduler.step()
-        base.optimizer.zero_grad()
+        self.optimizer.step()
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
 
-        self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
+        self._callbacks(stage="step_end", loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 
     def offline_cache_step(self, data_iterator: Any) -> None:
-        base = self.base
         if self.offline_cache_writer is None:
             raise RuntimeError("offline_cache_step requires an initialized SeedOmniOfflineCacheWriter.")
 
-        base.state.global_step += 1
+        self.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
-        self.on_step_begin(micro_batches=micro_batches)
+        self._callbacks(stage="step_begin", micro_batches=micro_batches)
         synchronize()
 
         num_micro_steps = len(micro_batches)
         for micro_step, micro_batch in enumerate(micro_batches):
-            micro_batch = base.preforward(micro_batch)
-            with veomni_context("forward", "offline_cache", micro_step, num_micro_steps):
-                base.model(profiler=self.graph_profiler, **micro_batch)
+            micro_batch = self.preforward(micro_batch)
+            self._cascade_module_reshard(micro_step, num_micro_steps)
+            # Encode-only: no autograd graph; still honour offload + batch-invariant.
+            with torch.no_grad(), self.fwd_activation_offload_ctx, self.batch_invariant_context:
+                self.model.forward(micro_batch)
 
-            conversation_list = micro_batch.get("conversation_list")
-            if conversation_list is None:
-                raise RuntimeError("offline_cache graph did not leave `conversation_list` in the micro-batch.")
+            conversation_list = micro_batch["conversation_list"]
             self.offline_cache_writer.save_conversation_list(conversation_list)
 
-        self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
+        self._callbacks(stage="step_end", loss=0.0, loss_dict={}, grad_norm=0.0)
 
     def train(self):
-        base = self.base
-        args: OmniArguments = base.args
-        self.on_train_begin()
+        args: OmniArguments = self.args
+        self._callbacks(stage="train_begin")
         logger.info(
             f"Rank{args.train.local_rank} Start training. "
-            f"Start step: {base.start_step}. "
+            f"Start step: {self.start_step}. "
             f"Train steps: {args.train_steps}. "
-            f"Start epoch: {base.start_epoch}. "
+            f"Start epoch: {self.start_epoch}. "
             f"Train epochs: {args.train.num_train_epochs}."
         )
 
-        for epoch in range(base.start_epoch, args.train.num_train_epochs):
-            if hasattr(base.train_dataloader, "set_epoch"):
-                base.train_dataloader.set_epoch(epoch)
-            base.state.epoch = epoch
+        for epoch in range(self.start_epoch, args.train.num_train_epochs):
+            if hasattr(self.train_dataloader, "set_epoch"):
+                self.train_dataloader.set_epoch(epoch)
+            self.state.epoch = epoch
 
-            self.on_epoch_begin()
+            self._callbacks(stage="epoch_begin")
 
-            data_iterator = iter(base.train_dataloader)
+            self.data_iterator = VeOmniIter(
+                self.train_dataloader,
+                use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
+            )
 
-            for _ in range(base.start_step, args.train_steps):
+            for _ in range(self.start_step, args.train_steps):
                 try:
                     if args.train.train_type == "offline_cache":
-                        self.offline_cache_step(data_iterator)
+                        self.offline_cache_step(self.data_iterator)
                     else:
-                        self.train_step(data_iterator)
+                        self.train_step(self.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
 
-            self.on_epoch_end()
+            self._callbacks(stage="epoch_end")
 
-            base.start_step = 0
+            self.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
-        self.on_train_end()
+            if args.data.dataloader.use_background_prefetcher:
+                self.data_iterator.stop()
+
+        self._callbacks(stage="train_end")
         if self.offline_cache_writer is not None:
             self.offline_cache_writer.finalize()
 
+        if self.data_iterator is not None and args.data.dataloader.use_background_prefetcher:
+            self.data_iterator.stop()
+
         synchronize()
 
-        base.destroy_distributed()
+        self.destroy_distributed()
 
 
 __all__ = [
     "OmniTrainer",
     "MultiOptimizer",
     "MultiLRScheduler",
-    "OmniGlobalStateCallback",
+    "build_omni_model",
+    "cascade_module_reshard",
 ]

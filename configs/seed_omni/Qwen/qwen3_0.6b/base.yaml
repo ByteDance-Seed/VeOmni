@@ -5,7 +5,6 @@
 #
 # Launch inference (text-only chat):
 #   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
-#     --infer.infer_type infer_text \
 #     --infer.prompt "What is 2+2?" \
 #     --infer.output_dir qwen3_out
 #
@@ -16,27 +15,44 @@
 
 model:
   model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
-  modules: configs/seed_omni/Qwen/qwen3_0.6b/modules_train.yaml
-  train_graph: configs/seed_omni/Qwen/qwen3_0.6b/graph_train.yaml
+  model_config:
+    modules: configs/seed_omni/Qwen/qwen3_0.6b/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3_0.6b/graph_train.yaml
+    infer_graph:
+      infer_text: configs/seed_omni/Qwen/qwen3_0.6b/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
-accelerator:
-  fsdp_config:
-    fsdp_mode: fsdp2
-    full_shard: true
-    reshard_after_forward: true
-    reshard_after_backward: true
-    forward_prefetch: true
-    offload: false
-    max_load_broadcast_size: 20.0
-    mixed_precision:
-      enable: true
-      param_dtype: bfloat16
-      reduce_dtype: float32
-  offload_config:
-    enable_activation: false
-    activation_gpu_limit: 0.0
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
 
 data:
   data_type: seedomni
@@ -64,19 +80,6 @@ train:
     enable: true
     enable_reentrant: false
 
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-    lr_min: 1.0e-6
-    lr_start: 0.0
-    lr_warmup_ratio: 0.03
-    lr_decay_style: cosine
-    lr_decay_ratio: 1.0
-    weight_decay: 0.01
-    max_grad_norm: 1.0
-    no_decay_params: []
-    no_decay_modules: []
-
   checkpoint:
     output_dir: outputs/qwen3_0.6b_omni_sft
     save_steps: 500
@@ -90,9 +93,6 @@ train:
     name: qwen3_0.6b_omni_sft
 
 infer:
-  infer_graph:
-    infer_text: configs/seed_omni/Qwen/qwen3_0.6b/graph_infer.yaml
-  infer_type: infer_text
   generation_kwargs:
     max_new_tokens: 2048
     temperature: 0.0

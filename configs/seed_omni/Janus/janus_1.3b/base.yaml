@@ -9,30 +9,54 @@
 #     --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
 #
 # See docs/seed_omni/example_models/janus.md for the full pipeline.
-
+#
+# Launch inference (override modules for eager single-process or fsdp distributed):
+#   python tasks/omni/infer_omni.py configs/seed_omni/Janus/janus_1.3b/base.yaml \
+#     --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml \
+#     --infer.prompt "Describe this image." \
+#     --infer.output_dir janus_out
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
-  modules: configs/seed_omni/Janus/janus_1.3b/modules_train.yaml
-  train_graph: configs/seed_omni/Janus/janus_1.3b/graph_train.yaml
+  model_config:
+    modules: configs/seed_omni/Janus/janus_1.3b/modules_train.yaml
+    train_graph: configs/seed_omni/Janus/janus_1.3b/graph_train.yaml
+    infer_graph:
+      infer_gen: configs/seed_omni/Janus/janus_1.3b/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Janus/janus_1.3b/graph_infer_und.yaml
+      infer_interleave: configs/seed_omni/Janus/janus_1.3b/graph_infer_interleave.yaml
+    infer_type: infer_interleave
   ops_implementation:
     attn_implementation: flash_attention_2
 
-accelerator:
-  fsdp_config:
-    fsdp_mode: fsdp2
-    full_shard: true
-    reshard_after_forward: true
-    reshard_after_backward: true
-    forward_prefetch: true
-    offload: false
-    max_load_broadcast_size: 20.0
-    mixed_precision:
-      enable: true
-      param_dtype: bfloat16
-      reduce_dtype: float32
-  offload_config:
-    enable_activation: false
-    activation_gpu_limit: 0.0
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
 
 
 data:
@@ -64,19 +88,6 @@ train:
     enable: true
     enable_reentrant: false
 
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-    lr_min: 1.0e-6
-    lr_start: 0.0
-    lr_warmup_ratio: 0.03
-    lr_decay_style: cosine
-    lr_decay_ratio: 1.0
-    weight_decay: 0.01
-    max_grad_norm: 1.0
-    no_decay_params: []
-    no_decay_modules: []
-
   checkpoint:
     output_dir: outputs/janus_1.3b_omni_sft
     save_steps: 500
@@ -90,14 +101,6 @@ train:
     name: janus_1.3b_omni_sft
 
 infer:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
-  modules: configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml
-  # modules: configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml
-  infer_graph:
-    infer_gen: configs/seed_omni/Janus/janus_1.3b/graph_infer_gen.yaml
-    infer_und: configs/seed_omni/Janus/janus_1.3b/graph_infer_und.yaml
-    infer_interleave: configs/seed_omni/Janus/janus_1.3b/graph_infer_interleave.yaml
-  infer_type: infer_interleave
   generation_kwargs:
     max_new_tokens: 2048
     temperature: 0.0

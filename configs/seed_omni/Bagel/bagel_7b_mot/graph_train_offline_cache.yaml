@@ -1,3 +1,2 @@
 # BAGEL-7B-MoT VAE posterior cache production DAG.
-training_graph:
-  - { from: bagel_vae.offline_encode, to: end }
+- { from: bagel_vae.offline_encode, to: end }

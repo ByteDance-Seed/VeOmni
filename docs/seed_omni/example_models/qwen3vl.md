@@ -108,7 +108,7 @@ Key knobs (override on the CLI):
 - `--model.model_path` — split-checkpoint root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
 - `--data.max_seq_len` — packed sequence length.
-- `--train.optimizer.lr` — learning rate.
+- `--model.optimizer.lr` — learning rate (global default; override per module in `modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
 
@@ -157,18 +157,26 @@ bash train.sh tasks/omni/train_omni.py \
 
 ## 5. Inference
 
+SeedOmni V2 has **two inference entry points**:
+
+| Script | Checkpoint | Runtime | When to use |
+|--------|------------|---------|-------------|
+| `tasks/omni/infer_omni.py` | Split SeedOmni root | VeOmni runtime — `OmniModelRuntimeArguments` + generation FSM; optional per-module FSDP | Distributed inference or launcher-YAML overrides |
+| `tasks/omni/infer_omni_native.py` | Split SeedOmni root | ``OmniModel.from_pretrained`` — all modules eager, simple process + generate | Single-process smoke tests and quick experiments |
+
+### 5.1 VeOmni runtime (`infer_omni.py`)
+
 `tasks/omni/infer_omni.py` runs the `vision_understanding` generation graph. Point
-`--infer.model_path` at a **split-checkpoint root** holding `qwen3vl_vision/`,
+`model.model_path` at a **split-checkpoint root** holding `qwen3vl_vision/`,
 `qwen3vl_text_encoder/` and `qwen3vl_llm/`. The step-1 converter output already
 has this layout, so you can infer directly:
 
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Qwen/qwen3vl_2b/base.yaml \
-  --infer.infer_type vision_understanding \
-  --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct \
-  --infer.image /path/to/image.jpg \
+  --model.model_config.infer_type vision_understanding \
   --infer.prompt "What is in this image?" \
+  --infer.image /path/to/image.jpg \
   --infer.output_dir qwen3vl_out \
   --infer.generation_kwargs.max_new_tokens 1024
 ```
@@ -183,7 +191,31 @@ mkdir -p "$ASM"
 for m in qwen3vl_vision qwen3vl_text_encoder qwen3vl_llm; do
   ln -sfn "$(realpath "$STEP/$m/hf_ckpt")" "$ASM/$m"
 done
-# then: --infer.model_path "$ASM"
+# then: --model.model_path "$ASM"
+```
+
+### 5.2 Native eager (`infer_omni_native.py`)
+
+Single-process load — preprocess the request, then ``model.generate``:
+
+```python
+from veomni.models.seed_omni import OmniModel, OmniProcessor
+
+model = OmniModel.from_pretrained(checkpoint_root, device_map="auto")
+processor = OmniProcessor.from_pretrained(checkpoint_root)  # or from_model(model)
+inputs = processor(text="Describe this image.", images=["/path/to/image.jpg"])
+model.generate(inputs, generation_kwargs={"max_new_tokens": 128})
+```
+
+CLI equivalent:
+
+```bash
+python tasks/omni/infer_omni_native.py \
+  --model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct \
+  --infer_type vision_understanding \
+  --prompt "Describe this image." \
+  --image /path/to/image.jpg \
+  --max_new_tokens 128
 ```
 
 ---

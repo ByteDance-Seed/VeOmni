@@ -9,7 +9,9 @@ flowchart LR
         direction TB
         prompt_encode__bagel_text_encoder_generate["<i>bagel_text_encoder.generate</i>"]:::body_node
         prompt_encode__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
+        prompt_encode__bagel_siglip_navit_generate["<i>bagel_siglip_navit.generate</i>"]:::body_node
         prompt_encode__bagel_text_encoder_generate --> prompt_encode__bagel_qwen2_mot_generate
+        prompt_encode__bagel_siglip_navit_generate --> prompt_encode__bagel_qwen2_mot_generate
     end
     subgraph state_query_denoise [query_denoise]
         direction TB

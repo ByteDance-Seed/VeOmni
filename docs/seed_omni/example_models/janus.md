@@ -19,7 +19,7 @@ drives the inferencer.
 |------|------|
 | `base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. References the module/graph files below. |
 | `modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
-| `graph_train.yaml` | Training DAG (`training_graph:` flat edge list). |
+| `graph_train.yaml` | Training DAG — the file *is* the flat edge list. |
 | `data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
 | `modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager (base.yaml's default `infer.modules`). |
 | `modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager` (single-process replica). |

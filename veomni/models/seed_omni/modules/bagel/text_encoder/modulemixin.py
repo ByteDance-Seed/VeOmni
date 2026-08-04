@@ -50,8 +50,6 @@ class BagelTextEncoderCPUPreprocessor(CPUPreprocessor):
 class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     """Training hooks for BAGEL text embeddings and CE loss."""
 
-    tokenizer_class = object
-
     def init_omni_state(self) -> None:
         super().init_omni_state()
         self._chat_template: Optional[BagelChatTemplate] = None

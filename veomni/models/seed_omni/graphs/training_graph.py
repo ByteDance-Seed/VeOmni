@@ -3,18 +3,18 @@ TrainingGraph: DAG view over a flat list of edges for training.
 
 Schema
 ------
-The ``training_graph`` block of ``OmniConfig`` is a *single list of edges*;
-each endpoint is a self-describing ``module[.method]`` string (a bare module
-defaults to ``.forward``)::
+``OmniConfig.training_graph`` is a *single list of edges*; each endpoint is a
+self-describing ``module[.method]`` string (a bare module defaults to
+``.forward``). A launcher ``graph_train.yaml`` *is* that list, at the file top
+level with no wrapper key::
 
-    training_graph:
-      - {from: janus_siglip,             to: janus_llama}
-      - {from: janus_vqvae.encode,       to: janus_llama}
-      - {from: janus_text_encoder.encode, to: janus_llama}
-      - {from: janus_llama,              to: janus_text_encoder.decode}
-      - {from: janus_llama,              to: janus_vqvae.decode}
-      - {from: janus_text_encoder.decode, to: end}   # leaf → end
-      - {from: janus_vqvae.decode,       to: end}    # leaf → end
+    - {from: janus_siglip,             to: janus_llama}
+    - {from: janus_vqvae.encode,       to: janus_llama}
+    - {from: janus_text_encoder.encode, to: janus_llama}
+    - {from: janus_llama,              to: janus_text_encoder.decode}
+    - {from: janus_llama,              to: janus_vqvae.decode}
+    - {from: janus_text_encoder.decode, to: end}   # leaf → end
+    - {from: janus_vqvae.decode,       to: end}    # leaf → end
 
 Active nodes are *derived* from the endpoints of those edges (excluding the
 virtual :data:`~.graph.END` keyword); a node's identity is its canonical
@@ -80,20 +80,20 @@ class TrainingGraph:
 
     def __init__(
         self,
-        edges: List[Dict],
+        training_graph: List[Dict],
         *,
         default_method: str = "forward",
     ):
-        if not edges:
+        if not training_graph:
             raise ValueError(
-                "TrainingGraph requires a non-empty `edges` list. "
+                "TrainingGraph requires a non-empty `training_graph` list. "
                 "Even a single-node graph must use `to: end` to make the node visible."
             )
 
         # Parse edges; endpoints are self-describing `module[.method]` strings.
         resolved_edges: List[EdgeDef] = []
         seen_edges: set = set()
-        for spec in edges:
+        for spec in training_graph:
             edge = EdgeDef.parse(spec, default_method=default_method)
             key = (edge.from_, edge.to)
             if key in seen_edges:

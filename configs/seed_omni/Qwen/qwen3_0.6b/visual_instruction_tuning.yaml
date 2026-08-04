@@ -25,6 +25,9 @@ model:
   model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
   modules: configs/seed_omni/Qwen/qwen3_0.6b/modules_train_visual_instruction_tuning.yaml
   train_graph: configs/seed_omni/Qwen/qwen3_0.6b/graph_train_visual_instruction_tuning.yaml
+  model_config:
+    infer_graph:
+      understanding: configs/seed_omni/Qwen/qwen3_0.6b/graph_infer_visual_instruction_tuning.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -97,9 +100,6 @@ train:
     name: qwen3_0.6b_visual_instruction_tuning
 
 infer:
-  infer_graph:
-    understanding: configs/seed_omni/Qwen/qwen3_0.6b/graph_infer_visual_instruction_tuning.yaml
-  infer_type: understanding
   generation_kwargs:
     max_new_tokens: 512
     temperature: 0.0

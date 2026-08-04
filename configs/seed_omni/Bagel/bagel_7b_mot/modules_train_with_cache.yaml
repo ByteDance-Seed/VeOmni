@@ -1,21 +1,12 @@
 bagel_vae:
-  model:
-    model_path: bagel_vae
-    model_config:
-      support_cache: true
-
+  model_path: bagel_vae
+  model_config:
+    support_cache: true
 bagel_siglip_navit:
-  model:
-    model_path: bagel_siglip_navit
-
+  model_path: bagel_siglip_navit
 bagel_text_encoder:
-  model:
-    model_path: bagel_text_encoder
-
+  model_path: bagel_text_encoder
 bagel_flow_connector:
-  model:
-    model_path: bagel_flow_connector
-
+  model_path: bagel_flow_connector
 bagel_qwen2_mot:
-  model:
-    model_path: bagel_qwen2_mot
+  model_path: bagel_qwen2_mot

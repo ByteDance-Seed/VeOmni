@@ -1,100 +1,60 @@
 """
 OmniModel V2 — composable multi-modal model driven by config-specified graphs.
 
-This file holds the *minimal* runtime — graph traversal for training, FSM
-walk for inference, and a single ``_loss`` aggregation step.  It deliberately
-contains **no** build / weight-loading / FSDP wiring; that lives in
-:class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`, which builds and
-FSDP-wraps each module independently and attaches them to :class:`OmniModel`.
+This file holds the **clean modeling definition** — FSM inference via
+:meth:`OmniModel.generate` and checkpoint compose/load/save.  It is profiler-free
+and parallel-infra-free so it can be loaded with HF ``from_pretrained`` /
+``from_config`` and run eager single-process inference without VeOmni.
+
+**Training** requires :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`,
+which owns the training DAG loop, parallel-state scoping, graph profiling, and
+metric metering.
 
 Architecture
 ------------
 ``OmniModel`` carries:
 
-* sub-modules           — each named :class:`ModuleMixin` is attached as a
-                          **direct attribute** of ``OmniModel``, so
-                          ``model.named_children()`` enumerates them in the
-                          declared order and parameter fqns flatten to
-                          ``<module_name>.<rest>`` (no ``modules_dict.``
-                          middle prefix).  ``model.modules_dict`` remains as
-                          a read-only dict view for back-compat.
-* ``training_graph``    — :class:`TrainingGraph` (DAG over the flat edge list).
-* ``generation_graph``  — :class:`GenerationGraph` (FSM, optional).
+* sub-modules           — each graph participant is attached as a **direct
+                          attribute** of ``OmniModel``.  In the eager path these
+                          are bare hook-bearing modules (typically a concrete
+                          ``*ModuleMixin + PreTrainedModel`` class from the
+                          registry).  Under VeOmni training they may be
+                          FSDP/DDP-wrapped; the graph resolves graph hooks
+                          (``pre_forward`` / ``post_forward``) through
+                          :func:`~veomni.models.seed_omni.graphs.dispatch.unwrap_graph_module`.
+                          Parallel/acceleration build hooks live on
+                          :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
+                          (or a customized runtime subclass), not on
+                          :class:`~veomni.models.seed_omni.mixins.modulemixin.ModuleMixin`.
+* ``generation_graph``  — :class:`GenerationGraph` (FSM).
 
-Loss protocol (single ``_loss`` key per module)
------------------------------------------------
-Each module's ``forward`` returns at most one ``_loss`` scalar — a *token-
-level* mean already reduced across every micro-batch the module consumed
-internally.  ``OmniModel.forward`` simply sums those scalars across nodes::
-
-    losses[node] = out["_loss"]   # if present
-    total = sum(losses.values())  # zero-dim tensor
-
-No aliasing, no per-batch averaging at the OmniModel level — that responsibility
-sits with each module's ``post_forward`` (so token counts stay correct when
-micro-batch sizes differ across modules).
-
-Training
---------
-``forward(**batch)`` walks the DAG one node at a time, fully symmetric with
-:meth:`generate` (it resets the graph cursor at entry — each forward is
-independent). The graph only **selects** nodes; execution is external:
-
-  * ``for node in training_graph.iter_nodes(): ...`` — the graph yields the node at the
-    cursor (selection only), then advances via ``maybe_transition``. Edges
-    declare execution order only — no per-field routing.
-  * ``execute_train_node(modules, node, batch, scope_fn=self.module_context)`` —
-    run the node (``pre_forward`` → method → ``post_forward``, every method
-    routed through the module's ``__call__`` so FSDP2/DDP hooks fire), mutating
-    the shared ``conversation_list`` carrier in place.
-  * ``_collect_training_loss(batch, node.name)`` — drain the node's optional
-    ``_loss``.
-
-Returns ``{"loss": scalar_or_None, "losses": {node: scalar}}``.
+Training uses :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+to walk ``training_graph``; the bare :class:`OmniModel` does not implement it.
 
 Inference
 ---------
-``generate(request, profiler, generation_kwargs)`` loops (it does **not** reset
-the FSM — the caller owns request boundaries via :meth:`reset`):
-
-  * ``for node in fsm.iter_nodes(ctx): execute_generation_node(...)`` — the FSM
-    selects the nodes of one iteration of the current state (honouring the
-    ``module_signal`` early-break); the caller runs each.
-  * ``fsm.maybe_transition(ctx)`` — first matching condition wins.
-  * Stop when ``fsm.is_done()`` or the ``generation_kwargs["max_new_tokens"]``
-    safety cap (default 2048) is reached.
-
-Modules emit one-shot ``generated`` payloads (``{type, value}``) from their
-FSM step return dict when a span ends; :meth:`OmniModel.generate` drains
-those into :attr:`OmniModel.generated` via :meth:`_collect_generated` and
-does not persist them on ``ctx``.
-
-The executors (``execute_train_node`` / ``execute_generation_node``) and
-``maybe_transition`` accept an optional graph profiler. Print-driven flow tests
-collect the visit log from ``profiler.save_records()`` to assert the expected
-node order and transition timing.
-
-``OmniModel.generate`` always emits a coarse progress trail via
-:meth:`logger.info_rank0` — one line per FSM state entry
-(``[FSM] step <N>: <state_name>``) so CLI users can follow long-running
-spans (e.g. Janus T2I's 576-step ``image_vq`` loop).  Rank-0 gating is
-handled by the logger.
+``generate(request, generation_kwargs)`` loops the FSM.  Each node calls its
+endpoint directly (no pre/post hooks).  Stop when ``is_done()`` or
+``max_new_tokens`` is reached.
 """
 
-from contextlib import nullcontext
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from __future__ import annotations
 
+import os
+from typing import Any, Iterator, Mapping
+
+import torch.distributed as dist
 import torch.nn as nn
+from transformers import PreTrainedModel
 
-from ...distributed.parallel_state import use_parallel_state
 from ...utils import helper
 from .configuration_omni import OmniConfig
-from .graphs.executor import execute_generation_node, execute_train_node
+from .graphs.dispatch import unwrap_graph_module, unwrap_module_chain
 from .graphs.generation_graph import GenerationGraph
 from .graphs.graph import NodeDef
-from .graphs.profiling import GraphProfiler
 from .graphs.training_graph import TrainingGraph
 from .mixins.modulemixin import ModuleMixin
+from .modules import OMNI_MODEL_REGISTRY, read_model_type
 
 
 logger = helper.create_logger(__name__)
@@ -102,302 +62,369 @@ logger = helper.create_logger(__name__)
 # Must match the ``_loss`` key every OmniModule's ``post_forward`` emits.
 _LOSS_KEY = "_loss"
 
+# HF hub kwargs forwarded to :meth:`OmniConfig.from_pretrained`.
+_CONFIG_LOAD_KWARG_NAMES = frozenset(
+    {
+        "cache_dir",
+        "force_download",
+        "local_files_only",
+        "proxies",
+        "resume_download",
+        "revision",
+        "subfolder",
+        "token",
+        "trust_remote_code",
+        "mirror",
+        "_from_pipeline",
+    }
+)
 
-class OmniModel(nn.Module):
-    """Pure runtime over already-built sub-modules.
+# Top-level :class:`OmniConfig` fields overridable at ``OmniModel.from_pretrained`` time.
+_OMNI_CONFIG_OVERRIDE_KEYS = frozenset(
+    {
+        "infer_type",
+        "generation_kwargs",
+        "training_graph",
+        "generation_graphs",
+        "modules",
+        "training_graph_file",
+        "generation_graph_file",
+    }
+)
+
+
+class OmniModel(PreTrainedModel):
+    """Pure SeedOmni modeling runtime over already-built sub-modules.
 
     Parameters
     ----------
     config:
         :class:`OmniConfig` with ``modules`` / ``training_graph`` /
-        ``generation_graph`` populated.
+        ``generation_graphs`` populated. The FSM bound here is the one
+        ``config.infer_type`` selects, so switching scenario means rebuilding.
     modules:
-        ``{module_name: ModuleMixin-mixin instance}`` — already constructed
-        (and parallelised, if running under FSDP).  ``OmniTrainer`` is
-        responsible for building these via ``build_foundation_model`` /
-        ``build_parallelize_model``.  The print-flow tests pass plain
-        :class:`ModuleMixin` subclasses here.
-
-    Notes
-    -----
-    The runtime never instantiates modules itself — that contract belongs
-    to the trainer.  Keeping the runtime free of build logic means it stays
-    importable in cpu-only / torch-free contexts (the tests rely on this).
+        ``{module_name: nn.Module}`` — already constructed graph participants.
+        VeOmni trainers/inferencers compose them into :class:`OmniModel` and run
+        graph loops via :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`.
+        Training may attach FSDP/DDP wrappers around each entry;
+        graph hooks are resolved via :func:`~veomni.models.seed_omni.graphs.dispatch.unwrap_graph_module`.
     """
 
     config_class = OmniConfig
-
-    # Names that ``OmniModel`` itself uses as attributes — sub-module names
-    # coming in from YAML must not collide with these or PyTorch's nn.Module
-    # ``add_module`` would silently overwrite framework state.  Listed
-    # explicitly so the failure mode is loud and obvious.
-    _RESERVED_ATTR_NAMES: Tuple[str, ...] = (
-        "config",
-        "training_graph",
-        "generation_graph",
-        "modules_dict",
-        "_module_names",
-        "_RESERVED_ATTR_NAMES",
-    )
+    base_model_prefix = "omni"
+    main_input_name = "conversation_list"
+    supports_gradient_checkpointing = False
 
     def __init__(self, config: OmniConfig, modules: Mapping[str, nn.Module]):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
 
-        missing = [n for n in config.module_names if n not in modules]
-        if missing:
-            raise KeyError(
-                f"OmniModel: modules dict missing entries declared in config: {missing}. "
-                f"Provided: {sorted(modules)}; expected: {config.module_names}."
-            )
-        clashes = [n for n in config.module_names if n in self._RESERVED_ATTR_NAMES]
-        if clashes:
-            raise ValueError(
-                f"OmniModel: sub-module name(s) {clashes} collide with framework "
-                f"attribute(s).  Rename these in your YAML's `modules:` section."
-            )
-
-        # Sub-modules are attached as **direct attributes** of OmniModel (not
-        # via an `nn.ModuleDict` middle layer) so that:
-        #   * ``model.named_children()`` directly yields ``[(name, mod), ...]``
-        #     — needed by ``build_parallelize_model`` to dispatch a
-        #     per-sub-module ``weights_path`` mapping;
-        #   * ``model.named_parameters()`` fqns shape as ``<name>.<rest>``
-        #     instead of ``modules_dict.<name>.<rest>`` — so per-module
-        #     checkpoint subfolders map 1:1 to parameter-fqn prefixes;
-        #   * downstream save/load callbacks that target subfolder names can
-        #     reuse those names verbatim without stripping a prefix.
-        # ``_module_names`` is a plain list (not an ``nn.Module``) so it
-        # doesn't show up under ``children()`` / ``modules()``.  The
-        # back-compat ``modules_dict`` view below preserves existing call
-        # sites that index/iterate by name.
-        self._module_names: List[str] = list(config.module_names)
+        self._module_names: list[str] = list(config.module_names)
         for name in self._module_names:
             self.add_module(name, modules[name])
 
-        # Both views are optional: an inference-only config may carry just a
-        # ``generation_graph`` (no ``training_graph``), and vice versa.
-        self.training_graph = TrainingGraph(edges=config.training_graph) if config.has_training_graph() else None
+        self.training_graph = TrainingGraph(config.training_graph)
+        self.generation_graph = GenerationGraph(config.generation_graph)
 
-        self.generation_graph = (
-            GenerationGraph(fsm_config=config.generation_graph) if config.has_generation_graph() else None
-        )
+        self._last_printed_state: str | None = None
+        self._generated: list[dict[str, Any]] = []
 
-        # Last FSM state printed by :meth:`_emit_progress` — its private
-        # dedup cursor (reset on each fresh ``generate`` run).
-        self._last_printed_state: Optional[str] = None
-        # Per-``generate`` artefacts emitted by modules as one-shot
-        # ``ctx["generated"] = {type, value}`` payloads — drained into this
-        # list and never persisted back onto ``ctx``.
-        self._generated: List[Dict[str, Any]] = []
-
-        # Per-``forward`` training losses, ``{node_name: scalar}`` — drained from
-        # each node's ``batch["_loss"]`` by ``_collect_training_loss`` (the
-        # training analogue of ``_generated`` / ``_collect_generated``).
-        self._losses: Dict[str, Any] = {}
-
-        # Module names whose ParallelState is registered in the global
-        # ``_PARALLEL_STATE_REGISTRY`` (set by the trainer via
-        # :meth:`set_module_parallel_state_names`).  ``module_context`` scopes a
-        # node's forward under its module's mesh by *name* (registry lookup).
-        # Empty by default so the runtime stays importable without a trainer
-        # (print-flow tests) and eager single-process inference stays unscoped.
-        self._module_parallel_state_names: set = set()
-
-        # Prime per-request inference runtime state (FSM at its initial
-        # state).  :meth:`generate` deliberately does NOT reset, so a future
-        # multi-turn conversation can keep cache across turns and only wipe
-        # it when the caller explicitly invokes :meth:`reset`.
         self.reset()
 
-    @property
-    def modules_dict(self) -> Dict[str, nn.Module]:
-        """Back-compat dict view of the sub-modules.
+    def _init_weights(self, module: nn.Module) -> None:
+        """Sub-modules own weight init; the composed model has no standalone params."""
+        return
 
-        Read-only — sub-modules are real attributes; mutating this dict has
-        no effect on the model.  Returned as a fresh ``dict`` (not an
-        ``nn.ModuleDict``) so callers indexing / iterating it never see
-        the deprecated middle-attribute path.
+    @classmethod
+    def from_config(cls, config: OmniConfig | dict[str, Any], **kwargs: Any) -> OmniModel:
+        """Build an :class:`OmniModel` from config only (sub-modules without weights)."""
+        if not isinstance(config, OmniConfig):
+            config = OmniConfig.from_dict(config)
+        checkpoint_root = kwargs.pop("checkpoint_root", None) or getattr(config, "_name_or_path", None)
+        modules = cls._load_modules(
+            config,
+            checkpoint_root=checkpoint_root,
+            pretrained=False,
+            **kwargs,
+        )
+        return cls(config, modules)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike,
+        *model_args: Any,
+        **kwargs: Any,
+    ) -> OmniModel:
+        """Load an :class:`OmniModel` and every declared sub-module from a split checkpoint.
+
+        ``pretrained_model_name_or_path`` is the omni root (``config.json`` +
+        graph YAML sidecars + one subfolder per module).
+
+        Remaining kwargs are forwarded to **every** sub-module's
+        ``from_pretrained`` as global load options (e.g. ``torch_dtype``,
+        ``device_map``).  Per-module ``model_config`` and ``ops_implementation``
+        persisted in the checkpoint are merged on top via
+        :meth:`_build_module_load_kwargs` — module-level ``attn_implementation``
+        wins over any global kwarg when both are set.
+
+        Pass ``config=`` to load the weights under an already-resolved
+        :class:`OmniConfig` instead of the root ``config.json`` — how
+        :class:`~veomni.trainer.omni.omni_inferencer.OmniInferencer` keeps its
+        launcher-YAML graph / ``model_config`` overrides on the eager path.
+
+        Top-level :class:`OmniConfig` fields (``infer_type``, ``generation_kwargs``,
+        …) may also be passed as kwargs and override the checkpoint defaults.
         """
-        return {name: getattr(self, name) for name in self._module_names}
+        config = kwargs.pop("config", None)
+        config_kwargs = {key: kwargs.pop(key) for key in list(kwargs) if key in _CONFIG_LOAD_KWARG_NAMES}
+        config_overrides = {key: kwargs.pop(key) for key in list(kwargs) if key in _OMNI_CONFIG_OVERRIDE_KEYS}
+        if config is None:
+            config = OmniConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                **config_kwargs,
+                **config_overrides,
+            )
+        elif not isinstance(config, OmniConfig):
+            config = OmniConfig.from_dict(config)
+            for key, value in config_overrides.items():
+                setattr(config, key, value)
+        elif config_overrides:
+            for key, value in config_overrides.items():
+                setattr(config, key, value)
 
-    @property
-    def generated(self) -> List[Dict[str, Any]]:
-        """Artefacts collected during the latest :meth:`generate` run.
+        checkpoint_root = getattr(config, "_name_or_path", None) or str(pretrained_model_name_or_path)
+        modules = cls._load_modules(
+            config,
+            checkpoint_root=checkpoint_root,
+            pretrained=True,
+            **kwargs,
+        )
+        return cls(config, modules)
 
-        Each entry is ``{"type": <str>, "value": <any>}`` — e.g.
-        ``{"type": "image", "value": PIL.Image}``.  Not mirrored on ``ctx``.
-        """
-        return list(self._generated)
+    @staticmethod
+    def _build_module_load_kwargs(
+        config: OmniConfig,
+        name: str,
+        base_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge checkpoint overrides and apply persisted ``ops_implementation``."""
+        from ...arguments import OpsImplementationConfig
+        from ...ops import apply_ops_config
 
-    def set_module_parallel_state_names(self, module_names: Iterable[str]) -> None:
-        """Register which module names have a ParallelState in the global registry.
+        load_kwargs = {**base_kwargs, **config.module_model_config(name)}
+        ops_dict = config.module_ops_implementation(name)
+        if not ops_dict:
+            return load_kwargs
 
-        Called by :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` (and the
-        inferencer) after the modules are built. Each module trainer registers its
-        own :class:`ParallelState` under its module name via ``init_parallel_state(
-        name=...)``; here we only record the *set of names* so each node's
-        pre/forward/post can be scoped by name (registry lookup) under its own
-        module's device mesh / extra-parallel groups — needed when modules use
-        different parallelism (e.g. a vocab-parallel ``emb`` embedding whose forward
-        all-reduces over the ``emb`` group, or an EP MoE module whose kernels read
-        ``get_parallel_state().ep_group``). Only distributed modules are passed
-        (eager single-process inference modules stay unscoped).
-        """
-        self._module_parallel_state_names = set(module_names)
+        ops = OpsImplementationConfig(**ops_dict)
+        apply_ops_config(ops)
+        if ops.attn_implementation is not None:
+            load_kwargs["attn_implementation"] = ops.attn_implementation
+        return load_kwargs
 
-    def module_context(self, module_name: str):
-        """Context manager scoping ``module_name``'s ParallelState as current.
-
-        Used by both training ``forward`` and the inference ``generate`` FSM
-        (passed as ``scope_fn`` to :meth:`GenerationGraph.step`).  Resolves the
-        state from the global registry by name; no-op when the module has no
-        registered state (e.g. eager single-process inference / print-flow tests).
-        """
-        if module_name in self._module_parallel_state_names:
-            return use_parallel_state(module_name)
-        return nullcontext()
-
-    # ── Training ──────────────────────────────────────────────────────────────
-
-    def _collect_training_loss(
-        self, batch: Dict[str, Any], node_name: str, profiler: Optional[GraphProfiler] = None
-    ) -> None:
-        """Drain ``batch["_loss"]`` for the just-executed ``node_name`` into :attr:`_losses`.
-
-        The training analogue of :meth:`_collect_generated`: the node's
-        ``post_forward`` merges an optional scalar ``_loss`` into the carrier;
-        we pop it (so it never leaks to the next node) and key it by the node
-        that produced it for per-node logging.
-        """
-        loss = batch.pop(_LOSS_KEY, None)
-        if loss is not None:
-            self._losses[node_name] = loss
-            if profiler is not None:
-                profiler.record(f"loss:{node_name}")
-
-    def forward(
-        self,
+    @classmethod
+    def _load_modules(
+        cls,
+        config: OmniConfig,
         *,
-        profiler: Optional[GraphProfiler] = None,
-        **batch: Any,
-    ) -> Dict[str, Any]:
-        """Execute the training DAG once over the full ``batch``.
+        checkpoint_root: str | os.PathLike | None,
+        pretrained: bool,
+        **kwargs: Any,
+    ) -> dict[str, nn.Module]:
+        import sys
 
-        Fully symmetric with :meth:`generate`: the graph *selects* one node at a
-        time (``training_graph.iter_nodes``), the external ``execute_train_node`` runs
-        it (firing the FSDP2/DDP hooks) and ``_collect_training_loss`` drains its
-        ``_loss`` — until ``is_done()``. Each module is invoked exactly once and
-        owns its internal micro-batch chunking (token-mean reduction included).
+        from transformers import PretrainedConfig
+
+        from ...ops.config.singleton import get_ops_config
+        from ..auto import _bind_veomni_ops
+
+        modules: dict[str, nn.Module] = {}
+        for name in config.module_names:
+            module_path = config.resolve_module_path(checkpoint_root, name)
+            entry = config.modules.get(name)
+            load_kwargs = cls._build_module_load_kwargs(config, name, kwargs)
+            if isinstance(entry, PretrainedConfig):
+                model_type = entry.model_type
+                mod_cls = OMNI_MODEL_REGISTRY[model_type]()
+                modeling_module = sys.modules.get(mod_cls.__module__)
+                if modeling_module is not None and config.module_ops_implementation(name):
+                    _bind_veomni_ops(modeling_module, get_ops_config())
+                if pretrained:
+                    modules[name] = mod_cls.from_pretrained(module_path, config=entry, **load_kwargs)
+                else:
+                    modules[name] = mod_cls.from_config(entry, **load_kwargs)
+                continue
+            model_type = read_model_type(module_path)
+            mod_cls = OMNI_MODEL_REGISTRY[model_type]()
+            modeling_module = sys.modules.get(mod_cls.__module__)
+            if modeling_module is not None and config.module_ops_implementation(name):
+                _bind_veomni_ops(modeling_module, get_ops_config())
+            if pretrained:
+                modules[name] = mod_cls.from_pretrained(module_path, **load_kwargs)
+            else:
+                cfg_cls = mod_cls.config_class
+                sub_config = cfg_cls.from_pretrained(module_path)
+                modules[name] = mod_cls.from_config(sub_config, **config.module_model_config(name))
+        return modules
+
+    @staticmethod
+    def _save_module_assets(module: nn.Module, module_dir: str) -> None:
+        """Save a module's config plus its processor / tokenizer sidecars (no weights)."""
+        cfg = getattr(module, "config", None)
+        if cfg is not None and hasattr(cfg, "save_pretrained"):
+            cfg.save_pretrained(module_dir)
+        for attr in ("_processor", "_image_processor", "_video_processor", "_tokenizer"):
+            asset = getattr(module, attr, None)
+            if asset is not None and hasattr(asset, "save_pretrained"):
+                asset.save_pretrained(module_dir)
+
+    def _save_module_subdirectory(
+        self,
+        name: str,
+        module: nn.Module,
+        save_directory: str,
+        *,
+        save_module_weights: bool,
+        **kwargs: Any,
+    ) -> None:
+        subfolder = self.config.module_checkpoint_subfolder(name)
+        module_dir = os.path.join(save_directory, subfolder)
+        os.makedirs(module_dir, exist_ok=True)
+        # Processors / tokenizers are not part of a module's ``save_pretrained``, so
+        # they are written on both paths: a weights export without them reloads as a
+        # model that cannot preprocess its own inputs. Weights go last so the module
+        # has the final say over ``config.json``.
+        self._save_module_assets(module, module_dir)
+        if save_module_weights:
+            if not hasattr(module, "save_pretrained"):
+                raise TypeError(
+                    f"OmniModel.save_pretrained: sub-module '{name}' ({type(module).__name__}) "
+                    "has no save_pretrained()."
+                )
+            module.save_pretrained(module_dir, **kwargs)
+
+    def save_pretrained(
+        self,
+        save_directory: str | os.PathLike,
+        *,
+        save_module_weights: bool = True,
+        safe_serialization: bool = True,
+        max_shard_size: int | str = "5GB",
+        is_main_process: bool | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Write an HF-style omni checkpoint (root config/graphs + module subfolders).
 
         Parameters
         ----------
-        profiler:
-            Optional graph profiler used by print-flow tests and diagnostics.
-        **batch:
-            Raw batch fields, transparently visible to every node.
-
-        Returns
-        -------
-        dict with keys:
-        * ``"loss"``    : scalar tensor (sum of all node ``_loss`` values),
-                          or ``None`` if no node emitted a loss.
-        * ``"losses"``  : ``{node_name: scalar tensor}``.
+        save_directory:
+            Omni checkpoint root. Each module is written under
+            ``<root>/<subfolder>/`` where ``subfolder`` comes from
+            :meth:`OmniConfig.module_checkpoint_subfolder`.
+        save_module_weights:
+            When ``False``, only each module's ``config.json`` and attached
+            assets (processor / tokenizer) are written — used for the initial
+            ``model_assets`` export at train begin.
+        safe_serialization / max_shard_size:
+            Forwarded to each sub-module's ``save_pretrained`` when
+            ``save_module_weights=True``.
         """
-        if self.training_graph is None:
-            raise RuntimeError(
-                "OmniModel.forward requires a `training_graph`, but this config declares none "
-                "(inference-only). Use `generate` instead, or load a training YAML."
+        if is_main_process is None:
+            is_main_process = not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+        if not is_main_process:
+            return
+
+        save_directory = str(save_directory)
+        os.makedirs(save_directory, exist_ok=True)
+
+        module_save_kwargs = {
+            **kwargs,
+            "safe_serialization": safe_serialization,
+            "max_shard_size": max_shard_size,
+        }
+        for name in self._module_names:
+            module = getattr(self, name)
+            self._save_module_subdirectory(
+                name,
+                module,
+                save_directory,
+                save_module_weights=save_module_weights,
+                **module_save_kwargs,
             )
 
-        self.training_graph.reset()
-        self._losses.clear()
-        modules = {name: getattr(self, name) for name in self._module_names}
+        self.config.save_pretrained(save_directory)
 
-        # The graph only *selects* the next node (profiler-free — it is
-        # model-bound); execution (unwrap + module scope + pre/forward/post) is
-        # external (``execute_train_node``) and the transition trace is recorded
-        # here, where the profiler lives — the graph stays pure.
-        prev_node: Optional[NodeDef] = None
-        for node in self.training_graph.iter_nodes():
-            if prev_node is not None and profiler is not None:
-                profiler.record(f"transition: -> {node.name}")
-            execute_train_node(modules, node, batch, profiler=profiler, scope_fn=self.module_context)
-            self._collect_training_loss(batch, node.name, profiler)
-            prev_node = node
+    @property
+    def modules_dict(self) -> dict[str, nn.Module]:
+        """Back-compat dict view of the sub-modules."""
+        return {name: getattr(self, name) for name in self._module_names}
 
-        return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
+    def forward(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Training is not supported on the bare :class:`OmniModel`.
+
+        Use :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+        (via :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`) for the training DAG.
+        """
+        raise NotImplementedError(
+            "OmniModel.forward() is not available on the native eager model. "
+            "Training requires OmniModelRuntime (see OmniTrainer)."
+        )
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def reset(self) -> None:
-        """Clear per-conversation inference runtime state.
-
-        Re-points the generation FSM to its initial state (and is the future
-        home for clearing per-module KV / VQ caches).  Called once at
-        construction; afterwards the *caller* drives it at request
-        boundaries — :class:`OmniInferencer` resets before each independent
-        request, while a multi-turn conversation would reset only on an
-        explicit ``clear`` so cache survives across turns.  :meth:`generate`
-        never resets on its own.
-        """
-        if self.generation_graph is not None:
-            self.generation_graph.reset()
+        """Clear per-conversation inference runtime state."""
+        self.generation_graph.reset()
         self._generated.clear()
+        for _, module in self.named_omni_modules():
+            module.reset_global_inference_state()
 
     @staticmethod
-    def _normalize_generated(item: Any) -> Optional[Dict[str, Any]]:
-        """Normalize a one-shot module ``generated`` payload to ``{type, value}``."""
+    def _normalize_generated(item: Any) -> dict[str, Any] | None:
         if item is None:
             return None
         if isinstance(item, dict) and "type" in item and "value" in item:
-            normalized: Dict[str, Any] = {"type": item["type"], "value": item["value"]}
+            normalized: dict[str, Any] = {"type": item["type"], "value": item["value"]}
             if item.get("meta") is not None:
                 normalized["meta"] = item["meta"]
             return normalized
         return None
 
     def _append_generated(self, item: Any) -> None:
-        """Append a normalized ``{type, value}`` entry to :attr:`_generated`."""
         normalized = self._normalize_generated(item)
         if normalized is not None:
             self._generated.append(normalized)
 
-    def _collect_generated(self, ctx: Dict[str, Any], profiler: Optional[GraphProfiler] = None) -> None:
+    def _collect_generated(self, ctx: dict[str, Any]) -> None:
         """Drain ``ctx["generated"]`` into :attr:`_generated` (one-shot)."""
-        generated = ctx.pop("generated", None)
-        self._append_generated(generated)
-        if profiler is not None and generated is not None:
-            profiler.record(f"generated:{generated['type']}")
+        self._append_generated(ctx.pop("generated", None))
 
-    def _invoke_module_finalize(
+    def _run_generation_node(
         self,
-        ctx: Dict[str, Any],
-        profiler: Optional[GraphProfiler] = None,
+        module: nn.Module,
+        node: NodeDef,
+        ctx: dict[str, Any],
+        generation_kwargs: dict[str, Any] | None,
     ) -> None:
-        """Call :meth:`ModuleMixin.finalize` and drain any ``generated`` payload.
+        """Run one generation node — eager endpoint call only."""
+        method = node.method
+        fn = getattr(module, method, None)
+        if fn is None:
+            raise AttributeError(f"Node method {type(module).__name__}.{method}() is not implemented.")
+        out = fn(**ctx, generation_kwargs=generation_kwargs)
+        if not isinstance(out, dict):
+            raise TypeError(f"FSM node '{node.name}'.{method} must return a dict; got {type(out).__name__}.")
+        ctx.update(out)
 
-        Runs on every module when ``max_new_tokens`` trips before ``done``.
-        """
-        for name, raw in self.named_omni_modules():
+    def _invoke_module_finalize(self, ctx: dict[str, Any]) -> None:
+        """Call ``finalize`` on every graph participant when the safety cap trips."""
+        for _, raw in self.named_omni_modules():
             out = raw.finalize(ctx=ctx)
             if not isinstance(out, dict):
                 raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
-            generated = out.pop("generated", None)
-            self._append_generated(generated)
-            if profiler is not None and generated is not None:
-                profiler.record(f"finalize:{name} | generated:{generated['type']}")
+            self._append_generated(out.pop("generated", None))
 
     def _emit_progress(self, total_steps: int) -> None:
-        """Log one ``[FSM] step <N>: <state>`` line on a state change.
-
-        Owns its own dedup cursor (:attr:`_last_printed_state`) so the caller
-        doesn't thread it around: emits via :meth:`logger.info_rank0` only
-        when the FSM's current state differs from the last printed one.  The
-        cursor is reset at ``total_steps == 0`` (the first call of every
-        :meth:`generate` run) so a fresh run always re-prints its initial
-        state.
-        """
         if total_steps == 0:
             self._last_printed_state = None
         current = self.generation_graph.current_state_name
@@ -407,156 +434,105 @@ class OmniModel(nn.Module):
 
     def generate(
         self,
-        request: Dict[str, Any],
-        profiler: Optional[GraphProfiler] = None,
-        generation_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Run inference using the FSM.
+        request: dict[str, Any],
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run inference using the FSM (profiler-free eager path).
 
         Parameters
         ----------
         request:
-            Generation request dict — used directly as the initial ``ctx``.
-            Built by :class:`OmniInferencer` and contains the seed
-            ``conversation_list`` (see :func:`build_conversation`).  Modules
-            read and mutate it in place each FSM step.
-        profiler:
-            Optional graph profiler that receives FSM step / transition log
-            and optional node timings.
+            Generation request dict — used directly as the initial ``ctx`` and
+            mutated in place as the FSM runs. Call :meth:`reset` before each
+            request to clear graph / module / artefact state.
         generation_kwargs:
-            Opaque per-request knobs forwarded to every module's FSM step
-            (e.g. ``temperature`` / ``top_p`` / ``guidance_scale``).  The
-            framework only reads ``max_new_tokens`` (default 2048) as the
-            hard safety cap on total FSM iterations.
+            Per-request knobs merged on top of :attr:`~OmniConfig.generation_kwargs`
+            defaults (request keys win). Forwarded to every module's FSM step.
+            The framework only reads ``max_new_tokens`` (default 2048).
 
-        Termination is fully FSM-driven: a state reaches ``done`` only when a
-        module raises the ``module_signal`` its transition is waiting on
-        (e.g. the text encoder emits ``text_done`` on ``</s>``, the VQ
-        decoder emits ``image_complete`` when the grid is full).  There is no
-        token-level stop list — EOS handling lives inside the emitting module,
-        not here.  ``max_new_tokens`` is only a hard safety cap on total FSM
-        iterations.
-
-        A coarse progress trail is always emitted via
-        :meth:`logger.info_rank0` — one ``[FSM] step <N>: <state>`` line
-        each time the FSM enters a new state (the initial state at step 0,
-        every state reached via :meth:`GenerationGraph.maybe_transition`,
-        and the terminal ``done`` state).  It fires once more after the loop
-        exits so the final resting state is always reported regardless of
-        how the loop terminated (normal ``done`` or ``max_new_tokens`` cap).
-        This lets the user follow which FSM
-        span is in flight for long-running inference — Janus T2I e.g. shows
-        ``prompt_encode → image_vq → image_vq_end → done``, where the
-        576-step ``image_vq`` loop dominates and is read off the step deltas
-        between consecutive lines.
-
-        Note this does **not** reset the FSM — the caller owns request
-        boundaries via :meth:`reset` (so multi-turn conversations can keep
-        cache across turns).  The FSM runs from whatever state it is in.
+        Returns
+        -------
+        list[dict]
+            Generated artefacts — ``{"type": ..., "value": ..., "meta": ...}``
+            entries collected from the FSM (text replies, images, …).
         """
-        ctx: Dict[str, Any] = request
-        self._generated.clear()
+        ctx: dict[str, Any] = request
+        generation_kwargs = self.resolve_generation_kwargs(generation_kwargs)
 
-        modules = {name: getattr(self, name) for name in self._module_names}
-
-        # Progress trail.  ``maybe_transition`` flips the FSM's current state
-        # at the END of each iteration body, so emitting at the START of the
-        # NEXT body catches every state change (including the initial state at
-        # step 0).  A final emit after the loop catches the transition into
-        # ``done`` (the while-cond exits before the body iterates that state).
-        # :meth:`_emit_progress` owns the dedup cursor — nothing to thread.
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
 
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
             self._emit_progress(total_steps)
-            # The FSM only *selects* the nodes for this state's body iteration;
-            # execution is external (``execute_generation_node``). ``iter_nodes``
-            # reads the mutated ``ctx`` after each yield to honour a terminating
-            # ``module_signal`` / fan-in gating. ``state_name`` (stable across the
-            # body) only labels the profiler node.
-            state_name = self.generation_graph.current_state_name
             for node in self.generation_graph.iter_nodes(ctx):
-                execute_generation_node(
-                    modules,
-                    node,
-                    ctx,
-                    state_name=state_name,
-                    generation_kwargs=generation_kwargs,
-                    profiler=profiler,
-                    scope_fn=self.module_context,
-                )
+                module = getattr(self, node.module)
+                self._run_generation_node(module, node, ctx, generation_kwargs)
             total_steps += 1
-            self._collect_generated(ctx, profiler)
-            # The FSM advances state (profiler-free); we record the transition
-            # trace here from the returned FiredTransition, so the graph stays pure.
-            fired = self.generation_graph.maybe_transition(ctx)
-            if fired is not None and profiler is not None:
-                profiler.record(f"transition: {fired.from_state} -> {fired.to_state} [{fired.condition}]")
+            self._collect_generated(ctx)
+            self.generation_graph.maybe_transition(ctx)
 
-        # Final emit — captures the state the FSM is in after the loop
-        # exits.  Usually ``done`` (a module raised its terminating signal);
-        # otherwise the state the FSM got stuck in when the ``max_new_tokens``
-        # safety cap tripped.
         self._emit_progress(total_steps)
 
         if not self.generation_graph.is_done():
-            self._invoke_module_finalize(ctx, profiler=profiler)
+            self._invoke_module_finalize(ctx)
 
-        return ctx
+        return list(self._generated)
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
-    def named_omni_modules(self) -> Iterator[Tuple[str, nn.Module]]:
-        """Yield ``(name, raw_module)`` for every entry whose unwrapped form
-        is an :class:`ModuleMixin` mixin instance."""
+    def named_omni_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        """Yield ``(name, raw)`` for every graph participant.
+
+        ``raw`` is the :class:`ModuleMixin` resolved through
+        :func:`~veomni.models.seed_omni.graphs.dispatch.unwrap_graph_module`
+        (bare in the eager path; unwrapped from FSDP/DDP/LoRA wrappers under
+        VeOmni).  Non-:class:`ModuleMixin` entries are skipped.
+        """
         for name in self._module_names:
-            raw = _unwrap_module(getattr(self, name))
-            if _is_omni_module(raw):
-                yield name, raw  # type: ignore[misc]
+            module = getattr(self, name)
+            if not _is_omni_module(module):
+                continue
+            yield name, unwrap_graph_module(module, module_name=name)
 
     def get_module(self, name: str) -> nn.Module:
         if name not in self._module_names:
             raise KeyError(f"Module '{name}' not found in OmniModel")
         return getattr(self, name)
 
-    def collect_assets(self) -> List[Any]:
-        """Collect per-module assets (vision/audio processors, codebooks).
+    def resolve_generation_kwargs(
+        self,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Merge :attr:`~OmniConfig.generation_kwargs` defaults with per-request overrides."""
+        return merge_generation_kwargs(self.config.generation_kwargs, generation_kwargs)
 
-        Tokenizers (e.g. ``janus_text_encoder``) are module-owned assets assigned
-        on ``_tokenizer`` by :class:`~veomni.trainer.omni.omni_module_trainer.OmniModuleTrainer`.
-        """
-        assets: List[Any] = []
-        for _, raw in self.named_omni_modules():
-            assets.extend(raw.get_assets())
+    def collect_assets(self) -> list[Any]:
+        """Collect per-module assets (vision/audio processors, codebooks)."""
+        assets: list[Any] = []
+        for _, module in self.named_omni_modules():
+            assets.extend(module.get_assets())
         return assets
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
-def _unwrap_module(mod: nn.Module) -> nn.Module:
-    """Strip DDP / FSDP wrappers so mixin hooks (pre/post_forward) reach the raw module.
-
-    FSDP2 (DTensor params) does not wrap; DDP exposes ``.module``.  We treat
-    anything else as already-raw.
-    """
-    inner = getattr(mod, "module", None)
-    if inner is not None and isinstance(inner, nn.Module) and inner is not mod:
-        # DDP-style wrapper.
-        return inner
-    return mod
+def merge_generation_kwargs(
+    defaults: Mapping[str, Any] | None,
+    overrides: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return ``defaults`` updated with ``overrides`` (override keys win)."""
+    merged = dict(defaults or {})
+    merged.update(overrides or {})
+    return merged
 
 
 def _is_omni_module(mod: nn.Module) -> bool:
-    return isinstance(mod, ModuleMixin)
+    """True when ``mod`` (possibly wrapped) resolves to a :class:`ModuleMixin`."""
+    return isinstance(unwrap_module_chain(mod), ModuleMixin)
 
 
-def _sum_losses(losses: Dict[str, Any]) -> Optional[Any]:
-    """Sum a per-node ``{name: scalar}`` dict into one scalar (or ``None``).
-
-    Plain ``+`` builds the autograd graph across the per-node loss tensors.
-    """
+def _sum_losses(losses: dict[str, Any]) -> Any | None:
     if not losses:
         return None
     it = iter(losses.values())
@@ -566,4 +542,4 @@ def _sum_losses(losses: Dict[str, Any]) -> Optional[Any]:
     return total
 
 
-__all__ = ["OmniModel"]
+__all__ = ["OmniModel", "_LOSS_KEY", "merge_generation_kwargs"]

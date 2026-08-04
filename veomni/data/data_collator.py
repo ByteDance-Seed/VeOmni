@@ -596,16 +596,18 @@ class SeedOmniCollator(DataCollator):
         ])
         # batch == {"conversation_list": [[ConversationItem(...)], ...]}
 
-    ``cpu_preprocessors`` is an ordered list of picklable, weight-free callables
-    (see :class:`veomni.models.seed_omni.mixins.modulemixin.CPUPreprocessor`) collected by
-    :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` from the active graph-node
-    modules. Each is run, in order, over the grouped ``conversation_list`` so the
-    heavy per-module CPU input-prep (tokenize / image normalize) executes inside
-    the DataLoader worker and overlaps with GPU compute via prefetch, instead of
-    blocking the main process inside each module's ``pre_forward``. Default empty
-    => pure grouping (all other behaviour unchanged).
+    ``processor`` is an :class:`~veomni.models.seed_omni.processing.OmniProcessor`
+    collected by :func:`~veomni.models.seed_omni.collator.build_seed_omni_collator`
+    from the active graph modules. Its preprocessor chain runs, in order, over the
+    grouped ``conversation_list`` so the heavy per-module CPU input-prep (tokenize /
+    image normalize) executes inside the DataLoader worker and overlaps with GPU
+    compute via prefetch, instead of blocking the main process inside each module's
+    ``pre_forward``. Default ``None`` => pure grouping (all other behaviour unchanged).
+
+    ``cpu_preprocessors`` is a legacy escape hatch for tests; prefer ``processor``.
     """
 
+    processor: Any = None
     cpu_preprocessors: Sequence[Callable[[List[List[Any]]], None]] = ()
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -635,13 +637,12 @@ class SeedOmniCollator(DataCollator):
         # normalize) over the grouped conversation_list. Mutates items in place;
         # the modules' thin pre_forward then only moves to device.
         #
-        # Order is FIXED and SERIAL: the preprocessors are applied one-by-one in the
-        # exact order they were supplied (``OmniTrainer._build_collate_fn`` collects
-        # them in the config ``modules:`` declaration order). This is a contract, not
-        # an accident — a later preprocessor may depend on an earlier one's output
-        # (e.g. the text encoder's chat-template runs after a vision tower has
-        # patchified its image items). Keep ``cpu_preprocessors`` ordered accordingly.
-        for preprocess in self.cpu_preprocessors:
-            preprocess(batch["conversation_list"])
+        # Order is FIXED and SERIAL: preprocessors run one-by-one in config
+        # ``modules:`` declaration order (see :class:`OmniProcessor`).
+        if self.processor is not None:
+            self.processor.preprocess_batch(batch["conversation_list"], inference=False)
+        else:
+            for preprocess in self.cpu_preprocessors:
+                preprocess(batch["conversation_list"])
 
         return batch

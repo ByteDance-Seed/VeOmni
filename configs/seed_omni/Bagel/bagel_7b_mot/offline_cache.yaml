@@ -4,6 +4,12 @@ model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
   modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_train_offline_cache.yaml
   train_graph: configs/seed_omni/Bagel/bagel_7b_mot/graph_train_offline_cache.yaml
+  model_config:
+    infer_graph:
+      infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
+      infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_und.yaml
+    infer_type: infer_und
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -80,13 +86,6 @@ train:
     name: bagel_7b_mot_offline_cache
 
 infer:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
-  modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer_eager.yaml
-  infer_graph:
-    infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
-    infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
-    infer_und: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_und.yaml
-  infer_type: infer_und
   generation_kwargs:
     max_new_tokens: 2048
     temperature: 0.0
