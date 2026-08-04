@@ -31,6 +31,11 @@ config = PatchConfig(
     source_module="deepspec.modeling.dspark.qwen3.modeling",
     target_file="patched_modeling_dspark_qwen3_gpu.py",
     description="DeepSpec Qwen3 DSpark draft model with VeOmni OpSlot guards",
+    # ``deepspec`` is an optional dependency (installed via the ``deepspec``
+    # extra). The default CI drift check runs without it, so skip this config
+    # unless the source module is importable. Run
+    # ``uv run --extra deepspec --dev patchgen --check`` to verify drift here.
+    optional=True,
 )
 
 config.add_post_import_block(
