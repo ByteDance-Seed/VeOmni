@@ -147,22 +147,45 @@ precomputed_max_seqlen = vit_metadata.get("max_seqlen")
 A model whose ViT runs `dummy_forward` (FSDP path for ranks with no real images)
 builds the same `vit_metadata` sub-dict host-side from its Python-int `t/h/w`.
 
-### Merged image+video call (SP disabled)
+### Merged image+video call (exactly-once vision execution)
 
-With SP disabled, Model.forward runs the vision tower **exactly once per rank
-per step**: a mixed image+video micro-batch is served by ONE merged ViT call —
-`cat(pixel_values, pixel_values_videos)` + `cat` of the grids — and the feature
-stream is split back at `pixel_values.shape[0] // spatial_merge_unit`. The
-per-modality metadata is combined host-side by the `merge_image_video_vit_kwargs`
-helper (grid lists concatenated; video `cu_seqlens` offset by the image
-patch-row total; `max_seqlen = max(...)`); if either side lacks metadata the
-merged call passes `{"vit_metadata": {}}` and the ViT falls back to rebuilding
-from the merged grid. Ranks with a single modality make one real call; ranks
-with neither make one `dummy_forward` (FSDP only). With SP enabled the
-historical two-slot layout (image slot + video slot, each real-or-dummy → two
-calls per rank) is kept, because the collator SP-slices the two pixel streams
-per rank independently and cat-ing rank-local slices would misorder the global
-vision sequence.
+Model.forward runs the vision tower **exactly once per rank per step** for the
+Qwen VL family: one merged image+video call, one single-modality call, or one
+`dummy_forward` (FSDP only, when the rank has no vision input).
+
+**SP disabled** — a mixed micro-batch is merged in-forward:
+`cat(pixel_values, pixel_values_videos)` + `cat` of the grids, features split
+back at `pixel_values.shape[0] // spatial_merge_unit`. The per-modality
+metadata is combined host-side by the `merge_image_video_vit_kwargs` helper
+(grid lists concatenated; video `cu_seqlens` offset by the image patch-row
+total; `max_seqlen = max(...)`); if either side lacks metadata the merged call
+passes `{"vit_metadata": {}}` and the ViT falls back to rebuilding from the
+merged grid.
+
+**SP enabled** — merging must happen BEFORE the collator's per-key SP slice
+(rank-local slices of two independently-sliced streams cannot be concatenated
+afterwards without misordering the global vision sequence), so the model
+exposes a second collator hook, `get_pre_sp_collate_func` →
+`merge_pixel_streams_pre_sp`. It runs inside `SequenceParallelCollator` before
+SP padding/slicing and replaces `pixel_values` / `pixel_values_videos` with a
+single `pixel_values_merged` stream (image rows first, then video rows; one
+sp-pad tail; the `*_grid_thw` tensors stay). `collate_multimodal_metadata`
+detects the merged key and emits `merged_grid_thw_list` /
+`vit_merged_cu_seqlens` / `vit_merged_max_seqlen` /
+`vit_merged_n_image_rows` instead of the per-modality keys. Model.forward runs
+one ViT call on the rank-local slice, gathers the feature stream once
+(`gather_outputs(dim=0)`), and splits at
+`vit_merged_n_image_rows // spatial_merge_unit`. Raw per-modality pixel
+streams under SP are rejected with a `ValueError` — wire
+`MainCollator(pre_sp_collate_func=model.get_pre_sp_collate_func())` (VeOmni's
+VLM trainer does this automatically). SP requires the
+`veomni_flash_attention_*_with_sp` attention implementations; the sdpa/eager
+fallbacks are not SP-aware.
+
+Coverage: `tests/models/test_vlm_merged_vision_forward.py` (CPU,
+merged==split), `tests/data/test_pre_sp_merge.py` (CPU, collator merge +
+metadata), `tests/parallel/ulysses/test_vlm_merged_vision_sp.py` (2-GPU SP=2
+end-to-end equivalence).
 
 ## Producer flow (collator pipeline)
 

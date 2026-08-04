@@ -217,10 +217,15 @@ class VLMTrainer:
         #     feature tensors); replaces the former model_type hardcode here.
         #   * get_metadata_collate_func() — picklable CPU-side hook the collator
         #     runs after SP padding to derive multimodal_metadata.
+        #   * get_pre_sp_collate_func() — picklable CPU-side hook the collator
+        #     runs before SP padding/slicing (e.g. merging the image and video
+        #     pixel streams into one so the ViT runs exactly once under SP).
         get_extra_infos = getattr(model, "get_extra_collate_infos", None)
         data_collate_info = get_extra_infos() if get_extra_infos is not None else {}
         get_metadata_func = getattr(model, "get_metadata_collate_func", None)
         metadata_collate_func = get_metadata_func() if get_metadata_func is not None else None
+        get_pre_sp_func = getattr(model, "get_pre_sp_collate_func", None)
+        pre_sp_collate_func = get_pre_sp_func() if get_pre_sp_func is not None else None
 
         seq_classification = self.base.args.data.data_type == "classification"
         pad_to_length = self.base.args.train.pad_to_length
@@ -229,6 +234,7 @@ class VLMTrainer:
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
             metadata_collate_func=metadata_collate_func,
+            pre_sp_collate_func=pre_sp_collate_func,
         )
 
     def _build_optimizer(self):

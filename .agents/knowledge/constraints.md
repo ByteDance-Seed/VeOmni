@@ -125,7 +125,20 @@ Core files:
 
 ### Multimodal Data
 
-15. **Multimodal preprocessing pipeline (`veomni/data/multimodal/`)**
+15. **Qwen VL family under SP requires the collator-merged vision stream**
+    - With sequence parallel enabled, qwen3_5 / qwen3_5_moe / qwen3_vl /
+      qwen3_vl_moe forwards accept only `pixel_values_merged` (produced by the
+      model's `get_pre_sp_collate_func` hook inside `SequenceParallelCollator`,
+      BEFORE the per-key SP pad/slice) and raise on raw `pixel_values` /
+      `pixel_values_videos`; with SP disabled the reverse holds. Merging after
+      the per-key slice is unfixable: rank-local slices of two
+      independently-sliced streams cannot be concatenated without misordering
+      the global vision sequence.
+    - This keeps the vision tower at exactly ONE execution per rank per step
+      (merged / single-modality / dummy), which FSDP collective alignment
+      depends on. See `.agents/knowledge/multimodal_metadata.md`.
+
+16. **Multimodal preprocessing pipeline (`veomni/data/multimodal/`)**
     - `encode_multimodal_sample()` in `multimodal_transform.py` orchestrates: `conv_preprocess()` → `fetch_images/videos/audios` → `process_mm_data()` → processor tokenization.
     - Images: load → RGB PIL → `smart_resize` (pixel min/max, scale_factor for grid alignment, max aspect ratio).
     - Videos: `torchcodec` decode → `calculate_frame_indices` (FPS, min/max frames, `frame_factor`/`frame_factor_remainder` for VAE-friendly counts); optional paired audio.
@@ -134,16 +147,16 @@ Core files:
 
 ## Checkpoint
 
-16. **DCP checkpoint keys must match model state dict**
+17. **DCP checkpoint keys must match model state dict**
     - `veomni/checkpoint/dcp_checkpointer.py` uses PyTorch's DCP (`torch.distributed.checkpoint`).
     - Renaming model parameters or changing the model structure between save and load breaks checkpoint loading.
     - Extra state is saved per-rank via `_EXTRA_STATE_FORMAT` — changing rank count requires checkpoint resharding.
 
-17. **Checkpoint save/load requires all ranks to participate**
+18. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
 
-18. **Distributed HF safetensors consolidation must support non-floating tensors**
+19. **Distributed HF safetensors consolidation must support non-floating tensors**
     - PyTorch 2.9–2.11 computes consolidated tensor byte sizes with `torch.finfo`, which crashes for valid integer and boolean buffers such as DeepSeek V4 `tid2eid`.
     - `apply_dcp_consolidation_patch()` in `veomni/checkpoint/dcp_consolidation.py` replaces the metadata parser with `Tensor.element_size()` and verifies the upstream private-function source hash before patching.
     - Offline DCP-to-HF conversion may cast `save_dtype` only onto floating tensors; integer and boolean buffers must retain their original dtype, and shard-size planning must use their original element sizes.
@@ -151,38 +164,38 @@ Core files:
 
 ## Code Quality
 
-19. **Ruff must pass before commit**
+20. **Ruff must pass before commit**
     - `make quality` runs `ruff check` and `ruff format --check`.
     - Pre-commit hooks enforce this automatically (`pre-commit run --all-files`).
 
-20. **All comments and docstrings must be in English**
+21. **All comments and docstrings must be in English**
     - No Chinese or other non-English text in code comments. This is enforced by project convention.
 
-21. **PR title must follow format: `[{modules}] {type}: {description}`**
+22. **PR title must follow format: `[{modules}] {type}: {description}`**
     - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (single source of truth).
     - CI checks PR titles automatically on every PR.
 
 ## Hardware
 
-22. **NPU (Ascend) code paths require guards**
+23. **NPU (Ascend) code paths require guards**
     - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
     - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/` — they must not be imported on GPU-only environments.
 
-23. **Device-agnostic code must use `veomni.utils.device` helpers**
+24. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU compatibility.
 
 ## Trainer Extensions
 
-24. **Trainer callback lifecycle changes must cover composed trainers**
+25. **Trainer callback lifecycle changes must cover composed trainers**
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
-25. **Module-level OpSlots are shared by every model instance**
+26. **Module-level OpSlots are shared by every model instance**
    - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
    - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
 
-26. **DCP full resume skips HF weight materialization**
+27. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `skip_weights_load=True` into `build_parallelize_model` / `parallelize_model_fsdp2`.
     - The model is only `to_empty()`-materialized; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
     - LoRA/PEFT must not set `skip_weights_load` (and the FSDP2 path raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
