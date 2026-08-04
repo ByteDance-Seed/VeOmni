@@ -382,7 +382,7 @@ class ModuleRuntime:
         defaults to ``False``).
         """
         name = self.module_name
-        gc = self.self.train.gradient_checkpointing
+        gc = self.train.gradient_checkpointing
 
         def _recompute_context_fn():
             return nullcontext(), use_parallel_state(name)

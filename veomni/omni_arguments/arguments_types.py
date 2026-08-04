@@ -430,36 +430,12 @@ class OmniTrainingArguments:
         self._resolve_profile()
 
     def _validate_accelerator(self, accelerator: AcceleratorConfig) -> None:
+        # `dp_size`/`dp_shard_size`/`dp_replicate_size` are already resolved by
+        # `AcceleratorConfig.__post_init__` at construction time. What's left here are
+        # cross-checks against *this* owner's own fields (`init_device`,
+        # `broadcast_model_weights_from_rank0`, `ep_sharded_stream_load`), which
+        # `AcceleratorConfig` has no access to.
         acc = accelerator
-
-        if self.world_size % (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size) != 0:
-            raise ValueError(
-                f"World size should be a multiple of pp_size: {acc.pp_size}, "
-                f"ulysses_size: {acc.ulysses_size}, cp_size: {acc.cp_size}, "
-                f"tp_size: {acc.tp_size}."
-            )
-        assert acc.tp_size == 1, "Tensor parallel size not supported yet."
-        assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
-        assert acc.cp_size == 1, "Context parallel size not supported yet."
-
-        acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
-
-        if acc.dp_replicate_size > 0 and acc.dp_shard_size > 0:
-            assert acc.dp_size == acc.dp_replicate_size * acc.dp_shard_size, (
-                f"dp_size should be equal to dp_replicate_size: {acc.dp_replicate_size} "
-                f"* dp_shard_size: {acc.dp_shard_size}."
-            )
-        elif acc.dp_replicate_size > 0:
-            if acc.dp_size % acc.dp_replicate_size != 0:
-                raise ValueError("dp_size should be a multiple of dp_replicate_size.")
-            acc.dp_shard_size = acc.dp_size // acc.dp_replicate_size
-        elif acc.dp_shard_size > 0:
-            if acc.dp_size % acc.dp_shard_size != 0:
-                raise ValueError("dp_size should be a multiple of dp_shard_size.")
-            acc.dp_replicate_size = acc.dp_size // acc.dp_shard_size
-        else:
-            acc.dp_replicate_size = 1
-            acc.dp_shard_size = acc.dp_size
 
         num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
         if num_nodes > 1:

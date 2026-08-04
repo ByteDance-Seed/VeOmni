@@ -507,6 +507,47 @@ class AcceleratorConfig:
         self.extra_parallel_names.append("ep")
         self.extra_parallel_placement_innermost.append(self.ep_outside)
 
+        # `world_size`/`dp_size`/`dp_shard_size`/`dp_replicate_size` are process-global,
+        # runtime-derived state, not CLI/YAML-configurable — so (like `world_size` on
+        # `TrainingArguments`) they're plain instance attributes, not dataclass fields.
+        # Deriving them here (instead of via an external `_validate_accelerator` call
+        # from the owning `TrainingArguments`) makes every `AcceleratorConfig` instance
+        # self-resolving regardless of *how* or *where* it's constructed: the top-level
+        # `train.accelerator`, or a per-OmniModule accelerator rebuilt from scratch by
+        # `build_module_runtime_args` / `build_module_args` (each of those calls
+        # `AcceleratorConfig(**field_values)` fresh, dropping any externally-computed
+        # `dp_size` since it was never a field to begin with).
+        self.world_size = int(os.getenv("WORLD_SIZE", 1))
+
+        if self.world_size % (self.pp_size * self.ulysses_size * self.cp_size * self.tp_size) != 0:
+            raise ValueError(
+                f"World size should be a multiple of pp_size: {self.pp_size}, "
+                f"ulysses_size: {self.ulysses_size}, cp_size: {self.cp_size}, "
+                f"tp_size: {self.tp_size}."
+            )
+        assert self.tp_size == 1, "Tensor parallel size not supported yet."
+        assert self.pp_size == 1, "Pipeline parallel size not supported yet."
+        assert self.cp_size == 1, "Context parallel size not supported yet."
+
+        self.dp_size = self.world_size // (self.pp_size * self.ulysses_size * self.cp_size * self.tp_size)
+
+        if self.dp_replicate_size > 0 and self.dp_shard_size > 0:
+            assert self.dp_size == self.dp_replicate_size * self.dp_shard_size, (
+                f"dp_size should be equal to dp_replicate_size: {self.dp_replicate_size} "
+                f"* dp_shard_size: {self.dp_shard_size}."
+            )
+        elif self.dp_replicate_size > 0:
+            if self.dp_size % self.dp_replicate_size != 0:
+                raise ValueError("dp_size should be a multiple of dp_replicate_size.")
+            self.dp_shard_size = self.dp_size // self.dp_replicate_size
+        elif self.dp_shard_size > 0:
+            if self.dp_size % self.dp_shard_size != 0:
+                raise ValueError("dp_size should be a multiple of dp_shard_size.")
+            self.dp_replicate_size = self.dp_size // self.dp_shard_size
+        else:
+            self.dp_replicate_size = 1
+            self.dp_shard_size = self.dp_size
+
 
 @dataclass
 class CheckpointConfig:
@@ -751,37 +792,12 @@ class TrainingArguments:
     # -- validation & derivation helpers (called by __post_init__) -----------------------
 
     def _validate_accelerator(self):
+        # `dp_size`/`dp_shard_size`/`dp_replicate_size` are already resolved by
+        # `AcceleratorConfig.__post_init__` at construction time. What's left here are
+        # cross-checks against *this* owner's own fields (`init_device`,
+        # `broadcast_model_weights_from_rank0`, `ep_sharded_stream_load`), which
+        # `AcceleratorConfig` has no access to.
         acc = self.accelerator
-
-        if self.world_size % (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size) != 0:
-            raise ValueError(
-                f"World size should be a multiple of pp_size: {acc.pp_size}, "
-                f"ulysses_size: {acc.ulysses_size}, cp_size: {acc.cp_size}, "
-                f"tp_size: {acc.tp_size}."
-            )
-        assert acc.tp_size == 1, "Tensor parallel size not supported yet."
-        assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
-        assert acc.cp_size == 1, "Context parallel size not supported yet."
-
-        acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
-
-        # resolve dp_replicate_size / dp_shard_size
-        if acc.dp_replicate_size > 0 and acc.dp_shard_size > 0:
-            assert acc.dp_size == acc.dp_replicate_size * acc.dp_shard_size, (
-                f"dp_size should be equal to dp_replicate_size: {acc.dp_replicate_size} "
-                f"* dp_shard_size: {acc.dp_shard_size}."
-            )
-        elif acc.dp_replicate_size > 0:
-            if acc.dp_size % acc.dp_replicate_size != 0:
-                raise ValueError("dp_size should be a multiple of dp_replicate_size.")
-            acc.dp_shard_size = acc.dp_size // acc.dp_replicate_size
-        elif acc.dp_shard_size > 0:
-            if acc.dp_size % acc.dp_shard_size != 0:
-                raise ValueError("dp_size should be a multiple of dp_shard_size.")
-            acc.dp_replicate_size = acc.dp_size // acc.dp_shard_size
-        else:
-            acc.dp_replicate_size = 1
-            acc.dp_shard_size = acc.dp_size
 
         # multi-node warning
         num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))

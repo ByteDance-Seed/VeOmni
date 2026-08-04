@@ -1,0 +1,30 @@
+# Distributed inference overrides for janus_1.3b_hf/base.yaml (8 GPUs):
+#   janus_siglip / janus_vqvae -> ddp (replicated)
+#   janus_llama                -> fsdp2 (sharded backbone)
+#   janus_text_encoder         -> fsdp2 + emb-parallel across all 8 ranks (vocab-parallel wte/lm_head)
+janus_siglip:
+  model_path: janus_siglip
+  accelerator:
+    fsdp_config:
+      fsdp_mode: ddp
+janus_vqvae:
+  model_path: janus_vqvae
+  accelerator:
+    fsdp_config:
+      fsdp_mode: ddp
+janus_text_encoder:
+  model_path: janus_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+    extra_parallel_sizes:
+    - 8
+    extra_parallel_names:
+    - emb
+    extra_parallel_placement_innermost:
+    - false
+janus_llama:
+  model_path: janus_llama
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
