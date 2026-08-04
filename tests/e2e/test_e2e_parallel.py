@@ -146,6 +146,7 @@ def main(
         compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
+    return res
 
 
 _DEFAULT_RTOL = 1e-1
@@ -547,6 +548,30 @@ def test_qwen3vl_parallel_align(
         atol=atol,
         max_sp_size=max_sp_size,
         train_path=dummy_qwen3vl_dataset,
+    )
+
+
+def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset):
+    results = main(
+        task_name="train_vlm_test",
+        model_name="qwen3vl",
+        config_path="./tests/toy_config/qwen3vl_toy",
+        is_moe=False,
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        train_path=dummy_qwen3vl_dataset,
+        max_sp_size=1,
+        compare_alignment=False,
+        extra_args=[
+            '--model.lora_config={"rank":4,"alpha":8,"lora_modules":["q_proj","qkv"]}',
+            "--train.freeze_vit=False",
+        ],
+    )
+    assert results and all(results.values())
+    assert all(
+        values and torch.isfinite(torch.tensor(values)).all()
+        for result in results.values()
+        for values in result.values()
     )
 
 
