@@ -26,6 +26,11 @@ from ..utils.device import IS_CUDA_AVAILABLE
 logger = logging.get_logger(__name__)
 
 
+_SUPPORTED_MULTIMODAL_DECODER_BLOCKS = {
+    "qwen3_vl": "Qwen3VLTextDecoderLayer",
+}
+
+
 @dataclass
 class CompileConfig:
     """Runtime options for compiling FSDP2 decoder blocks."""
@@ -47,6 +52,57 @@ def _decoder_block_class_names(model: nn.Module) -> set[str]:
     if no_split_modules is None:
         return set()
     return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+
+
+def _is_multimodal_model(model: nn.Module) -> bool:
+    config = getattr(model, "config", None)
+    if config is not None and any(
+        getattr(config, config_name, None) is not None for config_name in ("vision_config", "audio_config")
+    ):
+        return True
+
+    input_modalities = getattr(model, "input_modalities", None) or getattr(type(model), "input_modalities", ())
+    if isinstance(input_modalities, str):
+        input_modalities = (input_modalities,)
+    return any(modality != "text" for modality in input_modalities)
+
+
+def validate_compile_model(
+    model: nn.Module,
+    compile_config: CompileConfig,
+    sequence_parallel_enabled: bool = False,
+) -> None:
+    """Validate model-specific contracts for per-block compilation.
+
+    Text models keep the generic decoder-layer path. Multimodal models are
+    fail-closed because their towers and cross-modal injection points have
+    different shape and lifecycle contracts.
+    """
+
+    if not _is_multimodal_model(model):
+        return
+
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    expected_decoder_block = _SUPPORTED_MULTIMODAL_DECODER_BLOCKS.get(model_type)
+    if expected_decoder_block is None:
+        raise RuntimeError(
+            "train.torch_compile.enable currently supports multimodal training only for dense Qwen3-VL "
+            f"(model_type='qwen3_vl'); got model_type={model_type!r}."
+        )
+    if compile_config.dynamic:
+        raise RuntimeError("train.torch_compile.enable for Qwen3-VL requires train.torch_compile.dynamic=False.")
+    if sequence_parallel_enabled:
+        raise RuntimeError(
+            "train.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism yet; "
+            "set train.accelerator.ulysses_size=1."
+        )
+
+    decoder_block_class_names = _decoder_block_class_names(model)
+    if expected_decoder_block not in decoder_block_class_names:
+        raise RuntimeError(
+            f"train.torch_compile.enable for Qwen3-VL requires {expected_decoder_block!r} in model._no_split_modules."
+        )
 
 
 def _is_decoder_block(module: nn.Module, decoder_block_class_names: Optional[Collection[str]] = None) -> bool:
@@ -74,7 +130,11 @@ def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_resh
         )
 
 
-def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> int:
+def compile_decoder_blocks(
+    model: nn.Module,
+    compile_config: CompileConfig,
+    sequence_parallel_enabled: bool = False,
+) -> int:
     """Compile forward of every decoder block inside ``model`` in place.
 
     Compiling the forward method (rather than wrapping the whole module)
@@ -86,6 +146,8 @@ def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> i
         raise RuntimeError(
             "train.torch_compile.enable requires torch.compile, but this PyTorch build has no torch.compile."
         )
+
+    validate_compile_model(model, compile_config, sequence_parallel_enabled)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,

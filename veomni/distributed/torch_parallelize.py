@@ -249,7 +249,11 @@ def parallelize_model_fsdp2(
             )
         validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
-        compiled_count = compile_decoder_blocks(model, compile_config)
+        compiled_count = compile_decoder_blocks(
+            model,
+            compile_config,
+            sequence_parallel_enabled=parallel_state.sp_enabled,
+        )
         if compiled_count == 0:
             raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True

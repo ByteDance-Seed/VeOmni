@@ -66,3 +66,18 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
     --data.dataloader.num_workers 8 \
     --train.micro_batch_size 2
 ```
+
+## Optional per-block torch.compile on CUDA
+
+Dense Qwen3-VL can compile each text decoder block before FSDP2 sharding while keeping the vision tower, DeepStack injection, and language-model head eager. Enable fixed-length packed inputs together with compile:
+
+```shell
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+    --model.model_path ./Qwen3-VL-8B-Instruct \
+    --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
+    --train.dyn_bsz true \
+    --train.pad_to_length true \
+    --train.torch_compile.enable true
+```
+
+This path currently requires CUDA, FSDP2, `train.torch_compile.dynamic=false`, and `train.accelerator.ulysses_size=1`. It does not yet support Qwen3-VL-MoE, ChunkMBS, ExtraParallel, or NPU execution.

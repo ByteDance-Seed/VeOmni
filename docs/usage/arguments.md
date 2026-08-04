@@ -277,11 +277,13 @@ NPU validation runs at two times:
 
 ### TorchCompileConfig
 
-`train.torch_compile.*` — Per-block `torch.compile` options for text training. This path currently supports text trainers only and requires `train.dyn_bsz=True` plus `train.pad_to_length=True`, so packed inputs have stable shapes. The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `train.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
+`train.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed text inputs have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Qwen3-VL currently requires `train.torch_compile.dynamic=False` and `train.accelerator.ulysses_size=1`. Qwen3-VL-MoE, ChunkMBS, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
+
+The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `train.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable | `bool` | `False` | Enable per-block `torch.compile` on FSDP2 decoder blocks. |
+| enable | `bool` | `False` | Enable per-block `torch.compile` on supported FSDP2 decoder blocks. |
 | backend | `Optional[str]` | `"inductor"` | Backend passed to `torch.compile`. |
 | mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `train.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
 | fullgraph | `bool` | `True` | Whether to pass `fullgraph=True` to `torch.compile`. |

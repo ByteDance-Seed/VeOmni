@@ -1,9 +1,13 @@
+import copy
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from veomni.arguments.arguments_types import (
     ChunkMBSConfig,
@@ -17,6 +21,7 @@ from veomni.arguments.arguments_types import (
 from veomni.arguments.arguments_types import (
     TorchCompileConfig as ArgumentsTorchCompileConfig,
 )
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.distributed.torch_compile import (
     CompileConfig,
     compile_decoder_blocks,
@@ -59,6 +64,17 @@ class ToyModel(nn.Module):
         self.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
         self.vision = ToyVisionBlock()
         self.lm_head = nn.Linear(4, 8)
+
+
+class ToyQwen3VLModel(nn.Module):
+    _no_split_modules = ["Qwen3VLTextDecoderLayer", "ToyVisionBlock"]
+    input_modalities = ("image", "text")
+
+    def __init__(self, decoder_layer):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="qwen3_vl", vision_config=SimpleNamespace())
+        self.layer = decoder_layer
+        self.vision = ToyVisionBlock()
 
 
 def test_compile_decoder_blocks_compiles_only_decoder_layers(monkeypatch):
@@ -118,6 +134,118 @@ def test_compile_decoder_blocks_uses_no_split_modules(monkeypatch):
     assert getattr(model.selected, "_veomni_forward_compiled", False)
     assert not getattr(model.unselected, "_veomni_forward_compiled", False)
     assert calls == [{"fullgraph": True, "dynamic": False, "backend": "inductor"}]
+
+
+def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch):
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ToyModel()
+    model.config = SimpleNamespace(model_type="qwen2_vl", vision_config=SimpleNamespace())
+    model.input_modalities = ("image", "text")
+
+    with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
+        compile_decoder_blocks(model, CompileConfig())
+
+
+def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    with pytest.raises(RuntimeError, match="train.torch_compile.dynamic=False"):
+        compile_decoder_blocks(
+            ToyQwen3VLModel(ToyDecoderLayer()),
+            CompileConfig(dynamic=True),
+        )
+
+
+def test_compile_decoder_blocks_rejects_qwen3_vl_sequence_parallel(monkeypatch):
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    with pytest.raises(RuntimeError, match="ulysses_size=1"):
+        compile_decoder_blocks(
+            ToyQwen3VLModel(ToyDecoderLayer()),
+            CompileConfig(),
+            sequence_parallel_enabled=True,
+        )
+
+
+def test_compile_decoder_blocks_targets_qwen3_vl_text_layers_only(monkeypatch):
+    from veomni.models import build_foundation_model
+
+    from ..tools.training_utils import make_eager_ops_config
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    model = build_foundation_model(
+        config_path="tests/toy_config/qwen3vl_toy/config.json",
+        weights_path=None,
+        torch_dtype="float32",
+        init_device="meta",
+        ops_implementation=make_eager_ops_config(),
+    )
+
+    compiled = compile_decoder_blocks(model, CompileConfig())
+
+    assert compiled == len(model.model.language_model.layers) == 2
+    assert all(layer._veomni_forward_compiled for layer in model.model.language_model.layers)
+    assert all(not getattr(block, "_veomni_forward_compiled", False) for block in model.model.visual.blocks)
+
+
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_qwen3_vl_compiled_decoder_matches_eager_forward_backward(use_checkpoint):
+    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+        Qwen3VLTextConfig,
+        Qwen3VLTextDecoderLayer,
+        Qwen3VLTextRotaryEmbedding,
+    )
+
+    torch.manual_seed(0)
+    config = Qwen3VLTextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+        attention_dropout=0.0,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        rope_theta=10000,
+    )
+    config._attn_implementation = "eager"
+
+    eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
+    compiled_layer = copy.deepcopy(eager_layer)
+    if use_checkpoint:
+        for layer in (eager_layer, compiled_layer):
+            layer.gradient_checkpointing = True
+            layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+
+    compiled_model = ToyQwen3VLModel(compiled_layer)
+    hidden_states_eager = torch.randn(1, 7, config.hidden_size, requires_grad=True)
+    hidden_states_compiled = hidden_states_eager.detach().clone().requires_grad_(True)
+    position_ids = torch.arange(7, dtype=torch.long).view(1, 7)
+    rotary_emb = Qwen3VLTextRotaryEmbedding(config)
+    position_embeddings = rotary_emb(hidden_states_eager, position_ids)
+
+    with use_parallel_state(SimpleNamespace(async_enabled=False)):
+        assert (
+            compile_decoder_blocks(
+                compiled_model,
+                CompileConfig(enable=True, backend="eager", fullgraph=True, dynamic=False),
+            )
+            == 1
+        )
+        eager_output = eager_layer(hidden_states_eager, position_embeddings=position_embeddings)
+        compiled_output = compiled_layer(hidden_states_compiled, position_embeddings=position_embeddings)
+        eager_output.square().mean().backward()
+        compiled_output.square().mean().backward()
+
+    torch.testing.assert_close(compiled_output, eager_output)
+    torch.testing.assert_close(hidden_states_compiled.grad, hidden_states_eager.grad)
+    for eager_param, compiled_param in zip(eager_layer.parameters(), compiled_layer.parameters()):
+        torch.testing.assert_close(compiled_param.grad, eager_param.grad)
 
 
 def test_compile_decoder_blocks_rejects_mode_with_cudagraphs_backend():
@@ -194,6 +322,34 @@ def test_mark_compile_step_begin_skips_without_torch_compiler(monkeypatch):
     monkeypatch.delattr(torch, "compiler", raising=False)
 
     mark_compile_step_begin(enable_compile=True)
+
+
+def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
+    from veomni.trainer.vlm_trainer import VLMTrainer
+
+    marks = []
+    monkeypatch.setattr("veomni.trainer.vlm_trainer.mark_compile_step_begin", marks.append)
+    monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token", lambda _: 1)
+    monkeypatch.setattr("veomni.trainer.vlm_trainer.synchronize", lambda: None)
+    monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
+    monkeypatch.setattr("veomni.trainer.vlm_trainer.veomni_clip_grad_norm", lambda *_: torch.tensor(0.0))
+
+    trainer = VLMTrainer.__new__(VLMTrainer)
+    trainer.base = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=1.0))),
+        state=SimpleNamespace(global_step=0),
+        model=SimpleNamespace(_veomni_compile_uses_cuda_graphs=True),
+        model_reshard=lambda *_: None,
+        forward_backward_step=lambda _: (torch.tensor(1.0), {}),
+        optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
+        lr_scheduler=SimpleNamespace(step=lambda: None),
+        on_step_begin=lambda **_: None,
+        on_step_end=lambda **_: None,
+    )
+
+    trainer.train_step(iter([[{}, {}]]))
+
+    assert marks == [True, True]
 
 
 def test_compile_config_detects_cuda_graphs():
@@ -346,8 +502,8 @@ class ToyMultimodalDataArguments(DataArguments):
     mm_configs: dict = field(default_factory=dict)
 
 
-def test_enable_compile_rejects_multimodal_data_arguments():
-    with pytest.raises(ValueError, match="text trainers only"):
+def test_enable_compile_rejects_unsupported_data_pipeline():
+    with pytest.raises(ValueError, match="not supported by this data pipeline"):
         VeOmniArguments(
             model=_model_args(),
             data=ToyMultimodalDataArguments(train_path="dummy.jsonl", max_seq_len=8),
@@ -358,6 +514,23 @@ def test_enable_compile_rejects_multimodal_data_arguments():
                 micro_batch_size=2,
             ),
         )
+
+
+def test_enable_compile_accepts_vlm_static_padded_dynamic_batching():
+    from veomni.trainer.vlm_trainer import VeOmniVLMArguments, VLMMDataArguments
+
+    args = VeOmniVLMArguments(
+        model=_model_args(),
+        data=VLMMDataArguments(train_path="dummy.jsonl", max_seq_len=8),
+        train=TrainingArguments(
+            torch_compile=ArgumentsTorchCompileConfig(enable=True),
+            dyn_bsz=True,
+            pad_to_length=True,
+            micro_batch_size=2,
+        ),
+    )
+
+    assert args.train.pad_to_length == 16
 
 
 @dataclass

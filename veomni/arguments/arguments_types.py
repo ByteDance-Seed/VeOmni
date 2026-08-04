@@ -612,7 +612,7 @@ class TorchCompileConfig:
 
     enable: bool = field(
         default=False,
-        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
+        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
     )
     backend: Optional[str] = field(
         default="inductor",
@@ -1500,12 +1500,12 @@ class VeOmniArguments:
                 )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text trainers only. "
-                    "Multimodal/DiT/Omni data pipelines do not implement pad_to_length for static packed shapes yet."
+                    "train.torch_compile.enable is not supported by this data pipeline. "
+                    "The pipeline must implement pad_to_length for static packed shapes."
                 )
             if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text data only; "
+                    "train.torch_compile.enable currently supports packed language-model data types only; "
                     f"got data.data_type={self.data.data_type!r}."
                 )
             if not self.train.dyn_bsz or not self.train.pad_to_length:
