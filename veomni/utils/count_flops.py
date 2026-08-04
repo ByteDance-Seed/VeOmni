@@ -652,6 +652,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
+                vision_lora_enabled=kargs.get("vision_lora_enabled"),
             )
         else:
             vit_flops = 0
@@ -683,6 +684,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
+                vision_lora_enabled=kargs.get("vision_lora_enabled"),
             )
         else:
             vit_flops = 0
@@ -713,6 +715,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
+                vision_lora_enabled=kargs.get("vision_lora_enabled"),
             )
         else:
             vit_flops = 0
@@ -721,7 +724,13 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_vit_flop(self, images_seqlens, config, lora_config=None):
+    def _estimate_qwen3_vit_flop(
+        self,
+        images_seqlens,
+        config,
+        lora_config=None,
+        vision_lora_enabled=None,
+    ):
         """
         Estimate the FLOPs of the Qwen3-family vision encoder.
         """
@@ -767,7 +776,9 @@ class VeomniFlopsCounter:
             ],
         }
         target_modules = lora_config.target_modules if lora_config is not None else ()
-        vision_has_lora = any(module in vision_module_shapes for module in target_modules or ())
+        vision_has_lora = vision_lora_enabled is not False and any(
+            module in vision_module_shapes for module in target_modules or ()
+        )
 
         if lora_config is None:
             dense_N_flops = 6 * dense_N * tokens_sum
@@ -798,7 +809,13 @@ class VeomniFlopsCounter:
 
         return vit_flops
 
-    def _estimate_qwen_vit_flop(self, images_seqlens, config, lora_config=None):
+    def _estimate_qwen_vit_flop(
+        self,
+        images_seqlens,
+        config,
+        lora_config=None,
+        vision_lora_enabled=None,
+    ):
         """
         Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
         """
@@ -860,15 +877,20 @@ class VeomniFlopsCounter:
                     "down_proj": (mlp_hidden_dim, dim, depth),
                 }
             )
-        dense_N_flops = self._compute_linear_flops(
-            dense_N,
-            tokens_sum,
-            lora_config=lora_config,
-            module_shapes=vision_module_shapes,
-            detached_without_targets=True,
-        )
         target_modules = lora_config.target_modules if lora_config is not None else ()
-        vision_has_lora = any(module in vision_module_shapes for module in target_modules or ())
+        vision_has_lora = vision_lora_enabled is not False and any(
+            module in vision_module_shapes for module in target_modules or ()
+        )
+        if lora_config is not None and not vision_has_lora:
+            dense_N_flops = 2 * dense_N * tokens_sum
+        else:
+            dense_N_flops = self._compute_linear_flops(
+                dense_N,
+                tokens_sum,
+                lora_config=lora_config,
+                module_shapes=vision_module_shapes,
+                detached_without_targets=True,
+            )
         attention_factor = 12 if lora_config is None or vision_has_lora else 4
 
         # In Qwen2.5 VL, windowed attention is used in some layers.
@@ -1224,6 +1246,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 getattr(self.config, "vision_config", None),
                 lora_config=lora_config,
+                vision_lora_enabled=kargs.get("vision_lora_enabled"),
             )
         else:
             vit_flops = 0
@@ -1239,6 +1262,7 @@ class VeomniFlopsCounter:
         delta_time,
         lora_config: VeOmniLoraConfig | None = None,
         images_seqlens=None,
+        vision_lora_enabled: bool | None = None,
     ):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
@@ -1254,6 +1278,9 @@ class VeomniFlopsCounter:
                 return zero achieved FLOPs instead of interrupting training.
             images_seqlens (List[int], optional): Vision-token sequence lengths for multimodal
                 models.
+            vision_lora_enabled (bool, optional): Whether the trainer permits matched vision
+                adapters to train. ``False`` forces forward-only ViT accounting even when
+                ``target_modules`` contains vision layer names.
 
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
@@ -1274,6 +1301,8 @@ class VeomniFlopsCounter:
             kwargs["lora_config"] = lora_config
         if images_seqlens is not None:
             kwargs["images_seqlens"] = images_seqlens
+        if vision_lora_enabled is not None:
+            kwargs["vision_lora_enabled"] = vision_lora_enabled
 
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)

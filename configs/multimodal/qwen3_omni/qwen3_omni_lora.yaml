@@ -4,6 +4,9 @@
 # `thinker.model.layers.*.mlp.experts.{gate_up_proj,down_proj}`. The wrapper
 # auto-detects the fused experts layout regardless of where the experts module
 # sits in the model tree.
+# `freeze_vit` / `freeze_audio_tower` gate adapters in those towers. When a
+# flag is false, only explicitly targeted Linear adapters train; tower base
+# weights and convolutional patch/audio projections remain frozen.
 
 model:
   model_path: Qwen3-Omni-30B-A3B-Instruct

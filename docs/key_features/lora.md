@@ -151,16 +151,29 @@ misleading value. `scripts/profile/compare_lora_flops.py` exercises this path ag
 Hugging Face Qwen configs and compares full fine-tuning with several LoRA target sets and
 ranks.
 
-> `VLMTrainer` does not currently initialize LoRA. The vision accounting described below
-> is included for a future VLM LoRA capability and is not an indication that VLM LoRA
-> training is available today.
+`VLMTrainer` uses the same native LoRA setup, FSDP2 loading, and adapter checkpoint path as
+the text trainer. During LoRA training all base weights remain frozen and the multimodal
+freeze flags gate which matched adapters may train:
+
+- `freeze_vit: true` disables every adapter inside the vision tower. With `false`, only
+  vision modules explicitly matched by `target_modules` train; unmatched vision weights
+  remain frozen.
+- `freeze_audio_tower: true` applies the same rule to the audio tower.
+- Full merger or audio-projection weights that are normally retained by the non-LoRA freeze
+  policy are not trained in LoRA mode, because those full weights are not part of the
+  exported adapter.
+
+Consequently, `freeze_vit: false` permits vision LoRA but does not full-fine-tune the ViT.
+For example, Qwen3-VL vision adapters may target `qkv`, `proj`, `linear_fc1`, and
+`linear_fc2`; language targets such as `q_proj` and `v_proj` can be used in the same config.
 
 For Qwen VLM configurations, vision-tower accounting uses the vision-token sequence lengths
 collected from the current batch and follows this logic:
 
 1. If the batch has no vision tokens, ViT FLOPs are zero.
-2. If the batch has vision tokens but none of `target_modules` matches a supported ViT
-   module, the ViT is treated as frozen and only its forward-pass FLOPs are counted.
+2. If the batch has vision tokens but `freeze_vit` is enabled, or none of `target_modules`
+   matches a supported ViT module, the ViT is treated as frozen and only its forward-pass
+   FLOPs are counted.
 3. If at least one target matches a supported ViT module, the ViT is treated as participating
    in LoRA training: base forward/input-gradient work and the matched LoRA forward/backward
    work are counted.
@@ -173,9 +186,8 @@ The native LoRA implementation currently adapts two kinds of weights:
 
 The MoE experts are not `nn.Embedding` layers. The FLOPs estimator counts adapter work for
 both supported categories above. Within the ViT, only matched linear layers receive LoRA
-FLOPs; non-linear projections such as Qwen's `Conv3d` patch embedding do not. If native LoRA
-later supports another module type such as `Conv3d`, `VeomniFlopsCounter` and its module-shape
-tables must be updated at the same time or MFU will be underestimated.
+FLOPs; non-linear projections such as Qwen's `Conv3d` patch embedding are not supported LoRA
+targets. Adding a convolution name to `target_modules` does not adapt it.
 
 ---
 

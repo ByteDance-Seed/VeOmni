@@ -4,6 +4,9 @@
 # different from the text-only `qwen3_moe_lora.yaml`. The wrapper auto-detects
 # the v5 fused layout (`gate_up_proj` / `down_proj`) and matches the same eager
 # per-expert dispatch used by `Qwen3_5MoeExperts`.
+# The vision tower is frozen in this example. To adapt its Linear layers, set
+# `freeze_vit: false` and add vision targets such as `qkv` / `linear_fc1` /
+# `linear_fc2`; the Conv3d patch embedding is not supported by native LoRA.
 
 model:
   model_path: Qwen/Qwen3.5-35B-A3B

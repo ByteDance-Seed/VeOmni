@@ -36,6 +36,12 @@ MAX_PIXELS = 768 * 28 * 28
 
 
 def _get_vlm_visual_module(model):
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        base_model = get_base_model()
+        if base_model is not model:
+            return _get_vlm_visual_module(base_model)
+
     # Qwen-VL wrappers are not consistent across transformers versions:
     # older releases may expose `visual` directly on the conditional model
     # for backward compatibility, while newer ones only keep `model.visual`.
@@ -156,13 +162,24 @@ class VLMTrainer:
     def _freeze_model_module(self):
         args: VeOmniVLMArguments = self.base.args
         model_config = self.base.model_config
+        lora_enabled = bool(args.model.lora_config)
         if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             self.base.model.disable_talker()
+
+        # VLMTrainer composes BaseTrainer instead of calling its constructor, so
+        # it must opt into the shared LoRA setup explicitly. The wrapper freezes
+        # all base weights and re-enables only matched adapter parameters.
+        if lora_enabled:
+            self.base._setup_lora()
 
         if args.train.freeze_vit:
             if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
                 self.base.model.thinker.visual.requires_grad_(False)
-                self.base.model.thinker.visual.merger.requires_grad_(True)
+                # Full tuning keeps the merger trainable for compatibility with
+                # the existing freeze policy. During LoRA training it must stay
+                # frozen: full merger weights are not part of an adapter export.
+                if not lora_enabled:
+                    self.base.model.thinker.visual.merger.requires_grad_(True)
             else:
                 # Resolve both flat and nested visual-module layouts to cover
                 # both the plain `model.visual` shape and Qwen3.5-VL's nested
@@ -174,11 +191,23 @@ class VLMTrainer:
 
         if args.train.freeze_audio_tower and model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             self.base.model.thinker.audio_tower.requires_grad_(False)
-            # Qwen2.5-Omni uses audio_tower.proj; Qwen3-Omni-MoE uses audio_tower.proj1.
-            audio_proj = (
-                getattr(self.base.model.thinker.audio_tower, "proj1", None) or self.base.model.thinker.audio_tower.proj
+            if not lora_enabled:
+                # Qwen2.5-Omni uses audio_tower.proj; Qwen3-Omni-MoE uses audio_tower.proj1.
+                audio_proj = (
+                    getattr(self.base.model.thinker.audio_tower, "proj1", None)
+                    or self.base.model.thinker.audio_tower.proj
+                )
+                audio_proj.requires_grad_(True)
+
+        has_trainable_lora = any(
+            param.requires_grad and (".lora_A." in name or ".lora_B." in name)
+            for name, param in self.base.model.named_parameters()
+        )
+        if lora_enabled and not has_trainable_lora:
+            raise ValueError(
+                "VLM LoRA configuration produced no trainable adapters after applying "
+                "freeze_vit/freeze_audio_tower. Select at least one unfrozen Linear or MoE target."
             )
-            audio_proj.requires_grad_(True)
 
         pretty_print_trainable_parameters(self.base.model)
         helper.print_device_mem_info("VRAM usage after building model")

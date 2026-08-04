@@ -300,6 +300,45 @@ class TestQwen35LoraFlops:
 
         assert vl_flops - text_flops == pytest.approx((linear_flops + attention_flops) / 2.0 / 1e12, rel=1e-9)
 
+        frozen_vl_flops, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=_lora_config(rank, ["qkv"]),
+            images_seqlens=images_seqlens,
+            vision_lora_enabled=False,
+        )
+        # freeze_vit disables the matched adapters and detaches the ViT, so its
+        # contribution falls back to forward-only work.
+        assert frozen_vl_flops - text_flops == pytest.approx((full_vl - full_text) / 3, rel=1e-9)
+
+
+@pytest.mark.usefixtures("mock_device_flops")
+@pytest.mark.parametrize(
+    "config_dir",
+    [
+        pytest.param("tests/toy_config/qwen2vl_toy", id="qwen2_vl"),
+        pytest.param("tests/toy_config/qwen25vl_toy", id="qwen2_5_vl"),
+    ],
+)
+def test_frozen_qwen2_family_vit_ignores_configured_lora_targets(config_dir):
+    counter = VeomniFlopsCounter(_load_toy_config(config_dir))
+    batch_seqlens = [12, 5]
+    images_seqlens = [16]
+    lora_config = _lora_config(8, ["qkv"])
+
+    full_text, _ = counter.estimate_flops(batch_seqlens, delta_time=2.0)
+    full_vl, _ = counter.estimate_flops(batch_seqlens, delta_time=2.0, images_seqlens=images_seqlens)
+    lora_text, _ = counter.estimate_flops(batch_seqlens, delta_time=2.0, lora_config=lora_config)
+    frozen_vl, _ = counter.estimate_flops(
+        batch_seqlens,
+        delta_time=2.0,
+        lora_config=lora_config,
+        images_seqlens=images_seqlens,
+        vision_lora_enabled=False,
+    )
+
+    assert frozen_vl - lora_text == pytest.approx((full_vl - full_text) / 3, rel=1e-9)
+
 
 class TestQwen35MoeFlops:
     pytestmark = pytest.mark.usefixtures("mock_device_flops")

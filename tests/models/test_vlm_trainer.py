@@ -24,22 +24,10 @@ _FREEZE_VIT_VLM_CASES = [
 ]
 
 
-@pytest.mark.parametrize(
-    "freeze_vit",
-    [
-        pytest.param(False, id="freeze_vit_disabled"),
-        pytest.param(True, id="freeze_vit_enabled"),
-    ],
-)
+@pytest.mark.parametrize("freeze_vit", [False, True])
 @pytest.mark.parametrize("config_path", _FREEZE_VIT_VLM_CASES)
 def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
-    # This test only constructs the model on `meta` and verifies freeze
-    # behaviour — it never runs forward. Use an all-eager ops config so the
-    # build works everywhere: it pins every per-op field (including the
-    # Qwen3.5 GatedDeltaNet trio that has no FLA backend on NPU and the
-    # GPU-only liger/triton defaults that fail NPU validation). Eager paths
-    # that raise only at forward time are fine because this test never
-    # forwards.
+    # Structural meta-device coverage; eager ops keep it accelerator-agnostic.
     ops_implementation = make_eager_ops_config()
     model = build_foundation_model(
         config_path=config_path,
@@ -52,24 +40,13 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     assert visual is not None
 
     args = VeOmniVLMArguments(
-        model=VLMMModelArguments(
-            config_path=config_path,
-            ops_implementation=make_eager_ops_config(),
-        ),
+        model=VLMMModelArguments(config_path=config_path, ops_implementation=ops_implementation),
         data=VLMMDataArguments(train_path="dummy"),
     )
     args.train.freeze_vit = freeze_vit
-
     trainer = VLMTrainer.__new__(VLMTrainer)
-    trainer.base = SimpleNamespace(
-        args=args,
-        model=model,
-        model_config=model.config,
-    )
+    trainer.base = SimpleNamespace(args=args, model=model, model_config=model.config)
 
     trainer._freeze_model_module()
 
-    if freeze_vit:
-        assert all(not param.requires_grad for param in visual.parameters())
-    else:
-        assert all(param.requires_grad for param in visual.parameters())
+    assert all(param.requires_grad is not freeze_vit for param in visual.parameters())
