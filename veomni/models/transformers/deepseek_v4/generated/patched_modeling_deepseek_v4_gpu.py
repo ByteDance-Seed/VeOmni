@@ -736,6 +736,8 @@ class DeepseekV4Indexer(nn.Module):
             and compressed_len > 0
             and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
         )
+        if not use_tilelang:
+            raise ValueError("DeepSeek-V4 indexer does not support use_tilelang=False")
         if use_tilelang:
             query = q.transpose(0, 1).contiguous()
             query_weights = weights.transpose(0, 1).contiguous()
@@ -993,6 +995,8 @@ def eager_attention_forward(
         and dropout == 0
         and key.shape[1] == 1
     )
+    if not use_tilelang:
+        raise ValueError("DeepSeek-V4 indexer does not support use_tilelang=False")
     if use_tilelang:
         topk_indices = kwargs.get("sparse_topk_indices")
         if topk_indices is None:
