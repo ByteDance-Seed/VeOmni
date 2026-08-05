@@ -319,10 +319,11 @@ magi-attention = ["setuptools>=78.1.1", "wheel", "packaging>=24.2", "ninja", "to
 magi-to-hstu-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
 
 [tool.uv.extra-build-variables]
-# VeOmni exposes only MagiAttention's SM100+ CUTE DSL/JIT path. FFA kernels
-# compile lazily at runtime; CP communication remains outside the CP1 scope.
-magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
-create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100" }
+# SM90 uses the separately installed CUTLASS FFA overlay, while SM100+ uses
+# CUTE DSL/JIT. Build their shared extensions for both architectures; CP
+# communication remains outside the CP1 scope.
+magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
+create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100" }
 magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
 [tool.setuptools.dynamic]
