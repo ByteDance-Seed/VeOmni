@@ -25,6 +25,8 @@ import tilelang
 import torch
 from tilelang import language as T
 
+from ....utils.device import get_torch_device
+
 
 @tilelang.jit(
     out_idx=[-2, -1],
@@ -42,10 +44,24 @@ def sparse_mqa_fwd(
     num_stages=0,
     threads=256,
 ):
-    # The KV rows are gathered through a data-dependent index, which TileLang 0.1.9
-    # cannot lower into a multi-stage async copy, so keep this loop unpipelined
-    # (num_stages=0).
-    assert num_stages == 0, "data-dependent sparse gathers do not support software pipelining"
+    # ``num_stages >= 1`` pipelines the KV gather, and that is only legal because the
+    # gather takes its row index straight from ``Indices`` in global memory. This is
+    # load-bearing: if the index ever comes from a register fragment again -- as it did
+    # before the clamp rewrite -- TileLang's IsPureCopyStmt puts the gather in stage 0
+    # while the loop writing that fragment lands in a later stage, and the pipeliner dies
+    # on `Check failed: src_info.stage <= dst_info.stage (1 vs. 0)`. Only the gather's own
+    # index matters; the ``mask`` fragment is fine where it is, since it and its consumer
+    # both stay in the compute stage.
+    #
+    # It stays off by default: enabling it cost 5% of a production step. An isolated
+    # benchmark of this kernel had predicted a win, and why it was wrong matters more
+    # than its numbers -- in training every gather slowed by 46-69%, including the
+    # compress-ratio-4 layers whose working set that benchmark measured a 19% gain on.
+    # The commit/wait only pays for itself if the gather is HBM-bound, and no isolated
+    # measurement reproduced the cache and bandwidth state of a real step. So re-enable
+    # this on an end-to-end measurement, never on a microbenchmark. Nothing plumbs the
+    # parameter to a config, so opting in is a source change by construction.
+    assert num_stages >= 0, f"num_stages must be non-negative, got {num_stages}"
     assert dim == tilelang.math.next_power_of_2(dim), f"dim must be power of 2, got {dim}"
     assert topk % block_I == 0, f"topk ({topk}) must be divisible by block_I ({block_I})"
     if sm_scale is None:
@@ -80,6 +96,23 @@ def sparse_mqa_fwd(
         REPLICATE_H = 1
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
+
+    # Every stage past the first double-buffers the BI x D KV tile, so the depth is
+    # bounded by shared memory rather than by anything in the algorithm -- and by
+    # block_I and dim, not by a fixed depth. Sum the tiles rather than hardcoding a
+    # ceiling: the estimate ignores TileLang's inter-buffer alignment, so it under-counts
+    # and can only ever under-reject, and a depth that slips through still fails loudly
+    # at launch naming the bytes it could not allocate.
+    smem_lower_bound = (
+        H_per_block * D * 2  # Q_shared, bf16
+        + H_per_block * BI * 2  # S_shared, bf16
+        + max(num_stages, 1) * BI * D * 2  # KV_shared, one buffer per stage
+    )
+    smem_limit = get_torch_device().get_device_properties(None).shared_memory_per_block_optin
+    assert smem_lower_bound <= smem_limit, (
+        f"num_stages={num_stages} at block_I={block_I}, dim={dim} needs at least "
+        f"{smem_lower_bound} B of shared memory per block, above this device's {smem_limit} B"
+    )
 
     @T.prim_func
     def main(

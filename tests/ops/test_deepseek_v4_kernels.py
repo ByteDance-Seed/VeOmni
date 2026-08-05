@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import inspect
 import sys
 import types
 from types import SimpleNamespace
@@ -220,6 +221,74 @@ def _sparse_attention_reference(q, kv, sinks, indices, scale):
     numerator = torch.einsum("bmhk,bmkd->bmhd", exp_scores, gathered.float())
     denominator = exp_scores.sum(-1) + (sinks.view(1, 1, -1) - max_score.squeeze(-1)).exp()
     return numerator / denominator.unsqueeze(-1)
+
+
+def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing_output():
+    """Pipelining the forward's sparse gather must stay legal, real, and exact.
+
+    Legality is load-bearing on the gather reading its row index straight from global
+    memory. Indexing a register fragment there instead puts the gather in pipeline
+    stage 0 while the fragment's producer lands in a later stage, which is a hard
+    TileLang failure -- so a future change of that shape breaks compilation here rather
+    than silently losing the overlap. The async-copy check is what distinguishes "still
+    pipelined" from "compiles but the pipelining was dropped".
+
+    Pipelining is off by default because it is a loss at the production shape, so this
+    only pins that it remains available and exact when asked for.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+
+    torch.manual_seed(4)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 64, 8, 512, 128, 640
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16)
+    sinks = torch.randn(heads, device=DEVICE)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    # topk=640 is 10 gather tiles, so the loop has a real steady state; plant sentinels
+    # in every tile so a one-tile skew between the mask and the gather cannot hide.
+    indices[..., ::64] = -1
+    indices[..., 63::64] = kv_len
+    scale = dim**-0.5
+
+    pipelined = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=1)
+    serial = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=0)
+    assert "cp_async_gs" in pipelined.get_kernel_source()
+    assert "cp_async_gs" not in serial.get_kernel_source()
+
+    expected_out, expected_lse = serial(q, kv, sinks, indices)
+    for out, lse in (
+        pipelined(q, kv, sinks, indices),
+        sparse_mqa_fwd_interface(q, kv, sinks, indices, scale, num_stages=1),
+    ):
+        assert torch.equal(out, expected_out)
+        assert torch.equal(lse, expected_lse)
+
+    # The depth is bounded by shared memory, so it is derived from the device rather than
+    # left to surface as an opaque launch failure. The bound scales with the head tile
+    # and with block_I, which is why both are checked at the production head count and
+    # why the 8-head tile above can afford a depth that 64 heads cannot.
+    with pytest.raises(AssertionError, match="shared memory per block"):
+        sparse_mqa_fwd(64, dim, topk, scale, num_stages=3)
+    with pytest.raises(AssertionError, match="shared memory per block"):
+        sparse_mqa_fwd(64, dim, topk, scale, block_I=128, num_stages=2)
+
+
+def test_tilelang_sparse_attention_forward_defaults_to_no_pipelining():
+    """The shipped gather depth is a performance choice that no output can reveal.
+
+    Both depths are bitwise identical, so the numerics test above cannot catch a flipped
+    default -- and the depth it would flip to cost 5% of a production step. This lives
+    outside that test because it needs no GPU, while the test it would otherwise sit in
+    skips below SM90 and therefore never runs on CI's L20 runners.
+    """
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+
+    for entry in (sparse_mqa_fwd, sparse_mqa_fwd_interface):
+        # tilelang.jit re-exports the kernel as (*args, **kwargs), hiding its defaults.
+        params = inspect.signature(getattr(entry, "func", entry)).parameters
+        assert params["num_stages"].default == 0
 
 
 def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
