@@ -71,6 +71,7 @@ def validate_compile_model(
     model: nn.Module,
     compile_config: CompileConfig,
     sequence_parallel_enabled: bool = False,
+    async_enabled: bool = False,
 ) -> None:
     """Validate model-specific contracts for per-block compilation.
 
@@ -92,10 +93,11 @@ def validate_compile_model(
         )
     if compile_config.dynamic:
         raise RuntimeError("train.torch_compile.enable for Qwen3-VL requires train.torch_compile.dynamic=False.")
-    if sequence_parallel_enabled:
+    if sequence_parallel_enabled or async_enabled:
         raise RuntimeError(
-            "train.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism yet; "
-            "set train.accelerator.ulysses_size=1."
+            "train.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism, "
+            "Ring Attention context parallelism, or async Ulysses yet; set train.accelerator.ulysses_size=1, "
+            "train.accelerator.cp_size=1, and train.accelerator.enable_async=False."
         )
 
     decoder_block_class_names = _decoder_block_class_names(model)
@@ -130,10 +132,38 @@ def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_resh
         )
 
 
+def validate_compile_runtime(
+    compile_config: CompileConfig,
+    *,
+    device_type: str,
+    fsdp_enabled: bool,
+    fsdp_mode: str,
+    any_extra_parallel_enabled: bool,
+    enable_reshard_after_forward: bool,
+) -> None:
+    """Validate runtime contracts before compile-specific setup begins."""
+
+    if not compile_config.enable:
+        return
+    if device_type != "cuda":
+        raise RuntimeError("train.torch_compile.enable is CUDA-only for now.")
+    if not fsdp_enabled:
+        raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
+    if fsdp_mode != "fsdp2":
+        raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
+    if any_extra_parallel_enabled:
+        raise RuntimeError(
+            "train.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
+            "communication may be captured inside compiled blocks."
+        )
+    validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
+
+
 def compile_decoder_blocks(
     model: nn.Module,
     compile_config: CompileConfig,
     sequence_parallel_enabled: bool = False,
+    async_enabled: bool = False,
 ) -> int:
     """Compile forward of every decoder block inside ``model`` in place.
 
@@ -147,7 +177,7 @@ def compile_decoder_blocks(
             "train.torch_compile.enable requires torch.compile, but this PyTorch build has no torch.compile."
         )
 
-    validate_compile_model(model, compile_config, sequence_parallel_enabled)
+    validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,

@@ -27,7 +27,9 @@ from veomni.distributed.torch_compile import (
     compile_decoder_blocks,
     mark_compile_step_begin,
     validate_compile_config_for_fsdp2,
+    validate_compile_runtime,
 )
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 def _model_args() -> ModelArguments:
@@ -157,14 +159,24 @@ def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):
         )
 
 
-def test_compile_decoder_blocks_rejects_qwen3_vl_sequence_parallel(monkeypatch):
+@pytest.mark.parametrize(
+    ("sequence_parallel_enabled", "async_enabled"),
+    [(True, False), (False, True)],
+    ids=["sequence-or-context-parallel", "async-ulysses"],
+)
+def test_compile_decoder_blocks_rejects_qwen3_vl_parallel_attention_paths(
+    monkeypatch,
+    sequence_parallel_enabled,
+    async_enabled,
+):
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
-    with pytest.raises(RuntimeError, match="ulysses_size=1"):
+    with pytest.raises(RuntimeError, match="ulysses_size=1.*cp_size=1.*enable_async=False"):
         compile_decoder_blocks(
             ToyQwen3VLModel(ToyDecoderLayer()),
             CompileConfig(),
-            sequence_parallel_enabled=True,
+            sequence_parallel_enabled=sequence_parallel_enabled,
+            async_enabled=async_enabled,
         )
 
 
@@ -190,7 +202,7 @@ def test_compile_decoder_blocks_targets_qwen3_vl_text_layers_only(monkeypatch):
 
 
 @pytest.mark.parametrize("use_checkpoint", [False, True])
-def test_qwen3_vl_compiled_decoder_matches_eager_forward_backward(use_checkpoint):
+def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
@@ -229,6 +241,7 @@ def test_qwen3_vl_compiled_decoder_matches_eager_forward_backward(use_checkpoint
     rotary_emb = Qwen3VLTextRotaryEmbedding(config)
     position_embeddings = rotary_emb(hidden_states_eager, position_ids)
 
+    # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
     with use_parallel_state(SimpleNamespace(async_enabled=False)):
         assert (
             compile_decoder_blocks(
@@ -246,6 +259,79 @@ def test_qwen3_vl_compiled_decoder_matches_eager_forward_backward(use_checkpoint
     torch.testing.assert_close(hidden_states_compiled.grad, hidden_states_eager.grad)
     for eager_param, compiled_param in zip(eager_layer.parameters(), compiled_layer.parameters()):
         torch.testing.assert_close(compiled_param.grad, eager_param.grad)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA")
+def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
+    pytest.importorskip("flash_attn")
+
+    from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
+    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+        Qwen3VLTextConfig,
+        Qwen3VLTextDecoderLayer,
+        Qwen3VLTextRotaryEmbedding,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device(get_device_type())
+    dtype = torch.float16
+    config = Qwen3VLTextConfig(
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=32,
+        attention_dropout=0.0,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        rope_theta=10000,
+    )
+    config._attn_implementation = "flash_attention_2"
+
+    eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
+    compiled_layer = copy.deepcopy(eager_layer)
+    compiled_model = ToyQwen3VLModel(compiled_layer)
+    hidden_states_eager = torch.randn(1, 7, config.hidden_size, device=device, dtype=dtype, requires_grad=True)
+    hidden_states_compiled = hidden_states_eager.detach().clone().requires_grad_(True)
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3]], device=device, dtype=torch.long)
+    rotary_emb = Qwen3VLTextRotaryEmbedding(config).to(device)
+    position_embeddings = rotary_emb(hidden_states_eager, position_ids)
+    batch = {"position_ids": position_ids}
+    add_flash_attention_kwargs_from_position_ids(batch)
+    flash_attention_kwargs = {
+        key: batch[key] for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+    }
+
+    # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
+    with use_parallel_state(SimpleNamespace(async_enabled=False)):
+        assert (
+            compile_decoder_blocks(
+                compiled_model,
+                CompileConfig(enable=True, backend="inductor", fullgraph=True, dynamic=False),
+            )
+            == 1
+        )
+        eager_output = eager_layer(
+            hidden_states_eager,
+            position_embeddings=position_embeddings,
+            **flash_attention_kwargs,
+        )
+        compiled_output = compiled_layer(
+            hidden_states_compiled,
+            position_embeddings=position_embeddings,
+            **flash_attention_kwargs,
+        )
+        eager_output.float().square().mean().backward()
+        compiled_output.float().square().mean().backward()
+
+    torch.testing.assert_close(compiled_output, eager_output, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(hidden_states_compiled.grad, hidden_states_eager.grad, rtol=2e-2, atol=2e-2)
+    for eager_param, compiled_param in zip(eager_layer.parameters(), compiled_layer.parameters()):
+        torch.testing.assert_close(compiled_param.grad, eager_param.grad, rtol=2e-2, atol=2e-2)
 
 
 def test_compile_decoder_blocks_rejects_mode_with_cudagraphs_backend():
@@ -352,6 +438,34 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     assert marks == [True, True]
 
 
+def test_vlm_trainer_rejects_unsupported_compile_model_before_data_setup(monkeypatch):
+    from veomni.trainer.vlm_trainer import VLMTrainer
+
+    calls = []
+
+    def build_unsupported_model(trainer):
+        calls.append("build_model")
+        trainer.base.model = ToyModel()
+        trainer.base.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
+        trainer.base.model.input_modalities = ("image", "text")
+
+    monkeypatch.setattr("veomni.trainer.vlm_trainer.BaseTrainer._setup", lambda _: None)
+    monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
+    monkeypatch.setattr(VLMTrainer, "_build_model", build_unsupported_model)
+    monkeypatch.setattr(VLMTrainer, "_freeze_model_module", lambda _: calls.append("freeze_model"))
+
+    args = SimpleNamespace(
+        train=SimpleNamespace(
+            torch_compile=ArgumentsTorchCompileConfig(enable=True),
+            accelerator=SimpleNamespace(ulysses_size=1, cp_size=1, enable_async=False),
+        )
+    )
+    with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
+        VLMTrainer(args)
+
+    assert calls == ["build_model"]
+
+
 def test_compile_config_detects_cuda_graphs():
     assert CompileConfig(backend="inductor", mode=None).uses_cuda_graphs() is False
     assert CompileConfig(backend="inductor", mode="reduce-overhead").uses_cuda_graphs() is True
@@ -378,6 +492,45 @@ def test_validate_compile_config_accepts_cuda_graphs_without_forward_reshard():
         CompileConfig(enable=True, backend="inductor", mode="reduce-overhead"),
         enable_reshard_after_forward=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"device_type": "cpu"}, "CUDA-only"),
+        ({"fsdp_enabled": False}, "requires FSDP2"),
+        ({"fsdp_mode": "ddp"}, "fsdp_mode='fsdp2'"),
+        ({"any_extra_parallel_enabled": True}, "does not support ExtraParallel"),
+    ],
+)
+def test_validate_compile_runtime_rejects_unsupported_contracts(monkeypatch, overrides, error):
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    runtime = {
+        "device_type": get_device_type(),
+        "fsdp_enabled": True,
+        "fsdp_mode": "fsdp2",
+        "any_extra_parallel_enabled": False,
+        "enable_reshard_after_forward": True,
+    }
+    runtime.update(overrides)
+
+    with pytest.raises(RuntimeError, match=error):
+        validate_compile_runtime(CompileConfig(enable=True), **runtime)
+
+
+def test_validate_compile_runtime_rejects_cuda_graphs_with_forward_reshard(monkeypatch):
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    with pytest.raises(RuntimeError, match="reshard_after_forward=False"):
+        validate_compile_runtime(
+            CompileConfig(enable=True, backend="inductor", mode="reduce-overhead"),
+            device_type=get_device_type(),
+            fsdp_enabled=True,
+            fsdp_mode="fsdp2",
+            any_extra_parallel_enabled=False,
+            enable_reshard_after_forward=True,
+        )
 
 
 def test_torch_compile_config_defaults():
