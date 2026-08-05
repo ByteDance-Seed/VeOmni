@@ -1233,10 +1233,21 @@ class DeepseekV4Attention(nn.Module):
             and q.is_cuda
             and q.dtype == torch.bfloat16
         )
-        # ``DeepseekV4Model.forward`` withholds the dense mask exactly when the packed
-        # metadata is sufficient to validate candidates on its own, so its absence is
-        # the signal to take the mask-free path and skip every O(S^2) intermediate.
-        mask_free_sparse = use_compact_sparse_indices and attention_mask is None
+        # ``DeepseekV4Model.forward`` owns this decision and hands it down, the same
+        # way it hands down the packed metadata. Re-deriving it here from a missing
+        # mask would not agree with it: under sdpa and flash_attention_2,
+        # ``create_sliding_window_causal_mask`` also returns None for an all-ones or
+        # absent 2-D mask, so absence does not imply the model chose to withhold.
+        mask_free_sparse = bool(kwargs.pop("mask_free_sparse", False))
+        if mask_free_sparse and not use_compact_sparse_indices:
+            # The model already dropped the causal mask on the strength of this path,
+            # so falling back now would silently run attention with no mask at all.
+            raise RuntimeError(
+                "DeepseekV4Model withheld the causal mask for the mask-free sparse path, but this layer "
+                "cannot produce compact indices "
+                f"(dsa_attention_implementation={veomni_dsa_attention_implementation.value}, "
+                f"q.dtype={q.dtype}, q.is_cuda={q.is_cuda}, cache={'set' if past_key_values is not None else 'none'})"
+            )
         if self.compressor is not None:
             compressor_output = self.compressor(
                 compressor_hidden,
@@ -1910,7 +1921,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 and not isinstance(attention_mask, dict)
                 and inputs_embeds.dtype == torch.bfloat16
                 and inputs_embeds.is_cuda
+                # Padding lives only in the 2-D mask, and the mask-free path never
+                # reads it -- it reconstructs every constraint from position_ids and
+                # cu-seqlens. VeOmni's collator pads with ones for exactly this
+                # reason (``data_collator`` asserts ``sp_pad_value == 1``), so this
+                # guards against a foreign collator rather than a live case, and it
+                # runs once per forward instead of once per layer.
+                and (attention_mask is None or bool(attention_mask.all()))
             )
+            # Attention must not re-derive this from the missing mask; see the note
+            # at the consuming site in ``DeepseekV4Attention.forward``.
+            kwargs["mask_free_sparse"] = mask_free_sparse
             # Metadata is indexed by global positions / cu-seqlens; under SP the
             # collator already provides full-sequence cu-seqlens while local embeds
             # are only one shard, so materialize a full-length reference tensor.

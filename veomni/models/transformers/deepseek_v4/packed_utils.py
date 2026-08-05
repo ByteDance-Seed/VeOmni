@@ -236,9 +236,11 @@ def build_packed_sparse_attention_indices(
       marks misses with ``-1``, or a contiguous ``[range_start, range_end)``
       interval computed from the same metadata that built the block bias.
 
-    Callers must guarantee the padding mask is all ones over the packed length,
-    which the FlashAttention varlen collator does by construction -- boundaries
-    travel through ``position_ids`` and ``cu_seq_lens`` instead.
+    The padding mask must be all ones over the packed length, since nothing here
+    reads it. The FlashAttention varlen collator satisfies that by construction --
+    boundaries travel through ``position_ids`` and ``cu_seq_lens`` instead -- and
+    ``DeepseekV4Model.forward`` checks it once per forward before choosing this
+    path, rather than each layer re-checking it here.
     """
     if position_ids.ndim != 2:
         raise ValueError(f"Packed sparse indices need [batch, seq_len] position ids; got {position_ids.ndim} dims")

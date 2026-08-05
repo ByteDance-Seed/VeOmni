@@ -752,6 +752,97 @@ def test_deepseek_v4_packed_model_forward_skips_dense_mask(monkeypatch):
         assert (causal | ~is_sliding).all(), "sliding candidate is not causal"
 
 
+def _toy_attention_inputs(modeling, config, seq_len, layer_idx=0):
+    hidden_states = torch.randn(1, seq_len, config.hidden_size)
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    rotary = modeling.DeepseekV4RotaryEmbedding(config)
+    position_embeddings = {
+        layer_type: rotary(hidden_states, position_ids=position_ids, layer_type=layer_type)
+        for layer_type in ("main", "compress")
+    }
+    return modeling.DeepseekV4Attention(config, layer_idx).eval(), hidden_states, position_ids, position_embeddings
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="compact sparse dispatch requires bf16 CUDA tensors")
+def test_deepseek_v4_attention_reads_the_decision_not_the_missing_mask(monkeypatch):
+    """A missing mask is not the mask-free signal; only the model's decision is.
+
+    The mask-free builder needs packed metadata that only the packed branch of
+    ``DeepseekV4Model.forward`` produces. A layer that read a missing mask as
+    consent would reach for it on any forward that happens to arrive without
+    one, so the two sites have to agree by construction rather than by
+    coincidence.
+    """
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    torch.manual_seed(13)
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    attention, hidden_states, position_ids, position_embeddings = _toy_attention_inputs(modeling, config, seq_len=16)
+    attention = attention.to(device=DEVICE, dtype=torch.bfloat16)
+    hidden_states = hidden_states.to(device=DEVICE, dtype=torch.bfloat16)
+    position_ids = position_ids.to(DEVICE)
+    position_embeddings = {
+        key: tuple(t.to(device=DEVICE, dtype=torch.bfloat16) for t in value)
+        for key, value in position_embeddings.items()
+    }
+
+    called = []
+    for name in ("build_packed_sparse_attention_indices", "build_sparse_attention_indices"):
+        original = getattr(modeling, name)
+
+        def record(*args, _name=name, _original=original, **kwargs):
+            called.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(modeling, name, record)
+
+    monkeypatch.setattr(
+        modeling,
+        "sparse_attn_tilelang",
+        lambda query, key, sinks, topk_indices, scaling: torch.zeros_like(query),
+    )
+
+    modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+    try:
+        with torch.no_grad():
+            attention(hidden_states, position_embeddings, position_ids, None)
+    finally:
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+
+    assert called == ["build_sparse_attention_indices"]
+
+
+def test_deepseek_v4_attention_refuses_mask_free_it_cannot_serve():
+    """Withholding the mask must never degrade into unmasked attention.
+
+    The model drops the causal mask on the strength of the compact path. If the
+    layer then cannot build compact indices, silently falling back would run
+    attention with no mask at all rather than merely slower.
+    """
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    torch.manual_seed(17)
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    attention, hidden_states, position_ids, position_embeddings = _toy_attention_inputs(modeling, config, seq_len=8)
+
+    modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+    try:
+        with pytest.raises(RuntimeError, match="withheld the causal mask"), torch.no_grad():
+            attention(
+                hidden_states,
+                position_embeddings,
+                position_ids,
+                None,
+                mask_free_sparse=True,
+            )
+    finally:
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+
+
 def test_deepseek_v4_packed_causal_mask_blocks_previous_samples():
     from transformers import AutoConfig
     from transformers.cache_utils import DynamicCache

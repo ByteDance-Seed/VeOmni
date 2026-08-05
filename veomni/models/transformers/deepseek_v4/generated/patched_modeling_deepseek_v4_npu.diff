@@ -846,7 +846,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -793,47 +1169,118 @@
+@@ -793,47 +1169,129 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -924,10 +924,21 @@
 +            and q.is_cuda
 +            and q.dtype == torch.bfloat16
 +        )
-+        # ``DeepseekV4Model.forward`` withholds the dense mask exactly when the packed
-+        # metadata is sufficient to validate candidates on its own, so its absence is
-+        # the signal to take the mask-free path and skip every O(S^2) intermediate.
-+        mask_free_sparse = use_compact_sparse_indices and attention_mask is None
++        # ``DeepseekV4Model.forward`` owns this decision and hands it down, the same
++        # way it hands down the packed metadata. Re-deriving it here from a missing
++        # mask would not agree with it: under sdpa and flash_attention_2,
++        # ``create_sliding_window_causal_mask`` also returns None for an all-ones or
++        # absent 2-D mask, so absence does not imply the model chose to withhold.
++        mask_free_sparse = bool(kwargs.pop("mask_free_sparse", False))
++        if mask_free_sparse and not use_compact_sparse_indices:
++            # The model already dropped the causal mask on the strength of this path,
++            # so falling back now would silently run attention with no mask at all.
++            raise RuntimeError(
++                "DeepseekV4Model withheld the causal mask for the mask-free sparse path, but this layer "
++                "cannot produce compact indices "
++                f"(dsa_attention_implementation={veomni_dsa_attention_implementation.value}, "
++                f"q.dtype={q.dtype}, q.is_cuda={q.is_cuda}, cache={'set' if past_key_values is not None else 'none'})"
++            )
 +        if self.compressor is not None:
 +            compressor_output = self.compressor(
 +                compressor_hidden,
@@ -982,7 +993,7 @@
          attn_output, attn_weights = attention_interface(
              self,
              q,
-@@ -843,22 +1290,27 @@
+@@ -843,22 +1301,27 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -1018,7 +1029,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -909,22 +1361,30 @@
+@@ -909,22 +1372,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -1060,7 +1071,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -933,11 +1393,14 @@
+@@ -933,11 +1404,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -1078,7 +1089,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -953,10 +1416,27 @@
+@@ -953,10 +1427,27 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1106,7 +1117,7 @@
 
 
  class DeepseekV4MLP(nn.Module):
-@@ -970,16 +1450,60 @@
+@@ -970,16 +1461,60 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -1174,7 +1185,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -990,30 +1514,63 @@
+@@ -990,30 +1525,63 @@
          self.limit = config.swiglu_limit
 
      def forward(
@@ -1251,7 +1262,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1027,14 +1584,26 @@
+@@ -1027,14 +1595,26 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
@@ -1281,7 +1292,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1057,10 +1626,14 @@
+@@ -1057,10 +1637,14 @@
          self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1298,7 +1309,7 @@
          scores = self.score_fn(logits)
          indices = self.tid2eid[input_ids.reshape(-1)].long()
          weights = scores.gather(1, indices)
-@@ -1088,6 +1661,12 @@
+@@ -1088,6 +1672,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1311,7 +1322,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1697,20 @@
+@@ -1118,22 +1708,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -1342,7 +1353,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1810,12 @@
+@@ -1233,6 +1821,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1355,7 +1366,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1835,16 @@
+@@ -1252,6 +1846,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1372,7 +1383,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +1860,94 @@
+@@ -1267,28 +1871,104 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1433,7 +1444,17 @@
 +                and not isinstance(attention_mask, dict)
 +                and inputs_embeds.dtype == torch.bfloat16
 +                and inputs_embeds.is_cuda
++                # Padding lives only in the 2-D mask, and the mask-free path never
++                # reads it -- it reconstructs every constraint from position_ids and
++                # cu-seqlens. VeOmni's collator pads with ones for exactly this
++                # reason (``data_collator`` asserts ``sp_pad_value == 1``), so this
++                # guards against a foreign collator rather than a live case, and it
++                # runs once per forward instead of once per layer.
++                and (attention_mask is None or bool(attention_mask.all()))
 +            )
++            # Attention must not re-derive this from the missing mask; see the note
++            # at the consuming site in ``DeepseekV4Attention.forward``.
++            kwargs["mask_free_sparse"] = mask_free_sparse
 +            # Metadata is indexed by global positions / cu-seqlens; under SP the
 +            # collator already provides full-sequence cu-seqlens while local embeds
 +            # are only one shard, so materialize a full-length reference tensor.
@@ -1477,7 +1498,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +2051,12 @@
+@@ -1392,6 +2072,12 @@
      return overall_loss * num_experts
 
 
@@ -1490,7 +1511,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +2075,36 @@
+@@ -1410,49 +2096,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1560,7 +1581,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +2117,64 @@
+@@ -1465,26 +2138,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1639,7 +1660,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2182,17 @@
+@@ -1492,7 +2203,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
