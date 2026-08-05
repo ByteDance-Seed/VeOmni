@@ -658,6 +658,4 @@ class ModuleRuntime:
         return assets
 
 
-OmniModuleRuntime = ModuleRuntime
-
-__all__ = ["ModuleRuntime", "OmniModuleRuntime", "OmniModuleCheckpointManager"]
+__all__ = ["ModuleRuntime", "OmniModuleCheckpointManager"]

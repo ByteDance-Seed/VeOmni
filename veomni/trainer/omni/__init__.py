@@ -16,7 +16,7 @@
 
 from ...models.seed_omni.accelerator import OmniModelRuntime
 from ...models.seed_omni.accelerator.checkpoint import OmniModuleCheckpointManager
-from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime, OmniModuleRuntime
+from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime
 from ...omni_arguments.model_runtime import build_module_runtime_args
 from ..callbacks.omni_callbacks import (
     OmniGlobalStateCallback,
@@ -33,7 +33,6 @@ OmniModuleTrainer = ModuleRuntime
 __all__ = [
     "OmniTrainer",
     "ModuleRuntime",
-    "OmniModuleRuntime",
     "OmniModuleTrainer",
     "OmniModuleCheckpointManager",
     "OmniModelRuntime",
