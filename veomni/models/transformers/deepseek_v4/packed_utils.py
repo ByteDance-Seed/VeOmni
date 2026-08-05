@@ -173,10 +173,20 @@ def build_sparse_attention_indices(
     compressed_len: int,
     compressed_indices: torch.Tensor | None,
     device: torch.device,
+    query_offset: int = 0,
+    kv_full_len: int | None = None,
 ) -> torch.Tensor:
-    """Build compact sliding-window and compressed-KV candidates."""
-    sliding_width = min(sliding_window, seq_len)
-    query_indices = torch.arange(seq_len, device=device, dtype=torch.int32)
+    """Build compact sliding-window and compressed-KV candidates.
+
+    ``seq_len`` counts query rows. Under context parallelism those are one shard
+    while the KV buffer stays global, so ``query_offset`` rebases each query onto
+    its absolute full-resolution row and ``kv_full_len`` is the offset that lifts
+    a compressed slot past the full-resolution rows. They default to the
+    single-shard case where both collapse back to ``seq_len``.
+    """
+    kv_full_len = seq_len if kv_full_len is None else kv_full_len
+    sliding_width = min(sliding_window, kv_full_len)
+    query_indices = torch.arange(seq_len, device=device, dtype=torch.int32) + query_offset
     window_offsets = torch.arange(sliding_width - 1, -1, -1, device=device, dtype=torch.int32)
     sliding_indices = query_indices[:, None] - window_offsets[None, :]
     sliding_indices = sliding_indices.masked_fill(sliding_indices < 0, -1)
@@ -198,7 +208,7 @@ def build_sparse_attention_indices(
 
     compressed_indices = torch.where(
         compressed_indices >= 0,
-        compressed_indices + seq_len,
+        compressed_indices + kv_full_len,
         torch.full_like(compressed_indices, -1),
     )
     return torch.cat((sliding_indices, compressed_indices), dim=-1).contiguous()
@@ -232,6 +242,8 @@ def build_packed_sparse_attention_indices(
     sliding_window: int,
     compressed_len: int,
     candidates: CompressedCandidates | None,
+    query_offset: int = 0,
+    kv_full_len: int | None = None,
 ) -> torch.Tensor:
     """Build fully validated sparse candidates without materializing a dense mask.
 
@@ -250,15 +262,22 @@ def build_packed_sparse_attention_indices(
     Callers must guarantee the padding mask is all ones over the packed length,
     which the FlashAttention varlen collator does by construction -- boundaries
     travel through ``position_ids`` and ``cu_seq_lens`` instead.
+
+    ``seq_len`` counts query rows only. Under context parallelism the queries are
+    one shard while the KV buffer stays global, so ``query_offset`` rebases a
+    local query onto its absolute full-resolution row and ``kv_full_len`` lifts a
+    compressed slot past the full-resolution rows. Conflating the two is silent:
+    the shapes stay self-consistent and attention simply reads the wrong rows.
     """
     if position_ids.ndim != 2:
         raise ValueError(f"Packed sparse indices need [batch, seq_len] position ids; got {position_ids.ndim} dims")
 
     batch_size, seq_len = position_ids.shape
+    kv_full_len = seq_len if kv_full_len is None else kv_full_len
     device = position_ids.device
-    sliding_width = min(sliding_window, seq_len)
+    sliding_width = min(sliding_window, kv_full_len)
     positions = position_ids.to(torch.int32)
-    query_indices = torch.arange(seq_len, device=device, dtype=torch.int32)
+    query_indices = torch.arange(seq_len, device=device, dtype=torch.int32) + query_offset
     window_offsets = torch.arange(sliding_width - 1, -1, -1, device=device, dtype=torch.int32)
 
     sliding_indices = (query_indices[None, :, None] - window_offsets[None, None, :]).expand(batch_size, -1, -1)
@@ -274,7 +293,7 @@ def build_packed_sparse_attention_indices(
                 "Compressed sparse indices must match the attention batch and sequence dimensions; "
                 f"got {tuple(compressed_indices.shape)} for batch={batch_size}, seq_len={seq_len}"
             )
-        compressed_indices = torch.where(compressed_indices >= 0, compressed_indices + seq_len, -1)
+        compressed_indices = torch.where(compressed_indices >= 0, compressed_indices + kv_full_len, -1)
     elif candidates.range_starts is not None and candidates.range_ends is not None:
         starts = _broadcast_query_ranges(candidates.range_starts, batch_size, seq_len)
         ends = _broadcast_query_ranges(candidates.range_ends, batch_size, seq_len)
@@ -282,7 +301,7 @@ def build_packed_sparse_attention_indices(
         visible = (entry_indices[None, None, :] >= starts[:, :, None]) & (
             entry_indices[None, None, :] < ends[:, :, None]
         )
-        compressed_indices = torch.where(visible, entry_indices[None, None, :] + seq_len, -1)
+        compressed_indices = torch.where(visible, entry_indices[None, None, :] + kv_full_len, -1)
     else:
         return sliding_indices.contiguous()
 
