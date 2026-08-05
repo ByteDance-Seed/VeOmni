@@ -427,9 +427,7 @@ def rotate_half(x):
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
-def apply_rotary_pos_emb(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
-) -> torch.Tensor:
+def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1) -> torch.Tensor:
     """V4 interleaved RoPE applied to the *trailing* rope slice of `x`.
 
     `cos` / `sin` come in half-sized (one entry per interleaved pair, from
@@ -737,6 +735,7 @@ class DeepseekV4Indexer(nn.Module):
             and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
         )
         if indexer_implementation == "tilelang" and not use_tilelang:
+            breakpoint()
             raise ValueError("DeepseekV4Indexer set dsa_indexer_implementation=True but not take effect.")
         if use_tilelang:
             query = q.transpose(0, 1).contiguous()
@@ -1176,9 +1175,7 @@ class DeepseekV4Attention(nn.Module):
 
         block_bias = None
         compressed_topk_indices = None
-        use_compact_sparse_indices = (
-            veomni_dsa_attention_implementation.value == "tilelang" and past_key_values is None
-        )
+        use_compact_sparse_indices = veomni_dsa_attention_implementation.value == "tilelang" and past_key_values is None
         if self.compressor is not None:
             compressor_output = self.compressor(
                 compressor_hidden,
