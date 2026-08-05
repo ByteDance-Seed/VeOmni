@@ -93,7 +93,8 @@ class _FakeModule(nn.Module):
         self.config = config
 
     @classmethod
-    def from_config(cls, config, **kwargs):
+    def _from_config(cls, config, **kwargs):
+        """Mirrors ``PreTrainedModel._from_config`` — real modules have no public ``from_config``."""
         return cls(config)
 
     @classmethod

@@ -38,7 +38,7 @@ from ....distributed.parallel_state import (
 )
 from ....distributed.torch_compile import CompileConfig
 from ....distributed.torch_parallelize import build_parallelize_model
-from ....models import build_foundation_model, build_tokenizer
+from ....models import build_foundation_model
 from ....optim import build_lr_scheduler, build_optimizer
 from ....trainer.base import _collect_muon_kwargs
 from ....utils import helper, logging
@@ -117,7 +117,6 @@ class ModuleRuntime:
         *,
         train: "OmniTrainingArguments",
         train_steps: int = -1,
-        init_checkpoint: bool = True,
         for_inference: bool = False,
     ):
         self.args = args
@@ -149,7 +148,7 @@ class ModuleRuntime:
                 self._build_optimizer()
                 if self._train_steps != -1:
                     self._build_lr_scheduler()
-            if init_checkpoint and not for_inference:
+            if not for_inference:
                 self._init_checkpoint()
 
         if for_inference:
@@ -586,57 +585,42 @@ class ModuleRuntime:
         helper.print_device_mem_info(f"ModuleRuntime '{self.module_name}': VRAM after build")
 
     def _load_module_assets(self):
-        """Load this module's processor / tokenizer onto the runtime model for training.
+        """Bind this module's preprocessor (processor / tokenizer / chat template)
+        onto the runtime model for training.
 
-        Meta-init skips ``from_pretrained``, so vision modules and text encoders that
-        need a processor or tokenizer at train time load them here from this module's
-        weights path.  HF export collects ``config`` + attached assets from the live
-        model at save time via :meth:`collect_hf_export_assets` — nothing is cached on
-        the runtime as a separate ``model_assets`` list.
+        Meta-init skips ``from_pretrained``, so vision modules and text encoders
+        that need a processor or tokenizer at train time bind them here from this
+        module's weights path — via ``preprocessor_class.from_pretrained``
+        (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`),
+        which builds with no model instance involved, then
+        :meth:`ModuleMixin.bind_preprocessor` copies its assets onto ``model``.
+        A no-op when the module declares no ``preprocessor_class``, or when an
+        earlier eager ``from_pretrained`` already bound one. HF export collects
+        ``config`` + attached assets from the live model at save time via
+        :meth:`collect_hf_export_assets` — nothing is cached on the runtime as a
+        separate ``model_assets`` list.
         """
         model = self.model
-        cfg = getattr(model, "config", None)
         label = type(model).__name__
+        preprocessor_cls = getattr(type(model), "preprocessor_class", None)
+        if preprocessor_cls is None:
+            return
+        if any(
+            getattr(model, attr, None) is not None for attr in ("_image_processor", "_video_processor", "_tokenizer")
+        ):
+            return  # already bound by an earlier `from_pretrained` (e.g. eager inference)
         weights_path = self.args.model_path
-
-        # Per-module assets, tried in order. Assets that can be derived from the
-        # runtime module config use ``from_config`` so CLI overrides are honored.
-        # Others are loaded from the module's own checkpoint dir via the class
-        # declared on the model. The tokenizer is the exception — it has no class
-        # slot (``class_attr is None``) and is built by ``build_tokenizer``.
-        # A module that doesn't declare a kind is skipped; a load failure is only
-        # a warning (the module raises lazily if that modality is actually used).
-        model_type = type(model)
-        asset_specs = [
-            # (human label, set attr, check attr, class attr | None)
-            # ``set attr`` is the public name so the tokenizer goes through its
-            # property setter (which may build chat markers / token ids); ``check
-            # attr`` is the private storage used for the already-loaded / asset
-            # collection. ``class attr`` None => load via ``build_tokenizer``.
-            ("processor", "_processor", "_processor", "processor_class"),
-            ("image processor", "_image_processor", "_image_processor", "image_processor_class"),
-            ("video processor", "_video_processor", "_video_processor", "video_processor_class"),
-            ("tokenizer", "tokenizer", "_tokenizer", None),
-        ]
-        for kind, set_attr, check_attr, class_attr in asset_specs:
-            if getattr(model, check_attr, None) is not None:
-                continue
-            try:
-                if class_attr is None:
-                    asset = build_tokenizer(weights_path)
-                else:
-                    asset_class = getattr(model_type, class_attr, None)
-                    if asset_class is None:
-                        continue
-                    if cfg is not None and callable(getattr(asset_class, "from_config", None)):
-                        asset = asset_class.from_config(cfg)
-                    else:
-                        asset = asset_class.from_pretrained(weights_path)
-                setattr(model, set_attr, asset)
-            except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if the modality is used
-                logger.warning_once(f"ModuleRuntime '{label}': could not load {kind} from {weights_path}: {e}.")
-                continue
-            logger.info_rank0(f"ModuleRuntime '{label}': loaded {kind}.")
+        try:
+            # `args.model_config` is the same per-module YAML `model_config:` override
+            # dict already threaded into the live model's `config_kwargs` (see
+            # `_build_module_model`) — forward it so the preprocessor's config-derived
+            # behavior (e.g. `enable_image`, `cache_mode`) agrees with `model.config`.
+            preprocessor = preprocessor_cls.from_pretrained(weights_path, config_overrides=self.args.model_config)
+        except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if the modality is used
+            logger.warning_once(f"ModuleRuntime '{label}': could not build preprocessor from {weights_path}: {e}.")
+            return
+        model.bind_preprocessor(preprocessor)
+        logger.info_rank0(f"ModuleRuntime '{label}': bound preprocessor.")
 
     def collect_hf_export_assets(self) -> List[Any]:
         """Return this module's config + processor/tokenizer sidecars for HF export.

@@ -15,13 +15,13 @@
 """SeedOmni V2 mixins: the per-module graph-hook base + the metric meter."""
 
 from .metric_meter_mixin import MetricMeterMixin, MetricMeterResult
-from .modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
+from .modulemixin import ModuleMixin, Preprocessor, post_forward, pre_forward
 from .offline_encoding import OfflineEncodingConfigMixin, OfflineEncodingMixin
 
 
 __all__ = [
     "ModuleMixin",
-    "CPUPreprocessor",
+    "Preprocessor",
     "pre_forward",
     "post_forward",
     "MetricMeterMixin",

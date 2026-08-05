@@ -1,4 +1,12 @@
-"""Image processor helpers for BAGEL SigLIP NaViT."""
+"""Image processor + worker-side preprocessor for BAGEL SigLIP NaViT.
+
+:class:`BagelSiglipNavitPreprocessor` is the picklable, weight-free CPU worker
+counterpart (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`) —
+built straight off the checkpoint dir, with no model instance involved. Unlike
+Janus, BAGEL ships no separate ``preprocessor_config.json``: the image
+processor is fully derived from the module's own ``config.json`` via
+:meth:`BagelSiglipNavitProcessor.from_config`.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +19,11 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
+
+from ....mixins.modulemixin import Preprocessor
+from ....utils.conversation import ConversationItem, iter_desired_items
+from ..sources import BAGEL_SIGLIP_CONTEXT
+from .configuration import BagelSiglipNavitConfig
 
 
 class BagelSiglipNavitProcessor(BaseImageProcessor):
@@ -311,6 +324,98 @@ def _flattened_position_ids(
     return (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
 
 
+_OMNI_POSITION_IDS = "bagel_siglip_navit_position_ids"
+_OMNI_TOKEN_LEN = "bagel_siglip_navit_token_len"
+
+
+class BagelSiglipNavitPreprocessor(Preprocessor):
+    """Worker-side image patchify for BAGEL SigLIP NaViT context images."""
+
+    def __init__(
+        self,
+        image_processor: Any,
+        dtype: torch.dtype | None = None,
+        dummy_pixel_values: torch.Tensor | None = None,
+    ) -> None:
+        self._image_processor = image_processor
+        self._dtype = dtype
+        self._dummy_pixel_values = dummy_pixel_values
+
+    @classmethod
+    def from_pretrained(
+        cls, module_path: str, *, config_overrides: dict[str, Any] | None = None, **kwargs: Any
+    ) -> BagelSiglipNavitPreprocessor:
+        """Build straight from the checkpoint dir — no model instance needed.
+
+        BAGEL ships no standalone ``preprocessor_config.json``; the image
+        processor is derived from the module's own ``config.json``.
+
+        ``config_overrides`` (the module's YAML ``model_config:`` block) is
+        applied on top of the on-disk default before deriving the image
+        processor's geometry, so it agrees with the live model's own config.
+        """
+        del kwargs
+        config = BagelSiglipNavitConfig.from_pretrained(module_path, **(config_overrides or {}))
+        return cls(BagelSiglipNavitProcessor.from_config(config))
+
+    def bind_dummy_inputs(self, config: BagelSiglipNavitConfig, dtype: torch.dtype | None = None) -> None:
+        """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model."""
+        patch_dim = int(config.num_channels) * int(config.patch_size) * int(config.patch_size)
+        self._dtype = dtype
+        self._dummy_pixel_values = torch.zeros(1, patch_dim, dtype=dtype)
+
+    def __call__(
+        self,
+        conversation_list: list[list[ConversationItem]],
+        *,
+        inference: bool = False,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        del generation_kwargs
+
+        image_items: list[ConversationItem] = []
+        for sample in conversation_list:
+            sample_image_items = list(iter_desired_items([sample], types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]))
+            if sample_image_items:
+                image_items.extend(sample_image_items)
+            elif not inference:
+                if self._dummy_pixel_values is None:
+                    raise RuntimeError(
+                        f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                        "before training use (pure inference never reaches this branch)."
+                    )
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=self._dummy_pixel_values.to(dtype=self._dtype).clone(),
+                        role="dummy",
+                        source=BAGEL_SIGLIP_CONTEXT,
+                        meta={
+                            _OMNI_POSITION_IDS: torch.zeros(1, dtype=torch.long),
+                            _OMNI_TOKEN_LEN: 1,
+                        },
+                    )
+                )
+
+        if not image_items:
+            return
+
+        inputs = self._image_processor(
+            images=[item.value for item in image_items], return_tensors="pt", dtype=self._dtype
+        )
+        lengths = inputs["token_lens"].detach().cpu().reshape(-1).tolist()
+        pixel_chunks = torch.split(inputs["patchified_pixel_values"], lengths, dim=0)
+        position_chunks = torch.split(inputs["patchified_position_ids"], lengths, dim=0)
+        for item, pixels, position_ids, length in zip(
+            image_items, pixel_chunks, position_chunks, lengths, strict=True
+        ):
+            item.value = pixels.to(dtype=self._dtype)
+            item.source = BAGEL_SIGLIP_CONTEXT
+            item.meta[_OMNI_POSITION_IDS] = position_ids.to(dtype=torch.long)
+            item.meta[_OMNI_TOKEN_LEN] = int(length)
+
+
 __all__ = [
     "BagelSiglipNavitProcessor",
+    "BagelSiglipNavitPreprocessor",
 ]

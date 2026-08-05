@@ -33,8 +33,7 @@ from ....utils.logging import get_logger
 
 if TYPE_CHECKING:
     from ....arguments import OmniGraphProfileArguments
-    from ....omni_arguments.arguments_types import OmniTrainingArguments
-    from ....omni_arguments.model_runtime import OmniModelRuntimeArguments
+    from ....omni_arguments.arguments_types import OmniModelRuntimeArguments, OmniTrainingArguments
     from ....trainer.callbacks import TrainerState
     from .module_runtime import ModuleRuntime
 
@@ -104,7 +103,6 @@ class OmniModelRuntime:
                 train=train,
                 train_steps=train_steps,
                 for_inference=for_inference,
-                init_checkpoint=not for_inference,
             )
             module_runtime.checkpoint_subfolder = omni_config.module_checkpoint_subfolder(name)
             module_runtimes[name] = module_runtime

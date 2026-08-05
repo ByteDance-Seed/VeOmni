@@ -3,37 +3,16 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.modulemixin import CPUPreprocessor, post_forward, pre_forward
+from ....mixins.modulemixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from ...qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
 from .chat_template import Qwen3ChatTemplate
 from .configuration import Qwen3TextEncoderConfig
+from .processing import Qwen3TextEncoderPreprocessor
 
 
 SIGNAL_TEXT_DONE = "text_done"
-
-
-class Qwen3TextEncoderCPUPreprocessor(CPUPreprocessor):
-    """Worker-side ``apply_chat_template`` → tokenize → merge for the Qwen3 text encoder.
-
-    Holds only the (picklable) chat template (text-only or the reused Qwen3-VL image
-    template) — never the model — so it runs in DataLoader workers and overlaps with
-    GPU compute. Builds CPU tensors; the main process's thin ``encode_pre`` does the
-    single ``.to(device)``.
-    """
-
-    def __init__(self, chat_template: Qwen3ChatTemplate | Qwen3VLChatTemplate) -> None:
-        self._chat_template = chat_template
-
-    def __call__(
-        self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
-    ) -> None:
-        del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        for sample in conversation_list or []:
-            parts = self._chat_template.tokenize_conversation(sample, add_generation_prompt=inference)
-            sample.clear()
-            sample.extend(parts)
 
 
 class Qwen3TextEncoderModuleMixin(TextEncoderModuleMixin):
@@ -56,6 +35,7 @@ class Qwen3TextEncoderModuleMixin(TextEncoderModuleMixin):
 
     config: Qwen3TextEncoderConfig
     _chat_template: Qwen3ChatTemplate | Qwen3VLChatTemplate
+    preprocessor_class = Qwen3TextEncoderPreprocessor
 
     # Vision special tokens whose embedding rows bootstrap image understanding;
     # ids are resolved from the tokenizer at freeze time (see :meth:`freeze_model`).
@@ -82,12 +62,6 @@ class Qwen3TextEncoderModuleMixin(TextEncoderModuleMixin):
             self._chat_template = Qwen3VLChatTemplate(tokenizer)
         else:
             self._chat_template = Qwen3ChatTemplate(tokenizer)
-
-    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
-        """Worker-side chat-template + tokenize (see :class:`Qwen3TextEncoderCPUPreprocessor`)."""
-        if getattr(self, "_chat_template", None) is None:
-            return None
-        return Qwen3TextEncoderCPUPreprocessor(self._chat_template)
 
     # training hooks (explicit pass-through to TextEncoderModuleMixin for findability)
     @pre_forward("encode")

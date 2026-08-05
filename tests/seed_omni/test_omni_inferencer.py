@@ -162,7 +162,7 @@ def test_module_needs_distributed_only_when_declared_non_eager():
 
 def test_build_module_args_from_checkpoint_module_entry():
     from veomni.models.seed_omni.configuration_omni import OmniConfig
-    from veomni.omni_arguments.model_runtime import build_module_args
+    from veomni.omni_arguments.arguments_types import build_module_args
 
     omni_config = OmniConfig.from_dict(
         {

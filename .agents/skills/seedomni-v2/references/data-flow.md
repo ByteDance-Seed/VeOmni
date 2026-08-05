@@ -13,7 +13,7 @@ raw data transforms, or request preprocessing.
    - Input: list of per-sample dicts.
    - Output: `{"conversation_list": [[...], ...]}` plus aligned extra keys.
    - No tensor stacking, sequence padding, or SP slicing happens here.
-3. `SeedOmniCollator` runs ordered `CPUPreprocessor`s:
+3. `SeedOmniCollator` runs ordered `Preprocessor`s:
    - The trainer collects them from active graph modules.
    - They run serially in module declaration order.
    - They mutate `ConversationItem.value`, `source`, and `meta` in place.
@@ -24,9 +24,9 @@ raw data transforms, or request preprocessing.
 6. `post_forward` scatters outputs back to carrier items and returns
    `{"conversation_list": conversation}` or scalar `*_loss` values.
 
-## CPUPreprocessor Contract
+## Preprocessor Contract
 
-`CPUPreprocessor` lives in `veomni/models/seed_omni/mixins/modulemixin.py`.
+`Preprocessor` lives in `veomni/models/seed_omni/mixins/modulemixin.py`.
 
 Rules:
 

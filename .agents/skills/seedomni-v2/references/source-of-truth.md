@@ -5,7 +5,7 @@ Use this reference to decide which files to trust before editing SeedOmni V2.
 ## Highest Priority
 
 - `veomni/models/seed_omni/mixins/modulemixin.py`
-  - `ModuleMixin`, `CPUPreprocessor`, `pre_forward`, `post_forward`.
+  - `ModuleMixin`, `Preprocessor`, `pre_forward`, `post_forward`.
 - `veomni/models/seed_omni/graphs/graph.py`
   - endpoint parsing and common graph schema.
 - `veomni/models/seed_omni/graphs/training_graph.py`

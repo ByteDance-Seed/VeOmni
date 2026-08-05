@@ -608,7 +608,7 @@ def test_bagel_vae_meter_reports_latent_tokens_including_dummy() -> None:
 def test_bagel_vae_training_encode_crops_padded_latents_before_flow_patchify():
     from veomni.models.seed_omni.modules.bagel.flow_connector.processing import preprocess_latent_embed
     from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
-    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEPreprocessor, BagelVAEProcessor
 
     BagelVAE = model_cls("bagel_vae")
     BagelVAEConfig = config_cls("bagel_vae")
@@ -627,7 +627,7 @@ def test_bagel_vae_training_encode_crops_padded_latents_before_flow_patchify():
         )
     )
     model._image_processor = BagelVAEProcessor.from_config(model.config)
-    preprocessor = model.build_cpu_preprocessor()
+    preprocessor = BagelVAEPreprocessor(model._image_processor)
     assert preprocessor is not None
 
     tall = ConversationItem(

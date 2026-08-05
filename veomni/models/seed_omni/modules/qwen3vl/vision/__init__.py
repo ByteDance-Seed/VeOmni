@@ -23,10 +23,11 @@ def register_qwen3vl_vision_processor():
     returns a ``{"image": ..., "video": ...}`` dict rather than a single class.
 
     Note this registry is only a convenience for convert-time tooling; at
-    train / inference time both processors are loaded automatically from the
-    ``image_processor_class`` / ``video_processor_class`` attributes on
-    :class:`Qwen3VLVisionEncoder` (see ``OmniModule.from_pretrained``), exposed
-    as ``self._image_processor`` / ``self._video_processor``.
+    train / inference time both processors are loaded by
+    ``Qwen3VLVisionPreprocessor.from_pretrained`` (see
+    ``modulemixin.Qwen3VLVisionEncoderModuleMixin.preprocessor_class``) and bound
+    onto the model as ``self._image_processor`` / ``self._video_processor`` via
+    ``ModuleMixin.bind_preprocessor``.
     """
     from .processing import Qwen3VLVisionImageProcessor, Qwen3VLVisionVideoProcessor
 

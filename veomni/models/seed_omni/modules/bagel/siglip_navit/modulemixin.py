@@ -9,91 +9,23 @@ import torch
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import (
-    CPUPreprocessor,
-    ModuleMixin,
-    post_forward,
-    pre_forward,
-)
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
-
-
-_OMNI_POSITION_IDS = "bagel_siglip_navit_position_ids"
-_OMNI_TOKEN_LEN = "bagel_siglip_navit_token_len"
-
-
-class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
-    """Worker-side image patchify for BAGEL SigLIP NaViT context images."""
-
-    def __init__(self, image_processor: Any, dtype: torch.dtype, dummy_pixel_values: torch.Tensor) -> None:
-        self._image_processor = image_processor
-        self._dtype = dtype
-        self._dummy_pixel_values = dummy_pixel_values
-
-    def __call__(
-        self,
-        conversation_list: list[list[ConversationItem]],
-        *,
-        inference: bool = False,
-        generation_kwargs: dict[str, Any] | None = None,
-    ) -> None:
-        del generation_kwargs
-
-        image_items: list[ConversationItem] = []
-        for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]))
-            if sample_image_items:
-                image_items.extend(sample_image_items)
-            elif not inference:
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=self._dummy_pixel_values.to(dtype=self._dtype).clone(),
-                        role="dummy",
-                        source=BAGEL_SIGLIP_CONTEXT,
-                        meta={
-                            _OMNI_POSITION_IDS: torch.zeros(1, dtype=torch.long),
-                            _OMNI_TOKEN_LEN: 1,
-                        },
-                    )
-                )
-
-        if not image_items:
-            return
-
-        inputs = self._image_processor(
-            images=[item.value for item in image_items], return_tensors="pt", dtype=self._dtype
-        )
-        lengths = inputs["token_lens"].detach().cpu().reshape(-1).tolist()
-        pixel_chunks = torch.split(inputs["patchified_pixel_values"], lengths, dim=0)
-        position_chunks = torch.split(inputs["patchified_position_ids"], lengths, dim=0)
-        for item, pixels, position_ids, length in zip(
-            image_items, pixel_chunks, position_chunks, lengths, strict=True
-        ):
-            item.value = pixels.to(dtype=self._dtype)
-            item.source = BAGEL_SIGLIP_CONTEXT
-            item.meta[_OMNI_POSITION_IDS] = position_ids.to(dtype=torch.long)
-            item.meta[_OMNI_TOKEN_LEN] = int(length)
+from .processing import _OMNI_POSITION_IDS, _OMNI_TOKEN_LEN, BagelSiglipNavitPreprocessor
 
 
 class BagelSiglipNavitModuleMixin(ModuleMixin):
     """Carrier hooks for BAGEL visual-understanding image features."""
+
+    preprocessor_class = BagelSiglipNavitPreprocessor
 
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._image_items: list[ConversationItem] = []
         self._sp_image_count: int | None = None
         self._sp_token_count: int | None = None
-
-    def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
-        """Worker-side image patchify for training batches."""
-        if getattr(self, "_image_processor", None) is None:
-            return None
-        patch_dim = self.config.num_channels * self.config.patch_size * self.config.patch_size
-        dummy = torch.zeros(1, patch_dim, dtype=self.dtype)
-        return BagelSiglipNavitCPUPreprocessor(self._image_processor, self.dtype, dummy)
 
     # ── Graph Entrypoints ──────────────────────────────────
 
@@ -299,4 +231,4 @@ class BagelSiglipNavitMetricMeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["BagelSiglipNavitCPUPreprocessor", "BagelSiglipNavitModuleMixin", "BagelSiglipNavitMetricMeterMixin"]
+__all__ = ["BagelSiglipNavitPreprocessor", "BagelSiglipNavitModuleMixin", "BagelSiglipNavitMetricMeterMixin"]

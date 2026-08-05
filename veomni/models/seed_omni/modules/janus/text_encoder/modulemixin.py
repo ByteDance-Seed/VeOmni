@@ -3,10 +3,11 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.modulemixin import CPUPreprocessor, post_forward, pre_forward
+from ....mixins.modulemixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from .chat_template import JanusChatTemplate
+from .processing import JanusTextEncoderPreprocessor
 
 
 # Janus signal keys
@@ -14,38 +15,20 @@ SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
 
 
-class JanusTextEncoderCPUPreprocessor(CPUPreprocessor):
-    """Worker-side ``apply_chat_template`` → tokenize → merge for the Janus text encoder.
-
-    Holds only the (picklable) :class:`JanusChatTemplate` — never the model — so it
-    runs in DataLoader workers and overlaps with GPU compute. Builds CPU tensors;
-    the main process's thin ``encode_pre`` does the single ``.to(device)``.
-    """
-
-    def __init__(self, chat_template: JanusChatTemplate) -> None:
-        self._chat_template = chat_template
-
-    def __call__(
-        self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
-    ) -> None:
-        del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        for sample in conversation_list or []:
-            parts = self._chat_template.tokenize_conversation(sample, add_generation_prompt=inference)
-            sample.clear()
-            sample.extend(parts)
-
-
 class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
     """Janus ``TextEncoder`` — image-aware ChatML with ``<boi>`` / ``<eoi>`` emitters.
 
     The encode/decode call-site plumbing (prepare / scatter) lives in
-    :class:`TextEncoderModuleMixin`; the hooks + CPU preprocessor below are explicit
-    pass-throughs (for findability). Only the chat template and the T2I-aware
-    ``generate`` FSM (BOS injection, ``<boi>`` / ``<eoi>`` signals, classifier-free
-    guidance arming) are genuinely Janus-specific.
+    :class:`TextEncoderModuleMixin`; the hooks below are explicit pass-throughs
+    (for findability). The worker-side CPU preprocessor lives on
+    ``processing.py`` (see :class:`JanusTextEncoderPreprocessor`). Only the chat
+    template and the T2I-aware ``generate`` FSM (BOS injection, ``<boi>`` /
+    ``<eoi>`` signals, classifier-free guidance arming) are genuinely
+    Janus-specific.
     """
 
     _chat_template: JanusChatTemplate
+    preprocessor_class = JanusTextEncoderPreprocessor
 
     @property
     def tokenizer(self) -> Any:
@@ -55,10 +38,6 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
     def tokenizer(self, tokenizer: Any) -> None:
         self._tokenizer = tokenizer
         self._chat_template = JanusChatTemplate(tokenizer)
-
-    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
-        """chat-template + tokenize (see :class:`JanusTextEncoderCPUPreprocessor`)."""
-        return JanusTextEncoderCPUPreprocessor(self._chat_template)
 
     # training hooks
     @pre_forward("encode")

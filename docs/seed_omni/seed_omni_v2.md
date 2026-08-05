@@ -429,7 +429,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `graphs/training_graph.py` | DAG view (topological forward order) |
 | `graphs/generation_graph.py` | FSM view (states / transitions / signals) |
 | `configuration_omni.py` | `OmniConfig` — plain `PretrainedConfig`, checkpoint read/write only |
-| `omni_arguments/model_runtime.py` | parse + merge the launcher YAML into `OmniModelRuntimeArguments`; `.to_hf_config()` projects it onto `OmniConfig` |
+| `omni_arguments/arguments_types.py` | launcher argument schema (`OmniArguments`) + parse/merge the launcher YAML into `OmniModelRuntimeArguments`; `.to_hf_config()` projects it onto `OmniConfig` |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
 | `modules/<family>/<sub>/` | per-module `configuration.py`, `modulemixin.py`, `modeling.py` [, `processing.py`] |
 | `veomni/trainer/omni/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |

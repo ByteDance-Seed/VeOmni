@@ -217,4 +217,26 @@ def test_bagel_vae_from_pretrained_accepts_cache_overrides(tmp_path) -> None:
     assert loaded.cache_mode == "process_only"
     assert not hasattr(loaded, "encoder")
     assert not hasattr(loaded, "decoder")
+    # process_only reads already-preprocessed cached conversations, so no CPU
+    # image prep is needed for this module — `from_pretrained`'s `**overrides`
+    # (support_cache / train_type) must reach `BagelVAEPreprocessor.from_pretrained`
+    # the same way they reach `loaded.config`, so it also sees `process_only` and
+    # correctly skips building an `_image_processor` (mirrors `not hasattr(...,
+    # "encoder"/"decoder")` above — there is nothing for it to feed).
+    assert loaded._image_processor is None
+
+
+def test_bagel_vae_from_pretrained_full_cache_mode_still_loads_image_processor(tmp_path) -> None:
+    """Sibling of the above: a non-`process_only` override must still bind `_image_processor`."""
+    model = _tiny_vae()
+    model.save_pretrained(tmp_path)
+    BagelVAEProcessor.from_config(model.config).save_pretrained(tmp_path)
+
+    BagelVAE = model_cls("bagel_vae")
+    loaded = BagelVAE.from_pretrained(tmp_path, support_cache=False, train_type="sft")
+
+    assert loaded.cache_mode == "full"
+    assert hasattr(loaded, "encoder")
+    assert hasattr(loaded, "decoder")
+    assert loaded._image_processor is not None
     assert loaded._image_processor.max_image_size == 8

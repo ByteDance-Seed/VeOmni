@@ -62,14 +62,14 @@ from torch.utils.checkpoint import set_checkpoint_debug_enabled
 
 from ...arguments import OmniArguments
 from ...arguments.parser import save_args
-from ...data import build_dataloader, build_dataset
+from ...data import SeedOmniCollator, build_dataloader, build_dataset
 from ...data.data_transform import build_data_transform
 from ...distributed.chunk_mbs import build_chunk_mbs_ranges
 from ...distributed.offloading import build_activation_offloading_context
 from ...distributed.parallel_state import init_parallel_state
 from ...models.seed_omni.accelerator import OmniModelRuntime
 from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime
-from ...models.seed_omni.collator import build_seed_omni_collator
+from ...models.seed_omni.processing import OmniProcessor
 from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging
@@ -393,8 +393,20 @@ class OmniTrainer:
         self.train_dataset = train_dataset
 
     def _build_train_dataloader(self) -> None:
-        args = self.args
-        self.collate_fn = build_seed_omni_collator(self.model)
+        args: OmniArguments = self.args
+        processor = OmniProcessor.from_config(self.model.config, checkpoint_root=args.model.model_path)
+        # FSDP-anchor dummy tensors are only exercised by the training (inference=False)
+        # branch. `_build_model` already ran (see `setup`), so every module's own
+        # resolved `ModuleRuntime.model_config` is sitting in memory — hand that
+        # straight to the processor instead of re-reading each module's config.json
+        # from disk. Mirrors the per-module load dtype resolved in
+        # ModuleRuntime._build_module_model; a single dtype is fine since these dummies
+        # get re-cast to each module's live self.dtype before reaching its forward.
+        dummy_dtype = torch.float32 if args.model.accelerator.fsdp_config.mixed_precision.enable else torch.bfloat16
+        module_configs = {name: rt.model_config for name, rt in self.model.module_runtimes.items()}
+        processor.bind_dummy_inputs(module_configs, dtype=dummy_dtype)
+        logger.info_rank0(f"SeedOmniCollator with {len(processor)} worker-side CPU preprocessor(s).")
+        self.collate_fn = SeedOmniCollator(processor=processor)
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)

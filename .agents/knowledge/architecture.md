@@ -145,7 +145,8 @@ Canonical imports:
 from veomni.trainer.omni import OmniTrainer, OmniInferencer
 from veomni.models.seed_omni.accelerator import OmniModelRuntime
 from veomni.models.seed_omni.accelerator.module_runtime import ModuleRuntime
-from veomni.omni_arguments.model_runtime import (
+from veomni.omni_arguments.arguments_types import (
+    OmniModelRuntimeArguments,
     build_module_runtime_args,
     build_omni_model_runtime,
     resolve_omni_model,
@@ -168,9 +169,12 @@ reading the module subfolder's `config.json`.
 
 `OmniConfig` itself (`configuration_omni.py`) is a plain `PretrainedConfig` and imports
 nothing from `veomni.arguments`: it only reads/writes a checkpoint root. Every path from
-launcher YAML into an `OmniConfig` goes through `veomni.omni_arguments.model_runtime`
+launcher YAML into an `OmniConfig` goes through `veomni.omni_arguments.arguments_types`
 (`resolve_omni_model` / `build_omni_model_runtime`), which also owns the launcher-YAML
-helpers shared with `build_module_runtime_args()`.
+helpers shared with `build_module_runtime_args()`. `OmniModelRuntimeArguments` and these
+resolution helpers live in the same file as `OmniArguments` (no separate `model_runtime.py`)
+so `OmniArguments.model` can be typed directly as `OmniModelRuntimeArguments` without an
+import cycle.
 
 **Generation scenarios**: `OmniConfig` holds *every* FSM from `infer.infer_graph` in
 `generation_graphs` (`{infer_type: fsm}`), with `infer_type` naming the active one and

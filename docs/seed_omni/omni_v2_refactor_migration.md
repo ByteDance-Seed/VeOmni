@@ -29,7 +29,7 @@ old layout** — resolve them with the path/import maps below.
 
 | Old path | New path | Notes |
 |----------|----------|-------|
-| `veomni/models/seed_omni/module.py` | `veomni/models/seed_omni/mixins/modulemixin.py` | class is still `ModuleMixin`; adds `CPUPreprocessor` |
+| `veomni/models/seed_omni/module.py` | `veomni/models/seed_omni/mixins/modulemixin.py` | class is still `ModuleMixin`; adds `Preprocessor` |
 | `veomni/models/seed_omni/metric_meter_mixin.py` | `veomni/models/seed_omni/mixins/metric_meter_mixin.py` | |
 | `veomni/models/seed_omni/conversation.py` | `veomni/models/seed_omni/utils/conversation.py` | |
 | `veomni/models/seed_omni/graph.py` | `veomni/models/seed_omni/graphs/graph.py` | `NodeDef` / `EdgeDef` / `END` |
@@ -65,7 +65,7 @@ Relative imports **inside** `modules/<family>/<sub>/*.py` (4 dots reach `seed_om
 
 ```text
 from ....module import ModuleMixin, pre_forward, post_forward
-    → from ....mixins.modulemixin import ModuleMixin, pre_forward, post_forward, CPUPreprocessor
+    → from ....mixins.modulemixin import ModuleMixin, pre_forward, post_forward, Preprocessor
 from ....metric_meter_mixin import MetricMeterMixin
     → from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....conversation import ConversationItem, iter_desired_items, ...
@@ -78,7 +78,7 @@ Prefer the re-export hubs where possible (stable across future moves):
 
 ```python
 from veomni.models.seed_omni import OmniModel, OmniConfig, ModuleMixin, build_conversation
-from veomni.models.seed_omni.mixins import ModuleMixin, CPUPreprocessor, pre_forward, post_forward, MetricMeterMixin
+from veomni.models.seed_omni.mixins import ModuleMixin, Preprocessor, pre_forward, post_forward, MetricMeterMixin
 from veomni.models.seed_omni.utils import ConversationItem, iter_desired_items, is_dummy
 from veomni.models.seed_omni.graphs import TrainingGraph, GenerationGraph, NodeDef, EdgeDef, END
 from veomni.trainer.omni import OmniTrainer, OmniInferencer, OmniModuleTrainer, OmniModuleInferencer
@@ -136,11 +136,26 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 - `tokenize_conversation(sample, *, add_generation_prompt=False)` — inference passes
   `True`.
 
-### 3.4 CPU preprocessor: one path for training AND inference
-- Each module may return a `CPUPreprocessor` from `build_cpu_preprocessor()`.
-  Signature: `__call__(self, conversation_list, inference=False, **kwargs)`,
-  mutating items **in place**.
-- **Training:** collected by `OmniTrainer._build_collate_fn`, run inside
+### 3.4 CPU preprocessor: one path for training AND inference, built HF-`AutoProcessor` style
+- A module that needs CPU preprocessing defines `XxxPreprocessor(Preprocessor)` in its
+  own `processing.py` (not `modulemixin.py`) and registers it via the
+  `ModuleMixin.preprocessor_class` class attribute. Signature:
+  `__call__(self, conversation_list, inference=False, **kwargs)`, mutating items
+  **in place**.
+- **Built independently of `modeling`:** `XxxPreprocessor.from_pretrained(module_path)`
+  loads tokenizer / chat template / image processor directly from the checkpoint dir —
+  no model instance, no `build_processor()` on the module. `OmniProcessor` (top-level
+  `processing.py`) collects one `Preprocessor` per active module into
+  `dict[module_name, Preprocessor]` by calling each module's
+  `preprocessor_class.from_pretrained` against the checkpoint.
+- **Dummy inputs are optional and bound later:** `Preprocessor.bind_dummy_inputs(config,
+  dtype)` computes FSDP-anchor dummy tensors from pure `(config, dtype)` — no live model
+  needed. `OmniTrainer._build_train_dataloader` runs after `_build_model`, so it calls
+  `OmniProcessor.bind_dummy_inputs(module_configs, dtype=...)` once with each module's
+  already-resolved `ModuleRuntime.model_config` taken straight from the live model in
+  memory — no disk re-read, no re-applying config overrides — instead of the model
+  constructing dummy inputs at init time and threading them into the processor.
+- **Training:** the bound `OmniProcessor` (or its per-module preprocessors) is run inside
   `SeedOmniCollator` (DataLoader worker).
 - **Inference:** run by `OmniInferencer._preprocess_request` over the request once,
   before the FSM — **module `generate` no longer processes raw input** (only
@@ -150,10 +165,12 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 - **Order is fixed + serial** = config `modules:` declaration order (see
   `OmniConfig.module_names`). Declare an order-dependent module (e.g. text encoder
   after a vision tower that patchifies its image items) accordingly.
+- A module with no CPU preprocessing simply doesn't set `preprocessor_class` (defaults to
+  `None`), so `from_pretrained` skips it — zero overhead, same as before.
 
 ### 3.5 Dummy handling unified on `item.source`
 - **Gone:** `worker_dummy_items` / `has_worker_dummy` (from `utils/conversation.py`).
-- Dummies are appended by the module's `CPUPreprocessor` (training only), tagged
+- Dummies are appended by the module's `Preprocessor` (training only), tagged
   with `item.source == _SOURCE` and real-shaped zero `value`; real items are tagged
   the same way. Hooks filter with a single `iter_desired_items(sources=[_SOURCE])`
   — **no `None` / role branching**.

@@ -22,11 +22,12 @@ class TextEncoderModuleMixin(ModuleMixin):
     """Shared training / inference plumbing for every text encoder.
 
     Concrete modules (janus / qwen3 / qwen3vl) subclass this and, for
-    discoverability, explicitly re-declare their own ``XxxTextEncoderCPUPreprocessor``
-    + ``build_cpu_preprocessor`` and the ``encode_pre`` / ``encode_post`` /
-    ``decode_pre`` / ``decode_post`` pass-through hooks (mirroring the per-module
-    image preprocessors), so a reader finds each module's worker-prep and call-site
-    code in its own file rather than only here.
+    discoverability, define their own ``XxxTextEncoderPreprocessor`` in a
+    module-local ``processing.py`` (registered via the ``preprocessor_class``
+    class attribute, mirroring the per-module image preprocessors) plus the
+    ``encode_pre`` / ``encode_post`` / ``decode_pre`` / ``decode_post``
+    pass-through hooks, so a reader finds each module's worker-prep and
+    call-site code in its own file rather than only here.
     """
 
     _chat_template: TextEncoderChatTemplate

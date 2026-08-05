@@ -250,7 +250,7 @@ class OmniModel(PreTrainedModel):
                 if pretrained:
                     modules[name] = mod_cls.from_pretrained(module_path, config=entry, **load_kwargs)
                 else:
-                    modules[name] = mod_cls.from_config(entry, **load_kwargs)
+                    modules[name] = mod_cls._from_config(entry, **load_kwargs)
                 continue
             model_type = read_model_type(module_path)
             mod_cls = OMNI_MODEL_REGISTRY[model_type]()
@@ -262,7 +262,7 @@ class OmniModel(PreTrainedModel):
             else:
                 cfg_cls = mod_cls.config_class
                 sub_config = cfg_cls.from_pretrained(module_path)
-                modules[name] = mod_cls.from_config(sub_config, **config.module_model_config(name))
+                modules[name] = mod_cls._from_config(sub_config, **config.module_model_config(name))
         return modules
 
     @staticmethod

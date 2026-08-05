@@ -6,66 +6,19 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import (
-    CPUPreprocessor,
-    ModuleMixin,
-    post_forward,
-    pre_forward,
-)
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from .configuration import JanusSiglipConfig
-from .processing import JanusSiglipProcessor
+from .processing import JanusSiglipPreprocessor, JanusSiglipProcessor
 
 
 _SOURCE = "janus_siglip"
 
 
-class JanusSiglipCPUPreprocessor(CPUPreprocessor):
-    """Worker-side image normalize for the SigLIP (understanding) tower.
-
-    Holds only the (picklable) HF image processor + a CPU zero-pixel template —
-    never the model. Runs the same normalize as ``_pixels_from_raw_images`` but on
-    **CPU** (bf16, to halve worker→main IPC); writes the pixel tensor back into
-    each ``user``-image item. For each sample without a user image, appends a
-    ``role="dummy"`` placeholder carrying the zero pixels, so the GPU
-    forward never builds dummy inputs (the FSDP gradient anchor still runs there).
-    """
-
-    def __init__(self, image_processor: Any, dtype: Any, dummy_pixel_values: torch.Tensor) -> None:
-        self._image_processor = image_processor
-        self._dtype = dtype
-        self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
-
-    def __call__(
-        self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
-    ) -> None:
-        del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
-            if sample_image_items:
-                # Real user images present → normalize them; no dummy needed. Tag with
-                # the module source so forward_pre/post can pick up real images and
-                # dummies uniformly (single ``source == _SOURCE`` filter).
-                pixel_values = self._image_processor(
-                    images=[it.value for it in sample_image_items], return_tensors="pt"
-                )["pixel_values"]
-                for it, px in zip(sample_image_items, pixel_values, strict=True):
-                    it.value = px.to(dtype=self._dtype)
-                    it.source = _SOURCE
-            elif not inference:
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=self._dummy_pixel_values,
-                        role="dummy",
-                        source=_SOURCE,
-                    )
-                )
-
-
 class JanusSiglipModuleMixin(ModuleMixin):
     config: JanusSiglipConfig
     _image_processor: JanusSiglipProcessor
+    preprocessor_class = JanusSiglipPreprocessor
 
     def init_omni_state(self) -> None:
         # Training state
@@ -73,11 +26,6 @@ class JanusSiglipModuleMixin(ModuleMixin):
         # Active sample's image count. Under SP the output-gather hook
         # (``forward_sp_post``) narrows the all-gathered (batch-padded) embeds to it.
         self._sp_own_len: Optional[int] = None
-
-    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
-        """Worker-side image normalize (see :class:`JanusSiglipCPUPreprocessor`)."""
-        dummy = self.dummy_inputs()["pixel_values"]
-        return JanusSiglipCPUPreprocessor(self._image_processor, self.dtype, dummy)
 
     # Training hooks
     @pre_forward("forward")
@@ -87,7 +35,7 @@ class JanusSiglipModuleMixin(ModuleMixin):
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
         # Real user images and worker-built dummies both carry source == _SOURCE
-        # (normalized on CPU by the JanusSiglipCPUPreprocessor); stack + move.
+        # (normalized on CPU by the JanusSiglipPreprocessor); stack + move.
         items = list(iter_desired_items(conversation_list, types=["image"], sources=[_SOURCE]))
         pixel_values = torch.stack([it.value for it in items], dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True
@@ -144,7 +92,7 @@ class JanusSiglipModuleMixin(ModuleMixin):
 
     def dummy_inputs(self) -> Dict[str, Any]:
         # Per-image (C, H, W) zero template on CPU: it seeds the worker-side
-        # CPUPreprocessor's dummy item, which is pickled into the batch (a CUDA
+        # Preprocessor's dummy item, which is pickled into the batch (a CUDA
         # tensor would crash the DataLoader worker), and forward_pre stacks it
         # exactly like a real per-image pixel tensor.
         cfg = self.config.vision_config

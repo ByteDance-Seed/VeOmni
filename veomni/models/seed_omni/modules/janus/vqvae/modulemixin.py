@@ -8,12 +8,7 @@ from ......distributed.sequence_parallel import gather_outputs, slice_input_tens
 from ......utils import helper
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import (
-    CPUPreprocessor,
-    ModuleMixin,
-    post_forward,
-    pre_forward,
-)
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import (
     ConversationItem,
     is_dummy,
@@ -22,7 +17,7 @@ from ....utils.conversation import (
     seal_outputs,
 )
 from .configuration import JanusVqvaeConfig
-from .processing import JanusVqvaeProcessor
+from .processing import JanusVqvaePreprocessor, JanusVqvaeProcessor
 
 
 logger = helper.create_logger(__name__)
@@ -30,52 +25,10 @@ logger = helper.create_logger(__name__)
 _SOURCE = "janus_vqvae"
 
 
-class JanusVqvaeCPUPreprocessor(CPUPreprocessor):
-    """Worker-side image normalize for the VQVAE (generation) codec.
-
-    Holds only the (picklable) VQVAE image processor + a CPU zero-pixel template
-    — never the model. Runs the HF image processor on **CPU** (bf16, to halve
-    IPC); writes the pixel tensor back into each ``assistant``-image item.
-    For each sample without an assistant image, appends a ``role="dummy"``
-    placeholder carrying the zero pixels (the codec + generation heads
-    still run on it in the GPU forward for the FSDP gradient anchor).
-    """
-
-    def __init__(self, image_processor: JanusVqvaeProcessor, dtype: Any, dummy_pixel_values: torch.Tensor) -> None:
-        self._image_processor = image_processor
-        self._dtype = dtype
-        self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
-
-    def __call__(
-        self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
-    ) -> None:
-        del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["assistant"]))
-            if sample_image_items:
-                # Real assistant images present → normalize them; no dummy needed.
-                # Tag with the module source so the decode path can pick up real gen
-                # images and dummies uniformly (single ``source == _SOURCE`` filter).
-                pixel_values = self._image_processor(
-                    images=[it.value for it in sample_image_items], return_tensors="pt"
-                )["pixel_values"]
-                for it, px in zip(sample_image_items, pixel_values, strict=True):
-                    it.value = px.to(dtype=self._dtype)
-                    it.source = _SOURCE
-            elif not inference:
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=self._dummy_pixel_values,
-                        role="dummy",
-                        source=_SOURCE,
-                    )
-                )
-
-
 class JanusVqvaeModuleMixin(ModuleMixin):
     config: JanusVqvaeConfig
     _image_processor: JanusVqvaeProcessor
+    preprocessor_class = JanusVqvaePreprocessor
 
     def init_omni_state(self) -> None:
         # Training state
@@ -87,11 +40,6 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         # Inference state
         self._vq_buffer: List[int] = []
 
-    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
-        """Worker-side image normalize (see :class:`JanusVqvaeCPUPreprocessor`)."""
-        dummy = self.dummy_inputs()["pixel_values"]
-        return JanusVqvaeCPUPreprocessor(self._image_processor, self.dtype, dummy)
-
     # Training hooks — one pre/post pair per call-site (tagged with its method),
     # routed by the ModuleMixin.pre_forward / post_forward dispatchers.
     @pre_forward("encode")
@@ -101,7 +49,7 @@ class JanusVqvaeModuleMixin(ModuleMixin):
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
         # Real gen images and worker-built dummies both carry source == _SOURCE
-        # (normalized on CPU by the JanusVqvaeCPUPreprocessor); stack + move.
+        # (normalized on CPU by the JanusVqvaePreprocessor); stack + move.
         items = list(iter_desired_items(conversation_list, types=["image"], sources=[_SOURCE]))
         pixel_values = torch.stack([it.value for it in items], dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True

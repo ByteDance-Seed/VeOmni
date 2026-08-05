@@ -140,7 +140,7 @@ class OmniInferencer:
                 f"OmniInferencer: eager load of {len(self.module_names)} module(s) ({self.module_names}) "
                 f"from {self.checkpoint_root}."
             )
-        self.processor = OmniProcessor.from_composed_model(self.model)
+        self.processor = OmniProcessor.from_config(self.model.config, checkpoint_root=self.checkpoint_root)
         self.model_config = self.model.config
 
     # ── Inference entry point ─────────────────────────────────────────────────

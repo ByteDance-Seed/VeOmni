@@ -596,19 +596,19 @@ class SeedOmniCollator(DataCollator):
         ])
         # batch == {"conversation_list": [[ConversationItem(...)], ...]}
 
-    ``processor`` is an :class:`~veomni.models.seed_omni.processing.OmniProcessor`
-    collected by :func:`~veomni.models.seed_omni.collator.build_seed_omni_collator`
-    from the active graph modules. Its preprocessor chain runs, in order, over the
-    grouped ``conversation_list`` so the heavy per-module CPU input-prep (tokenize /
-    image normalize) executes inside the DataLoader worker and overlaps with GPU
-    compute via prefetch, instead of blocking the main process inside each module's
-    ``pre_forward``. Default ``None`` => pure grouping (all other behaviour unchanged).
+    ``processor`` is an :class:`~veomni.models.seed_omni.processing.OmniProcessor` built
+    via :meth:`~veomni.models.seed_omni.processing.OmniProcessor.from_config` from the
+    active graph modules' config (see ``OmniTrainer._build_train_dataloader``). Its preprocessor
+    chain runs, in order, over the grouped ``conversation_list`` so the heavy per-module CPU
+    input-prep (tokenize / image normalize) executes inside the DataLoader worker and
+    overlaps with GPU compute via prefetch, instead of blocking the main process inside each
+    module's ``pre_forward``. Default ``None`` => pure grouping (all other behaviour unchanged).
 
-    ``cpu_preprocessors`` is a legacy escape hatch for tests; prefer ``processor``.
+    ``preprocessors`` is a legacy escape hatch for tests; prefer ``processor``.
     """
 
     processor: Any = None
-    cpu_preprocessors: Sequence[Callable[[List[List[Any]]], None]] = ()
+    preprocessors: Sequence[Callable[[List[List[Any]]], None]] = ()
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if not features:
@@ -642,7 +642,7 @@ class SeedOmniCollator(DataCollator):
         if self.processor is not None:
             self.processor.preprocess_batch(batch["conversation_list"], inference=False)
         else:
-            for preprocess in self.cpu_preprocessors:
+            for preprocess in self.preprocessors:
                 preprocess(batch["conversation_list"])
 
         return batch

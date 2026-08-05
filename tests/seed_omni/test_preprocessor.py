@@ -2,11 +2,11 @@
 
 Covers the SeedOmni V2 optimization that moves each module's heavy CPU input-prep
 (chat-template + tokenize, image normalize) into the DataLoader worker via a
-picklable ``CPUPreprocessor`` run inside ``SeedOmniCollator``:
+picklable ``Preprocessor`` run inside ``SeedOmniCollator``:
 
 * ``naflatten``/``unflatten`` keep shape metadata on CPU (no per-segment D2H sync)
   and round-trip correctly.
-* The shared :class:`TextEncoderCPUPreprocessor` (wrapping a per-model
+* The shared :class:`TextEncoderPreprocessor` (wrapping a per-model
   ``TextEncoderChatTemplate``) produces the same tokens the in-module
   ``tokenize_conversation`` would, targets the right role, and is picklable.
 * The siglip / vqvae / qwen3vl-vision preprocessors normalize the right images,
@@ -21,46 +21,46 @@ import pickle
 import torch
 
 from veomni.data.data_collator import SeedOmniCollator
-from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
+from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
     _OMNI_POSITION_IDS as BAGEL_SIGLIP_POSITION_IDS,
 )
-from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
+from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
     _OMNI_TOKEN_LEN as BAGEL_SIGLIP_TOKEN_LEN,
 )
-from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
-    BagelSiglipNavitCPUPreprocessor,
+from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
+    BagelSiglipNavitPreprocessor,
+    BagelSiglipNavitProcessor,
 )
-from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import BagelSiglipNavitProcessor
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
 from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
     _OMNI_TOKENIZED as BAGEL_TOK,
 )
-from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
-    BagelTextEncoderCPUPreprocessor,
+from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
+    BagelTextEncoderPreprocessor,
 )
 from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
-from veomni.models.seed_omni.modules.bagel.vae.modulemixin import (
+from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BagelVAEModuleMixin
+from veomni.models.seed_omni.modules.bagel.vae.processing import (
     BAGEL_VAE_PIXEL_SHAPE,
-    BagelVAECPUPreprocessor,
-    BagelVAEModuleMixin,
+    BagelVAEPreprocessor,
+    BagelVAEProcessor,
 )
-from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
-from veomni.models.seed_omni.modules.janus.siglip.modulemixin import (
-    JanusSiglipCPUPreprocessor,
+from veomni.models.seed_omni.modules.janus.siglip.processing import (
+    JanusSiglipPreprocessor,
 )
 from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
-from veomni.models.seed_omni.modules.janus.text_encoder.modulemixin import JanusTextEncoderCPUPreprocessor
-from veomni.models.seed_omni.modules.janus.vqvae.modulemixin import (
-    JanusVqvaeCPUPreprocessor,
+from veomni.models.seed_omni.modules.janus.text_encoder.processing import JanusTextEncoderPreprocessor
+from veomni.models.seed_omni.modules.janus.vqvae.processing import (
+    JanusVqvaePreprocessor,
 )
 from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import Qwen3ChatTemplate
-from veomni.models.seed_omni.modules.qwen3.text_encoder.modulemixin import Qwen3TextEncoderCPUPreprocessor
+from veomni.models.seed_omni.modules.qwen3.text_encoder.processing import Qwen3TextEncoderPreprocessor
 from veomni.models.seed_omni.modules.qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
-from veomni.models.seed_omni.modules.qwen3vl.text_encoder.modulemixin import Qwen3VLTextEncoderCPUPreprocessor
-from veomni.models.seed_omni.modules.qwen3vl.vision.modulemixin import (
+from veomni.models.seed_omni.modules.qwen3vl.text_encoder.processing import Qwen3VLTextEncoderPreprocessor
+from veomni.models.seed_omni.modules.qwen3vl.vision.processing import (
     _OMNI_GRID,
-    Qwen3VLVisionCPUPreprocessor,
+    Qwen3VLVisionPreprocessor,
 )
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from veomni.utils.tensor_utils import naflatten, unflatten
@@ -200,7 +200,7 @@ def test_unflatten_accepts_non_cpu_shape_without_error():
     assert all(torch.equal(a, b) for a, b in zip(out, parts))
 
 
-# ── Text encoder preprocessor (shared TextEncoderCPUPreprocessor) ────────────────
+# ── Text encoder preprocessor (shared TextEncoderPreprocessor) ────────────────
 
 
 def _raw_text_sample():
@@ -217,7 +217,7 @@ def test_text_preprocessor_matches_inmodule_pipeline():
     batch = [_raw_text_sample(), _raw_text_sample()]
 
     # Worker path (mutates batch in place).
-    JanusTextEncoderCPUPreprocessor(tmpl)(batch)
+    JanusTextEncoderPreprocessor(tmpl)(batch)
     worker_ids = []
     for sample in batch:
         worker_ids.extend(tmpl.pack_input_ids(sample))
@@ -237,7 +237,7 @@ def test_text_preprocessor_matches_inmodule_pipeline():
 def test_text_preprocessor_sets_labels_and_mask_on_cpu():
     tmpl = _janus_template()
     batch = [_raw_text_sample()]
-    JanusTextEncoderCPUPreprocessor(tmpl)(batch)
+    JanusTextEncoderPreprocessor(tmpl)(batch)
     for part in batch[0]:
         if part.type == "text":
             assert isinstance(part.value, torch.Tensor) and part.value.dtype == torch.long
@@ -247,7 +247,7 @@ def test_text_preprocessor_sets_labels_and_mask_on_cpu():
 
 
 def test_bagel_text_preprocessor_tokenizes_plain_items_and_is_idempotent():
-    pre = BagelTextEncoderCPUPreprocessor(_bagel_template())
+    pre = BagelTextEncoderPreprocessor(_bagel_template())
     batch = [
         [
             ConversationItem(type="text", value="hi", role="user"),
@@ -286,7 +286,7 @@ def test_bagel_text_preprocessor_tokenizes_plain_items_and_is_idempotent():
 
 
 def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
-    pre = BagelSiglipNavitCPUPreprocessor(
+    pre = BagelSiglipNavitPreprocessor(
         BagelSiglipNavitProcessor(
             patch_size=2,
             image_size=4,
@@ -318,7 +318,7 @@ def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
 
 
 def test_bagel_siglip_preprocessor_appends_per_sample_dummy_for_missing_context():
-    pre = BagelSiglipNavitCPUPreprocessor(
+    pre = BagelSiglipNavitPreprocessor(
         BagelSiglipNavitProcessor(
             patch_size=2,
             image_size=4,
@@ -356,7 +356,7 @@ def test_bagel_siglip_preprocessor_appends_per_sample_dummy_for_missing_context(
 
 
 def test_bagel_siglip_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
-    pre = BagelSiglipNavitCPUPreprocessor(
+    pre = BagelSiglipNavitPreprocessor(
         BagelSiglipNavitProcessor(
             patch_size=2,
             image_size=4,
@@ -393,9 +393,31 @@ def test_bagel_siglip_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
             assert len(context_items) == 1
 
 
-def test_bagel_vae_process_only_skips_cpu_preprocessor():
-    assert _DummyBagelVAE(support_cache=True, train_type="train_with_cache").build_cpu_preprocessor() is None
-    assert isinstance(_DummyBagelVAE().build_cpu_preprocessor(), BagelVAECPUPreprocessor)
+def test_bagel_vae_process_only_skips_preprocessor(tmp_path):
+    process_only_dir = tmp_path / "process_only"
+    BagelVAEConfig(support_cache=True, train_type="train_with_cache").save_pretrained(str(process_only_dir))
+    assert BagelVAEPreprocessor.from_pretrained(str(process_only_dir)) is None
+
+    full_dir = tmp_path / "full"
+    BagelVAEConfig().save_pretrained(str(full_dir))
+    assert isinstance(BagelVAEPreprocessor.from_pretrained(str(full_dir)), BagelVAEPreprocessor)
+
+
+def test_bagel_vae_process_only_override_applies_even_when_checkpoint_default_is_full(tmp_path):
+    """`modules_train_with_cache.yaml`'s `model_config: {support_cache: true,
+    train_type: train_with_cache}` override must reach the preprocessor the same
+    way it reaches the live model's config — regardless of the checkpoint's own
+    on-disk default (regression: `from_pretrained` used to silently re-read the
+    on-disk config and drop this override, always building a real preprocessor).
+    """
+    full_dir = tmp_path / "full_on_disk"
+    BagelVAEConfig().save_pretrained(str(full_dir))
+
+    assert isinstance(BagelVAEPreprocessor.from_pretrained(str(full_dir)), BagelVAEPreprocessor)
+    overridden = BagelVAEPreprocessor.from_pretrained(
+        str(full_dir), config_overrides={"support_cache": True, "train_type": "train_with_cache"}
+    )
+    assert overridden is None
 
 
 def test_bagel_vae_process_only_full_hf_checkpoint_copies_source(tmp_path):
@@ -417,13 +439,13 @@ def test_bagel_vae_process_only_full_hf_checkpoint_copies_source(tmp_path):
 
 
 def test_bagel_preprocessors_route_inference_edit_prompt_context():
-    text_pre = BagelTextEncoderCPUPreprocessor(_bagel_template())
-    siglip_pre = BagelSiglipNavitCPUPreprocessor(
+    text_pre = BagelTextEncoderPreprocessor(_bagel_template())
+    siglip_pre = BagelSiglipNavitPreprocessor(
         BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(1, 2 * 2 * 3, dtype=torch.bfloat16),
     )
-    vae_pre = BagelVAECPUPreprocessor(
+    vae_pre = BagelVAEPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
@@ -480,13 +502,13 @@ def test_bagel_preprocessors_route_inference_edit_prompt_context():
 
 
 def test_bagel_preprocessors_route_tagged_edit_without_infer_type():
-    text_pre = BagelTextEncoderCPUPreprocessor(_bagel_template())
-    siglip_pre = BagelSiglipNavitCPUPreprocessor(
+    text_pre = BagelTextEncoderPreprocessor(_bagel_template())
+    siglip_pre = BagelSiglipNavitPreprocessor(
         BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(1, 12, dtype=torch.bfloat16),
     )
-    vae_pre = BagelVAECPUPreprocessor(
+    vae_pre = BagelVAEPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
@@ -524,13 +546,13 @@ def test_bagel_preprocessors_route_tagged_edit_without_infer_type():
 
 
 def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
-    vae_pre = BagelVAECPUPreprocessor(
+    vae_pre = BagelVAEPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
         dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
     )
-    text_pre = BagelTextEncoderCPUPreprocessor(_bagel_template())
+    text_pre = BagelTextEncoderPreprocessor(_bagel_template())
     image = torch.full((3, 4, 4), 7, dtype=torch.uint8)
     batch = [[ConversationItem(type="image", value=image.clone(), role="user")]]
 
@@ -543,7 +565,7 @@ def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
 
 
 def test_bagel_vae_preprocessor_appends_per_sample_dummy_for_missing_context():
-    pre = BagelVAECPUPreprocessor(
+    pre = BagelVAEPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
@@ -581,7 +603,7 @@ def test_bagel_vae_preprocessor_appends_per_sample_dummy_for_missing_context():
 
 
 def test_bagel_vae_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
-    pre = BagelVAECPUPreprocessor(
+    pre = BagelVAEPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
         dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
@@ -631,7 +653,7 @@ def test_qwen3_text_preprocessor_matches_inmodule_pipeline():
     tmpl = _qwen3_template()
     batch = [_qwen3_text_sample(), _qwen3_text_sample()]
 
-    Qwen3TextEncoderCPUPreprocessor(tmpl)(batch)
+    Qwen3TextEncoderPreprocessor(tmpl)(batch)
     worker_ids = []
     for sample in batch:
         for part in sample:
@@ -650,10 +672,30 @@ def test_qwen3_text_preprocessor_matches_inmodule_pipeline():
     assert torch.equal(worker_shape, ref_shape)
 
 
+def test_qwen3_text_preprocessor_from_pretrained_applies_enable_image_override(tmp_path, monkeypatch):
+    """`modules_train_visual_instruction_tuning.yaml`'s `model_config: {enable_image:
+    true}` override must reach the preprocessor's template choice the same way it
+    reaches the live model's config — regardless of the checkpoint's own on-disk
+    default (regression: `from_pretrained` used to silently re-read the on-disk
+    config and always fall back to the text-only template).
+    """
+    import veomni.models.seed_omni.modules.qwen3.text_encoder.processing as qwen3_text_processing
+    from veomni.models.seed_omni.modules.qwen3.text_encoder.configuration import Qwen3TextEncoderConfig
+
+    Qwen3TextEncoderConfig(enable_image=False).save_pretrained(str(tmp_path))
+    monkeypatch.setattr(qwen3_text_processing, "build_tokenizer", lambda module_path: FakeTokenizer())
+
+    default_pre = Qwen3TextEncoderPreprocessor.from_pretrained(str(tmp_path))
+    assert isinstance(default_pre._chat_template, Qwen3ChatTemplate)
+
+    override_pre = Qwen3TextEncoderPreprocessor.from_pretrained(str(tmp_path), config_overrides={"enable_image": True})
+    assert isinstance(override_pre._chat_template, Qwen3VLChatTemplate)
+
+
 def test_qwen3vl_text_preprocessor_tokenizes():
     tmpl = _qwen3vl_template()
     batch = [_qwen3_text_sample()]
-    Qwen3VLTextEncoderCPUPreprocessor(tmpl)(batch)
+    Qwen3VLTextEncoderPreprocessor(tmpl)(batch)
     sample = batch[0]
     for part in sample:
         if part.type == "text":
@@ -672,7 +714,7 @@ def test_qwen3vl_vision_preprocessor_splits_and_recombines():
     batch = [items]
     ref = proc(images=[it.value for it in items])["pixel_values"]
 
-    Qwen3VLVisionCPUPreprocessor(
+    Qwen3VLVisionPreprocessor(
         proc,
         None,
         dtype=torch.bfloat16,
@@ -705,7 +747,7 @@ def test_qwen3vl_vision_preprocessor_normalizes_user_and_leaves_assistant_untouc
         meta={_IMG_TAG_KEY: "und"},
     )
     batch = [[user_img, asst_img]]
-    pre = Qwen3VLVisionCPUPreprocessor(
+    pre = Qwen3VLVisionPreprocessor(
         proc,
         None,
         dtype=torch.bfloat16,
@@ -740,7 +782,7 @@ def _raw_image_sample():
 
 
 def test_siglip_preprocessor_normalizes_only_user_images():
-    pre = JanusSiglipCPUPreprocessor(
+    pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = [_raw_image_sample()]
@@ -753,7 +795,7 @@ def test_siglip_preprocessor_normalizes_only_user_images():
 
 
 def test_vqvae_preprocessor_normalizes_only_assistant_images():
-    pre = JanusVqvaeCPUPreprocessor(
+    pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = [_raw_image_sample()]
@@ -769,24 +811,18 @@ def test_vqvae_preprocessor_normalizes_only_assistant_images():
 
 
 def test_collator_runs_preprocessors_in_order():
-    from veomni.models.seed_omni.configuration_omni import OmniConfig
     from veomni.models.seed_omni.processing import OmniProcessor
 
-    preprocessors = [
-        JanusTextEncoderCPUPreprocessor(_janus_template()),
-        JanusSiglipCPUPreprocessor(
+    preprocessors = {
+        "text": JanusTextEncoderPreprocessor(_janus_template()),
+        "siglip": JanusSiglipPreprocessor(
             FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
         ),
-        JanusVqvaeCPUPreprocessor(
+        "vqvae": JanusVqvaePreprocessor(
             FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
         ),
-    ]
-    config = OmniConfig(
-        modules={"a": {"subfolder": "a"}},
-        training_graph=[{"from": "a", "to": "end"}],
-        generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
-    )
-    processor = OmniProcessor(config, tuple(preprocessors))
+    }
+    processor = OmniProcessor(preprocessors)
     collator = SeedOmniCollator(processor=processor)
     features = [{"conversation_list": _raw_image_sample()}, {"conversation_list": _raw_text_sample()}]
     batch = collator(features)
@@ -807,11 +843,11 @@ def test_repr_after_preprocessing_does_not_raise():
     # ConversationItem.__repr__ must handle non-empty meta (regression: it used
     # to crash because __value_repr__ took no value argument).
     batch = [_raw_image_sample()]
-    JanusTextEncoderCPUPreprocessor(_janus_template())(batch)
-    JanusSiglipCPUPreprocessor(
+    JanusTextEncoderPreprocessor(_janus_template())(batch)
+    JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )(batch)
-    JanusVqvaeCPUPreprocessor(
+    JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )(batch)
     for sample in batch:
@@ -839,7 +875,7 @@ def _text_only_batch():
 
 
 def test_siglip_appends_one_dummy_per_sample_when_no_user_image():
-    pre = JanusSiglipCPUPreprocessor(
+    pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
@@ -853,7 +889,7 @@ def test_siglip_appends_one_dummy_per_sample_when_no_user_image():
 
 
 def test_siglip_no_dummy_when_user_image_present():
-    pre = JanusSiglipCPUPreprocessor(
+    pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = [[ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user")]]
@@ -863,7 +899,7 @@ def test_siglip_no_dummy_when_user_image_present():
 
 
 def test_siglip_appends_dummy_for_missing_samples_in_mixed_batch():
-    pre = JanusSiglipCPUPreprocessor(
+    pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = [
@@ -880,7 +916,7 @@ def test_siglip_appends_dummy_for_missing_samples_in_mixed_batch():
 
 
 def test_vqvae_appends_dummy_only_when_no_assistant_image():
-    pre = JanusVqvaeCPUPreprocessor(
+    pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
@@ -891,7 +927,7 @@ def test_vqvae_appends_dummy_only_when_no_assistant_image():
 
 
 def test_vqvae_appends_dummy_for_missing_samples_in_mixed_batch():
-    pre = JanusVqvaeCPUPreprocessor(
+    pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = [
@@ -909,7 +945,7 @@ def test_vqvae_appends_dummy_for_missing_samples_in_mixed_batch():
 
 def test_qwen3vl_vision_appends_dummy_with_grid_when_no_visual():
     proc = FakeQwen3VLImageProcessor()
-    pre = Qwen3VLVisionCPUPreprocessor(
+    pre = Qwen3VLVisionPreprocessor(
         proc,
         None,
         dtype=torch.bfloat16,
@@ -926,7 +962,7 @@ def test_qwen3vl_vision_appends_dummy_with_grid_when_no_visual():
 
 
 def test_qwen3vl_vision_appends_dummy_for_missing_samples_in_mixed_batch():
-    pre = Qwen3VLVisionCPUPreprocessor(
+    pre = Qwen3VLVisionPreprocessor(
         FakeQwen3VLImageProcessor(),
         None,
         dtype=torch.bfloat16,
@@ -951,7 +987,7 @@ def test_worker_dummy_routes_to_dummy_parts_in_text_template():
     # A worker-appended role="dummy" image item must survive Janus chat-template
     # (routed to dummy_parts at the end, no markers, value untouched).
     batch = _text_only_batch()
-    JanusSiglipCPUPreprocessor(
+    JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )(batch)
     sample = batch[0]
@@ -968,21 +1004,21 @@ def test_worker_dummy_routes_to_dummy_parts_in_text_template():
 def test_image_preprocessors_skip_dummy_in_inference():
     # At inference there is no FSDP gradient anchor, so a no-image request must not
     # gain dummy items (the per-module ``generate`` simply has nothing to encode).
-    siglip = JanusSiglipCPUPreprocessor(
+    siglip = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     siglip(batch, inference=True)
     assert _worker_dummies(batch, "janus_siglip") == []
 
-    vqvae = JanusVqvaeCPUPreprocessor(
+    vqvae = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     vqvae(batch, inference=True)
     assert _worker_dummies(batch, "janus_vqvae") == []
 
-    vision = Qwen3VLVisionCPUPreprocessor(
+    vision = Qwen3VLVisionPreprocessor(
         FakeQwen3VLImageProcessor(),
         None,
         dtype=torch.bfloat16,
@@ -1000,8 +1036,8 @@ def test_text_preprocessor_appends_generation_prompt_in_inference():
     tmpl = _qwen3_template()
     train_batch = [_qwen3_text_sample()]
     infer_batch = [_qwen3_text_sample()]
-    Qwen3TextEncoderCPUPreprocessor(tmpl)(train_batch)
-    Qwen3TextEncoderCPUPreprocessor(tmpl)(infer_batch, inference=True)
+    Qwen3TextEncoderPreprocessor(tmpl)(train_batch)
+    Qwen3TextEncoderPreprocessor(tmpl)(infer_batch, inference=True)
 
     train_tokens = sum(p.value.numel() for p in train_batch[0] if p.type == "text")
     infer_tokens = sum(p.value.numel() for p in infer_batch[0] if p.type == "text")
@@ -1018,28 +1054,28 @@ def test_text_preprocessor_appends_generation_prompt_in_inference():
 
 def test_preprocessors_are_picklable():
     for pre in (
-        JanusTextEncoderCPUPreprocessor(_janus_template()),
-        Qwen3TextEncoderCPUPreprocessor(_qwen3_template()),
-        Qwen3VLTextEncoderCPUPreprocessor(_qwen3vl_template()),
-        JanusSiglipCPUPreprocessor(
+        JanusTextEncoderPreprocessor(_janus_template()),
+        Qwen3TextEncoderPreprocessor(_qwen3_template()),
+        Qwen3VLTextEncoderPreprocessor(_qwen3vl_template()),
+        JanusSiglipPreprocessor(
             FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
         ),
-        JanusVqvaeCPUPreprocessor(
+        JanusVqvaePreprocessor(
             FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
         ),
-        BagelTextEncoderCPUPreprocessor(_bagel_template()),
-        BagelSiglipNavitCPUPreprocessor(
+        BagelTextEncoderPreprocessor(_bagel_template()),
+        BagelSiglipNavitPreprocessor(
             BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
             dtype=torch.bfloat16,
             dummy_pixel_values=torch.zeros(1, 2 * 2 * 3, dtype=torch.bfloat16),
         ),
-        BagelVAECPUPreprocessor(
+        BagelVAEPreprocessor(
             BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
             dtype=torch.bfloat16,
             dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
             dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
         ),
-        Qwen3VLVisionCPUPreprocessor(
+        Qwen3VLVisionPreprocessor(
             FakeQwen3VLImageProcessor(),
             None,
             dtype=torch.bfloat16,

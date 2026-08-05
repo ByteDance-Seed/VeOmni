@@ -12,115 +12,24 @@ from veomni.utils.device import get_device_id, get_device_type
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs, slice_input_tensor
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import (
-    CPUPreprocessor,
-    ModuleMixin,
-    post_forward,
-    pre_forward,
-)
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....mixins.offline_encoding import OfflineEncodingMixin
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
-from .processing import crop_latent_to_image_shape, route_image_sources
-
-
-BAGEL_VAE_PIXEL_SHAPE = "bagel_vae_pixel_shape"
-
-
-class BagelVAECPUPreprocessor(CPUPreprocessor):
-    """Worker-side image normalize for BAGEL VAE context/target images."""
-
-    def __init__(
-        self,
-        image_processor: Any,
-        dtype: torch.dtype,
-        dummy_pixel_values: torch.Tensor,
-        dummy_pixel_shape: torch.Tensor,
-    ) -> None:
-        self._image_processor = image_processor
-        self._dtype = dtype
-        self._dummy_pixel_values = dummy_pixel_values
-        self._dummy_pixel_shape = dummy_pixel_shape
-
-    def __call__(
-        self,
-        conversation_list: list[list[ConversationItem]],
-        *,
-        inference: bool = False,
-        generation_kwargs: dict[str, Any] | None = None,
-    ) -> None:
-        infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
-        route_image_sources(conversation_list, inference=inference, infer_type=infer_type)
-
-        image_items: list[ConversationItem] = []
-        missing_samples: list[list[ConversationItem]] = []
-        for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], sources=[BAGEL_VAE_CONTEXT]))
-            if sample_image_items:
-                image_items.extend(sample_image_items)
-            elif not inference:
-                missing_samples.append(sample)
-
-        if image_items:
-            inputs = self._image_processor(
-                images=[item.value for item in image_items], return_tensors="pt", dtype=self._dtype
-            )
-            for item, pixels, pixel_shape in zip(
-                image_items, inputs["pixel_values"], inputs["pixel_shapes"], strict=True
-            ):
-                item.value = pixels.to(dtype=self._dtype)
-                item.source = BAGEL_VAE_CONTEXT
-                item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
-
-        if not missing_samples:
-            return
-
-        if image_items:
-            # VAE encode stacks every context item in the micro-batch, so dummies must
-            # match a real processed image shape whenever the batch has one.
-            reference_item = image_items[0]
-            dummy_pixel_values = torch.zeros_like(reference_item.value, dtype=self._dtype)
-            dummy_pixel_shape = reference_item.meta[BAGEL_VAE_PIXEL_SHAPE].to(dtype=torch.long)
-        else:
-            dummy_pixel_values = self._dummy_pixel_values.to(dtype=self._dtype)
-            dummy_pixel_shape = self._dummy_pixel_shape.to(dtype=torch.long)
-
-        for sample in missing_samples:
-            sample.append(
-                ConversationItem(
-                    type="image",
-                    value=dummy_pixel_values.clone(),
-                    role="dummy",
-                    source=BAGEL_VAE_CONTEXT,
-                    meta={
-                        BAGEL_VAE_PIXEL_SHAPE: dummy_pixel_shape.clone(),
-                    },
-                )
-            )
+from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, crop_latent_to_image_shape
 
 
 class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
     """Carrier hooks for raw-image VAE encode and latent decode."""
 
     config: BagelVAEConfig
+    preprocessor_class = BagelVAEPreprocessor
 
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._encode_items: list[ConversationItem] = []
         self._sp_encode_count: int | None = None
-
-    def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
-        # Full training and offline-cache production preprocess raw images here;
-        # process-only training reads preprocessed cached conversations instead.
-        if self.cache_mode == "process_only":
-            return None
-        if getattr(self, "_image_processor", None) is None:
-            return None
-        size = max(int(self.config.image_stride), int(self.config.downsample))
-        dummy = torch.zeros(int(self.config.in_channels), size, size, dtype=self.dtype)
-        dummy_shape = torch.tensor([size, size], dtype=torch.long)
-        return BagelVAECPUPreprocessor(self._image_processor, self.dtype, dummy, dummy_shape)
 
     # ── Graph Entrypoints ──────────────────────────────────
 
@@ -438,7 +347,6 @@ class BagelVAEMetricMeterMixin(MetricMeterMixin):
 
 
 __all__ = [
-    "BagelVAECPUPreprocessor",
     "BagelVAEModuleMixin",
     "BagelVAEMetricMeterMixin",
 ]

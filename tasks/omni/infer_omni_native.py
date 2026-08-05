@@ -74,7 +74,7 @@ def main() -> None:
         torch_dtype="auto",
         infer_type=args.infer_type,
     ).eval()
-    processor = OmniProcessor.from_model(model)
+    processor = OmniProcessor.from_pretrained(args.model_path)
     model_input = processor(
         text=args.prompt,
         images=args.image or None,

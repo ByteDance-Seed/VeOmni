@@ -4,21 +4,9 @@ import torch
 
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs, sp_pad_and_slice
-from ....mixins.modulemixin import (
-    CPUPreprocessor,
-    ModuleMixin,
-    post_forward,
-    pre_forward,
-)
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
-
-
-# qwen3vl-specific meta key: per-item ``grid_thw`` stashed alongside the
-# normalized patches (which go onto ``item.value``, like siglip/vqvae) by the
-# CPU preprocessor (DataLoader worker for training, pre-FSM pass for inference).
-# ``_pixels_and_grid`` pops it on the main process.
-_OMNI_GRID = "_omni_grid"
-_SOURCE = "qwen3vl_vision"
+from .processing import _OMNI_GRID, _SOURCE, Qwen3VLVisionPreprocessor
 
 
 class _VisualOutputSlot(NamedTuple):
@@ -41,91 +29,6 @@ class _VisualOutputSlot(NamedTuple):
     num_merged: int
 
 
-def _video_metadata(items: list, frames: list) -> list[dict]:
-    """HF ``video_metadata`` for the handed-over (already decoded) frames.
-
-    The data layer (``seed_omni/video_utils.load_video``) pre-trims each clip to
-    ``mm_configs.fps`` purely as a memory bound, so the frames passed here are a
-    self-contained clip whose *source* fps **is** ``VideoInputs.video_fps``. We
-    forward that as the metadata fps; the HF ``Qwen3VLVideoProcessor`` then
-    sub-samples to its own authoritative ``self.fps`` (the model's target rate).
-    Without metadata it would default to ``fps=24`` and mangle the clip.
-    """
-    return [{"total_num_frames": f.shape[0], "fps": it.value.video_fps} for it, f in zip(items, frames)]
-
-
-def _store_patches(items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor, dtype: Any) -> None:
-    """Split flat ViT patches by per-item grid; stash patches on ``value`` + grid on ``meta``.
-
-    Used by the CPU preprocessor (both training and inference share it) so items
-    are left in the preprocessed form that ``_pixels_and_grid`` reads back.
-    """
-    grids = grid_thw.tolist()
-    sizes = [g[0] * g[1] * g[2] for g in grids]
-    chunks = torch.split(pixel_values, sizes, dim=0)
-    for it, px, g in zip(items, chunks, grids, strict=True):
-        it.value = px.to(dtype=dtype)
-        it.meta[_OMNI_GRID] = g
-
-
-class Qwen3VLVisionCPUPreprocessor(CPUPreprocessor):
-    """Worker-side image/video patchify+normalize for the Qwen3-VL vision tower.
-
-    Holds only the (picklable) HF image / video processors + a CPU zero-patch
-    template — never the model. Runs them on **CPU** (bf16, to halve IPC), writes
-    the per-item normalized patches onto ``item.value`` and stashes ``grid_thw`` on
-    ``meta``. For each sample without a user image/video, appends a
-    ``role="dummy"`` placeholder
-    carrying the zero patches + grid (the merger still runs on it in the GPU
-    forward for the FSDP gradient anchor).
-    """
-
-    def __init__(
-        self,
-        image_processor: Any,
-        video_processor: Any,
-        dtype: Any,
-        dummy_pixel_values: torch.Tensor,
-        dummy_grid: list,
-    ) -> None:
-        self._image_processor = image_processor
-        self._video_processor = video_processor
-        self._dtype = dtype
-        self._dummy_pixel_values = dummy_pixel_values  # CPU (t*h*w, pixel_row), model dtype
-        self._dummy_grid = dummy_grid  # [t, h, w]
-
-    def __call__(
-        self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
-    ) -> None:
-        del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        for sample in conversation_list:
-            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
-            sample_video_items = list(iter_desired_items([sample], types=["video"], roles=["user"]))
-            if sample_image_items or sample_video_items:
-                if sample_image_items and self._image_processor is not None:
-                    out = self._image_processor(images=[it.value for it in sample_image_items], return_tensors="pt")
-                    self._store(sample_image_items, out["pixel_values"], out["image_grid_thw"])
-                if sample_video_items and self._video_processor is not None:
-                    frames = [it.value.video for it in sample_video_items]
-                    out = self._video_processor(
-                        videos=frames, video_metadata=_video_metadata(sample_video_items, frames), return_tensors="pt"
-                    )
-                    self._store(sample_video_items, out["pixel_values_videos"], out["video_grid_thw"])
-            elif not inference:
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=self._dummy_pixel_values,
-                        role="dummy",
-                        source=_SOURCE,
-                        meta={_OMNI_GRID: self._dummy_grid},
-                    )
-                )
-
-    def _store(self, items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> None:
-        _store_patches(items, pixel_values, grid_thw, self._dtype)
-
-
 class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
     """Graph hooks for the Qwen3-VL vision tower (images + videos).
 
@@ -141,6 +44,8 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
     images use the ``Qwen2VLImageProcessor``.  Qwen3-VL has no audio modality.
     """
 
+    preprocessor_class = Qwen3VLVisionPreprocessor
+
     def init_omni_state(self) -> None:
         self._conversation_carrier: Any = None
         self._visual_output_slots: Optional[List[_VisualOutputSlot]] = None
@@ -148,19 +53,6 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
         # so ``forward_sp_post`` can drop the sp-pad tail from the all-gathered
         # merged tokens.
         self._sp_own_len: Optional[int] = None
-
-    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
-        """Worker-side patchify+normalize (see :class:`Qwen3VLVisionCPUPreprocessor`)."""
-        image_processor = getattr(self, "_image_processor", None)
-        video_processor = getattr(self, "_video_processor", None)
-        if image_processor is None and video_processor is None:
-            return None
-        cfg = self.config.vision_config
-        merge = cfg.spatial_merge_size
-        t, h, w = 1, 2 * merge, 2 * merge
-        pixel_row = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
-        dummy_pixels = torch.zeros(t * h * w, pixel_row, dtype=self.dtype)
-        return Qwen3VLVisionCPUPreprocessor(image_processor, video_processor, self.dtype, dummy_pixels, [t, h, w])
 
     # ── Training hooks ──────────────────────────────────────────────────────
     @pre_forward("forward")

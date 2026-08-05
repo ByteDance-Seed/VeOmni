@@ -1,11 +1,28 @@
-"""Stateless text carrier helpers for BAGEL text encoder."""
+"""Stateless text carrier helpers + worker-side preprocessor for BAGEL text encoder.
+
+:class:`BagelTextEncoderPreprocessor` is the picklable, weight-free CPU worker
+counterpart (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`).
+Its :meth:`from_pretrained` loads the tokenizer and builds the
+:class:`~veomni.models.seed_omni.modules.bagel.text_encoder.chat_template.BagelChatTemplate`
+straight off the checkpoint dir — no model instance involved.
+"""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import torch
 
+from .....auto import build_tokenizer
+from ....mixins.modulemixin import Preprocessor
 from ....utils.conversation import ConversationItem
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+
+
+if TYPE_CHECKING:
+    # chat_template.py imports is_bagel_vision_marker from this module, so the
+    # reverse import must stay deferred (see from_pretrained) to avoid a cycle.
+    from .chat_template import BagelChatTemplate
 
 
 def is_bagel_vision_marker(item: ConversationItem, *, source: str | None = None) -> bool:
@@ -61,7 +78,43 @@ def apply_image_marker(
     item.value = torch.cat([marker_embeds[:1], image_embeds, marker_embeds[1:]], dim=0)
 
 
+class BagelTextEncoderPreprocessor(Preprocessor):
+    """Worker-side chat-template + tokenize for BAGEL text encoder inputs."""
+
+    def __init__(self, chat_template: BagelChatTemplate) -> None:
+        self._chat_template = chat_template
+        # bind_preprocessor also copies _tokenizer onto the model — TextEncoderModuleMixin
+        # (base/text_encoder/modulemixin.py) decodes generated text via self._tokenizer.
+        self._tokenizer = chat_template.tokenizer
+
+    @classmethod
+    def from_pretrained(cls, module_path: str, **kwargs: Any) -> BagelTextEncoderPreprocessor:
+        """Build straight from the checkpoint dir — no model instance needed."""
+        del kwargs
+        from .chat_template import BagelChatTemplate  # deferred: see module-level note
+
+        tokenizer = build_tokenizer(module_path)
+        return cls(BagelChatTemplate(tokenizer))
+
+    def __call__(
+        self,
+        conversation_list: list[list[ConversationItem]],
+        *,
+        inference: bool = False,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        for sample in conversation_list:
+            parts = self._chat_template.tokenize_conversation(
+                sample,
+                add_generation_prompt=inference,
+                generation_kwargs=generation_kwargs,
+            )
+            sample.clear()
+            sample.extend(parts)
+
+
 __all__ = [
     "apply_image_marker",
     "is_bagel_vision_marker",
+    "BagelTextEncoderPreprocessor",
 ]

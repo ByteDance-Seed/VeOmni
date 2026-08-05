@@ -2,7 +2,8 @@
 
 This is the **framework** inference path:
 
-* ``model`` / per-module entries resolve to :class:`~veomni.omni_arguments.model_runtime.OmniModelRuntimeArguments`
+* ``model`` / per-module entries resolve to
+  :class:`~veomni.omni_arguments.arguments_types.OmniModelRuntimeArguments`
   and :class:`~veomni.omni_arguments.arguments_types.OmniModuleRuntimeArguments`.
 * When every module is ``fsdp_mode: eager``, :class:`~veomni.trainer.omni.omni_inferencer.OmniInferencer`
   loads a composed :class:`~veomni.models.seed_omni.modeling_omni.OmniModel` from the split checkpoint.

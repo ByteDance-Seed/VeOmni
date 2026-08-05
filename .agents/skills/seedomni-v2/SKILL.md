@@ -1,6 +1,6 @@
 ---
 name: seedomni-v2
-description: "SeedOmni V2 development guidance for Open-VeOmni. Use when adding or modifying `veomni/models/seed_omni/`, Omni modules, module mixins, CPU preprocessors, conversation carrier handling, training or generation graph YAML, SeedOmni split-checkpoint scripts, per-module accelerators, distributed/eager Omni inference, or SeedOmni V2 validation. Triggers include: new OmniModule, modify SeedOmni module, wire graph, update `training_graph` or `generation_graph`, split SeedOmni checkpoint, add CPUPreprocessor, change conversation_list flow, configure per-module FSDP2/DDP/emb/ep, or debug SeedOmni V2 train/infer graph behavior."
+description: "SeedOmni V2 development guidance for Open-VeOmni. Use when adding or modifying `veomni/models/seed_omni/`, Omni modules, module mixins, CPU preprocessors, conversation carrier handling, training or generation graph YAML, SeedOmni split-checkpoint scripts, per-module accelerators, distributed/eager Omni inference, or SeedOmni V2 validation. Triggers include: new OmniModule, modify SeedOmni module, wire graph, update `training_graph` or `generation_graph`, split SeedOmni checkpoint, add Preprocessor, change conversation_list flow, configure per-module FSDP2/DDP/emb/ep, or debug SeedOmni V2 train/infer graph behavior."
 ---
 
 # SeedOmni V2 Skill
@@ -39,7 +39,7 @@ task at hand; do not read every reference by default.
 
 - Entry-time samples use `{"conversation_list": [...]}`. The SeedOmni collator
   groups samples and runs ordered module CPU preprocessors before GPU forward.
-- `CPUPreprocessor` is a core data-flow contract, shared by training and
+- `Preprocessor` is a core data-flow contract, shared by training and
   inference. Training runs it inside `SeedOmniCollator`; inference runs it once
   before the FSM.
 - Modules communicate by mutating/returning the shared `conversation_list`

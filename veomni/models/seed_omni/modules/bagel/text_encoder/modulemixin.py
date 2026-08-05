@@ -8,47 +8,26 @@ from transformers import PreTrainedTokenizerBase
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.modulemixin import CPUPreprocessor, post_forward, pre_forward
+from ....mixins.modulemixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from ..sources import BAGEL_FLOW_QUERY
 from .chat_template import BagelChatTemplate
-from .processing import apply_image_marker
+from .processing import BagelTextEncoderPreprocessor, apply_image_marker
 
 
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
 
-# Sentinel written by BagelTextEncoderCPUPreprocessor onto every text item so
+# Sentinel written by BagelTextEncoderPreprocessor onto every text item so
 # encode_pre can skip tokenizer work already completed by a DataLoader worker.
 _OMNI_TOKENIZED = "_omni_tokenized"
 
 
-class BagelTextEncoderCPUPreprocessor(CPUPreprocessor):
-    """Worker-side chat-template + tokenize for BAGEL text encoder inputs."""
-
-    def __init__(self, chat_template: BagelChatTemplate) -> None:
-        self._chat_template = chat_template
-
-    def __call__(
-        self,
-        conversation_list: List[List[ConversationItem]],
-        *,
-        inference: bool = False,
-        generation_kwargs: Dict[str, Any] | None = None,
-    ) -> None:
-        for sample in conversation_list:
-            parts = self._chat_template.tokenize_conversation(
-                sample,
-                add_generation_prompt=inference,
-                generation_kwargs=generation_kwargs,
-            )
-            sample.clear()
-            sample.extend(parts)
-
-
 class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     """Training hooks for BAGEL text embeddings and CE loss."""
+
+    preprocessor_class = BagelTextEncoderPreprocessor
 
     def init_omni_state(self) -> None:
         super().init_omni_state()
@@ -62,10 +41,6 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     def tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self._tokenizer = tokenizer
         self._chat_template = BagelChatTemplate(tokenizer)
-
-    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
-        """Worker-side tokenize for training batches."""
-        return BagelTextEncoderCPUPreprocessor(self._chat_template)
 
     # ── Graph Entrypoints ──────────────────────────────────
 
@@ -286,7 +261,6 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
 
 
 __all__ = [
-    "BagelTextEncoderCPUPreprocessor",
     "BagelTextEncoderModuleMixin",
     "SIGNAL_START_IMAGE_GEN",
     "SIGNAL_TEXT_DONE",

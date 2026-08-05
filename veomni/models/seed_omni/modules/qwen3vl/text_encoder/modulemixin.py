@@ -1,34 +1,14 @@
 from typing import Any, Dict, List, Optional
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.modulemixin import CPUPreprocessor, post_forward, pre_forward
+from ....mixins.modulemixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from .chat_template import Qwen3VLChatTemplate
+from .processing import Qwen3VLTextEncoderPreprocessor
 
 
 SIGNAL_TEXT_DONE = "text_done"
-
-
-class Qwen3VLTextEncoderCPUPreprocessor(CPUPreprocessor):
-    """Worker-side ``apply_chat_template`` → tokenize → merge for the Qwen3-VL text encoder.
-
-    Holds only the (picklable) :class:`Qwen3VLChatTemplate` — never the model — so it
-    runs in DataLoader workers and overlaps with GPU compute. Builds CPU tensors;
-    the main process's thin ``encode_pre`` does the single ``.to(device)``.
-    """
-
-    def __init__(self, chat_template: Qwen3VLChatTemplate) -> None:
-        self._chat_template = chat_template
-
-    def __call__(
-        self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
-    ) -> None:
-        del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        for sample in conversation_list or []:
-            parts = self._chat_template.tokenize_conversation(sample, add_generation_prompt=inference)
-            sample.clear()
-            sample.extend(parts)
 
 
 class Qwen3VLTextEncoderModuleMixin(TextEncoderModuleMixin):
@@ -46,6 +26,7 @@ class Qwen3VLTextEncoderModuleMixin(TextEncoderModuleMixin):
     """
 
     _chat_template: Qwen3VLChatTemplate
+    preprocessor_class = Qwen3VLTextEncoderPreprocessor
 
     @property
     def tokenizer(self) -> Any:
@@ -55,12 +36,6 @@ class Qwen3VLTextEncoderModuleMixin(TextEncoderModuleMixin):
     def tokenizer(self, tokenizer: Any) -> None:
         self._tokenizer = tokenizer
         self._chat_template = Qwen3VLChatTemplate(tokenizer)
-
-    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
-        """Worker-side chat-template + tokenize (see :class:`Qwen3VLTextEncoderCPUPreprocessor`)."""
-        if getattr(self, "_chat_template", None) is None:
-            return None
-        return Qwen3VLTextEncoderCPUPreprocessor(self._chat_template)
 
     # training hooks (explicit pass-through to TextEncoderModuleMixin for findability)
     @pre_forward("encode")

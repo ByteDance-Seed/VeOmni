@@ -1,4 +1,12 @@
-"""Image processor helpers for BAGEL VAE."""
+"""Image processor + worker-side preprocessor for BAGEL VAE.
+
+:class:`BagelVAEPreprocessor` is the picklable, weight-free CPU worker
+counterpart (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`) —
+built straight off the checkpoint dir, with no model instance involved. Like
+:mod:`..siglip_navit.processing`, BAGEL ships no separate
+``preprocessor_config.json``: the image processor is derived from the
+module's own ``config.json`` via :meth:`BagelVAEProcessor.from_config`.
+"""
 
 from __future__ import annotations
 
@@ -13,8 +21,10 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, is_dummy
+from ....mixins.modulemixin import Preprocessor
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from .configuration import BagelVAEConfig
 
 
 _VALID_IMG_TAGS = frozenset({"und", "gen", "edit"})
@@ -401,8 +411,119 @@ def route_image_sources(
         sample[:] = routed
 
 
+BAGEL_VAE_PIXEL_SHAPE = "bagel_vae_pixel_shape"
+
+
+class BagelVAEPreprocessor(Preprocessor):
+    """Worker-side image normalize for BAGEL VAE context/target images."""
+
+    def __init__(
+        self,
+        image_processor: Any,
+        dtype: torch.dtype | None = None,
+        dummy_pixel_values: torch.Tensor | None = None,
+        dummy_pixel_shape: torch.Tensor | None = None,
+    ) -> None:
+        self._image_processor = image_processor
+        self._dtype = dtype
+        self._dummy_pixel_values = dummy_pixel_values
+        self._dummy_pixel_shape = dummy_pixel_shape
+
+    @classmethod
+    def from_pretrained(
+        cls, module_path: str, *, config_overrides: dict[str, Any] | None = None, **kwargs: Any
+    ) -> BagelVAEPreprocessor | None:
+        """Build straight from the checkpoint dir — no model instance needed.
+
+        Returns ``None`` under ``cache_mode="process_only"``: training then reads
+        already-preprocessed cached conversations, so no CPU image prep is needed
+        for this module (mirrors the old ``build_preprocessor`` early return).
+        BAGEL ships no standalone ``preprocessor_config.json``; the image
+        processor is derived from the module's own ``config.json``.
+
+        ``config_overrides`` (the module's YAML ``model_config:`` block, e.g.
+        ``train_with_cache``'s ``support_cache: true`` / ``train_type``) is
+        applied on top of the on-disk default so ``cache_mode`` below agrees
+        with what the live model was actually configured with.
+        """
+        del kwargs
+        config = BagelVAEConfig.from_pretrained(module_path, **(config_overrides or {}))
+        if config.validated_cache_mode() == "process_only":
+            return None
+        return cls(BagelVAEProcessor.from_config(config))
+
+    def bind_dummy_inputs(self, config: BagelVAEConfig, dtype: torch.dtype | None = None) -> None:
+        """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model."""
+        size = max(int(config.image_stride), int(config.downsample))
+        self._dtype = dtype
+        self._dummy_pixel_values = torch.zeros(int(config.in_channels), size, size, dtype=dtype)
+        self._dummy_pixel_shape = torch.tensor([size, size], dtype=torch.long)
+
+    def __call__(
+        self,
+        conversation_list: list[list[ConversationItem]],
+        *,
+        inference: bool = False,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
+        route_image_sources(conversation_list, inference=inference, infer_type=infer_type)
+
+        image_items: list[ConversationItem] = []
+        missing_samples: list[list[ConversationItem]] = []
+        for sample in conversation_list:
+            sample_image_items = list(iter_desired_items([sample], types=["image"], sources=[BAGEL_VAE_CONTEXT]))
+            if sample_image_items:
+                image_items.extend(sample_image_items)
+            elif not inference:
+                missing_samples.append(sample)
+
+        if image_items:
+            inputs = self._image_processor(
+                images=[item.value for item in image_items], return_tensors="pt", dtype=self._dtype
+            )
+            for item, pixels, pixel_shape in zip(
+                image_items, inputs["pixel_values"], inputs["pixel_shapes"], strict=True
+            ):
+                item.value = pixels.to(dtype=self._dtype)
+                item.source = BAGEL_VAE_CONTEXT
+                item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
+
+        if not missing_samples:
+            return
+
+        if image_items:
+            # VAE encode stacks every context item in the micro-batch, so dummies must
+            # match a real processed image shape whenever the batch has one.
+            reference_item = image_items[0]
+            dummy_pixel_values = torch.zeros_like(reference_item.value, dtype=self._dtype)
+            dummy_pixel_shape = reference_item.meta[BAGEL_VAE_PIXEL_SHAPE].to(dtype=torch.long)
+        else:
+            if self._dummy_pixel_values is None:
+                raise RuntimeError(
+                    f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                    "before training use (pure inference never reaches this branch)."
+                )
+            dummy_pixel_values = self._dummy_pixel_values.to(dtype=self._dtype)
+            dummy_pixel_shape = self._dummy_pixel_shape.to(dtype=torch.long)
+
+        for sample in missing_samples:
+            sample.append(
+                ConversationItem(
+                    type="image",
+                    value=dummy_pixel_values.clone(),
+                    role="dummy",
+                    source=BAGEL_VAE_CONTEXT,
+                    meta={
+                        BAGEL_VAE_PIXEL_SHAPE: dummy_pixel_shape.clone(),
+                    },
+                )
+            )
+
+
 __all__ = [
     "BagelVAEProcessor",
+    "BagelVAEPreprocessor",
     "copy_image_item",
     "crop_latent_to_image_shape",
     "route_image_sources",

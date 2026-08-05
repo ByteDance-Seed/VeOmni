@@ -15,19 +15,17 @@
 """SeedOmni V2 launcher arguments — isolated from V1 ``veomni.arguments``."""
 
 from .arguments_types import (
+    DEFAULT_SCENARIO,
     OMNI_TRAIN_WORKFLOWS,
     BaseOmniModelArguments,
     OmniArguments,
     OmniDataArguments,
     OmniGraphProfileArguments,
     OmniInferArguments,
+    OmniModelRuntimeArguments,
     OmniModuleRuntimeArguments,
     OmniTrainingArguments,
     _is_omni_checkpoint_root,
-)
-from .model_runtime import (
-    DEFAULT_SCENARIO,
-    OmniModelRuntimeArguments,
     build_module_args,
     build_module_runtime_args,
     build_omni_model_runtime,
