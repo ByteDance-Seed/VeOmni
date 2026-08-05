@@ -25,7 +25,7 @@ _PRODUCTION_CONFIGS = [
     pytest.param(
         "configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_lora.yaml",
         "tests/toy_config/qwen3_5_moe_toy/config.json",
-        True,
+        False,
         False,
         id="qwen3_5_moe",
     ),
