@@ -10,6 +10,7 @@ from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.ops.kernels.cross_entropy import install_loss_mapping
 from veomni.utils.device import get_device_type, get_torch_device
 
 
@@ -19,6 +20,7 @@ def _text_encoder_sp_worker() -> None:
     assert world_size == 2
     device = torch.device(f"{get_device_type()}:{rank}")
     module_state = init_parallel_state(ulysses_size=world_size, dp_mode="ddp")
+    install_loss_mapping("eager")
 
     BagelTextEncoder = model_cls("bagel_text_encoder")
     BagelTextEncoderConfig = config_cls("bagel_text_encoder")

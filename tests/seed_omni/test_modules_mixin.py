@@ -288,6 +288,58 @@ def test_text_encoder_decode_inference_returns_logits_only():
     assert out["loss"] is None
 
 
+def test_text_encoder_decode_dispatches_pre_shifted_loss(monkeypatch):
+    """Untied, bias-free heads delegate loss policy to the configured ops wrapper."""
+    import veomni.models.seed_omni.modules.base.text_encoder.modeling as text_encoder_modeling
+
+    reduction_group = object()
+    captured = {}
+    monkeypatch.setattr(
+        text_encoder_modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_group=reduction_group),
+    )
+
+    TextEncoder = _model_cls("text_encoder")
+    TextEncoderConfig = _config_cls("text_encoder")
+    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
+
+    def fake_loss_function(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"].sum() * 0, None, None
+
+    te.loss_function = fake_loss_function
+    hidden_states = torch.randn(5, 16)
+    shift_labels = torch.tensor([1, 2, -100, 3, -100])
+    out = te.decode(hidden_states=hidden_states, shift_labels=shift_labels)
+
+    assert out["loss"].dim() == 0
+    assert out["logits"] is None
+    assert captured["hidden_states"] is hidden_states
+    assert captured["shift_labels"] is shift_labels
+    assert captured["labels"] is shift_labels
+    assert captured["weights"] is te.lm_head.weight
+    assert captured["loss_reduction_group"] is reduction_group
+
+
+def test_text_encoder_tied_head_uses_explicit_eager_loss():
+    """Tied heads must not enter a globally selected fused-linear loss."""
+    TextEncoder = _model_cls("text_encoder")
+    TextEncoderConfig = _config_cls("text_encoder")
+    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=True))
+
+    def unexpected_loss_function(**kwargs):
+        raise AssertionError("tied head must not call the globally selected loss function")
+
+    te.loss_function = unexpected_loss_function
+    hidden_states = torch.randn(5, 16)
+    shift_labels = torch.tensor([1, 2, -100, 3, -100])
+    out = te.decode(hidden_states=hidden_states, shift_labels=shift_labels)
+
+    assert torch.isfinite(out["loss"])
+    assert out["logits"].shape == (5, 64)
+
+
 def test_janus_vqvae_decode_training_loss(monkeypatch):
     """Training ``decode``: hidden_states + labels → scalar loss."""
     _patch_local_loss_reducer(monkeypatch)
@@ -497,10 +549,15 @@ def test_qwen3_text_encoder_save_reload_via_registry(tmp_path: Path):
 
 def test_fsdp_no_split_modules_preserved():
     """The FSDP unit boundary list must survive the mixin reshuffle."""
+    TextEncoder = _model_cls("text_encoder")
+    TextEncoderConfig = _config_cls("text_encoder")
     JanusLlama = _model_cls("janus_llama")
     JanusLlamaConfig = _config_cls("janus_llama")
     JanusSiglip = _model_cls("janus_siglip")
     JanusSiglipConfig = _config_cls("janus_siglip")
+
+    text_encoder = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
+    assert text_encoder._no_split_modules == {"Embedding"}
 
     jl = JanusLlama(JanusLlamaConfig(text_config=_tiny_text_cfg()))
     assert "LlamaDecoderLayer" in (jl._no_split_modules or set())
