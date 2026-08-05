@@ -58,9 +58,7 @@ def build_packed_compression_metadata(
         }
         if compress_rate in block_bias_rates:
             entry_indices = torch.arange(compressed_offset, device=reference.device)
-            allowed = (entry_indices[None, :] >= range_starts[:, None]) & (
-                entry_indices[None, :] < range_ends[:, None]
-            )
+            allowed = (entry_indices[None, :] >= range_starts[:, None]) & (entry_indices[None, :] < range_ends[:, None])
             block_bias = reference.new_full((1, 1, position_ids.shape[1], compressed_offset), float("-inf"))
             rate_metadata["block_bias"] = block_bias.masked_fill(allowed[None, None, :, :], 0.0)
         metadata[compress_rate] = rate_metadata
@@ -120,6 +118,7 @@ def compress_packed_windows(
         position_ids=window_positions.unsqueeze(0),
         layer_type=rope_layer_type,
     )
+    breakpoint()
     return apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
 
 
