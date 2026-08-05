@@ -160,6 +160,18 @@ def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "compile_config",
+    [CompileConfig(backend="inductor", mode="reduce-overhead"), CompileConfig(backend="cudagraphs")],
+    ids=["reduce-overhead", "cudagraphs-backend"],
+)
+def test_compile_decoder_blocks_rejects_qwen3_vl_cuda_graphs(monkeypatch, compile_config):
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    with pytest.raises(RuntimeError, match="does not support CUDA Graph replay"):
+        compile_decoder_blocks(ToyQwen3VLModel(ToyDecoderLayer()), compile_config)
+
+
+@pytest.mark.parametrize(
     ("sequence_parallel_enabled", "async_enabled"),
     [(True, False), (False, True)],
     ids=["sequence-or-context-parallel", "async-ulysses"],
@@ -416,7 +428,7 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     marks = []
     monkeypatch.setattr("veomni.trainer.vlm_trainer.mark_compile_step_begin", marks.append)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token", lambda _: 1)
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.synchronize", lambda: None)
+    monkeypatch.setattr("veomni.trainer.vlm_trainer.reduce_global_loss_token", lambda token_count: token_count)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
     monkeypatch.setattr("veomni.trainer.vlm_trainer.veomni_clip_grad_norm", lambda *_: torch.tensor(0.0))
 
@@ -426,6 +438,7 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
         state=SimpleNamespace(global_step=0),
         model=SimpleNamespace(_veomni_compile_uses_cuda_graphs=True),
         model_reshard=lambda *_: None,
+        sync_before_train_step=lambda: None,
         forward_backward_step=lambda _: (torch.tensor(1.0), {}),
         optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
         lr_scheduler=SimpleNamespace(step=lambda: None),

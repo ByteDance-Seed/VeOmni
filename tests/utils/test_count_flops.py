@@ -64,6 +64,16 @@ def mock_device_flops():
         yield
 
 
+def test_b200_device_flops():
+    with patch("veomni.utils.count_flops.get_device_name", return_value="NVIDIA B200"):
+        assert get_device_flops() == 2382.0
+
+
+def test_gb200_device_flops():
+    with patch("veomni.utils.count_flops.get_device_name", return_value="NVIDIA GB200"):
+        assert get_device_flops() == 2565.0
+
+
 def test_b300_device_flops():
     with patch("veomni.utils.count_flops.get_device_name", return_value="NVIDIA B300"):
         assert get_device_flops() == 2250.0

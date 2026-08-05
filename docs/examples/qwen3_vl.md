@@ -80,4 +80,4 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
     --train.torch_compile.enable true
 ```
 
-This path currently requires CUDA, FSDP2, `train.torch_compile.dynamic=false`, `train.accelerator.ulysses_size=1`, `train.accelerator.cp_size=1`, and `train.accelerator.enable_async=false`. It does not yet support Qwen3-VL-MoE, ChunkMBS, ExtraParallel, or NPU execution.
+This path currently requires CUDA, FSDP2, the default `train.torch_compile.backend=inductor` and `train.torch_compile.mode=None`, `train.torch_compile.dynamic=false`, `train.accelerator.ulysses_size=1`, `train.accelerator.cp_size=1`, and `train.accelerator.enable_async=false`. Padding fixes the token-tensor shapes, while different packed sequence boundaries can still produce separate Inductor specializations. CUDA Graph replay, Qwen3-VL-MoE, ChunkMBS, ExtraParallel, and NPU execution are not yet supported.

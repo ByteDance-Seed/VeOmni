@@ -32,7 +32,7 @@ from ..models import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize
-from ..utils.loss_utils import count_loss_token
+from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs
 
@@ -326,13 +326,14 @@ class VLMTrainer:
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
-        synchronize()
+        self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
         # token num for fixed_ce_loss in postforward
         self.base.micro_batches_token_len = count_loss_token(micro_batches)
+        self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

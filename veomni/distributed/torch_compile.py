@@ -92,6 +92,11 @@ def validate_compile_model(
         )
     if compile_config.dynamic:
         raise RuntimeError("train.torch_compile.enable for Qwen3-VL requires train.torch_compile.dynamic=False.")
+    if compile_config.uses_cuda_graphs():
+        raise RuntimeError(
+            "train.torch_compile.enable for Qwen3-VL does not support CUDA Graph replay yet because packed "
+            "FlashAttention metadata can vary between micro-batches; use backend='inductor' and mode=None."
+        )
     if sequence_parallel_enabled or async_enabled:
         raise RuntimeError(
             "train.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism, "

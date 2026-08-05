@@ -16,6 +16,7 @@ from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
+from veomni.distributed.sequence_parallel.ulysses import _all_gather
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .utils import (
@@ -60,6 +61,21 @@ class AllToAllCommTest(SequenceParallelTest):
         test_input_final = gather_outputs(test_input, gather_dim=1, group=group)
 
         torch.allclose(input_, test_input_final)
+
+    @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
+    def test_all_gather_shapes_stay_on_host(self):
+        group = self._get_process_group()
+        rank = dist.get_rank(group)
+        world_size = dist.get_world_size(group)
+        local = torch.full((rank + 1, 3), float(rank), device=get_device_type())
+
+        tensor_list, size_list = _all_gather(local, group=group)
+
+        # Plain ints, not device tensors: reading a shape back one dimension at a time
+        # syncs the device on every gather, and every layer gathers.
+        assert size_list == [[i + 1, 3] for i in range(world_size)]
+        for i, tensor in enumerate(tensor_list):
+            assert torch.equal(tensor, torch.full_like(tensor, float(i)))
 
     @staticmethod
     def _run_forward(x):
