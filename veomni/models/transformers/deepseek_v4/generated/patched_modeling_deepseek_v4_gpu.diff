@@ -779,7 +779,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -793,47 +1146,136 @@
+@@ -793,47 +1146,151 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -819,20 +819,35 @@
 +        query_offset = 0
 +        kv_full_len = None
 +        if cp_enabled:
++            if self.compressor is not None:
++                # A compressor would summarise this rank's shard only, while its rows
++                # are concatenated onto the globally gathered kv. Every shape agrees,
++                # so the result would be silently wrong rather than an error.
++                raise NotImplementedError(
++                    "DeepSeek V4 context parallelism does not implement the compressor path yet; "
++                    f"layer {self.layer_idx} is {self.layer_type}"
++                )
 +            if past_key_values is not None:
 +                raise NotImplementedError("DeepSeek V4 context parallelism does not support a KV cache")
 +            # Queries stay sharded with every head; KV is replicated so every sparse
-+            # index keeps addressing the same global row the kernels expect. The
-+            # compressor inputs stay local for the same reason -- each rank
-+            # compresses its own shard.
++            # index keeps addressing the same global row the kernels expect.
 +            local_seq_len = hidden_states.shape[1]
 +            query_offset = parallel_state.cp_rank * local_seq_len
 +            kv_full_len = local_seq_len * parallel_state.cp_size
-+            kv = all_gather_kv(kv, parallel_state.cp_group)
 +            # The caller builds the mask over the full sequence, as it does under
-+            # Ulysses; only this rank's query rows are computed here.
++            # Ulysses; only this rank's query rows are computed here. Checked before
++            # the all-gather so a violation raises on every rank rather than leaving
++            # rank 0 waiting in a collective for ranks that already failed.
 +            if isinstance(attention_mask, torch.Tensor):
++                if attention_mask.shape[-2] != kv_full_len:
++                    raise ValueError(
++                        "DeepSeek V4 context parallelism needs an attention mask spanning the full "
++                        f"sequence, so {kv_full_len} query rows, not this rank's shard; got "
++                        f"{attention_mask.shape[-2]}. An uneven split across cp ranks fails here too, "
++                        "because the full length is derived as local_seq_len * cp_size."
++                    )
 +                attention_mask = attention_mask.narrow(-2, query_offset, local_seq_len)
++            kv = all_gather_kv(kv, parallel_state.cp_group)
 +        elif ulysses_enabled:
 +            if past_key_values is not None:
 +                raise RuntimeError("DeepSeek-V4 Ulysses SP does not support KV-cache decode")
@@ -933,7 +948,7 @@
          attn_output, attn_weights = attention_interface(
              self,
              q,
-@@ -843,22 +1285,27 @@
+@@ -843,22 +1300,28 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -948,8 +963,9 @@
 -        # just a layout fix-up: apply_rotary_pos_emb expects `[B, S, H, D]` (its
 -        # `unsqueeze_dim=1` adds a head-broadcast dim to cos/sin); attention gave us
 -        # `[B, H, S, D]`.
-+        if ulysses_enabled:
++        if ulysses_enabled and not cp_enabled:
 +            # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
++            # CP took the branch above instead, so its output is already [B, S_local, H, D].
 +            attn_output = gather_heads_scatter_seq(
 +                attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
 +            )
@@ -969,7 +985,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -909,22 +1356,30 @@
+@@ -909,22 +1372,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -1011,7 +1027,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -933,11 +1388,14 @@
+@@ -933,11 +1404,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -1029,7 +1045,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -953,10 +1411,27 @@
+@@ -953,10 +1427,27 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1057,7 +1073,7 @@
 
 
  class DeepseekV4MLP(nn.Module):
-@@ -970,16 +1445,60 @@
+@@ -970,16 +1461,60 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -1125,7 +1141,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -990,30 +1509,63 @@
+@@ -990,30 +1525,63 @@
          self.limit = config.swiglu_limit
 
      def forward(
@@ -1202,7 +1218,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1027,14 +1579,26 @@
+@@ -1027,14 +1595,26 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
@@ -1232,7 +1248,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1057,10 +1621,14 @@
+@@ -1057,10 +1637,14 @@
          self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1249,7 +1265,7 @@
          scores = self.score_fn(logits)
          indices = self.tid2eid[input_ids.reshape(-1)].long()
          weights = scores.gather(1, indices)
-@@ -1088,6 +1656,12 @@
+@@ -1088,6 +1672,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1262,7 +1278,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1692,20 @@
+@@ -1118,22 +1708,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -1293,7 +1309,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1805,12 @@
+@@ -1233,6 +1821,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1306,7 +1322,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1830,16 @@
+@@ -1252,6 +1846,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1323,7 +1339,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +1855,94 @@
+@@ -1267,28 +1871,94 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1428,7 +1444,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +2046,12 @@
+@@ -1392,6 +2062,12 @@
      return overall_loss * num_experts
 
 
@@ -1441,7 +1457,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +2070,36 @@
+@@ -1410,49 +2086,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1511,7 +1527,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +2112,64 @@
+@@ -1465,26 +2128,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1590,7 +1606,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2177,17 @@
+@@ -1492,7 +2193,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

@@ -1197,20 +1197,35 @@ class DeepseekV4Attention(nn.Module):
         query_offset = 0
         kv_full_len = None
         if cp_enabled:
+            if self.compressor is not None:
+                # A compressor would summarise this rank's shard only, while its rows
+                # are concatenated onto the globally gathered kv. Every shape agrees,
+                # so the result would be silently wrong rather than an error.
+                raise NotImplementedError(
+                    "DeepSeek V4 context parallelism does not implement the compressor path yet; "
+                    f"layer {self.layer_idx} is {self.layer_type}"
+                )
             if past_key_values is not None:
                 raise NotImplementedError("DeepSeek V4 context parallelism does not support a KV cache")
             # Queries stay sharded with every head; KV is replicated so every sparse
-            # index keeps addressing the same global row the kernels expect. The
-            # compressor inputs stay local for the same reason -- each rank
-            # compresses its own shard.
+            # index keeps addressing the same global row the kernels expect.
             local_seq_len = hidden_states.shape[1]
             query_offset = parallel_state.cp_rank * local_seq_len
             kv_full_len = local_seq_len * parallel_state.cp_size
-            kv = all_gather_kv(kv, parallel_state.cp_group)
             # The caller builds the mask over the full sequence, as it does under
-            # Ulysses; only this rank's query rows are computed here.
+            # Ulysses; only this rank's query rows are computed here. Checked before
+            # the all-gather so a violation raises on every rank rather than leaving
+            # rank 0 waiting in a collective for ranks that already failed.
             if isinstance(attention_mask, torch.Tensor):
+                if attention_mask.shape[-2] != kv_full_len:
+                    raise ValueError(
+                        "DeepSeek V4 context parallelism needs an attention mask spanning the full "
+                        f"sequence, so {kv_full_len} query rows, not this rank's shard; got "
+                        f"{attention_mask.shape[-2]}. An uneven split across cp ranks fails here too, "
+                        "because the full length is derived as local_seq_len * cp_size."
+                    )
                 attention_mask = attention_mask.narrow(-2, query_offset, local_seq_len)
+            kv = all_gather_kv(kv, parallel_state.cp_group)
         elif ulysses_enabled:
             if past_key_values is not None:
                 raise RuntimeError("DeepSeek-V4 Ulysses SP does not support KV-cache decode")
@@ -1318,8 +1333,9 @@ class DeepseekV4Attention(nn.Module):
             **kwargs,
         )
 
-        if ulysses_enabled:
+        if ulysses_enabled and not cp_enabled:
             # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
+            # CP took the branch above instead, so its output is already [B, S_local, H, D].
             attn_output = gather_heads_scatter_seq(
                 attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
             )

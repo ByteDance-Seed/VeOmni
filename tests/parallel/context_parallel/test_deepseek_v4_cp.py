@@ -50,6 +50,25 @@ def _build_causal_mask(seq_len: int, sliding_window: int | None, device, dtype) 
     return full_mask.masked_fill(~causal, torch.finfo(dtype).min)
 
 
+def _make_forward(layer, rotary):
+    """The attention call every test shares: both rope variants, then the layer."""
+
+    def forward(hidden_states, position_ids, attention_mask, **kwargs):
+        embeddings = {
+            name: rotary(hidden_states, position_ids=position_ids, layer_type=name) for name in ("main", "compress")
+        }
+        output, _ = layer(
+            hidden_states,
+            position_embeddings=embeddings,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        return output
+
+    return forward
+
+
 def _init_cp_attention(rank: int, world_size: int, init_file: str, seq_len: int, with_compressor: bool):
     """Enter the process group, build the shared layer, and return the fixture."""
     device_type = get_device_type()
@@ -85,20 +104,8 @@ def _init_cp_attention(rank: int, world_size: int, init_file: str, seq_len: int,
     rotary = dsv4.DeepseekV4RotaryEmbedding(config).to(device=device_type)
     _broadcast_module(rotary)
 
-    def forward(hidden_states, position_ids, attention_mask):
-        embeddings = {
-            name: rotary(hidden_states, position_ids=position_ids, layer_type=name) for name in ("main", "compress")
-        }
-        output, _ = layer(
-            hidden_states,
-            position_embeddings=embeddings,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-        )
-        return output
-
     full_mask = _build_causal_mask(seq_len, config.sliding_window, device_type, torch.float32)
-    return dsv4, layer, forward, full_hidden, full_position_ids, full_mask
+    return dsv4, layer, _make_forward(layer, rotary), full_hidden, full_position_ids, full_mask
 
 
 def _run_attention_cp(rank: int, world_size: int, init_file: str, seq_len: int, with_compressor: bool) -> None:
@@ -189,6 +196,65 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
 
     clear_parallel_state()
     dist.destroy_process_group()
+
+
+def _cp_state(cp_size: int = 2, cp_rank: int = 0) -> SimpleNamespace:
+    """A parallel state claiming CP without a process group.
+
+    Every guard below raises before the KV all-gather, so ``cp_group=None`` is
+    reached only if a guard has been moved after the collective.
+    """
+    return SimpleNamespace(ulysses_enabled=False, cp_enabled=True, cp_group=None, cp_rank=cp_rank, cp_size=cp_size)
+
+
+def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int):
+    """One rank's fixture on CPU: a local shard plus the full-sequence mask CP requires."""
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    torch.manual_seed(0)
+    # Layer 0 is HCA on the toy config; dropping the compressor is what makes it
+    # sliding-only, so keeping it is exactly the layer kind CP must refuse.
+    layer = dsv4.DeepseekV4Attention(config, layer_idx=0)
+    if not with_compressor:
+        layer.compressor = None
+
+    hidden = torch.randn(1, local_len, config.hidden_size)
+    position_ids = torch.arange(local_len).view(1, -1)
+    full_mask = _build_causal_mask(local_len * cp_size, config.sliding_window, "cpu", torch.float32)
+    rotary = dsv4.DeepseekV4RotaryEmbedding(config)
+    return config, _make_forward(layer, rotary), hidden, position_ids, full_mask
+
+
+def test_deepseek_v4_attention_cp_rejects_a_compressor_layer():
+    """A compressor would summarise the local shard only, so CP must refuse it until Task 6."""
+    _, forward, hidden, position_ids, full_mask = _build_local_attention(with_compressor=True, local_len=16, cp_size=2)
+    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
+        with pytest.raises(NotImplementedError, match="compressor path"):
+            forward(hidden, position_ids, full_mask)
+
+
+def test_deepseek_v4_attention_cp_rejects_a_kv_cache():
+    """Decode would append this rank's shard to a cache the other ranks also gather."""
+    from transformers import DynamicCache
+
+    config, forward, hidden, position_ids, full_mask = _build_local_attention(
+        with_compressor=False, local_len=16, cp_size=2
+    )
+    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
+        with pytest.raises(NotImplementedError, match="KV cache"):
+            forward(hidden, position_ids, full_mask, past_key_values=DynamicCache(config=config))
+
+
+def test_deepseek_v4_attention_cp_rejects_a_local_length_mask():
+    """A shard-width mask would let rank 0 attend everywhere uncaused and later ranks time out."""
+    config, forward, hidden, position_ids, _ = _build_local_attention(with_compressor=False, local_len=16, cp_size=2)
+    local_mask = _build_causal_mask(hidden.shape[1], config.sliding_window, "cpu", torch.float32)
+    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
+        with pytest.raises(ValueError, match="full sequence"):
+            forward(hidden, position_ids, local_mask)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
