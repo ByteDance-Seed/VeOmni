@@ -270,8 +270,7 @@ class ShardedIterableDataset(IterableDataset):
         total_workers = world_size * num_workers
         if not self._just_resumed or self._current_idx < 0:
             self._current_idx = rank * num_workers + worker_id
-        else:
-            self._just_resumed = False
+        self._just_resumed = False
 
         for i in range(self._current_idx, len(self.indices), total_workers):
             idx = self.indices[i]
