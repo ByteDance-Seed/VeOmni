@@ -37,6 +37,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoConfig
 
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 TOY_CONFIG = os.path.join(REPO_ROOT, "tests", "toy_config", "qwen3vl_toy")
@@ -152,8 +154,8 @@ def _run_worker(rank, world_size, init_file):
         OpsImplementationConfig(),
     )
 
-    torch.cuda.set_device(rank)
-    device = torch.device("cuda", rank)
+    get_torch_device().set_device(rank)
+    device = torch.device(get_device_type(), rank)
 
     # ── Non-SP reference BEFORE dist init ───────────────────────────────────
     # With no process group the default parallel state is single-process
@@ -174,14 +176,14 @@ def _run_worker(rank, world_size, init_file):
     assert len(ref_calls) == 1, f"non-SP vision tower ran {len(ref_calls)}x, expected exactly once"
 
     dist.init_process_group(
-        backend="nccl",
+        backend=get_dist_comm_backend(),
         init_method=f"file://{init_file}",
         rank=rank,
         world_size=world_size,
     )
     try:
         # ── SP pipeline: merged stream through the collator hooks ───────────
-        init_parallel_state(dp_size=1, ulysses_size=world_size, device_type="cuda")
+        init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=get_device_type())
         sp_collator = MainCollator(
             metadata_collate_func=model.get_metadata_collate_func(),
             pre_sp_collate_func=model.get_pre_sp_collate_func(),
@@ -217,8 +219,8 @@ def _run_worker(rank, world_size, init_file):
 
 @pytest.mark.parametrize("world_size", [2])
 def test_vlm_merged_vision_forward_sp_equivalence(world_size):
-    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
-        pytest.skip(f"Requires {world_size} CUDA devices")
+    if not get_torch_device().is_available() or get_torch_device().device_count() < world_size:
+        pytest.skip(f"Requires {world_size} accelerator devices")
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         init_file = tmp.name
     mp.spawn(_run_worker, args=(world_size, init_file), nprocs=world_size, join=True)
