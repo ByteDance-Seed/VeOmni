@@ -79,6 +79,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_outputs, gather_seq_scatter_heads
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_compression_metadata,
+    build_packed_sparse_attention_indices,
     build_sparse_attention_indices,
     compress_packed_windows,
     isolate_packed_causal_mask_,
@@ -1019,10 +1020,17 @@ def eager_attention_forward(
         and key.dtype == torch.bfloat16
         and value.dtype == torch.bfloat16
         and query.shape[-1] == 1 << (query.shape[-1] - 1).bit_length()
-        and isinstance(attention_mask, torch.Tensor)
+        and (isinstance(attention_mask, torch.Tensor) or kwargs.get("sparse_topk_indices") is not None)
         and dropout == 0
         and key.shape[1] == 1
     )
+    if not use_tilelang and attention_mask is None and kwargs.get("sparse_topk_indices") is not None:
+        raise RuntimeError(
+            "DeepSeek-V4 built mask-free sparse indices but the TileLang dispatch was "
+            "declined at runtime; the eager fallback has no mask left to enforce "
+            "causality. Check that query/key/value are bf16 CUDA tensors."
+        )
+
     if use_tilelang:
         topk_indices = kwargs.get("sparse_topk_indices")
         if topk_indices is None:
@@ -1042,7 +1050,7 @@ def eager_attention_forward(
             _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
             selected_valid = allowed.gather(-1, topk_indices)
             topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
-        else:
+        elif attention_mask is not None:
             topk_indices = mask_sparse_attention_indices(attention_mask, topk_indices)
         sinks = kwargs.get("s_aux", module.sinks)
         attn_output = sparse_attn_tilelang(
@@ -1202,7 +1210,7 @@ class DeepseekV4Attention(nn.Module):
             s_aux = self.sinks.narrow(0, head_start, local_num_heads).contiguous()
 
         block_bias = None
-        compressed_topk_indices = None
+        compressed_candidates = None
         # The device and dtype terms mirror what ``eager_attention_forward`` requires
         # before it can dispatch to TileLang. Without them this reads the config string
         # alone and claims the compact path on hosts where the kernel cannot run and the
@@ -1216,6 +1224,10 @@ class DeepseekV4Attention(nn.Module):
             and q.is_cuda
             and q.dtype == torch.bfloat16
         )
+        # ``DeepseekV4Model.forward`` withholds the dense mask exactly when the packed
+        # metadata is sufficient to validate candidates on its own, so its absence is
+        # the signal to take the mask-free path and skip every O(S^2) intermediate.
+        mask_free_sparse = use_compact_sparse_indices and attention_mask is None
         if self.compressor is not None:
             compressor_output = self.compressor(
                 compressor_hidden,
@@ -1226,9 +1238,10 @@ class DeepseekV4Attention(nn.Module):
                 packed_sequence_slices=kwargs.get("packed_sequence_slices"),
                 packed_compression_metadata=kwargs.get("packed_compression_metadata"),
                 return_topk_indices=use_compact_sparse_indices,
+                build_block_bias=not mask_free_sparse,
             )
             if use_compact_sparse_indices:
-                compressed_kv, block_bias, compressed_topk_indices = compressor_output
+                compressed_kv, block_bias, compressed_candidates = compressor_output
             else:
                 compressed_kv, block_bias = compressor_output
             kv = torch.cat([kv, compressed_kv], dim=2)
@@ -1243,13 +1256,20 @@ class DeepseekV4Attention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
         kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
-        if use_compact_sparse_indices:
+        if mask_free_sparse:
+            kwargs["sparse_topk_indices"] = build_packed_sparse_attention_indices(
+                position_ids=compressor_position_ids,
+                sliding_window=self.sliding_window,
+                compressed_len=kv.shape[-2] - q.shape[-2],
+                candidates=compressed_candidates,
+            )
+        elif use_compact_sparse_indices:
             kwargs["sparse_topk_indices"] = build_sparse_attention_indices(
                 batch_size=q.shape[0],
                 seq_len=q.shape[-2],
                 sliding_window=self.sliding_window,
                 compressed_len=kv.shape[-2] - q.shape[-2],
-                compressed_indices=compressed_topk_indices,
+                compressed_indices=compressed_candidates.topk_indices if compressed_candidates is not None else None,
                 device=q.device,
             )
         attn_output, attn_weights = attention_interface(
@@ -1854,6 +1874,11 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             gather_outputs(position_ids, gather_dim=-1, group=ulysses_group) if ulysses_enabled else position_ids
         )
 
+        # The TileLang sparse kernel reads a compact candidate list, and packed
+        # metadata already pins down every constraint a dense mask would encode, so
+        # the O(S^2) mask and block bias are skipped entirely on that path.
+        mask_free_sparse = False
+
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
         if isinstance(cu_seq_lens_q, torch.Tensor) and inputs_embeds.shape[0] == 1:
             boundaries = cu_seq_lens_q.detach().cpu().tolist()
@@ -1866,6 +1891,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             kwargs["packed_sequence_slices"] = packed_sequence_slices
             compress_rates = tuple(self.config.compress_rates.values())
             hca_rate = self.config.compress_rates["heavily_compressed_attention"]
+            # Packed training disables the cache below, so TileLang attention is the
+            # only mask consumer left and it can validate candidates on its own.
+            # ``eager_attention_forward`` declines the TileLang dispatch for non-bf16
+            # or host tensors, and its dense fallback needs the mask to stay causal,
+            # so mirror those two runtime conditions before dropping the mask.
+            mask_free_sparse = (
+                veomni_dsa_attention_implementation.value == "tilelang"
+                and not isinstance(attention_mask, dict)
+                and inputs_embeds.dtype == torch.bfloat16
+                and inputs_embeds.is_cuda
+            )
             # Metadata is indexed by global positions / cu-seqlens; under SP the
             # collator already provides full-sequence cu-seqlens while local embeds
             # are only one shard, so materialize a full-length reference tensor.
@@ -1875,14 +1911,16 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 full_position_ids,
                 packed_sequence_slices,
                 compress_rates,
-                block_bias_rates=(hca_rate,),
+                block_bias_rates=() if mask_free_sparse else (hca_rate,),
             )
             # Packed training combines independent samples in one physical row;
             # treating that row as a decode cache would merge their KV histories.
             past_key_values = None
             return_cache = None
 
-        if isinstance(attention_mask, dict):
+        if mask_free_sparse:
+            causal_mask = None
+        elif isinstance(attention_mask, dict):
             causal_mask = next(iter(attention_mask.values()))
         else:
             mask_embeds = inputs_embeds
@@ -1899,7 +1937,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 past_key_values=past_key_values,
                 position_ids=mask_position_ids,
             )
-        if "packed_sequence_slices" in kwargs:
+        if causal_mask is not None and "packed_sequence_slices" in kwargs:
             causal_mask = isolate_packed_causal_mask_(causal_mask, kwargs["packed_sequence_slices"])
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         position_embeddings = {
