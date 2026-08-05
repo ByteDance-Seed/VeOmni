@@ -181,9 +181,9 @@ class TestFsdpAllToAllEligibility:
         mesh = object()
         fp32 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.float32))
         bf16 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.bfloat16))
-        bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update: update.device_mesh)
+        bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update, mesh: mesh)
 
-        assert bucket_key(fp32) != bucket_key(bf16)
+        assert bucket_key(fp32, mesh) != bucket_key(bf16, mesh)
 
 
 class TestIntermediateLifetime:
