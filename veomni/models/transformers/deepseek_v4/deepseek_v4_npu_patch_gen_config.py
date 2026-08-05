@@ -380,7 +380,8 @@ def deepseek_v4_hca_compressor_forward_patched(
     layer_idx: int,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_topk_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
     batch, _, _ = hidden_states.shape
@@ -407,7 +408,8 @@ def deepseek_v4_hca_compressor_forward_patched(
             anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
             compressed = compressed + anchor.to(compressed.dtype)
         block_bias = packed_compressed_block_bias(rate_metadata)
-        return compressed.unsqueeze(1), block_bias
+        result = (compressed.unsqueeze(1), block_bias)
+        return (*result, None) if return_topk_indices else result
 
     if cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -438,7 +440,8 @@ def deepseek_v4_hca_compressor_forward_patched(
     compressed_len = compressed_kv.shape[2]
     seq_len = position_ids.shape[1]
     if seq_len == 1 or compressed_len == 0:
-        return compressed_kv, None
+        result = (compressed_kv, None)
+        return (*result, None) if return_topk_indices else result
 
     entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
     causal_threshold = (position_ids + 1) // self.compress_rate
@@ -447,7 +450,8 @@ def deepseek_v4_hca_compressor_forward_patched(
         entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
         float("-inf"),
     )
-    return compressed_kv, block_bias
+    result = (compressed_kv, block_bias)
+    return (*result, None) if return_topk_indices else result
 
 
 @config.override_method(
@@ -463,7 +467,8 @@ def deepseek_v4_csa_compressor_forward_patched(
     layer_idx: int,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_topk_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
     batch, seq_len, _ = hidden_states.shape
@@ -508,7 +513,8 @@ def deepseek_v4_csa_compressor_forward_patched(
         safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
         block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
         block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-        return compressed_kv, block_bias[..., :compressed_len]
+        result = (compressed_kv, block_bias[..., :compressed_len])
+        return (*result, top_k_indices) if return_topk_indices else result
 
     if cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -551,4 +557,5 @@ def deepseek_v4_csa_compressor_forward_patched(
     safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
     block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
     block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-    return compressed_kv, block_bias[..., :compressed_len]
+    result = (compressed_kv, block_bias[..., :compressed_len])
+    return (*result, top_k_indices) if return_topk_indices else result

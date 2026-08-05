@@ -280,13 +280,15 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -398,18 +515,44 @@
+@@ -398,18 +515,46 @@
          position_ids: torch.Tensor,
          past_key_values: Cache | None,
          layer_idx: int,
+-    ) -> tuple[torch.Tensor, torch.Tensor]:
 +        packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
 +        packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-     ) -> tuple[torch.Tensor, torch.Tensor]:
++        return_topk_indices: bool = False,
++    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
 +        if (packed_sequence_slices is None) != (packed_compression_metadata is None):
 +            raise ValueError("Packed sequence slices and compression metadata must be provided together")
          batch, _, _ = hidden_states.shape
@@ -313,7 +315,8 @@
 +                anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
 +                compressed = compressed + anchor.to(compressed.dtype)
 +            block_bias = packed_compressed_block_bias(rate_metadata)
-+            return compressed.unsqueeze(1), block_bias
++            result = (compressed.unsqueeze(1), block_bias)
++            return (*result, None) if return_topk_indices else result
 +
          if cache_layer is None:
              usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -326,11 +329,16 @@
              n_windows = chunk_kv.shape[1] // self.compress_rate
              chunk_kv = chunk_kv.view(batch, n_windows, self.compress_rate, -1)
              chunk_gate = chunk_gate.view(batch, n_windows, self.compress_rate, -1) + self.position_bias.to(
-@@ -434,15 +577,20 @@
+@@ -432,17 +577,24 @@
+         compressed_len = compressed_kv.shape[2]
+         seq_len = position_ids.shape[1]
          if seq_len == 1 or compressed_len == 0:
-             return compressed_kv, None
-
+-            return compressed_kv, None
+-
 -        # query `t` may only see cache entries at pos `w` t > w * compress_rate (ex: t=7, w=2 t does not attend to it).
++            result = (compressed_kv, None)
++            return (*result, None) if return_topk_indices else result
++
          entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
 -        causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
 +        causal_threshold = (position_ids + 1) // self.compress_rate
@@ -339,7 +347,9 @@
              entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
              float("-inf"),
          )
-         return compressed_kv, block_bias
+-        return compressed_kv, block_bias
++        result = (compressed_kv, block_bias)
++        return (*result, None) if return_topk_indices else result
 +
 +
 +# ======================================================================
@@ -349,7 +359,7 @@
 
 
  class DeepseekV4Indexer(nn.Module):
-@@ -476,8 +624,8 @@
+@@ -476,8 +628,8 @@
 
      rope_layer_type = "compress"
 
@@ -360,7 +370,7 @@
          self.compress_rate = config.compress_rates["compressed_sparse_attention"]
          self.num_heads = config.index_n_heads
          self.head_dim = config.index_head_dim
-@@ -491,7 +639,14 @@
+@@ -491,7 +643,14 @@
          self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
          self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
          self.rotary_emb = DeepseekV4RotaryEmbedding(config)
@@ -376,7 +386,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -499,25 +654,47 @@
+@@ -499,25 +658,47 @@
          position_ids: torch.Tensor,
          past_key_values: Cache | None,
          layer_idx: int,
@@ -427,7 +437,7 @@
              new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
              new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
              new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
-@@ -549,31 +726,102 @@
+@@ -549,31 +730,102 @@
          cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
          q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
          q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
@@ -547,7 +557,7 @@
 
 
  class DeepseekV4CSACompressor(nn.Module):
-@@ -599,8 +847,8 @@
+@@ -599,8 +851,8 @@
 
      rope_layer_type = "compress"
 
@@ -558,7 +568,7 @@
          self.compress_rate = config.compress_rates["compressed_sparse_attention"]
          self.head_dim = config.head_dim
          self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
-@@ -609,6 +857,7 @@
+@@ -609,6 +861,7 @@
          self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
          self.rotary_emb = DeepseekV4RotaryEmbedding(config)
          self.indexer = DeepseekV4Indexer(config)
@@ -566,14 +576,15 @@
 
      def forward(
          self,
-@@ -617,11 +866,54 @@
+@@ -617,11 +870,56 @@
          position_ids: torch.Tensor,
          past_key_values: Cache | None,
          layer_idx: int,
 -    ) -> torch.Tensor:
 +        packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
 +        packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-+    ) -> tuple[torch.Tensor, torch.Tensor]:
++        return_topk_indices: bool = False,
++    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 +        if (packed_sequence_slices is None) != (packed_compression_metadata is None):
 +            raise ValueError("Packed sequence slices and compression metadata must be provided together")
          batch, seq_len, _ = hidden_states.shape
@@ -618,11 +629,12 @@
 +            safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
 +            block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
 +            block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-+            return compressed_kv, block_bias[..., :compressed_len]
++            result = (compressed_kv, block_bias[..., :compressed_len])
++            return (*result, top_k_indices) if return_topk_indices else result
 
          if cache_layer is None:
              usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
-@@ -634,13 +926,6 @@
+@@ -634,13 +932,6 @@
              ratio = self.compress_rate
              chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
              chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
@@ -636,7 +648,7 @@
              new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
              new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
              new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
-@@ -655,9 +940,6 @@
+@@ -655,9 +946,6 @@
                  if prior_kv is not None:
                      new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
                      new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
@@ -646,7 +658,7 @@
              compressed = self.kv_norm(
                  (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2)
              )
-@@ -672,18 +954,9 @@
+@@ -672,22 +960,14 @@
          if cache_layer is not None:
              compressed = cache_layer.update_compressor_states("compressor", compressed)
          compressed_kv = compressed.unsqueeze(1)
@@ -667,7 +679,13 @@
          safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
          block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
          block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-@@ -702,6 +975,19 @@
+-        return compressed_kv, block_bias[..., :compressed_len]
++        result = (compressed_kv, block_bias[..., :compressed_len])
++        return (*result, top_k_indices) if return_topk_indices else result
+
+
+ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+@@ -702,6 +982,19 @@
      return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -687,7 +705,7 @@
  def eager_attention_forward(
      module: nn.Module,
      query: torch.Tensor,
-@@ -712,25 +998,78 @@
+@@ -712,25 +1005,78 @@
      dropout: float | int = 0.0,
      **kwargs,
  ):
@@ -774,7 +792,7 @@
 
 
  COMPRESSOR_CLASSES = {
-@@ -738,6 +1077,12 @@
+@@ -738,6 +1084,12 @@
      "compressed_sparse_attention": DeepseekV4CSACompressor,
      "heavily_compressed_attention": DeepseekV4HCACompressor,
  }
@@ -787,7 +805,7 @@
 
 
  class DeepseekV4Attention(nn.Module):
-@@ -786,6 +1131,13 @@
+@@ -786,6 +1138,13 @@
              COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
          )
 
@@ -801,7 +819,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -793,47 +1145,106 @@
+@@ -793,47 +1152,106 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -924,7 +942,7 @@
          attn_output, attn_weights = attention_interface(
              self,
              q,
-@@ -843,22 +1254,27 @@
+@@ -843,22 +1261,27 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -960,7 +978,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -909,22 +1325,30 @@
+@@ -909,22 +1332,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -1002,7 +1020,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -933,11 +1357,14 @@
+@@ -933,11 +1364,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -1020,7 +1038,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -953,10 +1380,27 @@
+@@ -953,10 +1387,27 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1048,7 +1066,7 @@
 
 
  class DeepseekV4MLP(nn.Module):
-@@ -970,16 +1414,60 @@
+@@ -970,16 +1421,60 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -1116,7 +1134,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -990,30 +1478,63 @@
+@@ -990,30 +1485,63 @@
          self.limit = config.swiglu_limit
 
      def forward(
@@ -1193,7 +1211,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1027,14 +1548,26 @@
+@@ -1027,14 +1555,26 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
@@ -1223,7 +1241,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1057,10 +1590,14 @@
+@@ -1057,10 +1597,14 @@
          self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1240,7 +1258,7 @@
          scores = self.score_fn(logits)
          indices = self.tid2eid[input_ids.reshape(-1)].long()
          weights = scores.gather(1, indices)
-@@ -1088,6 +1625,12 @@
+@@ -1088,6 +1632,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1253,7 +1271,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1661,20 @@
+@@ -1118,22 +1668,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -1284,7 +1302,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1774,12 @@
+@@ -1233,6 +1781,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1297,7 +1315,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1799,16 @@
+@@ -1252,6 +1806,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1314,7 +1332,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +1824,76 @@
+@@ -1267,28 +1831,76 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1399,7 +1417,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +1997,12 @@
+@@ -1392,6 +2004,12 @@
      return overall_loss * num_experts
 
 
@@ -1412,7 +1430,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +2021,36 @@
+@@ -1410,49 +2028,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1482,7 +1500,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +2063,64 @@
+@@ -1465,26 +2070,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1561,7 +1579,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2128,17 @@
+@@ -1492,7 +2135,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
