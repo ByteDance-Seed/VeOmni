@@ -510,7 +510,7 @@ class DiTTrainer:
 
         self.on_step_begin(micro_batches=micro_batches)
 
-        synchronize()
+        self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(float)
