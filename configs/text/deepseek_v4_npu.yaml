@@ -1,0 +1,88 @@
+model:
+  # Set this to the target DeepSeek-V4 checkpoint (HF format, v5 fused expert layout).
+  # model_path: <path-or-id-to-DeepSeek-V4-checkpoint>
+  ops_implementation:
+    # DeepSeek-V4 attention has no flash/sdpa/flex support on any backend
+    # (head_dim=512 exceeds FlashAttention's 256 cap, per-head learnable
+    # attention sink, in-block compressor concatenation resizes BlockMask).
+    # Must be eager on both GPU and NPU.
+    attn_implementation: eager
+    # 'fused_triton' is the dataclass default and auto-normalizes to
+    # 'fused_npu' on NPU (veomni/arguments/arguments_types.py
+    # _NPU_DEFAULT_FALLBACK); set explicitly to 'fused_npu' here so the NPU
+    # backend choice is visible in the config rather than implicit.
+    moe_implementation: fused_npu
+    # Fused-CE default ('liger_kernel') is GPU-only; use the NPU chunk_loss
+    # gate instead.
+    cross_entropy_loss_implementation: npu
+    # Triton load-balancing kernel is CUDA-only; NPU falls back to eager
+    # (this is also the automatic NPU default-normalization target).
+    load_balancing_loss_implementation: eager
+    # rms_norm_implementation / rotary_pos_emb_implementation default to
+    # 'liger_kernel' and auto-normalize to 'npu' on NPU (a generic Ascend
+    # kernel exists for both ops). DeepSeek-V4 uses a non-standard RoPE
+    # layout (trailing-slice partial rotary + repeat_interleave(2) cos/sin)
+    # that the generic NPU rotary kernel does not implement, and ships two
+    # RMSNorm flavours the generic NPU kernel has not been validated against
+    # — force both to 'eager' rather than pick up the generic backend
+    # silently. swiglu_mlp_implementation has no NPU backend at all, so it
+    # must be 'eager' too (see arguments_types.py's OpsImplementationConfig).
+    rms_norm_implementation: eager
+    rotary_pos_emb_implementation: eager
+    swiglu_mlp_implementation: eager
+    # dsa_indexer_implementation / dsa_attention_implementation /
+    # mhc_implementation all default to "eager" already (their "tilelang"
+    # backends are CUDA SM90+ only) — no override needed for NPU, left unset
+    # here on purpose so a future CUDA run of this same file doesn't need
+    # editing.
+
+data:
+  train_path: fineweb_100BT
+  train_size: 1000000000000
+  dataloader:
+    type: native
+    drop_last: true
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 8192
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+
+train:
+  accelerator:
+    # DeepSeek-V4's Ulysses SP path (Q head all-to-all + sequence all-gather
+    # around compressors / sparse attention) is backend-agnostic but has not
+    # been validated on NPU with this model yet — keep ulysses_size at 1
+    # until it has been.
+    ulysses_size: 1
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 32
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    type: adamw
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: deepseek_v4_npu
+    manager: dcp
+    save_steps: 100
+    save_hf_weights: true
+  wandb:
+    project: DeepSeek-V4
+    name: dsv4_npu_pretrain_ep8
