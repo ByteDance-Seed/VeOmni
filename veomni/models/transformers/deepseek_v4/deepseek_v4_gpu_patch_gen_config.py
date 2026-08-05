@@ -726,8 +726,7 @@ def deepseek_v4_attention_forward_patched(
     cos, sin = position_embeddings[self.rope_layer_type]
 
     q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-    q = self.q_b_proj(q_residual).view(*hidden_shape)
-    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_b_norm.eps)
+    q = self.q_b_norm(self.q_b_proj(q_residual).view(*hidden_shape))
     q = q.transpose(1, 2)
     q = apply_rotary_pos_emb(q, cos, sin)
 
