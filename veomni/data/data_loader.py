@@ -82,6 +82,8 @@ def build_native_dataloader(
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
+    persistent_workers: bool = False,
+    in_order: bool = True,
     shuffle: bool = True,
     seed: int = 0,
     collate_fn: Optional[Callable] = None,
@@ -225,6 +227,11 @@ def build_native_dataloader(
         )
 
     worker_init_fn = _build_worker_init_fn(worker_num_threads) if worker_num_threads is not None else None
+    if not in_order and num_workers > 0:
+        logger.warning_rank0(
+            "data.dataloader.in_order=False can improve throughput for uneven worker loads, "
+            "but StatefulDataLoader does not guarantee exact checkpoint/resume ordering in this mode."
+        )
     # Snapshot is only consumed at save; widen to save_steps in worker mode (1:1 next/step), else keep the every-step default so resume sees a fresh snapshot.
     if save_steps and save_steps > 0 and not (dyn_bsz and dyn_bsz_runtime == "main"):
         snapshot_every_n_steps = save_steps
@@ -240,6 +247,8 @@ def build_native_dataloader(
         pin_memory_device=get_device_type(),
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers and num_workers > 0,
+        in_order=in_order,
         worker_init_fn=worker_init_fn,
         multiprocessing_context=multiprocessing_context,
         snapshot_every_n_steps=snapshot_every_n_steps,
