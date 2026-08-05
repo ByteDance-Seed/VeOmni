@@ -95,13 +95,16 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.transformers.deepseek_v4.packed_utils import (
+    CompressedCandidates,
     build_packed_compression_metadata,
+    build_packed_sparse_attention_indices,
     build_sparse_attention_indices,
     compress_packed_windows,
     isolate_packed_causal_mask_,
     mask_sparse_attention_indices,
     packed_compressed_block_bias,
     packed_compressed_causal_ranges,
+    scatter_topk_block_bias,
 )
 from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
@@ -156,13 +159,16 @@ config.add_import(
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
     names=[
-        "build_sparse_attention_indices",
+        "CompressedCandidates",
         "build_packed_compression_metadata",
+        "build_packed_sparse_attention_indices",
+        "build_sparse_attention_indices",
         "compress_packed_windows",
         "isolate_packed_causal_mask_",
         "mask_sparse_attention_indices",
         "packed_compressed_block_bias",
         "packed_compressed_causal_ranges",
+        "scatter_topk_block_bias",
     ],
 )
 
@@ -357,7 +363,8 @@ def deepseek_v4_hca_compressor_forward_patched(
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
+    build_block_bias: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, CompressedCandidates]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
     batch, _, _ = hidden_states.shape
@@ -380,9 +387,13 @@ def deepseek_v4_hca_compressor_forward_patched(
             rate_metadata,
             overlap=False,
         )
-        block_bias = packed_compressed_block_bias(rate_metadata)
-        result = (compressed.unsqueeze(1), block_bias)
-        return (*result, None) if return_topk_indices else result
+        compressed_kv = compressed.unsqueeze(1)
+        candidates = CompressedCandidates(
+            range_starts=rate_metadata["range_starts"],
+            range_ends=rate_metadata["range_ends"],
+        )
+        block_bias = packed_compressed_block_bias(rate_metadata) if build_block_bias else None
+        return (compressed_kv, block_bias, candidates) if return_topk_indices else (compressed_kv, block_bias)
 
     if cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -414,17 +425,22 @@ def deepseek_v4_hca_compressor_forward_patched(
     seq_len = position_ids.shape[1]
     if seq_len == 1 or compressed_len == 0:
         result = (compressed_kv, None)
-        return (*result, None) if return_topk_indices else result
+        return (*result, CompressedCandidates()) if return_topk_indices else result
 
-    entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
     causal_threshold = (position_ids + 1) // self.compress_rate
-    block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
-    block_bias = block_bias.masked_fill(
-        entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
-        float("-inf"),
+    candidates = CompressedCandidates(
+        range_starts=torch.zeros_like(causal_threshold, dtype=torch.int32),
+        range_ends=causal_threshold.to(torch.int32),
     )
-    result = (compressed_kv, block_bias)
-    return (*result, None) if return_topk_indices else result
+    block_bias = None
+    if build_block_bias:
+        entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
+        block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
+        block_bias = block_bias.masked_fill(
+            entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
+            float("-inf"),
+        )
+    return (compressed_kv, block_bias, candidates) if return_topk_indices else (compressed_kv, block_bias)
 
 
 @config.override_method(
@@ -441,7 +457,8 @@ def deepseek_v4_csa_compressor_forward_patched(
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    build_block_bias: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, CompressedCandidates]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
     batch, seq_len, _ = hidden_states.shape
@@ -474,13 +491,11 @@ def deepseek_v4_csa_compressor_forward_patched(
             packed_sequence_slices=packed_sequence_slices,
             packed_compression_metadata=packed_compression_metadata,
         )
-        compressed_len = compressed_kv.shape[2]
-        valid = top_k_indices >= 0
-        safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
-        block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
-        block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-        result = (compressed_kv, block_bias[..., :compressed_len])
-        return (*result, top_k_indices) if return_topk_indices else result
+        candidates = CompressedCandidates(topk_indices=top_k_indices)
+        block_bias = (
+            scatter_topk_block_bias(compressed_kv, top_k_indices, batch, seq_len) if build_block_bias else None
+        )
+        return (compressed_kv, block_bias, candidates) if return_topk_indices else (compressed_kv, block_bias)
 
     if cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -518,13 +533,9 @@ def deepseek_v4_csa_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     compressed_kv = compressed.unsqueeze(1)
     top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
-    compressed_len = compressed_kv.shape[2]
-    valid = top_k_indices >= 0
-    safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
-    block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
-    block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-    result = (compressed_kv, block_bias[..., :compressed_len])
-    return (*result, top_k_indices) if return_topk_indices else result
+    candidates = CompressedCandidates(topk_indices=top_k_indices)
+    block_bias = scatter_topk_block_bias(compressed_kv, top_k_indices, batch, seq_len) if build_block_bias else None
+    return (compressed_kv, block_bias, candidates) if return_topk_indices else (compressed_kv, block_bias)
 
 
 # ================================================================
@@ -769,7 +780,7 @@ def deepseek_v4_attention_forward_patched(
         s_aux = self.sinks.narrow(0, head_start, local_num_heads).contiguous()
 
     block_bias = None
-    compressed_topk_indices = None
+    compressed_candidates = None
     # The device and dtype terms mirror what ``eager_attention_forward`` requires
     # before it can dispatch to TileLang. Without them this reads the config string
     # alone and claims the compact path on hosts where the kernel cannot run and the
@@ -783,6 +794,21 @@ def deepseek_v4_attention_forward_patched(
         and q.is_cuda
         and q.dtype == torch.bfloat16
     )
+    # ``DeepseekV4Model.forward`` owns this decision and hands it down, the same
+    # way it hands down the packed metadata. Re-deriving it here from a missing
+    # mask would not agree with it: under sdpa and flash_attention_2,
+    # ``create_sliding_window_causal_mask`` also returns None for an all-ones or
+    # absent 2-D mask, so absence does not imply the model chose to withhold.
+    mask_free_sparse = bool(kwargs.pop("mask_free_sparse", False))
+    if mask_free_sparse and not use_compact_sparse_indices:
+        # The model already dropped the causal mask on the strength of this path,
+        # so falling back now would silently run attention with no mask at all.
+        raise RuntimeError(
+            "DeepseekV4Model withheld the causal mask for the mask-free sparse path, but this layer "
+            "cannot produce compact indices "
+            f"(dsa_attention_implementation={veomni_dsa_attention_implementation.value}, "
+            f"q.dtype={q.dtype}, q.is_cuda={q.is_cuda}, cache={'set' if past_key_values is not None else 'none'})"
+        )
     if self.compressor is not None:
         compressor_output = self.compressor(
             compressor_hidden,
@@ -793,9 +819,10 @@ def deepseek_v4_attention_forward_patched(
             packed_sequence_slices=kwargs.get("packed_sequence_slices"),
             packed_compression_metadata=kwargs.get("packed_compression_metadata"),
             return_topk_indices=use_compact_sparse_indices,
+            build_block_bias=not mask_free_sparse,
         )
         if use_compact_sparse_indices:
-            compressed_kv, block_bias, compressed_topk_indices = compressor_output
+            compressed_kv, block_bias, compressed_candidates = compressor_output
         else:
             compressed_kv, block_bias = compressor_output
         kv = torch.cat([kv, compressed_kv], dim=2)
@@ -810,13 +837,20 @@ def deepseek_v4_attention_forward_patched(
         self.config._attn_implementation, eager_attention_forward
     )
     kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
-    if use_compact_sparse_indices:
+    if mask_free_sparse:
+        kwargs["sparse_topk_indices"] = build_packed_sparse_attention_indices(
+            position_ids=compressor_position_ids,
+            sliding_window=self.sliding_window,
+            compressed_len=kv.shape[-2] - q.shape[-2],
+            candidates=compressed_candidates,
+        )
+    elif use_compact_sparse_indices:
         kwargs["sparse_topk_indices"] = build_sparse_attention_indices(
             batch_size=q.shape[0],
             seq_len=q.shape[-2],
             sliding_window=self.sliding_window,
             compressed_len=kv.shape[-2] - q.shape[-2],
-            compressed_indices=compressed_topk_indices,
+            compressed_indices=compressed_candidates.topk_indices if compressed_candidates is not None else None,
             device=q.device,
         )
     attn_output, attn_weights = attention_interface(
@@ -878,10 +912,17 @@ def deepseek_v4_eager_attention_forward_patched(
         and key.dtype == torch.bfloat16
         and value.dtype == torch.bfloat16
         and query.shape[-1] == 1 << (query.shape[-1] - 1).bit_length()
-        and isinstance(attention_mask, torch.Tensor)
+        and (isinstance(attention_mask, torch.Tensor) or kwargs.get("sparse_topk_indices") is not None)
         and dropout == 0
         and key.shape[1] == 1
     )
+    if not use_tilelang and attention_mask is None and kwargs.get("sparse_topk_indices") is not None:
+        raise RuntimeError(
+            "DeepSeek-V4 built mask-free sparse indices but the TileLang dispatch was "
+            "declined at runtime; the eager fallback has no mask left to enforce "
+            "causality. Check that query/key/value are bf16 CUDA tensors."
+        )
+
     if use_tilelang:
         topk_indices = kwargs.get("sparse_topk_indices")
         if topk_indices is None:
@@ -901,7 +942,7 @@ def deepseek_v4_eager_attention_forward_patched(
             _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
             selected_valid = allowed.gather(-1, topk_indices)
             topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
-        else:
+        elif attention_mask is not None:
             topk_indices = mask_sparse_attention_indices(attention_mask, topk_indices)
         sinks = kwargs.get("s_aux", module.sinks)
         attn_output = sparse_attn_tilelang(
@@ -987,6 +1028,11 @@ def deepseek_v4_model_forward_patched(
         gather_outputs(position_ids, gather_dim=-1, group=ulysses_group) if ulysses_enabled else position_ids
     )
 
+    # The TileLang sparse kernel reads a compact candidate list, and packed
+    # metadata already pins down every constraint a dense mask would encode, so
+    # the O(S^2) mask and block bias are skipped entirely on that path.
+    mask_free_sparse = False
+
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
     if isinstance(cu_seq_lens_q, torch.Tensor) and inputs_embeds.shape[0] == 1:
         boundaries = cu_seq_lens_q.detach().cpu().tolist()
@@ -999,6 +1045,27 @@ def deepseek_v4_model_forward_patched(
         kwargs["packed_sequence_slices"] = packed_sequence_slices
         compress_rates = tuple(self.config.compress_rates.values())
         hca_rate = self.config.compress_rates["heavily_compressed_attention"]
+        # Packed training disables the cache below, so TileLang attention is the
+        # only mask consumer left and it can validate candidates on its own.
+        # ``eager_attention_forward`` declines the TileLang dispatch for non-bf16
+        # or host tensors, and its dense fallback needs the mask to stay causal,
+        # so mirror those two runtime conditions before dropping the mask.
+        mask_free_sparse = (
+            veomni_dsa_attention_implementation.value == "tilelang"
+            and not isinstance(attention_mask, dict)
+            and inputs_embeds.dtype == torch.bfloat16
+            and inputs_embeds.is_cuda
+            # Padding lives only in the 2-D mask, and the mask-free path never
+            # reads it -- it reconstructs every constraint from position_ids and
+            # cu-seqlens. VeOmni's collator pads with ones for exactly this
+            # reason (``data_collator`` asserts ``sp_pad_value == 1``), so this
+            # guards against a foreign collator rather than a live case, and it
+            # runs once per forward instead of once per layer.
+            and (attention_mask is None or bool(attention_mask.all()))
+        )
+        # Attention must not re-derive this from the missing mask; see the note
+        # at the consuming site in ``DeepseekV4Attention.forward``.
+        kwargs["mask_free_sparse"] = mask_free_sparse
         # Metadata is indexed by global positions / cu-seqlens; under SP the
         # collator already provides full-sequence cu-seqlens while local embeds
         # are only one shard, so materialize a full-length reference tensor.
@@ -1008,14 +1075,16 @@ def deepseek_v4_model_forward_patched(
             full_position_ids,
             packed_sequence_slices,
             compress_rates,
-            block_bias_rates=(hca_rate,),
+            block_bias_rates=() if mask_free_sparse else (hca_rate,),
         )
         # Packed training combines independent samples in one physical row;
         # treating that row as a decode cache would merge their KV histories.
         past_key_values = None
         return_cache = None
 
-    if isinstance(attention_mask, dict):
+    if mask_free_sparse:
+        causal_mask = None
+    elif isinstance(attention_mask, dict):
         causal_mask = next(iter(attention_mask.values()))
     else:
         mask_embeds = inputs_embeds
@@ -1032,7 +1101,7 @@ def deepseek_v4_model_forward_patched(
             past_key_values=past_key_values,
             position_ids=mask_position_ids,
         )
-    if "packed_sequence_slices" in kwargs:
+    if causal_mask is not None and "packed_sequence_slices" in kwargs:
         causal_mask = isolate_packed_causal_mask_(causal_mask, kwargs["packed_sequence_slices"])
     hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
     position_embeddings = {
