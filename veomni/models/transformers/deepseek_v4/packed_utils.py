@@ -14,10 +14,9 @@
 
 """Packed-sequence helpers for DeepSeek V4 compressed attention."""
 
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import torch
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb
 
 
 def build_packed_compression_metadata(
@@ -82,6 +81,7 @@ def compress_packed_windows(
     packed_metadata: dict[str, torch.Tensor],
     *,
     overlap: bool,
+    apply_rope: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
     """Compress complete windows without crossing packed sequence boundaries.
 
@@ -89,6 +89,12 @@ def compress_packed_windows(
     and resets ``position_ids`` to zero at each sequence boundary. Selecting
     window ends from local positions keeps incomplete tails out of the next
     sequence and lets every operation stay on device.
+
+    ``apply_rope`` is injected so callers in the generated modeling pass their
+    module-global ``apply_rotary_pos_emb``, which ``device_patch.py`` may have
+    swapped for the fused Triton backend. It is required rather than defaulted
+    to the eager reference: a defaulted call site would silently keep eager
+    while every other one is fused, which no test would catch.
     """
     if kv.shape[0] != 1:
         raise ValueError(f"Packed DeepSeek V4 compression expects batch size 1, got {kv.shape[0]}")
@@ -122,7 +128,7 @@ def compress_packed_windows(
         position_ids=window_positions.unsqueeze(0),
         layer_type=rope_layer_type,
     )
-    return apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+    return apply_rope(compressed.unsqueeze(1), cos, sin).squeeze(1)
 
 
 def packed_compressed_causal_ranges(

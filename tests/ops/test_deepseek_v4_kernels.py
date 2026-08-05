@@ -1092,3 +1092,210 @@ def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
     # divide by, so the pairing has to be rejected instead of drifting.
     with pytest.raises(AssertionError, match="powers of two"):
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)
+
+
+# Mirrors the real DeepSeek-V4 RoPE call sites. ``transposed`` marks the ones
+# that reach the op as a ``[B, S, H, D].transpose(1, 2)`` view (Q, MQA KV, the
+# attention output) rather than a contiguous tensor (compressor entries).
+_ROPE_CALL_SITES = [
+    pytest.param(1, 8, 37, 512, 64, True, id="query"),
+    pytest.param(2, 1, 64, 512, 64, True, id="mqa_kv"),
+    pytest.param(1, 1, 13, 512, 64, False, id="compressed_entries"),
+    pytest.param(2, 4, 33, 128, 64, True, id="indexer_query"),
+    pytest.param(1, 2, 16, 64, 64, False, id="rope_spans_full_head"),
+    pytest.param(2, 3, 33, 48, 24, True, id="rope_dim_not_power_of_two"),
+]
+
+
+def _rope_inputs(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype, device=None):
+    device = device or DEVICE
+    if transposed:
+        x = torch.randn(batch, seqlen, heads, head_dim, device=device, dtype=dtype).transpose(1, 2)
+    else:
+        x = torch.randn(batch, heads, seqlen, head_dim, device=device, dtype=dtype)
+    # One angle per interleaved pair, as ``DeepseekV4RotaryEmbedding`` emits.
+    angle = torch.randn(batch, seqlen, rope_dim // 2, device=device, dtype=dtype)
+    return x, angle.cos(), angle.sin()
+
+
+# The eager backward rounds each of its two branches to the activation dtype
+# before summing them, so individual elements can cancel to exactly zero where
+# the fused kernel's single rounding leaves a residue. That makes a relative
+# comparison meaningless per element; bound the absolute error at ~2 ULP of the
+# operand scale instead.
+_ROPE_GRAD_TOLERANCE = {
+    torch.bfloat16: {"rtol": 1.6e-2, "atol": 1e-2},
+    torch.float32: {"rtol": 1.3e-6, "atol": 1e-6},
+}
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="fused DeepSeek-V4 RoPE is a CUDA Triton kernel")
+@pytest.mark.parametrize("batch, heads, seqlen, head_dim, rope_dim, transposed", _ROPE_CALL_SITES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_deepseek_v4_triton_rope_matches_eager(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype):
+    """The fused kernel must agree with the eager reference in both directions."""
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as eager_rope
+
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _rope_inputs(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype)
+    grad = torch.randn(batch, heads, seqlen, head_dim, device=DEVICE, dtype=dtype)
+
+    expected_input = x.detach().clone().requires_grad_(True)
+    actual_input = x.detach().clone().requires_grad_(True)
+    expected = eager_rope(expected_input, cos, sin)
+    actual = apply_rotary_pos_emb_triton(actual_input, cos, sin)
+
+    assert actual.shape == expected.shape
+    # The eager path ends in ``torch.cat``, so callers may rely on contiguity.
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected)
+
+    expected.backward(grad)
+    actual.backward(grad)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad, **_ROPE_GRAD_TOLERANCE[dtype])
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="fused DeepSeek-V4 RoPE is a CUDA Triton kernel")
+def test_deepseek_v4_triton_rope_inverse_rotation_round_trips():
+    """``DeepseekV4Attention.forward`` un-rotates the attention output with -sin."""
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _rope_inputs(1, 4, 32, 512, 64, True, torch.float32)
+
+    round_tripped = apply_rotary_pos_emb_triton(apply_rotary_pos_emb_triton(x, cos, sin), cos, -sin)
+
+    torch.testing.assert_close(round_tripped, x.contiguous(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="fused DeepSeek-V4 RoPE is a CUDA Triton kernel")
+def test_deepseek_v4_triton_rope_keeps_no_activations_for_backward():
+    """RoPE is orthogonal, so the backward only needs cos/sin — never ``x``."""
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _rope_inputs(1, 4, 32, 512, 64, True, torch.bfloat16)
+
+    out = apply_rotary_pos_emb_triton(x.detach().requires_grad_(True), cos, sin)
+
+    saved = out.grad_fn.saved_tensors
+    assert [tensor.shape for tensor in saved] == [cos.shape, sin.shape]
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="fused DeepSeek-V4 RoPE is a CUDA Triton kernel")
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda x, cos, sin: (x, cos, sin, 2), id="unsqueeze_dim_not_one"),
+        pytest.param(lambda x, cos, sin: (x[0], cos, sin, 1), id="x_not_4d"),
+        pytest.param(lambda x, cos, sin: (x, cos.requires_grad_(True), sin, 1), id="cos_requires_grad"),
+        pytest.param(lambda x, cos, sin: (x, cos[:, :-1], sin[:, :-1], 1), id="cos_seqlen_mismatch"),
+        # An odd nope_dim breaks the ``rd ^ 1`` interleaved-partner indexing, so
+        # the kernel would silently compute garbage rather than fail. This is the
+        # only guard standing between that layout and wrong numbers.
+        pytest.param(lambda x, cos, sin: (x[..., :-1], cos, sin, 1), id="odd_nope_dim"),
+        pytest.param(lambda x, cos, sin: (x, cos[..., :0], sin[..., :0], 1), id="empty_rope_dim"),
+        pytest.param(lambda x, cos, sin: (x, cos.cpu(), sin.cpu(), 1), id="cos_on_other_device"),
+    ],
+)
+def test_deepseek_v4_triton_rope_falls_back_when_unsupported(monkeypatch, mutate):
+    """Unsupported layouts must reach eager instead of the kernel.
+
+    Only dispatch is under test here: several of these mutations are malformed
+    for *any* implementation, so the eager reference is stubbed out rather than
+    executed. ``..._fallback_matches_eager`` covers a fallback that has to
+    produce a real answer.
+    """
+    from transformers.models.deepseek_v4 import modeling_deepseek_v4
+
+    from veomni.ops.kernels.rotary import triton_deepseek_v4
+
+    torch.manual_seed(7)
+    x, cos, sin, unsqueeze_dim = mutate(*_rope_inputs(1, 4, 32, 512, 64, True, torch.float32))
+
+    monkeypatch.setattr(
+        triton_deepseek_v4,
+        "_rotary_launch",
+        lambda *a, **k: pytest.fail("unsupported input reached the Triton kernel"),
+    )
+    reached_eager = False
+
+    def record_eager(tensor, *args, **kwargs):
+        nonlocal reached_eager
+        reached_eager = True
+        return tensor
+
+    monkeypatch.setattr(modeling_deepseek_v4, "apply_rotary_pos_emb", record_eager)
+
+    triton_deepseek_v4.apply_rotary_pos_emb_triton(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+    assert reached_eager
+
+
+def test_deepseek_v4_triton_rope_fallback_matches_eager():
+    """The unconditional bind means CPU tensors must still get a correct answer."""
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as eager_rope
+
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _rope_inputs(1, 4, 32, 512, 64, True, torch.float32, device="cpu")
+
+    torch.testing.assert_close(apply_rotary_pos_emb_triton(x, cos, sin), eager_rope(x, cos, sin))
+
+
+def test_deepseek_v4_device_patch_selects_rotary_backend(monkeypatch):
+    """``rotary_pos_emb_implementation`` must actually reach DeepSeek-V4."""
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.models.transformers.deepseek_v4.device_patch import apply_veomni_deepseek_v4_device_patch
+    from veomni.ops.config import singleton
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    def generated_module():
+        module = types.ModuleType("fake_deepseek_v4")
+        module.apply_rotary_pos_emb = _unpatched_rope
+        return module
+
+    def use(value):
+        monkeypatch.setattr(
+            singleton, "_ops_config", OpsImplementationConfig(rotary_pos_emb_implementation=value), raising=False
+        )
+
+    use("eager")
+    module = generated_module()
+    apply_veomni_deepseek_v4_device_patch(module)
+    assert module.apply_rotary_pos_emb is _unpatched_rope
+
+    use("triton")
+    module = generated_module()
+    apply_veomni_deepseek_v4_device_patch(module)
+    assert module.apply_rotary_pos_emb is apply_rotary_pos_emb_triton
+
+    # Liger implements neither the partial rope slice nor the interleaved layout.
+    use("liger_kernel")
+    with pytest.raises(ValueError, match="explicitly disabled"):
+        apply_veomni_deepseek_v4_device_patch(generated_module())
+
+
+def test_deepseek_v4_device_patch_disables_wrong_signature_backends(monkeypatch):
+    """Neither registry default may bind: both take ``(q, k, cos, sin)``.
+
+    ``npu`` is asserted on the declared mapping rather than through dispatch,
+    because ``OpsImplementationConfig`` rejects ``npu`` at construction on a GPU
+    host, so the disabled branch is only reachable on Ascend.
+    """
+    from veomni.models.transformers.deepseek_v4 import device_patch
+
+    captured = {}
+    monkeypatch.setattr(device_patch, "apply_per_model_patches", lambda **kwargs: captured.update(kwargs))
+    device_patch.apply_veomni_deepseek_v4_device_patch(types.ModuleType("fake_deepseek_v4"))
+
+    backends = captured["extra_backends"]["rotary_pos_emb"]
+    assert backends["liger_kernel"] is None
+    assert backends["npu"] is None
+
+
+def _unpatched_rope(*args, **kwargs):
+    raise AssertionError("sentinel for the generated module's eager definition")

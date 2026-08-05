@@ -59,11 +59,18 @@ Intentionally NOT patched:
 - Class-level ``LigerSwiGLUMLP`` / ``LigerRMSNorm`` replacement — keep the
   native V4 constructors (unweighted norm layout and shared-expert
   ``moe_intermediate_size`` mapping) and only swap arithmetic through OpSlots.
-- ``apply_rotary_pos_emb`` — DeepSeek-V4 uses a *partial* RoPE (the
-  trailing ``qk_rope_head_dim`` slice only, with the leading nope channels
-  untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
-  that ``liger_rotary_pos_emb`` does not implement. SKILL.md flags this
-  exact case (partial_rotary -> liger NaN).
+- ``apply_rotary_pos_emb`` — the generated definition stays the eager
+  reference. DeepSeek-V4 uses a *partial* RoPE (the trailing
+  ``qk_rope_head_dim`` slice only, with the leading nope channels untouched)
+  plus an interleaved ``repeat_interleave(2)`` cos/sin layout that
+  ``liger_rotary_pos_emb`` does not implement — SKILL.md flags this exact
+  case (partial_rotary -> liger NaN) — so ``device_patch.py`` disables the
+  registry-default Liger backend and offers a model-specific fused Triton
+  kernel instead, selected by ``rotary_pos_emb_implementation=triton``.
+  Because every call site (Q, MQA KV, the inverse rotation on the attention
+  output, the indexer Q, and the compressors) resolves the module global,
+  that one rebind covers all of them; ``compress_packed_windows`` takes it
+  as an ``apply_rope`` argument for the same reason.
 - ``DeepseekV4Attention.forward`` remains eager/TileLang-only
   (``_supports_flash_attn = False`` / ``_supports_sdpa = False`` /
   ``_supports_flex_attn = False``: ``head_dim=512`` exceeds FlashAttention's
@@ -386,6 +393,7 @@ def deepseek_v4_hca_compressor_forward_patched(
             position_ids,
             rate_metadata,
             overlap=False,
+            apply_rope=apply_rotary_pos_emb,
         )
         compressed_kv = compressed.unsqueeze(1)
         candidates = CompressedCandidates(
@@ -480,6 +488,7 @@ def deepseek_v4_csa_compressor_forward_patched(
             position_ids,
             rate_metadata,
             overlap=True,
+            apply_rope=apply_rotary_pos_emb,
         )
         compressed_kv = compressed.unsqueeze(1)
         top_k_indices = self.indexer(
@@ -576,6 +585,7 @@ def deepseek_v4_indexer_forward_patched(
             position_ids,
             rate_metadata,
             overlap=True,
+            apply_rope=apply_rotary_pos_emb,
         )
         chunk_kv = chunk_gate = None
         first_window_position = 0
