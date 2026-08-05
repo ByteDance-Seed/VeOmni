@@ -265,13 +265,29 @@ def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing
         assert torch.equal(lse, expected_lse)
 
     # The depth is bounded by shared memory, so it is derived from the device rather than
-    # left to surface as an opaque launch failure. The bound scales with the head tile
-    # and with block_I, which is why both are checked at the production head count and
-    # why the 8-head tile above can afford a depth that 64 heads cannot.
-    with pytest.raises(AssertionError, match="shared memory per block"):
-        sparse_mqa_fwd(64, dim, topk, scale, num_stages=3)
-    with pytest.raises(AssertionError, match="shared memory per block"):
-        sparse_mqa_fwd(64, dim, topk, scale, block_I=128, num_stages=2)
+    # left to surface as an opaque launch failure. Walk the depth up until the guard
+    # refuses, then show the deepest depth it did allow really launches: that measures the
+    # bound against the device instead of against a copy of its own formula, and it holds
+    # on any opt-in shared-memory limit rather than assuming Hopper's 227 KB.
+    wide_heads = 64
+    wide_q = torch.randn(batch, seqlen, wide_heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    wide_sinks = torch.randn(wide_heads, device=DEVICE)
+    deepest = None
+    for depth in range(1, 9):
+        try:
+            candidate = sparse_mqa_fwd(wide_heads, dim, topk, scale, num_stages=depth)
+        except AssertionError as exc:
+            assert "shared memory per block" in str(exc)
+            break
+        deepest = candidate
+    else:
+        pytest.fail("the shared-memory guard never rejected a gather depth")
+
+    assert deepest is not None, "the guard rejected even a single-stage gather"
+    deep_out, _ = deepest(wide_q, kv, wide_sinks, indices)
+    # Reading the result into a Python bool is the synchronization point: a launch that
+    # could not get its shared memory surfaces here rather than staying pending.
+    assert torch.isfinite(deep_out).all().item()
 
 
 def test_tilelang_sparse_attention_forward_defaults_to_no_pipelining():

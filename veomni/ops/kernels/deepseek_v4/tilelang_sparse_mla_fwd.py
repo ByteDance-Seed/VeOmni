@@ -99,15 +99,27 @@ def sparse_mqa_fwd(
 
     # Every stage past the first double-buffers the BI x D KV tile, so the depth is
     # bounded by shared memory rather than by anything in the algorithm -- and by
-    # block_I and dim, not by a fixed depth. Sum the tiles rather than hardcoding a
-    # ceiling: the estimate ignores TileLang's inter-buffer alignment, so it under-counts
-    # and can only ever under-reject, and a depth that slips through still fails loudly
-    # at launch naming the bytes it could not allocate.
+    # block_I and dim too, which is why the shipped depth is checked as well and not
+    # only the opt-in ones.
+    #
+    # O_shared and Lse_shared are deliberately absent from the sum: TileLang merges
+    # them into buffers that are dead by the time the output accumulates, so they cost
+    # nothing on top. Measured across heads in {8, 16, 64}, block_I in {64, 128} and
+    # depths 0-2, the launch requests exactly this sum plus 2048 B of inter-buffer
+    # alignment -- adding O_shared would over-count by ~32% and falsely reject depths
+    # that run today. The 2048 stays out because it is TileLang's own padding rule
+    # rather than ours; leaving the sum a lower bound means it can only under-reject,
+    # and a depth that slips through still fails loudly at launch naming its bytes.
     smem_lower_bound = (
         H_per_block * D * 2  # Q_shared, bf16
         + H_per_block * BI * 2  # S_shared, bf16
         + max(num_stages, 1) * BI * D * 2  # KV_shared, one buffer per stage
     )
+    # Every kernel here is CUDA-only, so the device-agnostic helper reads as more
+    # portable than it is -- but it stays: `device-api-check` rejects a vendor-namespaced
+    # device reference under veomni/ unless `veomni/utils/device.py` has no equivalent,
+    # and here it does. Reaching this line already implies an accelerator anyway, since
+    # the module imports tilelang at import time and only a compiling kernel gets here.
     smem_limit = get_torch_device().get_device_properties(None).shared_memory_per_block_optin
     assert smem_lower_bound <= smem_limit, (
         f"num_stages={num_stages} at block_I={block_I}, dim={dim} needs at least "

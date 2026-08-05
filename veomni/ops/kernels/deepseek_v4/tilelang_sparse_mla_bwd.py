@@ -176,7 +176,7 @@ def bwd(
     assert threads % 32 == 0 and threads & (threads - 1) == 0, (
         f"threads ({threads}) must be a power-of-two multiple of the 32-lane warp"
     )
-    assert 4 * threads <= BS * block_H, (
+    assert threads <= BS * block_H // 4, (
         f"threads ({threads}) exceeds the GEMM warp-tile bound {BS * block_H // 4} "
         f"for block_H={block_H}, block_size={BS}"
     )
