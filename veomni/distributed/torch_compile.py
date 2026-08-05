@@ -19,8 +19,7 @@ from typing import Collection, Optional
 import torch
 import torch.nn as nn
 
-from ..utils import logging
-from ..utils.device import IS_CUDA_AVAILABLE
+from ..utils import device, logging
 
 
 logger = logging.get_logger(__name__)
@@ -145,7 +144,7 @@ def validate_compile_runtime(
 
     if not compile_config.enable:
         return
-    if device_type != "cuda":
+    if not device.IS_CUDA_AVAILABLE or device_type != device.get_device_type():
         raise RuntimeError("train.torch_compile.enable is CUDA-only for now.")
     if not fsdp_enabled:
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
@@ -221,7 +220,7 @@ def compile_decoder_blocks(
 def mark_compile_step_begin(enable_compile: bool) -> None:
     """Mark a new training step for CUDA Graph Trees managed by torch.compile."""
 
-    if not enable_compile or not IS_CUDA_AVAILABLE:
+    if not enable_compile or not device.IS_CUDA_AVAILABLE:
         return
     mark_step_begin = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
     if mark_step_begin is not None:

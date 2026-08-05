@@ -383,7 +383,7 @@ def test_compile_decoder_blocks_no_decoder_layers_returns_zero(monkeypatch):
 def test_mark_compile_step_begin_calls_torch_compiler_api(monkeypatch):
     calls = []
 
-    monkeypatch.setattr("veomni.distributed.torch_compile.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(torch, "compiler", SimpleNamespace(cudagraph_mark_step_begin=lambda: calls.append("mark")))
 
     mark_compile_step_begin(enable_compile=True)
@@ -395,7 +395,7 @@ def test_mark_compile_step_begin_calls_torch_compiler_api(monkeypatch):
 def test_mark_compile_step_begin_skips_non_cuda(monkeypatch):
     calls = []
 
-    monkeypatch.setattr("veomni.distributed.torch_compile.IS_CUDA_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(torch, "compiler", SimpleNamespace(cudagraph_mark_step_begin=lambda: calls.append("mark")))
 
     mark_compile_step_begin(enable_compile=True)
@@ -404,7 +404,7 @@ def test_mark_compile_step_begin_skips_non_cuda(monkeypatch):
 
 
 def test_mark_compile_step_begin_skips_without_torch_compiler(monkeypatch):
-    monkeypatch.setattr("veomni.distributed.torch_compile.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
     monkeypatch.delattr(torch, "compiler", raising=False)
 
     mark_compile_step_begin(enable_compile=True)
@@ -517,6 +517,21 @@ def test_validate_compile_runtime_rejects_unsupported_contracts(monkeypatch, ove
 
     with pytest.raises(RuntimeError, match=error):
         validate_compile_runtime(CompileConfig(enable=True), **runtime)
+
+
+def test_validate_compile_runtime_rejects_when_cuda_is_unavailable(monkeypatch):
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+
+    with pytest.raises(RuntimeError, match="CUDA-only"):
+        validate_compile_runtime(
+            CompileConfig(enable=True),
+            device_type=get_device_type(),
+            fsdp_enabled=True,
+            fsdp_mode="fsdp2",
+            any_extra_parallel_enabled=False,
+            enable_reshard_after_forward=True,
+        )
 
 
 def test_validate_compile_runtime_rejects_cuda_graphs_with_forward_reshard(monkeypatch):
