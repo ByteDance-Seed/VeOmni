@@ -87,6 +87,21 @@ def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
     return Shard(dim) if dim is not None else None
 
 
+def _move_buffers_to_device(model: nn.Module, device: str) -> None:
+    """Place every buffer on ``device``.
+
+    ``CPUOffloadPolicy`` only offloads parameters, gradients and optimizer states:
+    ``fully_shard`` puts buffers on the FSDP device once at wrap time and never stages
+    them again. Meta init defers that move, so a CPU materialization leaves buffers such
+    as the DeepSeek-V4 hash-router ``tid2eid`` table or rotary ``inv_freq`` on CPU while
+    the activations are on the accelerator.
+    """
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if buffer is not None and buffer.device.type != device:
+                module._buffers[name] = buffer.to(device)
+
+
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
     """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``."""
     parallel_plan = getattr(model, "get_parallel_plan", None)
@@ -555,6 +570,9 @@ def parallelize_model_fsdp2(
                     adapter_path=adapter_path,
                     fqn_to_index_mapping=fqn_to_index_mapping,
                 )
+
+    if materialize_device == "cpu":
+        _move_buffers_to_device(model, get_device_type())
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn

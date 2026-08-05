@@ -26,13 +26,18 @@ except ImportError:
     from .hdfs_io import copy, exists, makedirs
 
 
-__all__ = ["copy", "exists", "makedirs"]
+__all__ = ["copy", "exists", "makedirs", "copy_to_local", "is_non_local"]
 
 _HDFS_PREFIX = "hdfs://"
 
 
-def _is_non_local(path):
+def is_non_local(path: str) -> bool:
+    """Return True if ``path`` is a non-local (HDFS) path."""
     return path.startswith(_HDFS_PREFIX)
+
+
+# Backward-compatible private alias.
+_is_non_local = is_non_local
 
 
 def md5_encode(path: str) -> str:
