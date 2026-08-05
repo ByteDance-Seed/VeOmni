@@ -172,17 +172,23 @@ Core files:
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU compatibility.
 
+24. **MagiAttention SM90 requires a separately installed CUTLASS overlay**
+   - Run `scripts/kernel/install_magi_sm90.sh` after `uv sync --extra gpu --dev`. A later exact `uv sync` can remove the overlay.
+   - The verified default exposes BF16/FP16 inputs, the hdim128 bucket, and nfunc 1/3/5. Input head dimensions up to 128 use that bucket; use `--dtype bf16` when FP16 runtime dispatch is unnecessary.
+   - The pinned upstream build cannot disable BF16, so a true FP16-only overlay is unsupported.
+   - The pinned upstream nfunc generator instantiates disabled dtype and feature combinations. Enabling dedicated hdim64 or hdim256 buckets can exceed CUDA 13 PTX register-allocation limits, so CLI overrides are build requests rather than supported configurations.
+
 ## Trainer Extensions
 
-24. **Trainer callback lifecycle changes must cover composed trainers**
+25. **Trainer callback lifecycle changes must cover composed trainers**
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
-25. **Module-level OpSlots are shared by every model instance**
+26. **Module-level OpSlots are shared by every model instance**
    - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
    - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
 
-26. **DCP full resume skips HF weight materialization**
+27. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `skip_weights_load=True` into `build_parallelize_model` / `parallelize_model_fsdp2`.
     - The model is only `to_empty()`-materialized; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
     - LoRA/PEFT must not set `skip_weights_load` (and the FSDP2 path raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.

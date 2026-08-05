@@ -61,12 +61,10 @@ The backend compute functions are replaceable module-level slots:
   `_flash_attention_forward`;
 - `attention.flex._flex_attention_forward`, defaulting to Transformers'
   `flex_attention_forward`;
-- `attention.magi._magi_attention_forward`, defaulting to a lazy import of
-  MagiAttention's architecture-portable `functional.ffa_fa4_func`.
+- `attention.magi._magi_attention_forward`, defaulting to MagiAttention's architecture-aware `functional.ffa_fa4_func`.
 
 The Magi default uses the package's existing `FA4AttnFunc` autograd node.
-VeOmni adds no custom autograd implementation. The adapter supports the SM100+
-CUTE DSL/JIT path and validates that hardware requirement once per device.
+VeOmni adds no custom autograd implementation. SM90 uses the precompiled CUTLASS `ffa_fa3` backend, while SM100 and newer GPUs use the CUTE DSL/JIT backend. VeOmni prepares and validates the selected backend once per device.
 
 All three public callables use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
@@ -108,15 +106,46 @@ sequence lengths. The tensors are then passed directly to MagiAttention's
 public non-distributed FFA API. The generic adapter does not infer ranges from
 dense masks or convert a FlexAttention `BlockMask`.
 
-The current adapter requires `cp_size == 1`, batch size 1, zero attention
-dropout, and NVIDIA SM100 or newer. It accepts SP1 or VeOmni Ulysses sequence
-parallelism, passes `scaling` as Magi's `softmax_scale`, and passes `softcap`.
-The CUTE DSL/JIT backend and its metadata helper extensions are installed by
-the `gpu` extra:
+The current adapter requires `cp_size == 1`, batch size 1, zero attention dropout, and NVIDIA SM90 or newer. It accepts SP1 or VeOmni Ulysses sequence parallelism, passes `scaling` as Magi's `softmax_scale`, and passes `softcap`. SM80 and older GPUs are unsupported.
+
+The `gpu` extra installs MagiAttention and the CUTE DSL/JIT dependencies used on SM100 and newer GPUs:
 
 ```bash
 uv sync --extra gpu --dev
 ```
+
+### Installing the SM90 CUTLASS overlay
+
+SM90 additionally requires a precompiled CUTLASS overlay. Install the verified default matrix after syncing the GPU environment:
+
+```bash
+bash scripts/kernel/install_magi_sm90.sh
+```
+
+The default configuration enables BF16 and FP16 inputs, the hdim128 kernel bucket, arbitrary-mask forward and backward for nfunc 1, 3, and 5, `MAX_JOBS=2`, `NVCC_THREADS=4`, and NVCC `--split-compile=32`. The hdim128 bucket accepts input head dimensions up to 128, so models with head dimension 64 do not require the separate hdim64 specialization. Use `--dtype bf16` when FP16 runtime dispatch is unnecessary. FP8, softcap, split KV, paged KV, append KV, local attention, PackGQA, varlen, and cluster kernels are excluded from runtime dispatch because the current Magi adapter does not use them.
+
+Use `--print-config` to inspect the resolved build without checking CUDA or compiling. Selected settings can be overridden from the CLI:
+
+```bash
+# Inspect the verified default.
+bash scripts/kernel/install_magi_sm90.sh --print-config
+
+# Request additional upstream head-dimension buckets.
+bash scripts/kernel/install_magi_sm90.sh --dim 64,128,256
+
+# Customize mask functions, dtype coverage, and compiler concurrency.
+bash scripts/kernel/install_magi_sm90.sh \
+  --dim 128 \
+  --nfunc 1,3 \
+  --dtype bf16,fp16 \
+  --max-jobs 4 \
+  --nvcc-threads 2 \
+  --split-compile 16
+```
+
+Run the script with `--help` for the complete option list. The pinned upstream build always exposes BF16 and provides no corresponding disable flag, so `--dtype fp16` cannot produce a true FP16-only overlay and is rejected. The `--dtype` option controls runtime dtype exposure, but the upstream nfunc generator may still instantiate disabled dtype and feature combinations during compilation. Non-default matrices are forwarded to the pinned upstream build without claiming that they are supported. Dedicated hdim64 or hdim256 arbitrary kernels can fail CUDA 13 compilation with a PTX register-allocation error. In particular, `--dim 64,128,256` is a valid request but is not a verified configuration and does not fall back automatically if compilation fails.
+
+The overlay is intentionally installed after `uv sync`. A later exact `uv sync` can remove it, so rerun the installer before using MagiAttention on SM90.
 
 Standalone `sliding_window` metadata is rejected because all visibility must
 already be encoded by the range mask. MagiAttention's own FFA autograd

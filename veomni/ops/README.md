@@ -70,7 +70,7 @@ own Triton RMSNorm/rotary. See the per-model table below.
 | `triton` | Triton + CUDA | Validated by the model `extra_backends` registration |
 | `flash_attention_2/3/4` | `flash-attn` / `flash-attn-interface` / `flash-attn.cute` | Validated in `OpsImplementationConfig.__post_init__` |
 | `flex_attention` | PyTorch FlexAttention | Native `BlockMask`; compiled CUDA execution for training |
-| `magi_attention` | `magi-attention==1.1.1`, NVIDIA SM100+ | Native `MagiAttentionMask`; CP1 FFA with optional Ulysses through the CUTE DSL/JIT backend. |
+| `magi_attention` | `magi-attention==1.1.1`, NVIDIA SM90+ | Native `MagiAttentionMask`; CP1 FFA with optional Ulysses through the SM90 CUTLASS overlay or SM100+ CUTE DSL/JIT backend. |
 | `moe_implementation=fused_triton` | Triton, SM70+ | `is_fused_moe_available()` |
 | `moe_implementation=fused_quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
 | `moe_implementation=fused_npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
@@ -84,9 +84,13 @@ The GPU extra installs MagiAttention and its SM100+ CUTE DSL/JIT backend:
 uv sync --extra gpu --dev
 ```
 
-SM80 and SM90 are not supported by VeOmni's MagiAttention adapter; selecting
-`magi_attention` on those devices raises a hardware-requirement error before
-loading the backend.
+SM90 additionally requires the precompiled CUTLASS overlay:
+
+```bash
+bash scripts/kernel/install_magi_sm90.sh
+```
+
+The verified default enables BF16/FP16 inputs, the hdim128 bucket, and nfunc 1/3/5. Run the installer with `--help` to see optional dtype, head-dimension, nfunc, and compiler-concurrency overrides. SM80 and older GPUs are unsupported.
 
 ### Per-model PER_MODEL coverage
 

@@ -31,6 +31,16 @@ optional energon dataset format. See
 [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
 for the full list.
 
+### Optional MagiAttention SM90 overlay
+
+MagiAttention uses CUTE DSL/JIT on SM100 and newer GPUs. SM90 GPUs require an additional CUTLASS overlay after the GPU environment is synced:
+
+```bash
+bash scripts/kernel/install_magi_sm90.sh
+```
+
+The verified default enables BF16/FP16 inputs, the hdim128 bucket, and nfunc 1/3/5. Use `--help` to inspect optional build overrides. A later exact `uv sync` can remove the overlay, so rerun the installer before using MagiAttention on SM90.
+
 > **Note**: video/audio processing also needs ffmpeg installed at the OS level:
 > ```bash
 > # Ubuntu/Debian
