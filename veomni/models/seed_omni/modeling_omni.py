@@ -269,7 +269,14 @@ class OmniModel(PreTrainedModel):
 
     @staticmethod
     def _save_module_assets(module: nn.Module, module_dir: str) -> None:
-        """Save a module's config plus its processor / tokenizer sidecars (no weights)."""
+        """Save a module's config plus its processor / tokenizer sidecars (no weights).
+
+        ``module`` may still be DDP-wrapped under VeOmni training (FSDP2 composes
+        in place, but ``DistributedDataParallel`` does not forward unknown
+        attribute lookups to ``.module``) — unwrap first so ``config`` / processor
+        / tokenizer resolve regardless of ``dp_mode``.
+        """
+        module = unwrap_module_chain(module)
         cfg = getattr(module, "config", None)
         if cfg is not None and hasattr(cfg, "save_pretrained"):
             cfg.save_pretrained(module_dir)

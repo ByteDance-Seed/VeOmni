@@ -639,8 +639,14 @@ class ModuleRuntime:
             logger.info_rank0(f"ModuleRuntime '{label}': loaded {kind}.")
 
     def collect_hf_export_assets(self) -> List[Any]:
-        """Return this module's config + processor/tokenizer sidecars for HF export."""
-        model = self.model
+        """Return this module's config + processor/tokenizer sidecars for HF export.
+
+        ``self.model`` may still be DDP-wrapped here (FSDP2 composes in place and
+        exposes the raw model's attributes, but ``DistributedDataParallel`` does
+        not forward unknown attribute lookups to ``.module``) — unwrap first so
+        ``config`` / processor / tokenizer resolve regardless of ``dp_mode``.
+        """
+        model = unwrap_module(self.model)
         assets: List[Any] = []
         cfg = getattr(model, "config", None)
         if cfg is not None:

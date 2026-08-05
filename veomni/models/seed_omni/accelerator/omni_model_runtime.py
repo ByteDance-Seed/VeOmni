@@ -311,9 +311,9 @@ class OmniModelRuntime:
         for module_runtime in self.module_runtimes.values():
             module_runtime.save_hf_or_lora(state)
 
-    def save_pretrained(self, **kwargs: Any) -> None:
+    def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
         """Save the omni-root HF layout (config + graphs + module sidecars)."""
-        self.model.save_pretrained(**kwargs)
+        self.model.save_pretrained(save_directory, **kwargs)
 
 
 __all__ = ["OmniModelRuntime"]

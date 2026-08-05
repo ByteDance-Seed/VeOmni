@@ -462,6 +462,13 @@ class OmniTrainer:
         Each context is entered explicitly in :meth:`forward_backward_step` /
         :meth:`offline_cache_step` so the train loop reads as a recipe. Grad-accum
         FSDP reshard is handled imperatively via :func:`cascade_module_reshard`.
+
+        The activation-offload contexts are genuinely reusable (``nullcontext`` /
+        ``saved_tensors_hooks`` don't consume state on ``__enter__``), so they are
+        built once here and entered repeatedly. ``set_batch_invariant_mode`` is a
+        ``@contextmanager`` generator CM — single-use by construction (Python
+        deletes its ``args``/``kwds``/``func`` on first ``__enter__``) — so it is
+        *not* cached here; every call site builds a fresh one per step instead.
         """
         args = self.args
         offload = args.model.accelerator.offload_config
@@ -471,7 +478,6 @@ class OmniTrainer:
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
             activation_gpu_limit=offload.activation_gpu_limit if offload else 0.0,
         )
-        self.batch_invariant_context = set_batch_invariant_mode(enabled=self.args.train.enable_batch_invariant_mode)
         logger.info_rank0(
             "OmniTrainer: step contexts — "
             f"activation_offload={enable_activation}, "
@@ -620,14 +626,14 @@ class OmniTrainer:
         self._cascade_module_reshard(micro_step, num_micro_steps)
 
         # Forward: spill activations to CPU (if enabled) + batch-invariant ops.
-        with self.fwd_activation_offload_ctx, self.batch_invariant_context:
+        with self.fwd_activation_offload_ctx, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             result: Dict[str, Any] = self.model.forward(micro_batch)
 
         total_loss: torch.Tensor = result["loss"]
         loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
 
         # Backward: separate offload hook stack (may differ from forward when GC is on).
-        with self.bwd_activation_offload_ctx, self.batch_invariant_context:
+        with self.bwd_activation_offload_ctx, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
             total_loss.backward()
 
         del micro_batch
@@ -674,7 +680,11 @@ class OmniTrainer:
             micro_batch = self.preforward(micro_batch)
             self._cascade_module_reshard(micro_step, num_micro_steps)
             # Encode-only: no autograd graph; still honour offload + batch-invariant.
-            with torch.no_grad(), self.fwd_activation_offload_ctx, self.batch_invariant_context:
+            with (
+                torch.no_grad(),
+                self.fwd_activation_offload_ctx,
+                set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
+            ):
                 self.model.forward(micro_batch)
 
             conversation_list = micro_batch["conversation_list"]
