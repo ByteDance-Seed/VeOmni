@@ -23,5 +23,5 @@ def test_accelerator_context_parallel_alone_is_accepted(monkeypatch):
 
 def test_accelerator_hybrid_context_and_ulysses_is_rejected(monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "4")
-    with pytest.raises(AssertionError, match="ulysses_size"):
+    with pytest.raises(NotImplementedError, match="ulysses_size"):
         TrainingArguments(accelerator=AcceleratorConfig(cp_size=2, ulysses_size=2))

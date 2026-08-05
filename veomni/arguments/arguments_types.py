@@ -810,11 +810,12 @@ class TrainingArguments:
             )
         assert acc.tp_size == 1, "Tensor parallel size not supported yet."
         assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
-        assert not (acc.cp_size > 1 and acc.ulysses_size > 1), (
-            "Context parallelism cannot be combined with Ulysses yet; "
-            f"got cp_size={acc.cp_size} with ulysses_size={acc.ulysses_size}. "
-            "Set ulysses_size=1 to use context parallelism."
-        )
+        if acc.cp_size > 1 and acc.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={acc.cp_size} with ulysses_size={acc.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
 
