@@ -28,7 +28,7 @@ from ..distributed.torch_compile import mark_compile_step_begin
 from ..models import build_tokenizer
 from ..utils import helper
 from ..utils.device import synchronize
-from ..utils.loss_utils import count_loss_token
+from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
 from .base import BaseTrainer, VeOmniIter
 
 
@@ -127,6 +127,7 @@ class TextTrainer:
 
         # token num for fixed_ce_loss in postforward
         self.base.micro_batches_token_len = count_loss_token(micro_batches)
+        self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
