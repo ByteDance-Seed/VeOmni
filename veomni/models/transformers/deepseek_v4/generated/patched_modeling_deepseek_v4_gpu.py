@@ -28,7 +28,7 @@
 #    - method_override: DeepseekV4Indexer.forward
 #      Optional TileLang Lightning Indexer dispatch
 #    - method_override: DeepseekV4Attention.forward
-#      Packed compressor path + Ulysses SP for DeepSeek-V4 eager/TileLang attention
+#      Packed compressor path + Ulysses SP / context parallelism for DeepSeek-V4 attention
 #    - function_replacement: eager_attention_forward
 #      Optional TileLang sparse MQA dispatch
 #    - method_override: DeepseekV4Model.forward
@@ -69,6 +69,7 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
+from veomni.distributed.context_parallel import all_gather_kv
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_outputs, gather_seq_scatter_heads
 from veomni.models.transformers.deepseek_v4.packed_utils import (
@@ -1156,6 +1157,9 @@ class DeepseekV4Attention(nn.Module):
     # 2. Ulysses SP: all-to-all Q heads, sequence all-gather for MQA KV and
     #    compressor inputs (windows/indexers need the full sequence), then
     #    scatter attention outputs back to the local sequence shard.
+    # 3. Context parallelism: shard the queries instead of the heads and
+    #    replicate the MQA KV, so both Ulysses all-to-alls disappear and the
+    #    sparse indices keep addressing global KV rows.
     # ================================================================
     def forward(
         self,
@@ -1181,12 +1185,33 @@ class DeepseekV4Attention(nn.Module):
         if past_key_values is not None:
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
 
-        ulysses_enabled = get_parallel_state().ulysses_enabled
+        parallel_state = get_parallel_state()
+        ulysses_enabled = parallel_state.ulysses_enabled
+        cp_enabled = parallel_state.cp_enabled
         compressor_hidden = hidden_states
         compressor_q_residual = q_residual
         compressor_position_ids = position_ids
         s_aux = self.sinks
-        if ulysses_enabled:
+        # Query rows and KV rows coincide off the CP path, which is what the sparse
+        # index builders assume by default.
+        query_offset = 0
+        kv_full_len = None
+        if cp_enabled:
+            if past_key_values is not None:
+                raise NotImplementedError("DeepSeek V4 context parallelism does not support a KV cache")
+            # Queries stay sharded with every head; KV is replicated so every sparse
+            # index keeps addressing the same global row the kernels expect. The
+            # compressor inputs stay local for the same reason -- each rank
+            # compresses its own shard.
+            local_seq_len = hidden_states.shape[1]
+            query_offset = parallel_state.cp_rank * local_seq_len
+            kv_full_len = local_seq_len * parallel_state.cp_size
+            kv = all_gather_kv(kv, parallel_state.cp_group)
+            # The caller builds the mask over the full sequence, as it does under
+            # Ulysses; only this rank's query rows are computed here.
+            if isinstance(attention_mask, torch.Tensor):
+                attention_mask = attention_mask.narrow(-2, query_offset, local_seq_len)
+        elif ulysses_enabled:
             if past_key_values is not None:
                 raise RuntimeError("DeepSeek-V4 Ulysses SP does not support KV-cache decode")
             ulysses_group = get_parallel_state().ulysses_group
@@ -1257,21 +1282,28 @@ class DeepseekV4Attention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
         kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
+        # Not ``kv.shape[-2] - q.shape[-2]``: that assumed the query and
+        # full-resolution KV lengths are equal, which is what CP breaks.
+        compressed_len = compressed_kv.shape[2] if self.compressor is not None else 0
         if mask_free_sparse:
             kwargs["sparse_topk_indices"] = build_packed_sparse_attention_indices(
                 position_ids=compressor_position_ids,
                 sliding_window=self.sliding_window,
-                compressed_len=kv.shape[-2] - q.shape[-2],
+                compressed_len=compressed_len,
                 candidates=compressed_candidates,
+                query_offset=query_offset,
+                kv_full_len=kv_full_len,
             )
         elif use_compact_sparse_indices:
             kwargs["sparse_topk_indices"] = build_sparse_attention_indices(
                 batch_size=q.shape[0],
                 seq_len=q.shape[-2],
                 sliding_window=self.sliding_window,
-                compressed_len=kv.shape[-2] - q.shape[-2],
+                compressed_len=compressed_len,
                 compressed_indices=compressed_candidates.topk_indices if compressed_candidates is not None else None,
                 device=q.device,
+                query_offset=query_offset,
+                kv_full_len=kv_full_len,
             )
         attn_output, attn_weights = attention_interface(
             self,

@@ -116,7 +116,9 @@ def _run_deepseek_v4_attention_sp_fw_bw(
     baseline_param_grads = None
     baseline_input_grad = None
     if rank == 0:
-        no_sp_state = SimpleNamespace(ulysses_enabled=False)
+        # The stub has to carry every parallel-state attribute the attention
+        # forward reads, or the baseline raises instead of taking the single-rank path.
+        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
             baseline_hidden = full_hidden.detach().clone().requires_grad_(True)
             baseline_out, _ = layer(
