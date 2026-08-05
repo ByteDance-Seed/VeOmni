@@ -198,13 +198,30 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
     dist.destroy_process_group()
 
 
-def _cp_state(cp_size: int = 2, cp_rank: int = 0) -> SimpleNamespace:
-    """A parallel state claiming CP without a process group.
+class _UnusableGroup:
+    """A truthy stand-in for a CP process group that no collective can use.
 
-    Every guard below raises before the KV all-gather, so ``cp_group=None`` is
-    reached only if a guard has been moved after the collective.
+    ``cp_group=None`` would be worse than useless here: ``gather_outputs``
+    resolves a ``None`` group to the global SP group, which is also ``None`` in a
+    single-process test, and then returns its input unchanged at
+    ``if not group: return x``. The KV all-gather would silently identity-pass and
+    a guard moved after it would go unnoticed. This object is truthy, so it gets
+    past that check, and has none of a process group's methods, so reaching the
+    collective raises ``ValueError: Default process group has not been
+    initialized`` instead. That is what lets the tests below pin each guard ahead
+    of the all-gather rather than merely somewhere in the forward.
     """
-    return SimpleNamespace(ulysses_enabled=False, cp_enabled=True, cp_group=None, cp_rank=cp_rank, cp_size=cp_size)
+
+
+def _cp_state(cp_size: int = 2, cp_rank: int = 0) -> SimpleNamespace:
+    """A parallel state claiming CP, with a group that fails loudly if used."""
+    return SimpleNamespace(
+        ulysses_enabled=False,
+        cp_enabled=True,
+        cp_group=_UnusableGroup(),
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+    )
 
 
 def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int):

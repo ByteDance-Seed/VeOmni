@@ -836,15 +836,15 @@
 +            kv_full_len = local_seq_len * parallel_state.cp_size
 +            # The caller builds the mask over the full sequence, as it does under
 +            # Ulysses; only this rank's query rows are computed here. Checked before
-+            # the all-gather so a violation raises on every rank rather than leaving
-+            # rank 0 waiting in a collective for ranks that already failed.
++            # the all-gather: shards are equally sized, so every rank sees the same
++            # mismatch and all of them raise before any enters a collective.
 +            if isinstance(attention_mask, torch.Tensor):
 +                if attention_mask.shape[-2] != kv_full_len:
 +                    raise ValueError(
 +                        "DeepSeek V4 context parallelism needs an attention mask spanning the full "
 +                        f"sequence, so {kv_full_len} query rows, not this rank's shard; got "
-+                        f"{attention_mask.shape[-2]}. An uneven split across cp ranks fails here too, "
-+                        "because the full length is derived as local_seq_len * cp_size."
++                        f"{attention_mask.shape[-2]}. That length assumes every cp rank holds an "
++                        "equally sized shard, which is what the collator's padding guarantees."
 +                    )
 +                attention_mask = attention_mask.narrow(-2, query_offset, local_seq_len)
 +            kv = all_gather_kv(kv, parallel_state.cp_group)
