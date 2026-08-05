@@ -146,8 +146,6 @@ class OmniConfig(PretrainedConfig):
         generation_graphs: Dict[str, Dict],
         *,
         infer_type: Optional[str] = None,
-        training_graph_file: str = DEFAULT_TRAINING_GRAPH_FILE,
-        generation_graph_file: str = DEFAULT_GENERATION_GRAPH_FILE,
         generation_kwargs: Optional[Dict] = None,
         **kwargs,
     ):
@@ -155,8 +153,6 @@ class OmniConfig(PretrainedConfig):
         self.training_graph = training_graph
         self.generation_graphs = generation_graphs
         self.infer_type = infer_type
-        self.training_graph_file = training_graph_file
-        self.generation_graph_file = generation_graph_file
         self.generation_kwargs = generation_kwargs
 
         super().__init__(**kwargs)
@@ -184,7 +180,7 @@ class OmniConfig(PretrainedConfig):
             self.infer_type,
             empty_hint=(
                 "Populate `generation_graphs` (via `model.model_config.infer_graph`, or by loading a "
-                f"checkpoint whose `{self.generation_graph_file}` sidecar has them)."
+                f"checkpoint whose `{DEFAULT_GENERATION_GRAPH_FILE}` sidecar has them)."
             ),
             unknown_hint="infer_type",
         )
@@ -275,8 +271,6 @@ class OmniConfig(PretrainedConfig):
             generation_graphs if generation_graphs is not None else self.generation_graphs
         )
         export_dict["infer_type"] = self.infer_type
-        export_dict["training_graph_file"] = self.training_graph_file
-        export_dict["generation_graph_file"] = self.generation_graph_file
         accepted = {k: v for k, v in export_dict.items() if k in OmniConfig.__init__.__code__.co_varnames}
         return OmniConfig.from_dict(accepted)
 
@@ -379,17 +373,15 @@ class OmniConfig(PretrainedConfig):
         self.modules = hydrated
 
     def _hydrate_graphs_from_checkpoint(self, checkpoint_root: Union[str, os.PathLike]) -> None:
-        """Load ``training_graph`` and ``generation_graphs`` from YAML sidecars."""
+        """Load ``training_graph`` and ``generation_graphs`` from their fixed-name YAML sidecars."""
         root = str(checkpoint_root)
-        training_file = self.training_graph_file
-        generation_file = self.generation_graph_file
 
-        training_path = os.path.join(root, training_file)
+        training_path = os.path.join(root, DEFAULT_TRAINING_GRAPH_FILE)
         if not os.path.isfile(training_path):
             raise FileNotFoundError(f"Omni checkpoint missing required graph sidecar: {training_path}")
         self.training_graph = self._read_graph_file(training_path, "training_graph")
 
-        generation_path = os.path.join(root, generation_file)
+        generation_path = os.path.join(root, DEFAULT_GENERATION_GRAPH_FILE)
         if not os.path.isfile(generation_path):
             raise FileNotFoundError(f"Omni checkpoint missing required graph sidecar: {generation_path}")
         self.generation_graphs = self._read_generation_graphs(generation_path)
@@ -428,24 +420,22 @@ class OmniConfig(PretrainedConfig):
 
         export_config = self.copy_for_hf_export()
 
-        training_file = export_config.training_graph_file
-        generation_file = export_config.generation_graph_file
-
         self._write_graph_file(
-            os.path.join(save_directory, training_file),
+            os.path.join(save_directory, DEFAULT_TRAINING_GRAPH_FILE),
             "training_graph",
             export_config.training_graph,
         )
         self._write_graph_file(
-            os.path.join(save_directory, generation_file),
+            os.path.join(save_directory, DEFAULT_GENERATION_GRAPH_FILE),
             "generation_graphs",
             export_config.generation_graphs,
         )
 
+        # The sidecar files above are the sole source of truth for both graphs —
+        # `config.json` never carries them inline, so `from_pretrained` always
+        # re-hydrates via `_hydrate_graphs_from_checkpoint` (fixed filenames).
         config_dict = export_config.to_dict()
-        config_dict["training_graph_file"] = training_file
-        config_dict["generation_graph_file"] = generation_file
-        config_dict["training_graph"] = []
+        config_dict.pop("training_graph", None)
         config_dict.pop("generation_graphs", None)
 
         config_path = os.path.join(save_directory, "config.json")

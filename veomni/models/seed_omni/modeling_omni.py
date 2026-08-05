@@ -87,8 +87,6 @@ _OMNI_CONFIG_OVERRIDE_KEYS = frozenset(
         "training_graph",
         "generation_graphs",
         "modules",
-        "training_graph_file",
-        "generation_graph_file",
     }
 )
 

@@ -76,8 +76,6 @@ def _write_omni_checkpoint(root: Path) -> None:
             "decoder": {"subfolder": "decoder"},
         },
         "infer_type": "infer_gen",
-        "training_graph_file": DEFAULT_TRAINING_GRAPH_FILE,
-        "generation_graph_file": DEFAULT_GENERATION_GRAPH_FILE,
         "generation_kwargs": {"max_new_tokens": 16},
     }
     (root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -250,8 +248,7 @@ def test_omni_config_save_pretrained_writes_graph_sidecars(tmp_path):
     config.save_pretrained(tmp_path)
 
     saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    assert saved["training_graph_file"] == DEFAULT_TRAINING_GRAPH_FILE
-    assert saved["training_graph"] == []
+    assert "training_graph" not in saved
     assert saved["modules"] == {"encoder": {"subfolder": "encoder"}}
     assert "generation_graphs" not in saved
     assert (tmp_path / DEFAULT_GENERATION_GRAPH_FILE).exists()
