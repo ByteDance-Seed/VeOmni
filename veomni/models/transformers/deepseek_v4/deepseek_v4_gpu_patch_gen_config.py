@@ -637,6 +637,8 @@ def deepseek_v4_indexer_forward_patched(
         and compressed_len > 0
         and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
     )
+    if indexer_implementation == "tilelang" and not use_tilelang:
+        raise ValueError("DeepseekV4Indexer set dsa_indexer_implementation=True but not take effect.")
     if use_tilelang:
         query = q.transpose(0, 1).contiguous()
         query_weights = weights.transpose(0, 1).contiguous()
@@ -869,6 +871,8 @@ def deepseek_v4_eager_attention_forward_patched(
         and dropout == 0
         and key.shape[1] == 1
     )
+    if attention_implementation == "tilelang" and not use_tilelang:
+        raise ValueError("DeepseekV4Attention set dsa_attention_implementation=tilelang but not take effect.")
     if use_tilelang:
         topk_indices = kwargs.get("sparse_topk_indices")
         if topk_indices is None:
