@@ -166,3 +166,173 @@ def act_quant(
         x.copy_(y)
         return x
     return y, s
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def fp8_weight_quant_kernel(
+    M,
+    N,
+    block_size=128,
+    scale_dtype=FP32,
+    round_scale=False,
+):
+    """Block-wise ``block_size x block_size`` FP8 quantization, one tile per CTA.
+    round_scale=True rounds each tile scale up to a power of two (MXFP).
+    """
+    assert M % block_size == 0 and N % block_size == 0
+    fp8_min = -448.0
+    fp8_max = 448.0
+    fp8_max_inv = 1 / fp8_max
+
+    @T.prim_func
+    def fp8_weight_quant_kernel_(
+        X: T.Tensor[(M, N), BF16],
+        Y: T.Tensor[(M, N), FP8],
+        S: T.Tensor[(M // block_size, N // block_size), scale_dtype],
+    ):
+        with T.Kernel(N // block_size, M // block_size, threads=128) as (bx, by):
+            x_shared = T.alloc_shared((block_size, block_size), BF16)
+            y_shared = T.alloc_shared((block_size, block_size), FP8)
+            amax_row_local = T.alloc_fragment((block_size,), FP32)
+            scale_local = T.alloc_fragment((1,), FP32)
+            scale_shared = T.alloc_shared((1,), FP32)
+
+            T.copy(X[by * block_size, bx * block_size], x_shared)
+            T.reduce_absmax(x_shared, amax_row_local, dim=1)
+            T.reduce_absmax(amax_row_local, scale_local, dim=0)
+            scale_local[0] = T.max(scale_local[0], 1e-4)
+            if round_scale:
+                scale_local[0] = fast_round_scale(scale_local[0], fp8_max_inv)
+            else:
+                scale_local[0] = scale_local[0] * fp8_max_inv
+            T.copy(scale_local, scale_shared)
+
+            for i, j in T.Parallel(block_size, block_size):
+                y_shared[i, j] = T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max)
+
+            T.copy(y_shared, Y[by * block_size, bx * block_size])
+            if T.get_thread_binding(0) == 0:
+                S[by, bx] = T.Cast(scale_dtype, scale_shared[0])
+
+    return fp8_weight_quant_kernel_
+
+
+def fp8_weight_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: str | None = None,
+    scale_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise ``block_size x block_size`` FP8 quantization of a 2D weight.
+
+    Args:
+        x (torch.Tensor): The bfloat16 weight to quantize.
+        block_size (int): Side length of the square quantization tile.
+        scale_fmt (str | None): When set, tile scales are rounded up to a power
+            of two, as the MXFP formats require. DeepSeek V4 uses ``"ue8m0"``.
+        scale_dtype (torch.dtype): Storage dtype of the returned scales, either
+            ``torch.float32`` or ``torch.float8_e8m0fnu``. E8M0 carries no
+            mantissa, so it is only usable together with ``scale_fmt``.
+
+    Returns:
+        weight (torch.float8_e4m3fn): Quantized weight, same shape as ``x``.
+        scale (``scale_dtype``): One scale per ``block_size x block_size`` tile.
+    """
+    assert x.dim() == 2, f"fp8_weight_quant expects a 2D weight, got shape {tuple(x.shape)}"
+    assert x.dtype == torch.bfloat16, f"fp8_weight_quant expects a bfloat16 weight, got {x.dtype}"
+    assert scale_dtype in (torch.float32, torch.float8_e8m0fnu), (
+        f"fp8_weight_quant supports float32 and float8_e8m0fnu scales, got {scale_dtype}"
+    )
+    # Without rounding, the stored E8M0 scale would differ from the FP32 scale
+    # the kernel divides by, so dequantization would silently drift.
+    assert scale_dtype != torch.float8_e8m0fnu or scale_fmt is not None, (
+        'float8_e8m0fnu scales only represent powers of two: pass scale_fmt (DeepSeek V4 uses "ue8m0")'
+    )
+    M, N = x.shape
+    assert M % block_size == 0 and N % block_size == 0, (
+        f"weight shape {(M, N)} is not divisible by block_size {block_size}"
+    )
+    z = x.contiguous()
+    y = torch.empty_like(z, dtype=torch.float8_e4m3fn)
+    s = z.new_empty((M // block_size, N // block_size), dtype=scale_dtype)
+    kernel = fp8_weight_quant_kernel(
+        M,
+        N,
+        block_size,
+        scale_dtype=scale_dtype,
+        round_scale=scale_fmt is not None,
+    )
+    kernel(z, y, s)
+    return y, s
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, inplace=False):
+    """Block-wise FP4 quantization. Power-of-2 scale via bit ops. inplace=True does fused quant+dequant."""
+    M = T.symbolic("M")
+    fp4_max = 6.0
+    fp4_max_inv = 1.0 / fp4_max
+    blk_m = 32
+    group_size = block_size
+    compute_dtype = FP32
+    out_dtype = in_dtype if inplace else FP4
+
+    @T.prim_func
+    def fp4_quant_kernel_(
+        X: T.Tensor[(M, N), in_dtype],
+        Y: T.Tensor[(M, N), out_dtype],
+        S: T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (
+            pid_m,
+            pid_n,
+        ):
+            x_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+            x_local = T.alloc_fragment((blk_m, group_size), in_dtype)
+            amax_local = T.alloc_fragment((blk_m,), compute_dtype)
+            s_local = T.alloc_fragment((blk_m,), compute_dtype)
+            y_local = T.alloc_fragment((blk_m, group_size), out_dtype)
+            y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
+
+            for _ in T.Pipelined(1, num_stages=2):
+                T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
+                T.copy(x_shared, x_local)
+                T.reduce_absmax(x_local, amax_local, dim=1)
+                for i in T.Parallel(blk_m):
+                    amax_local[i] = T.max(amax_local[i], 6 * (2**-126))
+                    s_local[i] = fast_round_scale(amax_local[i], fp4_max_inv)
+                if inplace:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.Cast(
+                            out_dtype,
+                            T.Cast(compute_dtype, T.Cast(FP4, T.clamp(x_local[i, j] / s_local[i], -fp4_max, fp4_max)))
+                            * s_local[i],
+                        )
+                else:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], -fp4_max, fp4_max)
+                for i in T.Parallel(blk_m):
+                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
+                T.copy(y_local, y_shared)
+                T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
+
+    return fp4_quant_kernel_
+
+
+def fp4_act_quant(
+    x: torch.Tensor,
+    block_size: int = 32,
+    inplace: bool = False,
+) -> torch.Tensor:
+    """Block-wise FP4 quantization. inplace=True does fused quant+dequant back to BF16."""
+    N = x.size(-1)
+    assert N % block_size == 0
+    z = x.contiguous()
+    y = torch.empty_like(z) if inplace else z.new_empty(*z.shape[:-1], N // 2, dtype=torch.float4_e2m1fn_x2)
+    s = z.new_empty(*z.size()[:-1], N // block_size, dtype=torch.float8_e8m0fnu)
+    kernel = fp4_quant_kernel(N, block_size, inplace=inplace)
+    kernel(z.view(-1, N), y.view(-1, y.size(-1)), s.view(-1, N // block_size))
+    if inplace:
+        x.copy_(y)
+        return x
+    return y, s
