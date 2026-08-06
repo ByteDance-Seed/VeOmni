@@ -61,10 +61,9 @@ The backend compute functions are replaceable module-level slots:
   `_flash_attention_forward`;
 - `attention.flex._flex_attention_forward`, defaulting to Transformers'
   `flex_attention_forward`;
-- `attention.magi._magi_attention_forward`, defaulting to MagiAttention's architecture-aware `functional.ffa_fa4_func`.
+- `attention.magi._magi_attention_forward`, defaulting to VeOmni's architecture-aware FA4 adapter.
 
-The Magi default uses the package's existing `FA4AttnFunc` autograd node.
-VeOmni adds no custom autograd implementation. SM90 uses the precompiled CUTLASS `ffa_fa3` backend, while SM100 and newer GPUs use the CUTE DSL/JIT backend. VeOmni prepares and validates the selected backend once per device.
+The Magi default prepares an explicit `FA4AttnArg` and reuses it while the range tensors and attention shape remain unchanged, avoiding the upstream facade's repeated GPU-to-CPU range conversion in every transformer layer. VeOmni's FA4 autograd function passes that prepared argument directly to MagiAttention's lower-level `fa4_fwd` and `fa4_bwd` functions. SM90 uses the precompiled CUTLASS `ffa_fa3` backend, while SM100 and newer GPUs use the CUTE DSL/JIT backend. VeOmni prepares and validates the selected backend once per device.
 
 All three public callables use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
@@ -96,17 +95,19 @@ MagiAttentionMask(
 )
 ```
 
-Query and key ranges are paired half-open token intervals. When
-`attn_type_map` is present, values mean `0=full`, `1=causal`,
-`2=inverse causal`, and `3=bidirectional causal`; `None` means full attention
-for every range. The mask constructor validates tensor structure and static
-range/type values once. The caller or model-specific mask builder must also
-ensure that every range endpoint is within the actual post-SP query/key
-sequence lengths. The tensors are then passed directly to MagiAttention's
-public non-distributed FFA API. The generic adapter does not infer ranges from
-dense masks or convert a FlexAttention `BlockMask`.
+Query and key ranges are paired half-open token intervals. When `attn_type_map` is present, values mean `0=full`, `1=causal`, `2=inverse causal`, and `3=bidirectional causal`; `None` means full attention for every range. The mask constructor validates tensor structure and static range/type values once. The caller or model-specific mask builder must also ensure that every range endpoint is within the actual post-SP query/key sequence lengths. The default backend converts the tensor metadata into a prepared `FA4AttnArg` and reuses it across layers while the mask and attention shape remain unchanged. The generic adapter does not infer ranges from dense masks or convert a FlexAttention `BlockMask`.
 
 The current adapter requires `cp_size == 1`, batch size 1, zero attention dropout, and NVIDIA SM90 or newer. It accepts SP1 or VeOmni Ulysses sequence parallelism, passes `scaling` as Magi's `softmax_scale`, and passes `softcap`. SM80 and older GPUs are unsupported.
+
+### Unified MagiAttention mask builder
+
+VeOmni registers `create_magi_mask` as the Transformers mask builder for `veomni_magi_attention_with_sp`. Canonical unpacked causal and bidirectional models that call the Transformers mask registry without a 2D attention mask can therefore select MagiAttention without defining another mask builder. Models with richer visibility call the same builder directly with one of these metadata forms:
+
+- `cu_seq_lens_q` and `cu_seq_lens_k` for packed causal or bidirectional sequences;
+- explicit `q_ranges`, `k_ranges`, and `attn_type_map` for mixed or asymmetric visibility;
+- `q_length` and `kv_length` for one unpacked sequence.
+
+The builder deliberately does not materialize or reverse-engineer an arbitrary Transformers `mask_function`. Predicate-to-range conversion would require an O(sequence length squared) dense mask and cannot preserve every model-specific visibility rule efficiently. A 2D attention mask also does not expose packed boundaries because VeOmni uses an all-ones mask and records boundaries in `position_ids` and precomputed cumulative sequence lengths. Registry calls with a 2D mask but without explicit range metadata are rejected rather than silently allowing cross-sample attention. Models with packed, sliding-window, prefix, multimodal, or mixed visibility must pass declarative metadata explicitly.
 
 The `gpu` extra installs MagiAttention and the CUTE DSL/JIT dependencies used on SM100 and newer GPUs:
 
@@ -147,15 +148,16 @@ Run the script with `--help` for the complete option list. The pinned upstream b
 
 The overlay is intentionally installed after `uv sync`. A later exact `uv sync` can remove it, so rerun the installer before using MagiAttention on SM90.
 
-Standalone `sliding_window` metadata is rejected because all visibility must
-already be encoded by the range mask. MagiAttention's own FFA autograd
-implementation supplies backward; VeOmni does not add a custom autograd node.
+Standalone `sliding_window` metadata is rejected because all visibility must already be encoded by the range mask. VeOmni's `_MagiFA4Function` passes the prepared argument to MagiAttention's `fa4_fwd` and reuses the same argument for `fa4_bwd`.
 
 With Ulysses, the ranges describe the full sequence after the
 sequence-gather/head-scatter exchange and must be identical on every Ulysses
-rank. A future Magi Context Parallel implementation may reuse this mask
-carrier, but distributed dispatch/calc/undispatch and `cp_size > 1` are outside
-the current contract.
+rank. A layer that passes `skip_ulysses=True` must build local ranges by passing
+the same flag to `create_magi_mask`. The forward adapter validates range
+endpoints against the actual post-exchange query and key lengths before
+launching the kernel. A future Magi Context Parallel implementation may reuse
+this mask carrier, but distributed dispatch/calc/undispatch and `cp_size > 1`
+are outside the current contract.
 
 ## Integrating a new patchgen model
 
