@@ -567,6 +567,17 @@ def _cp_state(cp_size: int = 2, cp_rank: int = 0) -> SimpleNamespace:
     )
 
 
+def _ulysses_state(ulysses_size: int = 2) -> SimpleNamespace:
+    """The other sequence-parallel mode, likewise unusable if a collective is reached."""
+    return SimpleNamespace(
+        ulysses_enabled=True,
+        cp_enabled=False,
+        ulysses_group=_UnusableGroup(),
+        ulysses_rank=0,
+        ulysses_size=ulysses_size,
+    )
+
+
 def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, layer_idx: int = 0):
     """One rank's fixture on CPU: a local shard plus the full-sequence mask CP requires.
 
@@ -639,6 +650,54 @@ def test_deepseek_v4_attention_cp_rejects_a_local_length_mask(with_compressor):
     with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
         with pytest.raises(ValueError, match="full sequence"):
             forward(hidden, position_ids, local_mask)
+
+
+def _build_toy_model(seq_len: int):
+    """A whole toy model on CPU plus one batch of ids, for the model-forward guards."""
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    torch.manual_seed(0)
+    model = dsv4.DeepseekV4Model(config)
+    _init_every_position_bias(model)
+    model.eval()
+    return model, torch.randint(0, config.vocab_size, (1, seq_len))
+
+
+@pytest.mark.parametrize("sp_state", [_cp_state, _ulysses_state], ids=["cp", "ulysses"])
+def test_deepseek_v4_model_sp_rejects_absent_position_ids(sp_state):
+    """A shard cannot invent global positions, so the forward refuses to guess them.
+
+    ``arange(inputs_embeds.shape[1])`` would tell every rank that its tokens
+    start at position 0, while ``shard_packed_compression_metadata``, the
+    attention forward and the indexer all read ``position_ids`` as global. The
+    result would be silently wrong rather than an error: shapes stay
+    self-consistent, the sliding-window mask is built from nonsense positions,
+    and the indexer's canonical-position check admits the TileLang kernel on rank
+    0 alone, so the ranks disagree about causality. Both modes, because the
+    fabrication is equally wrong under Ulysses and the guard is one branch.
+
+    Pinned with the unusable group, which proves the refusal lands ahead of the
+    ``position_ids`` all-gather rather than merely somewhere in the forward.
+    """
+    model, input_ids = _build_toy_model(seq_len=32)
+    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=sp_state()):
+        with pytest.raises(ValueError, match="requires explicit position_ids"):
+            model(input_ids=input_ids)
+
+
+def test_deepseek_v4_model_without_sp_still_defaults_position_ids():
+    """With sequence parallelism off this rank holds the whole sequence, so ``arange`` is right."""
+    model, input_ids = _build_toy_model(seq_len=32)
+    no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
+    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state), torch.no_grad():
+        defaulted = model(input_ids=input_ids).last_hidden_state
+        explicit = model(
+            input_ids=input_ids, position_ids=torch.arange(input_ids.shape[1]).view(1, -1)
+        ).last_hidden_state
+    torch.testing.assert_close(defaulted, explicit, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")

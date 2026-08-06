@@ -2094,6 +2094,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     #    mask and packed compression metadata on the full sequence length so
     #    attention matches non-SP semantics after the all-gather inside
     #    ``DeepseekV4Attention``.
+    # 4. Refuse ``position_ids=None`` under either sequence-parallel mode instead
+    #    of defaulting to ``arange`` over the shard, which the layers below would
+    #    read as global positions.
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -2119,10 +2122,6 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         return_cache = past_key_values if use_cache else None
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        if position_ids is None:
-            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
-            position_ids = position_ids.unsqueeze(0)
 
         # Both sequence-parallel modes hand this forward one shard of a longer
         # sequence, and everything below has to keep describing the whole of it: the
@@ -2155,6 +2154,31 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         else:
             sp_group, sp_size = None, 1
         sp_enabled = sp_size > 1
+
+        if position_ids is None:
+            # ``arange(local_seq_len)`` is only the global sequence's positions when
+            # this rank holds all of it. Under either sequence-parallel mode it would
+            # tell every rank that its shard starts at position 0, and the contract
+            # above -- which ``shard_packed_compression_metadata``, the attention
+            # forward and the indexer all read as *global* -- would be violated
+            # silently: shapes stay self-consistent while every rank above 0
+            # compresses the wrong rows, and the indexer's canonical-position check
+            # admits the TileLang kernel on rank 0 alone, so the ranks disagree about
+            # causality. No local shard carries what it would take to reconstruct the
+            # global positions (packed data renumbers them per sample), so refuse
+            # instead of guessing. Ahead of the all-gather below, so a rank that
+            # refuses does not strand its peers in a collective.
+            if sp_enabled:
+                raise ValueError(
+                    "DeepSeek V4 requires explicit position_ids under sequence parallelism: "
+                    "this forward holds one shard of the sequence and cannot reconstruct the "
+                    "global positions the compressors, the attention forward and the indexer "
+                    "read. Pass the position_ids the collator sliced, which stay global."
+                )
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
+            position_ids = position_ids.unsqueeze(0)
+
         local_seq_len = inputs_embeds.shape[1]
         full_seq_len = local_seq_len * sp_size
         full_position_ids = gather_outputs(position_ids, gather_dim=-1, group=sp_group) if sp_enabled else position_ids

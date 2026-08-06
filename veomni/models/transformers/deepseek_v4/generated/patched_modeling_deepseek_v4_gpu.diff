@@ -1609,7 +1609,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +2084,17 @@
+@@ -1252,6 +2084,20 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1623,11 +1623,14 @@
 +    #    mask and packed compression metadata on the full sequence length so
 +    #    attention matches non-SP semantics after the all-gather inside
 +    #    ``DeepseekV4Attention``.
++    # 4. Refuse ``position_ids=None`` under either sequence-parallel mode instead
++    #    of defaulting to ``arange`` over the shard, which the layers below would
++    #    read as global positions.
 +    # ================================================================
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +2110,123 @@
+@@ -1267,28 +2113,144 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1642,15 +1645,6 @@
 -            past_key_values = DynamicCache(config=self.config)
          if inputs_embeds is None:
              inputs_embeds = self.embed_tokens(input_ids)
-         if position_ids is None:
--            past_seen = past_key_values.get_seq_length()
-+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
-             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
-             position_ids = position_ids.unsqueeze(0)
--            # `generate()` may pass a per-layer-type mask dict already built by
--            # `create_masks_for_generate`; all V4 layer types use the same sliding-window
--            # mask, so use the prebuilt one directly. Otherwise build it here.
--        if isinstance(attention_mask, dict):
 +
 +        # Both sequence-parallel modes hand this forward one shard of a longer
 +        # sequence, and everything below has to keep describing the whole of it: the
@@ -1683,6 +1677,36 @@
 +        else:
 +            sp_group, sp_size = None, 1
 +        sp_enabled = sp_size > 1
++
+         if position_ids is None:
+-            past_seen = past_key_values.get_seq_length()
++            # ``arange(local_seq_len)`` is only the global sequence's positions when
++            # this rank holds all of it. Under either sequence-parallel mode it would
++            # tell every rank that its shard starts at position 0, and the contract
++            # above -- which ``shard_packed_compression_metadata``, the attention
++            # forward and the indexer all read as *global* -- would be violated
++            # silently: shapes stay self-consistent while every rank above 0
++            # compresses the wrong rows, and the indexer's canonical-position check
++            # admits the TileLang kernel on rank 0 alone, so the ranks disagree about
++            # causality. No local shard carries what it would take to reconstruct the
++            # global positions (packed data renumbers them per sample), so refuse
++            # instead of guessing. Ahead of the all-gather below, so a rank that
++            # refuses does not strand its peers in a collective.
++            if sp_enabled:
++                raise ValueError(
++                    "DeepSeek V4 requires explicit position_ids under sequence parallelism: "
++                    "this forward holds one shard of the sequence and cannot reconstruct the "
++                    "global positions the compressors, the attention forward and the indexer "
++                    "read. Pass the position_ids the collator sliced, which stay global."
++                )
++            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
+             position_ids = position_ids.unsqueeze(0)
+-            # `generate()` may pass a per-layer-type mask dict already built by
+-            # `create_masks_for_generate`; all V4 layer types use the same sliding-window
+-            # mask, so use the prebuilt one directly. Otherwise build it here.
+-        if isinstance(attention_mask, dict):
++
 +        local_seq_len = inputs_embeds.shape[1]
 +        full_seq_len = local_seq_len * sp_size
 +        full_position_ids = gather_outputs(position_ids, gather_dim=-1, group=sp_group) if sp_enabled else position_ids
@@ -1761,7 +1785,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +2330,12 @@
+@@ -1392,6 +2354,12 @@
      return overall_loss * num_experts
 
 
@@ -1774,7 +1798,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +2354,36 @@
+@@ -1410,49 +2378,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1844,7 +1868,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +2396,64 @@
+@@ -1465,26 +2420,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1923,7 +1947,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2461,17 @@
+@@ -1492,7 +2485,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
