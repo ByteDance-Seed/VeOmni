@@ -21,13 +21,13 @@ _SAMPLING_KWARGS = ("temperature", "top_p", "do_sample")
 class TextEncoderModuleMixin(ModuleMixin):
     """Shared training / inference plumbing for every text encoder.
 
-    Concrete modules (janus / qwen3 / qwen3vl) subclass this and, for
-    discoverability, define their own ``XxxTextEncoderPreprocessor`` in a
-    module-local ``processing.py`` (registered via the ``preprocessor_class``
-    class attribute, mirroring the per-module image preprocessors) plus the
-    ``encode_pre`` / ``encode_post`` / ``decode_pre`` / ``decode_post``
-    pass-through hooks, so a reader finds each module's worker-prep and
-    call-site code in its own file rather than only here.
+    Concrete modules (janus / qwen3 / qwen3vl / bagel) subclass this and define
+    ``XxxTextEncoderPreprocessor`` in their ``processing.py`` by subclassing
+    :class:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor`
+    and implementing :meth:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
+    with the module-local chat template.  Register via ``preprocessor_class`` on
+    the family mixin, plus the ``encode_pre`` / ``encode_post`` / ``decode_pre`` /
+    ``decode_post`` pass-through hooks in each module's ``modulemixin.py``.
     """
 
     _chat_template: TextEncoderChatTemplate

@@ -4,6 +4,7 @@ Sub-package layout (per :mod:`veomni.models.seed_omni.modules`):
 
 * :mod:`.configuration` — :class:`TextEncoderConfig`
 * :mod:`.modeling`      — :class:`TextEncoder`
+* :mod:`.processing`   — :class:`TextEncoderPreprocessor`
 """
 
 from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY

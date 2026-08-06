@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .....auto import build_tokenizer
-from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem
+from ...base.text_encoder.processing import TextEncoderPreprocessor
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 
 
@@ -78,23 +78,26 @@ def apply_image_marker(
     item.value = torch.cat([marker_embeds[:1], image_embeds, marker_embeds[1:]], dim=0)
 
 
-class BagelTextEncoderPreprocessor(ModulePreprocessorBase):
+class BagelTextEncoderPreprocessor(TextEncoderPreprocessor):
     """Worker-side chat-template + tokenize for BAGEL text encoder inputs."""
 
-    def __init__(self, chat_template: BagelChatTemplate) -> None:
-        self._chat_template = chat_template
-        # bind_module_assets also copies _tokenizer onto the model — TextEncoderModuleMixin
-        # (base/text_encoder/modulemixin.py) decodes generated text via self._tokenizer.
-        self._tokenizer = chat_template.tokenizer
-
     @classmethod
-    def from_pretrained(cls, module_path: str, **kwargs: Any) -> BagelTextEncoderPreprocessor:
-        """Build straight from the checkpoint dir — no model instance needed."""
-        del kwargs
+    def build_chat_template(
+        cls,
+        module_path: str,
+        *,
+        config_overrides: dict[str, Any] | None = None,
+    ) -> BagelChatTemplate:
+        del config_overrides
         from .chat_template import BagelChatTemplate  # deferred: see module-level note
 
-        tokenizer = build_tokenizer(module_path)
-        return cls(BagelChatTemplate(tokenizer))
+        return BagelChatTemplate(build_tokenizer(module_path))
+
+    def _tokenize_conversation_kwargs(self, inference: bool, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "add_generation_prompt": inference,
+            "generation_kwargs": kwargs.get("generation_kwargs"),
+        }
 
     def __call__(
         self,
@@ -103,14 +106,7 @@ class BagelTextEncoderPreprocessor(ModulePreprocessorBase):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        for sample in conversation_list:
-            parts = self._chat_template.tokenize_conversation(
-                sample,
-                add_generation_prompt=inference,
-                generation_kwargs=generation_kwargs,
-            )
-            sample.clear()
-            sample.extend(parts)
+        super().__call__(conversation_list, inference=inference, generation_kwargs=generation_kwargs)
 
 
 __all__ = [
