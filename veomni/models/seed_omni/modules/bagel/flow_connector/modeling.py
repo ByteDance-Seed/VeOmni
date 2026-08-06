@@ -16,10 +16,10 @@ import torch.nn as nn
 from transformers import PreTrainedModel
 
 from .configuration import BagelFlowConnectorConfig
-from .modulemixin import BagelFlowConnectorMetricMeterMixin, BagelFlowConnectorModuleMixin
+from .modulemixin import VeOmniMixin
 
 
-class BagelFlowConnector(BagelFlowConnectorModuleMixin, BagelFlowConnectorMetricMeterMixin, PreTrainedModel):
+class BagelFlowConnector(VeOmniMixin, PreTrainedModel):
     config_class = BagelFlowConnectorConfig
     base_model_prefix = "bagel_flow_connector"
     main_input_name = "hidden_states"

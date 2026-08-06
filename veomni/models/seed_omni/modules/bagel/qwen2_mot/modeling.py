@@ -22,10 +22,10 @@ from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
 from ......ops.kernels.attention import flash_attention_forward
 from .configuration import BagelQwen2MoTConfig
-from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
+from .modulemixin import VeOmniMixin
 
 
-class BagelQwen2MoT(BagelQwen2MoTModuleMixin, BagelQwen2MoTMetricMeterMixin, PreTrainedModel):
+class BagelQwen2MoT(VeOmniMixin, PreTrainedModel):
     config_class = BagelQwen2MoTConfig
     base_model_prefix = "bagel_qwen2_mot"
     main_input_name = "inputs_embeds"

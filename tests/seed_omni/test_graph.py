@@ -16,7 +16,9 @@ from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.base import END
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
-from veomni.models.seed_omni.mixins.module_mixin import ModuleMixin
+from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
+from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin
+from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.utils import graph_profiler
 from veomni.models.seed_omni.utils.graph_profiler import GraphProfiler
@@ -202,7 +204,7 @@ def test_module_lookup_raises_for_unknown():
 # ── Execution lifecycle (cursor + step + maybe_transition) ────────────────────
 
 
-class _FakeOmniModule(nn.Module, ModuleMixin):
+class _FakeOmniModule(nn.Module, TrainingModuleMixin, BaseMixin, InferenceModuleMixin):
     """Minimal stand-in for an OmniModule: callable (→ forward) + pre/post hooks.
 
     ``__call__`` delegates to ``self.forward`` so the non-``forward`` alias trick

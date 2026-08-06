@@ -28,7 +28,7 @@ task at hand; do not read every reference by default.
 |---|---|
 | Understand current authoritative files | `references/source-of-truth.md` |
 | Change data flow, `conversation_list`, CPU preprocessing, dummy items, or raw request preprocessing | `references/data-flow.md` |
-| Add or modify a module mixin/model/config/processor | `references/module-contract.md`, `references/module-workflow.md`, `references/janus-example-map.md` |
+| Add or modify a module mixin/model/config/processor | `references/module-contract.md`, `references/modulemixin-ide-stubs.md`, `references/module-workflow.md`, `references/janus-example-map.md` |
 | Edit training graph or generation FSM YAML | `references/graph-runtime.md`, then the matching `templates/*.yaml` |
 | Add a new model config layout | `references/graph-runtime.md`, `templates/base.template.yaml`, `templates/modules_train.template.yaml` |
 | Add distributed/eager inference module config | `references/per-module-parallel.md`, `templates/modules_infer_eager.template.yaml`, `templates/modules_infer_fsdp.template.yaml` |

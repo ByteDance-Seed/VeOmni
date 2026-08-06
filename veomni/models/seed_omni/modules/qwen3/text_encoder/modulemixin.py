@@ -3,9 +3,17 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.module_mixin import post_forward, pre_forward
+from ....mixins.training_module_mixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
-from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
+from ...base.text_encoder.modulemixin import (
+    InferenceMixin as BaseInferenceMixin,
+)
+from ...base.text_encoder.modulemixin import (
+    TrainingMixin as BaseTrainingMixin,
+)
+from ...base.text_encoder.modulemixin import (
+    VeOmniMixin as BaseVeOmniMixin,
+)
 from ...qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
 from .chat_template import Qwen3ChatTemplate
 from .configuration import Qwen3TextEncoderConfig
@@ -15,55 +23,23 @@ from .processing import Qwen3TextEncoderPreprocessor
 SIGNAL_TEXT_DONE = "text_done"
 
 
-class Qwen3TextEncoderModuleMixin(TextEncoderModuleMixin):
-    """Qwen3 ChatML text encoder, optionally image-aware.
-
-    With ``config.enable_image`` the module uses the Qwen3-VL image ChatML template
-    (image items wrapped in ``<|vision_start|> … <|vision_end|>``; the sibling
-    vision module supplies the projected patch embeds) and handles image/video
-    parts in decode — enough to bootstrap a text-only Qwen3 into image
-    understanding. In that mode :meth:`freeze_model` trains only the vision
-    special-token embedding rows, whose ids it resolves from its own tokenizer
-    (the user can't know them, but the module can). With it off the behaviour is
-    the original text-only Qwen3 path.
-
-    The encode/decode plumbing (prepare / scatter) and the ChatML ``generate`` live
-    in :class:`TextEncoderModuleMixin`; the hooks + CPU preprocessor below are explicit
-    pass-throughs (for findability). Only the chat-template selection and the
-    image-mode freeze are genuinely Qwen3-specific.
-    """
-
+class TrainingMixin(BaseTrainingMixin):
     config: Qwen3TextEncoderConfig
-    _chat_template: Qwen3ChatTemplate | Qwen3VLChatTemplate
-    preprocessor_class = Qwen3TextEncoderPreprocessor
-
-    # Vision special tokens whose embedding rows bootstrap image understanding;
-    # ids are resolved from the tokenizer at freeze time (see :meth:`freeze_model`).
-    _VISION_SPECIAL_TOKENS = ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>")
-
-    def init_omni_state(self) -> None:
-        super().init_omni_state()
-        self._trainable_row_mask: Optional[torch.Tensor] = None
+    device: torch.device
+    dtype: torch.dtype
+    _tokenizer: Any
+    embed_tokens: torch.nn.Embedding
+    _trainable_row_mask: Optional[torch.Tensor]
 
     @property
     def _enable_image(self) -> bool:
-        return self.config.enable_image
+        """IDE stub — see :class:`VeOmniMixin` below (``config.enable_image``)."""
+        ...
 
-    @property
-    def tokenizer(self) -> Any:
-        return self._tokenizer
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._trainable_row_mask: Optional[torch.Tensor] = None
 
-    @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
-        self._tokenizer = tokenizer
-        # Only the template differs: image mode reuses the Qwen3-VL ChatML template
-        # (adds the vision wrap tokens); otherwise the text-only Qwen3 ChatML.
-        if self._enable_image:
-            self._chat_template = Qwen3VLChatTemplate(tokenizer)
-        else:
-            self._chat_template = Qwen3ChatTemplate(tokenizer)
-
-    # training hooks (explicit pass-through to TextEncoderModuleMixin for findability)
     @pre_forward("encode")
     def encode_pre(
         self,
@@ -88,7 +64,40 @@ class Qwen3TextEncoderModuleMixin(TextEncoderModuleMixin):
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:
         return super().decode_post(**outputs)
 
-    # inference hooks — ChatML autoregression keyed on eos / <|im_end|>
+    def freeze_model(self) -> None:
+        if not self._enable_image:
+            return  # fully trainable (default text-only behaviour)
+        # The user can't know the vision special-token ids, but the module can:
+        # resolve them from its own tokenizer so only those rows stay trainable.
+        ids = [int(self._tokenizer.convert_tokens_to_ids(tok)) for tok in self._VISION_SPECIAL_TOKENS]
+        weight = self.embed_tokens.weight
+        weight.requires_grad_(True)
+        keep = torch.zeros(weight.shape[0], dtype=torch.bool)
+        keep[ids] = True
+        self._trainable_row_mask = keep
+
+        def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
+            mask = self._trainable_row_mask.to(device=grad.device)
+            return grad * mask.unsqueeze(1).to(grad.dtype)
+
+        weight.register_hook(_mask_grad)
+
+
+class InferenceMixin(BaseInferenceMixin):
+    config: Qwen3TextEncoderConfig
+    device: torch.device
+    _chat_template: Qwen3ChatTemplate | Qwen3VLChatTemplate
+    _prompt_encoded: bool
+    _text_token_cache: list[int]
+
+    def encode(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """IDE stub — implemented on :class:`Qwen3TextEncoder` in ``modeling.py``."""
+        ...
+
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
@@ -123,24 +132,54 @@ class Qwen3TextEncoderModuleMixin(TextEncoderModuleMixin):
 
         raise ValueError(f"Invalid conversation tail type: {tail.type}")
 
-    # ── Freeze: in image mode, train only the vision special-token rows ──────
-    def freeze_model(self) -> None:
-        if not self._enable_image:
-            return  # fully trainable (default text-only behaviour)
-        # The user can't know the vision special-token ids, but the module can:
-        # resolve them from its own tokenizer so only those rows stay trainable.
-        ids = [int(self._tokenizer.convert_tokens_to_ids(tok)) for tok in self._VISION_SPECIAL_TOKENS]
-        weight = self.embed_tokens.weight
-        weight.requires_grad_(True)
-        keep = torch.zeros(weight.shape[0], dtype=torch.bool)
-        keep[ids] = True
-        self._trainable_row_mask = keep
 
-        def _mask_grad(grad: torch.Tensor) -> torch.Tensor:
-            mask = self._trainable_row_mask.to(device=grad.device)
-            return grad * mask.unsqueeze(1).to(grad.dtype)
+class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
+    """Qwen3 ChatML text encoder, optionally image-aware.
 
-        weight.register_hook(_mask_grad)
+    With ``config.enable_image`` the module uses the Qwen3-VL image ChatML template
+    (image items wrapped in ``<|vision_start|> … <|vision_end|>``; the sibling
+    vision module supplies the projected patch embeds) and handles image/video
+    parts in decode — enough to bootstrap a text-only Qwen3 into image
+    understanding. In that mode :meth:`freeze_model` trains only the vision
+    special-token embedding rows, whose ids it resolves from its own tokenizer
+    (the user can't know them, but the module can). With it off the behaviour is
+    the original text-only Qwen3 path.
+
+    The encode/decode plumbing (prepare / scatter) and the ChatML ``generate`` live
+    in :class:`BaseVeOmniMixin`; the hooks + CPU preprocessor below are explicit
+    pass-throughs (for findability). Only the chat-template selection and the
+    image-mode freeze are genuinely Qwen3-specific.
+    """
+
+    config: Qwen3TextEncoderConfig
+    _chat_template: Qwen3ChatTemplate | Qwen3VLChatTemplate
+    preprocessor_class = Qwen3TextEncoderPreprocessor
+
+    # Vision special tokens whose embedding rows bootstrap image understanding;
+    # ids are resolved from the tokenizer at freeze time (see :meth:`freeze_model`).
+    _VISION_SPECIAL_TOKENS = ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>")
+
+    @property
+    def _enable_image(self) -> bool:
+        return self.config.enable_image
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, tokenizer: Any) -> None:
+        self._tokenizer = tokenizer
+        # Only the template differs: image mode reuses the Qwen3-VL ChatML template
+        # (adds the vision wrap tokens); otherwise the text-only Qwen3 ChatML.
+        if self._enable_image:
+            self._chat_template = Qwen3VLChatTemplate(tokenizer)
+        else:
+            self._chat_template = Qwen3ChatTemplate(tokenizer)
 
 
-__all__ = ["Qwen3TextEncoderModuleMixin"]
+__all__ = [
+    "InferenceMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

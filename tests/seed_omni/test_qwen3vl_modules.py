@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
-from veomni.models.seed_omni.modules.qwen3vl.llm.modulemixin import Qwen3VLLlmModuleMixin
+from veomni.models.seed_omni.modules.qwen3vl.llm.modulemixin import TrainingMixin
 
 
 def test_registry_resolves_qwen3vl_modules():
@@ -108,7 +108,7 @@ def test_vision_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
 
 def test_vision_position_ids_layout():
     # grid (t=1, h=4, w=6), merge=2 -> llm grid (1, 2, 3); start offset 5.
-    pos = Qwen3VLLlmModuleMixin._vision_position_ids(5, torch.tensor([1, 4, 6]), merge=2)
+    pos = TrainingMixin._vision_position_ids(5, torch.tensor([1, 4, 6]), merge=2)
     assert pos.shape == (3, 6)
     # temporal: single frame -> all equal to start
     assert pos[0].tolist() == [5, 5, 5, 5, 5, 5]

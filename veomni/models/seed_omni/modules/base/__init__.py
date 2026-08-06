@@ -3,6 +3,9 @@
 Currently:
 * :class:`TextEncoder` — generic word-token embedding + LM head, reusable
   across LLM families (model_type ``text_encoder``).
+* :mod:`llm_packing` — shared ``conversation_list`` ↔ AR backbone carrier helpers:
+  ``pack_llm_conversations_for_forward`` (1-D position backbones) and
+  ``scatter_llm_hidden_states`` (all AR families including Qwen3-VL).
 
 These modules don't depend on any specific HuggingFace family — they can be
 mixed into any backbone setup that needs the conventional vocab-bound

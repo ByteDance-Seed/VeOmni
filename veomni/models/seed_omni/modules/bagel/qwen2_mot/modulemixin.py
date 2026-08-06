@@ -13,8 +13,10 @@ from ......distributed.sequence_parallel import (
     slice_input_tensor,
     sp_pad,
 )
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, get_tail_output_item, iter_desired_items
 from ..sources import (
     BAGEL_FLOW_HIDDEN,
@@ -28,132 +30,19 @@ from .generation_state import MotCacheContext, MotGenerationState
 from .processing import PackedConversation, PackedSpan, build_mot_attention_mask, preprocess_mot_inputs
 
 
-class BagelQwen2MoTModuleMixin(ModuleMixin):
-    """Carrier hooks and graph entrypoints for BAGEL's packed MoT backbone."""
+class TrainingMixin(TrainingModuleMixin):
+    """Training-graph hooks — depends on :class:`BagelQwen2MoT` modeling APIs."""
 
-    def init_omni_state(self) -> None:
+    config: BagelQwen2MoTConfig
+    device: torch.device
+    dtype: torch.dtype
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._packed_training: PackedConversation | None = None
         self._sp_full_sequence_length: int | None = None
         self._validated_ulysses_size: int | None = None
-        self._generation_state = MotGenerationState()
-
-    def reset_local_inference_state(self) -> None:
-        self._generation_state.reset()
-
-    # ── Graph Entrypoints ──────────────────────────────────
-
-    def generate(
-        self,
-        conversation_list: list[ConversationItem] | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del kwargs
-        if conversation_list is None:
-            raise ValueError("BAGEL Qwen2-MoT generate requires conversation_list.")
-
-        generation_kwargs = generation_kwargs or {}
-        infer_mode = self._generation_state.update_infer_mode(generation_kwargs)
-        if self._generation_state.main.cache is None or infer_mode == "gen":
-            hidden_states = self._prefill_prompt(conversation_list, generation_kwargs)
-        else:
-            hidden_states = self._decode_next_token(conversation_list)
-
-        if infer_mode != "gen":
-            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-                hidden_states = hidden_states.squeeze(0)
-            if hidden_states.dim() != 2:
-                raise ValueError(f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}.")
-            conversation_list.append(
-                ConversationItem(
-                    type="output",
-                    value=hidden_states[-1:].contiguous(),
-                    role="assistant",
-                )
-            )
-        return {"conversation_list": conversation_list}
-
-    def denoise_branch(
-        self,
-        conversation_list: list[ConversationItem] | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del kwargs
-        if conversation_list is None:
-            raise ValueError("BAGEL Qwen2-MoT denoise_branch requires conversation_list.")
-
-        self._generation_state.validate_cfg_request(generation_kwargs or {})
-        self._generation_state.main.require_ready()
-        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_QUERY])
-        if tail is None or not torch.is_tensor(tail.value):
-            raise ValueError("BAGEL Qwen2-MoT denoise branch requires source='bagel_flow_query'.")
-
-        query = tail.value
-        if query.dim() == 3 and query.shape[0] == 1:
-            query = query.squeeze(0)
-        if query.dim() != 2:
-            raise ValueError(f"BAGEL Qwen2-MoT denoise branch expects rank-2 query tensor, got {tuple(query.shape)}.")
-        if int(query.shape[-1]) != int(self.config.hidden_size):
-            raise ValueError(
-                "BAGEL Qwen2-MoT denoise branch hidden-size mismatch: "
-                f"got {query.shape[-1]}, expected {self.config.hidden_size}."
-            )
-        if int(query.shape[0]) < 3:
-            raise ValueError("BAGEL Qwen2-MoT denoise query must include start/end marker embeddings.")
-
-        inputs = self._generation_state.preprocess_parallel_denoise_inputs(
-            query,
-            generation_kwargs or {},
-            timestep=tail.meta.get("timestep"),
-            empty_cache_factory=self._new_empty_cache,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        outputs = self.forward_inference(
-            **inputs,
-            update_past_key_values=False,
-            is_causal=False,
-            mode="gen",
-        )
-
-        tail.source = BAGEL_FLOW_HIDDEN
-        tail.value = outputs["hidden_states"].to(device=self.device, dtype=self.dtype)
-        return {"conversation_list": conversation_list}
-
-    def collect_velocity(
-        self,
-        conversation_list: list[ConversationItem] | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del kwargs
-        if conversation_list is None:
-            raise ValueError("BAGEL Qwen2-MoT collect_velocity requires conversation_list.")
-
-        self._generation_state.validate_cfg_request(generation_kwargs or {})
-        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
-        if tail is None or not torch.is_tensor(tail.value):
-            raise ValueError("BAGEL Qwen2-MoT velocity collection requires source='bagel_flow_velocity'.")
-
-        velocity = tail.value
-        if velocity.dim() == 3 and velocity.shape[0] == 1:
-            velocity = velocity.squeeze(0)
-        if velocity.dim() != 2:
-            raise ValueError(
-                f"BAGEL Qwen2-MoT velocity collection expects rank-2 velocity, got {tuple(velocity.shape)}."
-            )
-
-        tail.value = self._generation_state.collect_velocity(
-            velocity,
-            generation_kwargs or {},
-            device=self.device,
-            dtype=self.dtype,
-        )
-        return {"conversation_list": conversation_list}
-
-    # ── Training hooks ──────────────────────────────────
 
     @pre_forward("forward")
     def forward_pre(
@@ -274,8 +163,6 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 offset += length
         return {"conversation_list": conversation}
 
-    # ── Dummy helper ──────────────────────────────────
-
     def _fold_dummy_anchors(
         self,
         packed_sequence: torch.Tensor,
@@ -374,7 +261,148 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             return True
         return False
 
-    # ── Internal helpers ──────────────────────────────────
+
+class InferenceMixin(InferenceModuleMixin):
+    config: BagelQwen2MoTConfig
+    device: torch.device
+    dtype: torch.dtype
+    model: Any
+
+    def forward_inference(
+        self,
+        packed_query_sequence: torch.Tensor,
+        query_lens: torch.Tensor,
+        packed_query_position_ids: torch.Tensor,
+        packed_query_indexes: torch.Tensor,
+        past_key_values: Any = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
+        update_past_key_values: bool = True,
+        is_causal: bool = True,
+        mode: str = "und",
+        packed_vae_token_indexes: torch.Tensor | None = None,
+        packed_text_indexes: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """IDE stub — implemented on :class:`BagelQwen2MoT` in ``modeling.py``."""
+        ...
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._generation_state = MotGenerationState()
+
+    def reset_local_inference_state(self) -> None:
+        self._generation_state.reset()
+
+    def generate(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL Qwen2-MoT generate requires conversation_list.")
+
+        generation_kwargs = generation_kwargs or {}
+        infer_mode = self._generation_state.update_infer_mode(generation_kwargs)
+        if self._generation_state.main.cache is None or infer_mode == "gen":
+            hidden_states = self._prefill_prompt(conversation_list, generation_kwargs)
+        else:
+            hidden_states = self._decode_next_token(conversation_list)
+
+        if infer_mode != "gen":
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                hidden_states = hidden_states.squeeze(0)
+            if hidden_states.dim() != 2:
+                raise ValueError(f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}.")
+            conversation_list.append(
+                ConversationItem(
+                    type="output",
+                    value=hidden_states[-1:].contiguous(),
+                    role="assistant",
+                )
+            )
+        return {"conversation_list": conversation_list}
+
+    def denoise_branch(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL Qwen2-MoT denoise_branch requires conversation_list.")
+
+        self._generation_state.validate_cfg_request(generation_kwargs or {})
+        self._generation_state.main.require_ready()
+        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_QUERY])
+        if tail is None or not torch.is_tensor(tail.value):
+            raise ValueError("BAGEL Qwen2-MoT denoise branch requires source='bagel_flow_query'.")
+
+        query = tail.value
+        if query.dim() == 3 and query.shape[0] == 1:
+            query = query.squeeze(0)
+        if query.dim() != 2:
+            raise ValueError(f"BAGEL Qwen2-MoT denoise branch expects rank-2 query tensor, got {tuple(query.shape)}.")
+        if int(query.shape[-1]) != int(self.config.hidden_size):
+            raise ValueError(
+                "BAGEL Qwen2-MoT denoise branch hidden-size mismatch: "
+                f"got {query.shape[-1]}, expected {self.config.hidden_size}."
+            )
+        if int(query.shape[0]) < 3:
+            raise ValueError("BAGEL Qwen2-MoT denoise query must include start/end marker embeddings.")
+
+        inputs = self._generation_state.preprocess_parallel_denoise_inputs(
+            query,
+            generation_kwargs or {},
+            timestep=tail.meta.get("timestep"),
+            empty_cache_factory=self._new_empty_cache,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        outputs = self.forward_inference(
+            **inputs,
+            update_past_key_values=False,
+            is_causal=False,
+            mode="gen",
+        )
+
+        tail.source = BAGEL_FLOW_HIDDEN
+        tail.value = outputs["hidden_states"].to(device=self.device, dtype=self.dtype)
+        return {"conversation_list": conversation_list}
+
+    def collect_velocity(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL Qwen2-MoT collect_velocity requires conversation_list.")
+
+        self._generation_state.validate_cfg_request(generation_kwargs or {})
+        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
+        if tail is None or not torch.is_tensor(tail.value):
+            raise ValueError("BAGEL Qwen2-MoT velocity collection requires source='bagel_flow_velocity'.")
+
+        velocity = tail.value
+        if velocity.dim() == 3 and velocity.shape[0] == 1:
+            velocity = velocity.squeeze(0)
+        if velocity.dim() != 2:
+            raise ValueError(
+                f"BAGEL Qwen2-MoT velocity collection expects rank-2 velocity, got {tuple(velocity.shape)}."
+            )
+
+        tail.value = self._generation_state.collect_velocity(
+            velocity,
+            generation_kwargs or {},
+            device=self.device,
+            dtype=self.dtype,
+        )
+        return {"conversation_list": conversation_list}
 
     def _prefill_prompt(
         self,
@@ -469,8 +497,6 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         )
 
         return outputs["hidden_states"]
-
-    # ── Cache and context helpers ──────────────────────────────────
 
     def _prefill_main_prompt_span(
         self,
@@ -590,7 +616,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         return NaiveCache(len(self.model.layers))
 
 
-class BagelQwen2MoTMetricMeterMixin(MetricMeterMixin):
+class MeterMixin(MetricMeterMixin):
     """Per-module training meter for BAGEL's Qwen2-MoT backbone (transformer layers only)."""
 
     config: BagelQwen2MoTConfig
@@ -617,4 +643,13 @@ class BagelQwen2MoTMetricMeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["BagelQwen2MoTModuleMixin", "BagelQwen2MoTMetricMeterMixin"]
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
+    """Carrier hooks and graph entrypoints for BAGEL's packed MoT backbone."""
+
+
+__all__ = [
+    "InferenceMixin",
+    "MeterMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

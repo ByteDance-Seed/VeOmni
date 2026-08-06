@@ -26,7 +26,7 @@ from ....distributed.parallel_state import is_parallel_state_registered, use_par
 from ....utils.logging import get_logger
 from ..graphs.base import NodeDef
 from ..mixins.metric_meter_mixin import MetricMeterResult
-from ..modeling_omni import _LOSS_KEY, OmniModel, _sum_losses
+from ..modeling_omni import _LOSS_KEY, OmniModel
 from ..utils.graph_profiler import GraphProfiler
 from .executor import execute_generation_node, execute_train_node
 
@@ -308,6 +308,16 @@ class OmniModelRuntime:
     def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
         """Save the omni-root HF layout (config + graphs + module sidecars)."""
         self.model.save_pretrained(save_directory, **kwargs)
+
+
+def _sum_losses(losses: dict[str, Any]) -> Any | None:
+    if not losses:
+        return None
+    it = iter(losses.values())
+    total = next(it)
+    for v in it:
+        total = total + v
+    return total
 
 
 __all__ = ["OmniModelRuntime"]

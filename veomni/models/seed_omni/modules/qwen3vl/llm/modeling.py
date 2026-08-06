@@ -9,7 +9,7 @@ from transformers import PreTrainedModel
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .configuration import Qwen3VLLlmConfig
-from .modulemixin import Qwen3VLLlmModuleMixin
+from .modulemixin import VeOmniMixin
 
 
 if IS_NPU_AVAILABLE:
@@ -18,7 +18,7 @@ else:
     from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import Qwen3VLTextModel
 
 
-class Qwen3VLLlm(Qwen3VLLlmModuleMixin, PreTrainedModel):
+class Qwen3VLLlm(VeOmniMixin, PreTrainedModel):
     """Qwen3-VL text backbone (no wte, no lm_head).
 
     Token / image embeds are produced by the sibling ``qwen3vl_text_encoder`` /

@@ -6,12 +6,111 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.inference_module_mixin import InferenceModuleMixin
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy
+from ...base.llm_packing import scatter_llm_hidden_states
+from .configuration import Qwen3VLLlmConfig
 
 
-class Qwen3VLLlmModuleMixin(ModuleMixin):
-    """Graph hooks for the Qwen3-VL AR backbone.
+def _cumsum(values: list[int]) -> list[int]:
+    out: list[int] = []
+    total = 0
+    for v in values:
+        total += v
+        out.append(total)
+    return out
+
+
+def qwen3vl_vision_position_ids(start: int, grid_thw: torch.Tensor, merge: int) -> torch.Tensor:
+    """3-row (t/h/w) M-RoPE positions for one image — mirrors Qwen3VLModel.get_vision_position_ids."""
+    t, h, w = int(grid_thw[0]), int(grid_thw[1]), int(grid_thw[2])
+    gt, gh, gw = t, h // merge, w // merge
+    temporal = torch.arange(gt).repeat_interleave(gh * gw) + start
+    height = torch.arange(gh).repeat_interleave(gw).repeat(gt) + start
+    width = torch.arange(gw).repeat(gh * gt) + start
+    return torch.stack([temporal, height, width], dim=0).long()
+
+
+def collect_qwen3vl_dummy_deepstack(
+    conversations: list[list[ConversationItem]],
+    device: torch.device,
+) -> Optional[List[torch.Tensor]]:
+    for sample in conversations:
+        for item in sample:
+            if is_dummy(item) and item.type == "image" and "deepstack" in item.meta:
+                return [d.to(device) for d in item.meta["deepstack"]]
+    return None
+
+
+def pack_qwen3vl_conversations_for_forward(
+    conversations: list[list[ConversationItem]],
+    device: torch.device,
+    spatial_merge_size: int,
+) -> Dict[str, Any]:
+    """Pack Qwen3-VL conversation embeds for backbone forward (training + inference)."""
+    inputs_embeds_list: list[torch.Tensor] = []
+    position_ids_list: list[torch.Tensor] = []
+    visual_pos_masks_list: list[torch.Tensor] = []
+    sample_lengths: list[int] = []
+    deepstack_chunks: list[list[torch.Tensor]] = []
+
+    for sample in conversations:
+        sample_len = 0
+        current_pos = 0
+        for item in sample:
+            if is_dummy(item):
+                continue
+            embeds = item.value.to(device)
+            length = embeds.size(0)
+            inputs_embeds_list.append(embeds)
+            is_visual = item.type in ("image", "video")
+            if is_visual:
+                grid_thw = item.meta["grid_thw"]
+                seg_pos = qwen3vl_vision_position_ids(current_pos, grid_thw, spatial_merge_size).to(device)
+                current_pos += int(max(int(grid_thw[1]), int(grid_thw[2])) // spatial_merge_size)
+                visual_pos_masks_list.append(torch.ones(length, dtype=torch.bool, device=device))
+                deepstack_chunks.append([d.to(device) for d in item.meta["deepstack"]])
+            else:
+                seg_pos = torch.arange(length, dtype=torch.long, device=device).view(1, -1).expand(3, -1) + current_pos
+                current_pos += length
+                visual_pos_masks_list.append(torch.zeros(length, dtype=torch.bool, device=device))
+            position_ids_list.append(seg_pos)
+            sample_len += length
+        sample_lengths.append(sample_len)
+
+    inputs_embeds, inputs_embeds_shape = naflatten(inputs_embeds_list)
+    if inputs_embeds.dim() == 2:
+        inputs_embeds = inputs_embeds.unsqueeze(0)
+    position_ids = torch.cat(position_ids_list, dim=1).unsqueeze(1)
+    visual_pos_masks = torch.cat(visual_pos_masks_list, dim=0).unsqueeze(0)
+
+    if deepstack_chunks:
+        num_layers = len(deepstack_chunks[0])
+        deepstack_visual_embeds = [
+            torch.cat([chunk[layer] for chunk in deepstack_chunks], dim=0) for layer in range(num_layers)
+        ]
+    else:
+        deepstack_visual_embeds = collect_qwen3vl_dummy_deepstack(conversations, device)
+        visual_pos_masks = None
+
+    cu_seq_lens = torch.tensor([0, *_cumsum(sample_lengths)], dtype=torch.int32, device=device)
+    max_length = max(sample_lengths) if sample_lengths else 0
+
+    return {
+        "inputs_embeds": inputs_embeds,
+        "position_ids": position_ids,
+        "visual_pos_masks": visual_pos_masks,
+        "deepstack_visual_embeds": deepstack_visual_embeds,
+        "cu_seq_lens": cu_seq_lens,
+        "max_length": max_length,
+        "inputs_embeds_shape": inputs_embeds_shape,
+    }
+
+
+class TrainingMixin(TrainingModuleMixin):
+    """Graph hooks for the Qwen3-VL AR backbone (training path).
 
     Packs every non-dummy ``conversation_list`` item's embedding segment into one
     bs=1 varlen sequence, rebuilds 3-row M-RoPE position ids (text runs +
@@ -19,27 +118,30 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
     the per-layer DeepStack features into ``Qwen3VLTextModel``.
     """
 
-    def init_omni_state(self) -> None:
+    config: Qwen3VLLlmConfig
+    device: torch.device
+    training: bool
+
+    @property
+    def _spatial_merge_size(self) -> int:
+        """IDE stub — see :class:`VeOmniMixin` below (``config.spatial_merge_size``)."""
+        ...
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
-        self._past_key_values: Any = None
-        self._next_position: int = 0
         # Active sample's pre-pad packed length. Under SP the output-gather hook
         # (``forward_sp_post``) narrows the all-gathered (padded) output back to it.
         self._sp_own_len: Optional[int] = None
 
-    @property
-    def _spatial_merge_size(self) -> int:
-        return self.config.spatial_merge_size
-
-    # ── Training hooks ──────────────────────────────────────────────────────
     @pre_forward("forward")
     def forward_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        packed = self._pack_conversations_for_forward(conversation_list)
+        packed = pack_qwen3vl_conversations_for_forward(conversation_list, self.device, self._spatial_merge_size)
         inputs_embeds = packed["inputs_embeds"]
 
         if self.training and get_parallel_state().fsdp_enabled:
@@ -168,113 +270,33 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
 
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
-        self._scatter_hidden_states(conversation, unflatten(hidden_states, pack_shape))
+        scatter_llm_hidden_states(conversation, unflatten(hidden_states, pack_shape))
         return {"conversation_list": conversation}
 
-    def _pack_conversations_for_forward(
+
+class InferenceMixin(InferenceModuleMixin):
+    config: Qwen3VLLlmConfig
+    device: torch.device
+
+    def forward(
         self,
-        conversations: list[list[ConversationItem]],
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        visual_pos_masks: Optional[torch.Tensor] = None,
+        deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
+        past_key_values: Any = None,
+        use_cache: Optional[bool] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        inputs_embeds_list: list[torch.Tensor] = []
-        position_ids_list: list[torch.Tensor] = []
-        visual_pos_masks_list: list[torch.Tensor] = []
-        sample_lengths: list[int] = []
-        deepstack_chunks: list[list[torch.Tensor]] = []  # per real-image: list[layer] of (N_i, D)
+        """IDE stub — implemented on :class:`Qwen3VLLlm` in ``modeling.py``."""
+        ...
 
-        for sample in conversations:
-            sample_len = 0
-            current_pos = 0
-            for item in sample:
-                if is_dummy(item):
-                    continue
-                embeds = item.value.to(self.device)
-                length = embeds.size(0)
-                inputs_embeds_list.append(embeds)
-                is_visual = item.type in ("image", "video")
-                if is_visual:
-                    grid_thw = item.meta["grid_thw"]
-                    seg_pos = self._vision_position_ids(current_pos, grid_thw, self._spatial_merge_size).to(
-                        self.device
-                    )
-                    current_pos += int(max(int(grid_thw[1]), int(grid_thw[2])) // self._spatial_merge_size)
-                    visual_pos_masks_list.append(torch.ones(length, dtype=torch.bool, device=self.device))
-                    deepstack_chunks.append([d.to(self.device) for d in item.meta["deepstack"]])
-                else:
-                    seg_pos = (
-                        torch.arange(length, dtype=torch.long, device=self.device).view(1, -1).expand(3, -1)
-                        + current_pos
-                    )
-                    current_pos += length
-                    visual_pos_masks_list.append(torch.zeros(length, dtype=torch.bool, device=self.device))
-                position_ids_list.append(seg_pos)
-                sample_len += length
-            sample_lengths.append(sample_len)
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._past_key_values: Any = None
+        self._next_position: int = 0
 
-        inputs_embeds, inputs_embeds_shape = naflatten(inputs_embeds_list)
-        if inputs_embeds.dim() == 2:
-            inputs_embeds = inputs_embeds.unsqueeze(0)
-        position_ids = torch.cat(position_ids_list, dim=1).unsqueeze(1)  # (3, 1, total)
-        visual_pos_masks = torch.cat(visual_pos_masks_list, dim=0).unsqueeze(0)  # (1, total)
-
-        if deepstack_chunks:
-            num_layers = len(deepstack_chunks[0])
-            deepstack_visual_embeds = [
-                torch.cat([chunk[layer] for chunk in deepstack_chunks], dim=0) for layer in range(num_layers)
-            ]
-        else:
-            # All-dummy (text-only) micro-batch: keep the DeepStack mergers on the
-            # FSDP grad graph via the visual_pos_masks=None add-0.0 path.
-            deepstack_visual_embeds = self._collect_dummy_deepstack(conversations)
-            visual_pos_masks = None
-
-        cu_seq_lens = torch.tensor([0, *_cumsum(sample_lengths)], dtype=torch.int32, device=self.device)
-        max_length = max(sample_lengths) if sample_lengths else 0
-
-        return {
-            "inputs_embeds": inputs_embeds,
-            "position_ids": position_ids,
-            "visual_pos_masks": visual_pos_masks,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
-            "cu_seq_lens": cu_seq_lens,
-            "max_length": max_length,
-            "inputs_embeds_shape": inputs_embeds_shape,
-        }
-
-    def _collect_dummy_deepstack(
-        self,
-        conversations: list[list[ConversationItem]],
-    ) -> Optional[List[torch.Tensor]]:
-        for sample in conversations:
-            for item in sample:
-                if is_dummy(item) and item.type == "image" and "deepstack" in item.meta:
-                    return [d.to(self.device) for d in item.meta["deepstack"]]
-        return None
-
-    @staticmethod
-    def _vision_position_ids(start: int, grid_thw: torch.Tensor, merge: int) -> torch.Tensor:
-        """3-row (t/h/w) M-RoPE positions for one image — mirrors Qwen3VLModel.get_vision_position_ids."""
-        t, h, w = int(grid_thw[0]), int(grid_thw[1]), int(grid_thw[2])
-        gt, gh, gw = t, h // merge, w // merge
-        temporal = torch.arange(gt).repeat_interleave(gh * gw) + start
-        height = torch.arange(gh).repeat_interleave(gw).repeat(gt) + start
-        width = torch.arange(gw).repeat(gh * gt) + start
-        return torch.stack([temporal, height, width], dim=0).long()
-
-    def _scatter_hidden_states(
-        self,
-        conversation_list: list[list[ConversationItem]],
-        hidden_states_list: list[torch.Tensor],
-    ) -> None:
-        hidden_states_list_iter = iter(hidden_states_list)
-        for sample in conversation_list:
-            for part in sample:
-                if is_dummy(part):
-                    continue
-                part.value = next(hidden_states_list_iter)
-        if next(hidden_states_list_iter, None) is not None:
-            raise RuntimeError("Qwen3VLLlm._scatter_hidden_states: segment count exceeds non-dummy items.")
-
-    # ── Inference hooks ─────────────────────────────────────────────────────
     def reset_local_inference_state(self) -> None:
         return
 
@@ -293,7 +315,7 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         # FSDP/DDP hooks have already fired; its dispatch trampoline restores
         # the real ``forward`` while this endpoint runs.
         if self._past_key_values is None:
-            packed = self._pack_conversations_for_forward([conversation_list])
+            packed = pack_qwen3vl_conversations_for_forward([conversation_list], self.device, self._spatial_merge_size)
             position_ids = packed["position_ids"]
             outputs = self.forward(
                 inputs_embeds=packed["inputs_embeds"],
@@ -349,13 +371,10 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         return hidden_states[:, -1:, :].contiguous()
 
 
-def _cumsum(values: list[int]) -> list[int]:
-    out: list[int] = []
-    total = 0
-    for v in values:
-        total += v
-        out.append(total)
-    return out
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin):
+    @property
+    def _spatial_merge_size(self) -> int:
+        return self.config.spatial_merge_size
 
 
 def _fold_fsdp_dummy_anchors(
@@ -373,4 +392,8 @@ def _fold_fsdp_dummy_anchors(
     return inputs_embeds
 
 
-__all__ = ["Qwen3VLLlmModuleMixin"]
+__all__ = [
+    "InferenceMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

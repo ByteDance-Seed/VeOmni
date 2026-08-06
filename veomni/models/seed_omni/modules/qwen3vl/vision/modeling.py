@@ -30,7 +30,7 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 from ......distributed.parallel_state import get_parallel_state
 from ......models.checkpoint_tensor_loading import ConvertedCheckpointTensor
 from .configuration import Qwen3VLVisionEncoderConfig
-from .modulemixin import Qwen3VLVisionEncoderModuleMixin
+from .modulemixin import VeOmniMixin
 from .processing import Qwen3VLVisionImageProcessor, Qwen3VLVisionVideoProcessor
 
 
@@ -76,7 +76,7 @@ class _MergerProjectionConverter:
         return []
 
 
-class Qwen3VLVisionEncoder(Qwen3VLVisionEncoderModuleMixin, PreTrainedModel):
+class Qwen3VLVisionEncoder(VeOmniMixin, PreTrainedModel):
     """Qwen3-VL vision tower for image understanding."""
 
     config_class = Qwen3VLVisionEncoderConfig

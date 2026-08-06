@@ -3,10 +3,19 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.module_mixin import post_forward, pre_forward
+from ....mixins.training_module_mixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
-from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
+from ...base.text_encoder.modulemixin import (
+    InferenceMixin as BaseInferenceMixin,
+)
+from ...base.text_encoder.modulemixin import (
+    TrainingMixin as BaseTrainingMixin,
+)
+from ...base.text_encoder.modulemixin import (
+    VeOmniMixin as BaseVeOmniMixin,
+)
 from .chat_template import JanusChatTemplate
+from .configuration import JanusTextEncoderConfig
 from .processing import JanusTextEncoderPreprocessor
 
 
@@ -15,31 +24,11 @@ SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
 
 
-class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
-    """Janus ``TextEncoder`` — image-aware ChatML with ``<boi>`` / ``<eoi>`` emitters.
-
-    The encode/decode call-site plumbing (prepare / scatter) lives in
-    :class:`TextEncoderModuleMixin`; the hooks below are explicit pass-throughs
-    (for findability). The worker-side CPU preprocessor lives on
-    ``processing.py`` (see :class:`JanusTextEncoderPreprocessor`). Only the chat
-    template and the T2I-aware ``generate`` FSM (BOS injection, ``<boi>`` /
-    ``<eoi>`` signals, classifier-free guidance arming) are genuinely
-    Janus-specific.
-    """
-
+class TrainingMixin(BaseTrainingMixin):
+    config: JanusTextEncoderConfig
+    device: torch.device
     _chat_template: JanusChatTemplate
-    preprocessor_class = JanusTextEncoderPreprocessor
 
-    @property
-    def tokenizer(self) -> Any:
-        return self._tokenizer
-
-    @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
-        self._tokenizer = tokenizer
-        self._chat_template = JanusChatTemplate(tokenizer)
-
-    # training hooks
     @pre_forward("encode")
     def encode_pre(
         self,
@@ -64,7 +53,26 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:
         return super().decode_post(**outputs)
 
-    # inference hooks
+
+class InferenceMixin(BaseInferenceMixin):
+    config: JanusTextEncoderConfig
+    device: torch.device
+    _chat_template: JanusChatTemplate
+    _prompt_encoded: bool
+    _text_token_cache: list[int]
+
+    def encode(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """IDE stub — implemented on :class:`JanusTextEncoder` in ``modeling.py``."""
+        ...
+
+    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """IDE stub — implemented on :class:`TextEncoder` in ``modeling.py``."""
+        ...
+
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
@@ -183,4 +191,33 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
         return uncond_inputs_embeds
 
 
-__all__ = ["JanusTextEncoderModuleMixin"]
+class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
+    """Janus ``TextEncoder`` — image-aware ChatML with ``<boi>`` / ``<eoi>`` emitters.
+
+    The encode/decode call-site plumbing (prepare / scatter) lives in
+    :class:`BaseVeOmniMixin`; the hooks below are explicit pass-throughs
+    (for findability). The worker-side CPU preprocessor lives on
+    ``processing.py`` (see :class:`JanusTextEncoderPreprocessor`). Only the chat
+    template and the T2I-aware ``generate`` FSM (BOS injection, ``<boi>`` /
+    ``<eoi>`` signals, classifier-free guidance arming) are genuinely
+    Janus-specific.
+    """
+
+    _chat_template: JanusChatTemplate
+    preprocessor_class = JanusTextEncoderPreprocessor
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, tokenizer: Any) -> None:
+        self._tokenizer = tokenizer
+        self._chat_template = JanusChatTemplate(tokenizer)
+
+
+__all__ = [
+    "InferenceMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

@@ -1,4 +1,4 @@
-"""Smoke tests for SeedOmni V2 ``*ModuleMixin`` classes and checkpoint layout."""
+"""Smoke tests for SeedOmni V2 ``*BaseMixin`` classes and checkpoint layout."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from veomni.arguments import OmniArguments, OmniDataArguments
 from veomni.models.seed_omni import (
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
-    ModuleMixin,
+    BaseMixin,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
@@ -195,7 +195,7 @@ def test_processor_registry_only_for_modules_with_processor_assets():
 def test_all_registered_classes_are_module_mixins():
     for name in OMNI_MODEL_REGISTRY.valid_keys():
         cls = OMNI_MODEL_REGISTRY[name]()
-        assert issubclass(cls, ModuleMixin), f"{name} must inherit ModuleMixin"
+        assert issubclass(cls, BaseMixin), f"{name} must inherit BaseMixin"
 
 
 # ── save / reload via OMNI registry ───────────────────────────────────────────

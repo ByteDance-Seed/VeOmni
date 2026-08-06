@@ -15,12 +15,11 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
-from ....mixins.emb_parallel_mixin import EmbParallelMixin
 from .configuration import TextEncoderConfig
-from .modulemixin import TextEncoderMetricMeterMixin, TextEncoderModuleMixin
+from .modulemixin import VeOmniMixin
 
 
-class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, EmbParallelMixin, PreTrainedModel):
+class TextEncoder(VeOmniMixin, PreTrainedModel):
     """Word-token embedding + LM head."""
 
     config_class = TextEncoderConfig

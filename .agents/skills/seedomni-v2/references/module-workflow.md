@@ -32,7 +32,9 @@ Follow the existing folder shape:
 
 - `configuration.py`: config fields, unique `model_type`.
 - `modeling.py`: weights and the actual model forward.
-- `modulemixin.py`: SeedOmni hooks and CPU preprocessor.
+- `modulemixin.py`: composable `TrainingMixin` / `InferenceMixin` / `VeOmniMixin`
+  hooks, CPU preprocessor, and **IDE type stubs** for modeling APIs (see
+  `references/modulemixin-ide-stubs.md`).
 - `processing.py`: processor wrapper only when needed.
 - `chat_template.py`: text encoder family-specific template only when needed.
 

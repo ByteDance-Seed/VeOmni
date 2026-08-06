@@ -8,7 +8,7 @@ import torch
 import yaml
 
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.modulemixin import BagelQwen2MoTModuleMixin
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.modulemixin import TrainingMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_SIGLIP_CONTEXT,
@@ -192,7 +192,7 @@ def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> Non
     )
     hidden_states = torch.arange(11 * _HIDDEN_SIZE, dtype=torch.float32).reshape(11, _HIDDEN_SIZE)
 
-    out = BagelQwen2MoTModuleMixin.forward_post(model, hidden_states)
+    out = TrainingMixin.forward_post(model, hidden_states)
 
     assert out["conversation_list"] == [sample]
     assert torch.equal(sample[0].value, hidden_states[0:1])

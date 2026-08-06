@@ -35,11 +35,11 @@ from transformers.models.janus.modeling_janus import (
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
 from .configuration import JanusVqvaeConfig
-from .modulemixin import JanusVqvaeMetricMeterMixin, JanusVqvaeModuleMixin
+from .modulemixin import VeOmniMixin
 from .processing import JanusVqvaeProcessor
 
 
-class JanusVqvae(JanusVqvaeModuleMixin, JanusVqvaeMetricMeterMixin, PreTrainedModel):
+class JanusVqvae(VeOmniMixin, PreTrainedModel):
     """VQVAE + generation head for Janus VQ image generation.
 
     The VQVAE encoder/decoder is frozen by default (matching the Janus

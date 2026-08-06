@@ -11,92 +11,44 @@ from veomni.utils.device import get_device_id, get_device_type
 
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs, slice_input_tensor
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
-from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, crop_latent_to_image_shape
+from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
 
 
-class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
-    """Carrier hooks for raw-image VAE encode and latent decode."""
+def select_bagel_vae_context_items(
+    conversation_list: list[list[ConversationItem]] | None,
+    *,
+    exclude_dummy: bool = False,
+) -> list[ConversationItem]:
+    """Select VAE context image items (training includes dummies; inference skips them)."""
+    if conversation_list is None:
+        raise ValueError("BagelVAE requires conversation_list to select VAE context items.")
+
+    items = list(iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]))
+    if exclude_dummy:
+        return [item for item in items if not is_dummy(item)]
+    return items
+
+
+class TrainingMixin(TrainingModuleMixin):
+    """Training-graph hooks — depends on :class:`BagelVAE` modeling APIs."""
 
     config: BagelVAEConfig
-    preprocessor_class = BagelVAEPreprocessor
+    device: torch.device
+    dtype: torch.dtype
 
-    def init_omni_state(self) -> None:
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._encode_items: list[ConversationItem] = []
         self._sp_encode_count: int | None = None
-
-    # ── Graph Entrypoints ──────────────────────────────────
-
-    def encode_context(
-        self,
-        conversation_list: list[ConversationItem] | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del generation_kwargs, kwargs
-        if conversation_list is None:
-            return {"conversation_list": conversation_list}
-
-        batched = [conversation_list]
-        image_items = self._select_vae_context_image_items(batched)
-        if not image_items:
-            return {"conversation_list": conversation_list}
-
-        pixel_values = torch.stack([item.value for item in image_items], dim=0).to(
-            device=self.device, dtype=self.dtype, non_blocking=True
-        )
-        outputs = self.encode(pixel_values=pixel_values)
-        for image_item, latent in zip(image_items, outputs["latents"], strict=True):
-            latent = crop_latent_to_image_shape(
-                latent,
-                image_item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
-                downsample=int(self.config.downsample),
-            )
-            image_item.value = latent.to(device=self.device, dtype=self.dtype)
-            image_item.source = BAGEL_VAE_CONTEXT
-        return {"conversation_list": conversation_list}
-
-    def decode_generated(
-        self,
-        conversation_list: list[ConversationItem] | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del generation_kwargs, kwargs
-        if conversation_list is None:
-            return {"conversation_list": conversation_list}
-
-        batched = [conversation_list]
-        decode_items = self._select_vae_decode_items(batched)
-        if not decode_items:
-            return {"conversation_list": conversation_list}
-
-        latents = []
-        for item in decode_items:
-            latents.append(
-                item.value.detach().squeeze(0)
-                if item.value.dim() == 4 and item.value.shape[0] == 1
-                else item.value.detach()
-            )
-        latents = torch.stack(latents, dim=0).to(device=self.device, dtype=self.dtype)
-
-        outputs = self.decode(latents=latents)
-        pixel_values = outputs["pixel_values"]
-        for item, image in zip(decode_items, pixel_values, strict=True):
-            item.type = "image"
-            item.value = image.to(device=self.device, dtype=self.dtype)
-        return {
-            "conversation_list": conversation_list,
-            "generated": {"type": "image", "value": self._image_processor.postprocess(pixel_values[-1])[0]},
-        }
-
-    # ── Training hooks ──────────────────────────────────
 
     @pre_forward("encode", "offline_encode")
     def encode_pre(
@@ -107,7 +59,7 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
         del kwargs
         self._conversation_carrier = conversation_list
 
-        self._encode_items = self._select_vae_context_items(conversation_list)
+        self._encode_items = select_bagel_vae_context_items(conversation_list)
 
         self._metric_meter_stash_latent_tokens(self._vae_latent_token_lengths())
 
@@ -199,7 +151,7 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
         self._encode_items = []
         self._sp_encode_count = None
 
-        self._encode_items = self._select_vae_context_items(conversation_list)
+        self._encode_items = select_bagel_vae_context_items(conversation_list)
         encoded_cache: list[torch.Tensor] = []
         for item in self._encode_items:
             cache = item.value
@@ -208,50 +160,11 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
             encoded_cache.append(cache.detach().to(device=self._online_process_device()))
         return {"encoded_cache": encoded_cache}
 
-    # ── Internal helpers ──────────────────────────────────
-
     def _gather_encode_output(self, output: torch.Tensor) -> torch.Tensor:
         if self._sp_encode_count is None:
             raise RuntimeError("BAGEL VAE SP image count was not initialized.")
         output = gather_outputs(output, gather_dim=0, group=get_parallel_state().sp_group)
         return output.narrow(0, 0, self._sp_encode_count)
-
-    def _select_vae_context_items(
-        self, conversation_list: list[list[ConversationItem]] | None
-    ) -> list[ConversationItem]:
-        if conversation_list is None:
-            raise ValueError("BagelVAE requires conversation_list to select VAE context items.")
-
-        return list(iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]))
-
-    def _select_vae_decode_items(
-        self, conversation_list: list[list[ConversationItem]] | None
-    ) -> list[ConversationItem]:
-        if conversation_list is None:
-            raise ValueError("BagelVAE decode requires conversation_list to select latent items.")
-
-        # Final image decode consumes the completed latent emitted by the flow connector.
-        decode_items: list[ConversationItem] = []
-        for item in iter_desired_items(conversation_list, types=["output"], sources=[BAGEL_GENERATED_LATENT]):
-            if not is_dummy(item):
-                decode_items.append(item)
-        return decode_items
-
-    def _select_vae_context_image_items(
-        self, conversation_list: list[list[ConversationItem]] | None
-    ) -> list[ConversationItem]:
-        if conversation_list is None:
-            raise ValueError("BagelVAE encode_context requires conversation_list to select context images.")
-
-        image_items: list[ConversationItem] = []
-        for item in iter_desired_items(
-            conversation_list,
-            types=["image"],
-            sources=[BAGEL_VAE_CONTEXT],
-        ):
-            if not is_dummy(item):
-                image_items.append(item)
-        return image_items
 
     def _vae_latent_token_lengths(self) -> list[int]:
         # Latent tokens per image = (H // ds) * (W // ds), using the real pixel shape
@@ -288,12 +201,107 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
             return torch.device("cpu")
         return torch.device(device_type, get_device_id())
 
-    def save_full_hf_checkpoint(self, output_dir: str, *, source_path: str, trainer: Any, state: Any) -> None:
-        del trainer, state
-        shutil.copytree(source_path, output_dir, dirs_exist_ok=True)
+
+class InferenceMixin(InferenceModuleMixin):
+    config: BagelVAEConfig
+    device: torch.device
+    dtype: torch.dtype
+    _image_processor: BagelVAEProcessor
+
+    def encode(
+        self,
+        pixel_values: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        """IDE stub — implemented on :class:`BagelVAE` in ``modeling.py``."""
+        ...
+
+    def decode(
+        self,
+        latents: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        """IDE stub — implemented on :class:`BagelVAE` in ``modeling.py``."""
+        ...
+
+    def encode_context(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del generation_kwargs, kwargs
+        if conversation_list is None:
+            return {"conversation_list": conversation_list}
+
+        batched = [conversation_list]
+        image_items = select_bagel_vae_context_items(batched, exclude_dummy=True)
+        if not image_items:
+            return {"conversation_list": conversation_list}
+
+        pixel_values = torch.stack([item.value for item in image_items], dim=0).to(
+            device=self.device, dtype=self.dtype, non_blocking=True
+        )
+        outputs = self.encode(pixel_values=pixel_values)
+        for image_item, latent in zip(image_items, outputs["latents"], strict=True):
+            latent = crop_latent_to_image_shape(
+                latent,
+                image_item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                downsample=int(self.config.downsample),
+            )
+            image_item.value = latent.to(device=self.device, dtype=self.dtype)
+            image_item.source = BAGEL_VAE_CONTEXT
+        return {"conversation_list": conversation_list}
+
+    def decode_generated(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del generation_kwargs, kwargs
+        if conversation_list is None:
+            return {"conversation_list": conversation_list}
+
+        batched = [conversation_list]
+        decode_items = self._select_vae_decode_items(batched)
+        if not decode_items:
+            return {"conversation_list": conversation_list}
+
+        latents = []
+        for item in decode_items:
+            latents.append(
+                item.value.detach().squeeze(0)
+                if item.value.dim() == 4 and item.value.shape[0] == 1
+                else item.value.detach()
+            )
+        latents = torch.stack(latents, dim=0).to(device=self.device, dtype=self.dtype)
+
+        outputs = self.decode(latents=latents)
+        pixel_values = outputs["pixel_values"]
+        for item, image in zip(decode_items, pixel_values, strict=True):
+            item.type = "image"
+            item.value = image.to(device=self.device, dtype=self.dtype)
+        return {
+            "conversation_list": conversation_list,
+            "generated": {"type": "image", "value": self._image_processor.postprocess(pixel_values[-1])[0]},
+        }
+
+    def _select_vae_decode_items(
+        self, conversation_list: list[list[ConversationItem]] | None
+    ) -> list[ConversationItem]:
+        if conversation_list is None:
+            raise ValueError("BagelVAE decode requires conversation_list to select latent items.")
+
+        # Final image decode consumes the completed latent emitted by the flow connector.
+        decode_items: list[ConversationItem] = []
+        for item in iter_desired_items(conversation_list, types=["output"], sources=[BAGEL_GENERATED_LATENT]):
+            if not is_dummy(item):
+                decode_items.append(item)
+        return decode_items
 
 
-class BagelVAEMetricMeterMixin(MetricMeterMixin):
+class MeterMixin(MetricMeterMixin):
     """Per-module training meter for BAGEL's latent VAE codec (FLUX-style conv AE)."""
 
     config: BagelVAEConfig
@@ -346,7 +354,21 @@ class BagelVAEMetricMeterMixin(MetricMeterMixin):
         return 6 * total_macs / 1e12
 
 
+class VeOmniMixin(OfflineEncodingMixin, BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
+    """Carrier hooks for raw-image VAE encode and latent decode."""
+
+    config: BagelVAEConfig
+    preprocessor_class = BagelVAEPreprocessor
+
+    def save_full_hf_checkpoint(self, output_dir: str, *, source_path: str, trainer: Any, state: Any) -> None:
+        del trainer, state
+        shutil.copytree(source_path, output_dir, dirs_exist_ok=True)
+
+
 __all__ = [
-    "BagelVAEModuleMixin",
-    "BagelVAEMetricMeterMixin",
+    "BAGEL_VAE_PIXEL_SHAPE",
+    "InferenceMixin",
+    "MeterMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
 ]

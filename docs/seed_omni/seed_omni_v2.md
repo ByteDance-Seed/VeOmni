@@ -41,23 +41,60 @@ flowchart LR
 
 ## 2. The four building blocks
 
-### 2.1 Module mixins (`module.py` + `modulemixin.py`)
+### 2.1 Module mixins (`modulemixin.py` + `modeling.py`)
 
-Every sub-model multi-inherits a family-specific ``*ModuleMixin`` and a real
-HuggingFace / diffusers model.  Shared defaults live in
-:class:`~veomni.models.seed_omni.mixins.module_mixin.ModuleMixin`; per-module train/infer
-logic lives in ``modules/<family>/<sub>/modulemixin.py``:
+Every sub-model multi-inherits a family ``VeOmniMixin`` and a real HuggingFace /
+diffusers model.  Graph hooks are split across composable mixins in
+``modules/<family>/<sub>/modulemixin.py``; weights and core ``forward`` stay in
+``modeling.py``:
 
 ```python
-class JanusSiglip(JanusSiglipModuleMixin, PreTrainedModel): ...
-class JanusLlama(JanusLlamaModuleMixin, PreTrainedModel): ...
+# modulemixin.py
+class TrainingMixin(TrainingModuleMixin): ...
+class InferenceMixin(InferenceModuleMixin): ...
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin): ...
+
+# modeling.py
+class JanusSiglip(VeOmniMixin, PreTrainedModel): ...
+class JanusLlama(VeOmniMixin, PreTrainedModel): ...
 ```
 
-Construction chain: ``super().__init__(config)`` → ``PreTrainedModel`` +
-:meth:`~veomni.models.seed_omni.mixins.module_mixin.ModuleMixin.init_omni_state`, then
-build submodules in ``modeling.py`` and call ``self.post_init()`` for HF
-weight init.  Core ``forward`` stays in ``modeling.py``; graph hooks
+Construction: cooperative ``__init__`` through the mixin chain → build
+submodules in ``modeling.py`` → ``self.post_init()`` for HF weight init.
+Core ``forward`` / ``encode`` / … stay in ``modeling.py``; graph hooks
 (``pre_forward``, ``generate``, …) stay in ``modulemixin.py``.
+
+#### IDE type stubs (static analysis only)
+
+Hooks call modeling APIs via ``self.method(...)``, but the mixin class does not
+contain the implementation. Declare **only what that mixin’s hooks use**:
+
+```python
+class TrainingMixin(TrainingModuleMixin):
+    config: BagelFlowConnectorConfig
+    device: torch.device
+    dtype: torch.dtype
+
+    def embed_latent(
+        self,
+        latents: torch.Tensor,
+        position_ids: torch.LongTensor,
+        timesteps: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """IDE stub — implemented on :class:`BagelFlowConnector` in ``modeling.py``."""
+        ...
+```
+
+Rules:
+
+- Signatures must match ``modeling.py`` exactly; body is always ``...``.
+- Docstring template: `IDE stub — implemented on :class:`Xxx` in modeling.py.`
+- Properties defined on ``VeOmniMixin`` in the same file use
+  ``IDE stub — see :class:`VeOmniMixin` below (``config.field``).``
+- Do **not** copy modeling logic into the mixin.
+
+See ``.agents/skills/seedomni-v2/references/modulemixin-ide-stubs.md`` and
+``modules/bagel/flow_connector/modulemixin.py`` for the full convention.
 
 The mixins expose **optional hooks** with safe defaults:
 
@@ -80,7 +117,7 @@ The mixins expose **optional hooks** with safe defaults:
 accounting is per-module and opt-in**. The per-module meter is the optional
 `MetricMeterMixin` living on the module itself (`self.base.model` may or may not be a
 `MetricMeterMixin`) — the per-module analogue of how `helper.EnvironMeter` lives on the
-trainer. A module opts in by mixing in `MetricMeterMixin` (alongside `ModuleMixin`) and:
+trainer. A module opts in by mixing in `MetricMeterMixin` on `VeOmniMixin` and:
 1. **reporting its tokens** by calling `metric_meter_set_seqlens(method, seqlens)`
    **inside `pre_forward`, before any SP slice** (the one uniform token entry
    point — even AR backbones use it, building `seqlens` from their `cu_seqlens`);
@@ -366,9 +403,10 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 2. **Write each module triplet** under
    `veomni/models/seed_omni/modules/<family>/<sub>/`:
    - `configuration.py` — a `PretrainedConfig` with a unique `model_type`.
-   - `modulemixin.py` — `class XxxModuleMixin(ModuleMixin)` with
-     `init_omni_state`, `pre_forward` / `post_forward`, `generate`, etc.
-   - `modeling.py` — `class X(XxxModuleMixin, <HFBase>)` with `__init__`,
+   - `modulemixin.py` — `TrainingMixin` / `InferenceMixin` / `VeOmniMixin`
+     with graph hooks **and IDE type stubs** for modeling APIs used by those
+     hooks (see §2.1).
+   - `modeling.py` — `class X(VeOmniMixin, <HFBase>)` with `__init__`,
      `forward`, and submodule layout.  Janus modules under
      `modules/janus/*/` are the reference pattern.
    - `processing.py` (optional) — if the module consumes raw images / audio.
@@ -421,7 +459,9 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 
 | Path | Responsibility |
 |------|----------------|
-| `mixins/module_mixin.py` | base `ModuleMixin` (shared hook defaults + `init_omni_state`) |
+| `mixins/base_mixin.py` | shared assets, `_omni_hook_name` registry |
+| `mixins/training_module_mixin.py` | `pre_forward` / `post_forward` dispatch |
+| `mixins/inference_module_mixin.py` | `pre_generate` / `post_generate` dispatch |
 | `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
 | `utils/conversation.py` | `ConversationItem` + carrier helpers |
 | `utils/convert_registry.py` | HF → split-checkpoint conversion registry |

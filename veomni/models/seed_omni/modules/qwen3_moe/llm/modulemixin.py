@@ -1,8 +1,8 @@
 """Graph hooks for the Qwen3-MoE AR backbone.
 
 The packing / scatter / generate logic is **identical** to the dense Qwen3
-backbone, so :class:`Qwen3MoeLlmModuleMixin` subclasses
-:class:`~veomni.models.seed_omni.modules.qwen3.llm.modulemixin.Qwen3LlmModuleMixin`
+backbone, so :class:`VeOmniMixin` subclasses
+:class:`~veomni.models.seed_omni.modules.qwen3.llm.modulemixin.Qwen3LlmVeOmniMixin`
 and only adds the Expert-Parallel (``ep``) plan for the fused experts.  The
 metric meter mixin overrides the FLOPs estimate with the MoE (sparse-MLP) cost.
 """
@@ -13,25 +13,11 @@ from torch.distributed._tensor import Shard
 
 from ......distributed.parallel_plan import ParallelPlan
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ...qwen3.llm.modulemixin import Qwen3LlmModuleMixin
+from ...qwen3.llm.modulemixin import VeOmniMixin as Qwen3LlmVeOmniMixin
 from .configuration import Qwen3MoeLlmConfig
 
 
-class Qwen3MoeLlmModuleMixin(Qwen3LlmModuleMixin):
-    """Qwen3-MoE backbone hooks (dense backbone behaviour + Expert Parallel)."""
-
-    def get_parallel_plan(self) -> ParallelPlan:
-        # fqn is module-local: ``self.language_model`` is the bare ``Qwen3MoeModel``
-        # (layers directly under it), so no ``model.`` prefix (unlike the
-        # transformers ``Qwen3MoeForCausalLM`` parallel plan).
-        ep_plan = {
-            "language_model.layers.*.mlp.experts.gate_up_proj": Shard(0),
-            "language_model.layers.*.mlp.experts.down_proj": Shard(0),
-        }
-        return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
-
-
-class Qwen3MoeLlmMetricMeterMixin(MetricMeterMixin):
+class MeterMixin(MetricMeterMixin):
     """Per-module training meter for the Qwen3-MoE backbone (transformer layers only)."""
 
     config: Qwen3MoeLlmConfig
@@ -64,4 +50,18 @@ class Qwen3MoeLlmMetricMeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["Qwen3MoeLlmModuleMixin", "Qwen3MoeLlmMetricMeterMixin"]
+class VeOmniMixin(MeterMixin, Qwen3LlmVeOmniMixin):
+    """Qwen3-MoE backbone hooks (dense backbone behaviour + Expert Parallel)."""
+
+    def get_parallel_plan(self) -> ParallelPlan:
+        # fqn is module-local: ``self.language_model`` is the bare ``Qwen3MoeModel``
+        # (layers directly under it), so no ``model.`` prefix (unlike the
+        # transformers ``Qwen3MoeForCausalLM`` parallel plan).
+        ep_plan = {
+            "language_model.layers.*.mlp.experts.gate_up_proj": Shard(0),
+            "language_model.layers.*.mlp.experts.down_proj": Shard(0),
+        }
+        return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
+
+
+__all__ = ["VeOmniMixin", "MeterMixin"]

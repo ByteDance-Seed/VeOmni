@@ -18,7 +18,7 @@ from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, Conversatio
 
 
 def test_bagel_training_text_embed_meta_preserves_grad():
-    from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import BagelTextEncoderModuleMixin
+    from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import VeOmniMixin
 
     item = ConversationItem(
         type="text",
@@ -27,7 +27,7 @@ def test_bagel_training_text_embed_meta_preserves_grad():
         meta={"input_ids": torch.tensor([11, 12])},
     )
     packed_text_embeds = torch.randn(2, 4, requires_grad=True)
-    mixin = BagelTextEncoderModuleMixin()
+    mixin = VeOmniMixin()
     mixin.device = torch.device("cpu")
     mixin.dtype = torch.float32
 

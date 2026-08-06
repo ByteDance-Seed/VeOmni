@@ -2,7 +2,7 @@
 
 Each entry maps a HuggingFace ``model_type`` string (the ``model_type``
 field of each module's :class:`PretrainedConfig` subclass) to the
-:class:`~veomni.models.seed_omni.mixins.module_mixin.ModuleMixin` subclass that backs it.  At trainer-build time the
+:class:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin` subclass that backs it.  At trainer-build time the
 flow is::
 
     model_type = read_model_type(<weights_path>)        # reads config.json

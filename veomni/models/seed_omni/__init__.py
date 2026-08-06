@@ -16,7 +16,7 @@
 # Exports cluster around three concerns:
 #
 #   1. Core graph / runtime types (:class:`OmniConfig`, :class:`OmniModel`,
-#      :class:`ModuleMixin`, :class:`TrainingGraph`, :class:`GenerationGraph`).
+#      :class:`BaseMixin`, :class:`TrainingGraph`, :class:`GenerationGraph`).
 #   2. Module registries — :data:`OMNI_CONFIG_REGISTRY`,
 #      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
 #      ``model_type → class`` lazily at runtime.
@@ -24,9 +24,11 @@ from .configuration_omni import OmniConfig
 from .graphs.base import END, EdgeDef, NodeDef
 from .graphs.generation_graph import GenerationGraph
 from .graphs.training_graph import TrainingGraph
+from .mixins.base_mixin import BaseMixin
+from .mixins.inference_module_mixin import InferenceModuleMixin
 from .mixins.metric_meter_mixin import MetricMeterMixin
-from .mixins.module_mixin import ModuleMixin
 from .mixins.offline_encoding_mixin import OfflineEncodingConfigMixin, OfflineEncodingMixin
+from .mixins.training_module_mixin import TrainingModuleMixin
 from .modeling_omni import OmniModel
 from .modules import (
     OMNI_CONFIG_REGISTRY,
@@ -44,7 +46,9 @@ __all__ = [
     "OmniConfig",
     "OmniModel",
     "OmniProcessor",
-    "ModuleMixin",
+    "BaseMixin",
+    "TrainingModuleMixin",
+    "InferenceModuleMixin",
     "MetricMeterMixin",
     "OfflineEncodingConfigMixin",
     "OfflineEncodingMixin",

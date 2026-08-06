@@ -5,8 +5,10 @@ import torch
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor
 
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from .configuration import JanusSiglipConfig
 from .processing import JanusSiglipPreprocessor, JanusSiglipProcessor
@@ -15,19 +17,20 @@ from .processing import JanusSiglipPreprocessor, JanusSiglipProcessor
 _SOURCE = "janus_siglip"
 
 
-class JanusSiglipModuleMixin(ModuleMixin):
-    config: JanusSiglipConfig
-    _image_processor: JanusSiglipProcessor
-    preprocessor_class = JanusSiglipPreprocessor
+class TrainingMixin(TrainingModuleMixin):
+    """Training-graph hooks — depends on :class:`JanusSiglip` modeling APIs."""
 
-    def init_omni_state(self) -> None:
-        # Training state
+    config: JanusSiglipConfig
+    device: torch.device
+    dtype: torch.dtype
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self._conversation_carrier: Any = None
         # Active sample's image count. Under SP the output-gather hook
         # (``forward_sp_post``) narrows the all-gathered (batch-padded) embeds to it.
         self._sp_own_len: Optional[int] = None
 
-    # Training hooks
     @pre_forward("forward")
     def forward_pre(
         self,
@@ -100,7 +103,17 @@ class JanusSiglipModuleMixin(ModuleMixin):
             "pixel_values": torch.zeros(cfg.num_channels, cfg.image_size, cfg.image_size, dtype=self.dtype),
         }
 
-    # Inference hooks
+
+class InferenceMixin(InferenceModuleMixin):
+    config: JanusSiglipConfig
+    device: torch.device
+    dtype: torch.dtype
+    _image_processor: JanusSiglipProcessor
+
+    def _encode_pixel_values(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """IDE stub — implemented on :class:`JanusSiglip` in ``modeling.py``."""
+        ...
+
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
@@ -137,7 +150,7 @@ class JanusSiglipModuleMixin(ModuleMixin):
         )
 
 
-class JanusSiglipMetricMeterMixin(MetricMeterMixin):
+class MeterMixin(MetricMeterMixin):
     """Per-module training meter for the SigLIP vision tower."""
 
     config: JanusSiglipConfig
@@ -167,4 +180,15 @@ class JanusSiglipMetricMeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["JanusSiglipModuleMixin", "JanusSiglipMetricMeterMixin"]
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
+    config: JanusSiglipConfig
+    _image_processor: JanusSiglipProcessor
+    preprocessor_class = JanusSiglipPreprocessor
+
+
+__all__ = [
+    "InferenceMixin",
+    "MeterMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

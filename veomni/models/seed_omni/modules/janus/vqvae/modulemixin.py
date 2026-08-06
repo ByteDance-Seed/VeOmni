@@ -7,8 +7,10 @@ from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs, slice_input_tensor
 from ......utils import helper
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import (
     ConversationItem,
     is_dummy,
@@ -25,23 +27,23 @@ logger = helper.create_logger(__name__)
 _SOURCE = "janus_vqvae"
 
 
-class JanusVqvaeModuleMixin(ModuleMixin):
-    config: JanusVqvaeConfig
-    _image_processor: JanusVqvaeProcessor
-    preprocessor_class = JanusVqvaePreprocessor
+class TrainingMixin(TrainingModuleMixin):
+    """Training-graph hooks — depends on :class:`JanusVqvae` modeling APIs."""
 
-    def init_omni_state(self) -> None:
-        # Training state
+    config: JanusVqvaeConfig
+    device: torch.device
+    dtype: torch.dtype
+    _image_processor: JanusVqvaeProcessor
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self._conversation_carrier: Any = None
         # Active sample's image count. Under SP the encode output-gather hook
         # (``encode_sp_post``) narrows the all-gathered (batch-padded) embeds + VQ ids.
         self._sp_own_len: Optional[int] = None
 
-        # Inference state
-        self._vq_buffer: List[int] = []
-
     # Training hooks — one pre/post pair per call-site (tagged with its method),
-    # routed by the ModuleMixin.pre_forward / post_forward dispatchers.
+    # routed by :class:`BaseMixin` ``pre_forward`` / ``post_forward`` dispatchers.
     @pre_forward("encode")
     def encode_pre(
         self,
@@ -182,7 +184,21 @@ class JanusVqvaeModuleMixin(ModuleMixin):
             "pixel_values": torch.zeros(cfg.in_channels, height, width, dtype=self.dtype),
         }
 
-    # Inference hooks
+
+class InferenceMixin(InferenceModuleMixin):
+    config: JanusVqvaeConfig
+    device: torch.device
+    dtype: torch.dtype
+    _image_processor: JanusVqvaeProcessor
+    generation_head: Any
+    generation_aligner: Any
+    generation_embeddings: torch.nn.Embedding
+    vqmodel: Any
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._vq_buffer: List[int] = []
+
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
@@ -305,7 +321,7 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
-class JanusVqvaeMetricMeterMixin(MetricMeterMixin):
+class MeterMixin(MetricMeterMixin):
     """Per-module training meter for the Janus VQVAE codec + generation head."""
 
     config: JanusVqvaeConfig
@@ -322,4 +338,15 @@ class JanusVqvaeMetricMeterMixin(MetricMeterMixin):
         return 0.0
 
 
-__all__ = ["JanusVqvaeModuleMixin", "JanusVqvaeMetricMeterMixin"]
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
+    config: JanusVqvaeConfig
+    _image_processor: JanusVqvaeProcessor
+    preprocessor_class = JanusVqvaePreprocessor
+
+
+__all__ = [
+    "InferenceMixin",
+    "MeterMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

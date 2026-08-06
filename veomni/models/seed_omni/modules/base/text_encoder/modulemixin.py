@@ -8,8 +8,11 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
 from veomni.utils.tensor_utils import naflatten, unflatten
 
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.emb_parallel_mixin import EmbParallelMixin
+from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, seal_outputs
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
@@ -18,50 +21,29 @@ from .configuration import TextEncoderConfig
 _SAMPLING_KWARGS = ("temperature", "top_p", "do_sample")
 
 
-class TextEncoderModuleMixin(ModuleMixin):
-    """Shared training / inference plumbing for every text encoder.
+def scatter_text_encoder_embeds(
+    conversation_list: list[list[ConversationItem]],
+    segment_embeds: list[torch.Tensor],
+) -> None:
+    """Write packed text embeds back onto conversation text segments."""
+    segment_embeds_iterator = iter(segment_embeds)
+    for sample in conversation_list:
+        for part in sample:
+            if part.type != "text":
+                continue
+            part.value = next(segment_embeds_iterator)
+    if next(segment_embeds_iterator, None) is not None:
+        raise RuntimeError("TextEncoder text segment count mismatch during embed scatter.")
 
-    Concrete modules (janus / qwen3 / qwen3vl / bagel) subclass this and define
-    ``XxxTextEncoderPreprocessor`` in their ``processing.py`` by subclassing
-    :class:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor`
-    and implementing :meth:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
-    with the module-local chat template.  Register via ``preprocessor_class`` on
-    the family mixin, plus the ``encode_pre`` / ``encode_post`` / ``decode_pre`` /
-    ``decode_post`` pass-through hooks in each module's ``modulemixin.py``.
-    """
 
+class TrainingMixin(TrainingModuleMixin):
+    """Training-graph hooks shared by every text encoder."""
+
+    config: TextEncoderConfig
+    device: torch.device
     _chat_template: TextEncoderChatTemplate
+    _encode_batch_shape: torch.LongTensor | None
 
-    def init_omni_state(self) -> None:
-        # Training state
-        self._conversation_carrier: Any = None
-        self._encode_batch_shape: torch.LongTensor | None = None
-        # Active sample's packed token count. Under SP the encode output-gather hook
-        # (``encode_sp_post``) narrows the all-gathered (seq-padded) embeds to it.
-        self._sp_own_len: Optional[int] = None
-
-        # Inference state
-        self._text_token_cache: list[int] = []
-        self._bos_injected: bool = False
-        # First FSM step embeds the whole (pre-templated, pre-tokenized) prompt;
-        # later steps autoregress. Set once the prompt has been encoded.
-        self._prompt_encoded: bool = False
-
-    def get_parallel_plan(self):
-        from .parallel_plan import get_parallel_plan as _get_parallel_plan
-
-        return _get_parallel_plan()
-
-    @property
-    def tokenizer(self) -> Any:
-        return self._tokenizer
-
-    @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
-        self._tokenizer = tokenizer
-        self._chat_template = TextEncoderChatTemplate(tokenizer)
-
-    # training hooks
     @pre_forward("encode")
     def encode_pre(
         self,
@@ -101,7 +83,7 @@ class TextEncoderModuleMixin(ModuleMixin):
         self._conversation_carrier = None
         batch_shape = self._encode_batch_shape
         self._encode_batch_shape = None
-        self._scatter_text_embeds(conversation, unflatten(inputs_embeds, batch_shape))
+        scatter_text_encoder_embeds(conversation, unflatten(inputs_embeds, batch_shape))
         return {"conversation_list": conversation}
 
     @pre_forward("decode")
@@ -177,21 +159,45 @@ class TextEncoderModuleMixin(ModuleMixin):
         shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, shift_labels
 
-    def _scatter_text_embeds(
-        self,
-        conversation_list: list[list[ConversationItem]],
-        segment_embeds: list[torch.Tensor],
-    ) -> None:
-        segment_embeds_iterator = iter(segment_embeds)
-        for sample in conversation_list:
-            for part in sample:
-                if part.type != "text":
-                    continue
-                part.value = next(segment_embeds_iterator)
-        if next(segment_embeds_iterator, None) is not None:
-            raise RuntimeError("TextEncoder text segment count mismatch during embed scatter.")
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._conversation_carrier: Any = None
+        self._encode_batch_shape: torch.LongTensor | None = None
+        # Active sample's packed token count. Under SP the encode output-gather hook
+        # (``encode_sp_post``) narrows the all-gathered (seq-padded) embeds to it.
+        self._sp_own_len: Optional[int] = None
 
-    # inference hooks
+
+class InferenceMixin(InferenceModuleMixin):
+    """Generation-FSM hooks shared by every text encoder."""
+
+    config: TextEncoderConfig
+    device: torch.device
+    _chat_template: TextEncoderChatTemplate
+    _tokenizer: Any
+    _prompt_encoded: bool
+    _text_token_cache: list[int]
+
+    def encode(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """IDE stub — implemented on :class:`TextEncoder` in ``modeling.py``."""
+        ...
+
+    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """IDE stub — implemented on :class:`TextEncoder` in ``modeling.py``."""
+        ...
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._text_token_cache: list[int] = []
+        self._bos_injected: bool = False
+        # First FSM step embeds the whole (pre-templated, pre-tokenized) prompt;
+        # later steps autoregress. Set once the prompt has been encoded.
+        self._prompt_encoded: bool = False
+
     def reset_local_inference_state(self) -> None:
         self._text_token_cache.clear()
 
@@ -217,7 +223,7 @@ class TextEncoderModuleMixin(ModuleMixin):
         input_ids, batch_shape = naflatten(input_ids)
         input_ids = input_ids.to(self.device)
         inputs_embeds = self.encode(input_ids)["inputs_embeds"]
-        self._scatter_text_embeds([conversation_list], unflatten(inputs_embeds, batch_shape))
+        scatter_text_encoder_embeds([conversation_list], unflatten(inputs_embeds, batch_shape))
         return {"conversation_list": conversation_list}
 
     @abstractmethod
@@ -234,7 +240,7 @@ class TextEncoderModuleMixin(ModuleMixin):
         ``<eoi>`` + classifier-free guidance), so each concrete module owns its
         ``generate``. The base provides only the shared sampling / embedding
         helpers (:meth:`_sample_token`, :meth:`_token_id_tensor`,
-        :meth:`_scatter_text_embeds`, :meth:`_flush_text_generated`).
+        :func:`scatter_text_encoder_embeds`, :meth:`_flush_text_generated`).
         """
         raise NotImplementedError
 
@@ -309,7 +315,7 @@ class TextEncoderModuleMixin(ModuleMixin):
         return {"type": "text", "value": text, "meta": meta}
 
 
-class TextEncoderMetricMeterMixin(MetricMeterMixin):
+class MeterMixin(MetricMeterMixin):
     """Per-module training meter for the text encoder (wte + lm_head)."""
 
     config: TextEncoderConfig
@@ -327,4 +333,38 @@ class TextEncoderMetricMeterMixin(MetricMeterMixin):
     # default ``metric_meter_token_lengths`` (drains the stash) is used as-is.
 
 
-__all__ = ["TextEncoderModuleMixin", "TextEncoderMetricMeterMixin"]
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin, EmbParallelMixin):
+    """Shared training / inference plumbing for every text encoder.
+
+    Concrete modules (janus / qwen3 / qwen3vl / bagel) subclass this and define
+    ``XxxTextEncoderPreprocessor`` in their ``processing.py`` by subclassing
+    :class:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor`
+    and implementing :meth:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
+    with the module-local chat template.  Register via ``preprocessor_class`` on
+    the family mixin, plus the ``encode_pre`` / ``encode_post`` / ``decode_pre`` /
+    ``decode_post`` pass-through hooks in each module's ``modulemixin.py``.
+    """
+
+    _chat_template: TextEncoderChatTemplate
+
+    def get_parallel_plan(self):
+        from .parallel_plan import get_parallel_plan as _get_parallel_plan
+
+        return _get_parallel_plan()
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, tokenizer: Any) -> None:
+        self._tokenizer = tokenizer
+        self._chat_template = TextEncoderChatTemplate(tokenizer)
+
+
+__all__ = [
+    "InferenceMixin",
+    "MeterMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

@@ -40,7 +40,7 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
     BagelTextEncoderPreprocessor,
 )
 from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
-from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BagelVAEModuleMixin
+from veomni.models.seed_omni.modules.bagel.vae.modulemixin import VeOmniMixin
 from veomni.models.seed_omni.modules.bagel.vae.processing import (
     BAGEL_VAE_PIXEL_SHAPE,
     BagelVAEPreprocessor,
@@ -71,15 +71,12 @@ def _worker_dummies(conversation_list, source):
     return list(iter_desired_items(conversation_list, roles=["dummy"], sources=[source]))
 
 
-class _DummyBagelVAE(BagelVAEModuleMixin):
+class _DummyBagelVAE(VeOmniMixin):
     def __init__(self, support_cache: bool = False, train_type: str = "train") -> None:
         self.config = BagelVAEConfig(support_cache=support_cache, train_type=train_type)
         self._image_processor = object()
         self.dtype = torch.float32
         super().__init__()
-
-    def init_omni_state(self) -> None:
-        return None
 
 
 # Module-level fakes so the preprocessors stay picklable (workers fork/spawn them).

@@ -58,7 +58,7 @@ logger = logging.get_logger(__name__)
 
 
 def unwrap_module(mod: nn.Module) -> nn.Module:
-    """Strip DDP/LoRA/FSDP wrappers so callers reach the inner :class:`ModuleMixin`."""
+    """Strip DDP/LoRA/FSDP wrappers so callers reach the inner :class:`BaseMixin`."""
     return unwrap_module_chain(mod)
 
 

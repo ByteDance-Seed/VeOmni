@@ -7,13 +7,13 @@ from typing import Any
 
 import torch.nn as nn
 
-from ..mixins.module_mixin import ModuleMixin
+from ..mixins.base_mixin import BaseMixin
 
 
 def unwrap_module_chain(wrapped: nn.Module) -> nn.Module:
     """Strip DDP-style ``.module`` and LoRA ``get_base_model()`` wrappers.
 
-    FSDP2 composes in place, so a bare :class:`ModuleMixin` is usually returned
+    FSDP2 composes in place, so a bare :class:`BaseMixin` is usually returned
     unchanged.
     """
     seen: set[int] = set()
@@ -21,7 +21,7 @@ def unwrap_module_chain(wrapped: nn.Module) -> nn.Module:
     while id(current) not in seen:
         seen.add(id(current))
 
-        if isinstance(current, ModuleMixin):
+        if isinstance(current, BaseMixin):
             return current
 
         inner = getattr(current, "module", None)
@@ -48,16 +48,20 @@ def unwrap_module_chain(wrapped: nn.Module) -> nn.Module:
     return current
 
 
-def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> ModuleMixin:
-    """Return the raw :class:`ModuleMixin` behind a graph-callable module.
+def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> BaseMixin:
+    """Return the raw :class:`BaseMixin` behind a graph-callable module.
 
     ``wrapped`` is the object that must be called so DDP/FSDP hooks run.  The
-    raw :class:`ModuleMixin` owns graph endpoint methods and ``pre_forward`` /
-    ``post_forward``.  FSDP2 is composable and leaves the module itself as the
+    raw :class:`BaseMixin` owns graph endpoint methods and the shared
+    :meth:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin._omni_hook_name`
+    registry.  Training call-sites dispatch ``pre_forward`` / ``post_forward``
+    through :class:`TrainingModuleMixin`; inference call-sites dispatch
+    ``pre_generate`` / ``post_generate`` through :class:`InferenceModuleMixin`.
+    FSDP2 is composable and leaves the module itself as the
     callable object; DDP-style wrappers expose the mixin through ``.module``.
 
     Parallel/acceleration hooks (``customized_build_parallelize_model``,
-    ``get_parallel_plan``, …) are **not** part of :class:`ModuleMixin`; they
+    ``get_parallel_plan``, …) are **not** part of :class:`BaseMixin`; they
     live on :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
     or optional family mixins on the wrapped model.
 
@@ -67,12 +71,12 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> ModuleMixin:
     (PEFT-aligned ``base_model.model``).  Its ``forward`` chain still bottoms out
     at ``base_model.model.forward``, so the :func:`call_graph_endpoint`
     trampoline (which swaps that module's ``forward``) keeps working — we only
-    need to return the inner :class:`ModuleMixin` here.
+    need to return the inner :class:`BaseMixin` here.
     """
     raw = unwrap_module_chain(wrapped)
-    if not isinstance(raw, ModuleMixin):
+    if not isinstance(raw, BaseMixin):
         raise TypeError(
-            f"Graph module '{module_name}' must be a ModuleMixin or wrap one on "
+            f"Graph module '{module_name}' must be a BaseMixin or wrap one on "
             f"`.module` / LoRA base; got {type(wrapped).__name__} "
             f"(resolved {type(raw).__name__})."
         )
@@ -81,7 +85,7 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> ModuleMixin:
 
 def call_graph_endpoint(
     wrapped: nn.Module,
-    raw: ModuleMixin,
+    raw: BaseMixin,
     *,
     method: str,
     kwargs: Mapping[str, Any],

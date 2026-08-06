@@ -17,7 +17,7 @@ Architecture
 * sub-modules           — each graph participant is attached as a **direct
                           attribute** of ``OmniModel``.  In the eager path these
                           are bare hook-bearing modules (typically a concrete
-                          ``*ModuleMixin + PreTrainedModel`` class from the
+                          ``*BaseMixin + PreTrainedModel`` class from the
                           registry).  Under VeOmni training they may be
                           FSDP/DDP-wrapped; the graph resolves graph hooks
                           (``pre_forward`` / ``post_forward``) through
@@ -25,7 +25,7 @@ Architecture
                           Parallel/acceleration build hooks live on
                           :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
                           (or a customized runtime subclass), not on
-                          :class:`~veomni.models.seed_omni.mixins.module_mixin.ModuleMixin`.
+                          :class:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin`.
 * ``generation_graph``  — :class:`GenerationGraph` (FSM).
 
 Training uses :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
@@ -52,7 +52,7 @@ from .configuration_omni import OmniConfig
 from .graphs.base import NodeDef
 from .graphs.generation_graph import GenerationGraph
 from .graphs.training_graph import TrainingGraph
-from .mixins.module_mixin import ModuleMixin
+from .mixins.base_mixin import BaseMixin
 from .modules import OMNI_MODEL_REGISTRY, read_model_type
 
 
@@ -491,10 +491,10 @@ class OmniModel(PreTrainedModel):
     def named_omni_modules(self) -> Iterator[tuple[str, nn.Module]]:
         """Yield ``(name, raw)`` for every graph participant.
 
-        ``raw`` is the :class:`ModuleMixin` resolved through
+        ``raw`` is the :class:`BaseMixin` resolved through
         :func:`~veomni.models.seed_omni.accelerator.dispatch.unwrap_graph_module`
         (bare in the eager path; unwrapped from FSDP/DDP/LoRA wrappers under
-        VeOmni).  Non-:class:`ModuleMixin` entries are skipped.
+        VeOmni).  Non-:class:`BaseMixin` entries are skipped.
         """
         from .accelerator.dispatch import unwrap_graph_module  # see _save_module_assets
 
@@ -538,20 +538,10 @@ def merge_generation_kwargs(
 
 
 def _is_omni_module(mod: nn.Module) -> bool:
-    """True when ``mod`` (possibly wrapped) resolves to a :class:`ModuleMixin`."""
+    """True when ``mod`` (possibly wrapped) resolves to a :class:`BaseMixin`."""
     from .accelerator.dispatch import unwrap_module_chain  # see OmniModel._save_module_assets
 
-    return isinstance(unwrap_module_chain(mod), ModuleMixin)
-
-
-def _sum_losses(losses: dict[str, Any]) -> Any | None:
-    if not losses:
-        return None
-    it = iter(losses.values())
-    total = next(it)
-    for v in it:
-        total = total + v
-    return total
+    return isinstance(unwrap_module_chain(mod), BaseMixin)
 
 
 __all__ = ["OmniModel", "_LOSS_KEY", "merge_generation_kwargs"]

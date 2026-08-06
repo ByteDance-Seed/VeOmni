@@ -1,43 +1,32 @@
 from typing import Any, Dict, List, Optional
 
+import torch
+
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.module_mixin import post_forward, pre_forward
+from ....mixins.training_module_mixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
-from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
+from ...base.text_encoder.modulemixin import (
+    InferenceMixin as BaseInferenceMixin,
+)
+from ...base.text_encoder.modulemixin import (
+    TrainingMixin as BaseTrainingMixin,
+)
+from ...base.text_encoder.modulemixin import (
+    VeOmniMixin as BaseVeOmniMixin,
+)
 from .chat_template import Qwen3VLChatTemplate
+from .configuration import Qwen3VLTextEncoderConfig
 from .processing import Qwen3VLTextEncoderPreprocessor
 
 
 SIGNAL_TEXT_DONE = "text_done"
 
 
-class Qwen3VLTextEncoderModuleMixin(TextEncoderModuleMixin):
-    """Qwen3-VL ``TextEncoder`` — ChatML templating + tokenize + wte / lm_head.
-
-    Image / video items (already carrying merged vision embeds from
-    ``qwen3vl_vision``) pass through ``encode`` untouched: they keep their
-    ``(N, D)`` value, get wrapped by ``<|vision_start|>`` / ``<|vision_end|>``
-    text rows, and the backbone splices them in by segment order. Only ``text``
-    rows are tokenized and embedded here.
-
-    The encode/decode plumbing (prepare / scatter) and the ChatML ``generate``
-    live in :class:`TextEncoderModuleMixin`; the hooks + CPU preprocessor below are
-    explicit pass-throughs (for findability). Only the chat template is model-specific.
-    """
-
+class TrainingMixin(BaseTrainingMixin):
+    config: Qwen3VLTextEncoderConfig
+    device: torch.device
     _chat_template: Qwen3VLChatTemplate
-    preprocessor_class = Qwen3VLTextEncoderPreprocessor
 
-    @property
-    def tokenizer(self) -> Any:
-        return self._tokenizer
-
-    @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
-        self._tokenizer = tokenizer
-        self._chat_template = Qwen3VLChatTemplate(tokenizer)
-
-    # training hooks (explicit pass-through to TextEncoderModuleMixin for findability)
     @pre_forward("encode")
     def encode_pre(
         self,
@@ -62,7 +51,22 @@ class Qwen3VLTextEncoderModuleMixin(TextEncoderModuleMixin):
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:
         return super().decode_post(**outputs)
 
-    # inference hooks — ChatML autoregression keyed on eos / <|im_end|>
+
+class InferenceMixin(BaseInferenceMixin):
+    config: Qwen3VLTextEncoderConfig
+    device: torch.device
+    _chat_template: Qwen3VLChatTemplate
+    _prompt_encoded: bool
+    _text_token_cache: list[int]
+
+    def encode(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """IDE stub — implemented on :class:`Qwen3VLTextEncoder` in ``modeling.py``."""
+        ...
+
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
@@ -98,4 +102,36 @@ class Qwen3VLTextEncoderModuleMixin(TextEncoderModuleMixin):
         raise ValueError(f"Invalid conversation tail type: {tail.type}")
 
 
-__all__ = ["Qwen3VLTextEncoderModuleMixin"]
+class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
+    """Qwen3-VL ``TextEncoder`` — ChatML templating + tokenize + wte / lm_head.
+
+    Image / video items (already carrying merged vision embeds from
+    ``qwen3vl_vision``) pass through ``encode`` untouched: they keep their
+    ``(N, D)`` value, get wrapped by ``<|vision_start|>`` / ``<|vision_end|>``
+    text rows, and the backbone splices them in by segment order. Only ``text``
+    rows are tokenized and embedded here.
+
+    The encode/decode plumbing (prepare / scatter) lives in
+    :class:`BaseVeOmniMixin`; the hooks below are explicit pass-throughs
+    (for findability). Only the chat template and the ChatML ``generate`` FSM
+    (autoregression keyed on eos / ``<|im_end|>``) are Qwen3-VL-specific.
+    """
+
+    _chat_template: Qwen3VLChatTemplate
+    preprocessor_class = Qwen3VLTextEncoderPreprocessor
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, tokenizer: Any) -> None:
+        self._tokenizer = tokenizer
+        self._chat_template = Qwen3VLChatTemplate(tokenizer)
+
+
+__all__ = [
+    "InferenceMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

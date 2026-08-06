@@ -14,7 +14,8 @@ from tests.seed_omni.bagel.contracts.helpers import (
 )
 from veomni.models.seed_omni.accelerator import OmniModelRuntime
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
-from veomni.models.seed_omni.mixins.module_mixin import ModuleMixin
+from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
+from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.generation_state import MotGenerationState
 from veomni.models.seed_omni.modules.bagel.sources import (
@@ -489,13 +490,13 @@ def _fake_cfg_branch_count(generation_kwargs: dict | None) -> int:
     return branch_count
 
 
-class _NoopBagelSiglip(ModuleMixin, nn.Module):
+class _NoopBagelSiglip(BaseMixin, InferenceModuleMixin, nn.Module):
     def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         return {"conversation_list": conversation_list}
 
 
-class _CountingInferGenBagelSiglip(ModuleMixin, nn.Module):
+class _CountingInferGenBagelSiglip(BaseMixin, InferenceModuleMixin, nn.Module):
     def __init__(self):
         super().__init__()
         self.calls = 0
@@ -511,7 +512,7 @@ class _CountingInferGenBagelSiglip(ModuleMixin, nn.Module):
         return {"conversation_list": conversation_list}
 
 
-class _InferGenTextEncoder(ModuleMixin, nn.Module):
+class _InferGenTextEncoder(BaseMixin, InferenceModuleMixin, nn.Module):
     def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         return {"conversation_list": conversation_list}
@@ -526,7 +527,7 @@ class _InferGenTextEncoder(ModuleMixin, nn.Module):
         return {"conversation_list": conversation_list}
 
 
-class _InferGenBagelQwen(ModuleMixin, nn.Module):
+class _InferGenBagelQwen(BaseMixin, InferenceModuleMixin, nn.Module):
     def generate(
         self,
         conversation_list: list[ConversationItem] | None = None,
@@ -576,7 +577,7 @@ class _InferGenBagelQwen(ModuleMixin, nn.Module):
         return {"conversation_list": conversation_list}
 
 
-class _InferGenBagelFlow(ModuleMixin, nn.Module):
+class _InferGenBagelFlow(BaseMixin, InferenceModuleMixin, nn.Module):
     def prepare_denoise_query(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
@@ -624,7 +625,7 @@ class _InferGenBagelFlow(ModuleMixin, nn.Module):
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "image_complete"}
 
 
-class _InferGenBagelVAE(ModuleMixin, nn.Module):
+class _InferGenBagelVAE(BaseMixin, InferenceModuleMixin, nn.Module):
     def decode_generated(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None

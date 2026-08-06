@@ -8,7 +8,8 @@ import torch
 from transformers import PretrainedConfig
 
 from veomni.models.seed_omni import OfflineEncodingConfigMixin, OfflineEncodingMixin
-from veomni.models.seed_omni.mixins.module_mixin import ModuleMixin, post_forward, pre_forward
+from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
+from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
@@ -20,15 +21,12 @@ class DummyOfflineConfig(OfflineEncodingConfigMixin, PretrainedConfig):
         super().__init__(**kwargs)
 
 
-class DummyOfflineModule(OfflineEncodingMixin, ModuleMixin):
+class DummyOfflineModule(OfflineEncodingMixin, TrainingModuleMixin, BaseMixin):
     def __init__(self, support_cache: bool = False, train_type: str = "train") -> None:
         self.config = DummyOfflineConfig(support_cache=support_cache, train_type=train_type)
         self.calls: list[str] = []
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         super().__init__()
-
-    def init_omni_state(self) -> None:
-        return None
 
     def offline_encode(self, **kwargs: torch.Tensor) -> dict[str, torch.Tensor]:
         return {"encoded_cache": kwargs["pixel_values"]}
@@ -135,7 +133,7 @@ def test_default_full_hf_checkpoint_hook_requires_module_implementation() -> Non
 
 
 def test_offline_encoding_mixin_is_not_module_mixin_subclass() -> None:
-    assert not issubclass(OfflineEncodingMixin, ModuleMixin)
+    assert not issubclass(OfflineEncodingMixin, BaseMixin)
 
 
 def test_offline_encoding_mixin_does_not_implement_decorated_hooks() -> None:
@@ -145,10 +143,7 @@ def test_offline_encoding_mixin_does_not_implement_decorated_hooks() -> None:
 
 
 def test_decorated_hook_slots_can_bind_multiple_contexts() -> None:
-    class MultiContextModule(ModuleMixin):
-        def init_omni_state(self) -> None:
-            return None
-
+    class MultiContextModule(TrainingModuleMixin, BaseMixin):
         @pre_forward("encode", "offline_encode")
         def encode_pre(self, **kwargs: object) -> dict[str, object]:
             return {"seen": kwargs["seen"]}

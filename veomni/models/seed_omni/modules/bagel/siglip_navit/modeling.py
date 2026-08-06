@@ -28,11 +28,11 @@ if IS_NPU_AVAILABLE:
 from transformers.activations import ACT2FN
 
 from .configuration import BagelSiglipNavitConfig
-from .modulemixin import BagelSiglipNavitMetricMeterMixin, BagelSiglipNavitModuleMixin
+from .modulemixin import VeOmniMixin
 from .processing import BagelSiglipNavitProcessor
 
 
-class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitMetricMeterMixin, PreTrainedModel):
+class BagelSiglipNavit(VeOmniMixin, PreTrainedModel):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
     base_model_prefix = "bagel_siglip_navit"

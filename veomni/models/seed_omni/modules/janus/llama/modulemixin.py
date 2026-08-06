@@ -5,37 +5,40 @@ import torch
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
-from veomni.utils.tensor_utils import naflatten, unflatten
+from veomni.utils.tensor_utils import unflatten
 
+from ....mixins.base_mixin import BaseMixin
+from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy
+from ...base.llm_packing import pack_llm_conversations_for_forward, scatter_llm_hidden_states
 from .configuration import JanusLlamaConfig
 
 
-class JanusLlamaModuleMixin(ModuleMixin):
-    def init_omni_state(self) -> None:
-        # Training state
+class TrainingMixin(TrainingModuleMixin):
+    """Training-graph hooks — depends on :class:`JanusLlama` modeling APIs."""
+
+    config: JanusLlamaConfig
+    device: torch.device
+    training: bool
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
         # Active sample's pre-pad packed length. Under SP the output-gather hook
         # (``forward_sp_post``) narrows the all-gathered (padded) output back to it.
         self._sp_own_len: Optional[int] = None
 
-        # Inference state
-        self._cfg_active: bool = False
-        self._past_key_values: Any = None
-        self._uncond_past_key_values: Any = None
-
-    # Training hooks
     @pre_forward("forward")
     def forward_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        inputs_embeds, attention_mask, position_ids, inputs_embeds_shape = self._pack_conversations_for_forward(
-            conversation_list
+        inputs_embeds, attention_mask, position_ids, inputs_embeds_shape = pack_llm_conversations_for_forward(
+            conversation_list, self.device
         )
 
         if self.training and get_parallel_state().fsdp_enabled:
@@ -112,61 +115,32 @@ class JanusLlamaModuleMixin(ModuleMixin):
 
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
-        self._scatter_hidden_states(conversation, unflatten(hidden_states, pack_shape))
+        scatter_llm_hidden_states(conversation, unflatten(hidden_states, pack_shape))
         return {"conversation_list": conversation}
 
-    def _pack_conversations_for_forward(
+
+class InferenceMixin(InferenceModuleMixin):
+    config: JanusLlamaConfig
+    device: torch.device
+
+    def forward(
         self,
-        conversations: list[list[ConversationItem]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        inputs_embeds_list = []
-        attention_mask = []
-        position_ids = []
-        for sample in conversations:
-            sample_lengths = 0
-            for item in sample:
-                role = item.role
-                if role != "dummy":
-                    embeds = item.value
-                    embeds_length = embeds.size(0)
-                    chunk_attention_mask = item.meta.pop("attention_mask", None)
-                    if chunk_attention_mask is None:
-                        chunk_attention_mask = torch.ones(embeds_length, dtype=torch.long, device=self.device)
-                    inputs_embeds_list.append(embeds.to(self.device))
-                    attention_mask.append(chunk_attention_mask.to(self.device))
-                    sample_lengths += embeds_length
-            sample_position_ids = torch.arange(sample_lengths, dtype=torch.long, device=self.device)
-            position_ids.append(sample_position_ids)
-        inputs_embeds, inputs_embeds_shape = naflatten(inputs_embeds_list)
-        position_ids = torch.cat(position_ids, dim=0)
-        attention_mask = torch.cat(attention_mask, dim=0)
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Any = None,
+        use_cache: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """IDE stub — implemented on :class:`JanusLlama` in ``modeling.py``."""
+        ...
 
-        if inputs_embeds.dim() == 2:
-            inputs_embeds = inputs_embeds.unsqueeze(0)
-        if attention_mask.dim() == 1:
-            attention_mask = attention_mask.unsqueeze(0)
-        if position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._cfg_active: bool = False
+        self._past_key_values: Any = None
+        self._uncond_past_key_values: Any = None
 
-        return inputs_embeds, attention_mask, position_ids, inputs_embeds_shape
-
-    def _scatter_hidden_states(
-        self,
-        conversation_list: list[list[ConversationItem]],
-        hidden_states_list: list[torch.Tensor],
-    ) -> None:
-        hidden_states_list_iter = iter(hidden_states_list)
-        for sample in conversation_list:
-            for part in sample:
-                if is_dummy(part):
-                    continue
-                part.value = next(hidden_states_list_iter)
-        if next(hidden_states_list_iter, None) is not None:
-            raise RuntimeError(
-                "JanusLlama._scatter_hidden_states: segment count exceeds non-dummy conversation items."
-            )
-
-    # Inference hooks
     def reset_local_inference_state(self) -> None:
         self._cfg_active = False
         self._uncond_past_key_values = None
@@ -185,7 +159,9 @@ class JanusLlamaModuleMixin(ModuleMixin):
         # the real ``forward`` while this endpoint runs.
         del kwargs
         if self._past_key_values is None:
-            inputs_embeds, attention_mask, position_ids, _ = self._pack_conversations_for_forward([conversation_list])
+            inputs_embeds, attention_mask, position_ids, _ = pack_llm_conversations_for_forward(
+                [conversation_list], self.device
+            )
             (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
                 position_ids
             )
@@ -279,22 +255,7 @@ class JanusLlamaModuleMixin(ModuleMixin):
         raise TypeError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
 
 
-def _fold_fsdp_dummy_anchors(
-    inputs_embeds: torch.Tensor,
-    conversations: list[list[ConversationItem]],
-) -> torch.Tensor:
-    for sample in conversations:
-        for part in sample:
-            if not is_dummy(part):
-                continue
-            if not isinstance(part.value, torch.Tensor):
-                continue
-            fake = part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
-            inputs_embeds = inputs_embeds + fake
-    return inputs_embeds
-
-
-class JanusLlamaMetricMeterMixin(MetricMeterMixin):
+class MeterMixin(MetricMeterMixin):
     """Per-module training meter for the Janus LLaMA backbone (transformer layers only)."""
 
     config: JanusLlamaConfig
@@ -322,4 +283,28 @@ class JanusLlamaMetricMeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["JanusLlamaModuleMixin", "JanusLlamaMetricMeterMixin"]
+class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
+    pass
+
+
+def _fold_fsdp_dummy_anchors(
+    inputs_embeds: torch.Tensor,
+    conversations: list[list[ConversationItem]],
+) -> torch.Tensor:
+    for sample in conversations:
+        for part in sample:
+            if not is_dummy(part):
+                continue
+            if not isinstance(part.value, torch.Tensor):
+                continue
+            fake = part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
+            inputs_embeds = inputs_embeds + fake
+    return inputs_embeds
+
+
+__all__ = [
+    "InferenceMixin",
+    "MeterMixin",
+    "VeOmniMixin",
+    "TrainingMixin",
+]

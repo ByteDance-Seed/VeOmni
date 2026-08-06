@@ -56,13 +56,13 @@ whatever its modality. Each module implements its own :meth:`estimate_flops`
 (its own FLOPs formula — there is no shared whole-model counter, which would
 mis-count at module granularity).
 
-Opt-in is by **multiple inheritance**, NOT by ``ModuleMixin`` (``ModuleMixin``
+Opt-in is by **multiple inheritance**, NOT by ``BaseMixin`` (``BaseMixin``
 does *not* inherit ``MetricMeterMixin``). A module that wants metering defines its own
 ``XxxMetricMeterMixin(MetricMeterMixin)`` implementing just ``estimate_flops`` (token
 lengths come from :meth:`metric_meter_set_seqlens` via the default
 ``metric_meter_token_lengths``), and its concrete model multi-inherits it, e.g.::
 
-    class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, PreTrainedModel): ...
+    class TextEncoder(VeOmniMixin, PreTrainedModel): ...
 
 The orchestrator decides whether a module contributes metrics with
 ``isinstance(model, MetricMeterMixin)``. Modules without a metric meter contribute
@@ -101,7 +101,7 @@ class MetricMeterMixin:
 
     def _metric_meter_seqlen_buffer(self) -> List[int]:
         # Lazily initialised so an implementing module never has to touch its own
-        # ``init_omni_state`` / ``pre_forward``.
+        # ``TrainingMixin.__init__`` / ``pre_forward``.
         if not hasattr(self, "_metric_meter_seqlens"):
             self._metric_meter_seqlens: List[int] = []
         return self._metric_meter_seqlens

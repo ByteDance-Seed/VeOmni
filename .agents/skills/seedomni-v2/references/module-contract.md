@@ -7,10 +7,14 @@ Read this before editing `veomni/models/seed_omni/modules/**`.
 A SeedOmni V2 module is usually:
 
 - A `configuration.py` with a unique `model_type`.
+- A `modulemixin.py` with composable mixins:
+  - `TrainingMixin(TrainingModuleMixin)` — `@pre_forward` / `@post_forward` hooks.
+  - `InferenceMixin(InferenceModuleMixin)` — `generate` / FSM hooks.
+  - optional `MeterMixin(MetricMeterMixin)`.
+  - `VeOmniMixin(BaseMixin, …)` — family assembly + assets / preprocessor class.
 - A `modeling.py` concrete model class that multi-inherits:
-  - family/module mixin first,
+  - `VeOmniMixin` first,
   - then the real HF/diffusers/torch model class.
-- A `modulemixin.py` with SeedOmni hooks.
 - Optional `processing.py` for module-owned processors.
 - Optional `chat_template.py` for text encoders.
 
@@ -36,10 +40,25 @@ modules/<family>/<submodule>/
 - Tokenizers and processors are module-owned assets.
 - Do not add a top-level tokenizer path.
 
+## IDE type stubs (`modulemixin.py`)
+
+Hooks call modeling APIs through `self`, but implementation stays in
+`modeling.py`. Each mixin declares **only the names its hooks use**:
+
+- class attributes: `config`, `device`, `dtype`, modeling-owned fields;
+- method bodies: `...` plus docstring:
+
+  ```text
+  IDE stub — implemented on :class:`Xxx` in ``modeling.py``.
+  ```
+
+Full style guide: `references/modulemixin-ide-stubs.md`. Reference implementation:
+`modules/bagel/flow_connector/modulemixin.py` (IDE stubs + module-level helpers).
+
 ## Optional Per-Module Metric Meter
 
-A module opts into token / theoretical-FLOPs metering by multi-inheriting
-`MetricMeterMixin` (alongside `ModuleMixin`) on its concrete model class. Then:
+A module opts into token / theoretical-FLOPs metering by mixing in
+`MetricMeterMixin` on `VeOmniMixin` (or a dedicated `MeterMixin` class). Then:
 
 - **Report tokens** by calling `self.metric_meter_set_seqlens("<method>", seqlens)`
   **inside `pre_forward`, BEFORE any SP gather/slice**. This is the single uniform
