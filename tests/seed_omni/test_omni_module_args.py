@@ -288,11 +288,10 @@ def test_from_model_runtime_projects_onto_hf_config():
     from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
 
     runtime_cfg = _janus_model_runtime()
-    train = _omni_args().train
     with patch("veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime") as mock_rt_cls:
         mock_rt_cls.return_value = MagicMock(model=MagicMock())
         with patch("veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModel") as mock_omni_model:
-            OmniModelRuntime.from_model_runtime(runtime_cfg, train=train)
+            OmniModelRuntime.from_model_runtime(runtime_cfg)
             omni_config = mock_omni_model.call_args[0][0]
             assert isinstance(omni_config, OmniConfig)
             assert set(omni_config.module_names) == set(runtime_cfg.module_names)

@@ -800,6 +800,24 @@ per-module 拓扑通过 `modules_{train,infer}.yaml` 里每个模块的 `acceler
 `micro_batch_size`。但 **dp / fsdp_mode / ExtraParallel 现在可以 per-module**——通过模块的 `accelerator:` 块声明，
 拓扑不同即自建独立 mesh。`OmniConfig.modules.<name>.accelerator.*` 即承载这些覆盖。
 
+`init_device` / `broadcast_model_weights_from_rank0` / `ep_sharded_stream_load` / `gradient_checkpointing` /
+`torch_compile` / `chunk_mbs_config` 同样挂在 `accelerator.*` 上（而不是 `train.*`），因此也是 **per-module**：
+不同模块可以各自声明 `accelerator.init_device` / `accelerator.gradient_checkpointing.enable` 等。这些字段的
+交叉校验（`init_device` 与 `fsdp_mode`/`ep_size` 的关系、`chunk_mbs_config` 与 `pad_to_length`/
+`gradient_checkpointing.enable_reentrant` 的关系、`torch_compile.enable` 的整体禁用）由
+`veomni.omni_arguments.arguments_types._validate_omni_accelerator` 负责，分别对顶层默认 `model.accelerator`
+（`OmniArguments.__post_init__` 时）和每个模块解析后的 `accelerator`（`resolve_omni_model` 里，模块合并之后）各
+校验一次——只放在 Omni 侧，不写进 V1 也会用到的共享 `AcceleratorConfig.__post_init__`（V1 的 `torch_compile` 是
+支持的，且校验逻辑不同）。
+
+`init_device: meta` 只有 `fsdp_mode: fsdp2` 才是必须的（`torch_parallelize.py` 里 `parallelize_model_fsdp2`
+的硬断言）；`ddp` 模块不需要 meta-init 的 materialize+broadcast 流程——`parallelize_model_ddp` 对非 meta
+的 `init_device` 直接跳过该分支，`build_foundation_model` 已经把权重加载到位，DDP 构造时再广播一次即可,故
+`ddp` 模块可以直接声明 `accelerator.init_device: cuda`（见 `janus_siglip` / `janus_vqvae` 的 `modules_train.yaml`
+/ `modules_infer_fsdp.yaml`）。这也规避了 `build_parallelize_model` 里 `not parallel_state.fsdp_enabled`
+（即 `world_size // (pp_size * tp_size) == 1`，例如单卡场景）时对 `init_device` 必须是 `cuda`/`npu` 的硬校验——
+继承全局 `meta` 默认值的 `ddp` 模块在这种拓扑下会直接报错。
+
 ### 推理侧
 
 推理同样支持 per-module 拓扑：`OmniInferencer` 用 `_module_needs_distributed`（fsdp_mode 非 `eager` 即为分布式，

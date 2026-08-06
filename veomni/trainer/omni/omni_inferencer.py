@@ -126,7 +126,6 @@ class OmniInferencer:
         if self._distributed:
             self.model = OmniModelRuntime.from_model_runtime(
                 self.omni_model_runtime,
-                train=self.args.train,
                 for_inference=True,
             )
         else:

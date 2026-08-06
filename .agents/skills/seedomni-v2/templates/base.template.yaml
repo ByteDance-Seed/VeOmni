@@ -2,26 +2,49 @@
 #
 # Replace all angle-bracket placeholders and compare with a live config such as
 # configs/seed_omni/Janus/janus_1.3b/base.yaml before committing.
+#
+# Launch inference (override modules for eager single-process or fsdp distributed):
+#   python tasks/omni/infer_omni.py configs/seed_omni/<Model>/<variant>/base.yaml \
+#     --model.model_config.modules configs/seed_omni/<Model>/<variant>/modules_infer_eager.yaml \
+#     --infer.prompt "..." \
+#     --infer.output_dir <model>_out
 
 model:
   model_path: <split_checkpoint_root>
-  modules: configs/seed_omni/<Model>/<variant>/modules_train.yaml
-  train_graph: configs/seed_omni/<Model>/<variant>/graph_train.yaml
+  model_config:
+    modules: configs/seed_omni/<Model>/<variant>/modules_train.yaml
+    train_graph: configs/seed_omni/<Model>/<variant>/graph_train.yaml
+    infer_graph:
+      infer_default: configs/seed_omni/<Model>/<variant>/graph_infer.yaml
+    infer_type: infer_default
   ops_implementation:
     attn_implementation: flash_attention_2
 
-accelerator:
-  fsdp_config:
-    fsdp_mode: fsdp2
-    full_shard: true
-    reshard_after_forward: true
-    reshard_after_backward: true
-    forward_prefetch: true
-    offload: false
-    mixed_precision:
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
       enable: true
-      param_dtype: bfloat16
-      reduce_dtype: float32
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-6
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    weight_decay: 0.01
+    max_grad_norm: 1.0
 
 data:
   data_type: seedomni
@@ -40,19 +63,7 @@ train:
   num_train_epochs: 1
   global_batch_size: 32
   micro_batch_size: 1
-  init_device: meta
   dyn_bsz: false
-  gradient_checkpointing:
-    enable: true
-    enable_reentrant: false
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-    lr_min: 1.0e-6
-    lr_warmup_ratio: 0.03
-    lr_decay_style: cosine
-    weight_decay: 0.01
-    max_grad_norm: 1.0
   checkpoint:
     output_dir: outputs/<model>_omni
     save_steps: 500
@@ -62,11 +73,6 @@ train:
     enable: false
 
 infer:
-  model_path: <split_checkpoint_root>
-  modules: configs/seed_omni/<Model>/<variant>/modules_infer_eager.yaml
-  infer_graph:
-    infer_default: configs/seed_omni/<Model>/<variant>/graph_infer.yaml
-  infer_type: infer_default
   generation_kwargs:
     max_new_tokens: 512
     temperature: 0.0

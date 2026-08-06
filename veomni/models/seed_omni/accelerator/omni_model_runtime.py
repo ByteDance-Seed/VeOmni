@@ -33,7 +33,7 @@ from ....utils.logging import get_logger
 
 if TYPE_CHECKING:
     from ....arguments import OmniGraphProfileArguments
-    from ....omni_arguments.arguments_types import OmniModelRuntimeArguments, OmniTrainingArguments
+    from ....omni_arguments.arguments_types import OmniModelRuntimeArguments
     from ....trainer.callbacks import TrainerState
     from .module_runtime import ModuleRuntime
 
@@ -84,8 +84,6 @@ class OmniModelRuntime:
         cls,
         model_runtime: OmniModelRuntimeArguments,
         *,
-        train: OmniTrainingArguments,
-        train_steps: int = -1,
         for_inference: bool = False,
     ) -> OmniModelRuntime:
         """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`."""
@@ -100,8 +98,6 @@ class OmniModelRuntime:
             module_runtime = ModuleRuntime(
                 module_args,
                 module_name=name,
-                train=train,
-                train_steps=train_steps,
                 for_inference=for_inference,
             )
             module_runtime.checkpoint_subfolder = omni_config.module_checkpoint_subfolder(name)

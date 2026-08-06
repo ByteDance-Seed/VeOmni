@@ -346,6 +346,10 @@ class ChunkMBSConfig:
         metadata={"help": "Number of packed samples per layer chunk."},
     )
 
+    def __post_init__(self):
+        if self.chunk_mbs < 1:
+            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs}.")
+
 
 @dataclass
 class MixedPrecisionConfig:
@@ -446,8 +450,48 @@ class OffloadConfig:
 
 
 @dataclass
+class TorchCompileConfig:
+    """train.torch_compile.* — Per-block torch.compile options."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
+    )
+    backend: Optional[str] = field(
+        default="inductor",
+        metadata={"help": "Backend passed to torch.compile."},
+    )
+    mode: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Mode passed to torch.compile. Leave as None to use the inductor default. "
+                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
+                "train.accelerator.fsdp_config.reshard_after_forward=False."
+            )
+        },
+    )
+    fullgraph: bool = field(
+        default=True,
+        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
+    )
+    dynamic: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    )
+
+
+@dataclass
 class AcceleratorConfig:
-    """train.accelerator.* — Parallelism and distributed-training topology."""
+    """train.accelerator.* — Parallelism and distributed-training topology.
+
+    ``init_device``, ``broadcast_model_weights_from_rank0``, ``ep_sharded_stream_load``,
+    ``gradient_checkpointing``, ``torch_compile`` and ``chunk_mbs_config`` are consulted by
+    SeedOmni V2 only (``veomni.models.seed_omni``), where this config is per-module and these
+    knobs can therefore be overridden per module. V1 trainers keep their own top-level
+    ``train.init_device`` / ``train.gradient_checkpointing`` / ... equivalents and never read
+    these fields off ``accelerator``.
+    """
 
     dp_replicate_size: int = field(
         default=-1,
@@ -499,6 +543,28 @@ class AcceleratorConfig:
     )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     offload_config: OffloadConfig = field(default_factory=OffloadConfig)
+    # ---- SeedOmni V2 per-module knobs (see class docstring) ----------------
+    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
+        default="meta",
+        metadata={
+            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
+        },
+    )
+    broadcast_model_weights_from_rank0: bool = field(
+        default=True,
+        metadata={
+            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
+        },
+    )
+    ep_sharded_stream_load: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+        },
+    )
+    gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
+    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
+    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
 
     def __post_init__(self):
         # although expert parallel and extra parallel are both provided in the arguments,
@@ -605,38 +671,6 @@ class CheckpointConfig:
     save_hf_weights: bool = field(
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
-    )
-
-
-@dataclass
-class TorchCompileConfig:
-    """train.torch_compile.* — Per-block torch.compile options."""
-
-    enable: bool = field(
-        default=False,
-        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
-    )
-    backend: Optional[str] = field(
-        default="inductor",
-        metadata={"help": "Backend passed to torch.compile."},
-    )
-    mode: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Mode passed to torch.compile. Leave as None to use the inductor default. "
-                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
-                "train.accelerator.fsdp_config.reshard_after_forward=False."
-            )
-        },
-    )
-    fullgraph: bool = field(
-        default=True,
-        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
-    )
-    dynamic: bool = field(
-        default=False,
-        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
     )
 
 
@@ -776,8 +810,6 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
-        if self.chunk_mbs_config.chunk_mbs < 1:
-            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs_config.chunk_mbs}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))

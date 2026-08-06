@@ -22,6 +22,11 @@ model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-hf
   ops_implementation:
     attn_implementation: flash_attention_2
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
 
 data:
   data_type: seedomni
@@ -41,11 +46,7 @@ train:
   num_train_epochs: 1
   global_batch_size: 8
   micro_batch_size: 1
-  init_device: meta
   dyn_bsz: false
-  gradient_checkpointing:
-    enable: false
-    enable_reentrant: false
   checkpoint:
     output_dir: outputs/janus_1.3b_hf
   wandb:

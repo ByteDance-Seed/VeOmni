@@ -5,11 +5,15 @@
 janus_siglip:
   model_path: janus_siglip
   accelerator:
+    init_device: cuda # ddp doesn't need meta-init's broadcast dance
+    broadcast_model_weights_from_rank0: false # only meaningful for fsdp2
     fsdp_config:
       fsdp_mode: ddp
 janus_vqvae:
   model_path: janus_vqvae
   accelerator:
+    init_device: cuda # ddp doesn't need meta-init's broadcast dance
+    broadcast_model_weights_from_rank0: false # only meaningful for fsdp2
     fsdp_config:
       fsdp_mode: ddp
 janus_text_encoder:

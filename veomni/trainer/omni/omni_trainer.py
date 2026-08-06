@@ -197,14 +197,12 @@ def cascade_module_reshard(
         module_runtime._model_reshard(reshard)
 
 
-def build_module_lr_schedulers(module_runtimes: Mapping[str, ModuleRuntime], train_steps: int) -> None:
-    """Build each :class:`ModuleRuntime`'s lr-scheduler once ``train_steps`` is known."""
+def build_module_lr_schedulers(module_runtimes: Mapping[str, ModuleRuntime], total_steps: int) -> None:
+    """Build each :class:`ModuleRuntime`'s lr-scheduler once ``total_steps`` (train_steps *
+    num_train_epochs) is known. ``_build_lr_scheduler`` itself no-ops for a frozen module.
+    """
     for module_runtime in module_runtimes.values():
-        if not module_runtime.has_trainable_parameters:
-            continue
-        module_runtime._train_steps = train_steps
-        if module_runtime.lr_scheduler is None:
-            module_runtime._build_lr_scheduler()
+        module_runtime._build_lr_scheduler(total_steps)
 
 
 def build_omni_model(
@@ -216,12 +214,7 @@ def build_omni_model(
         module_args = model_runtime.modules[name]
         module_args.model_config = dict(module_args.model_config or {})
         module_args.model_config["train_type"] = global_args.train.train_type
-    return OmniModelRuntime.from_model_runtime(
-        model_runtime,
-        train=global_args.train,
-        train_steps=global_args._train_steps,
-        for_inference=False,
-    )
+    return OmniModelRuntime.from_model_runtime(model_runtime, for_inference=False)
 
 
 # ── OmniTrainer ────────────────────────────────────────────────────────────────
@@ -343,7 +336,7 @@ class OmniTrainer:
         if args.train.global_rank == 0:
             save_args(args, args.train.checkpoint.output_dir)
 
-        set_checkpoint_debug_enabled(args.train.gradient_checkpointing.debug)
+        set_checkpoint_debug_enabled(args.model.accelerator.gradient_checkpointing.debug)
         return device
 
     def destroy_distributed(self) -> None:
@@ -458,7 +451,8 @@ class OmniTrainer:
 
     def _build_multi_lr_scheduler(self) -> None:
         """Build per-module lr-schedulers and wrap them in :class:`MultiLRScheduler`."""
-        build_module_lr_schedulers(self.model.module_runtimes, self.args.train_steps)
+        total_steps = self.args.train_steps * self.args.train.num_train_epochs
+        build_module_lr_schedulers(self.model.module_runtimes, total_steps)
         lr_schedulers = {
             name: module_runtime.lr_scheduler
             for name, module_runtime in self.model.module_runtimes.items()
@@ -487,7 +481,7 @@ class OmniTrainer:
         enable_activation = bool(offload and offload.enable_activation)
         self.fwd_activation_offload_ctx, self.bwd_activation_offload_ctx = build_activation_offloading_context(
             enable_activation=enable_activation,
-            enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+            enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable,
             activation_gpu_limit=offload.activation_gpu_limit if offload else 0.0,
         )
         logger.info_rank0(

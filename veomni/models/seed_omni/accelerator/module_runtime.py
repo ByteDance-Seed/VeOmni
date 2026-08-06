@@ -50,7 +50,7 @@ from .checkpoint import OmniModuleCheckpointManager
 
 
 if TYPE_CHECKING:
-    from ....omni_arguments.arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
+    from ....omni_arguments.arguments_types import OmniModuleRuntimeArguments
     from ....trainer.callbacks import TrainerState
 
 
@@ -81,8 +81,11 @@ class ModuleRuntime:
       module's on-disk weights.
     * :meth:`_build_optimizer` / :meth:`_build_lr_scheduler` — one each, over this
       module's still-trainable params. Optimizer is built during :meth:`__init__`
-      after FSDP wrap + freeze; the lr-scheduler is built in
-      :meth:`OmniTrainer._wire_multi_lr_scheduler` once ``train_steps`` is fixed from the dataset.
+      after FSDP wrap + freeze; the lr-scheduler is built later by
+      :func:`~veomni.trainer.omni.omni_trainer.build_module_lr_schedulers` once
+      ``train_steps`` is fixed from the dataset — this class holds no reference to
+      the global :class:`OmniTrainingArguments` itself, only the ``total_steps``
+      the caller passes to :meth:`_build_lr_scheduler`.
     * :meth:`_init_checkpoint` — builds :class:`OmniModuleCheckpointManager` for
       DCP / HF / LoRA save-load; trace / metering callbacks belong to the
       orchestrator, never here.
@@ -115,13 +118,9 @@ class ModuleRuntime:
         args: "OmniModuleRuntimeArguments",
         module_name: str,
         *,
-        train: "OmniTrainingArguments",
-        train_steps: int = -1,
         for_inference: bool = False,
     ):
         self.args = args
-        self.train = train
-        self._train_steps = train_steps
         self.module_name = module_name
         self.optimizer = None
         self.lr_scheduler = None
@@ -146,8 +145,6 @@ class ModuleRuntime:
                 self._scope_recompute_to_parallel_state()
             if not for_inference and self.has_trainable_parameters:
                 self._build_optimizer()
-                if self._train_steps != -1:
-                    self._build_lr_scheduler()
             if not for_inference:
                 self._init_checkpoint()
 
@@ -232,7 +229,7 @@ class ModuleRuntime:
             config_path=args.model_path,
             weights_path=args.model_path,
             torch_dtype="float32" if args.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=self.train.init_device,
+            init_device=args.accelerator.init_device,
             ops_implementation=args.ops_implementation,
             config_kwargs=args.model_config,
         )
@@ -280,28 +277,28 @@ class ModuleRuntime:
 
         if args.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.fqn_to_index_mapping
-        if self.train.chunk_mbs_config.enable:
-            kwargs["chunk_mbs_config"] = self.train.chunk_mbs_config
+        if args.accelerator.chunk_mbs_config.enable:
+            kwargs["chunk_mbs_config"] = args.accelerator.chunk_mbs_config
 
         model = build_parallelize_model(
             model,
-            init_device=self.train.init_device,
+            init_device=args.accelerator.init_device,
             weights_path=args.model_path,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=self.train.gradient_checkpointing.enable,
+            enable_gradient_checkpointing=args.accelerator.gradient_checkpointing.enable,
             basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.basic_modules)),
-            enable_reentrant=self.train.gradient_checkpointing.enable_reentrant,
-            early_stop=self.train.gradient_checkpointing.early_stop,
+            enable_reentrant=args.accelerator.gradient_checkpointing.enable_reentrant,
+            early_stop=args.accelerator.gradient_checkpointing.early_stop,
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
-            broadcast_model_weights_from_rank0=self.train.broadcast_model_weights_from_rank0,
-            ep_sharded_stream_load=self.train.ep_sharded_stream_load,
+            broadcast_model_weights_from_rank0=args.accelerator.broadcast_model_weights_from_rank0,
+            ep_sharded_stream_load=args.accelerator.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
             compile_config=CompileConfig(
-                **{field.name: getattr(self.train.torch_compile, field.name) for field in fields(CompileConfig)}
+                **{field.name: getattr(args.accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
             ),
             **kwargs,
         )
@@ -377,11 +374,11 @@ class ModuleRuntime:
         :func:`use_parallel_state` keeps reads of the free ``get_parallel_state()``
         (EP groups, vocab-parallel ``emb`` group, …) resolving to this module's mesh
         during recompute. ``use_reentrant=True`` does not honour ``context_fn`` — but
-        the omni path runs non-reentrant (``train.gradient_checkpointing.enable_reentrant``
+        the omni path runs non-reentrant (``accelerator.gradient_checkpointing.enable_reentrant``
         defaults to ``False``).
         """
         name = self.module_name
-        gc = self.train.gradient_checkpointing
+        gc = self.args.accelerator.gradient_checkpointing
 
         def _recompute_context_fn():
             return nullcontext(), use_parallel_state(name)
@@ -398,19 +395,6 @@ class ModuleRuntime:
             )
 
     # ── Optimizer / lr-scheduler (optimizer in __init__; scheduler after train_steps) ─
-
-    @property
-    def train_steps(self) -> int:
-        if self.train.max_steps is not None and self._train_steps >= self.train.max_steps:
-            from ....utils import logging as _logging
-
-            _logging.get_logger(__name__).warning_once(
-                f"Set train_steps to {self.train.max_steps}. It should be for debug purpose only."
-            )
-            return self.train.max_steps
-        if self._train_steps == -1:
-            raise ValueError("Please run `compute_train_steps` first!")
-        return self._train_steps
 
     @property
     def has_trainable_parameters(self) -> bool:
@@ -438,13 +422,21 @@ class ModuleRuntime:
                 muon_kwargs=_collect_muon_kwargs(opt),
             )
 
-    def _build_lr_scheduler(self):
-        """Build this module's lr-scheduler (needs ``self.train_steps`` set)."""
+    def _build_lr_scheduler(self, total_steps: int):
+        """Build this module's lr-scheduler over ``total_steps`` (train_steps * num_train_epochs).
+
+        The orchestrator (:func:`~veomni.trainer.omni.omni_trainer.build_module_lr_schedulers`)
+        computes ``total_steps`` once the dataset-derived ``train_steps`` (already clamped by the
+        global ``train.max_steps`` debug cap) is known, mirroring :meth:`BaseTrainer._build_lr_scheduler`.
+        A no-op for a fully-frozen module (no ``self.optimizer`` to schedule).
+        """
+        if not self.has_trainable_parameters:
+            return
         with self._scoped():
             opt = self.args.optimizer
             self.lr_scheduler = build_lr_scheduler(
                 self.optimizer,
-                train_steps=self.train_steps * self.train.num_train_epochs,
+                train_steps=total_steps,
                 lr=opt.lr,
                 lr_min=opt.lr_min,
                 lr_decay_style=opt.lr_decay_style,

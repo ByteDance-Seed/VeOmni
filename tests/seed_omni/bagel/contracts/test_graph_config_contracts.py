@@ -96,14 +96,14 @@ def test_bagel_offline_cache_full_entry_yamls_point_to_cache_graphs():
     assert offline_cache["train"]["train_type"] == "offline_cache"
     assert offline_cache["train"]["offline_cache_dir"] == "outputs/bagel_vae_cached_dataset"
     assert offline_cache["data"]["data_type"] == "seedomni"
-    assert offline_cache["model"]["modules"].endswith("modules_train_offline_cache.yaml")
-    assert offline_cache["model"]["train_graph"].endswith("graph_train_offline_cache.yaml")
+    assert offline_cache["model"]["model_config"]["modules"].endswith("modules_train_offline_cache.yaml")
+    assert offline_cache["model"]["model_config"]["train_graph"].endswith("graph_train_offline_cache.yaml")
 
     assert train_with_cache["train"]["train_type"] == "train_with_cache"
     assert train_with_cache["data"]["data_type"] == "seedomni_cached"
     assert train_with_cache["data"]["train_path"] == offline_cache["train"]["offline_cache_dir"]
-    assert train_with_cache["model"]["modules"].endswith("modules_train_with_cache.yaml")
-    assert train_with_cache["model"]["train_graph"].endswith("graph_train_with_cache.yaml")
+    assert train_with_cache["model"]["model_config"]["modules"].endswith("modules_train_with_cache.yaml")
+    assert train_with_cache["model"]["model_config"]["train_graph"].endswith("graph_train_with_cache.yaml")
 
 
 @pytest.mark.parametrize(

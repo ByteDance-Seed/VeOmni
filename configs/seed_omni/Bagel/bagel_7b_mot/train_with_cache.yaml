@@ -2,9 +2,9 @@
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
-  modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_train_with_cache.yaml
-  train_graph: configs/seed_omni/Bagel/bagel_7b_mot/graph_train_with_cache.yaml
   model_config:
+    modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_train_with_cache.yaml
+    train_graph: configs/seed_omni/Bagel/bagel_7b_mot/graph_train_with_cache.yaml
     infer_graph:
       infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
       infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
@@ -13,22 +13,39 @@ model:
   ops_implementation:
     attn_implementation: flash_attention_2
 
-accelerator:
-  fsdp_config:
-    fsdp_mode: fsdp2
-    full_shard: true
-    reshard_after_forward: true
-    reshard_after_backward: true
-    forward_prefetch: true
-    offload: false
-    max_load_broadcast_size: 20.0
-    mixed_precision:
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
       enable: true
-      param_dtype: bfloat16
-      reduce_dtype: float32
-  offload_config:
-    enable_activation: false
-    activation_gpu_limit: 0.0
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
 
 data:
   data_type: seedomni_cached
@@ -50,25 +67,7 @@ train:
   num_train_epochs: 1
   global_batch_size: 32
   micro_batch_size: 2
-  init_device: meta
   dyn_bsz: false
-
-  gradient_checkpointing:
-    enable: true
-    enable_reentrant: false
-
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-    lr_min: 1.0e-6
-    lr_start: 0.0
-    lr_warmup_ratio: 0.03
-    lr_decay_style: cosine
-    lr_decay_ratio: 1.0
-    weight_decay: 0.01
-    max_grad_norm: 1.0
-    no_decay_params: []
-    no_decay_modules: []
 
   checkpoint:
     output_dir: outputs/bagel_7b_mot_omni_sft_from_cache

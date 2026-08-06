@@ -86,11 +86,13 @@ def test_build_step_contexts_offload_flags():
 
     trainer = object.__new__(OmniTrainer)
     trainer.args = SimpleNamespace(
-        train=SimpleNamespace(
-            accelerator=SimpleNamespace(offload_config=None),
-            gradient_checkpointing=SimpleNamespace(enable=False),
-            enable_batch_invariant_mode=False,
-        )
+        model=SimpleNamespace(
+            accelerator=SimpleNamespace(
+                offload_config=None,
+                gradient_checkpointing=SimpleNamespace(enable=False),
+            ),
+        ),
+        train=SimpleNamespace(enable_batch_invariant_mode=False),
     )
     OmniTrainer._build_step_contexts(trainer)
     assert isinstance(trainer.fwd_activation_offload_ctx, nullcontext)

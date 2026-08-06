@@ -27,6 +27,10 @@ model:
     moe_implementation: fused_triton
 
   accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
     fsdp_config:
       fsdp_mode: fsdp2
       full_shard: true
@@ -77,12 +81,7 @@ train:
   # the global dp_size (= world_size, since the top-level accelerator has no EP).
   global_batch_size: 8
   micro_batch_size: 1
-  init_device: meta
   dyn_bsz: false
-
-  gradient_checkpointing:
-    enable: true
-    enable_reentrant: false
 
   checkpoint:
     output_dir: outputs/qwen3_30b_a3b_omni_sft

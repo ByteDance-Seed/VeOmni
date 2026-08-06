@@ -52,13 +52,10 @@ from ..arguments.arguments_types import (
     AcceleratorConfig,
     ChannelLossConfig,
     CheckpointConfig,
-    ChunkMBSConfig,
     DataloaderConfig,
-    GradientCheckpointingConfig,
     OpsImplementationConfig,
     OptimizerConfig,
     ProfileConfig,
-    TorchCompileConfig,
     WandbConfig,
 )
 from ..arguments.parser import _deep_update, _instantiate_recursive
@@ -311,6 +308,8 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
         train_modules,
         for_inference=for_inference,
     )
+    for module_args in modules.values():
+        _validate_omni_accelerator(module_args.accelerator, pad_to_length=args.train.pad_to_length)
     training_graphs = _load_graph_map(train_graph)
     generation_graphs = _load_graph_map(infer_graph)
     if train_type is not None and train_type not in training_graphs:
@@ -537,7 +536,18 @@ def _resolve_default_accelerator(
     train_modules_config: dict[str, Any],
     infer_modules_overrides: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    eager_by_module = {name: {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}} for name in train_modules_config}
+    # `broadcast_model_weights_from_rank0` is only meaningful for `fsdp2`; forcing it off here
+    # alongside `fsdp_mode: eager` avoids a spurious `_validate_omni_accelerator` warning on every
+    # module for the common single-process eager-inference default.
+    eager_by_module = {
+        name: {
+            "accelerator": {
+                "fsdp_config": {"fsdp_mode": "eager"},
+                "broadcast_model_weights_from_rank0": False,
+            }
+        }
+        for name in train_modules_config
+    }
     return _deep_update(eager_by_module, infer_modules_overrides)
 
 
@@ -730,24 +740,6 @@ class OmniTrainingArguments:
             )
         },
     )
-    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
-        default="meta",
-        metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
-        },
-    )
-    broadcast_model_weights_from_rank0: bool = field(
-        default=True,
-        metadata={
-            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
-        },
-    )
-    ep_sharded_stream_load: bool = field(
-        default=False,
-        metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
-        },
-    )
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
@@ -799,9 +791,6 @@ class OmniTrainingArguments:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
-    gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
-    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
-    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
@@ -818,8 +807,6 @@ class OmniTrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
-        if self.chunk_mbs_config.chunk_mbs < 1:
-            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs_config.chunk_mbs}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -827,39 +814,6 @@ class OmniTrainingArguments:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_checkpoint_paths()
         self._resolve_profile()
-
-    def _validate_accelerator(self, accelerator: AcceleratorConfig) -> None:
-        # `dp_size`/`dp_shard_size`/`dp_replicate_size` are already resolved by
-        # `AcceleratorConfig.__post_init__` at construction time. What's left here are
-        # cross-checks against *this* owner's own fields (`init_device`,
-        # `broadcast_model_weights_from_rank0`, `ep_sharded_stream_load`), which
-        # `AcceleratorConfig` has no access to.
-        acc = accelerator
-
-        num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
-        if num_nodes > 1:
-            logger.warning_rank0(
-                f"Detected {num_nodes} nodes. "
-                "Make sure that `train.checkpoint.output_dir` is shared by all nodes. "
-                "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
-            )
-
-        assert acc.ep_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
-        if acc.fsdp_config.fsdp_mode == "fsdp2":
-            assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
-        elif self.broadcast_model_weights_from_rank0:
-            logger.warning_rank0(
-                "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "
-                "used with accelerator.fsdp_config.fsdp_mode='fsdp2'. "
-                f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
-            )
-
-        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
-            "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
-            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
-        )
 
     def _derive_batch_config(self, accelerator: AcceleratorConfig) -> None:
         acc = accelerator
@@ -919,6 +873,53 @@ class OmniTrainingArguments:
             self.profile.this_rank = False
 
 
+def _validate_omni_accelerator(accelerator: AcceleratorConfig, *, pad_to_length: bool | int = False) -> None:
+    """Cross-field checks for the SeedOmni-V2-only knobs living on ``AcceleratorConfig``.
+
+    Kept Omni-side (not on the shared :class:`AcceleratorConfig` used by V1 trainers too) since
+    some of these constraints (e.g. the blanket ``torch_compile`` ban) do not apply to V1, which
+    fully supports ``torch_compile`` with its own, different validation. ``accelerator`` is
+    self-contained for every check except the ``chunk_mbs_config`` vs ``pad_to_length`` one, which
+    needs the launcher-wide ``train.pad_to_length`` passed in explicitly.
+
+    Called once for the top-level default (``model.accelerator``, at ``OmniArguments.__post_init__``
+    time, before modules are resolved) and once per module (in :func:`resolve_omni_model`, after
+    ``modules`` merges each module's own ``accelerator:`` YAML override) so a per-module override is
+    validated too, not just the global default.
+    """
+    acc = accelerator
+
+    assert acc.ep_size == 1 or acc.init_device != "cpu", (
+        "cpu init is not supported when enable ep. Please use `accelerator.init_device = cuda` or "
+        "`accelerator.init_device = meta` instead."
+    )
+    if acc.fsdp_config.fsdp_mode == "fsdp2":
+        assert acc.init_device == "meta", "Please use accelerator.init_device: meta for FSDP2 training"
+    elif acc.broadcast_model_weights_from_rank0:
+        logger.warning_rank0(
+            "Ignoring accelerator.broadcast_model_weights_from_rank0=True because it is only "
+            "used with accelerator.fsdp_config.fsdp_mode='fsdp2'. "
+            f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
+        )
+
+    assert not (acc.ep_sharded_stream_load and acc.broadcast_model_weights_from_rank0), (
+        "accelerator.ep_sharded_stream_load requires accelerator.broadcast_model_weights_from_rank0=False "
+        "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+    )
+
+    if acc.chunk_mbs_config.enable:
+        if pad_to_length:
+            raise ValueError("accelerator.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
+        if acc.gradient_checkpointing.enable and acc.gradient_checkpointing.enable_reentrant:
+            raise ValueError(
+                "accelerator.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
+                "Set accelerator.gradient_checkpointing.enable_reentrant=False."
+            )
+
+    if acc.torch_compile.enable:
+        raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni V2 yet.")
+
+
 @dataclass
 class OmniArguments:
     """Root launcher config for SeedOmni V2."""
@@ -931,7 +932,14 @@ class OmniArguments:
     def __post_init__(self):
         self._train_steps = -1
 
-        self.train._validate_accelerator(self.model.accelerator)
+        num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
+        if num_nodes > 1:
+            logger.warning_rank0(
+                f"Detected {num_nodes} nodes. "
+                "Make sure that `train.checkpoint.output_dir` is shared by all nodes. "
+                "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
+            )
+
         self.train._derive_batch_config(self.model.accelerator)
 
         if self.train.pad_to_length:
@@ -945,20 +953,7 @@ class OmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
-        if self.train.chunk_mbs_config.enable:
-            if self.train.pad_to_length:
-                raise ValueError("train.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
-            if self.train.gradient_checkpointing.enable and self.train.gradient_checkpointing.enable_reentrant:
-                raise ValueError(
-                    "train.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
-                    "Set train.gradient_checkpointing.enable_reentrant=False."
-                )
-
-        if self.train.torch_compile.enable:
-            raise ValueError(
-                "train.torch_compile.enable is not supported by SeedOmni V2 yet "
-                f"(data.data_type={self.data.data_type!r})."
-            )
+        _validate_omni_accelerator(self.model.accelerator, pad_to_length=self.train.pad_to_length)
 
     def resolve_model(self, *, for_inference: bool = False) -> OmniModelRuntimeArguments:
         """Build a resolved :class:`OmniModelRuntimeArguments`.
