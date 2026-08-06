@@ -216,8 +216,4 @@ class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
         self._chat_template = JanusChatTemplate(tokenizer)
 
 
-__all__ = [
-    "InferenceMixin",
-    "VeOmniMixin",
-    "TrainingMixin",
-]
+__all__ = ["VeOmniMixin"]

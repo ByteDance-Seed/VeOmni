@@ -316,9 +316,7 @@ class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
 
 
 __all__ = [
-    "InferenceMixin",
-    "VeOmniMixin",
-    "TrainingMixin",
     "SIGNAL_START_IMAGE_GEN",
     "SIGNAL_TEXT_DONE",
+    "VeOmniMixin",
 ]

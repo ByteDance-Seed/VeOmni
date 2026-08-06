@@ -178,8 +178,4 @@ class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
             self._chat_template = Qwen3ChatTemplate(tokenizer)
 
 
-__all__ = [
-    "InferenceMixin",
-    "VeOmniMixin",
-    "TrainingMixin",
-]
+__all__ = ["VeOmniMixin"]
