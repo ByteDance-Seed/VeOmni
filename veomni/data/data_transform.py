@@ -580,7 +580,12 @@ def process_sample_hunyuan_image_3(
     # package at import time
     from ..models.transformers.hunyuan_image_3.sequence_layout import T2ILayout
 
-    text_key = kwargs.get("text_key", "prompt")
+    # ``text_key`` accepts a single key or a priority list — different T2I
+    # datasets label the caption column differently (``prompt`` / ``text`` /
+    # ``caption``); the default probes those three in order (same pattern as
+    # ``multimodal/dit/preprocess.py::qwen_image_preprocess``). Set an
+    # explicit str/list in ``mm_configs.text_key`` to lock down one dataset.
+    text_key = kwargs.get("text_key", ["prompt", "text", "caption"])
     max_seq_len = int(kwargs.get("max_seq_len", 8192))
     target_image_key = kwargs.get("target_image_key", "image")
     resolution = kwargs.get("resolution", (1024, 1024))
@@ -594,7 +599,15 @@ def process_sample_hunyuan_image_3(
     im_end_id = int(config.im_end_id)
     image_token_id = int(config.image_token_id)
 
-    prompt = sample.get(text_key, "")
+    if isinstance(text_key, str):
+        prompt = sample.get(text_key, "")
+    else:
+        prompt = ""
+        for key in text_key:
+            value = sample.get(key)
+            if value is not None:
+                prompt = value
+                break
     if prompt_dropout_prob and torch.rand(()).item() < prompt_dropout_prob:
         prompt = ""
 

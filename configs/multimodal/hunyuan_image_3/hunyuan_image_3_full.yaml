@@ -26,7 +26,7 @@ model:
 data:
   train_path: /path/to/training-data
   datasets_type: mapping
-  data_type: multimodal_generation
+  data_type: conversation
   text_keys: prompt
   max_seq_len: 8192
   dataloader:
