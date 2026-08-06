@@ -56,6 +56,15 @@ def _get_vlm_visual_module(model):
     return None
 
 
+def _has_lora_parameters(module: torch.nn.Module | None, *, trainable_only: bool = False) -> bool:
+    if module is None:
+        return False
+    return any(
+        (not trainable_only or param.requires_grad) and ({"lora_A", "lora_B"} & set(name.split(".")))
+        for name, param in module.named_parameters()
+    )
+
+
 @dataclass
 class VLMTrainingArguments(TrainingArguments):
     freeze_vit: bool = field(
@@ -172,8 +181,12 @@ class VLMTrainer:
         if lora_enabled:
             self.base._setup_lora()
 
-        if args.train.freeze_vit:
-            if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
+        visual = self.base.model.thinker.visual if is_omni else _get_vlm_visual_module(self.base.model)
+        vision_has_lora = _has_lora_parameters(visual)
+
+        if args.train.freeze_vit and not vision_has_lora:
+            if is_omni:
                 self.base.model.thinker.visual.requires_grad_(False)
                 # Full tuning keeps the merger trainable for compatibility with
                 # the existing freeze policy. During LoRA training it must stay
@@ -188,6 +201,12 @@ class VLMTrainer:
                 if visual is None:
                     raise AttributeError(f"Cannot find visual module for model_type={model_config.model_type}.")
                 visual.requires_grad_(False)
+        # If vision adapters were injected, preserve _setup_lora's complete
+        # trainability policy, including explicitly requested bias parameters.
+
+        # FLOPs accounting must follow the resulting parameter state rather
+        # than infer vision-adapter trainability from freeze_vit.
+        self.base.vision_lora_enabled = _has_lora_parameters(visual, trainable_only=True)
 
         if args.train.freeze_audio_tower and model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             self.base.model.thinker.audio_tower.requires_grad_(False)
@@ -199,10 +218,7 @@ class VLMTrainer:
                 )
                 audio_proj.requires_grad_(True)
 
-        has_trainable_lora = any(
-            param.requires_grad and (".lora_A." in name or ".lora_B." in name)
-            for name, param in self.base.model.named_parameters()
-        )
+        has_trainable_lora = _has_lora_parameters(self.base.model, trainable_only=True)
         if lora_enabled and not has_trainable_lora:
             raise ValueError(
                 "VLM LoRA configuration produced no trainable adapters after applying "

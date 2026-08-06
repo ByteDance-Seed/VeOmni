@@ -91,7 +91,7 @@ def _trainable_lora_names(model):
 
 
 @pytest.mark.parametrize("freeze_vit", [False, True])
-def test_vlm_lora_wraps_language_and_gates_vision_adapters(freeze_vit):
+def test_vlm_lora_wraps_language_and_preserves_vision_adapters(freeze_vit):
     trainer = _build_meta_trainer(
         "tests/toy_config/qwen3vl_toy/config.json",
         {"rank": 4, "alpha": 8, "lora_modules": ["q_proj", "qkv"]},
@@ -108,19 +108,42 @@ def test_vlm_lora_wraps_language_and_gates_vision_adapters(freeze_vit):
     ]
     assert is_veomni_lora_model(model) and visual_lora and language_lora
     assert all(not module.base_layer.weight.requires_grad for module in visual_lora + language_lora)
-    assert all(param.requires_grad is not freeze_vit for module in visual_lora for param in module.lora_A.parameters())
+    assert all(param.requires_grad for module in visual_lora for param in module.lora_A.parameters())
     assert all(param.requires_grad for module in language_lora for param in module.lora_A.parameters())
+    assert trainer.base.vision_lora_enabled is True
 
 
 @pytest.mark.parametrize("bias", ["none", "all"])
-def test_vlm_lora_rejects_all_targets_disabled_by_freeze_flags(bias):
+def test_vlm_lora_vision_only_targets_override_freeze_vit(bias):
     trainer = _build_meta_trainer(
         "tests/toy_config/qwen3vl_toy/config.json",
         {"rank": 4, "alpha": 8, "lora_modules": ["qkv"], "bias": bias},
         freeze_vit=True,
     )
-    with pytest.raises(ValueError, match="no trainable adapters"):
-        trainer._freeze_model_module()
+    trainer._freeze_model_module()
+
+    visual = _get_vlm_visual_module(trainer.base.model)
+    trainable_visual_names = {name for name, param in visual.named_parameters() if param.requires_grad}
+    assert _trainable_lora_names(trainer.base.model)
+    assert trainer.base.vision_lora_enabled is True
+    if bias == "none":
+        assert all({"lora_A", "lora_B"} & set(name.split(".")) for name in trainable_visual_names)
+    else:
+        assert any(name.endswith("bias") for name in trainable_visual_names)
+
+
+def test_llm_only_lora_freezes_entire_vlm_visual_tower():
+    trainer = _build_meta_trainer(
+        "tests/toy_config/qwen3vl_toy/config.json",
+        {"rank": 4, "alpha": 8, "lora_modules": ["q_proj"]},
+        freeze_vit=True,
+    )
+
+    trainer._freeze_model_module()
+
+    visual = _get_vlm_visual_module(trainer.base.model)
+    assert all(not param.requires_grad for param in visual.parameters())
+    assert trainer.base.vision_lora_enabled is False
 
 
 def test_multimodal_lora_config_inventory_is_audited():
@@ -219,9 +242,38 @@ def test_omni_lora_freeze_flags_gate_tower_adapters(freeze_towers):
 
     wrapped = trainer.base.model
     assert any(param.requires_grad for param in wrapped.text_proj.parameters())
-    assert any(param.requires_grad for param in wrapped.thinker.visual.proj.parameters()) is not freeze_towers
+    assert any(param.requires_grad for param in wrapped.thinker.visual.proj.parameters())
     assert any(param.requires_grad for param in wrapped.thinker.audio_tower.proj1.parameters()) is not freeze_towers
     assert all(not param.requires_grad for param in wrapped.thinker.visual.merger.parameters())
+    assert trainer.base.vision_lora_enabled is True
+
+
+def test_llm_only_lora_freezes_entire_omni_visual_tower():
+    model = _FakeOmniModel()
+    args = _make_args(
+        "tests/toy_config/qwen3vl_toy/config.json",
+        {"rank": 2, "alpha": 4, "lora_modules": ["text_proj"]},
+        freeze_vit=True,
+    )
+    trainer = _make_trainer(model, args, SimpleNamespace(model_type="qwen3_omni_moe"))
+
+    trainer._freeze_model_module()
+
+    assert all(not param.requires_grad for param in trainer.base.model.thinker.visual.parameters())
+    assert trainer.base.vision_lora_enabled is False
+
+
+def test_full_tuning_freezes_omni_visual_backbone_but_keeps_merger_trainable():
+    model = _FakeOmniModel()
+    args = _make_args("tests/toy_config/qwen3vl_toy/config.json", None, freeze_vit=True)
+    trainer = _make_trainer(model, args, SimpleNamespace(model_type="qwen3_omni_moe"))
+
+    trainer._freeze_model_module()
+
+    visual = trainer.base.model.thinker.visual
+    assert all(not param.requires_grad for param in visual.proj.parameters())
+    assert all(param.requires_grad for param in visual.merger.parameters())
+    assert trainer.base.vision_lora_enabled is False
 
 
 class _TinyVLMModel(torch.nn.Module):
