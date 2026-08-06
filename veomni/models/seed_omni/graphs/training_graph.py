@@ -48,8 +48,8 @@ Exposed surface
                                             (mirror of the generation FSM).
 * ``iter_nodes()``                      — generator that *selects* nodes in
                                             execution order (no forward — the
-                                            caller runs each via
-                                            ``executor.execute_train_node``);
+                                            caller runs each node's endpoint
+                                            against the shared batch);
                                             ``maybe_transition()`` advances the
                                             cursor.
 * ``to_mermaid(...)``                    — render the active DAG (``end`` is
@@ -204,19 +204,12 @@ class TrainingGraph:
     def iter_nodes(self) -> Iterator[NodeDef]:
         """Yield each active node in execution order (selection only — no forward).
 
-        The graph only *chooses* what runs next; it never runs a model forward and
-        knows nothing about profiling / parallel infra (it is model-bound and
-        meant to travel with the pure modeling definition). The caller executes
-        each yielded node — see
-        :func:`~veomni.models.seed_omni.accelerator.executor.execute_train_node` —
-        mutating the shared ``conversation_list`` carrier in place. After the
+        The graph only *chooses* what runs next; it never runs a model forward.
+        The caller executes each yielded ``NodeDef`` (``module`` + ``method``)
+        and mutates the shared ``conversation_list`` carrier in place. After the
         caller consumes a node, this generator advances the cursor
         (:meth:`maybe_transition`) and yields the next, until :meth:`is_done`.
         Mirror of :meth:`GenerationGraph.iter_nodes` (one FSM body iteration).
-
-        Because execution is external, loss draining, any per-node context
-        (module scope / profiler node), and the transition trace all live at the
-        call site, not here.
         """
         while not self.is_done():
             yield self._node_by_name[self.current_node_name]
@@ -245,7 +238,7 @@ class TrainingGraph:
         ``to: end`` render as dashed arrows into a single ``end`` terminal.
 
         A dashed ``data`` pseudo-node fans out to every source node to mark
-        inputs that come from the shared batch dict (``raw_batch`` at runtime).
+        inputs that come from the shared batch dict.
 
         Layout
         ------

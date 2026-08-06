@@ -7,7 +7,7 @@ Each state specifies:
   body
       An ordered list of inline **edges** (``{from, to}`` dicts whose endpoints
       are ``module[.method]`` strings; a bare module defaults to ``.generate``).
-      Per FSM step the runtime walks the body in **topological order**:
+      Per FSM step the body is walked in **topological order**:
 
       1. Pre-compute, per node ``X`` appearing in body, the count of
          body edges with ``to: X`` (its in-body fan-in).
@@ -43,13 +43,11 @@ Each state specifies:
       An edge with ``to: end`` is purely declarative — it pins the producing
       node into the active set without routing anywhere.
 
-Method dispatch
----------------
+Default method
+--------------
 A bare endpoint (``module`` with no ``.method``) defaults to ``generate`` in the
 FSM view.  A dotted endpoint (``module.method`` — e.g. ``encode``, ``decode``,
-``emit_image_start``) is taken verbatim.  Every endpoint method is executed via
-the module's ``__call__`` path: non-``forward`` methods are temporarily installed
-as ``forward`` so DDP/FSDP pre/post-forward hooks still run.
+``emit_image_start``) is taken verbatim on the yielded :class:`NodeDef`.
 
   transitions
       Ordered list of ``{condition: ..., next_state: S}`` items checked after
@@ -95,7 +93,7 @@ Usage
   >>> ctx = {"input_ids": ..., "attention_mask": ...}
   >>> while not fsm.is_done():
   ...     for node in fsm.iter_nodes(ctx):          # graph selects; caller runs
-  ...         execute_generation_node(modules, node, ctx, state_name=fsm.current_state_name)
+  ...         run_node(modules, node, ctx)
   ...     fsm.maybe_transition(ctx)
 
 See also
@@ -182,8 +180,7 @@ class _Transition:
 class FiredTransition:
     """A transition that just fired in :meth:`GenerationGraph.maybe_transition`.
 
-    Returned to the caller (which owns the profiler) so it can format the
-    transition trace — the graph itself stays profiler-free.
+    Returned to the caller so it can format a transition trace if desired.
     """
 
     from_state: str
@@ -343,11 +340,10 @@ class GenerationGraph:
         """Yield the nodes to run for ONE iteration of the current state body.
 
         Selection only — the graph never runs a model forward. The caller
-        executes each yielded node — see
-        :func:`~veomni.models.seed_omni.accelerator.executor.execute_generation_node`
-        — mutating ``ctx`` in place; this generator reads the mutated ``ctx``
-        *after* each yield to honour a terminating ``module_signal`` (it stops
-        yielding) and the body's feed-forward fan-in gating. Mirror of
+        executes each yielded ``NodeDef`` and mutates ``ctx`` in place; this
+        generator reads the mutated ``ctx`` *after* each yield to honour a
+        terminating ``module_signal`` (it stops yielding) and the body's
+        feed-forward fan-in gating. Mirror of
         :meth:`TrainingGraph.iter_nodes` (which yields a whole training pass).
 
         Algorithm (topological body execution, see module-doc §"body"):
@@ -368,8 +364,8 @@ class GenerationGraph:
         only pins its ``from_`` node into the active set. The same node never
         re-runs within one body iteration.
 
-        Method dispatch (in the executor): bare nodes default to ``generate``;
-        dotted ``module.method`` nodes dispatch verbatim.
+        Bare nodes default to ``generate``; dotted ``module.method`` nodes keep
+        the parsed method on :class:`NodeDef`.
         """
         state = self._current_state
         executed: set = set()
@@ -436,8 +432,8 @@ class GenerationGraph:
 
         Returns a :class:`FiredTransition` (``from_state`` / ``to_state`` /
         ``condition`` description) if a transition fired and the state changed,
-        else ``None``. The graph stays profiler-free: the caller (which owns the
-        profiler) formats the transition trace from the returned value.
+        else ``None``. The caller may format a transition trace from the
+        returned value.
 
         For ``module_signal`` transitions ``context["module_signal"]`` is popped
         before the state switch.
