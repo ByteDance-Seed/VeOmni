@@ -50,6 +50,20 @@ def _build_causal_mask(seq_len: int, sliding_window: int | None, device, dtype) 
     return full_mask.masked_fill(~causal, torch.finfo(dtype).min)
 
 
+def _init_position_bias(compressor) -> None:
+    """Give ``position_bias`` real values.
+
+    Both compressors declare it with ``torch.empty`` and nothing in these tests
+    runs ``_init_weights``, so it would otherwise hold whatever was in memory. A
+    single inf there turns every comparison below into a NaN mismatch that says
+    nothing about context parallelism.
+    """
+    with torch.no_grad():
+        torch.nn.init.normal_(compressor.position_bias, std=0.02)
+        if getattr(compressor, "indexer", None) is not None:
+            torch.nn.init.normal_(compressor.indexer.position_bias, std=0.02)
+
+
 def _make_forward(layer, rotary):
     """The attention call every test shares: both rope variants, then the layer."""
 
@@ -94,6 +108,8 @@ def _init_cp_attention(rank: int, world_size: int, init_file: str, seq_len: int,
     layer = dsv4.DeepseekV4Attention(config, layer_idx=0).to(device=device_type, dtype=torch.float32)
     if not with_compressor:
         layer.compressor = None
+    else:
+        _init_position_bias(layer.compressor)
     _broadcast_module(layer)
     layer.train()
 
@@ -198,6 +214,163 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
     dist.destroy_process_group()
 
 
+class _FixedIndexer(torch.nn.Module):
+    """A Lightning Indexer stand-in that always selects compressed slot 0.
+
+    The CSA compressor calls its indexer unconditionally, and the indexer's own
+    context-parallel path is a separate task, so under CP it would still
+    summarise this rank's shard and hand back shard-local slot ids. Holding the
+    selection fixed keeps the compressor's window compression the only thing
+    these tests can distinguish.
+    """
+
+    def __init__(self, index_topk: int):
+        super().__init__()
+        self.index_topk = index_topk
+
+    def forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx, **kwargs):
+        batch, seq_len, _ = hidden_states.shape
+        return torch.zeros(batch, seq_len, self.index_topk, dtype=torch.long, device=hidden_states.device)
+
+
+def _grad_or_zeros(param: torch.nn.Parameter) -> torch.Tensor:
+    """This parameter's gradient, or zeros where the forward never reached it."""
+    return torch.zeros_like(param) if param.grad is None else param.grad.detach().clone()
+
+
+def _window_starts(rate: int, seq_len: int, sample_slices) -> torch.Tensor:
+    """The global window starts, spelled out rather than taken from the helper under test."""
+    if sample_slices is None:
+        return torch.arange(0, seq_len - rate + 1, rate)
+    return torch.tensor(
+        [start for begin, end in sample_slices for start in range(begin, end - rate + 1, rate)],
+        dtype=torch.long,
+    )
+
+
+def _run_compressor_cp(rank: int, world_size: int, init_file: str, kind: str, seq_len: int, sample_slices) -> None:
+    """A CP shard's compressor must return the whole globally-ordered compressed KV.
+
+    Every rank compresses only the windows it owns and then all-gathers, so the
+    tensor compared here is the *full* baseline result, not a slice of it: a
+    dropped or misordered window shows up directly. The backward reduces over
+    this rank's own windows only, because summing the replicated array on every
+    rank would scale the gradient by ``cp_size``.
+    """
+    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
+    dist.init_process_group(
+        backend=get_dist_comm_backend(),
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+
+    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    torch.manual_seed(0)
+    compressor_class = dsv4.DeepseekV4HCACompressor if kind == "hca" else dsv4.DeepseekV4CSACompressor
+    compressor = compressor_class(config).to(device=device_type, dtype=torch.float32)
+    _init_position_bias(compressor)
+    if kind == "csa":
+        compressor.indexer = _FixedIndexer(config.index_topk)
+    _broadcast_module(compressor)
+    compressor.train()
+
+    rate = compressor.compress_rate
+    full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device_type)
+    dist.broadcast(full_hidden, src=0)
+    q_residual = torch.zeros(1, seq_len, config.q_lora_rank, device=device_type)
+
+    if sample_slices is None:
+        full_position_ids = torch.arange(seq_len, device=device_type).view(1, -1)
+        packed_kwargs = {}
+    else:
+        full_position_ids = torch.cat(
+            [torch.arange(end - begin, device=device_type) for begin, end in sample_slices]
+        ).view(1, -1)
+        packed_kwargs = {
+            "packed_sequence_slices": sample_slices,
+            "packed_compression_metadata": build_packed_compression_metadata(
+                full_hidden,
+                full_position_ids,
+                sample_slices,
+                (rate,),
+                # The HCA path reads its block bias straight out of the metadata,
+                # so this is what makes the query-row slicing observable.
+                block_bias_rates=(rate,) if kind == "hca" else (),
+            ),
+        }
+
+    def _forward(hidden, positions, residual):
+        return compressor(
+            hidden_states=hidden,
+            q_residual=residual,
+            position_ids=positions,
+            past_key_values=None,
+            layer_idx=0,
+            **packed_kwargs,
+        )
+
+    no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
+    with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+        baseline_input = full_hidden.detach().clone().requires_grad_(True)
+        baseline_kv, baseline_bias = _forward(baseline_input, full_position_ids, q_residual)
+        baseline_kv.sum().backward()
+        baseline_grads = {name: _grad_or_zeros(param) for name, param in compressor.named_parameters()}
+        baseline_kv = baseline_kv.detach()
+        baseline_bias = None if baseline_bias is None else baseline_bias.detach()
+        baseline_input_grad = baseline_input.grad.detach().clone()
+        compressor.zero_grad(set_to_none=True)
+
+    local_len = seq_len // world_size
+    begin = rank * local_len
+    local_input = full_hidden[:, begin : begin + local_len].detach().clone().requires_grad_(True)
+    local_kv, local_bias = _forward(
+        local_input,
+        full_position_ids[:, begin : begin + local_len],
+        q_residual[:, begin : begin + local_len],
+    )
+
+    owned = (_window_starts(rate, seq_len, sample_slices) // local_len) == rank
+    local_kv[:, :, owned.to(local_kv.device)].sum().backward()
+    # A rank that owns no window never touches ``position_bias`` or ``kv_norm`` and
+    # so has no gradient for them, while its peers do. Reducing a zero stand-in
+    # instead of skipping keeps every rank in the same collectives.
+    summed_grads = {}
+    for name, param in compressor.named_parameters():
+        summed = _grad_or_zeros(param)
+        dist.all_reduce(summed)
+        summed_grads[name] = summed
+
+    # Every collective is behind us, so a mismatch below fails on all ranks at
+    # once instead of leaving the ones that passed waiting in the next one.
+    # Global window order is the whole point of the row all-gather, so compare
+    # the entire replicated array rather than this rank's contribution to it.
+    torch.testing.assert_close(local_kv.detach(), baseline_kv, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        local_bias.detach(), baseline_bias[..., begin : begin + local_len, :], rtol=1e-4, atol=1e-4
+    )
+    # The gathers sum-reduce in backward, so the local input gradient already
+    # carries the halo contributions every neighbour made to it.
+    torch.testing.assert_close(
+        local_input.grad, baseline_input_grad[:, begin : begin + local_len], rtol=1e-4, atol=1e-4
+    )
+    for name, summed in summed_grads.items():
+        torch.testing.assert_close(summed, baseline_grads[name], rtol=1e-4, atol=1e-4)
+
+    clear_parallel_state()
+    dist.destroy_process_group()
+
+
 class _UnusableGroup:
     """A truthy stand-in for a CP process group that no collective can use.
 
@@ -224,17 +397,22 @@ def _cp_state(cp_size: int = 2, cp_rank: int = 0) -> SimpleNamespace:
     )
 
 
-def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int):
-    """One rank's fixture on CPU: a local shard plus the full-sequence mask CP requires."""
+def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, layer_idx: int = 0):
+    """One rank's fixture on CPU: a local shard plus the full-sequence mask CP requires.
+
+    ``local_len`` must be at least the compressor's rate, which is the halo width,
+    so that a guard moved after the halo exchange is caught by the unusable group
+    rather than by the compressor's own shard-width check.
+    """
     from transformers import AutoConfig
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
-    # Layer 0 is HCA on the toy config; dropping the compressor is what makes it
-    # sliding-only, so keeping it is exactly the layer kind CP must refuse.
-    layer = dsv4.DeepseekV4Attention(config, layer_idx=0)
+    # Layer 0 is HCA and layer 3 is CSA on the toy config; there is no
+    # sliding-only layer type, so dropping the compressor is what makes one.
+    layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx)
     if not with_compressor:
         layer.compressor = None
 
@@ -245,29 +423,39 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int):
     return config, _make_forward(layer, rotary), hidden, position_ids, full_mask
 
 
-def test_deepseek_v4_attention_cp_rejects_a_compressor_layer():
-    """A compressor would summarise the local shard only, so CP must refuse it until Task 6."""
-    _, forward, hidden, position_ids, full_mask = _build_local_attention(with_compressor=True, local_len=16, cp_size=2)
+def test_deepseek_v4_attention_cp_rejects_an_indexer_layer():
+    """A CSA layer's Lightning Indexer still scores against shard-local compressed rows.
+
+    The compressor itself is context-parallel now; the indexer inside it is not,
+    and its selection would be silently wrong rather than mis-shaped.
+    """
+    _, forward, hidden, position_ids, full_mask = _build_local_attention(
+        with_compressor=True, local_len=32, cp_size=2, layer_idx=3
+    )
     with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
-        with pytest.raises(NotImplementedError, match="compressor path"):
+        with pytest.raises(NotImplementedError, match="indexer"):
             forward(hidden, position_ids, full_mask)
 
 
-def test_deepseek_v4_attention_cp_rejects_a_kv_cache():
+@pytest.mark.parametrize("with_compressor", [False, True])
+def test_deepseek_v4_attention_cp_rejects_a_kv_cache(with_compressor):
     """Decode would append this rank's shard to a cache the other ranks also gather."""
     from transformers import DynamicCache
 
     config, forward, hidden, position_ids, full_mask = _build_local_attention(
-        with_compressor=False, local_len=16, cp_size=2
+        with_compressor=with_compressor, local_len=32, cp_size=2
     )
     with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
         with pytest.raises(NotImplementedError, match="KV cache"):
             forward(hidden, position_ids, full_mask, past_key_values=DynamicCache(config=config))
 
 
-def test_deepseek_v4_attention_cp_rejects_a_local_length_mask():
+@pytest.mark.parametrize("with_compressor", [False, True])
+def test_deepseek_v4_attention_cp_rejects_a_local_length_mask(with_compressor):
     """A shard-width mask would let rank 0 attend everywhere uncaused and later ranks time out."""
-    config, forward, hidden, position_ids, _ = _build_local_attention(with_compressor=False, local_len=16, cp_size=2)
+    config, forward, hidden, position_ids, _ = _build_local_attention(
+        with_compressor=with_compressor, local_len=32, cp_size=2
+    )
     local_mask = _build_causal_mask(hidden.shape[1], config.sliding_window, "cpu", torch.float32)
     with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
         with pytest.raises(ValueError, match="full sequence"):
@@ -302,5 +490,77 @@ def test_deepseek_v4_attention_cp_sparse_indices(cp_size):
             _run_attention_cp_sparse_indices,
             args=(cp_size, init_file, 64),
             nprocs=cp_size,
+            join=True,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_deepseek_v4_attention_cp_with_compressor(cp_size):
+    """A whole HCA layer under CP matches the full-sequence forward and backward.
+
+    Sequence length 128 keeps every rank holding at least one window at
+    ``cp_size=4`` with the toy HCA rate of 32.
+    """
+    if torch.cuda.device_count() < cp_size:
+        pytest.skip(f"needs {cp_size} devices")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _run_attention_cp,
+            args=(cp_size, init_file, 128, True),
+            nprocs=cp_size,
+            join=True,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("kind", ["hca", "csa"])
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_deepseek_v4_compressor_cp_unpacked(kind, cp_size):
+    """Both compressors rebuild the global compressed KV from per-shard windows."""
+    if torch.cuda.device_count() < cp_size:
+        pytest.skip(f"needs {cp_size} devices")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _run_compressor_cp,
+            args=(cp_size, init_file, kind, 128, None),
+            nprocs=cp_size,
+            join=True,
+        )
+
+
+# Packed lengths that are deliberately not multiples of the compression rate, so
+# that a window straddles a shard boundary, a sample boundary falls inside a
+# shard, and the ranks own different numbers of windows. Aligned lengths
+# exercise none of that.
+#
+# ``csa`` (rate 4, cp_size=4, L=16): starts
+# [0,4,8,12,16,20,24,28,32,38,42,46,50,54,58], counts [4,4,4,3]. The window at
+# 46 covers 46..49 and crosses the rank 2/3 edge at 48; rank 2 owns the window
+# at 32 whose overlap half lives at 28..31, on rank 1.
+#
+# ``hca`` (rate 32, cp_size=4, L=32): starts [0,32,70], counts [1,1,1,0]. The
+# window at 70 covers 70..101 and crosses the rank 2/3 edge at 96, and rank 3
+# owns nothing at all. The rate is the halo width, so the shard cannot be
+# narrower than 32 here.
+_PACKED_COMPRESSOR_FIXTURES = {
+    "csa": (64, ((0, 38), (38, 64))),
+    "hca": (128, ((0, 70), (70, 128))),
+}
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.parametrize("kind", ["hca", "csa"])
+def test_deepseek_v4_compressor_cp_packed_straddling(kind):
+    """Windows that cross a shard boundary still land in the right global slot."""
+    seq_len, sample_slices = _PACKED_COMPRESSOR_FIXTURES[kind]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _run_compressor_cp,
+            args=(4, init_file, kind, seq_len, sample_slices),
+            nprocs=4,
             join=True,
         )

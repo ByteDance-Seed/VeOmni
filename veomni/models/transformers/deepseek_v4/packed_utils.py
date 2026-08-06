@@ -18,6 +18,8 @@ from typing import Callable, NamedTuple
 
 import torch
 
+from ....distributed.context_parallel import rebase_window_indices
+
 
 def build_packed_compression_metadata(
     reference: torch.Tensor,
@@ -68,6 +70,41 @@ def build_packed_compression_metadata(
     return metadata
 
 
+def shard_packed_compression_metadata(
+    packed_metadata: dict[str, torch.Tensor],
+    *,
+    window_begin: int,
+    window_end: int,
+    local_seq_len: int,
+    cp_rank: int,
+    halo: int,
+) -> dict[str, torch.Tensor]:
+    """Restrict global packed compression metadata to one context-parallel shard.
+
+    A window belongs to the rank that owns its first token, so the per-window
+    arrays are sliced to this rank's contiguous ``[window_begin, window_end)``
+    run. Per-query arrays are sliced by query row instead, and their *values*
+    stay untouched: the compressed array is replicated, so a compressed slot
+    means the same thing on every rank.
+
+    ``window_indices`` addresses ``[left halo | local shard | right halo]`` and
+    so shifts by ``halo`` as well as by the shard offset, while ``window_starts``
+    is only ever used to index ``position_ids``, which carries no halo.
+    """
+    window_starts = packed_metadata["window_starts"]
+    queries = slice(cp_rank * local_seq_len, (cp_rank + 1) * local_seq_len)
+    local_metadata = dict(packed_metadata)
+    local_metadata["window_starts"] = window_starts[window_begin:window_end] - cp_rank * local_seq_len
+    local_metadata["window_indices"] = rebase_window_indices(
+        packed_metadata["window_indices"][window_begin:window_end], local_seq_len, cp_rank, halo
+    )
+    local_metadata["range_starts"] = packed_metadata["range_starts"][queries]
+    local_metadata["range_ends"] = packed_metadata["range_ends"][queries]
+    if "block_bias" in packed_metadata:
+        local_metadata["block_bias"] = packed_metadata["block_bias"][..., queries, :]
+    return local_metadata
+
+
 def compress_packed_windows(
     kv: torch.Tensor,
     gate: torch.Tensor,
@@ -95,13 +132,28 @@ def compress_packed_windows(
     swapped for the fused Triton backend. It is required rather than defaulted
     to the eager reference: a defaulted call site would silently keep eager
     while every other one is fused, which no test would catch.
+
+    ``kv`` and ``gate`` may be pre-extended with halos, as context parallelism
+    does, provided ``window_indices`` has been rebased onto the extended buffer
+    by :func:`shard_packed_compression_metadata` and the left halo is at least
+    ``compress_rate`` wide. That width is what keeps
+    ``previous_indices = current_indices - compress_rate`` non-negative at the
+    first owned window; a narrower halo would silently read window 0's overlap
+    half from the wrong tokens instead, because ``clamp_min(0)`` cannot tell the
+    difference. ``position_ids`` and ``window_starts`` stay unhaloed and
+    shard-local, since positions are per-sample and never cross a rank.
     """
     if kv.shape[0] != 1:
         raise ValueError(f"Packed DeepSeek V4 compression expects batch size 1, got {kv.shape[0]}")
 
     window_starts = packed_metadata["window_starts"]
     if window_starts.numel() == 0:
-        return kv.new_zeros((1, 0, head_dim))
+        # Empty slices of *both* inputs rather than ``new_zeros``: a context-parallel
+        # rank can own no window, and it must still reach the backward of every
+        # collective its peers reach -- the compressed-row all-gather and both halo
+        # all-gathers all-reduce there. A detached result, or one touching only
+        # ``kv``, leaves this rank out of those and hangs the ranks that own windows.
+        return kv[:, :0, :head_dim] + gate[:, :0, :head_dim]
 
     current_indices = packed_metadata["window_indices"]
     current_kv = kv[0, current_indices]
@@ -363,4 +415,5 @@ __all__ = [
     "packed_compressed_block_bias",
     "packed_compressed_causal_ranges",
     "scatter_topk_block_bias",
+    "shard_packed_compression_metadata",
 ]
