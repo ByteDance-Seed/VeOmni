@@ -244,7 +244,7 @@ class ModuleRuntime:
         if callable(customized):
             return customized(lora_config)
 
-        from ..lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
+        from ....lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
 
         lora_adapter_path = lora_config.get("lora_adapter", None)
         if lora_adapter_path is not None:
