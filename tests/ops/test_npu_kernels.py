@@ -25,10 +25,13 @@ Tests are skipped on non-NPU hosts so the same test suite runs in any CI runner.
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import veomni.ops  # noqa: F401 — trigger KERNEL_REGISTRY registrations
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
+
+from ..tools import is_npu_arch35
 
 
 pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU kernels require torch_npu")
@@ -97,6 +100,38 @@ def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     fused_input = torch.cat([gate, normed], dim=-1)
     half = fused_input.shape[-1] // 2
     return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
+
+
+def _eager_varlen_causal_conv1d(x, weight, bias, activation, cu_seqlens):
+    """Depthwise causal-conv reference for a packed ``[1, T, D]`` input."""
+    kernel_size = weight.shape[-1]
+    outputs = []
+    for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+        segment = x[:, start:end].transpose(1, 2)
+        segment = F.pad(segment, (kernel_size - 1, 0))
+        output = F.conv1d(segment, weight.unsqueeze(1), bias=bias, groups=weight.shape[0])
+        if activation in ("silu", "swish"):
+            output = F.silu(output)
+        outputs.append(output.transpose(1, 2))
+    return torch.cat(outputs, dim=1)
+
+
+def _eager_varlen_chunk_gated_delta_rule(q, k, v, g, beta, cu_seqlens):
+    """Run the Transformers torch reference independently for each packed segment."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+
+    outputs = []
+    for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+        output, _ = torch_chunk_gated_delta_rule(
+            q[:, start:end],
+            k[:, start:end],
+            v[:, start:end],
+            g=g[:, start:end],
+            beta=beta[:, start:end],
+            use_qk_l2norm_in_kernel=True,
+        )
+        outputs.append(output)
+    return torch.cat(outputs, dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +278,104 @@ class TestNPURmsNormGated:
 
 
 # ---------------------------------------------------------------------------
+# Qwen3.5 varlen GatedDeltaNet tests
+# ---------------------------------------------------------------------------
+
+
+class TestNPUGatedDeltaNetVarlen:
+    """Validate packed-sequence NPU kernels against segmented eager references."""
+
+    @pytest.fixture(autouse=True)
+    def skip_on_arch35(self):
+        if is_npu_arch35():
+            pytest.skip("Qwen3.5 causal_conv1d is not supported on arch35 NPUs")
+
+    def test_causal_conv1d_matches_segmented_eager_forward_backward(self):
+        torch.manual_seed(0)
+        dtype = torch.bfloat16
+        cu_seqlens = torch.tensor([0, 17, 64], device=DEVICE, dtype=torch.int32)
+
+        # The no-state NPU kernel tiles channels with BD=256 and requires D to
+        # be divisible by that tile size; real Qwen3.5 conv dimensions satisfy it.
+        x = torch.randn(1, 64, 256, device=DEVICE, dtype=dtype, requires_grad=True)
+        weight = torch.randn(256, 4, device=DEVICE, dtype=dtype, requires_grad=True)
+        bias = torch.randn(256, device=DEVICE, dtype=dtype, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        weight_ref = weight.detach().clone().requires_grad_(True)
+        bias_ref = bias.detach().clone().requires_grad_(True)
+
+        slot = OpSlot("causal_conv1d", "standard")
+        slot.bind("npu")
+        output, _ = slot(
+            x=x,
+            weight=weight,
+            bias=bias,
+            activation="silu",
+            cu_seqlens=cu_seqlens,
+        )
+        output_ref = _eager_varlen_causal_conv1d(
+            x_ref,
+            weight_ref,
+            bias_ref,
+            "silu",
+            cu_seqlens,
+        )
+
+        grad = torch.randn_like(output)
+        output.backward(grad)
+        output_ref.backward(grad)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(x.grad.float(), x_ref.grad.float(), rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(weight.grad.float(), weight_ref.grad.float(), rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(bias.grad.float(), bias_ref.grad.float(), rtol=5e-2, atol=5e-2)
+
+    def test_chunk_gated_delta_rule_matches_segmented_eager_forward_backward(self):
+        torch.manual_seed(1)
+        dtype = torch.bfloat16
+        # Put a sequence boundary inside a 64-token kernel chunk so recurrent
+        # state leakage across packed samples changes the result.
+        cu_seqlens = torch.tensor([0, 47, 128], device=DEVICE, dtype=torch.int32)
+
+        q, k, v = [torch.randn(1, 128, 2, 128, device=DEVICE, dtype=dtype, requires_grad=True) for _ in range(3)]
+        # Qwen3.5 computes the decay gate from float32 A_log/dt_bias even when
+        # q/k/v and beta use bfloat16.
+        g = F.logsigmoid(torch.randn(1, 128, 2, device=DEVICE, dtype=torch.float32)).requires_grad_(True)
+        beta = torch.sigmoid(torch.randn(1, 128, 2, device=DEVICE, dtype=dtype)).requires_grad_(True)
+        q_ref, k_ref, v_ref, g_ref, beta_ref = [
+            tensor.detach().clone().requires_grad_(True) for tensor in (q, k, v, g, beta)
+        ]
+
+        slot = OpSlot("chunk_gated_delta_rule", "standard")
+        slot.bind("npu")
+        output, _ = slot(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+        )
+        output_ref = _eager_varlen_chunk_gated_delta_rule(
+            q_ref,
+            k_ref,
+            v_ref,
+            g_ref,
+            beta_ref,
+            cu_seqlens,
+        )
+
+        grad = torch.randn_like(output)
+        output.backward(grad)
+        output_ref.backward(grad)
+
+        torch.testing.assert_close(output.float(), output_ref.float(), rtol=3e-2, atol=3e-2)
+        for actual, expected in zip((q, k, v, g, beta), (q_ref, k_ref, v_ref, g_ref, beta_ref)):
+            torch.testing.assert_close(actual.grad.float(), expected.grad.float(), rtol=5e-2, atol=5e-2)
+
+
+# ---------------------------------------------------------------------------
 # HCCL premul_sum patch tests (mock-based, no distributed required)
 # ---------------------------------------------------------------------------
 
@@ -364,6 +497,8 @@ class TestNPUKernelRegistry:
             ("rotary_pos_emb_vision", "full"),
             ("rotary_pos_emb", "partial"),
             ("rms_norm_gated", "standard"),
+            ("causal_conv1d", "standard"),
+            ("chunk_gated_delta_rule", "standard"),
             ("moe_experts", "standard"),
         ],
     )

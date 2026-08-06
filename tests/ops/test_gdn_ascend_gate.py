@@ -27,6 +27,7 @@ these tests never import the Triton kernels and run on any CI host without
 ``triton-ascend`` / ``flash-linear-attention``.
 """
 
+import builtins
 from unittest.mock import patch
 
 import pytest
@@ -137,3 +138,22 @@ def test_npu_ascendc_factory_missing_dep_raises_actionable():
 
     with pytest.raises(RuntimeError, match="npu_ascendc"):
         _npu_ascendc_chunk_gated_delta_rule_factory()
+
+
+def test_npu_ascendc_factory_triton_error_uses_locked_installer():
+    from veomni.ops.kernels.gated_delta_rule import _npu_ascendc_chunk_gated_delta_rule_factory
+
+    real_import = builtins.__import__
+
+    def import_without_triton(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "npu_ascendc_gated_delta_rule" and level == 1:
+            raise ModuleNotFoundError("No module named 'triton'", name="triton")
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch("builtins.__import__", side_effect=import_without_triton):
+        with pytest.raises(RuntimeError) as exc_info:
+            _npu_ascendc_chunk_gated_delta_rule_factory()
+
+    message = str(exc_info.value)
+    assert "scripts/ci/install_triton_ascend.py" in message
+    assert "--extra-index-url" not in message

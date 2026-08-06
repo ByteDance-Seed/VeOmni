@@ -43,3 +43,5 @@ jobs:
             echo "=========================================="
             exit 1
           fi
+      - name: Verify pinned NPU CI dependencies
+        run: python3 scripts/ci/install_triton_ascend.py --check-config
