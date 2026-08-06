@@ -37,6 +37,38 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+# Models whose forward implements context parallelism. An allow-list rather than
+# a deny-list so that a model has to be ported deliberately: CP is enabled
+# model-agnostically (``ParallelState`` and ``TrainingArguments`` both admit
+# ``cp_size > 1`` for anything), and nothing downstream would notice a model that
+# has not been. ``SequenceParallelCollator`` shards the sequence on
+# ``sp_enabled``, which CP alone turns on, while every unported model gates its
+# sequence-parallel collectives on ``ulysses_enabled``, which CP alone leaves
+# false — so the shards are never gathered, each rank attends only within its own
+# 1/cp_size of the sequence, and the run trains to a plausible loss curve while
+# being silently wrong.
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+
+
+def check_context_parallel_supported(config: PretrainedConfig) -> None:
+    """Raise unless this model type implements context parallelism.
+
+    A no-op when context parallelism is off, which is every other configuration.
+    """
+    if not get_parallel_state().cp_enabled:
+        return
+
+    model_type = getattr(config, "model_type", None)
+    if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
+        return
+
+    supported = ", ".join(sorted(CONTEXT_PARALLEL_MODEL_TYPES))
+    raise NotImplementedError(
+        f"Context parallelism is not implemented for model type {model_type!r}; "
+        f"only {supported} supports it. Set cp_size=1 to disable it, or use "
+        "ulysses_size for sequence parallelism on this model."
+    )
+
 
 def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     """
@@ -196,6 +228,8 @@ def build_foundation_model(
         config = config_path
     else:
         config = build_config(config_path, **config_kwargs)
+
+    check_context_parallel_supported(config)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
