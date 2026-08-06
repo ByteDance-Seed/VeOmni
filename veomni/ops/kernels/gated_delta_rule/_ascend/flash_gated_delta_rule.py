@@ -29,6 +29,7 @@ from .triton.cumsum import chunk_local_cumsum
 from .triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 from .triton.utils import is_arch35
+
 if is_arch35():
     from .triton_core.solve_tril import solve_tril
 else:
@@ -585,14 +586,17 @@ def flash_gated_delta_rule(
         raise ValueError(f"chunk_size must be a power of 2, got {chunk_size}.")
 
     if cu_seqlens is not None:
-        cu_seqlens, cu_seqlens_list, chunk_indices, chunk_indices_list = _ensure_varlen_metadata(
-            g=g,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_list=cu_seqlens_list,
-            chunk_indices=chunk_indices,
-            chunk_indices_list=chunk_indices_list,
-            chunk_size=chunk_size,
-        )
+        if cu_seqlens_list is not None and chunk_indices is not None and chunk_indices_list is not None:
+            cu_seqlens = cu_seqlens.to(device=g.device, dtype=torch.int64)
+        else:
+            cu_seqlens, cu_seqlens_list, chunk_indices, chunk_indices_list = _ensure_varlen_metadata(
+                g=g,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_list=cu_seqlens_list,
+                chunk_indices=chunk_indices,
+                chunk_indices_list=chunk_indices_list,
+                chunk_size=chunk_size,
+            )
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using cu_seqlens. "
@@ -611,6 +615,10 @@ def flash_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
+    if use_qk_l2norm_in_kernel:
+        q = l2norm(q, dim=-1, eps=1e-6)
+        k = l2norm(k, dim=-1, eps=1e-6)
+
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -624,10 +632,66 @@ def flash_gated_delta_rule(
         cu_seqlens_list,
         chunk_indices,
         chunk_indices_list,
-        use_qk_l2norm_in_kernel,
+        False,
         chunk_size,
     )
     return o, final_state
+
+
+def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+    """Eager L2 normalization aligned with the FLA library's ``l2norm`` kernel.
+
+    Computes ``x / sqrt(sum(x^2) + eps)`` in the input dtype.  Unlike the fused
+    ``triton_core.l2norm`` path (which accumulates in fp32 inside the kernel),
+    this eager implementation runs ``(x*x).sum()`` in the input dtype.
+    """
+    original_dtype = x.dtype
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    # Restore original dtype — ``torch.rsqrt`` promotes bf16 inputs to fp32.
+    return (x * inv_norm).to(original_dtype)
+
+
+def precompute_varlen_metadata(
+    cu_seqlens: torch.LongTensor,
+    num_heads: int,
+    chunk_size: int = 64,
+    device: Optional[torch.device | str] = None,
+) -> tuple[list[int], Dict[str, Optional[torch.LongTensor]], Dict[str, Optional[list[int]]]]:
+    """Precompute variable-length metadata once for all GDN layers.
+
+    Hoists the per-layer ``cu_seqlens.tolist()`` / ``prepare_chunk_indices``
+    calls into a single host-side pass so that subsequent layers can reuse the
+    results via the fast-path bypass in :func:`flash_gated_delta_rule`.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths ``[N+1]`` in FlashAttention format.
+        num_heads: Number of value heads — should be the **local** head count
+            (i.e. ``num_v_heads // ulysses_size`` under Ulysses SP).
+        chunk_size: GDN chunk size (must be a power of 2).
+        device: If set, ``chunk_indices`` tensors are placed on this device.
+
+    Returns:
+        ``(cu_seqlens_list, chunk_indices, chunk_indices_list)`` suitable for
+        passing as the precomputed-metadata kwargs to :func:`flash_gated_delta_rule`.
+    """
+    if cu_seqlens.device.type != "cpu":
+        cu_seqlens = cu_seqlens.cpu()
+    cu_seqlens_list = cu_seqlens.tolist()
+    cumsum_block_size = _next_power_of_2((1 << 17) // max(1, num_heads * chunk_size))
+    required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES) | {chunk_size, cumsum_block_size}
+    chunk_indices: Dict[str, Optional[torch.LongTensor]] = {}
+    chunk_indices_list: Dict[str, Optional[list[int]]] = {}
+
+    for size in required_sizes:
+        key = str(size)
+        chunk_indices[key] = prepare_chunk_indices(cu_seqlens, size)
+        chunk_indices_list[key] = prepare_chunk_indices_list(cu_seqlens_list, size)
+    if device is not None:
+        chunk_indices = {
+            k: v.to(device=device) if v is not None else None
+            for k, v in chunk_indices.items()
+        }
+    return cu_seqlens_list, chunk_indices, chunk_indices_list
 
 
 __all__ = [
@@ -636,4 +700,5 @@ __all__ = [
     "flash_chunk_gated_delta_rule_bwd",
     "prepare_chunk_indices",
     "prepare_chunk_indices_list",
+    "precompute_varlen_metadata",
 ]

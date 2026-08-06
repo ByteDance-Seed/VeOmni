@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -21,12 +21,18 @@ import torch
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import use_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
+from ..distributed.torch_compile import (
+    CompileConfig,
+    mark_compile_step_begin,
+    validate_compile_model,
+    validate_compile_runtime,
+)
 from ..models import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
-from ..utils.device import synchronize
-from ..utils.loss_utils import count_loss_token
+from ..utils.device import get_device_type, synchronize
+from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs
 
@@ -68,7 +74,7 @@ class VLMTrainingArguments(TrainingArguments):
 
 @dataclass
 class VLMMDataArguments(DataArguments):
-    supports_torch_compile = False
+    supports_torch_compile = True
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
@@ -113,6 +119,7 @@ class VLMTrainer:
         with use_parallel_state("base"):
             # rewrite build model to support data balancing
             self._build_model()
+            self._validate_torch_compile()
 
             # rewrite freeze_model_module to support freeze multimodal encoder, etc.
             self._freeze_model_module()
@@ -152,6 +159,31 @@ class VLMTrainer:
             config_kwargs=args.model.model_config,
         )
         self.base.model_config = self.base.model.config
+
+    def _validate_torch_compile(self):
+        args: VeOmniVLMArguments = self.base.args
+        if not args.train.torch_compile.enable:
+            return
+
+        accelerator = args.train.accelerator
+        compile_config = CompileConfig(
+            **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
+        )
+        validate_compile_model(
+            self.base.model,
+            compile_config,
+            sequence_parallel_enabled=accelerator.ulysses_size > 1 or accelerator.cp_size > 1,
+            async_enabled=accelerator.enable_async,
+        )
+        parallel_state = get_parallel_state()
+        validate_compile_runtime(
+            compile_config,
+            device_type=get_device_type(),
+            fsdp_enabled=parallel_state.fsdp_enabled,
+            fsdp_mode=parallel_state.dp_mode,
+            any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
+            enable_reshard_after_forward=accelerator.fsdp_config.reshard_after_forward,
+        )
 
     def _freeze_model_module(self):
         args: VeOmniVLMArguments = self.base.args
@@ -294,16 +326,18 @@ class VLMTrainer:
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
-        synchronize()
+        self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
         # token num for fixed_ce_loss in postforward
         self.base.micro_batches_token_len = count_loss_token(micro_batches)
+        self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
+            mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
             self.base.model_reshard(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]

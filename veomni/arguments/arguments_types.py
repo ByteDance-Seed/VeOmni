@@ -25,6 +25,21 @@ from ..utils.env import get_env
 logger = logging.get_logger(__name__)
 
 
+def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
+    """Copy an ``hdfs://`` path to a local cache and return the local path.
+
+    Non-HDFS paths (local filesystem, HF hub ids, hdfs-fuse mounts) are returned
+    unchanged. Concurrent processes on the same node are serialized by the file
+    lock inside ``copy_to_local``, so the download happens only once per node.
+    """
+    from ..utils.fs import copy_to_local, is_non_local
+
+    if path is None or not is_non_local(path):
+        return path
+
+    return copy_to_local(path.rstrip("/"), verbose=True)
+
+
 # ================================ Training Arguments ======================================
 #
 # Hierarchy:
@@ -612,7 +627,7 @@ class TorchCompileConfig:
 
     enable: bool = field(
         default=False,
-        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
+        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
     )
     backend: Optional[str] = field(
         default="inductor",
@@ -722,6 +737,15 @@ class TrainingArguments:
     enable_batch_invariant_mode: bool = field(
         default=False,
         metadata={"help": "Enable batch invariant mode."},
+    )
+    sync_each_train_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Synchronize the accelerator before each training step's forward/backward work. "
+                "Disable to allow asynchronous dataloader and H2D work to overlap with the next step."
+            )
+        },
     )
     empty_cache_steps: int = field(
         default=500,
@@ -1283,6 +1307,16 @@ class ModelArguments:
         if self.config_path is None and self.model_path is None:
             raise ValueError("`config_path` must be specified when `model_path` is None.")
 
+        # Download HDFS-hosted paths to a local cache before resolving defaults so
+        # that all downstream loaders (config/tokenizer/safetensors) see local paths.
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.config_path = _resolve_hdfs_path(self.config_path)
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
+        for sub_args in (*self.encoders.values(), *self.decoders.values()):
+            for key in ("model_path", "config_path", "tokenizer_path"):
+                if sub_args.get(key) is not None:
+                    sub_args[key] = _resolve_hdfs_path(sub_args[key])
+
         if self.config_path is None:
             self.config_path = self.model_path
 
@@ -1360,6 +1394,14 @@ class DataloaderConfig:
     prefetch_factor: int = field(
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},
+    )
+    persistent_workers: bool = field(
+        default=False,
+        metadata={"help": "Keep DataLoader worker processes alive between iterator recreations."},
+    )
+    in_order: bool = field(
+        default=True,
+        metadata={"help": "Return worker-loaded batches in first-in, first-out order."},
     )
     drop_last: bool = field(
         default=True,
@@ -1502,12 +1544,12 @@ class VeOmniArguments:
                 )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text trainers only. "
-                    "Multimodal/DiT/Omni data pipelines do not implement pad_to_length for static packed shapes yet."
+                    "train.torch_compile.enable is not supported by this data pipeline. "
+                    "The pipeline must implement pad_to_length for static packed shapes."
                 )
             if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text data only; "
+                    "train.torch_compile.enable currently supports packed language-model data types only; "
                     f"got data.data_type={self.data.data_type!r}."
                 )
             if not self.train.dyn_bsz or not self.train.pad_to_length:
@@ -1578,5 +1620,7 @@ class InferArguments:
     )
 
     def __post_init__(self):
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
