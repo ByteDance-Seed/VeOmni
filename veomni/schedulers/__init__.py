@@ -16,6 +16,7 @@
 
 Two near-identically named modules live here: ``flow_match`` holds the
 inference-time ``FlowMatchScheduler`` (Wan / Flux DiT sampling), while
-``flow_matching`` holds the deterministic training-path helpers (seed
-derivation, posterior / noise / timestep sampling, velocity-MSE loss).
+``flow_matching`` holds the training-path helpers (flow recipe validation,
+per-DP-replica seed derivation, posterior / timestep / noise sampling from a
+caller-owned generator, velocity-MSE loss).
 """

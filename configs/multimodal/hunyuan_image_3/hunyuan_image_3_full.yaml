@@ -22,6 +22,9 @@ model:
       training_shift: 1.0
       prediction_type: velocity
       loss_weighting: uniform
+      # Base seed for the flow noise stream. Lives on the recipe (and so in
+      # the checkpoint's config.json), independent of train.seed.
+      seed: 0
 
 data:
   train_path: /path/to/training-data
