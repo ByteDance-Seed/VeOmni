@@ -6,8 +6,8 @@ import os
 import re
 from typing import Protocol
 
-from .generation_graph import GenerationGraph
-from .training_graph import TrainingGraph
+from ..graphs.generation_graph import GenerationGraph
+from ..graphs.training_graph import TrainingGraph
 
 
 class GraphConfig(Protocol):

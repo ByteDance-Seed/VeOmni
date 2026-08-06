@@ -16,8 +16,8 @@ from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Dict, Optional
 
 from ..graphs.graph import NodeDef
+from ..utils.graph_profiler import GraphProfiler
 from .dispatch import call_graph_endpoint, unwrap_graph_module
-from .profiling import GraphProfiler
 
 
 def execute_train_node(

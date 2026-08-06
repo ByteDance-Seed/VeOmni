@@ -31,12 +31,14 @@ veomni/
 │       ├── configuration_omni.py   OmniConfig (pure HF PretrainedConfig, checkpoint I/O,
 │       │                           all generation scenarios keyed by infer_type)
 │       ├── modeling_omni.py        OmniModel (eager graph forward/generate)
+│       ├── utils/                  Shared SeedOmni helpers
+│       │   ├── graph_profiler.py   GraphProfiler (request-local node timing)
+│       │   └── visualize.py        Mermaid export for training/generation graphs
 │       └── accelerator/          VeOmni runtime (graph loops + per-module FSDP)
 │           ├── omni_model_runtime.py  OmniModelRuntime (composed graph loops)
 │           ├── module_runtime.py      ModuleRuntime (per sub-module FSDP/opt/ckpt)
 │           ├── executor.py            execute_train_node / execute_generation_node
-│           ├── dispatch.py            unwrap FSDP/DDP/LoRA wrappers, call_graph_endpoint
-│           └── profiling.py           GraphProfiler
+│           └── dispatch.py            unwrap FSDP/DDP/LoRA wrappers, call_graph_endpoint
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW

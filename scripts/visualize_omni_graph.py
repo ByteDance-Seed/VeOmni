@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from veomni.arguments import OmniArguments, parse_omni_args
-from veomni.models.seed_omni.graphs.visualize import (
+from veomni.models.seed_omni.utils.visualize import (
     render_generation_mermaid,
     render_training_mermaid,
     write_mermaid_file,

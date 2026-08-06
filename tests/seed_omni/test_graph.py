@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from veomni.arguments import OmniGraphProfileArguments
 from veomni.models.seed_omni import EdgeDef, NodeDef
-from veomni.models.seed_omni.accelerator import GraphProfiler, OmniModelRuntime, profiling
+from veomni.models.seed_omni.accelerator import OmniModelRuntime
 from veomni.models.seed_omni.accelerator.executor import execute_generation_node, execute_train_node
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
@@ -18,6 +18,8 @@ from veomni.models.seed_omni.graphs.graph import END
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
+from veomni.models.seed_omni.utils import graph_profiler
+from veomni.models.seed_omni.utils.graph_profiler import GraphProfiler
 from veomni.trainer.callbacks.omni_callbacks import GraphProfileCallback
 from veomni.trainer.omni.omni_trainer import OmniTrainer
 
@@ -334,7 +336,7 @@ def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
             return 3 * 1024**3
 
     device = _FakeDevice()
-    monkeypatch.setattr(profiling, "get_torch_device", lambda: device)
+    monkeypatch.setattr(graph_profiler, "get_torch_device", lambda: device)
 
     profiler = GraphProfiler(enable_memory=True)
     with profiler.node("forward:run_ar.forward"):

@@ -27,8 +27,8 @@ from ....utils.logging import get_logger
 from ..graphs.graph import NodeDef
 from ..mixins.metric_meter_mixin import MetricMeterResult
 from ..modeling_omni import _LOSS_KEY, OmniModel, _sum_losses
+from ..utils.graph_profiler import GraphProfiler
 from .executor import execute_generation_node, execute_train_node
-from .profiling import GraphProfiler
 
 
 if TYPE_CHECKING:

@@ -446,7 +446,7 @@ class OmniConfig(PretrainedConfig):
             json.dump(config_dict, f, indent=2)
             f.write("\n")
 
-        from .graphs.visualize import save_graph_mermaid_diagrams
+        from .utils.visualize import save_graph_mermaid_diagrams
 
         save_graph_mermaid_diagrams(export_config, save_directory)
 

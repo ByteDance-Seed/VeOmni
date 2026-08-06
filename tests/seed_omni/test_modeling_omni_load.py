@@ -16,12 +16,12 @@ from veomni.models.seed_omni.configuration_omni import (
     DEFAULT_TRAINING_GRAPH_FILE,
     OmniConfig,
 )
-from veomni.models.seed_omni.graphs.visualize import (
+from veomni.models.seed_omni.modeling_omni import OmniModel, merge_generation_kwargs
+from veomni.models.seed_omni.utils.visualize import (
     GRAPH_VIS_SUBDIR,
     TRAINING_MMD_FILENAME,
     generation_mmd_filename,
 )
-from veomni.models.seed_omni.modeling_omni import OmniModel, merge_generation_kwargs
 
 
 def _write_module_stub(module_dir: Path, *, model_type: str = "fake_omni_module") -> None:

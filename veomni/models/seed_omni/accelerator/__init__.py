@@ -22,12 +22,10 @@ trainer/distributed setup into every ``seed_omni`` import.
 
 from .executor import execute_generation_node, execute_train_node
 from .omni_model_runtime import OmniModelRuntime
-from .profiling import GraphProfiler
 
 
 __all__ = [
     "OmniModelRuntime",
     "execute_train_node",
     "execute_generation_node",
-    "GraphProfiler",
 ]

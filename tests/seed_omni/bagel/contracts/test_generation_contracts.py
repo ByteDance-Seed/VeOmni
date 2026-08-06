@@ -12,7 +12,7 @@ from tests.seed_omni.bagel.contracts.helpers import (
     model_cls,
     tiny_bagel_qwen2_cfg,
 )
-from veomni.models.seed_omni.accelerator import GraphProfiler, OmniModelRuntime
+from veomni.models.seed_omni.accelerator import OmniModelRuntime
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
@@ -26,6 +26,7 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_VAE_CONTEXT,
 )
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.models.seed_omni.utils.graph_profiler import GraphProfiler
 
 
 def _make_veomni_runtime(cfg, modules):
