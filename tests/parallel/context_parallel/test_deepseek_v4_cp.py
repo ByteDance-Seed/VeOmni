@@ -186,17 +186,26 @@ def _run_attention_cp(
     local_output = _forward(local_input, full_position_ids[:, begin : begin + local_len], full_mask)
     local_output.sum().backward()
 
+    summed_grads = {}
+    for name, param in layer.named_parameters():
+        if param.grad is None:
+            continue
+        summed = param.grad.detach().clone()
+        dist.all_reduce(summed)
+        summed_grads[name] = summed
+
+    # Every collective is behind us, so a mismatch below fails on all ranks at
+    # once instead of leaving the ones that passed waiting in the next one. The
+    # asserts used to sit above and inside this loop, which turned any failure
+    # into a ten-minute NCCL watchdog timeout with the real message buried under
+    # it -- the most expensive failure mode this suite has.
     torch.testing.assert_close(local_output, baseline[:, begin : begin + local_len], rtol=1e-4, atol=1e-4)
     # The KV all-gather's backward sum-reduces before slicing, so the input grad
     # already carries every other rank's contribution and must not be reduced again.
     torch.testing.assert_close(
         local_input.grad, baseline_input_grad[:, begin : begin + local_len], rtol=1e-4, atol=1e-4
     )
-    for name, param in layer.named_parameters():
-        if param.grad is None:
-            continue
-        summed = param.grad.detach().clone()
-        dist.all_reduce(summed)
+    for name, summed in summed_grads.items():
         torch.testing.assert_close(summed, baseline_grads[name], rtol=1e-4, atol=1e-4)
 
     clear_parallel_state()
