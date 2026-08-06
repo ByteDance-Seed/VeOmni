@@ -1,3 +1,5 @@
+"""VeOmni-accelerated Qwen3VLVisionEncoder — training / inference graph hooks."""
+
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -9,6 +11,7 @@ from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
 from .configuration import Qwen3VLVisionEncoderConfig
+from .modeling import Qwen3VLVisionEncoder
 from .processing import _OMNI_GRID, _SOURCE, Qwen3VLVisionPreprocessor
 
 
@@ -261,15 +264,6 @@ class InferenceMixin(InferenceModuleMixin):
     device: torch.device
     dtype: torch.dtype
 
-    def _encode(
-        self,
-        pixel_values: torch.Tensor,
-        image_grid_thw: torch.Tensor,
-        vit_metadata: Optional[Dict[str, Any]] = None,
-    ) -> tuple[torch.Tensor, List[torch.Tensor]]:
-        """IDE stub — implemented on :class:`Qwen3VLVisionEncoder` in ``modeling.py``."""
-        ...
-
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
@@ -302,4 +296,25 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin):
     preprocessor_class = Qwen3VLVisionPreprocessor
 
 
-__all__ = ["VeOmniMixin"]
+class Qwen3VLVisionEncoderAccelerated(VeOmniMixin, Qwen3VLVisionEncoder):
+    """Training/runtime Qwen3-VL vision — FSDP dummy forward patch."""
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        vit_metadata: Optional[Dict[str, Any]] = None,
+        is_dummy: bool = False,
+    ) -> Dict[str, Any]:
+        if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
+            image_embeds, deepstack_features = self._dummy_outputs(pixel_values, image_grid_thw)
+        else:
+            image_embeds, deepstack_features = self._encode(pixel_values, image_grid_thw, vit_metadata)
+        return {
+            "image_embeds": image_embeds,
+            "deepstack_features": deepstack_features,
+            "image_grid_thw": image_grid_thw,
+        }
+
+
+__all__ = ["Qwen3VLVisionEncoderAccelerated"]

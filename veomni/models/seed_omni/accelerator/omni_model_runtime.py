@@ -26,7 +26,7 @@ from ....distributed.parallel_state import is_parallel_state_registered, use_par
 from ....utils.logging import get_logger
 from ..graphs.base import NodeDef
 from ..mixins.metric_meter_mixin import MetricMeterResult
-from ..modeling_omni import _LOSS_KEY, OmniModel
+from ..modeling_omni import OmniModel
 from ..utils.graph_profiler import GraphProfiler
 from .executor import execute_generation_node, execute_train_node
 from .utils import iter_named_omni_modules, save_module_subdirectory
@@ -40,6 +40,9 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits.
+_LOSS_KEY = "_loss"
 
 
 class OmniModelRuntime:

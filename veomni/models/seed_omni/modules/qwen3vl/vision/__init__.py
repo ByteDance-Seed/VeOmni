@@ -1,6 +1,6 @@
 """Qwen3-VL vision tower OmniModule."""
 
-from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
+from ... import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
 
 
 @OMNI_CONFIG_REGISTRY.register("qwen3vl_vision")
@@ -15,6 +15,13 @@ def register_qwen3vl_vision_model():
     from .modeling import Qwen3VLVisionEncoder
 
     return Qwen3VLVisionEncoder
+
+
+@OMNI_ACCELERATED_MODEL_REGISTRY.register("qwen3vl_vision")
+def register_qwen3vl_vision_accelerated_model():
+    from .accelerated import Qwen3VLVisionEncoderAccelerated
+
+    return Qwen3VLVisionEncoderAccelerated
 
 
 @OMNI_PROCESSOR_REGISTRY.register("qwen3vl_vision")

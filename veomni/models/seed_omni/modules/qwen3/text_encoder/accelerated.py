@@ -1,3 +1,5 @@
+"""VeOmni-accelerated Qwen3TextEncoder — training / inference graph hooks."""
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -5,18 +7,19 @@ import torch
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.training_module_mixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     InferenceMixin as BaseInferenceMixin,
 )
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     TrainingMixin as BaseTrainingMixin,
 )
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     VeOmniMixin as BaseVeOmniMixin,
 )
 from ...qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
 from .chat_template import Qwen3ChatTemplate
 from .configuration import Qwen3TextEncoderConfig
+from .modeling import Qwen3TextEncoder
 from .processing import Qwen3TextEncoderPreprocessor
 
 
@@ -32,10 +35,6 @@ class TrainingMixin(BaseTrainingMixin):
     _trainable_row_mask: Optional[torch.Tensor]
 
     @property
-    def _enable_image(self) -> bool:
-        """IDE stub — see :class:`VeOmniMixin` below (``config.enable_image``)."""
-        ...
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._trainable_row_mask: Optional[torch.Tensor] = None
@@ -89,14 +88,6 @@ class InferenceMixin(BaseInferenceMixin):
     _chat_template: Qwen3ChatTemplate | Qwen3VLChatTemplate
     _prompt_encoded: bool
     _text_token_cache: list[int]
-
-    def encode(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """IDE stub — implemented on :class:`Qwen3TextEncoder` in ``modeling.py``."""
-        ...
 
     def generate(
         self,
@@ -178,4 +169,8 @@ class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
             self._chat_template = Qwen3ChatTemplate(tokenizer)
 
 
-__all__ = ["VeOmniMixin"]
+class Qwen3TextEncoderAccelerated(VeOmniMixin, Qwen3TextEncoder):
+    pass
+
+
+__all__ = ["Qwen3TextEncoderAccelerated"]

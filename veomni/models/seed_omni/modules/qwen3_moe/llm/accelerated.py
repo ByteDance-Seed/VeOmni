@@ -2,7 +2,7 @@
 
 The packing / scatter / generate logic is **identical** to the dense Qwen3
 backbone, so :class:`VeOmniMixin` subclasses
-:class:`~veomni.models.seed_omni.modules.qwen3.llm.modulemixin.Qwen3LlmVeOmniMixin`
+:class:`~veomni.models.seed_omni.modules.qwen3.llm.accelerated.Qwen3LlmVeOmniMixin`
 and only adds the Expert-Parallel (``ep``) plan for the fused experts.  The
 metric meter mixin overrides the FLOPs estimate with the MoE (sparse-MLP) cost.
 """
@@ -13,8 +13,9 @@ from torch.distributed._tensor import Shard
 
 from ......distributed.parallel_plan import ParallelPlan
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ...qwen3.llm.modulemixin import VeOmniMixin as Qwen3LlmVeOmniMixin
+from ...qwen3.llm.accelerated import VeOmniMixin as Qwen3LlmVeOmniMixin
 from .configuration import Qwen3MoeLlmConfig
+from .modeling import Qwen3MoeLlm
 
 
 class MeterMixin(MetricMeterMixin):
@@ -64,4 +65,8 @@ class VeOmniMixin(MeterMixin, Qwen3LlmVeOmniMixin):
         return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 
 
-__all__ = ["VeOmniMixin"]
+class Qwen3MoeLlmAccelerated(VeOmniMixin, Qwen3MoeLlm):
+    pass
+
+
+__all__ = ["Qwen3MoeLlmAccelerated"]

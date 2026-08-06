@@ -2,10 +2,9 @@
 
 from ...base.text_encoder.modeling import TextEncoder
 from .configuration import BagelTextEncoderConfig
-from .modulemixin import VeOmniMixin
 
 
-class BagelTextEncoder(VeOmniMixin, TextEncoder):
+class BagelTextEncoder(TextEncoder):
     config_class = BagelTextEncoderConfig
 
 

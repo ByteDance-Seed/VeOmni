@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from veomni.arguments import OmniArguments, OmniDataArguments
-from veomni.models.seed_omni import OMNI_MODEL_REGISTRY
+from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_MODEL_REGISTRY
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.omni_arguments import OmniModelRuntimeArguments, build_module_runtime_args, build_omni_model_runtime
@@ -18,6 +18,12 @@ def config_cls(model_type: str):
 
 
 def model_cls(model_type: str):
+    """Return the VeOmni-accelerated module class (training / graph hooks)."""
+    return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
+
+
+def native_model_cls(model_type: str):
+    """Return the HF-native module class (eager inference weights)."""
     return OMNI_MODEL_REGISTRY[model_type]()
 
 

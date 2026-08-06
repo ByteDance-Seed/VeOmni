@@ -13,13 +13,12 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
 
+from ....omni_pretrained_model import OmniPreTrainedModel
 from .configuration import BagelFlowConnectorConfig
-from .modulemixin import VeOmniMixin
 
 
-class BagelFlowConnector(VeOmniMixin, PreTrainedModel):
+class BagelFlowConnector(OmniPreTrainedModel):
     config_class = BagelFlowConnectorConfig
     base_model_prefix = "bagel_flow_connector"
     main_input_name = "hidden_states"

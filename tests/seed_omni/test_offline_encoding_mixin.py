@@ -7,13 +7,13 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from veomni.models.seed_omni import OfflineEncodingConfigMixin, OfflineEncodingMixin
+from veomni.models.seed_omni import OfflineEncodingMixin
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
-class DummyOfflineConfig(OfflineEncodingConfigMixin, PretrainedConfig):
+class DummyOfflineConfig(PretrainedConfig):
     model_type = "dummy_offline_config"
 
     def __init__(self, marker: str = "default", **kwargs: object) -> None:
@@ -23,7 +23,8 @@ class DummyOfflineConfig(OfflineEncodingConfigMixin, PretrainedConfig):
 
 class DummyOfflineModule(OfflineEncodingMixin, TrainingModuleMixin, BaseMixin):
     def __init__(self, support_cache: bool = False, train_type: str = "train") -> None:
-        self.config = DummyOfflineConfig(support_cache=support_cache, train_type=train_type)
+        self.config = DummyOfflineConfig()
+        OfflineEncodingMixin.patch_config(self.config, support_cache=support_cache, train_type=train_type)
         self.calls: list[str] = []
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         super().__init__()
@@ -84,20 +85,15 @@ def test_cache_mode_is_derived_from_support_cache_and_train_type(
     assert DummyOfflineModule(support_cache=support_cache, train_type=train_type).cache_mode == expected
 
 
-def test_offline_encoding_config_mixin_consumes_hf_runtime_overrides(tmp_path) -> None:
+def test_patch_config_applies_runtime_overrides_without_config_mixin(tmp_path) -> None:
     DummyOfflineConfig().save_pretrained(tmp_path)
 
-    config, unused = DummyOfflineConfig.from_pretrained(
-        tmp_path,
-        support_cache=True,
-        train_type="train_with_cache",
-        return_unused_kwargs=True,
-    )
+    config = DummyOfflineConfig.from_pretrained(tmp_path)
+    OfflineEncodingMixin.patch_config(config, support_cache=True, train_type="train_with_cache")
 
     assert config.support_cache is True
     assert config.train_type == "train_with_cache"
-    assert "support_cache" not in unused
-    assert "train_type" not in unused
+    assert OfflineEncodingMixin.validated_cache_mode(config) == "process_only"
 
 
 def test_pre_forward_rejects_process_only_for_offline_encode() -> None:
@@ -132,8 +128,60 @@ def test_default_full_hf_checkpoint_hook_requires_module_implementation() -> Non
         module.save_full_hf_checkpoint("/tmp/out", source_path="/tmp/source", trainer=object(), state=object())
 
 
+def test_offline_encoding_mixin_requires_tensor_endpoints() -> None:
+    source = inspect.getsource(OfflineEncodingMixin)
+    assert "@abstractmethod" in source
+    assert "def offline_encode" in source
+    assert "def online_process" in source
+
+
 def test_offline_encoding_mixin_is_not_module_mixin_subclass() -> None:
     assert not issubclass(OfflineEncodingMixin, BaseMixin)
+
+
+def test_bagel_vae_accelerated_patches_config_in_init() -> None:
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated import BagelVAEAccelerated, BagelVAEOfflineMixin
+    from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
+    from veomni.models.seed_omni.modules.bagel.vae.modeling import BagelVAE
+
+    assert issubclass(BagelVAEAccelerated, BagelVAEOfflineMixin)
+    assert not issubclass(BagelVAE, BagelVAEOfflineMixin)
+    model = BagelVAEAccelerated(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        ),
+        support_cache=True,
+        train_type="offline_cache",
+    )
+    assert model.cache_mode == "encode_only"
+    assert hasattr(model, "encoder")
+    assert not hasattr(model, "decoder")
+
+
+def test_bagel_vae_offline_mixin_wins_mro_over_abstract_stubs() -> None:
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated import BagelVAEAccelerated, BagelVAEOfflineMixin
+    from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
+
+    model = BagelVAEAccelerated(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        ),
+        support_cache=True,
+        train_type="offline_cache",
+    )
+    offline_mro_index = BagelVAEAccelerated.__mro__.index(BagelVAEOfflineMixin)
+    offline_encoding_mro_index = BagelVAEAccelerated.__mro__.index(OfflineEncodingMixin)
+    assert offline_mro_index < offline_encoding_mro_index
+    encoded_cache = model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"]
+    assert torch.is_tensor(encoded_cache)
 
 
 def test_offline_encoding_mixin_does_not_implement_decorated_hooks() -> None:

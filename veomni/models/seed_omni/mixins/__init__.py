@@ -17,7 +17,7 @@
 from .base_mixin import BaseMixin
 from .inference_module_mixin import InferenceModuleMixin, post_generate, pre_generate
 from .metric_meter_mixin import MetricMeterMixin, MetricMeterResult
-from .offline_encoding_mixin import OfflineEncodingConfigMixin, OfflineEncodingMixin
+from .offline_encoding_mixin import OfflineEncodingMixin
 from .training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 
 
@@ -31,6 +31,5 @@ __all__ = [
     "post_generate",
     "MetricMeterMixin",
     "MetricMeterResult",
-    "OfflineEncodingConfigMixin",
     "OfflineEncodingMixin",
 ]

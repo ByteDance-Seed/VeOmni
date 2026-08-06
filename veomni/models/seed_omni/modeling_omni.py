@@ -42,9 +42,6 @@ from .modules import OMNI_MODEL_REGISTRY, read_model_type
 
 logger = helper.create_logger(__name__)
 
-# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits.
-_LOSS_KEY = "_loss"
-
 # HF hub kwargs forwarded to :meth:`OmniConfig.from_pretrained`.
 _CONFIG_LOAD_KWARG_NAMES = frozenset(
     {
@@ -498,4 +495,4 @@ def merge_generation_kwargs(
     return merged
 
 
-__all__ = ["OmniModel", "_LOSS_KEY", "merge_generation_kwargs"]
+__all__ = ["OmniModel", "merge_generation_kwargs"]

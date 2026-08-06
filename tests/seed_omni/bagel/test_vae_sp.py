@@ -15,7 +15,7 @@ from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
 from veomni.models.seed_omni.accelerator.dispatch import call_graph_endpoint
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_VAE_CONTEXT
-from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
+from veomni.models.seed_omni.modules.bagel.vae.accelerated import BAGEL_VAE_PIXEL_SHAPE
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.utils.device import get_device_type, get_torch_device
 

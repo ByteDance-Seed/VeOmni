@@ -10,6 +10,7 @@ import torch
 
 from veomni.arguments import OmniArguments, OmniDataArguments
 from veomni.models.seed_omni import (
+    OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
     BaseMixin,
@@ -28,16 +29,23 @@ def _model_cls(model_type: str):
     return OMNI_MODEL_REGISTRY[model_type]()
 
 
+def _patch_parallel_state(monkeypatch, **attrs):
+    import veomni.distributed.parallel_state as ps_utils
+
+    monkeypatch.setattr(ps_utils, "get_parallel_state", lambda: SimpleNamespace(**attrs))
+    return ps_utils
+
+
 def _patch_local_loss_reducer(monkeypatch):
     """Keep module-only tests out of the distributed loss collective."""
-    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+    import veomni.distributed.sequence_parallel as sp_utils
 
     def _local_reduce(loss, num_valid_tokens, group=None):
         del group
         return torch.where(num_valid_tokens > 0, loss, torch.zeros_like(loss))
 
-    monkeypatch.setattr(vqvae_modeling, "reduce_sequence_parallel_loss", _local_reduce)
-    return vqvae_modeling
+    monkeypatch.setattr(sp_utils, "reduce_sequence_parallel_loss", _local_reduce)
+    return sp_utils
 
 
 def _omni_base_args(*, model_path: str = ""):
@@ -192,10 +200,21 @@ def test_processor_registry_only_for_modules_with_processor_assets():
     }
 
 
+def _accelerated_model_cls(model_type: str):
+    return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
+
+
 def test_all_registered_classes_are_module_mixins():
+    from veomni.models.seed_omni.omni_pretrained_model import OmniPreTrainedModel
+
+    accelerated_keys = set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys())
     for name in OMNI_MODEL_REGISTRY.valid_keys():
-        cls = OMNI_MODEL_REGISTRY[name]()
-        assert issubclass(cls, BaseMixin), f"{name} must inherit BaseMixin"
+        native_cls = OMNI_MODEL_REGISTRY[name]()
+        assert name in accelerated_keys, f"{name} must register OMNI_ACCELERATED_MODEL_REGISTRY"
+        assert issubclass(native_cls, OmniPreTrainedModel), f"{name} native must inherit OmniPreTrainedModel"
+        assert not issubclass(native_cls, BaseMixin), f"{name} native must not inherit BaseMixin"
+        accelerated_cls = OMNI_ACCELERATED_MODEL_REGISTRY[name]()
+        assert issubclass(accelerated_cls, BaseMixin), f"{name} accelerated must inherit BaseMixin"
 
 
 # ── save / reload via OMNI registry ───────────────────────────────────────────
@@ -260,7 +279,7 @@ def test_janus_text_encoder_save_reload_via_registry(tmp_path: Path):
 
 
 def test_janus_text_encoder_emit_image_start_replaces_output_tail():
-    JanusTextEncoder = _model_cls("janus_text_encoder")
+    JanusTextEncoder = _accelerated_model_cls("janus_text_encoder")
     JanusTextEncoderConfig = _config_cls("janus_text_encoder")
 
     cfg = JanusTextEncoderConfig(vocab_size=128, hidden_size=16, tie_word_embeddings=True)
@@ -278,7 +297,7 @@ def test_janus_text_encoder_emit_image_start_replaces_output_tail():
 
 def test_text_encoder_decode_returns_single_loss_key():
     """V2 single-loss protocol: ``post_forward`` maps ``loss`` → ``_loss``."""
-    TextEncoder = _model_cls("text_encoder")
+    TextEncoder = _accelerated_model_cls("text_encoder")
     TextEncoderConfig = _config_cls("text_encoder")
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
     h = torch.randn(2, 4, 16)
@@ -320,14 +339,10 @@ def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph(monkeypatch):
     """FSDP2 regression: under FSDP the dummy decode path must route through
     ``generation_head`` so its grad/reduce_scatter fires on every rank (ranks
     with no assistant image would otherwise skip it and dead-lock NCCL)."""
-    vqvae_modeling = _patch_local_loss_reducer(monkeypatch)
-    monkeypatch.setattr(
-        vqvae_modeling,
-        "get_parallel_state",
-        lambda: SimpleNamespace(fsdp_enabled=True, fsdp_group=None),
-    )
+    _patch_local_loss_reducer(monkeypatch)
+    _patch_parallel_state(monkeypatch, fsdp_enabled=True, fsdp_group=None)
 
-    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvae = _accelerated_model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
     jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
 
@@ -353,11 +368,9 @@ def test_janus_vqvae_dummy_encode_emits_real_shaped_zeros_without_fsdp(monkeypat
     """Off-FSDP the dummy encode skips the codec forward but must still emit
     zeros shaped exactly like a real encode (same batch + token count, no
     ``None``), so the pre/post hooks never special-case the dummy."""
-    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+    _patch_parallel_state(monkeypatch, fsdp_enabled=False)
 
-    monkeypatch.setattr(vqvae_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
-
-    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvae = _accelerated_model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
     jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
 
@@ -375,11 +388,9 @@ def test_janus_vqvae_dummy_encode_emits_real_shaped_zeros_without_fsdp(monkeypat
 def test_janus_vqvae_dummy_encode_skips_codec_in_eval_even_under_fsdp(monkeypatch):
     """Inference (eval) needs no gradient anchor, so the dummy encode fabricates
     zeros even with FSDP enabled — the real codec must not run."""
-    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+    _patch_parallel_state(monkeypatch, fsdp_enabled=True)
 
-    monkeypatch.setattr(vqvae_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
-
-    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvae = _accelerated_model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
     jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg())).eval()
 
@@ -394,14 +405,10 @@ def test_janus_vqvae_dummy_encode_skips_codec_in_eval_even_under_fsdp(monkeypatc
 def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph_without_fsdp(monkeypatch):
     """The non-distributed dummy path follows the same decode contract: ignored
     labels contribute 0.0 while ``generation_head`` remains in the graph."""
-    vqvae_modeling = _patch_local_loss_reducer(monkeypatch)
-    monkeypatch.setattr(
-        vqvae_modeling,
-        "get_parallel_state",
-        lambda: SimpleNamespace(fsdp_enabled=False, fsdp_group=None),
-    )
+    _patch_local_loss_reducer(monkeypatch)
+    _patch_parallel_state(monkeypatch, fsdp_enabled=False, fsdp_group=None)
 
-    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvae = _accelerated_model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
     jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
     jv.freeze_model()
@@ -429,13 +436,13 @@ def test_janus_siglip_forward_returns_image_embeds():
 def test_janus_siglip_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
     """Off-FSDP the dummy forward skips the ViT but must still emit zeros shaped
     exactly like a real encode (no ``None``), so forward_post never branches."""
-    import veomni.models.seed_omni.modules.janus.siglip.modeling as siglip_modeling
+    import veomni.models.seed_omni.modules.janus.siglip.accelerated as siglip_accelerated
 
-    monkeypatch.setattr(siglip_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
+    monkeypatch.setattr(siglip_accelerated, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
 
-    JanusSiglip = _model_cls("janus_siglip")
+    JanusSiglipAccelerated = _accelerated_model_cls("janus_siglip")
     JanusSiglipConfig = _config_cls("janus_siglip")
-    js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg()))
+    js = JanusSiglipAccelerated(JanusSiglipConfig(vision_config=_tiny_vision_cfg()))
     pixels = torch.zeros(3, 3, 64, 64)
     real = js._encode_pixel_values(pixels)
     out = js.forward(pixel_values=pixels, is_dummy=True)
@@ -448,13 +455,13 @@ def test_janus_siglip_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeyp
 def test_janus_siglip_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
     """Inference (eval) needs no gradient anchor, so the dummy forward fabricates
     zeros even with FSDP enabled — the real ViT must not run."""
-    import veomni.models.seed_omni.modules.janus.siglip.modeling as siglip_modeling
+    import veomni.models.seed_omni.modules.janus.siglip.accelerated as siglip_accelerated
 
-    monkeypatch.setattr(siglip_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
+    monkeypatch.setattr(siglip_accelerated, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
 
-    JanusSiglip = _model_cls("janus_siglip")
+    JanusSiglipAccelerated = _accelerated_model_cls("janus_siglip")
     JanusSiglipConfig = _config_cls("janus_siglip")
-    js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg())).eval()
+    js = JanusSiglipAccelerated(JanusSiglipConfig(vision_config=_tiny_vision_cfg())).eval()
 
     def _boom(*_a, **_k):
         raise AssertionError("ViT must not run for a dummy in eval mode")
@@ -471,6 +478,25 @@ def test_janus_llama_forward_returns_hidden_states():
     embeds = torch.randn(1, 4, 64)
     out = jl(inputs_embeds=embeds)
     assert out["hidden_states"].shape == (1, 4, 64)
+
+
+def test_accelerated_forward_delegates_to_native_modeling():
+    JanusLlamaAccelerated = _accelerated_model_cls("janus_llama")
+    JanusLlamaConfig = _config_cls("janus_llama")
+    model = JanusLlamaAccelerated(JanusLlamaConfig(text_config=_tiny_text_cfg()))
+    embeds = torch.randn(1, 4, 64)
+    out = model.forward(inputs_embeds=embeds)
+    assert out["hidden_states"].shape == (1, 4, 64)
+
+
+def test_training_module_mixin_forward_requires_override_without_native_impl():
+    from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleMixin
+
+    class CodecOnlyAccelerated(TrainingModuleMixin, BaseMixin):
+        pass
+
+    with pytest.raises(NotImplementedError, match="forward\\(\\*\\*kwargs\\) is not implemented"):
+        CodecOnlyAccelerated().forward()
 
 
 def test_qwen3_llm_save_reload_via_registry(tmp_path: Path):

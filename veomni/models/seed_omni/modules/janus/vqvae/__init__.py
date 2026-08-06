@@ -7,7 +7,7 @@ Sub-package layout (per :mod:`veomni.models.seed_omni.modules`):
 * :mod:`.processing`    — :class:`JanusVqvaeProcessor`
 """
 
-from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
+from ... import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
 
 
 @OMNI_CONFIG_REGISTRY.register("janus_vqvae")
@@ -22,6 +22,13 @@ def register_janus_vqvae_model():
     from .modeling import JanusVqvae
 
     return JanusVqvae
+
+
+@OMNI_ACCELERATED_MODEL_REGISTRY.register("janus_vqvae")
+def register_janus_vqvae_accelerated_model():
+    from .accelerated import JanusVqvaeAccelerated
+
+    return JanusVqvaeAccelerated
 
 
 @OMNI_PROCESSOR_REGISTRY.register("janus_vqvae")

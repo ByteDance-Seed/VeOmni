@@ -1,28 +1,18 @@
-"""Janus SigLIP vision tower + MLP aligner.
+"""Janus SigLIP vision tower + aligner — HF-native :class:`OmniPreTrainedModel`."""
 
-``JanusSiglip(JanusSiglipModuleMixin, PreTrainedModel)`` — HF vision stack in
-this file; graph hooks in ``modulemixin.py``.
-"""
-
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
-from transformers import PreTrainedModel
 from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, JanusVisionModel
 
-from ......distributed.parallel_state import get_parallel_state
+from ....omni_pretrained_model import OmniPreTrainedModel
+from ....utils.conversation import ConversationItem
 from .configuration import JanusSiglipConfig
-from .modulemixin import VeOmniMixin
 from .processing import JanusSiglipProcessor
 
 
-class JanusSiglip(VeOmniMixin, PreTrainedModel):
-    """SigLIP vision tower + MLP aligner for image understanding.
-
-    Composes HF :class:`JanusVisionModel` + :class:`JanusVisionAlignerMLP`
-    (weights split from ``JanusForConditionalGeneration`` by
-    ``scripts/convert_model.py``).
-    """
+class JanusSiglip(OmniPreTrainedModel):
+    """SigLIP vision tower + MLP aligner for image understanding."""
 
     config_class = JanusSiglipConfig
     image_processor_class = JanusSiglipProcessor
@@ -44,28 +34,41 @@ class JanusSiglip(VeOmniMixin, PreTrainedModel):
         vision_out = self.vision_model(pixel_values, return_dict=True)
         return self.aligner(vision_out.last_hidden_state)
 
-    def _dummy_image_embeds(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Zero stand-in shaped exactly like :meth:`_encode_pixel_values`' output
-        (same batch + patch count) for the non-FSDP dummy, whose ViT forward is
-        skipped (no gradient anchor needed without FSDP). Emitting real-shaped
-        zeros instead of ``None`` keeps the pre/post hooks branch-free."""
-        cfg = self.config.vision_config
-        b, _, h, w = pixel_values.shape
-        num_patches = (h // cfg.patch_size) * (w // cfg.patch_size)
-        return pixel_values.new_zeros(b, num_patches, cfg.projection_dim)
-
     def forward(
         self,
         pixel_values: Optional[torch.Tensor],
-        is_dummy: bool = False,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        # ``is_dummy`` is True only when the whole batch is dummy (a worker-built
-        # placeholder that exists solely as the training FSDP gradient anchor). We
-        # still run the ViT under training + FSDP to keep that anchor alive; only
-        # an all-dummy batch with no anchor to maintain (inference / no FSDP)
-        # short-circuits to real-shaped zeros, keeping the pre/post hooks branch-free.
-        if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
-            image_embeds = self._dummy_image_embeds(pixel_values)
+        del kwargs
+        return {"image_embeds": self._encode_pixel_values(pixel_values)}
+
+    def generate(
+        self,
+        conversation_list: Optional[List[ConversationItem]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        pending = [part for part in conversation_list if part.type == "image_output"]
+        if pending:
+            pixel_values = self._pixels_from_raw_images([part.value for part in pending])
         else:
-            image_embeds = self._encode_pixel_values(pixel_values)
-        return {"image_embeds": image_embeds}
+            pending = [part for part in conversation_list if part.type == "image" and part.role == "user"]
+            if not pending:
+                return {"conversation_list": conversation_list}
+            pixel_values = torch.stack([part.value for part in pending], dim=0).to(self.device, self.dtype)
+
+        embeds = self._encode_pixel_values(pixel_values)
+        for part, emb in zip(pending, embeds, strict=True):
+            part.value = emb if emb.dim() == 2 else emb.squeeze(0)
+            if part.type == "image_output":
+                part.type = "image"
+                assert part.role == "assistant"
+
+        return {"conversation_list": conversation_list}
+
+    def _pixels_from_raw_images(self, raw_images: list[Any]) -> Optional[torch.Tensor]:
+        if not raw_images:
+            return None
+        return self._image_processor(images=raw_images, return_tensors="pt")["pixel_values"].to(
+            device=self.device, dtype=self.dtype
+        )

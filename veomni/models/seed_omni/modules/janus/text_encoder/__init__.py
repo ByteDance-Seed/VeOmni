@@ -6,7 +6,7 @@ Sub-package layout (per :mod:`veomni.models.seed_omni.modules`):
 * :mod:`.modeling`      — :class:`JanusTextEncoder`
 """
 
-from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
+from ... import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 
 
 @OMNI_CONFIG_REGISTRY.register("janus_text_encoder")
@@ -21,3 +21,10 @@ def register_janus_text_encoder_model():
     from .modeling import JanusTextEncoder
 
     return JanusTextEncoder
+
+
+@OMNI_ACCELERATED_MODEL_REGISTRY.register("janus_text_encoder")
+def register_janus_text_encoder_accelerated_model():
+    from .accelerated import JanusTextEncoderAccelerated
+
+    return JanusTextEncoderAccelerated

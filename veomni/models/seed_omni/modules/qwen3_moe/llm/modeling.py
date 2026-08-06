@@ -4,7 +4,6 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
 
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
@@ -27,11 +26,11 @@ from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_g
     veomni_swiglu_mlp,
 )
 
+from ....omni_pretrained_model import OmniPreTrainedModel
 from .configuration import Qwen3MoeLlmConfig
-from .modulemixin import VeOmniMixin
 
 
-class Qwen3MoeLlm(VeOmniMixin, PreTrainedModel):
+class Qwen3MoeLlm(OmniPreTrainedModel):
     """Qwen3-MoE backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling text encoder and live

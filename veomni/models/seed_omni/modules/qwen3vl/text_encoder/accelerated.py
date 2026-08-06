@@ -1,3 +1,5 @@
+"""VeOmni-accelerated Qwen3VLTextEncoder — training / inference graph hooks."""
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -5,17 +7,18 @@ import torch
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.training_module_mixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     InferenceMixin as BaseInferenceMixin,
 )
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     TrainingMixin as BaseTrainingMixin,
 )
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     VeOmniMixin as BaseVeOmniMixin,
 )
 from .chat_template import Qwen3VLChatTemplate
 from .configuration import Qwen3VLTextEncoderConfig
+from .modeling import Qwen3VLTextEncoder
 from .processing import Qwen3VLTextEncoderPreprocessor
 
 
@@ -58,14 +61,6 @@ class InferenceMixin(BaseInferenceMixin):
     _chat_template: Qwen3VLChatTemplate
     _prompt_encoded: bool
     _text_token_cache: list[int]
-
-    def encode(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """IDE stub — implemented on :class:`Qwen3VLTextEncoder` in ``modeling.py``."""
-        ...
 
     def generate(
         self,
@@ -130,4 +125,8 @@ class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
         self._chat_template = Qwen3VLChatTemplate(tokenizer)
 
 
-__all__ = ["VeOmniMixin"]
+class Qwen3VLTextEncoderAccelerated(VeOmniMixin, Qwen3VLTextEncoder):
+    pass
+
+
+__all__ = ["Qwen3VLTextEncoderAccelerated"]

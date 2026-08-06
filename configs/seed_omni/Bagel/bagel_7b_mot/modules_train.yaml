@@ -1,5 +1,8 @@
 bagel_vae:
   model_path: bagel_vae
+  accelerator:
+    gradient_checkpointing:
+      enable: false
 bagel_siglip_navit:
   model_path: bagel_siglip_navit
 bagel_text_encoder:

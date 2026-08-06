@@ -4,12 +4,11 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
 
 from veomni.utils.device import IS_NPU_AVAILABLE
 
+from ....omni_pretrained_model import OmniPreTrainedModel
 from .configuration import Qwen3VLLlmConfig
-from .modulemixin import VeOmniMixin
 
 
 if IS_NPU_AVAILABLE:
@@ -18,7 +17,7 @@ else:
     from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import Qwen3VLTextModel
 
 
-class Qwen3VLLlm(VeOmniMixin, PreTrainedModel):
+class Qwen3VLLlm(OmniPreTrainedModel):
     """Qwen3-VL text backbone (no wte, no lm_head).
 
     Token / image embeds are produced by the sibling ``qwen3vl_text_encoder`` /

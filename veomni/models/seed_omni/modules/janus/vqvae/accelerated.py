@@ -1,3 +1,5 @@
+"""VeOmni-accelerated JanusVqvae — training / inference graph hooks."""
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -19,6 +21,7 @@ from ....utils.conversation import (
     seal_outputs,
 )
 from .configuration import JanusVqvaeConfig
+from .modeling import JanusVqvae
 from .processing import JanusVqvaePreprocessor, JanusVqvaeProcessor
 
 
@@ -344,4 +347,29 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
     preprocessor_class = JanusVqvaePreprocessor
 
 
-__all__ = ["VeOmniMixin"]
+class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae):
+    """Training/runtime VQVAE — FSDP dummy encode + SP-aware VQ loss."""
+
+    def encode(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        is_dummy: bool = False,
+    ) -> Dict[str, Any]:
+        if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
+            return self._dummy_encode_outputs(pixel_values)
+        return self._encode_pixels(pixel_values)
+
+    def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
+        from veomni.distributed.sequence_parallel import reduce_sequence_parallel_loss
+
+        labels = gt_token_ids.to(hidden_states.device)
+        logits = self.generation_head(hidden_states)
+        flat_labels = labels.reshape(-1)
+        ce_sum = F.cross_entropy(logits.reshape(-1, logits.size(-1)), flat_labels, ignore_index=-100, reduction="sum")
+        ps = get_parallel_state()
+        n_valid_local = (flat_labels != -100).sum()
+        local_mean = ce_sum / n_valid_local.clamp(min=1)
+        return reduce_sequence_parallel_loss(local_mean, n_valid_local.to(local_mean.dtype), group=ps.fsdp_group)
+
+
+__all__ = ["JanusVqvaeAccelerated"]

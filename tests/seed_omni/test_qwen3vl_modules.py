@@ -5,8 +5,14 @@ from types import SimpleNamespace
 
 import torch
 
-from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
-from veomni.models.seed_omni.modules.qwen3vl.llm.modulemixin import TrainingMixin
+from veomni.models.seed_omni.modules import (
+    OMNI_ACCELERATED_MODEL_REGISTRY,
+    OMNI_CONFIG_REGISTRY,
+    OMNI_MODEL_REGISTRY,
+    OMNI_PROCESSOR_REGISTRY,
+)
+from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import qwen3vl_vision_position_ids
+from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import build_qwen3vl_vit_metadata
 
 
 def test_registry_resolves_qwen3vl_modules():
@@ -28,11 +34,13 @@ def test_vision_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
     """Off-FSDP the dummy vision forward skips the ViT but must still emit zeros
     shaped exactly like a real encode (image_embeds + one feature per deepstack
     layer, no ``None``), so forward_post never branches on the dummy."""
-    import veomni.models.seed_omni.modules.qwen3vl.vision.modeling as vision_modeling
+    import veomni.models.seed_omni.modules.qwen3vl.vision.accelerated as vision_accelerated
 
-    monkeypatch.setattr(vision_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
+    monkeypatch.setattr(
+        vision_accelerated, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False, sp_enabled=False)
+    )
 
-    Enc = OMNI_MODEL_REGISTRY["qwen3vl_vision"]()
+    Enc = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3vl_vision"]()
     Cfg = OMNI_CONFIG_REGISTRY["qwen3vl_vision"]()
     vc = dict(
         hidden_size=64,
@@ -51,7 +59,7 @@ def test_vision_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
     g = [1, 4, 4]  # two dummy placeholders
     pixel_values = torch.zeros(2 * 1 * 4 * 4, 3 * 2 * 16 * 16)
     grid_thw = torch.tensor([g, g], dtype=torch.long)
-    vit_metadata = enc._build_vit_metadata([g, g])
+    vit_metadata = build_qwen3vl_vit_metadata([g, g], spatial_merge_size=2)
 
     real_emb, real_deep = enc._encode(pixel_values, grid_thw, vit_metadata)
     out = enc.forward(
@@ -71,11 +79,13 @@ def test_vision_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
 def test_vision_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
     """Inference (eval) needs no gradient anchor, so the dummy vision forward
     fabricates zeros even with FSDP enabled — the real ViT must not run."""
-    import veomni.models.seed_omni.modules.qwen3vl.vision.modeling as vision_modeling
+    import veomni.models.seed_omni.modules.qwen3vl.vision.accelerated as vision_accelerated
 
-    monkeypatch.setattr(vision_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
+    monkeypatch.setattr(
+        vision_accelerated, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True, sp_enabled=False)
+    )
 
-    Enc = OMNI_MODEL_REGISTRY["qwen3vl_vision"]()
+    Enc = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3vl_vision"]()
     Cfg = OMNI_CONFIG_REGISTRY["qwen3vl_vision"]()
     vc = dict(
         hidden_size=64,
@@ -99,7 +109,7 @@ def test_vision_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
     out = enc.forward(
         pixel_values=torch.zeros(1 * 4 * 4, 3 * 2 * 16 * 16),
         image_grid_thw=torch.tensor([g], dtype=torch.long),
-        vit_metadata=enc._build_vit_metadata([g]),
+        vit_metadata=build_qwen3vl_vit_metadata([g], spatial_merge_size=2),
         is_dummy=True,
     )
     assert out["image_embeds"].abs().sum().item() == 0.0
@@ -108,7 +118,7 @@ def test_vision_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
 
 def test_vision_position_ids_layout():
     # grid (t=1, h=4, w=6), merge=2 -> llm grid (1, 2, 3); start offset 5.
-    pos = TrainingMixin._vision_position_ids(5, torch.tensor([1, 4, 6]), merge=2)
+    pos = qwen3vl_vision_position_ids(5, torch.tensor([1, 4, 6]), merge=2)
     assert pos.shape == (3, 6)
     # temporal: single frame -> all equal to start
     assert pos[0].tolist() == [5, 5, 5, 5, 5, 5]

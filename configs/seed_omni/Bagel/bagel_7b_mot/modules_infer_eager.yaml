@@ -6,6 +6,8 @@
 bagel_vae:
   model_path: bagel_vae
   accelerator:
+    gradient_checkpointing:
+      enable: false
     fsdp_config:
       fsdp_mode: eager
 

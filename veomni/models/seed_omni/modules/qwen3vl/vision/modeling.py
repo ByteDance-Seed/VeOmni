@@ -1,6 +1,6 @@
 """Qwen3-VL vision tower (ViT + patch merger + deepstack mergers).
 
-``Qwen3VLVisionEncoder(Qwen3VLVisionEncoderModuleMixin, PreTrainedModel)`` — HF
+``Qwen3VLVisionEncoder(Qwen3VLVisionEncoderModuleMixin)`` — HF
 vision stack in this file; graph hooks in ``modulemixin.py``.
 
 The ``forward`` returns two payloads consumed by the backbone:
@@ -22,15 +22,13 @@ shape, :class:`_MergerProjectionConverter` drops it at load so it's re-initialis
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from transformers import PreTrainedModel
 
 from veomni.utils import logging
 from veomni.utils.device import IS_NPU_AVAILABLE
 
-from ......distributed.parallel_state import get_parallel_state
 from ......models.checkpoint_tensor_loading import ConvertedCheckpointTensor
+from ....omni_pretrained_model import OmniPreTrainedModel
 from .configuration import Qwen3VLVisionEncoderConfig
-from .modulemixin import VeOmniMixin
 from .processing import Qwen3VLVisionImageProcessor, Qwen3VLVisionVideoProcessor
 
 
@@ -53,7 +51,7 @@ class _MergerProjectionConverter:
     match (standard Qwen3-VL load) nothing is dropped.
     """
 
-    def __init__(self, model: "PreTrainedModel"):
+    def __init__(self, model: "OmniPreTrainedModel"):
         self._model = model
 
     def can_handle(self, name: str) -> bool:
@@ -76,7 +74,7 @@ class _MergerProjectionConverter:
         return []
 
 
-class Qwen3VLVisionEncoder(VeOmniMixin, PreTrainedModel):
+class Qwen3VLVisionEncoder(OmniPreTrainedModel):
     """Qwen3-VL vision tower for image understanding."""
 
     config_class = Qwen3VLVisionEncoderConfig
@@ -105,7 +103,7 @@ class Qwen3VLVisionEncoder(VeOmniMixin, PreTrainedModel):
         self.post_init()
 
     @staticmethod
-    def _create_checkpoint_tensor_converter(model: "PreTrainedModel") -> _MergerProjectionConverter:
+    def _create_checkpoint_tensor_converter(model: "OmniPreTrainedModel") -> _MergerProjectionConverter:
         return _MergerProjectionConverter(model)
 
     def freeze_model(self) -> None:
@@ -150,15 +148,8 @@ class Qwen3VLVisionEncoder(VeOmniMixin, PreTrainedModel):
         vit_metadata: Optional[Dict[str, Any]] = None,
         is_dummy: bool = False,
     ) -> Dict[str, Any]:
-        # ``is_dummy`` is True only when the whole batch is dummy (a worker-built
-        # placeholder that exists solely as the training FSDP gradient anchor). We
-        # still run the ViT under training + FSDP to keep that anchor alive; only an
-        # all-dummy batch with no anchor to maintain (inference / no FSDP)
-        # short-circuits to real-shaped zeros (pre/post stay branch-free).
-        if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
-            image_embeds, deepstack_features = self._dummy_outputs(pixel_values, image_grid_thw)
-        else:
-            image_embeds, deepstack_features = self._encode(pixel_values, image_grid_thw, vit_metadata)
+        del is_dummy
+        image_embeds, deepstack_features = self._encode(pixel_values, image_grid_thw, vit_metadata)
         return {
             "image_embeds": image_embeds,
             "deepstack_features": deepstack_features,

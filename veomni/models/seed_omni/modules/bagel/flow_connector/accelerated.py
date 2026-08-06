@@ -23,6 +23,7 @@ from ..sources import (
 )
 from .configuration import BagelFlowConnectorConfig
 from .generation_state import FlowGenerationState
+from .modeling import BagelFlowConnector
 from .processing import (
     flattened_position_ids,
     preprocess_context_latent_embed,
@@ -111,19 +112,6 @@ class TrainingMixin(TrainingModuleMixin):
     config: BagelFlowConnectorConfig
     device: torch.device
     dtype: torch.dtype
-
-    def embed_latent(
-        self,
-        latents: torch.Tensor,
-        position_ids: torch.LongTensor,
-        timesteps: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """IDE stub — implemented on :class:`BagelFlowConnector` in ``modeling.py``."""
-        ...
-
-    def decode_velocity(self, hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
-        """IDE stub — implemented on :class:`BagelFlowConnector` in ``modeling.py``."""
-        ...
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -391,19 +379,6 @@ class InferenceMixin(InferenceModuleMixin):
     dtype: torch.dtype
     _generation_state: FlowGenerationState
 
-    def embed_latent(
-        self,
-        latents: torch.Tensor,
-        position_ids: torch.LongTensor,
-        timesteps: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """IDE stub — implemented on :class:`BagelFlowConnector` in ``modeling.py``."""
-        ...
-
-    def decode_velocity(self, hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
-        """IDE stub — implemented on :class:`BagelFlowConnector` in ``modeling.py``."""
-        ...
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._generation_state = FlowGenerationState()
@@ -602,7 +577,8 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
     """Carrier hooks for latent embedding and velocity projection."""
 
 
-__all__ = [
-    "SIGNAL_IMAGE_COMPLETE",
-    "VeOmniMixin",
-]
+class BagelFlowConnectorAccelerated(VeOmniMixin, BagelFlowConnector):
+    pass
+
+
+__all__ = ["SIGNAL_IMAGE_COMPLETE", "BagelFlowConnectorAccelerated"]

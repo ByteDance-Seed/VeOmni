@@ -1,3 +1,5 @@
+"""VeOmni-accelerated Qwen3Llm — training / inference graph hooks."""
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -13,13 +15,14 @@ from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy
 from ...base.llm_packing import pack_llm_conversations_for_forward, scatter_llm_hidden_states
-from .configuration import JanusLlamaConfig
+from .configuration import Qwen3LlmConfig
+from .modeling import Qwen3Llm
 
 
 class TrainingMixin(TrainingModuleMixin):
-    """Training-graph hooks — depends on :class:`JanusLlama` modeling APIs."""
+    """Training-graph hooks — depends on :class:`Qwen3Llm` modeling APIs."""
 
-    config: JanusLlamaConfig
+    config: Qwen3LlmConfig
     device: torch.device
     training: bool
 
@@ -49,10 +52,10 @@ class TrainingMixin(TrainingModuleMixin):
 
         # Metering: this rank's OWN per-sample lengths, from the packed
         # ``position_ids``. ``OmniEnvironMeter`` sums tokens+FLOPs over the DP group
-        # only, so each rank must report just its own data — NOT the module_sp peers
-        # a per-module SP forward redistributes (that would over-count by
-        # ~module_sp). This keeps tokens/FLOPs identical to the non-SP run for both
-        # SP-disabled and per-module SP.
+        # only, so each rank reports just its own data — NOT the module_sp peers a
+        # per-module SP forward redistributes (that would over-count by ~module_sp).
+        # This keeps tokens/FLOPs identical to the non-SP run for both SP-disabled
+        # and per-module SP.
         (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
             position_ids
         )
@@ -65,10 +68,11 @@ class TrainingMixin(TrainingModuleMixin):
             # Ulysses shard (+ per-shard ``cu_seqlens``). The dataloader replicates
             # each shard across the SP group, so ``inputs_embeds`` / ``attention_mask``
             # / ``position_ids`` are the SAME on every rank. Pad them to a multiple of
-            # ``sp_size``, rebuild FA varlen ``cu_seqlens`` over the padded sample,
-            # then hand this rank only its ``1/sp_size`` chunk (the full-sample
-            # ``cu_seqlens`` above are for metering / the non-SP path only).
-            # ``forward_post`` all-gathers the shards back.
+            # ``sp_size``, rebuild FA varlen ``cu_seqlens`` over the padded sample (the
+            # attention all-to-all reconstructs the full sequence before the kernel, so
+            # mask/lengths stay full), then hand this rank only its ``1/sp_size`` chunk
+            # (the full-sample ``cu_seqlens`` above are for metering / the non-SP path
+            # only). ``forward_post`` all-gathers the shards back.
             group = get_parallel_state().sp_group
             self._sp_own_len = inputs_embeds.size(1)
             embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
@@ -120,30 +124,15 @@ class TrainingMixin(TrainingModuleMixin):
 
 
 class InferenceMixin(InferenceModuleMixin):
-    config: JanusLlamaConfig
+    config: Qwen3LlmConfig
     device: torch.device
-
-    def forward(
-        self,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Any = None,
-        use_cache: Optional[bool] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """IDE stub — implemented on :class:`JanusLlama` in ``modeling.py``."""
-        ...
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._cfg_active: bool = False
         self._past_key_values: Any = None
-        self._uncond_past_key_values: Any = None
 
     def reset_local_inference_state(self) -> None:
-        self._cfg_active = False
-        self._uncond_past_key_values = None
+        return
 
     def reset_global_inference_state(self) -> None:
         self.reset_local_inference_state()
@@ -154,9 +143,6 @@ class InferenceMixin(InferenceModuleMixin):
         conversation_list: Optional[List[ConversationItem]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        # GenerationGraph invokes this endpoint through ``self.__call__`` so
-        # FSDP/DDP hooks have already fired; its dispatch trampoline restores
-        # the real ``forward`` while this endpoint runs.
         del kwargs
         if self._past_key_values is None:
             inputs_embeds, attention_mask, position_ids, _ = pack_llm_conversations_for_forward(
@@ -166,6 +152,9 @@ class InferenceMixin(InferenceModuleMixin):
                 position_ids
             )
 
+            # GenerationGraph invokes this endpoint through ``self.__call__`` so
+            # FSDP/DDP hooks have already fired; its dispatch trampoline restores
+            # the real ``forward`` while this endpoint runs.
             outputs = self.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -187,54 +176,21 @@ class InferenceMixin(InferenceModuleMixin):
                 )
             )
             return {"conversation_list": conversation_list}
+
         tail_part = conversation_list[-1]
         assert tail_part.type == "output"
-
-        cfg_uncond_inputs_embeds = tail_part.meta.pop("cfg_uncond_inputs_embeds", None)
-        if cfg_uncond_inputs_embeds is not None and not self._cfg_active:
-            uncond = cfg_uncond_inputs_embeds.to(self.device)
-            if uncond.dim() == 2:
-                uncond = uncond.unsqueeze(0)
-            uncond_out = self.forward(
-                inputs_embeds=uncond,
-                attention_mask=None,
-                past_key_values=None,
-                use_cache=True,
-            )
-            self._uncond_past_key_values = uncond_out["past_key_values"]
-            self._cfg_active = True
-        elif tail_part.meta.get("collapse_cfg", False):
-            self._uncond_past_key_values = None
-            self._cfg_active = False
 
         inputs_embeds: torch.Tensor = tail_part.value[-1:].to(self.device)
         inputs_embeds = inputs_embeds.unsqueeze(0)
 
-        if self._cfg_active:
-            cond_out = self.forward(
-                inputs_embeds=inputs_embeds,
-                attention_mask=None,
-                past_key_values=self._past_key_values,
-                use_cache=True,
-            )
-            uncond_out = self.forward(
-                inputs_embeds=inputs_embeds,
-                attention_mask=None,
-                past_key_values=self._uncond_past_key_values,
-                use_cache=True,
-            )
-            self._past_key_values = cond_out["past_key_values"]
-            self._uncond_past_key_values = uncond_out["past_key_values"]
-            hidden_states = torch.cat([cond_out["hidden_states"], uncond_out["hidden_states"]], dim=0)
-        else:
-            outputs = self.forward(
-                inputs_embeds=inputs_embeds,
-                attention_mask=None,
-                past_key_values=self._past_key_values,
-                use_cache=True,
-            )
-            self._past_key_values = outputs["past_key_values"]
-            hidden_states = outputs["hidden_states"]
+        outputs = self.forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=None,
+            past_key_values=self._past_key_values,
+            use_cache=True,
+        )
+        self._past_key_values = outputs["past_key_values"]
+        hidden_states = outputs["hidden_states"]
 
         conversation_list.append(
             ConversationItem(
@@ -247,18 +203,16 @@ class InferenceMixin(InferenceModuleMixin):
 
     @staticmethod
     def _tail_hidden_from_forward(hidden_states: torch.Tensor) -> torch.Tensor:
-        """Return the last-token hidden state as ``[B, 1, H]`` for VQVAE sampling."""
-        if hidden_states.dim() == 3:
-            return hidden_states[:, -1:, :].contiguous()
-        if hidden_states.dim() == 2:
-            return hidden_states.unsqueeze(1).contiguous()
-        raise TypeError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
+        if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+            hidden_states = hidden_states.squeeze(0)
+            return hidden_states[-1:].contiguous()
+        return hidden_states[:, -1:, :].contiguous()
 
 
 class MeterMixin(MetricMeterMixin):
-    """Per-module training meter for the Janus LLaMA backbone (transformer layers only)."""
+    """Per-module training meter for the Qwen3 backbone (transformer layers only)."""
 
-    config: JanusLlamaConfig
+    config: Qwen3LlmConfig
 
     def estimate_flops(self, seqlens: List[int]) -> float:
         # Transformer layers only: this backbone owns no wte / lm_head (those
@@ -302,4 +256,8 @@ def _fold_fsdp_dummy_anchors(
     return inputs_embeds
 
 
-__all__ = ["VeOmniMixin"]
+class Qwen3LlmAccelerated(VeOmniMixin, Qwen3Llm):
+    pass
+
+
+__all__ = ["Qwen3LlmAccelerated"]

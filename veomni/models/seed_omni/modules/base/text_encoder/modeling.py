@@ -1,6 +1,6 @@
 """Generic word-token embedding (``wte``) + LM head as a graph node.
 
-``TextEncoder(TextEncoderModuleMixin, PreTrainedModel)`` — ``encode`` /
+``TextEncoder(TextEncoderModuleMixin)`` — ``encode`` /
 ``decode`` call-sites mirror a VQ codec pre/post stage so the backbone stays
 vocab-agnostic.  Family-specific chat template / sampling live in
 ``modules/<family>/text_encoder/``.
@@ -11,15 +11,13 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
-from ......distributed.parallel_state import get_parallel_state
-from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
+from ....omni_pretrained_model import OmniPreTrainedModel
 from .configuration import TextEncoderConfig
-from .modulemixin import VeOmniMixin
 
 
-class TextEncoder(VeOmniMixin, PreTrainedModel):
+class TextEncoder(OmniPreTrainedModel):
     """Word-token embedding + LM head."""
 
     config_class = TextEncoderConfig
@@ -76,9 +74,7 @@ class TextEncoder(VeOmniMixin, PreTrainedModel):
         }
 
     def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Embedding lookup, vocab-parallel-aware when ``emb`` extra-parallel is on
-        (:class:`EmbParallelMixin` — AllToAllEmbedding + emb_fsdp hidden gather)."""
-        return self.emb_parallel_lookup(self.embed_tokens, input_ids)
+        return self.embed_tokens(input_ids)
 
     def decode(
         self,
@@ -98,21 +94,8 @@ class TextEncoder(VeOmniMixin, PreTrainedModel):
                 ignore_index=-100,
                 reduction="sum",
             )
-            # Token-weighted mean over the FULL data-parallel + SP mesh
-            # (``dp_sp`` == ``fsdp_group``): every valid token is weighted equally
-            # and the objective is IDENTICAL no matter how the global batch is
-            # split into DP vs SP — the invariant that makes per-module SP
-            # accuracy-transparent. ``reduce_sequence_parallel_loss`` all-reduces
-            # this rank's local CE sum / valid-token count over ``dp_sp`` and its
-            # backward scales grads by ``|dp_sp|``, exactly cancelling FSDP2's
-            # reduce-scatter (÷dp_shard_sp) + HSDP all-reduce (÷dp_replicate) so
-            # the gradient is the true global token-mean. (A plain per-rank
-            # ``ce_sum/n_valid`` would instead give a DP mean-of-means that
-            # over-weights ranks holding few valid tokens.)
-            ps = get_parallel_state()
-            n_valid_local = (flat_labels != -100).sum()
-            local_mean = ce_sum / n_valid_local.clamp(min=1)
-            loss = reduce_sequence_parallel_loss(local_mean, n_valid_local.to(local_mean.dtype), group=ps.fsdp_group)
+            n_valid_local = (flat_labels != -100).sum().clamp(min=1)
+            loss = ce_sum / n_valid_local
         elif labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_targets = labels[..., 1:].contiguous()
@@ -133,11 +116,4 @@ class TextEncoder(VeOmniMixin, PreTrainedModel):
     def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.config.tie_word_embeddings:
             return self.lm_head(hidden_states)
-
-        # Tied head reuses ``embed_tokens.weight`` directly, bypassing
-        # ``embed_tokens.__call__`` — and ``embed_tokens`` is its own FSDP2 unit
-        # (``_no_split_modules``), so the pre-forward all-gather that would
-        # materialize + cast the weight never fires here. :class:`EmbParallelMixin`
-        # reconstructs this rank's slice (dual of ``_embed_tokens``) and projects
-        # via ``VocabParallelLinear`` under ``emb`` (plain ``F.linear`` otherwise).
-        return self.emb_parallel_project(hidden_states, self.embed_tokens.weight)
+        return F.linear(hidden_states, self.embed_tokens.weight)

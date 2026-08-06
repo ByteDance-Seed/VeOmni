@@ -27,16 +27,18 @@ from .graphs.training_graph import TrainingGraph
 from .mixins.base_mixin import BaseMixin
 from .mixins.inference_module_mixin import InferenceModuleMixin
 from .mixins.metric_meter_mixin import MetricMeterMixin
-from .mixins.offline_encoding_mixin import OfflineEncodingConfigMixin, OfflineEncodingMixin
+from .mixins.offline_encoding_mixin import OfflineEncodingMixin
 from .mixins.training_module_mixin import TrainingModuleMixin
 from .modeling_omni import OmniModel
 from .modules import (
+    OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
     read_hf_model_type,
     read_model_type,
 )
+from .omni_pretrained_model import OmniPreTrainedModel
 from .processing_omni import OmniProcessor
 from .utils.conversation import build_conversation
 
@@ -45,12 +47,12 @@ __all__ = [
     # Core
     "OmniConfig",
     "OmniModel",
+    "OmniPreTrainedModel",
     "OmniProcessor",
     "BaseMixin",
     "TrainingModuleMixin",
     "InferenceModuleMixin",
     "MetricMeterMixin",
-    "OfflineEncodingConfigMixin",
     "OfflineEncodingMixin",
     "TrainingGraph",
     "GenerationGraph",
@@ -59,6 +61,7 @@ __all__ = [
     "END",
     "build_conversation",
     # Module registry
+    "OMNI_ACCELERATED_MODEL_REGISTRY",
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",

@@ -192,7 +192,9 @@ def get_model_class(model_config: PretrainedConfig):
         # OMNI registry (keyed by model_type; the factory takes no arch_name).
         _, omni_model_registry, _ = _omni_registries()
         if model_type in set(omni_model_registry.valid_keys()):
-            return omni_model_registry[model_type]()
+            from .seed_omni.modules import OMNI_ACCELERATED_MODEL_REGISTRY
+
+            return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
         return MODELING_REGISTRY[model_type](arch_name)
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
         load_class = AutoModelForImageTextToText

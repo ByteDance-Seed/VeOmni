@@ -4,15 +4,14 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
 
 from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3Model
 
+from ....omni_pretrained_model import OmniPreTrainedModel
 from .configuration import Qwen3LlmConfig
-from .modulemixin import VeOmniMixin
 
 
-class Qwen3Llm(VeOmniMixin, PreTrainedModel):
+class Qwen3Llm(OmniPreTrainedModel):
     """Qwen3 backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling text encoder and live

@@ -7,7 +7,7 @@ Sub-package layout (per :mod:`veomni.models.seed_omni.modules`):
 * :mod:`.processing`   — :class:`TextEncoderPreprocessor`
 """
 
-from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
+from ... import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 
 
 @OMNI_CONFIG_REGISTRY.register("text_encoder")
@@ -22,3 +22,10 @@ def register_text_encoder_model():
     from .modeling import TextEncoder
 
     return TextEncoder
+
+
+@OMNI_ACCELERATED_MODEL_REGISTRY.register("text_encoder")
+def register_text_encoder_accelerated_model():
+    from .accelerated import TextEncoderAccelerated
+
+    return TextEncoderAccelerated

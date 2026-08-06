@@ -1,3 +1,5 @@
+"""VeOmni-accelerated TextEncoder — training / inference graph hooks."""
+
 from abc import abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -5,7 +7,12 @@ import torch
 import torch.nn.functional as F
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
+from veomni.distributed.sequence_parallel import (
+    gather_outputs,
+    reduce_sequence_parallel_loss,
+    slice_input_tensor,
+    sp_pad,
+)
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.base_mixin import BaseMixin
@@ -16,6 +23,7 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, is_dummy, seal_outputs
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
+from .modeling import TextEncoder
 
 
 _SAMPLING_KWARGS = ("temperature", "top_p", "do_sample")
@@ -178,18 +186,6 @@ class InferenceMixin(InferenceModuleMixin):
     _prompt_encoded: bool
     _text_token_cache: list[int]
 
-    def encode(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """IDE stub — implemented on :class:`TextEncoder` in ``modeling.py``."""
-        ...
-
-    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """IDE stub — implemented on :class:`TextEncoder` in ``modeling.py``."""
-        ...
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._text_token_cache: list[int] = []
@@ -342,7 +338,7 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin, EmbParal
     and implementing :meth:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
     with the module-local chat template.  Register via ``preprocessor_class`` on
     the family mixin, plus the ``encode_pre`` / ``encode_post`` / ``decode_pre`` /
-    ``decode_post`` pass-through hooks in each module's ``modulemixin.py``.
+    ``decode_post`` pass-through hooks in each module's ``accelerated.py``.
     """
 
     _chat_template: TextEncoderChatTemplate
@@ -362,4 +358,55 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin, EmbParal
         self._chat_template = TextEncoderChatTemplate(tokenizer)
 
 
-__all__ = ["VeOmniMixin"]
+class TextEncoderAccelerated(VeOmniMixin, TextEncoder):
+    """Training/runtime text encoder — vocab-parallel embed + SP-aware CE."""
+
+    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.emb_parallel_lookup(self.embed_tokens, input_ids)
+
+    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self.config.tie_word_embeddings:
+            return self.lm_head(hidden_states)
+        return self.emb_parallel_project(hidden_states, self.embed_tokens.weight)
+
+    def decode(
+        self,
+        hidden_states: torch.Tensor | None = None,
+        labels: torch.LongTensor | None = None,
+        shift_labels: torch.LongTensor | None = None,
+        **kwargs: Any,
+    ) -> dict:
+        logits = self._project(hidden_states)
+        loss: torch.Tensor | None = None
+
+        if shift_labels is not None:
+            flat_labels = shift_labels.view(-1)
+            ce_sum = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            ps = get_parallel_state()
+            n_valid_local = (flat_labels != -100).sum()
+            local_mean = ce_sum / n_valid_local.clamp(min=1)
+            loss = reduce_sequence_parallel_loss(local_mean, n_valid_local.to(local_mean.dtype), group=ps.fsdp_group)
+        elif labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_targets = labels[..., 1:].contiguous()
+            ce_sum = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_targets.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            n_valid = (shift_targets != -100).sum().clamp(min=1)
+            loss = ce_sum / n_valid
+
+        return {
+            "loss": loss,
+            "logits": logits,
+        }
+
+
+__all__ = ["TextEncoderAccelerated", "scatter_text_encoder_embeds"]

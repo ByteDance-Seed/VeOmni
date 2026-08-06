@@ -15,9 +15,10 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+from ....omni_pretrained_model import OmniPreTrainedModel
 
 
 if IS_CUDA_AVAILABLE:
@@ -28,11 +29,10 @@ if IS_NPU_AVAILABLE:
 from transformers.activations import ACT2FN
 
 from .configuration import BagelSiglipNavitConfig
-from .modulemixin import VeOmniMixin
 from .processing import BagelSiglipNavitProcessor
 
 
-class BagelSiglipNavit(VeOmniMixin, PreTrainedModel):
+class BagelSiglipNavit(OmniPreTrainedModel):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
     base_model_prefix = "bagel_siglip_navit"

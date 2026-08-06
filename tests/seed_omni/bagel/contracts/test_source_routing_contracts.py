@@ -7,7 +7,7 @@ import torch
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
-from veomni.models.seed_omni.modules.bagel.flow_connector.modulemixin import SIGNAL_IMAGE_COMPLETE
+from veomni.models.seed_omni.modules.bagel.flow_connector.accelerated import SIGNAL_IMAGE_COMPLETE
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
@@ -370,11 +370,11 @@ def test_bagel_qwen2_mot_forward_pre_rejects_only_upstream_dummy_anchor(monkeypa
 
 
 def test_bagel_qwen2_mot_rejects_context_parallel_training(monkeypatch) -> None:
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 
     model = _tiny_qwen2_mot()
     monkeypatch.setattr(
-        modulemixin,
+        accelerated,
         "get_parallel_state",
         lambda: SimpleNamespace(sp_size=2, cp_size=2),
     )
@@ -604,7 +604,8 @@ def test_bagel_runtime_marker_wrapping_selects_only_flow_query() -> None:
 
 
 def test_bagel_siglip_selector_requires_context_source() -> None:
-    model = _tiny_siglip()
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.accelerated import select_siglip_image_items
+
     raw_image = ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="user")
     context_image = ConversationItem(
         type="image",
@@ -613,8 +614,8 @@ def test_bagel_siglip_selector_requires_context_source() -> None:
         source=BAGEL_SIGLIP_CONTEXT,
     )
 
-    assert model._select_siglip_image_items([[raw_image]]) == []
-    assert model._select_siglip_image_items([[context_image]]) == [context_image]
+    assert select_siglip_image_items([[raw_image]]) == []
+    assert select_siglip_image_items([[context_image]]) == [context_image]
 
 
 def test_bagel_siglip_meter_reports_per_sample_processed_image_tokens() -> None:

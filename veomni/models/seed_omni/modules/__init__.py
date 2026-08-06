@@ -36,6 +36,7 @@ from ....utils.registry import Registry
 
 OMNI_CONFIG_REGISTRY = Registry("OmniConfig")
 OMNI_MODEL_REGISTRY = Registry("OmniModel")
+OMNI_ACCELERATED_MODEL_REGISTRY = Registry("OmniAcceleratedModel")
 OMNI_PROCESSOR_REGISTRY = Registry("OmniProcessor")
 
 
@@ -107,6 +108,7 @@ def read_model_type(model_path: str) -> str:
 
 
 __all__ = [
+    "OMNI_ACCELERATED_MODEL_REGISTRY",
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",

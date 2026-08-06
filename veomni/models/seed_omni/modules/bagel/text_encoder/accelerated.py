@@ -10,18 +10,19 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.training_module_mixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     InferenceMixin as BaseInferenceMixin,
 )
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     TrainingMixin as BaseTrainingMixin,
 )
-from ...base.text_encoder.modulemixin import (
+from ...base.text_encoder.accelerated import (
     VeOmniMixin as BaseVeOmniMixin,
 )
 from ..sources import BAGEL_FLOW_QUERY
 from .chat_template import BagelChatTemplate
 from .configuration import BagelTextEncoderConfig
+from .modeling import BagelTextEncoder
 from .processing import BagelTextEncoderPreprocessor, apply_image_marker
 
 
@@ -209,14 +210,6 @@ class InferenceMixin(BaseInferenceMixin):
     _encode_batch_shape: torch.LongTensor | None
     _text_token_cache: list[int]
 
-    def encode(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """IDE stub — implemented on :class:`BagelTextEncoder` in ``modeling.py``."""
-        ...
-
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
@@ -315,8 +308,8 @@ class VeOmniMixin(TrainingMixin, InferenceMixin, BaseVeOmniMixin):
         self._chat_template = BagelChatTemplate(tokenizer)
 
 
-__all__ = [
-    "SIGNAL_START_IMAGE_GEN",
-    "SIGNAL_TEXT_DONE",
-    "VeOmniMixin",
-]
+class BagelTextEncoderAccelerated(VeOmniMixin, BagelTextEncoder):
+    pass
+
+
+__all__ = ["SIGNAL_START_IMAGE_GEN", "SIGNAL_TEXT_DONE", "BagelTextEncoderAccelerated"]

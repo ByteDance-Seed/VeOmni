@@ -1,6 +1,6 @@
 """Janus LLaMA backbone (no wte / lm_head).
 
-``JanusLlama(JanusLlamaModuleMixin, PreTrainedModel)`` — patched
+``JanusLlama(JanusLlamaModuleMixin)`` — patched
 ``LlamaModel`` with ``embed_tokens = Identity``; ``inputs_embeds`` come from
 the text-encoder node.  Packing / FSDP dummy anchors live in ``modulemixin.py``.
 
@@ -35,15 +35,14 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
 
 from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaModel
 
+from ....omni_pretrained_model import OmniPreTrainedModel
 from .configuration import JanusLlamaConfig
-from .modulemixin import VeOmniMixin
 
 
-class JanusLlama(VeOmniMixin, PreTrainedModel):
+class JanusLlama(OmniPreTrainedModel):
     """LLaMA backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling encoder modules

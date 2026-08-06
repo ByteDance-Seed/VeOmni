@@ -80,4 +80,8 @@ def iter_named_omni_modules(
             yield name, raw
 
 
-__all__ = ["iter_named_omni_modules", "save_module_assets", "save_module_subdirectory"]
+__all__ = [
+    "iter_named_omni_modules",
+    "save_module_assets",
+    "save_module_subdirectory",
+]

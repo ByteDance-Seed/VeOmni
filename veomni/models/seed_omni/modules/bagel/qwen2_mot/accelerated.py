@@ -27,6 +27,7 @@ from ..sources import (
 )
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotCacheContext, MotGenerationState
+from .modeling import BagelQwen2MoT
 from .processing import PackedConversation, PackedSpan, build_mot_attention_mask, preprocess_mot_inputs
 
 
@@ -267,25 +268,6 @@ class InferenceMixin(InferenceModuleMixin):
     device: torch.device
     dtype: torch.dtype
     model: Any
-
-    def forward_inference(
-        self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_ids: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
-        past_key_values: Any = None,
-        key_values_lens: torch.Tensor | None = None,
-        packed_key_value_indexes: torch.Tensor | None = None,
-        update_past_key_values: bool = True,
-        is_causal: bool = True,
-        mode: str = "und",
-        packed_vae_token_indexes: torch.Tensor | None = None,
-        packed_text_indexes: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """IDE stub — implemented on :class:`BagelQwen2MoT` in ``modeling.py``."""
-        ...
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -647,4 +629,8 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
     """Carrier hooks and graph entrypoints for BAGEL's packed MoT backbone."""
 
 
-__all__ = ["VeOmniMixin"]
+class BagelQwen2MoTAccelerated(VeOmniMixin, BagelQwen2MoT):
+    pass
+
+
+__all__ = ["BagelQwen2MoTAccelerated"]

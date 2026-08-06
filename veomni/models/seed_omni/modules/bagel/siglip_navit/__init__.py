@@ -1,6 +1,6 @@
 """BAGEL SigLIP NaViT vision encoder module."""
 
-from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
+from ... import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
 
 
 @OMNI_CONFIG_REGISTRY.register("bagel_siglip_navit")
@@ -15,6 +15,13 @@ def register_bagel_siglip_navit_model():
     from .modeling import BagelSiglipNavit
 
     return BagelSiglipNavit
+
+
+@OMNI_ACCELERATED_MODEL_REGISTRY.register("bagel_siglip_navit")
+def register_bagel_siglip_navit_accelerated_model():
+    from .accelerated import BagelSiglipNavitAccelerated
+
+    return BagelSiglipNavitAccelerated
 
 
 @OMNI_PROCESSOR_REGISTRY.register("bagel_siglip_navit")

@@ -7,28 +7,24 @@ local ``VeOmniMixin``; ``modeling.py`` inherits only ``VeOmniMixin`` +
 
 Layout
 ------
-* ``base_mixin.py`` — :class:`BaseMixin` (``from_pretrained``, ``get_assets``, hook registry)
+* ``omni_pretrained_model.py`` — :class:`OmniPreTrainedModel` (native HF sub-models)
+* ``base_mixin.py`` — :class:`BaseMixin` (runtime hook registry)
 * ``training_module_mixin.py`` — :class:`TrainingModuleMixin` (``pre_forward`` / ``post_forward``)
-* ``inference_module_mixin.py`` — :class:`InferenceModuleMixin` (``pre_generate`` / ``post_generate``)
-* ``modules/<family>/<sub>/modulemixin.py``::
-
-    class TrainingMixin(TrainingModuleMixin): ...
-    class InferenceMixin(InferenceModuleMixin): ...
-    class MeterMixin(MetricMeterMixin): ...
-    class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin): ...
-
+* ``inference_module_mixin.py`` — :class:`InferenceModuleMixin` (runtime ``pre_generate`` / ``post_generate``)
 * ``modules/<family>/<sub>/modeling.py``::
 
-    class Xxx(VeOmniMixin, PreTrainedModel): ...
+    class Xxx(OmniPreTrainedModel): ...
+
+* ``modules/<family>/<sub>/accelerated.py``::
+
+    class XxxAccelerated(VeOmniMixin, Xxx): ...
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 
 class BaseMixin:
-    """SeedOmni V2 base — checkpoint load, asset export, shared hook-name registry."""
+    """Accelerated SeedOmni base — shared graph-hook registry for runtime mixins."""
 
     @classmethod
     def _omni_hook_name(cls, marker: str, context: str) -> str | None:
@@ -49,23 +45,6 @@ class BaseMixin:
                             registry[ctx] = name
             setattr(cls, cache_attr, registry)
         return registry.get(context)
-
-    def get_assets(self) -> list[Any]:
-        """Module-owned auxiliary artefacts to save alongside the weights."""
-        return []
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
-        """Load weights, then copy HF assets from the module's CPU worker if declared."""
-        from ..processing.binding import bind_module_assets
-
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        bind_module_assets(
-            model,
-            checkpoint_path=str(pretrained_model_name_or_path),
-            config_overrides=kwargs,
-        )
-        return model
 
 
 __all__ = ["BaseMixin"]

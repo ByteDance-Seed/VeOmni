@@ -21,6 +21,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
+from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ....processing import ModulePreprocessorBase
 from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
@@ -448,7 +449,8 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
         """
         del kwargs
         config = BagelVAEConfig.from_pretrained(module_path, **(config_overrides or {}))
-        if config.validated_cache_mode() == "process_only":
+        OfflineEncodingMixin.patch_config(config, **(config_overrides or {}))
+        if OfflineEncodingMixin.validated_cache_mode(config) == "process_only":
             return None
         return cls(BagelVAEProcessor.from_config(config))
 

@@ -1,3 +1,5 @@
+"""VeOmni-accelerated Qwen3VLLlm — training / inference graph hooks."""
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -12,6 +14,7 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, is_dummy
 from ...base.llm_packing import scatter_llm_hidden_states
 from .configuration import Qwen3VLLlmConfig
+from .modeling import Qwen3VLLlm
 
 
 def _cumsum(values: list[int]) -> list[int]:
@@ -123,10 +126,6 @@ class TrainingMixin(TrainingModuleMixin):
     training: bool
 
     @property
-    def _spatial_merge_size(self) -> int:
-        """IDE stub — see :class:`VeOmniMixin` below (``config.spatial_merge_size``)."""
-        ...
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
@@ -278,20 +277,6 @@ class InferenceMixin(InferenceModuleMixin):
     config: Qwen3VLLlmConfig
     device: torch.device
 
-    def forward(
-        self,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        visual_pos_masks: Optional[torch.Tensor] = None,
-        deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
-        past_key_values: Any = None,
-        use_cache: Optional[bool] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """IDE stub — implemented on :class:`Qwen3VLLlm` in ``modeling.py``."""
-        ...
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._past_key_values: Any = None
@@ -392,4 +377,8 @@ def _fold_fsdp_dummy_anchors(
     return inputs_embeds
 
 
-__all__ = ["VeOmniMixin"]
+class Qwen3VLLlmAccelerated(VeOmniMixin, Qwen3VLLlm):
+    pass
+
+
+__all__ = ["Qwen3VLLlmAccelerated"]

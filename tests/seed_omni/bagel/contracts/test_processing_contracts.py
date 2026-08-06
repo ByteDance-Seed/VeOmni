@@ -18,7 +18,7 @@ from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, Conversatio
 
 
 def test_bagel_training_text_embed_meta_preserves_grad():
-    from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import VeOmniMixin
+    from veomni.models.seed_omni.modules.bagel.text_encoder.accelerated import scatter_bagel_text_embeds
 
     item = ConversationItem(
         type="text",
@@ -27,13 +27,12 @@ def test_bagel_training_text_embed_meta_preserves_grad():
         meta={"input_ids": torch.tensor([11, 12])},
     )
     packed_text_embeds = torch.randn(2, 4, requires_grad=True)
-    mixin = VeOmniMixin()
-    mixin.device = torch.device("cpu")
-    mixin.dtype = torch.float32
 
-    mixin._scatter_text_embeds(
+    scatter_bagel_text_embeds(
         [[item]],
         [packed_text_embeds],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
     )
     assert item.value.requires_grad
 
@@ -217,14 +216,14 @@ def test_bagel_mot_training_attention_mask_contract_is_checked_once_at_the_modul
     error: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
     hidden_size = int(model.config.hidden_size)
     conversation = [[ConversationItem(type="text", value=torch.ones(3, hidden_size), role="user")]]
-    monkeypatch.setattr(modulemixin, "build_mot_attention_mask", lambda *args, **kwargs: attention_mask)
+    monkeypatch.setattr(accelerated, "build_mot_attention_mask", lambda *args, **kwargs: attention_mask)
 
     with pytest.raises(ValueError, match=error):
         model.forward_pre(conversation_list=conversation)
@@ -256,13 +255,13 @@ def test_bagel_mot_forward_pre_normalizes_sample_broadcast_dtype():
 
 
 def test_bagel_mot_forward_pre_keeps_dense_mask_full_and_marks_sequence_padding(monkeypatch):
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
     monkeypatch.setattr(
-        modulemixin,
+        accelerated,
         "get_parallel_state",
         lambda: SimpleNamespace(sp_size=4, cp_size=1, ulysses_size=4, sp_group=object()),
     )
@@ -273,8 +272,8 @@ def test_bagel_mot_forward_pre_keeps_dense_mask_full_and_marks_sequence_padding(
         padding = torch.full(pad_shape, pad_value, device=tensor.device, dtype=tensor.dtype)
         return torch.cat((tensor, padding), dim=dim)
 
-    monkeypatch.setattr(modulemixin, "sp_pad", fake_sp_pad)
-    monkeypatch.setattr(modulemixin, "slice_input_tensor", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(accelerated, "sp_pad", fake_sp_pad)
+    monkeypatch.setattr(accelerated, "slice_input_tensor", lambda tensor, **kwargs: tensor)
     hidden_size = int(model.config.hidden_size)
     text = ConversationItem(type="text", value=torch.ones(2, hidden_size), role="user")
     image = ConversationItem(
@@ -354,7 +353,7 @@ def test_bagel_mot_packing_rejects_incompatible_vae_img_tag():
 
 
 def test_bagel_vae_infer_encode_updates_vae_context_image_in_place():
-    from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated import BAGEL_VAE_PIXEL_SHAPE
     from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 
     BagelVAE = model_cls("bagel_vae")
@@ -571,7 +570,7 @@ def test_bagel_vae_training_encode_selects_source_routed_assistant_image():
 
 
 def test_bagel_vae_meter_reports_latent_tokens_including_dummy() -> None:
-    from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated import BAGEL_VAE_PIXEL_SHAPE
 
     BagelVAE = model_cls("bagel_vae")
     BagelVAEConfig = config_cls("bagel_vae")
@@ -607,7 +606,7 @@ def test_bagel_vae_meter_reports_latent_tokens_including_dummy() -> None:
 
 def test_bagel_vae_training_encode_crops_padded_latents_before_flow_patchify():
     from veomni.models.seed_omni.modules.bagel.flow_connector.processing import preprocess_latent_embed
-    from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated import BAGEL_VAE_PIXEL_SHAPE
     from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEPreprocessor, BagelVAEProcessor
 
     BagelVAE = model_cls("bagel_vae")

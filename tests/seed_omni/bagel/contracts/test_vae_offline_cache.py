@@ -4,7 +4,7 @@ import torch
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_VAE_CONTEXT
-from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
+from veomni.models.seed_omni.modules.bagel.vae.accelerated import BAGEL_VAE_PIXEL_SHAPE
 from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 

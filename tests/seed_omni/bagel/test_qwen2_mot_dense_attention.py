@@ -252,7 +252,7 @@ def test_native_gqa_rejects_invalid_global_head_ratio_at_config_init() -> None:
 def test_native_gqa_rejects_kv_heads_that_cannot_be_sharded_in_forward_pre(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 
     model_type = model_cls("bagel_qwen2_mot")
     config_type = config_cls("bagel_qwen2_mot")
@@ -266,7 +266,7 @@ def test_native_gqa_rejects_kv_heads_that_cannot_be_sharded_in_forward_pre(
         )
     )
     monkeypatch.setattr(
-        modulemixin,
+        accelerated,
         "get_parallel_state",
         lambda: SimpleNamespace(sp_size=4, cp_size=1, ulysses_size=4),
     )

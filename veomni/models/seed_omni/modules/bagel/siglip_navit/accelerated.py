@@ -15,6 +15,7 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
+from .modeling import BagelSiglipNavit
 from .processing import _OMNI_POSITION_IDS, _OMNI_TOKEN_LEN, BagelSiglipNavitPreprocessor
 
 
@@ -210,18 +211,6 @@ class InferenceMixin(InferenceModuleMixin):
     device: torch.device
     dtype: torch.dtype
 
-    def forward(
-        self,
-        patchified_pixel_values: torch.Tensor,
-        patchified_position_ids: torch.LongTensor,
-        cu_seqlens: torch.IntTensor,
-        max_seqlen: int,
-        token_lens: torch.IntTensor,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """IDE stub — implemented on :class:`BagelSiglipNavit` in ``modeling.py``."""
-        ...
-
     def generate(
         self,
         conversation_list: list[ConversationItem] | None = None,
@@ -274,4 +263,8 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
     preprocessor_class = BagelSiglipNavitPreprocessor
 
 
-__all__ = ["VeOmniMixin"]
+class BagelSiglipNavitAccelerated(VeOmniMixin, BagelSiglipNavit):
+    pass
+
+
+__all__ = ["BagelSiglipNavitAccelerated"]

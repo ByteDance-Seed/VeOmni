@@ -11,7 +11,7 @@ from torch.distributed.tensor import DTensor
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
-from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
+from veomni.models.seed_omni.modules.bagel.siglip_navit.accelerated import (
     _OMNI_POSITION_IDS,
     _OMNI_TOKEN_LEN,
 )

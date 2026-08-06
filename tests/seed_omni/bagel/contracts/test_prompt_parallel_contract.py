@@ -8,7 +8,7 @@ import torch
 import yaml
 
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.modulemixin import TrainingMixin
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import TrainingMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_SIGLIP_CONTEXT,

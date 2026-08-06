@@ -19,6 +19,7 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
+from .modeling import BagelVAE
 from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
 
 
@@ -37,12 +38,134 @@ def select_bagel_vae_context_items(
     return items
 
 
+def _posterior_from_cache(
+    cache: torch.Tensor,
+    *,
+    z_channels: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], bool]:
+    if cache.dim() == 5 and int(cache.shape[0]) == 1:
+        cache = cache.squeeze(0)
+    if cache.dim() == 4 and int(cache.shape[0]) == 2 and int(cache.shape[1]) == z_channels:
+        return (cache[0].unsqueeze(0), cache[1].unsqueeze(0)), True
+    raise ValueError(
+        "BAGEL VAE posterior cache tensor must be shaped (2, C, H, W) "
+        f"or singleton-batched (1, 2, C, H, W); got {tuple(cache.shape)}."
+    )
+
+
+class BagelVAEOfflineMixin:
+    """Offline-cache tensor endpoints and training-graph hooks for VAE encode / process."""
+
+    config: BagelVAEConfig
+    device: torch.device
+    dtype: torch.dtype
+    _conversation_carrier: list[list[ConversationItem]] | None
+    _encode_items: list[ConversationItem]
+    _sp_encode_count: int | None
+
+    def offline_encode(
+        self,
+        pixel_values: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        del kwargs
+        pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
+        with self._runtime_context(pixel_values):
+            posterior = self._encode_posterior(pixel_values)
+        return {"encoded_cache": torch.cat(posterior, dim=1).to(dtype=self.dtype)}
+
+    def online_process(
+        self,
+        encoded_cache: torch.Tensor | list[torch.Tensor],
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        del kwargs
+        if not isinstance(encoded_cache, list):
+            encoded_cache = [encoded_cache]
+
+        latents = []
+        for cache in encoded_cache:
+            posterior, is_item_cache = _posterior_from_cache(cache, z_channels=int(self.config.z_channels))
+            latent = self._sample_scaled_latents(posterior)
+            if is_item_cache:
+                latent = latent.squeeze(0)
+            latents.append(latent.to(dtype=cache.dtype))
+        return {"latents": latents}
+
+    @post_forward("offline_encode")
+    def offline_encode_post(self, encoded_cache: torch.Tensor) -> dict[str, Any]:
+        if get_parallel_state().sp_size > 1:
+            # Keep the CNN's spatial outputs intact through gather; crop each
+            # cache item from its original pixel shape only after batch unpadding.
+            encoded_cache = self._gather_encode_output(encoded_cache)
+
+        conversation = self._conversation_carrier
+        encode_items = self._encode_items
+        self._conversation_carrier = None
+        self._encode_items = []
+        self._sp_encode_count = None
+
+        for item, cache_tensor in zip(encode_items, encoded_cache, strict=True):
+            item.type = "image"
+            cache_tensor = crop_latent_to_image_shape(
+                cache_tensor,
+                item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                downsample=int(self.config.downsample),
+            )
+            z_channels = int(self.config.z_channels)
+            if cache_tensor.dim() == 3 and int(cache_tensor.shape[0]) == 2 * z_channels:
+                cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
+            item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
+            item.source = BAGEL_VAE_CONTEXT
+            item.meta = {}
+        return {"conversation_list": conversation}
+
+    @pre_forward("online_process")
+    def online_process_pre(
+        self,
+        conversation_list: list[list[ConversationItem]] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        self._conversation_carrier = conversation_list
+        self._encode_items = []
+        self._sp_encode_count = None
+
+        self._encode_items = select_bagel_vae_context_items(conversation_list)
+        encoded_cache: list[torch.Tensor] = []
+        for item in self._encode_items:
+            cache = item.value
+            if not torch.is_tensor(cache):
+                raise ValueError("BAGEL VAE online_process requires tensor posterior cache.")
+            encoded_cache.append(cache.detach().to(device=self._online_process_device()))
+        return {"encoded_cache": encoded_cache}
+
+    def _online_process_dtype(self) -> torch.dtype:
+        config_dtype = getattr(self.config, "dtype", None) or getattr(self.config, "torch_dtype", None)
+        if isinstance(config_dtype, torch.dtype):
+            return config_dtype
+        if isinstance(config_dtype, str) and hasattr(torch, config_dtype):
+            dtype = getattr(torch, config_dtype)
+            if isinstance(dtype, torch.dtype):
+                return dtype
+        return torch.get_default_dtype()
+
+    def _online_process_device(self) -> torch.device:
+        device_type = get_device_type()
+        if device_type == "cpu":
+            return torch.device("cpu")
+        return torch.device(device_type, get_device_id())
+
+
 class TrainingMixin(TrainingModuleMixin):
     """Training-graph hooks — depends on :class:`BagelVAE` modeling APIs."""
 
     config: BagelVAEConfig
     device: torch.device
     dtype: torch.dtype
+    _conversation_carrier: list[list[ConversationItem]] | None
+    _encode_items: list[ConversationItem]
+    _sp_encode_count: int | None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -112,54 +235,6 @@ class TrainingMixin(TrainingModuleMixin):
                 item.source = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation}
 
-    @post_forward("offline_encode")
-    def offline_encode_post(self, encoded_cache: torch.Tensor) -> dict[str, Any]:
-        if get_parallel_state().sp_size > 1:
-            # Keep the CNN's spatial outputs intact through gather; crop each
-            # cache item from its original pixel shape only after batch unpadding.
-            encoded_cache = self._gather_encode_output(encoded_cache)
-
-        conversation = self._conversation_carrier
-        encode_items = self._encode_items
-        self._conversation_carrier = None
-        self._encode_items = []
-        self._sp_encode_count = None
-
-        for item, cache_tensor in zip(encode_items, encoded_cache, strict=True):
-            item.type = "image"
-            cache_tensor = crop_latent_to_image_shape(
-                cache_tensor,
-                item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
-                downsample=int(self.config.downsample),
-            )
-            z_channels = int(self.config.z_channels)
-            if cache_tensor.dim() == 3 and int(cache_tensor.shape[0]) == 2 * z_channels:
-                cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
-            item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
-            item.source = BAGEL_VAE_CONTEXT
-            item.meta = {}
-        return {"conversation_list": conversation}
-
-    @pre_forward("online_process")
-    def online_process_pre(
-        self,
-        conversation_list: list[list[ConversationItem]] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del kwargs
-        self._conversation_carrier = conversation_list
-        self._encode_items = []
-        self._sp_encode_count = None
-
-        self._encode_items = select_bagel_vae_context_items(conversation_list)
-        encoded_cache: list[torch.Tensor] = []
-        for item in self._encode_items:
-            cache = item.value
-            if not torch.is_tensor(cache):
-                raise ValueError("BAGEL VAE online_process requires tensor posterior cache.")
-            encoded_cache.append(cache.detach().to(device=self._online_process_device()))
-        return {"encoded_cache": encoded_cache}
-
     def _gather_encode_output(self, output: torch.Tensor) -> torch.Tensor:
         if self._sp_encode_count is None:
             raise RuntimeError("BAGEL VAE SP image count was not initialized.")
@@ -185,44 +260,12 @@ class TrainingMixin(TrainingModuleMixin):
         self.metric_meter_set_seqlens("encode", lengths)
         self.metric_meter_set_seqlens("offline_encode", lengths)
 
-    def _online_process_dtype(self) -> torch.dtype:
-        config_dtype = getattr(self.config, "dtype", None) or getattr(self.config, "torch_dtype", None)
-        if isinstance(config_dtype, torch.dtype):
-            return config_dtype
-        if isinstance(config_dtype, str) and hasattr(torch, config_dtype):
-            dtype = getattr(torch, config_dtype)
-            if isinstance(dtype, torch.dtype):
-                return dtype
-        return torch.get_default_dtype()
-
-    def _online_process_device(self) -> torch.device:
-        device_type = get_device_type()
-        if device_type == "cpu":
-            return torch.device("cpu")
-        return torch.device(device_type, get_device_id())
-
 
 class InferenceMixin(InferenceModuleMixin):
     config: BagelVAEConfig
     device: torch.device
     dtype: torch.dtype
     _image_processor: BagelVAEProcessor
-
-    def encode(
-        self,
-        pixel_values: torch.Tensor,
-        **kwargs: object,
-    ) -> dict[str, Any]:
-        """IDE stub — implemented on :class:`BagelVAE` in ``modeling.py``."""
-        ...
-
-    def decode(
-        self,
-        latents: torch.Tensor,
-        **kwargs: object,
-    ) -> dict[str, Any]:
-        """IDE stub — implemented on :class:`BagelVAE` in ``modeling.py``."""
-        ...
 
     def encode_context(
         self,
@@ -354,7 +397,7 @@ class MeterMixin(MetricMeterMixin):
         return 6 * total_macs / 1e12
 
 
-class VeOmniMixin(OfflineEncodingMixin, BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, BagelVAEOfflineMixin, OfflineEncodingMixin, InferenceMixin, MeterMixin):
     """Carrier hooks for raw-image VAE encode and latent decode."""
 
     config: BagelVAEConfig
@@ -365,7 +408,8 @@ class VeOmniMixin(OfflineEncodingMixin, BaseMixin, TrainingMixin, InferenceMixin
         shutil.copytree(source_path, output_dir, dirs_exist_ok=True)
 
 
-__all__ = [
-    "BAGEL_VAE_PIXEL_SHAPE",
-    "VeOmniMixin",
-]
+class BagelVAEAccelerated(VeOmniMixin, BagelVAE):
+    pass
+
+
+__all__ = ["BAGEL_VAE_PIXEL_SHAPE", "BagelVAEAccelerated", "BagelVAEOfflineMixin"]
