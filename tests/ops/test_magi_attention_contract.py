@@ -1193,16 +1193,22 @@ def _build_profile_flex_mask(mask_case: str, sequence_length: int, device: torch
     elif mask_case == "bagel_mixed":
         if sequence_length % 4 != 0:
             raise ValueError("The BAGEL-like profile requires a sequence length divisible by four.")
-        span_length = sequence_length // 4
+        quarter = sequence_length // 4
 
         def mask_mod(batch_idx, head_idx, query_idx, key_idx):
-            query_span = query_idx // span_length
-            key_span = key_idx // span_length
-            same_span = query_span == key_span
-            full_local_span = (query_span == 1) | (query_span == 2)
-            visible_within_span = same_span & (full_local_span | (query_idx >= key_idx))
-            visible_clean_context = (key_span < query_span) & (key_span != 1)
-            return visible_within_span | visible_clean_context
+            first = (query_idx < quarter) & (key_idx <= query_idx)
+            noise = (query_idx >= quarter) & (query_idx < 2 * quarter) & (key_idx < 2 * quarter)
+            full = (
+                (query_idx >= 2 * quarter)
+                & (query_idx < 3 * quarter)
+                & ((key_idx < quarter) | ((key_idx >= 2 * quarter) & (key_idx < 3 * quarter)))
+            )
+            last = (query_idx >= 3 * quarter) & (
+                (key_idx < quarter)
+                | ((key_idx >= 2 * quarter) & (key_idx < 3 * quarter))
+                | ((key_idx >= 3 * quarter) & (key_idx <= query_idx))
+            )
+            return first | noise | full | last
 
     else:
         raise ValueError(f"Unsupported profile mask case: {mask_case}")
@@ -1526,7 +1532,6 @@ def _profile_attention_backend(
     elif backend == "flex_attention":
         attention_mask = _build_profile_flex_mask(mask_case, sequence_length, device)
         mask_kind = "native_BlockMask"
-        torch.compiler.reset()
 
         def forward():
             return flex_backend.flex_attention_forward(
