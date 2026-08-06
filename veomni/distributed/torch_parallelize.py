@@ -34,7 +34,7 @@ from .checkpoint import CheckpointFunction
 from .chunk_mbs import apply_chunk_mbs
 from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
-from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_config_for_fsdp2
+from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
 from .utils import sort_fqn_by_submodule_first
 
 
@@ -272,16 +272,21 @@ def parallelize_model_fsdp2(
     logger.info_rank0(f"extra_parallel layer pairs: {layer_pairs}")
 
     if compile_config.enable:
-        if get_device_type() != "cuda":
-            raise RuntimeError("train.torch_compile.enable is CUDA-only for now.")
-        if parallel_state.any_extra_parallel_enabled:
-            raise RuntimeError(
-                "train.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
-                "communication may be captured inside compiled blocks."
-            )
-        validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
+        validate_compile_runtime(
+            compile_config,
+            device_type=get_device_type(),
+            fsdp_enabled=parallel_state.fsdp_enabled,
+            fsdp_mode=parallel_state.dp_mode,
+            any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
+            enable_reshard_after_forward=enable_reshard_after_forward,
+        )
 
-        compiled_count = compile_decoder_blocks(model, compile_config)
+        compiled_count = compile_decoder_blocks(
+            model,
+            compile_config,
+            sequence_parallel_enabled=parallel_state.sp_enabled,
+            async_enabled=parallel_state.async_enabled,
+        )
         if compiled_count == 0:
             raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True
