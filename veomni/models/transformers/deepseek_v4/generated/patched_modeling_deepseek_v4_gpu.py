@@ -1443,6 +1443,12 @@ class DeepseekV4Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
+        # Whether every token routes to ``top_k`` *distinct* experts. True for the
+        # learned top-k router; the hash router's frozen ``tid2eid`` table has no
+        # distinct guarantee, so ``DeepseekV4SparseMoeBlock`` overrides this to
+        # False for hash_moe layers to select the conservative grouped-GEMM
+        # ``max_M`` bound. See ``compute_max_expert_tokens``.
+        self.assume_distinct_experts = True
 
     def forward(
         self,
@@ -1464,6 +1470,7 @@ class DeepseekV4Experts(nn.Module):
                 fc2_weight=self.down_proj,
                 fc1_1_2_weight=self.gate_up_proj,
                 swiglu_limit=self.limit,
+                assume_distinct_experts=self.assume_distinct_experts,
             )
         # --- Patch.2 ---
 
@@ -1574,10 +1581,15 @@ class DeepseekV4HashRouter(nn.Module):
 
 class DeepseekV4SparseMoeBlock(nn.Module):
     def __init__(self, config: DeepseekV4Config, layer_idx: int):
-        super().__init__()
+        nn.Module.__init__(self)
         self.is_hash = config.mlp_layer_types[layer_idx] == "hash_moe"
         self.gate = DeepseekV4HashRouter(config) if self.is_hash else DeepseekV4TopKRouter(config)
         self.experts = DeepseekV4Experts(config)
+        # Hash routing selects experts from a frozen ``tid2eid`` table with no
+        # distinct-per-token guarantee, so a token may map to the same expert
+        # twice. Tell the fused grouped-GEMM to use the conservative ``max_M``
+        # bound in that case; the learned top-k router is always distinct.
+        self.experts.assume_distinct_experts = not self.is_hash
         self.shared_experts = DeepseekV4MLP(config)
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:

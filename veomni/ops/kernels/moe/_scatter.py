@@ -77,3 +77,59 @@ def compute_expert_scatter_index(
     )
     scatter_index = inv.to(torch.int32).view(expert_index.shape)
     return sorted_order, scatter_index
+
+
+def compute_max_expert_tokens(
+    expert_index: torch.Tensor,
+    top_k: int,
+    assume_distinct_experts: bool = True,
+) -> int:
+    """Safe, tight per-expert row bound (``max_M``) for the grouped GEMM grid.
+
+    The grouped-GEMM kernels size their launch grid as
+    ``cdiv(max_M, BLOCK_M)`` row-tiles *per expert*; every tile whose row range
+    lies past the expert's real token count early-exits. Correctness only needs
+
+        max_M >= max_e counts[e]
+
+    where ``counts[e]`` is the number of scattered rows routed to expert ``e``.
+    Any value above that just launches extra tiles that immediately return.
+
+    Applicability range (why ``T`` works and is tighter than ``T * top_k``):
+        With standard top-k gating the router does ``torch.topk(logits, top_k)``,
+        which returns ``top_k`` *distinct* experts per token. A distinct-expert
+        constraint means each of the ``T = expert_index.shape[0]`` tokens
+        contributes at most one row to any single expert, hence
+        ``max_e counts[e] <= T``. So ``T`` is a valid bound and is ``top_k``x
+        smaller than the full scattered row count ``T * top_k``
+        (``scatter_output.shape[0]``), shrinking the launched grid accordingly.
+
+        This holds for every ``torch.topk``-gated non-EP fused-MoE path in
+        VeOmni (Qwen3-MoE, Qwen3.5-MoE, gpt-oss, DeepSeek-V4 ``DeepseekV4TopKRouter``).
+
+    When it does NOT hold (``assume_distinct_experts=False``):
+        Some routers select experts *without* a distinct guarantee — e.g. the
+        DeepSeek-V4 hash router looks up a frozen ``tid2eid`` table whose per-token
+        rows are not verified to be distinct. If one token maps to the same expert
+        more than once, that expert can receive up to ``T * top_k`` rows and ``T``
+        would under-count, silently dropping rows. Callers in that regime pass
+        ``assume_distinct_experts=False`` to get the conservative
+        ``T * top_k`` bound (== ``scatter_output.shape[0]``), which is always safe.
+
+    Args:
+        expert_index: ``[T, top_k]`` integer expert assignments per token.
+        top_k: number of expert slots per token (``expert_index.shape[1]``);
+            taken explicitly so the conservative bound is exact even if the
+            caller flattened the index.
+        assume_distinct_experts: when ``True`` (default) return the tight ``T``
+            bound valid under distinct top-k routing; when ``False`` return the
+            conservative ``T * top_k`` bound safe for arbitrary routing.
+
+    Returns:
+        A Python ``int`` usable directly as ``max_M`` (no host/device sync,
+        unlike ``int(counts.max())``).
+    """
+    T = expert_index.shape[0]
+    if assume_distinct_experts:
+        return T
+    return T * top_k
