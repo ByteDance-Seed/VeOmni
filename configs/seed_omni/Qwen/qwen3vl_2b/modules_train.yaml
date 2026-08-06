@@ -2,5 +2,8 @@ qwen3vl_vision:
   model_path: qwen3vl_vision
 qwen3vl_text_encoder:
   model_path: qwen3vl_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
 qwen3vl_llm:
   model_path: qwen3vl_llm

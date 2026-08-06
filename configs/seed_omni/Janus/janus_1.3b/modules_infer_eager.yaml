@@ -5,7 +5,13 @@ janus_siglip:
       fsdp_mode: eager
 janus_vqvae:
   model_path: janus_vqvae
+  accelerator:
+    gradient_checkpointing:
+      enable: false
 janus_text_encoder:
   model_path: janus_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
 janus_llama:
   model_path: janus_llama

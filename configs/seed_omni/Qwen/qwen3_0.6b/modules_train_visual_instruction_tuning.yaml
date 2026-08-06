@@ -6,6 +6,9 @@ qwen3vl_vision:
     freeze: true
 qwen3_text_encoder:
   model_path: qwen3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
   model_config:
     enable_image: true
 qwen3_llm:

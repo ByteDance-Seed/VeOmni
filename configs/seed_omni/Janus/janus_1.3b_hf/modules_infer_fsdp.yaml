@@ -16,6 +16,8 @@ janus_vqvae:
     broadcast_model_weights_from_rank0: false # only meaningful for fsdp2
     fsdp_config:
       fsdp_mode: ddp
+    gradient_checkpointing:
+      enable: false
 janus_text_encoder:
   model_path: janus_text_encoder
   accelerator:
@@ -27,6 +29,8 @@ janus_text_encoder:
     - emb
     extra_parallel_placement_innermost:
     - false
+    gradient_checkpointing:
+      enable: false
 janus_llama:
   model_path: janus_llama
   accelerator:

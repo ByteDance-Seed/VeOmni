@@ -25,6 +25,9 @@ janus_vqvae:
   model_path: janus_vqvae
   ops_implementation:
     attn_implementation: eager
+  accelerator:
+    gradient_checkpointing:
+      enable: false
 
 janus_text_encoder:
   model_path: janus_text_encoder
@@ -32,6 +35,8 @@ janus_text_encoder:
     extra_parallel_sizes: [4]
     extra_parallel_names: ["emb"]
     extra_parallel_placement_innermost: [false]
+    gradient_checkpointing:
+      enable: false
 
 janus_llama:
   model_path: janus_llama

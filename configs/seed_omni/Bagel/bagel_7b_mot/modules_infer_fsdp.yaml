@@ -13,11 +13,15 @@ bagel_text_encoder:
   accelerator:
     fsdp_config:
       fsdp_mode: fsdp2
+    gradient_checkpointing:
+      enable: false
 bagel_flow_connector:
   model_path: bagel_flow_connector
   accelerator:
     fsdp_config:
       fsdp_mode: fsdp2
+    gradient_checkpointing:
+      enable: false
 bagel_qwen2_mot:
   model_path: bagel_qwen2_mot
   accelerator:

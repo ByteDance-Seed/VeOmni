@@ -27,7 +27,6 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, EmbParall
     base_model_prefix = ""
     _no_split_modules: list = ["Embedding", "Linear"]
     main_input_name = "input_ids"
-    supports_gradient_checkpointing = True
 
     def __init__(self, config: TextEncoderConfig):
         super().__init__(config)
@@ -61,19 +60,7 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, EmbParall
         if not self.config.tie_word_embeddings:
             self.lm_head = new_embeddings
 
-    # ── Gradient checkpointing (no-op — nothing to recompute) ──────────────────
-
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
-        """No-op: an embedding/head has no activations worth checkpointing.
-
-        Overridden so a uniform ``enable`` call from the trainer is accepted
-        silently instead of raising in ``PreTrainedModel`` (see class note).
-        """
-        return
-
-    def gradient_checkpointing_disable(self) -> None:
-        """No-op counterpart to :meth:`gradient_checkpointing_enable`."""
-        return
+    # ── Forward ────────────────────────────────────────────────────────────────
 
     def forward(self, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
         return self.encode(**kwargs)
