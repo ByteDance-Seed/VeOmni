@@ -21,6 +21,11 @@ from transformers.utils import ModelOutput
 
 from ......ops.dispatch import OpSlot
 from ......ops.kernels.attention import fused_attention_forward
+from .checkpoint_conversion import (
+    BagelQwen2MoTCheckpointTensorConverter,
+    combine_qkv_state_dict_pre_hook,
+    split_qkv_state_dict_post_hook,
+)
 from .configuration import BagelQwen2MoTConfig
 from .masking import build_mot_block_mask
 from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
@@ -55,11 +60,22 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, BagelQwen2MoTMetricMeterMixin, Pre
     _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
     supports_gradient_checkpointing = True
     _supports_flex_attn = True
+    _export_hf_checkpoint_with_weight_conversions = True
 
     def __init__(self, config: BagelQwen2MoTConfig):
         super().__init__(config)
         self.model = BagelQwen2MoTBackbone(config)
         self.post_init()
+
+    # The runtime stores one merged QKV parameter per MoT branch, while existing
+    # HF checkpoints keep separate Q/K/V keys. VeOmni's streaming loader bypasses
+    # load_state_dict hooks, so it needs this dedicated checkpoint converter.
+    @staticmethod
+    def _create_checkpoint_tensor_converter(
+        model: PreTrainedModel,
+    ) -> BagelQwen2MoTCheckpointTensorConverter:
+        del model
+        return BagelQwen2MoTCheckpointTensorConverter()
 
     def forward(  # type: ignore[override]
         self,
@@ -311,18 +327,27 @@ class BagelQwen2MoTAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+
+        self.query_size = self.num_heads * self.head_dim
+        self.key_value_size = self.num_key_value_heads * self.head_dim
+        self.qkv_split_sizes = (self.query_size, self.key_value_size, self.key_value_size)
+        qkv_size = sum(self.qkv_split_sizes)
+
+        self.qkv_proj_und = nn.Linear(self.hidden_size, qkv_size, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.q_proj_moe_gen = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+
+        self.qkv_proj_gen = nn.Linear(self.hidden_size, qkv_size, bias=True)
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm_moe_gen = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm_moe_gen = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        # Keep the public checkpoint schema unchanged even though the runtime
+        # parameters are merged: direct PyTorch loads combine legacy Q/K/V keys,
+        # and ordinary state_dict exports split the combined parameters again.
+        self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
+        self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
 
     def _forward_packed_train(
         self,
@@ -333,40 +358,25 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_und_token_indexes: torch.Tensor,
         packed_gen_token_indexes: torch.Tensor,
     ) -> torch.Tensor:
-        packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
-        packed_key_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
-        packed_value_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
+        packed_qkv_states = packed_sequence.new_zeros((packed_sequence.shape[0], sum(self.qkv_split_sizes)))
 
         packed_sequence_und = packed_sequence[packed_und_token_indexes]
         packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
         has_und_tokens = int(packed_und_token_indexes.numel()) > 0
         has_gen_tokens = int(packed_gen_token_indexes.numel()) > 0
 
-        query_states_und = self.q_proj(packed_sequence_und)
-        query_states_gen = self.q_proj_moe_gen(packed_sequence_gen)
-        key_states_und = self.k_proj(packed_sequence_und)
-        key_states_gen = self.k_proj_moe_gen(packed_sequence_gen)
-        value_states_und = self.v_proj(packed_sequence_und)
-        value_states_gen = self.v_proj_moe_gen(packed_sequence_gen)
-        packed_query_states[packed_und_token_indexes] = query_states_und
-        packed_query_states[packed_gen_token_indexes] = query_states_gen
-        packed_key_states[packed_und_token_indexes] = key_states_und
-        packed_key_states[packed_gen_token_indexes] = key_states_gen
-        packed_value_states[packed_und_token_indexes] = value_states_und
-        packed_value_states[packed_gen_token_indexes] = value_states_gen
+        qkv_states_und = self.qkv_proj_und(packed_sequence_und)
+        qkv_states_gen = self.qkv_proj_gen(packed_sequence_gen)
+        packed_qkv_states[packed_und_token_indexes] = qkv_states_und
+        packed_qkv_states[packed_gen_token_indexes] = qkv_states_gen
         if not has_und_tokens:
-            packed_query_states = _fold_zero_anchors(packed_query_states, query_states_und)
-            packed_key_states = _fold_zero_anchors(packed_key_states, key_states_und)
-            packed_value_states = _fold_zero_anchors(packed_value_states, value_states_und)
+            packed_qkv_states = _fold_zero_anchors(packed_qkv_states, qkv_states_und)
         if not has_gen_tokens:
-            packed_query_states = _fold_zero_anchors(packed_query_states, query_states_gen)
-            packed_key_states = _fold_zero_anchors(packed_key_states, key_states_gen)
-            packed_value_states = _fold_zero_anchors(packed_value_states, value_states_gen)
+            packed_qkv_states = _fold_zero_anchors(packed_qkv_states, qkv_states_gen)
 
+        packed_query_states, packed_key_states, packed_value_states = packed_qkv_states.split(
+            self.qkv_split_sizes, dim=-1
+        )
         packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
         packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -434,33 +444,29 @@ class BagelQwen2MoTAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project packed inference tokens through the matching MoT attention expert."""
         if not is_gen:
-            packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
-            packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
-            packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+            packed_query_states, packed_key_states, packed_value_states = self.qkv_proj_und(
+                packed_query_sequence
+            ).split(self.qkv_split_sizes, dim=-1)
+            packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+            packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
             packed_query_states = self.q_norm(packed_query_states)
             packed_key_states = self.k_norm(packed_key_states)
             return packed_query_states, packed_key_states, packed_value_states
 
         packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
-        packed_query_states = packed_query_sequence.new_zeros(
-            (packed_query_sequence.shape[0], self.num_heads * self.head_dim)
-        )
-        packed_key_states = packed_query_sequence.new_zeros(
-            (packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
-        packed_value_states = packed_query_sequence.new_zeros(
-            (packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim)
+        packed_qkv_states = packed_query_sequence.new_zeros(
+            (packed_query_sequence.shape[0], sum(self.qkv_split_sizes))
         )
 
         packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
         packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-        packed_query_states[packed_text_indexes] = self.q_proj(packed_text_query_sequence)
-        packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence)
-        packed_key_states[packed_text_indexes] = self.k_proj(packed_text_query_sequence)
-        packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence)
-        packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
-        packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
+        packed_qkv_states[packed_text_indexes] = self.qkv_proj_und(packed_text_query_sequence)
+        packed_qkv_states[packed_vae_token_indexes] = self.qkv_proj_gen(packed_vae_query_sequence)
 
+        packed_query_states, packed_key_states, packed_value_states = packed_qkv_states.split(
+            self.qkv_split_sizes, dim=-1
+        )
         packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim).to(torch.float32)
         packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim).to(torch.float32)
         packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)

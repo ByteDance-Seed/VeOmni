@@ -17,6 +17,7 @@ from veomni.models.seed_omni.modules.bagel.qwen2_mot import modeling as qwen2_mo
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 from veomni.utils.device import get_device_type, get_torch_device
+from veomni.utils.save_safetensor_utils import get_model_save_state
 
 
 def _sample_items(
@@ -227,6 +228,21 @@ def _qwen2_mot_sp_worker() -> None:
         fully_shard(layer, mesh=sp_state.fsdp_mesh, mp_policy=mp_policy)
     fully_shard(sequence_parallel, mesh=sp_state.fsdp_mesh, mp_policy=mp_policy)
     _enable_scoped_gradient_checkpointing(sequence_parallel, sp_state)
+
+    qkv_checkpoint_keys = {
+        f"model.layers.0.self_attn.{projection}.{kind}"
+        for projection in ("q_proj", "k_proj", "v_proj", "q_proj_moe_gen", "k_proj_moe_gen", "v_proj_moe_gen")
+        for kind in ("weight", "bias")
+    }
+    exported_qkv = get_model_save_state(
+        sequence_parallel,
+        fqn_to_index_mapping=dict.fromkeys(qkv_checkpoint_keys, 0),
+        parallel_state=sp_state,
+    )
+    assert set(exported_qkv) == qkv_checkpoint_keys
+    assert tuple(exported_qkv["model.layers.0.self_attn.q_proj.weight"].shape) == (448, 448)
+    assert tuple(exported_qkv["model.layers.0.self_attn.k_proj.weight"].shape) == (64, 448)
+    assert tuple(exported_qkv["model.layers.0.self_attn.v_proj.weight"].shape) == (64, 448)
 
     hidden_size = int(reference.config.hidden_size)
     reference_conversation, reference_inputs = _replicated_batch(device, hidden_size)
