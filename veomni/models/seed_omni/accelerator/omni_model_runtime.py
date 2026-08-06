@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 import torch.nn as nn
 
@@ -29,6 +29,7 @@ from ..mixins.metric_meter_mixin import MetricMeterResult
 from ..modeling_omni import _LOSS_KEY, OmniModel
 from ..utils.graph_profiler import GraphProfiler
 from .executor import execute_generation_node, execute_train_node
+from .utils import iter_named_omni_modules, save_module_subdirectory
 
 
 if TYPE_CHECKING:
@@ -59,11 +60,10 @@ class OmniModelRuntime:
       metering.
 
     Both are used through the single ``self.model`` handle on the trainer /
-    inferencer. Everything not defined here is forwarded to the composed
-    :class:`OmniModel` (see :meth:`__getattr__`), so ``config``,
-    ``modules_dict``, ``save_pretrained`` and the ``nn.Module`` reads shared
-    callbacks rely on work the same either way; :meth:`forward` and
-    :meth:`generate` shadow the eager, profiler-free versions.
+    inferencer. APIs that need no wrapper handling are forwarded via
+    :meth:`__getattr__` (``config``, ``modules_dict``, …).
+    :meth:`forward`, :meth:`generate`, :meth:`save_pretrained`, :meth:`reset`,
+    and :meth:`named_omni_modules` are implemented here instead.
     """
 
     def __init__(
@@ -113,14 +113,7 @@ class OmniModelRuntime:
         )
 
     def __getattr__(self, name: str) -> Any:
-        """Forward the composed :class:`OmniModel` surface for anything not defined here.
-
-        Keeps ``trainer.model`` / ``inferencer.model`` a single handle whether it
-        is the bare :class:`OmniModel` or this runtime: ``config``,
-        ``modules_dict``, ``reset``, ``save_pretrained`` and the
-        ``nn.Module`` reads shared callbacks use (e.g. ``modules()`` for the MoE
-        router monitor) resolve identically.
-        """
+        """Forward undshadowed :class:`OmniModel` APIs."""
         try:
             model = object.__getattribute__(self, "model")
         except AttributeError:
@@ -270,7 +263,7 @@ class OmniModelRuntime:
         model._emit_progress(total_steps)
 
         if not model.generation_graph.is_done():
-            for name, raw in model.named_omni_modules():
+            for name, raw in self.named_omni_modules():
                 out = raw.finalize(ctx=ctx)
                 if not isinstance(out, dict):
                     raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
@@ -280,6 +273,58 @@ class OmniModelRuntime:
                     profiler.record(f"finalize:{name} | generated:{generated['type']}")
 
         return list(model._generated)
+
+    def named_omni_modules(self) -> Iterator[tuple[str, Any]]:
+        """Yield ``(name, BaseMixin)`` for every graph participant (unwraps wrappers)."""
+        yield from iter_named_omni_modules(self.model._module_names, self.model.modules_dict)
+
+    def reset(self) -> None:
+        """Clear per-conversation inference runtime state (unwraps wrapped modules)."""
+        model = self.model
+        model.generation_graph.reset()
+        model._generated.clear()
+        for _, module in self.named_omni_modules():
+            module.reset_global_inference_state()
+
+    def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
+        """Save the omni-root HF layout (config + graphs + module sidecars).
+
+        Unwraps DDP / LoRA wrappers when writing per-module assets; weight export
+        still calls each wrapped module's ``save_pretrained`` so FSDP/DDP hooks run.
+        """
+        import torch.distributed as dist
+
+        is_main_process = kwargs.pop("is_main_process", None)
+        if is_main_process is None:
+            is_main_process = not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+        if not is_main_process:
+            return
+
+        save_module_weights = kwargs.pop("save_module_weights", True)
+        safe_serialization = kwargs.pop("safe_serialization", True)
+        max_shard_size = kwargs.pop("max_shard_size", "5GB")
+
+        save_directory = str(save_directory)
+        os.makedirs(save_directory, exist_ok=True)
+
+        model = self.model
+        module_save_kwargs = {
+            **kwargs,
+            "safe_serialization": safe_serialization,
+            "max_shard_size": max_shard_size,
+        }
+        for name in model._module_names:
+            module = model.modules_dict[name]
+            save_module_subdirectory(
+                model.config,
+                name,
+                module,
+                save_directory,
+                save_module_weights=save_module_weights,
+                **module_save_kwargs,
+            )
+
+        model.config.save_pretrained(save_directory)
 
     def collect_step_metrics(self) -> dict[str, MetricMeterResult]:
         """Gather every metered module's ``(theoretical_flops, seqlens)`` on this model."""
@@ -304,10 +349,6 @@ class OmniModelRuntime:
         """Export every module's HF weights / LoRA adapter."""
         for module_runtime in self.module_runtimes.values():
             module_runtime.save_hf_or_lora(state)
-
-    def save_pretrained(self, save_directory: str | os.PathLike, **kwargs: Any) -> None:
-        """Save the omni-root HF layout (config + graphs + module sidecars)."""
-        self.model.save_pretrained(save_directory, **kwargs)
 
 
 def _sum_losses(losses: dict[str, Any]) -> Any | None:

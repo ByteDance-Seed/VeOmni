@@ -617,7 +617,8 @@ class _DdpStyleWrapper(nn.Module):
         return self.module(*args, **kwargs)
 
 
-def test_named_omni_modules_unwraps_ddp_style_wrapper():
+def test_named_omni_modules_yields_modules_as_attached():
+    """Bare :class:`OmniModel` yields sub-modules exactly as stored (no unwrap)."""
     edges = _understanding_only_edges()
     g = TrainingGraph(edges)
     raw_modules = _fake_modules(g)
@@ -630,21 +631,41 @@ def test_named_omni_modules_unwraps_ddp_style_wrapper():
     model = OmniModel(config, wrapped_modules)
 
     resolved = dict(model.named_omni_modules())
+    assert set(resolved) == set(wrapped_modules)
+    for name, mod in resolved.items():
+        assert mod is wrapped_modules[name]
+
+
+def test_iter_named_omni_modules_unwraps_ddp_style_wrapper():
+    from veomni.models.seed_omni.accelerator.utils import iter_named_omni_modules
+
+    edges = _understanding_only_edges()
+    g = TrainingGraph(edges)
+    raw_modules = _fake_modules(g)
+    wrapped_modules = {name: _DdpStyleWrapper(mod) for name, mod in raw_modules.items()}
+    config = OmniConfig(
+        modules={name: {"subfolder": name} for name in raw_modules},
+        training_graph=edges,
+        generation_graphs=_minimal_generation_graphs(),
+    )
+
+    resolved = dict(iter_named_omni_modules(config.module_names, wrapped_modules))
     assert set(resolved) == set(raw_modules)
     for name, raw in resolved.items():
         assert raw is raw_modules[name]
         assert not isinstance(raw, _DdpStyleWrapper)
 
 
-def test_named_omni_modules_skips_non_modulemixin():
+def test_named_omni_modules_yields_all_graph_participants():
     class _PlainModule(nn.Module):
         def forward(self, x):
             return x
 
+    plain = _PlainModule()
     config = OmniConfig(
         modules={"plain": {"subfolder": "plain"}},
         training_graph=[{"from": "plain", "to": "end"}],
         generation_graphs=_minimal_generation_graphs("plain"),
     )
-    model = OmniModel(config, {"plain": _PlainModule()})
-    assert list(model.named_omni_modules()) == []
+    model = OmniModel(config, {"plain": plain})
+    assert list(model.named_omni_modules()) == [("plain", plain)]

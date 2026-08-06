@@ -6,30 +6,15 @@ This file holds the **clean modeling definition** — FSM inference via
 and parallel-infra-free so it can be loaded with HF ``from_pretrained`` /
 ``from_config`` and run eager single-process inference without VeOmni.
 
-**Training** requires :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`,
-which owns the training DAG loop, parallel-state scoping, graph profiling, and
-metric metering.
+Training and distributed execution belong in ``accelerator/``; this module
+imports nothing from there.
 
 Architecture
 ------------
 ``OmniModel`` carries:
 
-* sub-modules           — each graph participant is attached as a **direct
-                          attribute** of ``OmniModel``.  In the eager path these
-                          are bare hook-bearing modules (typically a concrete
-                          ``*BaseMixin + PreTrainedModel`` class from the
-                          registry).  Under VeOmni training they may be
-                          FSDP/DDP-wrapped; the graph resolves graph hooks
-                          (``pre_forward`` / ``post_forward``) through
-                          :func:`~veomni.models.seed_omni.accelerator.dispatch.unwrap_graph_module`.
-                          Parallel/acceleration build hooks live on
-                          :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
-                          (or a customized runtime subclass), not on
-                          :class:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin`.
-* ``generation_graph``  — :class:`GenerationGraph` (FSM).
-
-Training uses :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
-to walk ``training_graph``; the bare :class:`OmniModel` does not implement it.
+* sub-modules — each graph participant is a direct attribute from the registry.
+* ``generation_graph`` — :class:`GenerationGraph` (FSM).
 
 Inference
 ---------
@@ -52,7 +37,6 @@ from .configuration_omni import OmniConfig
 from .graphs.base import NodeDef
 from .graphs.generation_graph import GenerationGraph
 from .graphs.training_graph import TrainingGraph
-from .mixins.base_mixin import BaseMixin
 from .modules import OMNI_MODEL_REGISTRY, read_model_type
 
 
@@ -100,11 +84,7 @@ class OmniModel(PreTrainedModel):
         ``generation_graphs`` populated. The FSM bound here is the one
         ``config.infer_type`` selects, so switching scenario means rebuilding.
     modules:
-        ``{module_name: nn.Module}`` — already constructed graph participants.
-        VeOmni trainers/inferencers compose them into :class:`OmniModel` and run
-        graph loops via :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`.
-        Training may attach FSDP/DDP wrappers around each entry;
-        graph hooks are resolved via :func:`~veomni.models.seed_omni.accelerator.dispatch.unwrap_graph_module`.
+        ``{module_name: nn.Module}`` — bare graph participants for the eager path.
     """
 
     config_class = OmniConfig
@@ -266,18 +246,7 @@ class OmniModel(PreTrainedModel):
 
     @staticmethod
     def _save_module_assets(module: nn.Module, module_dir: str) -> None:
-        """Save a module's config plus its processor / tokenizer sidecars (no weights).
-
-        ``module`` may still be DDP-wrapped under VeOmni training (FSDP2 composes
-        in place, but ``DistributedDataParallel`` does not forward unknown
-        attribute lookups to ``.module``) — unwrap first so ``config`` / processor
-        / tokenizer resolve regardless of ``dp_mode``.
-        """
-        # Local import: `.accelerator` eagerly imports `omni_model_runtime`, which
-        # imports this module — a module-level import here would be circular.
-        from .accelerator.dispatch import unwrap_module_chain
-
-        module = unwrap_module_chain(module)
+        """Save config plus processor / tokenizer sidecars (no weights)."""
         cfg = getattr(module, "config", None)
         if cfg is not None and hasattr(cfg, "save_pretrained"):
             cfg.save_pretrained(module_dir)
@@ -368,11 +337,7 @@ class OmniModel(PreTrainedModel):
         return {name: getattr(self, name) for name in self._module_names}
 
     def forward(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Training is not supported on the bare :class:`OmniModel`.
-
-        Use :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
-        (via :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`) for the training DAG.
-        """
+        """Training is not supported on the bare :class:`OmniModel`."""
         raise NotImplementedError(
             "OmniModel.forward() is not available on the native eager model. "
             "Training requires OmniModelRuntime (see OmniTrainer)."
@@ -385,7 +350,9 @@ class OmniModel(PreTrainedModel):
         self.generation_graph.reset()
         self._generated.clear()
         for _, module in self.named_omni_modules():
-            module.reset_global_inference_state()
+            reset_fn = getattr(module, "reset_global_inference_state", None)
+            if reset_fn is not None:
+                reset_fn()
 
     @staticmethod
     def _normalize_generated(item: Any) -> dict[str, Any] | None:
@@ -426,10 +393,13 @@ class OmniModel(PreTrainedModel):
 
     def _invoke_module_finalize(self, ctx: dict[str, Any]) -> None:
         """Call ``finalize`` on every graph participant when the safety cap trips."""
-        for _, raw in self.named_omni_modules():
-            out = raw.finalize(ctx=ctx)
+        for _, module in self.named_omni_modules():
+            finalize_fn = getattr(module, "finalize", None)
+            if finalize_fn is None:
+                continue
+            out = finalize_fn(ctx=ctx)
             if not isinstance(out, dict):
-                raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
+                raise TypeError(f"{type(module).__name__}.finalize must return a dict, got {type(out).__name__}.")
             self._append_generated(out.pop("generated", None))
 
     def _emit_progress(self, total_steps: int) -> None:
@@ -489,20 +459,9 @@ class OmniModel(PreTrainedModel):
     # ── Utilities ─────────────────────────────────────────────────────────────
 
     def named_omni_modules(self) -> Iterator[tuple[str, nn.Module]]:
-        """Yield ``(name, raw)`` for every graph participant.
-
-        ``raw`` is the :class:`BaseMixin` resolved through
-        :func:`~veomni.models.seed_omni.accelerator.dispatch.unwrap_graph_module`
-        (bare in the eager path; unwrapped from FSDP/DDP/LoRA wrappers under
-        VeOmni).  Non-:class:`BaseMixin` entries are skipped.
-        """
-        from .accelerator.dispatch import unwrap_graph_module  # see _save_module_assets
-
+        """Yield ``(name, module)`` for every graph participant."""
         for name in self._module_names:
-            module = getattr(self, name)
-            if not _is_omni_module(module):
-                continue
-            yield name, unwrap_graph_module(module, module_name=name)
+            yield name, getattr(self, name)
 
     def get_module(self, name: str) -> nn.Module:
         if name not in self._module_names:
@@ -520,7 +479,9 @@ class OmniModel(PreTrainedModel):
         """Collect per-module assets (vision/audio processors, codebooks)."""
         assets: list[Any] = []
         for _, module in self.named_omni_modules():
-            assets.extend(module.get_assets())
+            get_assets = getattr(module, "get_assets", None)
+            if get_assets is not None:
+                assets.extend(get_assets())
         return assets
 
 
@@ -535,13 +496,6 @@ def merge_generation_kwargs(
     merged = dict(defaults or {})
     merged.update(overrides or {})
     return merged
-
-
-def _is_omni_module(mod: nn.Module) -> bool:
-    """True when ``mod`` (possibly wrapped) resolves to a :class:`BaseMixin`."""
-    from .accelerator.dispatch import unwrap_module_chain  # see OmniModel._save_module_assets
-
-    return isinstance(unwrap_module_chain(mod), BaseMixin)
 
 
 __all__ = ["OmniModel", "_LOSS_KEY", "merge_generation_kwargs"]
