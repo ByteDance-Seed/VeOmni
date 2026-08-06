@@ -98,8 +98,16 @@ def _init_cp_attention(
     seq_len: int,
     with_compressor: bool,
     layer_idx: int = 0,
+    batch_size: int = 1,
 ):
-    """Enter the process group, build the shared layer, and return the fixture."""
+    """Enter the process group, build the shared layer, and return the fixture.
+
+    ``batch_size`` widens the hidden states, the position ids *and* the mask
+    together. It has to be all three: the compressor's ``block_bias`` carries the
+    batch dimension and is concatenated onto the mask, so a batch-1 mask beside
+    batch-2 hidden states fails on that concatenation instead of on whatever the
+    case was written to exercise.
+    """
     device_type = get_device_type()
     get_torch_device().set_device(rank)
     dist.init_process_group(
@@ -129,14 +137,16 @@ def _init_cp_attention(
     _broadcast_module(layer)
     layer.train()
 
-    full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device_type, dtype=torch.float32)
+    full_hidden = torch.randn(batch_size, seq_len, config.hidden_size, device=device_type, dtype=torch.float32)
     dist.broadcast(full_hidden, src=0)
-    full_position_ids = torch.arange(seq_len, device=device_type).view(1, -1)
+    full_position_ids = torch.arange(seq_len, device=device_type).view(1, -1).repeat(batch_size, 1)
 
     rotary = dsv4.DeepseekV4RotaryEmbedding(config).to(device=device_type)
     _broadcast_module(rotary)
 
-    full_mask = _build_causal_mask(seq_len, config.sliding_window, device_type, torch.float32)
+    full_mask = _build_causal_mask(seq_len, config.sliding_window, device_type, torch.float32).repeat(
+        batch_size, 1, 1, 1
+    )
     return dsv4, layer, _make_forward(layer, rotary), full_hidden, full_position_ids, full_mask
 
 
@@ -147,11 +157,12 @@ def _run_attention_cp(
     seq_len: int,
     with_compressor: bool,
     layer_idx: int = 0,
+    batch_size: int = 1,
 ) -> None:
     from veomni.distributed.parallel_state import clear_parallel_state
 
     _, layer, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
-        rank, world_size, init_file, seq_len, with_compressor, layer_idx
+        rank, world_size, init_file, seq_len, with_compressor, layer_idx, batch_size
     )
 
     # Baseline: whole sequence with the parallel state stubbed out. Re-initialising
@@ -748,6 +759,31 @@ def test_deepseek_v4_attention_cp_with_compressor(cp_size):
             _run_attention_cp,
             args=(cp_size, init_file, 128, True),
             nprocs=cp_size,
+            join=True,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+def test_deepseek_v4_attention_cp_with_compressor_batch_2():
+    """The same HCA layer at batch 2, which is where the KV gather's backward broke.
+
+    A compressor gives the gathered ``kv`` exactly one consumer,
+    ``torch.cat([kv, compressed_kv], dim=2)``, so ``_Gather.backward`` receives a
+    narrowed view of the cat's gradient buffer. ``kv`` is ``[B, 1, S, D]``, whose
+    leading dims collapse at batch 1 and make that view contiguous by accident;
+    at batch 2 it is not, and the in-place ``dist.all_reduce`` rejects it with
+    ``ValueError: Tensors must be contiguous``. Every real DeepSeek-V4 layer has
+    a compressor, so without this CP runs at batch 1 only.
+
+    One ``cp_size`` is enough: the view's stride does not depend on how many
+    ranks contributed to the buffer it was narrowed out of.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _run_attention_cp,
+            args=(2, init_file, 128, True, 0, 2),
+            nprocs=2,
             join=True,
         )
 
