@@ -2088,11 +2088,12 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     # Patch: DeepseekV4Model.forward
     # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
     # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
-    # 3. Under Ulysses SP the collator keeps full ``attention_mask`` /
-    #    ``cu_seq_lens_*`` while slicing ``input_ids`` / local ``position_ids``.
-    #    Build the sliding-window mask and packed compression metadata on the full
-    #    sequence length so attention matches non-SP semantics after the all-gather
-    #    inside ``DeepseekV4Attention``.
+    # 3. Under either sequence-parallel mode -- Ulysses or context parallelism --
+    #    the collator keeps full ``attention_mask`` / ``cu_seq_lens_*`` while
+    #    slicing ``input_ids`` / local ``position_ids``. Build the sliding-window
+    #    mask and packed compression metadata on the full sequence length so
+    #    attention matches non-SP semantics after the all-gather inside
+    #    ``DeepseekV4Attention``.
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -2123,14 +2124,40 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
             position_ids = position_ids.unsqueeze(0)
 
-        ulysses_enabled = get_parallel_state().ulysses_enabled
-        ulysses_group = get_parallel_state().ulysses_group if ulysses_enabled else None
-        ulysses_size = get_parallel_state().ulysses_size if ulysses_enabled else 1
+        # Both sequence-parallel modes hand this forward one shard of a longer
+        # sequence, and everything below has to keep describing the whole of it: the
+        # packed compression metadata is indexed by global positions, and the
+        # sliding-window mask covers every query row before ``DeepseekV4Attention``
+        # narrows it to this rank's. Ulysses gets there by all-gathering the queries;
+        # context parallelism never does, so the global length and positions have to
+        # be reconstructed here either way.
+        #
+        # The contract, which the context-parallel path leans on everywhere and no
+        # single rank can check: rank ``r`` of ``sp_size`` receives rows
+        # ``[r*L, (r+1)*L)`` of the global sequence -- contiguous and equally sized --
+        # carrying their *global* ``position_ids`` (for packed data the per-sample
+        # positions, which is what makes them global), while ``cu_seq_lens_q`` still
+        # spans the whole packed batch. ``DeepseekV4Attention``, the compressors'
+        # ``shard_packed_compression_metadata`` and ``DeepseekV4Indexer`` each rebuild
+        # the shard's origin as ``cp_rank * local_seq_len`` out of nothing but that.
+        # ``SequenceParallelCollator`` supplies it: ``sp_slice`` narrows on
+        # ``sp_rank`` without renumbering and derives the cu-seqlens before slicing,
+        # and a CP-only mesh flattens ``sp`` onto ``cp`` so the two ranks agree.
+        # The packed length check below is the one part of it visible from here.
+        parallel_state = get_parallel_state()
+        # Never both -- ``ParallelState`` refuses the hybrid. Each group and size is
+        # read only through the flag that selected it, so a parallel-state stub
+        # carrying just the two flags still takes the single-rank path.
+        if parallel_state.cp_enabled:
+            sp_group, sp_size = parallel_state.cp_group, parallel_state.cp_size
+        elif parallel_state.ulysses_enabled:
+            sp_group, sp_size = parallel_state.ulysses_group, parallel_state.ulysses_size
+        else:
+            sp_group, sp_size = None, 1
+        sp_enabled = sp_size > 1
         local_seq_len = inputs_embeds.shape[1]
-        full_seq_len = local_seq_len * ulysses_size if ulysses_enabled else local_seq_len
-        full_position_ids = (
-            gather_outputs(position_ids, gather_dim=-1, group=ulysses_group) if ulysses_enabled else position_ids
-        )
+        full_seq_len = local_seq_len * sp_size
+        full_position_ids = gather_outputs(position_ids, gather_dim=-1, group=sp_group) if sp_enabled else position_ids
 
         # The TileLang sparse kernel reads a compact candidate list, and packed
         # metadata already pins down every constraint a dense mask would encode, so
@@ -2183,9 +2210,12 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         else:
             mask_embeds = inputs_embeds
             mask_position_ids = position_ids
-            if ulysses_enabled:
+            if sp_enabled:
                 # SP collator keeps the full 2D attention_mask while slicing
                 # input_ids; build the 4D sliding-window mask on the full length.
+                # Under CP the attention forward additionally *requires* the full
+                # length, and refuses a shard-width mask rather than attending to
+                # the wrong rows.
                 mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
                 mask_position_ids = full_position_ids
             causal_mask = create_sliding_window_causal_mask(

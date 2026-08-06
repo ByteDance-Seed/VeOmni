@@ -64,6 +64,14 @@ def _init_position_bias(compressor) -> None:
             torch.nn.init.normal_(compressor.indexer.position_bias, std=0.02)
 
 
+def _init_every_position_bias(model: torch.nn.Module) -> None:
+    """``_init_position_bias`` for every compressor and indexer in a whole model."""
+    for module in model.modules():
+        if getattr(module, "position_bias", None) is not None:
+            with torch.no_grad():
+                torch.nn.init.normal_(module.position_bias, std=0.02)
+
+
 def _make_forward(layer, rotary):
     """The attention call every test shares: both rope variants, then the layer."""
 
@@ -251,6 +259,31 @@ class _FixedIndexer(torch.nn.Module):
 def _grad_or_zeros(param: torch.nn.Parameter) -> torch.Tensor:
     """This parameter's gradient, or zeros where the forward never reached it."""
     return torch.zeros_like(param) if param.grad is None else param.grad.detach().clone()
+
+
+def _assert_close_to_scale(actual: torch.Tensor, expected: torch.Tensor, tolerance: float, name: str) -> None:
+    """Compare with a tolerance tied to ``expected``'s own magnitude.
+
+    Whole-model gradients cannot be compared with a fixed ``atol``. Summing one
+    128-row forward and summing four 32-row ones reduce in different orders, and
+    the resulting error floor scales with the size of the terms being summed --
+    not with the element that happens to cancel down to near zero. In the toy
+    model the embedding gradient spans ``1e-2`` to ``1e3`` inside a single
+    tensor, so ``atol=1e-4`` fails on that cancellation while a fixed ``atol``
+    large enough to pass it would no longer catch anything. Scaling each tensor
+    by its own maximum makes the tolerance mean "a fraction of this tensor",
+    which is the quantity noise here is actually bounded by. The floor of 1 keeps
+    a tensor that is entirely rounding noise (the hash routers' gate weights peak
+    around ``1e-6``) from being compared against its own noise.
+    """
+    scale = expected.abs().max().clamp_min(1.0).float()
+    torch.testing.assert_close(
+        actual.float() / scale,
+        expected.float() / scale,
+        rtol=tolerance,
+        atol=tolerance,
+        msg=lambda text: f"{name} (scaled by {float(scale):.4g}): {text}",
+    )
 
 
 def _window_starts(rate: int, seq_len: int, sample_slices) -> torch.Tensor:
@@ -721,6 +754,256 @@ def test_deepseek_v4_indexer_cp(cp_size):
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
         mp.spawn(_run_indexer_cp, args=(cp_size, init_file, 256), nprocs=cp_size, join=True)
+
+
+# The packed fixture for the whole-model cases. ``seq_len`` 128 at cp_size=4
+# gives ``L=32``, which is the toy HCA rate: a compressor's halo is one rate
+# wide, so 128 is the shortest sequence that can run every layer of this config
+# at cp_size=4. Samples ``((0, 70), (70, 128))`` are deliberately misaligned:
+#
+#   * the sample boundary at 70 falls strictly inside rank 2's shard [64, 96);
+#   * HCA (rate 32) starts are [0, 32, 70], so the window at 70 covers 70..101
+#     and straddles the rank 2/3 edge at 96 -- and rank 3 owns no HCA window at
+#     all, which is the empty-result path;
+#   * CSA (rate 4) starts are 0,4,..,64 then 70,74,..,124, so the window at 94
+#     covers 94..97 and straddles the same edge from the other rate.
+#
+# The 31 CSA compressed rows are fewer than ``index_topk`` 32, so every causally
+# visible slot is selected and the comparison does not turn on top-k *order*;
+# ``test_deepseek_v4_indexer_cp`` is what covers the ranking.
+_PACKED_MODEL_SEQ_LEN = 128
+_PACKED_MODEL_SAMPLES = ((0, 70), (70, 128))
+
+
+def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torch.dtype, tilelang: bool) -> None:
+    """A CP shard of a whole packed model matches the single-rank forward and backward.
+
+    This is the end-to-end statement of the contract every layer beneath assumes:
+    rank ``r`` receives rows ``[r*L, (r+1)*L)`` of the global sequence, their
+    *global* ``position_ids``, and the *full-sequence* ``cu_seq_lens_q``. The
+    model forward has to build its packed compression metadata against that
+    global sequence rather than against the shard it can see, or every window and
+    every per-query compressed range below it describes the wrong tokens.
+    ``test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank`` pins that the
+    collator really produces these three things.
+    """
+    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
+    dist.init_process_group(
+        backend=get_dist_comm_backend(),
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+
+    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    if tilelang:
+        # The model forward withholds the dense mask only for bf16 CUDA tensors
+        # with the TileLang attention selected, so this is the arm that reaches
+        # the compact-candidate path -- and the only place the TileLang indexer
+        # runs inside a CSA layer under CP.
+        dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    torch.manual_seed(0)
+    model = dsv4.DeepseekV4Model(config).to(device=device_type, dtype=dtype)
+    _init_every_position_bias(model)
+    _broadcast_module(model)
+    model.train()
+
+    seq_len = _PACKED_MODEL_SEQ_LEN
+    cu_seq_lens = torch.tensor([0, *(end for _, end in _PACKED_MODEL_SAMPLES)], device=device_type, dtype=torch.int32)
+    position_ids = torch.cat(
+        [torch.arange(end - begin, device=device_type) for begin, end in _PACKED_MODEL_SAMPLES]
+    ).view(1, seq_len)
+    input_ids = torch.randint(0, config.vocab_size, (1, seq_len), device=device_type)
+    dist.broadcast(input_ids, src=0)
+
+    # Which scorer ran is not observable from the outputs: TileLang and eager
+    # agree when both are reachable, and the model forward silently keeps the
+    # dense mask when they are not. Counting the launches is what stops a parity
+    # pass that never entered the kernel it exists to exercise.
+    counts = dict.fromkeys(("sparse_attn_tilelang", "v4_lighting_indexer"), 0)
+
+    def _counted(name):
+        real = getattr(dsv4, name)
+
+        def wrapper(*args, **kwargs):
+            counts[name] += 1
+            return real(*args, **kwargs)
+
+        return wrapper
+
+    def _forward(ids, positions):
+        return model(input_ids=ids, position_ids=positions, cu_seq_lens_q=cu_seq_lens).last_hidden_state
+
+    local_len = seq_len // world_size
+    begin = rank * local_len
+    with (
+        patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _counted("sparse_attn_tilelang")),
+        patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counted("v4_lighting_indexer")),
+    ):
+        # Baseline: the whole packed batch with the parallel state stubbed out.
+        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
+        with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+            baseline = _forward(input_ids, position_ids)
+            baseline.sum().backward()
+            baseline_grads = {name: _grad_or_zeros(param) for name, param in model.named_parameters()}
+            baseline = baseline.detach()
+            model.zero_grad(set_to_none=True)
+
+        # Context-parallel: this rank's contiguous shard beside the full-sequence
+        # cu-seqlens, which is what the collator hands the model.
+        local = _forward(input_ids[:, begin : begin + local_len], position_ids[:, begin : begin + local_len])
+        local.sum().backward()
+
+    summed_grads = {}
+    for name, param in model.named_parameters():
+        summed = _grad_or_zeros(param)
+        dist.all_reduce(summed)
+        summed_grads[name] = summed
+
+    # Every collective is behind us, so a mismatch below fails on all ranks at
+    # once instead of leaving the ones that passed waiting in the next one.
+    expected_layers = config.num_hidden_layers if tilelang else 0
+    expected_csa = sum(kind == "compressed_sparse_attention" for kind in config.layer_types) if tilelang else 0
+    assert counts["sparse_attn_tilelang"] == 2 * expected_layers, counts
+    assert counts["v4_lighting_indexer"] == 2 * expected_csa, counts
+    forward_tol, grad_tol = (1e-4, 1e-4) if dtype == torch.float32 else (8e-3, 1e-1)
+    _assert_close_to_scale(local.detach(), baseline[:, begin : begin + local_len], forward_tol, "forward")
+    for name, summed in summed_grads.items():
+        _assert_close_to_scale(summed, baseline_grads[name], grad_tol, name)
+
+    clear_parallel_state()
+    dist.destroy_process_group()
+
+
+def _run_cp_collator_contract(rank: int, world_size: int, init_file: str) -> None:
+    """What the collator hands the model under CP is what the model forward assumes.
+
+    The model forward's ``query_offset = cp_rank * local_seq_len`` -- and the same
+    expression in the attention forward, the metadata sharding and the indexer --
+    is only correct for contiguous equally sized shards indexed by ``cp_rank``,
+    carrying global positions and full-sequence cu-seqlens. All three come from
+    ``SequenceParallelCollator``, which knows nothing about CP: it keys on
+    ``sp_rank`` / ``sp_size``, which resolve to the CP pair only because a
+    CP-only mesh flattens ``sp`` onto ``cp``.
+    """
+    from veomni.data.data_collator import SequenceParallelCollator
+    from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state, init_parallel_state
+
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
+    dist.init_process_group(
+        backend=get_dist_comm_backend(),
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+
+    state = get_parallel_state()
+    assert (state.sp_size, state.sp_rank) == (state.cp_size, state.cp_rank), (
+        f"CP-only sp/cp mismatch: sp=({state.sp_size}, {state.sp_rank}) cp=({state.cp_size}, {state.cp_rank})"
+    )
+    assert (state.cp_size, state.cp_rank) == (world_size, rank), (
+        f"expected cp=({world_size}, {rank}), got ({state.cp_size}, {state.cp_rank})"
+    )
+
+    seq_len = _PACKED_MODEL_SEQ_LEN
+    input_ids = torch.arange(seq_len).view(1, seq_len)
+    position_ids = torch.cat(
+        [torch.arange(end - begin) for begin, end in _PACKED_MODEL_SAMPLES],
+    ).view(1, seq_len)
+    collated = SequenceParallelCollator()(
+        {
+            "input_ids": input_ids.clone(),
+            "labels": input_ids.clone(),
+            "attention_mask": torch.ones(1, seq_len, dtype=torch.long),
+            "position_ids": position_ids.clone(),
+        }
+    )
+
+    local_len = seq_len // world_size
+    begin = rank * local_len
+    expected_ids = input_ids[:, begin : begin + local_len]
+    assert torch.equal(collated["input_ids"], expected_ids), (
+        f"rank {rank} expected rows [{begin}, {begin + local_len}) "
+        f"{expected_ids.tolist()}, got {collated['input_ids'].tolist()}"
+    )
+    # Narrowed, not renumbered: every place the design leans on ``position_ids``
+    # -- the compressor rope positions, the ``has_previous_window`` gate, the
+    # sliding causality test -- reads global positions.
+    expected_positions = position_ids[:, begin : begin + local_len]
+    assert torch.equal(collated["position_ids"], expected_positions), (
+        f"rank {rank} position_ids must stay global: expected {expected_positions.tolist()}, "
+        f"got {collated['position_ids'].tolist()}"
+    )
+    # Derived before the slice, so the model sees the whole packed batch's
+    # boundaries next to one shard. That is what ``full_seq_len`` reconstructs.
+    expected_cu_seq_lens = [0, *(end for _, end in _PACKED_MODEL_SAMPLES)]
+    assert collated["cu_seq_lens_q"].tolist() == expected_cu_seq_lens, (
+        f"rank {rank} cu_seq_lens_q must span the packed batch: expected {expected_cu_seq_lens}, "
+        f"got {collated['cu_seq_lens_q'].tolist()}"
+    )
+    # The mask is not sliced either, which is what the attention forward's
+    # full-sequence mask check depends on.
+    assert collated["attention_mask"].shape[-1] == seq_len, (
+        f"rank {rank} attention_mask must stay full length {seq_len}, got {tuple(collated['attention_mask'].shape)}"
+    )
+
+    clear_parallel_state()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+def test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank():
+    """The collator gives rank ``r`` rows ``[r*L, (r+1)*L)``, global positions, global cu-seqlens."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(_run_cp_collator_contract, args=(4, init_file), nprocs=4, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+def test_deepseek_v4_model_cp_packed_misaligned():
+    """A whole packed model under CP matches the single-rank forward and backward."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(_run_model_cp_packed, args=(4, init_file, torch.float32, False), nprocs=4, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+def test_deepseek_v4_model_cp_packed_misaligned_tilelang():
+    """The same in bf16, where the model withholds the mask and TileLang runs instead.
+
+    Distinct coverage rather than a duplicate: this is the only case that takes
+    the mask-free compact-candidate path end to end under CP -- packed sparse
+    indices rebased by ``query_offset``, sparse MQA in the kernel, and the
+    TileLang Lightning Indexer inside a real CSA layer.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(_run_model_cp_packed, args=(4, init_file, torch.bfloat16, True), nprocs=4, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+def test_deepseek_v4_attention_cp_unpacked_misaligned():
+    """A shard length that is a multiple of no compression rate still matches.
+
+    ``seq_len`` 68 gives ``L=17``. The compressor is dropped because the toy HCA
+    rate of 32 is wider than that shard, which its own guard refuses; what is
+    left is the sliding window, which at 32 reaches two shards back.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(_run_attention_cp, args=(4, init_file, 68, False), nprocs=4, join=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
