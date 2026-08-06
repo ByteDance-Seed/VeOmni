@@ -316,7 +316,15 @@ def _window_starts(rate: int, seq_len: int, sample_slices) -> torch.Tensor:
     )
 
 
-def _run_compressor_cp(rank: int, world_size: int, init_file: str, kind: str, seq_len: int, sample_slices) -> None:
+def _run_compressor_cp(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    kind: str,
+    seq_len: int,
+    sample_slices,
+    real_indexer: bool = False,
+) -> None:
     """A CP shard's compressor must return the whole globally-ordered compressed KV.
 
     Every rank compresses only the windows it owns and then all-gathers, so the
@@ -324,6 +332,14 @@ def _run_compressor_cp(rank: int, world_size: int, init_file: str, kind: str, se
     dropped or misordered window shows up directly. The backward reduces over
     this rank's own windows only, because summing the replicated array on every
     rank would scale the gradient by ``cp_size``.
+
+    ``real_indexer`` keeps the CSA compressor's own Lightning Indexer instead of
+    the fixed stand-in. The default is the stand-in because the two summarise the
+    same windows and a real one would let an indexer bug masquerade as a
+    compressor bug. The zero-window case wants the opposite: the indexer carries
+    its *own* copy of the empty-result construction and its own halo exchange and
+    row all-gather, and running it is the only way to drive them. Its selection
+    is then observable through ``block_bias``, which is scattered from it.
     """
     from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
 
@@ -348,7 +364,7 @@ def _run_compressor_cp(rank: int, world_size: int, init_file: str, kind: str, se
     compressor_class = dsv4.DeepseekV4HCACompressor if kind == "hca" else dsv4.DeepseekV4CSACompressor
     compressor = compressor_class(config).to(device=device_type, dtype=torch.float32)
     _init_position_bias(compressor)
-    if kind == "csa":
+    if kind == "csa" and not real_indexer:
         compressor.indexer = _FixedIndexer(config.index_topk)
     _broadcast_module(compressor)
     compressor.train()
@@ -356,7 +372,14 @@ def _run_compressor_cp(rank: int, world_size: int, init_file: str, kind: str, se
     rate = compressor.compress_rate
     full_hidden = torch.randn(1, seq_len, config.hidden_size, device=device_type)
     dist.broadcast(full_hidden, src=0)
-    q_residual = torch.zeros(1, seq_len, config.q_lora_rank, device=device_type)
+    # A real indexer scores against ``q_residual``; zeros would make every query
+    # identical and the selection arbitrary.
+    q_residual = (
+        torch.randn(1, seq_len, config.q_lora_rank, device=device_type)
+        if real_indexer
+        else torch.zeros(1, seq_len, config.q_lora_rank, device=device_type)
+    )
+    dist.broadcast(q_residual, src=0)
 
     if sample_slices is None:
         full_position_ids = torch.arange(seq_len, device=device_type).view(1, -1)
@@ -874,6 +897,90 @@ def test_deepseek_v4_indexer_cp(cp_size):
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
         mp.spawn(_run_indexer_cp, args=(cp_size, init_file, 256), nprocs=cp_size, join=True)
+
+
+# Shard lengths on which the *last* rank owns no compression window at all,
+# unpacked. Global window starts run ``0, rate, 2*rate, ...`` only while a whole
+# window still fits, so the tail of the sequence carries none: with ``cp_size=2``
+# a rank owns nothing whenever no multiple of the rate lands in
+# ``[L, 2L - rate]``.
+#
+#   * ``hca`` (rate 32, L=40): starts [0, 32], both rank 0's, since 64 + 32 > 80.
+#   * ``csa`` (rate 4, L=5): starts [0, 4], both rank 0's, since 8 + 4 > 10.
+#
+# In both the last owned window runs past the shard edge -- 32..63 into rank 1's
+# [40, 80), and 4..7 into rank 1's [5, 10) -- so the empty rank still supplies a
+# right halo and still has to reach that exchange's backward.
+_ZERO_WINDOW_UNPACKED_SEQ_LEN = {"hca": 80, "csa": 10}
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("kind", ["hca", "csa"])
+def test_deepseek_v4_compressor_cp_zero_windows_unpacked(kind):
+    """A rank owning no window keeps its peers' backward collectives from hanging.
+
+    This is the regression Task 6 found: the empty compression result has to stay
+    attached to both ``kv`` and ``gate``, because a rank that leaves the autograd
+    graph never enters the backward of the halo exchange and the row all-gather
+    that its peers are blocked in. The parity assertions here are secondary --
+    the load-bearing observation is that the backward completes at all -- so a
+    regression shows up as a watchdog timeout rather than a mismatch.
+
+    Unpacked, which is a distinct code path from the packed case below: the empty
+    result is built in the compressor's own forward rather than inside
+    ``compress_packed_windows``.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _run_compressor_cp,
+            args=(2, init_file, kind, _ZERO_WINDOW_UNPACKED_SEQ_LEN[kind], None),
+            nprocs=2,
+            join=True,
+        )
+
+
+# ``csa`` (rate 4, cp_size=4, L=4) with samples ((0, 6), (6, 16)): sample 1
+# yields the window at 0 alone (4 + 4 > 6), sample 2 the windows at 6 and 10
+# (14 + 4 > 16), so the global starts are [0, 6, 10] and the counts are
+# [1, 1, 1, 0]. Rank 3 owns nothing; the window at 10 covers 10..13 and reaches
+# two tokens into its shard, so it supplies rank 2's right halo. The window at 6
+# straddles the rank 1/2 edge at 8 as well.
+#
+# L=4 is the toy CSA rate, which is the narrowest shard the guard admits. Nothing
+# shorter can produce a zero-window rank at this rate: window starts are at most
+# one rate apart inside a sample, so an empty shard needs a sample boundary
+# inside it.
+_ZERO_WINDOW_PACKED_SEQ_LEN = 16
+_ZERO_WINDOW_PACKED_SAMPLES = ((0, 6), (6, 16))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+def test_deepseek_v4_compressor_cp_zero_windows_packed_with_indexer():
+    """The same, packed, with the CSA compressor's real Lightning Indexer attached.
+
+    Three copies of the zero-window path run here at once: the CSA compressor's,
+    the indexer's -- it owns no window either, since it compresses the same
+    windows at its own head dim -- and ``compress_packed_windows``, which both
+    reach on the packed path instead of their own forward.
+
+    The indexer's copy is driven in the forward only, and that is a limit of the
+    code rather than of the test: the indexer returns integer top-k indices, so
+    nothing downstream of its compression is differentiable and its collectives
+    have no backward on *any* rank. It cannot hang the way the compressors can.
+
+    Only three compressed rows exist against ``index_topk`` 32, so every causally
+    visible slot is selected and the block-bias comparison does not turn on top-k
+    order.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _run_compressor_cp,
+            args=(4, init_file, "csa", _ZERO_WINDOW_PACKED_SEQ_LEN, _ZERO_WINDOW_PACKED_SAMPLES, True),
+            nprocs=4,
+            join=True,
+        )
 
 
 # The packed fixture for the whole-model cases. ``seq_len`` 128 at cp_size=4
