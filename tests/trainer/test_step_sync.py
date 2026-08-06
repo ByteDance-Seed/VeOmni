@@ -31,3 +31,29 @@ def test_train_step_uses_sync_helper():
 
         assert "sync_before_train_step()" in source
         assert "synchronize()" not in source
+
+
+def test_configure_hsdp_allreduce_toggles_outer_micro_steps():
+    calls = []
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.args = SimpleNamespace(
+        train=SimpleNamespace(
+            accelerator=SimpleNamespace(
+                fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+                dp_replicate_size=2,
+            )
+        )
+    )
+    trainer.model = SimpleNamespace(set_requires_all_reduce=calls.append)
+
+    for micro_step in range(4):
+        trainer._configure_hsdp_allreduce(micro_step, 4)
+
+    assert calls == [False, True]
+
+
+def test_train_step_uses_hsdp_allreduce_helper():
+    for wrapper_cls in (BaseTrainer, TextTrainer, VLMTrainer, TextDPOTrainer, DiTTrainer):
+        source = inspect.getsource(wrapper_cls.train_step)
+
+        assert "_configure_hsdp_allreduce(" in source
