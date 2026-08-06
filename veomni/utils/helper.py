@@ -252,6 +252,7 @@ class EnvironMeter:
         global_step: int,
         lora_config: Optional["VeOmniLoraConfig"] = None,
         vision_lora_enabled: Optional[bool] = None,
+        vision_requires_grad: Optional[bool] = None,
     ) -> Dict[str, Any]:
         flops_kwargs = {}
         if self.images_seqlens:
@@ -262,6 +263,8 @@ class EnvironMeter:
                 flops_kwargs["lora_config"] = lora_config
                 if vision_lora_enabled is not None:
                     flops_kwargs["vision_lora_enabled"] = vision_lora_enabled
+                if vision_requires_grad is not None:
+                    flops_kwargs["vision_requires_grad"] = vision_requires_grad
             elif not self._warned_unsupported_lora_flops:
                 logger.warning_rank0(
                     "LoRA FLOPs are unavailable because the configured FLOP counter does not accept "

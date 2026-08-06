@@ -564,7 +564,7 @@ def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset):
         compare_alignment=False,
         extra_args=[
             '--model.lora_config={"rank":4,"alpha":8,"lora_modules":["q_proj","qkv"]}',
-            "--train.freeze_vit=False",
+            "--train.freeze_vit=True",
         ],
     )
     assert results and all(results.values())

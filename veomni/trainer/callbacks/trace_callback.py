@@ -190,6 +190,7 @@ class EnvironMeterCallback(Callback):
         args: "VeOmniArguments" = self.trainer.args
         self.lora_config = trainer.model.get_lora_config() if hasattr(trainer.model, "get_lora_config") else None
         self.vision_lora_enabled = getattr(trainer, "vision_lora_enabled", None)
+        self.vision_requires_grad = getattr(trainer, "vision_requires_grad", None)
         self.trainer.environ_meter = helper.EnvironMeter(
             config=trainer.model_config,
             global_batch_size=args.train.global_batch_size,
@@ -215,6 +216,7 @@ class EnvironMeterCallback(Callback):
             global_step=state.global_step,
             lora_config=self.lora_config,
             vision_lora_enabled=self.vision_lora_enabled,
+            vision_requires_grad=self.vision_requires_grad,
         )
 
         step_train_metrics = {

@@ -27,7 +27,13 @@ _FREEZE_VIT_VLM_CASES = [
 @pytest.mark.parametrize("freeze_vit", [False, True])
 @pytest.mark.parametrize("config_path", _FREEZE_VIT_VLM_CASES)
 def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
-    # Structural meta-device coverage; eager ops keep it accelerator-agnostic.
+    # This test only constructs the model on `meta` and verifies freeze
+    # behaviour — it never runs forward. Use an all-eager ops config so the
+    # build works everywhere: it pins every per-op field (including the
+    # Qwen3.5 GatedDeltaNet trio that has no FLA backend on NPU and the
+    # GPU-only liger/triton defaults that fail NPU validation). Eager paths
+    # that raise only at forward time are fine because this test never
+    # forwards.
     ops_implementation = make_eager_ops_config()
     model = build_foundation_model(
         config_path=config_path,

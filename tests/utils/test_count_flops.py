@@ -317,20 +317,42 @@ class TestQwen35LoraFlops:
             images_seqlens=images_seqlens,
             vision_lora_enabled=False,
         )
-        # freeze_vit disables the matched adapters and detaches the ViT, so its
-        # contribution falls back to forward-only work.
+        # Without trainable vision adapters, the ViT contributes forward-only work.
         assert frozen_vl_flops - text_flops == pytest.approx((full_vl - full_text) / 3, rel=1e-9)
+
+    def test_bias_only_vision_backward_is_not_counted_as_frozen(self, qwen3_5_counter):
+        batch_seqlens = [12, 5]
+        images_seqlens = [16]
+        lora_config = VeOmniLoraConfig(r=8, target_modules=["q_proj"], bias="all")
+
+        full_text, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=2.0)
+        full_vl, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            images_seqlens=images_seqlens,
+        )
+        bias_text, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=lora_config,
+        )
+        bias_vl, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=lora_config,
+            images_seqlens=images_seqlens,
+            vision_lora_enabled=False,
+            vision_requires_grad=True,
+        )
+
+        vision_flops = bias_vl - bias_text
+        assert vision_flops > (full_vl - full_text) / 3
+        assert vision_flops < full_vl - full_text
 
 
 @pytest.mark.usefixtures("mock_device_flops")
-@pytest.mark.parametrize(
-    "config_dir",
-    [
-        pytest.param("tests/toy_config/qwen2vl_toy", id="qwen2_vl"),
-        pytest.param("tests/toy_config/qwen25vl_toy", id="qwen2_5_vl"),
-    ],
-)
-def test_frozen_qwen2_family_vit_ignores_configured_lora_targets(config_dir):
+@pytest.mark.parametrize("config_dir", ["tests/toy_config/qwen2vl_toy", "tests/toy_config/qwen25vl_toy"])
+def test_qwen2_family_frozen_vit_lora_flops(config_dir):
     counter = VeomniFlopsCounter(_load_toy_config(config_dir))
     batch_seqlens = [12, 5]
     images_seqlens = [16]

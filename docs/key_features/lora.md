@@ -152,31 +152,30 @@ Hugging Face Qwen configs and compares full fine-tuning with several LoRA target
 ranks.
 
 `VLMTrainer` uses the same native LoRA setup, FSDP2 loading, and adapter checkpoint path as
-the text trainer. During LoRA training all base weights remain frozen and the multimodal
-freeze flags gate which matched adapters may train:
+the text trainer. During LoRA training, the LoRA configuration determines which adapters
+and optional bias parameters are trainable:
 
-- `freeze_vit: true` disables every adapter inside the vision tower. With `false`, only
-  vision modules explicitly matched by `target_modules` train; unmatched vision weights
-  remain frozen.
-- `freeze_audio_tower: true` applies the same rule to the audio tower.
+- `freeze_vit` and `freeze_audio_tower` are ignored. They control only full tuning.
+- Vision and audio modules explicitly matched by `target_modules` remain trainable.
+- With the default `bias: none`, untargeted towers remain frozen and do not participate
+  in backward. Other bias policies explicitly opt additional bias parameters into training.
 - Full merger or audio-projection weights that are normally retained by the non-LoRA freeze
   policy are not trained in LoRA mode, because those full weights are not part of the
   exported adapter.
 
-Consequently, `freeze_vit: false` permits vision LoRA but does not full-fine-tune the ViT.
-For example, Qwen3-VL vision adapters may target `qkv`, `proj`, `linear_fc1`, and
-`linear_fc2`; language targets such as `q_proj` and `v_proj` can be used in the same config.
+Qwen3-VL vision adapters may target `qkv`, `proj`, `linear_fc1`, and `linear_fc2`;
+language targets such as `q_proj` and `v_proj` can be used in the same config.
 
 For Qwen VLM configurations, vision-tower accounting uses the vision-token sequence lengths
 collected from the current batch and follows this logic:
 
 1. If the batch has no vision tokens, ViT FLOPs are zero.
-2. If the batch has vision tokens but `freeze_vit` is enabled, or none of `target_modules`
-   matches a supported ViT module, the ViT is treated as frozen and only its forward-pass
-   FLOPs are counted.
-3. If at least one target matches a supported ViT module, the ViT is treated as participating
-   in LoRA training: base forward/input-gradient work and the matched LoRA forward/backward
-   work are counted.
+2. If the batch has vision tokens but no vision parameter is trainable, the ViT is treated
+   as frozen and only its forward-pass FLOPs are counted.
+3. If a supported ViT module has a trainable adapter, base forward/input-gradient work and
+   the matched LoRA forward/backward work are counted.
+4. If only vision biases are trainable (for example, `bias: all` with language-only adapter
+   targets), base forward/input-gradient work is counted without adapter FLOPs.
 
 The native LoRA implementation currently adapts two kinds of weights:
 

@@ -94,6 +94,15 @@ from .callbacks import (
 logger = logging.get_logger(__name__)
 
 
+def _has_trainable_lora_parameters(module: torch.nn.Module | None) -> bool:
+    if module is None:
+        return False
+    return any(
+        param.requires_grad and ({"lora_A", "lora_B"} & set(name.split(".")))
+        for name, param in module.named_parameters()
+    )
+
+
 class BackgroundPrefetcher:
     """
     Prefetches batches from a dataloader in a background thread to overlap data loading
@@ -458,6 +467,11 @@ class BaseTrainer(Stateful, ABC):
             cfg = VeOmniLoraConfig.from_yaml(resolved_config)
             logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
             self.model = VeOmniLoraModel(self.model, cfg)
+
+        if not _has_trainable_lora_parameters(self.model):
+            raise ValueError(
+                "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
+            )
 
     def _freeze_model_module(self):
         self._setup_lora()

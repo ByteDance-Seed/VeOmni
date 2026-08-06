@@ -54,13 +54,24 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
     meter.images_seqlens = [16]
     lora_config = VeOmniLoraConfig(r=8, target_modules=["q_proj"])
 
-    meter.step(delta_time=0.5, global_step=1, lora_config=lora_config, vision_lora_enabled=False)
+    meter.step(
+        delta_time=0.5,
+        global_step=1,
+        lora_config=lora_config,
+        vision_lora_enabled=False,
+        vision_requires_grad=False,
+    )
 
     assert calls == [
         (
             [12, 5],
             0.5,
-            {"images_seqlens": [16], "lora_config": lora_config, "vision_lora_enabled": False},
+            {
+                "images_seqlens": [16],
+                "lora_config": lora_config,
+                "vision_lora_enabled": False,
+                "vision_requires_grad": False,
+            },
         )
     ]
 

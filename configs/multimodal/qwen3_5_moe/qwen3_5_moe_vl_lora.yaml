@@ -55,7 +55,6 @@ train:
       fsdp_mode: fsdp2
   gradient_checkpointing:
     enable_reentrant: false
-  freeze_vit: false
   optimizer:
     lr: 1.0e-4
     lr_decay_style: cosine

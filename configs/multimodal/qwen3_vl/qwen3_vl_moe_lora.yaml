@@ -1,10 +1,10 @@
 # LoRA fine-tuning config for Qwen3-VL-MoE.
 #
 # Experts FQN nests under `model.language_model.layers.*`. The vision tower is
-# frozen here because no vision modules are targeted. Adding vision Linear
-# targets such as `qkv` / `linear_fc1` / `linear_fc2` keeps those adapters
-# trainable even with `freeze_vit: true`; the ViT base and unsupported Conv3d
-# patch embedding remain frozen by LoRA setup.
+# frozen because no vision modules are targeted. Adding vision Linear targets
+# such as `qkv` / `linear_fc1` / `linear_fc2` trains those adapters; tower freeze
+# flags are ignored during LoRA training. With the default `bias: none`, the
+# unsupported Conv3d patch embedding remains frozen by LoRA setup.
 
 model:
   model_path: Qwen3-VL-30B-A3B-Instruct
@@ -50,7 +50,6 @@ train:
       fsdp_mode: fsdp2
   gradient_checkpointing:
     enable_reentrant: false
-  freeze_vit: true
   optimizer:
     lr: 1.0e-4
     lr_decay_style: cosine

@@ -665,6 +665,7 @@ class VeomniFlopsCounter:
                 self.config.vision_config,
                 lora_config=lora_config,
                 vision_lora_enabled=kargs.get("vision_lora_enabled"),
+                vision_requires_grad=kargs.get("vision_requires_grad"),
             )
         else:
             vit_flops = 0
@@ -697,6 +698,7 @@ class VeomniFlopsCounter:
                 self.config.vision_config,
                 lora_config=lora_config,
                 vision_lora_enabled=kargs.get("vision_lora_enabled"),
+                vision_requires_grad=kargs.get("vision_requires_grad"),
             )
         else:
             vit_flops = 0
@@ -728,6 +730,7 @@ class VeomniFlopsCounter:
                 self.config.vision_config,
                 lora_config=lora_config,
                 vision_lora_enabled=kargs.get("vision_lora_enabled"),
+                vision_requires_grad=kargs.get("vision_requires_grad"),
             )
         else:
             vit_flops = 0
@@ -742,6 +745,7 @@ class VeomniFlopsCounter:
         config,
         lora_config=None,
         vision_lora_enabled=None,
+        vision_requires_grad=None,
     ):
         """
         Estimate the FLOPs of the Qwen3-family vision encoder.
@@ -791,11 +795,18 @@ class VeomniFlopsCounter:
         vision_has_lora = vision_lora_enabled is not False and any(
             module in vision_module_shapes for module in target_modules or ()
         )
+        if vision_requires_grad is None:
+            vision_requires_grad = vision_has_lora or (lora_config is not None and lora_config.bias == "all")
 
         if lora_config is None:
             dense_N_flops = 6 * dense_N * tokens_sum
-        elif not vision_has_lora:
+        elif not vision_requires_grad:
             dense_N_flops = 2 * dense_N * tokens_sum
+        elif not vision_has_lora:
+            # Bias-only vision training needs activation gradients through the
+            # tower, but not input gradients for the initial patch embedding.
+            adaptable_base_N = dense_N - patch_embed_N
+            dense_N_flops = (2 * patch_embed_N + 4 * adaptable_base_N) * tokens_sum
         else:
             # Patch embedding is Conv3d and is not adapted by VeOmni's linear LoRA.
             adaptable_base_N = dense_N - patch_embed_N
@@ -814,7 +825,7 @@ class VeomniFlopsCounter:
         seqlen_square_sum = 0
         for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attention_factor = 12 if lora_config is None or vision_has_lora else 4
+        attention_factor = 12 if lora_config is None or vision_requires_grad else 4
         attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
 
         vit_flops = dense_N_flops + attn_qkv_flops
@@ -827,6 +838,7 @@ class VeomniFlopsCounter:
         config,
         lora_config=None,
         vision_lora_enabled=None,
+        vision_requires_grad=None,
     ):
         """
         Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
@@ -893,8 +905,12 @@ class VeomniFlopsCounter:
         vision_has_lora = vision_lora_enabled is not False and any(
             module in vision_module_shapes for module in target_modules or ()
         )
-        if lora_config is not None and not vision_has_lora:
+        if vision_requires_grad is None:
+            vision_requires_grad = vision_has_lora or (lora_config is not None and lora_config.bias == "all")
+        if lora_config is not None and not vision_requires_grad:
             dense_N_flops = 2 * dense_N * tokens_sum
+        elif lora_config is not None and not vision_has_lora:
+            dense_N_flops = 4 * dense_N * tokens_sum
         else:
             dense_N_flops = self._compute_linear_flops(
                 dense_N,
@@ -903,7 +919,7 @@ class VeomniFlopsCounter:
                 module_shapes=vision_module_shapes,
                 detached_without_targets=True,
             )
-        attention_factor = 12 if lora_config is None or vision_has_lora else 4
+        attention_factor = 12 if lora_config is None or vision_requires_grad else 4
 
         # In Qwen2.5 VL, windowed attention is used in some layers.
         full_attn_layer_num = config.depth if is_qwen2_vl else len(config.fullatt_block_indexes)
@@ -1259,6 +1275,7 @@ class VeomniFlopsCounter:
                 getattr(self.config, "vision_config", None),
                 lora_config=lora_config,
                 vision_lora_enabled=kargs.get("vision_lora_enabled"),
+                vision_requires_grad=kargs.get("vision_requires_grad"),
             )
         else:
             vit_flops = 0
@@ -1275,6 +1292,7 @@ class VeomniFlopsCounter:
         lora_config: VeOmniLoraConfig | None = None,
         images_seqlens=None,
         vision_lora_enabled: bool | None = None,
+        vision_requires_grad: bool | None = None,
     ):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
@@ -1293,6 +1311,8 @@ class VeomniFlopsCounter:
             vision_lora_enabled (bool, optional): Whether the trainer permits matched vision
                 adapters to train. ``False`` forces forward-only ViT accounting even when
                 ``target_modules`` contains vision layer names.
+            vision_requires_grad (bool, optional): Whether any vision parameter is trainable.
+                This keeps bias-only vision training from being counted as forward-only work.
 
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
@@ -1315,6 +1335,8 @@ class VeomniFlopsCounter:
             kwargs["images_seqlens"] = images_seqlens
         if vision_lora_enabled is not None:
             kwargs["vision_lora_enabled"] = vision_lora_enabled
+        if vision_requires_grad is not None:
+            kwargs["vision_requires_grad"] = vision_requires_grad
 
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)
