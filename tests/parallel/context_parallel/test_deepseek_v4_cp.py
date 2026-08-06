@@ -765,7 +765,7 @@ def test_deepseek_v4_indexer_cp(cp_size):
 #   * HCA (rate 32) starts are [0, 32, 70], so the window at 70 covers 70..101
 #     and straddles the rank 2/3 edge at 96 -- and rank 3 owns no HCA window at
 #     all, which is the empty-result path;
-#   * CSA (rate 4) starts are 0,4,..,64 then 70,74,..,124, so the window at 94
+#   * CSA (rate 4) starts are 0,4,..,64 then 70,74,..,122, so the window at 94
 #     covers 94..97 and straddles the same edge from the other rate.
 #
 # The 31 CSA compressed rows are fewer than ``index_topk`` 32, so every causally
