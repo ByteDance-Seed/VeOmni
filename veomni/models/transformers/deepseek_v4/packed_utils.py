@@ -18,7 +18,7 @@ from typing import Callable, NamedTuple
 
 import torch
 
-from ....distributed.context_parallel import rebase_window_indices
+from ....distributed.context_parallel import empty_compressed_rows, rebase_window_indices
 
 
 def build_packed_compression_metadata(
@@ -148,12 +148,12 @@ def compress_packed_windows(
 
     window_starts = packed_metadata["window_starts"]
     if window_starts.numel() == 0:
-        # Empty slices of *both* inputs rather than ``new_zeros``: a context-parallel
-        # rank can own no window, and it must still reach the backward of every
-        # collective its peers reach -- the compressed-row all-gather and both halo
-        # all-gathers all-reduce there. A detached result, or one touching only
-        # ``kv``, leaves this rank out of those and hangs the ranks that own windows.
-        return kv[:, :0, :head_dim] + gate[:, :0, :head_dim]
+        # Shared with the three unpacked window compressors rather than spelled out
+        # again here: this is the construction whose detached form hung a whole CP
+        # group once already, and the fix reaching one copy and not the others is
+        # the failure this import exists to prevent. It communicates nothing, so
+        # the non-CP callers of this function are unaffected.
+        return empty_compressed_rows(kv, gate, head_dim)
 
     current_indices = packed_metadata["window_indices"]
     current_kv = kv[0, current_indices]
