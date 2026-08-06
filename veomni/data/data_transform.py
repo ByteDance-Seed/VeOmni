@@ -414,10 +414,9 @@ def process_sample_qwen_omni(
 
     def get_omni_token_ids(processor: "ProcessorMixin") -> tuple[int, int, int]:
         tokenizer = getattr(processor, "tokenizer", processor)
-        vocab = tokenizer.get_vocab()
-        image_token_id = vocab.get("<|image_pad|>", vocab.get("<|IMAGE|>"))
-        video_token_id = vocab.get("<|video_pad|>", vocab.get("<|VIDEO|>"))
-        audio_token_id = vocab.get("<|audio_pad|>", vocab.get("<|AUDIO|>"))
+        image_token_id = tokenizer.encode("<|image_pad|>", add_special_tokens=False)[0]
+        video_token_id = tokenizer.encode("<|video_pad|>", add_special_tokens=False)[0]
+        audio_token_id = tokenizer.encode("<|audio_pad|>", add_special_tokens=False)[0]
         if image_token_id is None:
             raise ValueError("Cannot find image token (<|image_pad|> or <|IMAGE|>) in tokenizer vocab.")
         if video_token_id is None:
@@ -536,9 +535,8 @@ def process_sample_qwen_omni(
 
     labels = torch.full_like(input_ids, fill_value=IGNORE_INDEX)
     tokenizer = getattr(processor, "tokenizer", processor)
-    vocab = tokenizer.get_vocab()
-    user_token_id = vocab.get("user")
-    assistant_token_id = vocab.get("assistant")
+    user_token_id = tokenizer.encode("user", add_special_tokens=False)[0]
+    assistant_token_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
     if user_token_id is None or assistant_token_id is None:
         raise ValueError("Cannot find user/assistant tokens in tokenizer vocab.")
     user_start_index = torch.where(input_ids == user_token_id)[0].tolist()
