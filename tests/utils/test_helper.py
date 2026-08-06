@@ -58,7 +58,6 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
         delta_time=0.5,
         global_step=1,
         lora_config=lora_config,
-        vision_trainable_parameters={},
     )
 
     assert calls == [
@@ -68,7 +67,6 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
             {
                 "images_seqlens": [16],
                 "lora_config": lora_config,
-                "vision_trainable_parameters": {},
             },
         )
     ]
@@ -77,20 +75,10 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
     meter.supports_lora_flops = False
     meter.batch_seqlens = [7]
     with patch("veomni.utils.helper.logger.warning_rank0") as warning:
-        metrics = meter.step(
-            delta_time=0.25,
-            global_step=2,
-            lora_config=lora_config,
-            vision_trainable_parameters={"blocks.0.attn.qkv.lora_A.default.weight": 32},
-        )
+        metrics = meter.step(delta_time=0.25, global_step=2, lora_config=lora_config)
 
         meter.batch_seqlens = [8]
-        meter.step(
-            delta_time=0.25,
-            global_step=3,
-            lora_config=lora_config,
-            vision_trainable_parameters={"blocks.0.attn.qkv.lora_A.default.weight": 32},
-        )
+        meter.step(delta_time=0.25, global_step=3, lora_config=lora_config)
 
     assert calls == [([7], 0.25, {}), ([8], 0.25, {})]
     assert metrics["flops_achieved(T)"] == 0

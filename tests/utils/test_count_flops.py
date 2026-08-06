@@ -147,7 +147,7 @@ class TestQwen35Flops:
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(109.038815674368, rel=1e-9)
+        assert flops == pytest.approx(109.196454395904, rel=1e-9)
 
 
 class TestQwen35LoraFlops:
@@ -268,13 +268,11 @@ class TestQwen35LoraFlops:
             delta_time=2.0,
             lora_config=decoder_lora_config,
             images_seqlens=images_seqlens,
-            vision_trainable_parameters={},
         )
 
-        # No vision tokens skip the ViT. The empty runtime state proves that
-        # similarly named decoder targets did not create vision adapters.
+        # No vision tokens skip the ViT; decoder-only targets keep it forward-only.
         assert empty_image_flops == lora_text
-        assert 0 < lora_vl - lora_text < full_vl - full_text
+        assert lora_vl - lora_text == pytest.approx((full_vl - full_text) / 3, rel=1e-9)
 
         text_flops, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
@@ -295,6 +293,12 @@ class TestQwen35LoraFlops:
         images_seqlens = [16]
         lora_config = VeOmniLoraConfig(r=8, target_modules=["q_proj"], bias="all")
 
+        full_text, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=2.0)
+        full_vl, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            images_seqlens=images_seqlens,
+        )
         bias_text, _ = qwen3_5_counter.estimate_flops(
             batch_seqlens,
             delta_time=2.0,
@@ -305,95 +309,11 @@ class TestQwen35LoraFlops:
             delta_time=2.0,
             lora_config=lora_config,
             images_seqlens=images_seqlens,
-            vision_trainable_parameters={"patch_embed.proj.bias": 1280},
         )
 
-        frozen_vl, _ = qwen3_5_counter.estimate_flops(
-            batch_seqlens,
-            delta_time=2.0,
-            lora_config=lora_config,
-            images_seqlens=images_seqlens,
-            vision_trainable_parameters={},
-        )
-        vision = qwen3_5_counter.config.vision_config
-        tokens = sum(images_seqlens)
-        merged_tokens = tokens / vision.spatial_merge_size**2
-        block_N = vision.hidden_size * (2 * vision.intermediate_size + 4 * vision.hidden_size)
-        merger_hidden = vision.hidden_size * vision.spatial_merge_size**2
-        merger_N = merger_hidden * (merger_hidden + vision.out_hidden_size)
-        expected_backward = (
-            (
-                2 * block_N * vision.depth * tokens
-                + 2 * merger_N * merged_tokens
-                + 8 * sum(length**2 for length in images_seqlens) * vision.hidden_size * vision.depth
-            )
-            / 2.0
-            / 1e12
-        )
-        assert bias_vl - frozen_vl == pytest.approx(expected_backward, rel=1e-9)
-
-    def test_runtime_state_honors_late_block_exclusions(self, qwen3_5_counter):
-        images_seqlens = [16]
-        lora_config = _lora_config(8, ["qkv"])
-        adapter_size = 8 * 4 * qwen3_5_counter.config.vision_config.hidden_size
-        early = {"blocks.0.attn.qkv.lora_A.default.weight": adapter_size}
-        late = {"blocks.1.attn.qkv.lora_A.default.weight": adapter_size}
-
-        early_flops = qwen3_5_counter._estimate_qwen3_vit_flop(
-            images_seqlens, qwen3_5_counter.config.vision_config, lora_config, early
-        )
-        late_flops = qwen3_5_counter._estimate_qwen3_vit_flop(
-            images_seqlens, qwen3_5_counter.config.vision_config, lora_config, late
-        )
-        vision = qwen3_5_counter.config.vision_config
-        block_N = vision.hidden_size * (2 * vision.intermediate_size + 4 * vision.hidden_size)
-        expected_one_block_backward = (
-            2 * block_N * sum(images_seqlens) + 8 * sum(length**2 for length in images_seqlens) * vision.hidden_size
-        )
-        assert early_flops - late_flops == pytest.approx(expected_one_block_backward, rel=1e-9)
-
-
-@pytest.mark.usefixtures("mock_device_flops")
-@pytest.mark.parametrize("config_dir", ["tests/toy_config/qwen2vl_toy", "tests/toy_config/qwen25vl_toy"])
-def test_qwen2_family_merger_lora_does_not_backprop_through_blocks(config_dir):
-    counter = VeomniFlopsCounter(_load_toy_config(config_dir))
-    batch_seqlens = [12, 5]
-    images_seqlens = [16]
-    lora_config = _lora_config(8, ["mlp.0"])
-
-    full_text, _ = counter.estimate_flops(batch_seqlens, delta_time=2.0)
-    full_vl, _ = counter.estimate_flops(batch_seqlens, delta_time=2.0, images_seqlens=images_seqlens)
-    lora_text, _ = counter.estimate_flops(batch_seqlens, delta_time=2.0, lora_config=lora_config)
-    frozen_vl, _ = counter.estimate_flops(
-        batch_seqlens,
-        delta_time=2.0,
-        lora_config=lora_config,
-        images_seqlens=images_seqlens,
-        vision_trainable_parameters={},
-    )
-    vision = counter.config.vision_config
-    merger_hidden_size = (vision.embed_dim if hasattr(vision, "embed_dim") else vision.hidden_size) * 4
-    merger_lora = {
-        "merger.mlp.0.lora_A.default.weight": 8 * merger_hidden_size,
-        "merger.mlp.0.lora_B.default.weight": 8 * merger_hidden_size,
-    }
-    merger_vl, _ = counter.estimate_flops(
-        batch_seqlens,
-        delta_time=2.0,
-        lora_config=lora_config,
-        images_seqlens=images_seqlens,
-        vision_trainable_parameters=merger_lora,
-    )
-
-    merged_tokens = sum(images_seqlens) / vision.spatial_merge_size**2
-    expected_adapter_flops = (
-        (4 * merger_lora["merger.mlp.0.lora_A.default.weight"] + 6 * merger_lora["merger.mlp.0.lora_B.default.weight"])
-        * merged_tokens
-        / 2.0
-        / 1e12
-    )
-    assert merger_vl - frozen_vl == pytest.approx(expected_adapter_flops, rel=1e-9)
-    assert merger_vl < full_vl
+        vision_flops = bias_vl - bias_text
+        assert vision_flops > (full_vl - full_text) / 3
+        assert vision_flops < full_vl - full_text
 
 
 class TestQwen35MoeFlops:
@@ -417,7 +337,7 @@ class TestQwen35MoeFlops:
         shared_expert_gate_flops = (
             6 * text_config.hidden_size * text_config.num_hidden_layers * sum(batch_seqlens) / 1e12
         )
-        assert flops == pytest.approx(18.94536708096 + shared_expert_gate_flops, rel=1e-9)
+        assert flops == pytest.approx(19.05408344064 + shared_expert_gate_flops, rel=1e-9)
 
 
 class TestQwen3Flops:

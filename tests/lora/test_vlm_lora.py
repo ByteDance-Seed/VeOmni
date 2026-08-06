@@ -100,7 +100,6 @@ def test_vlm_lora_preserves_vision_adapters_when_vit_is_frozen():
     assert all(not module.base_layer.weight.requires_grad for module in visual_lora + language_lora)
     assert all(param.requires_grad for module in visual_lora for param in module.lora_A.parameters())
     assert all(param.requires_grad for module in language_lora for param in module.lora_A.parameters())
-    assert any(".lora_A." in name for name in trainer.base.vision_trainable_parameters)
 
 
 def test_llm_only_lora_freezes_entire_vlm_visual_tower():
@@ -114,7 +113,6 @@ def test_llm_only_lora_freezes_entire_vlm_visual_tower():
 
     visual = _get_vlm_visual_module(trainer.base.model)
     assert all(not param.requires_grad for param in visual.parameters())
-    assert trainer.base.vision_trainable_parameters == {}
 
 
 @pytest.mark.parametrize("yaml_path,config_path", _PRODUCTION_CONFIGS)
@@ -165,7 +163,6 @@ def test_omni_lora_ignores_tower_freeze_flags():
     assert any(param.requires_grad for param in wrapped.thinker.visual.proj.parameters())
     assert any(param.requires_grad for param in wrapped.thinker.audio_tower.proj1.parameters())
     assert all(not param.requires_grad for param in wrapped.thinker.visual.merger.parameters())
-    assert any(".lora_A." in name for name in trainer.base.vision_trainable_parameters)
 
 
 @pytest.mark.parametrize(
@@ -195,7 +192,6 @@ def test_omni_freeze_vit_without_vision_lora(lora_config, merger_trainable):
     assert all(
         param.requires_grad is merger_trainable for param in trainer.base.model.thinker.audio_tower.proj1.parameters()
     )
-    assert bool(trainer.base.vision_trainable_parameters) is merger_trainable
     if lora_config:
         inputs = torch.randn(1, 4)
         assert not visual.proj(inputs).requires_grad

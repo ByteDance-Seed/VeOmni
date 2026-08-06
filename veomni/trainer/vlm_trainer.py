@@ -56,12 +56,6 @@ def _get_vlm_visual_module(model):
     return None
 
 
-def _get_trainable_parameter_sizes(module: torch.nn.Module | None) -> dict[str, int]:
-    if module is None:
-        return {}
-    return {name: param.numel() for name, param in module.named_parameters() if param.requires_grad}
-
-
 @dataclass
 class VLMTrainingArguments(TrainingArguments):
     freeze_vit: bool = field(
@@ -206,11 +200,6 @@ class VLMTrainer:
                     or self.base.model.thinker.audio_tower.proj
                 )
                 audio_proj.requires_grad_(True)
-
-        # Preserve the actual post-freeze/post-LoRA state for FLOPs accounting.
-        # Names distinguish backbone and merger adapters; sizes make rank-pattern
-        # and exclude-module configurations observable without re-parsing config.
-        self.base.vision_trainable_parameters = _get_trainable_parameter_sizes(visual)
 
         pretty_print_trainable_parameters(self.base.model)
         helper.print_device_mem_info("VRAM usage after building model")
