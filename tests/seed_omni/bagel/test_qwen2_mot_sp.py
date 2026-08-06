@@ -178,6 +178,7 @@ def _qwen2_mot_sp_worker() -> None:
     assert world_size == 4
     device = torch.device(f"{get_device_type()}:{rank}")
     qwen2_mot_modeling.veomni_rms_norm.bind("liger_kernel")
+    qwen2_mot_modeling.veomni_apply_rotary_pos_emb.bind("liger_kernel")
     qwen2_mot_modeling.veomni_swiglu_mlp.bind("liger_kernel")
 
     non_sp_state = init_parallel_state(

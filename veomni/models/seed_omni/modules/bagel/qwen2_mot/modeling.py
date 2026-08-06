@@ -27,6 +27,7 @@ from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
 
 
 veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
 veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 
 
@@ -150,6 +151,34 @@ def _apply_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.numel() != 0 and k.numel() != 0 and veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        if unsqueeze_dim != 1:
+            raise NotImplementedError("BAGEL packed fused RoPE requires unsqueeze_dim=1.")
+        if q.ndim != 3 or k.ndim != 3 or cos.ndim != 2 or sin.ndim != 2:
+            raise NotImplementedError(
+                "BAGEL fused RoPE requires packed q/k tensors shaped [tokens, heads, head_dim] "
+                "and cos/sin tensors shaped [tokens, head_dim]."
+            )
+        if not (q.shape[0] == k.shape[0] == cos.shape[0] == sin.shape[0]):
+            raise ValueError("BAGEL packed q/k/cos/sin tensors must share the token dimension.")
+        if not (q.shape[-1] == k.shape[-1] == cos.shape[-1] == sin.shape[-1]):
+            raise NotImplementedError("Liger full RoPE does not support partial rotary dimensions.")
+
+        # The shared full-RoPE kernels consume [batch, heads, sequence, head_dim].
+        # BAGEL stores packed Q/K as [tokens, heads, head_dim], so adapt through
+        # a synthetic batch dimension and restore the packed layout afterwards.
+        q_embed, k_embed = veomni_apply_rotary_pos_emb(
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            cos.unsqueeze(0),
+            sin.unsqueeze(0),
+            unsqueeze_dim=1,
+        )
+        return (
+            q_embed.squeeze(0).transpose(0, 1).contiguous(),
+            k_embed.squeeze(0).transpose(0, 1).contiguous(),
+        )
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (_rotate_half(q) * sin)
