@@ -1,7 +1,7 @@
 """Worker-side preprocessor for :class:`Qwen3VLTextEncoder` — HF ``AutoProcessor`` style.
 
 :class:`Qwen3VLTextEncoderPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`).
+counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`).
 Its :meth:`from_pretrained` loads the tokenizer and builds the
 :class:`~veomni.models.seed_omni.modules.qwen3vl.text_encoder.chat_template.Qwen3VLChatTemplate`
 straight off the checkpoint dir — no model instance involved.
@@ -12,12 +12,12 @@ from __future__ import annotations
 from typing import Any
 
 from .....auto import build_tokenizer
-from ....mixins.module_processor_mixin import Preprocessor
+from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem
 from .chat_template import Qwen3VLChatTemplate
 
 
-class Qwen3VLTextEncoderPreprocessor(Preprocessor):
+class Qwen3VLTextEncoderPreprocessor(ModulePreprocessorBase):
     """Worker-side ``apply_chat_template`` → tokenize → merge for the Qwen3-VL text encoder.
 
     Holds only the (picklable) :class:`Qwen3VLChatTemplate` — never the model — so it
@@ -27,7 +27,7 @@ class Qwen3VLTextEncoderPreprocessor(Preprocessor):
 
     def __init__(self, chat_template: Qwen3VLChatTemplate) -> None:
         self._chat_template = chat_template
-        # bind_preprocessor also copies _tokenizer onto the model — TextEncoderModuleMixin
+        # bind_module_assets also copies _tokenizer onto the model — TextEncoderModuleMixin
         # (base/text_encoder/modulemixin.py) decodes generated text via self._tokenizer.
         self._tokenizer = chat_template.tokenizer
 

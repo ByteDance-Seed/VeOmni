@@ -16,7 +16,7 @@ ships a ``preprocessor_config.json`` saved by HF's standard
 :meth:`JanusVqvaePreprocessor.from_pretrained`.
 
 :class:`JanusVqvaePreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`) —
+counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`) —
 built straight off the checkpoint dir, with no model instance involved.
 """
 
@@ -26,7 +26,7 @@ import torch
 from PIL import Image
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....mixins.module_processor_mixin import Preprocessor
+from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem, iter_desired_items
 from .configuration import JanusVqvaeConfig
 
@@ -83,7 +83,7 @@ def _to_pil(img: torch.Tensor) -> Image.Image:
 _SOURCE = "janus_vqvae"
 
 
-class JanusVqvaePreprocessor(Preprocessor):
+class JanusVqvaePreprocessor(ModulePreprocessorBase):
     """Worker-side image normalize for the VQVAE (generation) codec.
 
     Holds only the (picklable) VQVAE image processor + a CPU zero-pixel template

@@ -4,10 +4,10 @@ Mirrors HuggingFace ``AutoProcessor``: collect each module's CPU preprocessor in
 ``config.module_names`` order, build a ``conversation_list`` from user inputs,
 run the preprocessor chain, and return a generate-ready request dict.
 
-Every module's :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`
+Every module's :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`
 (declared on its own ``processing.py`` as ``XxxModuleMixin.preprocessor_class``)
 builds straight off its checkpoint subfolder via
-:meth:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor.from_pretrained` —
+:meth:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase.from_pretrained` —
 no model instance (weight-free, meta-device, or otherwise) is built or required.
 :meth:`OmniProcessor.from_config` reads each module's ``preprocessor_class`` off
 the class registered for its ``model_type`` and is the single code path backing
@@ -47,8 +47,8 @@ from PIL import Image
 from ...data.multimodal.image_utils import load_image
 from ...utils import logging
 from .configuration_omni import OmniConfig
-from .mixins.module_processor_mixin import Preprocessor
 from .modules import OMNI_MODEL_REGISTRY, read_model_type
+from .processing import ModulePreprocessorBase
 from .utils.conversation import build_conversation
 
 
@@ -73,8 +73,8 @@ def _normalize_images(images: MediaInput) -> list[Any]:
 class OmniProcessor:
     """Composed SeedOmni request preprocessor (HF ``AutoProcessor``-style API)."""
 
-    def __init__(self, preprocessors: dict[str, Preprocessor]) -> None:
-        self._preprocessors: dict[str, Preprocessor] = dict(preprocessors)
+    def __init__(self, preprocessors: dict[str, ModulePreprocessorBase]) -> None:
+        self._preprocessors: dict[str, ModulePreprocessorBase] = dict(preprocessors)
 
     def __len__(self) -> int:
         """Number of worker-side preprocessors contributed by active graph modules."""
@@ -84,7 +84,7 @@ class OmniProcessor:
         """Training-only: attach each preprocessor's FSDP-anchor dummy tensor(s).
 
         Computed from each module's own already-resolved config + ``dtype``
-        alone (see :meth:`Preprocessor.bind_dummy_inputs`) — no disk re-read
+        alone (see :meth:`ModulePreprocessorBase.bind_dummy_inputs`) — no disk re-read
         here: ``module_configs`` is ``{module_name: config}`` taken straight
         from the already-built live modules (e.g.
         ``{name: module_runtime.model_config for name, module_runtime in
@@ -116,7 +116,7 @@ class OmniProcessor:
 
         Collects CPU preprocessors in ``config.module_names`` order: for each
         module, reads its ``preprocessor_class`` off the class registered for its
-        ``model_type`` and calls :meth:`Preprocessor.from_pretrained` directly on
+        ``model_type`` and calls :meth:`ModulePreprocessorBase.from_pretrained` directly on
         its checkpoint subfolder — no model instance is built at all (not even a
         ``meta``-device one). ``config.module_model_config(name)`` (the module's
         YAML ``model_config:`` block) is forwarded as ``config_overrides`` so a
@@ -127,7 +127,7 @@ class OmniProcessor:
         """
         root = checkpoint_root if checkpoint_root is not None else getattr(config, "_name_or_path", None)
         root = None if root is None else str(root)
-        preprocessors: dict[str, Preprocessor] = {}
+        preprocessors: dict[str, ModulePreprocessorBase] = {}
         for name in config.module_names:
             module_path = config.resolve_module_path(root, name)
             model_type = read_model_type(module_path)

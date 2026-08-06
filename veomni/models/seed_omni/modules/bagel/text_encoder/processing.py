@@ -1,7 +1,7 @@
 """Stateless text carrier helpers + worker-side preprocessor for BAGEL text encoder.
 
 :class:`BagelTextEncoderPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`).
+counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`).
 Its :meth:`from_pretrained` loads the tokenizer and builds the
 :class:`~veomni.models.seed_omni.modules.bagel.text_encoder.chat_template.BagelChatTemplate`
 straight off the checkpoint dir — no model instance involved.
@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .....auto import build_tokenizer
-from ....mixins.module_processor_mixin import Preprocessor
+from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 
@@ -78,12 +78,12 @@ def apply_image_marker(
     item.value = torch.cat([marker_embeds[:1], image_embeds, marker_embeds[1:]], dim=0)
 
 
-class BagelTextEncoderPreprocessor(Preprocessor):
+class BagelTextEncoderPreprocessor(ModulePreprocessorBase):
     """Worker-side chat-template + tokenize for BAGEL text encoder inputs."""
 
     def __init__(self, chat_template: BagelChatTemplate) -> None:
         self._chat_template = chat_template
-        # bind_preprocessor also copies _tokenizer onto the model — TextEncoderModuleMixin
+        # bind_module_assets also copies _tokenizer onto the model — TextEncoderModuleMixin
         # (base/text_encoder/modulemixin.py) decodes generated text via self._tokenizer.
         self._tokenizer = chat_template.tokenizer
 

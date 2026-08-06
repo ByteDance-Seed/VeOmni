@@ -27,7 +27,7 @@ def register_qwen3vl_vision_processor():
     ``Qwen3VLVisionPreprocessor.from_pretrained`` (see
     ``modulemixin.Qwen3VLVisionEncoderModuleMixin.preprocessor_class``) and bound
     onto the model as ``self._image_processor`` / ``self._video_processor`` via
-    ``ModuleMixin.bind_preprocessor``.
+    ``bind_module_assets`` (see ``veomni.models.seed_omni.processing.binding``).
     """
     from .processing import Qwen3VLVisionImageProcessor, Qwen3VLVisionVideoProcessor
 

@@ -17,7 +17,7 @@ Aliased (not subclassed) to the canonical classes so the saved configs keep
 their registered ``*_processor_type`` and stay Auto-loadable.
 
 :class:`Qwen3VLVisionPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`)
+counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`)
 — built straight off the checkpoint dir, with no model instance involved.
 """
 
@@ -29,7 +29,7 @@ import torch
 from transformers import Qwen2VLImageProcessor
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
 
-from ....mixins.module_processor_mixin import Preprocessor
+from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem, iter_desired_items
 from .configuration import Qwen3VLVisionEncoderConfig
 
@@ -74,7 +74,7 @@ def _store_patches(items: list, pixel_values: torch.Tensor, grid_thw: torch.Tens
         it.meta[_OMNI_GRID] = g
 
 
-class Qwen3VLVisionPreprocessor(Preprocessor):
+class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
     """Worker-side image/video patchify+normalize for the Qwen3-VL vision tower.
 
     Holds only the (picklable) HF image / video processors + a CPU zero-patch
@@ -101,18 +101,16 @@ class Qwen3VLVisionPreprocessor(Preprocessor):
         self._dummy_grid = dummy_grid  # [t, h, w]
 
     @classmethod
-    def from_pretrained(cls, module_path: str, **kwargs: Any) -> Qwen3VLVisionPreprocessor | None:
+    def from_pretrained(cls, module_path: str, **kwargs: Any) -> Qwen3VLVisionPreprocessor:
         """Build straight from the checkpoint dir — no model instance needed.
 
-        Image and video processors ship as two independent config files
-        (``preprocessor_config.json`` / ``video_preprocessor_config.json``); try
-        each on its own so one missing file doesn't drop the other modality.
+        Expects both ``preprocessor_config.json`` (image) and
+        ``video_preprocessor_config.json`` (video) under ``module_path`` — the
+        ``qwen3_vl`` convert script writes both into ``qwen3vl_vision/``.
         """
         del kwargs
-        image_processor = _try_from_pretrained(Qwen3VLVisionImageProcessor, module_path)
-        video_processor = _try_from_pretrained(Qwen3VLVisionVideoProcessor, module_path)
-        if image_processor is None and video_processor is None:
-            return None
+        image_processor = Qwen3VLVisionImageProcessor.from_pretrained(module_path)
+        video_processor = Qwen3VLVisionVideoProcessor.from_pretrained(module_path)
         return cls(image_processor, video_processor)
 
     def bind_dummy_inputs(self, config: Qwen3VLVisionEncoderConfig, dtype: torch.dtype | None = None) -> None:
@@ -133,10 +131,10 @@ class Qwen3VLVisionPreprocessor(Preprocessor):
             sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
             sample_video_items = list(iter_desired_items([sample], types=["video"], roles=["user"]))
             if sample_image_items or sample_video_items:
-                if sample_image_items and self._image_processor is not None:
+                if sample_image_items:
                     out = self._image_processor(images=[it.value for it in sample_image_items], return_tensors="pt")
                     self._store(sample_image_items, out["pixel_values"], out["image_grid_thw"])
-                if sample_video_items and self._video_processor is not None:
+                if sample_video_items:
                     frames = [it.value.video for it in sample_video_items]
                     out = self._video_processor(
                         videos=frames, video_metadata=_video_metadata(sample_video_items, frames), return_tensors="pt"
@@ -160,13 +158,6 @@ class Qwen3VLVisionPreprocessor(Preprocessor):
 
     def _store(self, items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> None:
         _store_patches(items, pixel_values, grid_thw, self._dtype)
-
-
-def _try_from_pretrained(processor_cls: Any, module_path: str) -> Any | None:
-    try:
-        return processor_cls.from_pretrained(module_path)
-    except Exception:  # noqa: BLE001 — this modality's config file may not exist for this module
-        return None
 
 
 __all__ = [

@@ -42,8 +42,6 @@ sums them.  See ``docs/seed_omni/seed_omni_v2.md`` for the full contract.
 
 from typing import Any, Callable, Dict, List, Optional
 
-from .module_processor_mixin import ModuleProcessorMixin, Preprocessor
-
 
 def pre_forward(*contexts: str) -> Callable[[Callable], Callable]:
     """Decorator: register a **pre-hook** for one or more graph call-sites.
@@ -96,20 +94,22 @@ def post_forward(*contexts: str) -> Callable[[Callable], Callable]:
     return decorator
 
 
-class ModuleMixin(ModuleProcessorMixin):
+class ModuleMixin:
     """SeedOmni V2 graph mixin — training/inference hooks for ``OmniModel`` graphs.
 
     This base class owns only graph-facing hooks (``pre_forward`` / ``post_forward`` /
     ``forward`` / ``generate*`` / ``finalize`` / …).  Parallel build, FSDP plans,
-    and metric metering live elsewhere:
+    metric metering, and CPU preprocessors live elsewhere:
 
     * :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
       (or a customized runtime subclass) — ``customized_build_parallelize_model``.
-    * Optional family mixins — ``get_parallel_plan``. A module's picklable,
-      weight-free preprocessor lives on its own ``processing.py`` (see
-      :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.ModuleProcessorMixin`
-      / :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`),
-      never on the model.
+    * Optional family mixins — ``get_parallel_plan``.
+    * :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase` — optional
+      CPU worker base class (``XxxPreprocessor`` in ``processing.py``); modules
+      that need one set ``preprocessor_class = XxxPreprocessor`` on the family
+      mixin.  Asset binding is handled by
+      :func:`~veomni.models.seed_omni.processing.binding.bind_module_assets`, not
+      by mixing in a processor base class.
     * :class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin`
       — ``metric_meter_set_seqlens`` and step metering.
     """
@@ -127,6 +127,19 @@ class ModuleMixin(ModuleProcessorMixin):
         """
         super().__init__(*args, **kwargs)
         self.init_omni_state()
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
+        """Load weights, then copy HF assets from the module's CPU worker if declared."""
+        from ..processing.binding import bind_module_assets
+
+        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        bind_module_assets(
+            model,
+            checkpoint_path=str(pretrained_model_name_or_path),
+            config_overrides=kwargs,
+        )
+        return model
 
     def init_omni_state(self) -> None:
         """Initialize per-module runtime state (training/inference caches).
@@ -258,7 +271,6 @@ class ModuleMixin(ModuleProcessorMixin):
 
 __all__ = [
     "ModuleMixin",
-    "Preprocessor",
     "pre_forward",
     "post_forward",
 ]

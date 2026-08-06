@@ -39,7 +39,7 @@ task at hand; do not read every reference by default.
 
 - Entry-time samples use `{"conversation_list": [...]}`. The SeedOmni collator
   groups samples and runs ordered module CPU preprocessors before GPU forward.
-- `Preprocessor` is a core data-flow contract, shared by training and
+- `ModulePreprocessorBase` is a core data-flow contract, shared by training and
   inference. Training runs it inside `SeedOmniCollator`; inference runs it once
   before the FSM.
 - Modules communicate by mutating/returning the shared `conversation_list`

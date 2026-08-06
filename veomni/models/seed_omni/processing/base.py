@@ -12,25 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Picklable CPU preprocessors and the mixin hooks that wire them onto modules."""
+"""Base class for per-module CPU input preparation (DataLoader workers).
+
+Terminology (three different "processor" layers)
+------------------------------------------------
+* **HF asset — ``XxxProcessor``** (in each ``modules/*/processing.py``):
+  HuggingFace-style checkpoint sidecar — image processor, tokenizer, etc.
+  Saved/loaded via ``save_pretrained`` / ``from_pretrained`` on the asset itself
+  (e.g. ``JanusSiglipProcessor``, ``BagelVAEProcessor``).  Holds resize /
+  normalize constants; no ``nn.Module`` weights.
+
+* **Module CPU worker — ``XxxPreprocessor(ModulePreprocessorBase)``** (same file):
+  Picklable, weight-free object run inside DataLoader workers (training) or
+  once before the generation FSM (inference).  Usually *wraps* the HF asset
+  (``self._image_processor``, ``self._tokenizer``, …) and mutates
+  ``conversation_list`` in place via ``__call__``.
+
+* **Omni orchestrator — ``OmniProcessor``** (``processing_omni.py``):
+  Composes one ``XxxPreprocessor`` per active graph module — the SeedOmni
+  analogue of HuggingFace ``AutoProcessor``.
+
+This module defines only the **middle** layer's abstract base.  It is **not**
+a graph mixin; family mixins declare ``preprocessor_class = XxxPreprocessor``
+as a registry pointer and optionally receive copied assets via
+:func:`~veomni.models.seed_omni.processing.binding.bind_module_assets`.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 
-class Preprocessor:
+class ModulePreprocessorBase:
     """Picklable, weight-free CPU input-prep run inside DataLoader workers.
 
-    A module whose ``pre_forward`` does heavy **CPU** input preparation (e.g. a
-    text encoder's chat-template + tokenize, a vision tower's image normalize)
-    can move that work off the main/GPU process by declaring one of these on its
-    ``modules/<family>/<sub>/processing.py`` (as ``XxxModuleMixin.preprocessor_class``).
-    The :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`
-    orchestrator collects the active graph-node modules' preprocessors and runs
-    them inside :class:`~veomni.data.data_collator.SeedOmniCollator` — which
-    executes in the DataLoader worker — so the work overlaps with GPU compute via
-    prefetch instead of blocking the main process inside ``pre_forward``.
+    Subclass as ``XxxPreprocessor`` in ``modules/<family>/<sub>/processing.py``.
+    The HF asset (``XxxProcessor`` / tokenizer) lives in the same file but is a
+    separate class — do not confuse the two.
 
     Contract:
 
@@ -80,8 +98,8 @@ class Preprocessor:
     @classmethod
     def from_pretrained(
         cls, module_path: str, *, config_overrides: dict[str, Any] | None = None, **kwargs: Any
-    ) -> Preprocessor | None:
-        """Build this module's preprocessor from its checkpoint subfolder alone.
+    ) -> ModulePreprocessorBase | None:
+        """Build this module's CPU worker from its checkpoint subfolder alone.
 
         No model instance (weight-free or otherwise) is built or required.
         ``config_overrides`` mirrors the module's YAML ``model_config:`` block
@@ -94,7 +112,7 @@ class Preprocessor:
         agrees with what the live model was actually configured with. Default:
         this module contributes no preprocessor (e.g. a pure backbone with no
         CPU-side input prep). Concrete modules override on their own
-        ``processing.py``-defined ``Preprocessor`` subclass.
+        ``processing.py``-defined ``ModulePreprocessorBase`` subclass.
         """
         del module_path, config_overrides, kwargs
         return None
@@ -111,63 +129,4 @@ class Preprocessor:
         return None
 
 
-class ModuleProcessorMixin:
-    """Mixin wiring a module's picklable ``Preprocessor`` onto the live model.
-
-    Concrete modules declare ``preprocessor_class`` on their family mixin and
-    implement ``XxxPreprocessor(Preprocessor)`` in ``processing.py``.  Training
-    collects preprocessors into :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`;
-    inference runs the same instances in
-    :meth:`~veomni.trainer.omni.omni_inferencer.OmniInferencer._preprocess_request`.
-    """
-
-    preprocessor_class: type[Preprocessor] | None = None
-
-    def bind_preprocessor(self, preprocessor: Preprocessor | None) -> None:
-        """Attach a preprocessor's already-loaded assets onto this module instance.
-
-        ``preprocessor`` was built independently of this model (see
-        :meth:`Preprocessor.from_pretrained`) — this only copies its well-known
-        asset attributes onto the conventional instance names a module's own
-        ``forward`` / ``generate`` code reads directly (``self._image_processor``,
-        ``self._video_processor``, ``self.tokenizer``/``self._chat_template``, …),
-        so those call sites need no changes. Copied verbatim (no rebuilding): a
-        text preprocessor's ``_chat_template`` was already derived from its
-        ``_tokenizer`` at construction time. Override on a family mixin only if a
-        module needs custom wiring beyond this attribute copy.
-        """
-        if preprocessor is None:
-            return
-        for attr in ("_processor", "_image_processor", "_video_processor", "_tokenizer", "_chat_template"):
-            if hasattr(preprocessor, attr):
-                setattr(self, attr, getattr(preprocessor, attr))
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
-        """Load weights, then bind the per-module preprocessor if declared.
-
-        The preprocessor itself is built by :meth:`Preprocessor.from_pretrained`
-        straight from the checkpoint dir — no model instance is involved in
-        building it; :meth:`bind_preprocessor` only copies its assets onto
-        ``model``. On failure the module gets no preprocessor bound (best-effort;
-        surfaced lazily when the modality is actually used).
-
-        Forwards this same call's ``kwargs`` on as ``config_overrides`` — HF's
-        ``PretrainedConfig.from_pretrained`` only applies keys it recognizes as
-        attributes and silently ignores the rest (e.g. ``device_map``), so
-        reusing the raw call kwargs is safe and keeps the preprocessor's
-        config-derived behavior (e.g. ``enable_image``, ``cache_mode``) in sync
-        with the config overrides just applied to ``model.config`` above.
-        """
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        preprocessor_cls = getattr(cls, "preprocessor_class", None)
-        if preprocessor_cls is not None:
-            try:
-                preprocessor = preprocessor_cls.from_pretrained(pretrained_model_name_or_path, config_overrides=kwargs)
-            except Exception:
-                preprocessor = None
-            model.bind_preprocessor(preprocessor)
-        return model
-
-
-__all__ = ["ModuleProcessorMixin", "Preprocessor"]
+__all__ = ["ModulePreprocessorBase"]

@@ -12,19 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 mixins: the per-module graph-hook base + the metric meter."""
+"""Per-module CPU preprocessing contracts and model asset binding."""
 
-from .metric_meter_mixin import MetricMeterMixin, MetricMeterResult
-from .module_mixin import ModuleMixin, post_forward, pre_forward
-from .offline_encoding_mixin import OfflineEncodingConfigMixin, OfflineEncodingMixin
+from .base import ModulePreprocessorBase
+from .binding import MODULE_ASSET_ATTRS, bind_module_assets
 
 
 __all__ = [
-    "ModuleMixin",
-    "pre_forward",
-    "post_forward",
-    "MetricMeterMixin",
-    "MetricMeterResult",
-    "OfflineEncodingConfigMixin",
-    "OfflineEncodingMixin",
+    "MODULE_ASSET_ATTRS",
+    "ModulePreprocessorBase",
+    "bind_module_assets",
 ]

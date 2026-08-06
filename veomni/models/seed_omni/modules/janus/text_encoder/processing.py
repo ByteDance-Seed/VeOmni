@@ -1,7 +1,7 @@
 """Worker-side preprocessor for :class:`JanusTextEncoder` — HF ``AutoProcessor`` style.
 
 :class:`JanusTextEncoderPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`).
+counterpart (see :class:`~veomni.models.seed_omni.processing.base.ModulePreprocessorBase`).
 Its :meth:`from_pretrained` loads the tokenizer and builds the
 :class:`~veomni.models.seed_omni.modules.janus.text_encoder.chat_template.JanusChatTemplate`
 straight off the checkpoint dir — no model instance involved. Text encoders never
@@ -11,12 +11,12 @@ need a dummy branch (only image-modality preprocessors do).
 from typing import Any
 
 from .....auto import build_tokenizer
-from ....mixins.module_processor_mixin import Preprocessor
+from ....processing import ModulePreprocessorBase
 from ....utils.conversation import ConversationItem
 from .chat_template import JanusChatTemplate
 
 
-class JanusTextEncoderPreprocessor(Preprocessor):
+class JanusTextEncoderPreprocessor(ModulePreprocessorBase):
     """Worker-side ``apply_chat_template`` → tokenize → merge for the Janus text encoder.
 
     Holds only the (picklable) tokenizer + :class:`JanusChatTemplate` — never the
@@ -27,7 +27,7 @@ class JanusTextEncoderPreprocessor(Preprocessor):
 
     def __init__(self, chat_template: JanusChatTemplate) -> None:
         self._chat_template = chat_template
-        # bind_preprocessor also copies _tokenizer onto the model — TextEncoderModuleMixin
+        # bind_module_assets also copies _tokenizer onto the model — TextEncoderModuleMixin
         # (base/text_encoder/modulemixin.py) decodes generated text via self._tokenizer.
         self._tokenizer = chat_template.tokenizer
 
