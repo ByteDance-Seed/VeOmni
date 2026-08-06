@@ -45,7 +45,7 @@ flowchart LR
 
 Every sub-model multi-inherits a family-specific ``*ModuleMixin`` and a real
 HuggingFace / diffusers model.  Shared defaults live in
-:class:`~veomni.models.seed_omni.mixins.modulemixin.ModuleMixin`; per-module train/infer
+:class:`~veomni.models.seed_omni.mixins.module_mixin.ModuleMixin`; per-module train/infer
 logic lives in ``modules/<family>/<sub>/modulemixin.py``:
 
 ```python
@@ -54,7 +54,7 @@ class JanusLlama(JanusLlamaModuleMixin, PreTrainedModel): ...
 ```
 
 Construction chain: ``super().__init__(config)`` → ``PreTrainedModel`` +
-:meth:`~veomni.models.seed_omni.mixins.modulemixin.ModuleMixin.init_omni_state`, then
+:meth:`~veomni.models.seed_omni.mixins.module_mixin.ModuleMixin.init_omni_state`, then
 build submodules in ``modeling.py`` and call ``self.post_init()`` for HF
 weight init.  Core ``forward`` stays in ``modeling.py``; graph hooks
 (``pre_forward``, ``generate``, …) stay in ``modulemixin.py``.
@@ -421,7 +421,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 
 | Path | Responsibility |
 |------|----------------|
-| `mixins/modulemixin.py` | base `ModuleMixin` (shared hook defaults + `init_omni_state`) |
+| `mixins/module_mixin.py` | base `ModuleMixin` (shared hook defaults + `init_omni_state`) |
 | `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
 | `utils/conversation.py` | `ConversationItem` + carrier helpers |
 | `utils/convert_registry.py` | HF → split-checkpoint conversion registry |

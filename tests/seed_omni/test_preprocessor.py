@@ -811,7 +811,7 @@ def test_vqvae_preprocessor_normalizes_only_assistant_images():
 
 
 def test_collator_runs_preprocessors_in_order():
-    from veomni.models.seed_omni.processing import OmniProcessor
+    from veomni.models.seed_omni.processing_omni import OmniProcessor
 
     preprocessors = {
         "text": JanusTextEncoderPreprocessor(_janus_template()),

@@ -1,7 +1,7 @@
 """Worker-side preprocessor for :class:`Qwen3TextEncoder` — HF ``AutoProcessor`` style.
 
 :class:`Qwen3TextEncoderPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`).
+counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`).
 Its :meth:`from_pretrained` loads the tokenizer and picks the chat template
 straight off the checkpoint dir — no model instance involved. The template
 choice mirrors the module's own ``config.enable_image`` flag: image mode reuses
@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from .....auto import build_tokenizer
-from ....mixins.modulemixin import Preprocessor
+from ....mixins.module_processor_mixin import Preprocessor
 from ....utils.conversation import ConversationItem
 from ...qwen3vl.text_encoder.chat_template import Qwen3VLChatTemplate
 from .chat_template import Qwen3ChatTemplate

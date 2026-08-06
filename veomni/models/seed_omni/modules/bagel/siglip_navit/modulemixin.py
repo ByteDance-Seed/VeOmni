@@ -9,7 +9,7 @@ import torch
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig

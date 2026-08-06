@@ -4,7 +4,7 @@ import torch
 
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs, sp_pad_and_slice
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
 from .processing import _OMNI_GRID, _SOURCE, Qwen3VLVisionPreprocessor
 

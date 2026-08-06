@@ -6,7 +6,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy
 
 

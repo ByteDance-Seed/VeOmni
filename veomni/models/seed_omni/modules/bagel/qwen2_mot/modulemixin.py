@@ -14,7 +14,7 @@ from ......distributed.sequence_parallel import (
     sp_pad,
 )
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, get_tail_output_item, iter_desired_items
 from ..sources import (
     BAGEL_FLOW_HIDDEN,

@@ -1,7 +1,7 @@
 """Image processor + worker-side preprocessor for BAGEL VAE.
 
 :class:`BagelVAEPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`) —
+counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`) —
 built straight off the checkpoint dir, with no model instance involved. Like
 :mod:`..siglip_navit.processing`, BAGEL ships no separate
 ``preprocessor_config.json``: the image processor is derived from the
@@ -21,7 +21,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....mixins.modulemixin import Preprocessor
+from ....mixins.module_processor_mixin import Preprocessor
 from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig

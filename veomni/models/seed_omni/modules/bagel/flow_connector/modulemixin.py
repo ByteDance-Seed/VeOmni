@@ -10,7 +10,7 @@ from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, get_tail_output_item, is_dummy, iter_desired_items
 from ..sources import (
     BAGEL_FLOW_HIDDEN,

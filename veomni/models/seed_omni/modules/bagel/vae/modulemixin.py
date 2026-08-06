@@ -12,8 +12,8 @@ from veomni.utils.device import get_device_id, get_device_type
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs, slice_input_tensor
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
-from ....mixins.offline_encoding import OfflineEncodingMixin
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig

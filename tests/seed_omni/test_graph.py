@@ -16,7 +16,7 @@ from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.graphs.graph import END
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
-from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
+from veomni.models.seed_omni.mixins.module_mixin import ModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.utils import graph_profiler
 from veomni.models.seed_omni.utils.graph_profiler import GraphProfiler

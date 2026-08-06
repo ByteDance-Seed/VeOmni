@@ -9,7 +9,7 @@ from veomni.distributed.sequence_parallel import gather_outputs, slice_input_ten
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, seal_outputs
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig

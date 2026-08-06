@@ -583,7 +583,7 @@ class ModuleRuntime:
         Meta-init skips ``from_pretrained``, so vision modules and text encoders
         that need a processor or tokenizer at train time bind them here from this
         module's weights path — via ``preprocessor_class.from_pretrained``
-        (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`),
+        (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`),
         which builds with no model instance involved, then
         :meth:`ModuleMixin.bind_preprocessor` copies its assets onto ``model``.
         A no-op when the module declares no ``preprocessor_class``, or when an

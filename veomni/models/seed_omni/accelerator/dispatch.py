@@ -7,7 +7,7 @@ from typing import Any
 
 import torch.nn as nn
 
-from ..mixins.modulemixin import ModuleMixin
+from ..mixins.module_mixin import ModuleMixin
 
 
 def unwrap_module_chain(wrapped: nn.Module) -> nn.Module:

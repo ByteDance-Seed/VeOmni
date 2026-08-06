@@ -8,7 +8,7 @@ from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_posit
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy
 from .configuration import JanusLlamaConfig
 

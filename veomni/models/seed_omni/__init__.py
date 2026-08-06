@@ -25,8 +25,8 @@ from .graphs.generation_graph import GenerationGraph
 from .graphs.graph import END, EdgeDef, NodeDef
 from .graphs.training_graph import TrainingGraph
 from .mixins.metric_meter_mixin import MetricMeterMixin
-from .mixins.modulemixin import ModuleMixin
-from .mixins.offline_encoding import OfflineEncodingConfigMixin, OfflineEncodingMixin
+from .mixins.module_mixin import ModuleMixin
+from .mixins.offline_encoding_mixin import OfflineEncodingConfigMixin, OfflineEncodingMixin
 from .modeling_omni import OmniModel
 from .modules import (
     OMNI_CONFIG_REGISTRY,
@@ -35,7 +35,7 @@ from .modules import (
     read_hf_model_type,
     read_model_type,
 )
-from .processing import OmniProcessor
+from .processing_omni import OmniProcessor
 from .utils.conversation import build_conversation
 
 

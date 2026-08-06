@@ -14,7 +14,7 @@ from tests.seed_omni.bagel.contracts.helpers import (
 )
 from veomni.models.seed_omni.accelerator import OmniModelRuntime
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
-from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
+from veomni.models.seed_omni.mixins.module_mixin import ModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.generation_state import MotGenerationState
 from veomni.models.seed_omni.modules.bagel.sources import (

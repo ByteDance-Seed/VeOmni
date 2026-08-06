@@ -25,7 +25,7 @@ Architecture
                           Parallel/acceleration build hooks live on
                           :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
                           (or a customized runtime subclass), not on
-                          :class:`~veomni.models.seed_omni.mixins.modulemixin.ModuleMixin`.
+                          :class:`~veomni.models.seed_omni.mixins.module_mixin.ModuleMixin`.
 * ``generation_graph``  — :class:`GenerationGraph` (FSM).
 
 Training uses :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
@@ -52,7 +52,7 @@ from .configuration_omni import OmniConfig
 from .graphs.generation_graph import GenerationGraph
 from .graphs.graph import NodeDef
 from .graphs.training_graph import TrainingGraph
-from .mixins.modulemixin import ModuleMixin
+from .mixins.module_mixin import ModuleMixin
 from .modules import OMNI_MODEL_REGISTRY, read_model_type
 
 

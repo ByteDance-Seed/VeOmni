@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Optional
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.modulemixin import post_forward, pre_forward
+from ....mixins.module_mixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, maybe_merge_outputs
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from .chat_template import Qwen3VLChatTemplate

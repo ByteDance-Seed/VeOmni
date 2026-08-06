@@ -596,8 +596,8 @@ class SeedOmniCollator(DataCollator):
         ])
         # batch == {"conversation_list": [[ConversationItem(...)], ...]}
 
-    ``processor`` is an :class:`~veomni.models.seed_omni.processing.OmniProcessor` built
-    via :meth:`~veomni.models.seed_omni.processing.OmniProcessor.from_config` from the
+    ``processor`` is an :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor` built
+    via :meth:`~veomni.models.seed_omni.processing_omni.OmniProcessor.from_config` from the
     active graph modules' config (see ``OmniTrainer._build_train_dataloader``). Its preprocessor
     chain runs, in order, over the grouped ``conversation_list`` so the heavy per-module CPU
     input-prep (tokenize / image normalize) executes inside the DataLoader worker and

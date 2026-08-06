@@ -8,7 +8,7 @@ from transformers import PreTrainedTokenizerBase
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....mixins.modulemixin import post_forward, pre_forward
+from ....mixins.module_mixin import post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from ..sources import BAGEL_FLOW_QUERY

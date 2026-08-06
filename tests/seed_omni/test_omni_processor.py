@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 from veomni.models.seed_omni.configuration_omni import OmniConfig
-from veomni.models.seed_omni.processing import OmniProcessor
+from veomni.models.seed_omni.processing_omni import OmniProcessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
@@ -24,7 +24,7 @@ def test_omni_processor_builds_conversation_and_runs_preprocessors_in_order():
         }
     )
 
-    with patch("veomni.models.seed_omni.processing.load_image", return_value="img"):
+    with patch("veomni.models.seed_omni.processing_omni.load_image", return_value="img"):
         model_input = processor(text="hello", images=["/tmp/fake.png"])
 
     assert calls == ["first", "second"]
@@ -63,9 +63,9 @@ def test_omni_processor_preprocess_batch_runs_with_inference_false():
     assert calls == [("batch", False)]
 
 
-@patch("veomni.models.seed_omni.processing.OMNI_MODEL_REGISTRY")
-@patch("veomni.models.seed_omni.processing.read_model_type", return_value="encoder_type")
-@patch("veomni.models.seed_omni.processing.OmniConfig.from_pretrained")
+@patch("veomni.models.seed_omni.processing_omni.OMNI_MODEL_REGISTRY")
+@patch("veomni.models.seed_omni.processing_omni.read_model_type", return_value="encoder_type")
+@patch("veomni.models.seed_omni.processing_omni.OmniConfig.from_pretrained")
 def test_omni_processor_from_pretrained_collects_module_preprocessors(
     mock_from_pretrained,
     mock_read_model_type,
@@ -88,8 +88,8 @@ def test_omni_processor_from_pretrained_collects_module_preprocessors(
     assert len(processor._preprocessors) == 1
 
 
-@patch("veomni.models.seed_omni.processing.OMNI_MODEL_REGISTRY")
-@patch("veomni.models.seed_omni.processing.read_model_type", return_value="encoder_type")
+@patch("veomni.models.seed_omni.processing_omni.OMNI_MODEL_REGISTRY")
+@patch("veomni.models.seed_omni.processing_omni.read_model_type", return_value="encoder_type")
 def test_omni_processor_from_config_forwards_module_model_config_overrides(mock_read_model_type, mock_registry):
     """A module's YAML `model_config:` override (e.g. visual-instruction-tuning's
     `enable_image: true` on `qwen3_text_encoder`) must reach the module's

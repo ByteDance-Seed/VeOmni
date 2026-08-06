@@ -69,7 +69,7 @@ from ...distributed.offloading import build_activation_offloading_context
 from ...distributed.parallel_state import init_parallel_state
 from ...models.seed_omni.accelerator import OmniModelRuntime
 from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime
-from ...models.seed_omni.processing import OmniProcessor
+from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging

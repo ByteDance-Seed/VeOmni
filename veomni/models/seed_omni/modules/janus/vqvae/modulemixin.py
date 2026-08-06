@@ -8,7 +8,7 @@ from ......distributed.sequence_parallel import gather_outputs, slice_input_tens
 from ......utils import helper
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import (
     ConversationItem,
     is_dummy,

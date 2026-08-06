@@ -1,7 +1,7 @@
 """Image processor + worker-side preprocessor for BAGEL SigLIP NaViT.
 
 :class:`BagelSiglipNavitPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`) —
+counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`) —
 built straight off the checkpoint dir, with no model instance involved. Unlike
 Janus, BAGEL ships no separate ``preprocessor_config.json``: the image
 processor is fully derived from the module's own ``config.json`` via
@@ -20,7 +20,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....mixins.modulemixin import Preprocessor
+from ....mixins.module_processor_mixin import Preprocessor
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig

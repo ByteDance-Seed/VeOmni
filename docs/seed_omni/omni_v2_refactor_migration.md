@@ -29,7 +29,7 @@ old layout** — resolve them with the path/import maps below.
 
 | Old path | New path | Notes |
 |----------|----------|-------|
-| `veomni/models/seed_omni/module.py` | `veomni/models/seed_omni/mixins/modulemixin.py` | class is still `ModuleMixin`; adds `Preprocessor` |
+| `veomni/models/seed_omni/module.py` | `veomni/models/seed_omni/mixins/module_mixin.py` | class is still `ModuleMixin`; adds `Preprocessor` |
 | `veomni/models/seed_omni/metric_meter_mixin.py` | `veomni/models/seed_omni/mixins/metric_meter_mixin.py` | |
 | `veomni/models/seed_omni/conversation.py` | `veomni/models/seed_omni/utils/conversation.py` | |
 | `veomni/models/seed_omni/graph.py` | `veomni/models/seed_omni/graphs/graph.py` | `NodeDef` / `EdgeDef` / `END` |
@@ -50,7 +50,7 @@ New package `__init__.py` files: `seed_omni/graphs/`, `seed_omni/mixins/`,
 Absolute imports (search-and-replace across your branch):
 
 ```text
-veomni.models.seed_omni.module            → veomni.models.seed_omni.mixins.modulemixin
+veomni.models.seed_omni.module            → veomni.models.seed_omni.mixins.module_mixin
 veomni.models.seed_omni.metric_meter_mixin        → veomni.models.seed_omni.mixins.metric_meter_mixin
 veomni.models.seed_omni.conversation      → veomni.models.seed_omni.utils.conversation
 veomni.models.seed_omni.graph             → veomni.models.seed_omni.graphs.graph
@@ -65,7 +65,7 @@ Relative imports **inside** `modules/<family>/<sub>/*.py` (4 dots reach `seed_om
 
 ```text
 from ....module import ModuleMixin, pre_forward, post_forward
-    → from ....mixins.modulemixin import ModuleMixin, pre_forward, post_forward, Preprocessor
+    → from ....mixins.module_mixin import ModuleMixin, pre_forward, post_forward, Preprocessor
 from ....metric_meter_mixin import MetricMeterMixin
     → from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....conversation import ConversationItem, iter_desired_items, ...

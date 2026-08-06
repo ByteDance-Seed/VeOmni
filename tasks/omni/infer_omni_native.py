@@ -1,7 +1,7 @@
 """SeedOmni V2 native eager inference — simple process, then generate.
 
 Loads a split checkpoint with ``OmniModel.from_pretrained`` and preprocesses
-requests through :class:`~veomni.models.seed_omni.processing.OmniProcessor`
+requests through :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`
 (HF ``AutoProcessor``-style API).
 
 Examples

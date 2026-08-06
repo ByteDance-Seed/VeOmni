@@ -1,7 +1,7 @@
 """Worker-side preprocessor for :class:`JanusTextEncoder` — HF ``AutoProcessor`` style.
 
 :class:`JanusTextEncoderPreprocessor` is the picklable, weight-free CPU worker
-counterpart (see :class:`~veomni.models.seed_omni.mixins.modulemixin.Preprocessor`).
+counterpart (see :class:`~veomni.models.seed_omni.mixins.module_processor_mixin.Preprocessor`).
 Its :meth:`from_pretrained` loads the tokenizer and builds the
 :class:`~veomni.models.seed_omni.modules.janus.text_encoder.chat_template.JanusChatTemplate`
 straight off the checkpoint dir — no model instance involved. Text encoders never
@@ -11,7 +11,7 @@ need a dummy branch (only image-modality preprocessors do).
 from typing import Any
 
 from .....auto import build_tokenizer
-from ....mixins.modulemixin import Preprocessor
+from ....mixins.module_processor_mixin import Preprocessor
 from ....utils.conversation import ConversationItem
 from .chat_template import JanusChatTemplate
 

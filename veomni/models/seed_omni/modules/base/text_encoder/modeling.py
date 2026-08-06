@@ -15,7 +15,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
-from ....mixins.emb_parallel import EmbParallelMixin
+from ....mixins.emb_parallel_mixin import EmbParallelMixin
 from .configuration import TextEncoderConfig
 from .modulemixin import TextEncoderMetricMeterMixin, TextEncoderModuleMixin
 

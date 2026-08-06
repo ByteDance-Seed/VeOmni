@@ -26,7 +26,7 @@ raw data transforms, or request preprocessing.
 
 ## Preprocessor Contract
 
-`Preprocessor` lives in `veomni/models/seed_omni/mixins/modulemixin.py`.
+`Preprocessor` lives in `veomni/models/seed_omni/mixins/module_processor_mixin.py`.
 
 Rules:
 

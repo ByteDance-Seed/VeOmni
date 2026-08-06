@@ -8,7 +8,7 @@ import torch
 from transformers import PretrainedConfig
 
 from veomni.models.seed_omni import OfflineEncodingConfigMixin, OfflineEncodingMixin
-from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from veomni.models.seed_omni.mixins.module_mixin import ModuleMixin, post_forward, pre_forward
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 

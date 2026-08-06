@@ -2,7 +2,7 @@
 
 from transformers import PretrainedConfig
 
-from ....mixins.offline_encoding import OfflineEncodingConfigMixin
+from ....mixins.offline_encoding_mixin import OfflineEncodingConfigMixin
 
 
 class BagelVAEConfig(OfflineEncodingConfigMixin, PretrainedConfig):

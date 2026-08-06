@@ -25,7 +25,7 @@ from ....checkpoint import CheckpointerBase, build_checkpointer
 from ....utils import helper, logging
 from ....utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from ..accelerator.dispatch import unwrap_module_chain
-from ..mixins.offline_encoding import OfflineEncodingMixin
+from ..mixins.offline_encoding_mixin import OfflineEncodingMixin
 
 
 if TYPE_CHECKING:
