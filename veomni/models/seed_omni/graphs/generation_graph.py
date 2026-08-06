@@ -98,14 +98,14 @@ Usage
 
 See also
 --------
-``graph.py``           — NodeDef / EdgeDef / END shared types.
+``base.py``           — NodeDef / EdgeDef / END shared types.
 ``training_graph.py``  — DAG view driven by ``OmniConfig.training_graph``.
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional
 
-from .graph import (
+from .base import (
     EdgeDef,
     NodeDef,
     is_end,

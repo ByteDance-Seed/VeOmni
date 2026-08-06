@@ -6,7 +6,7 @@ Use this reference to decide which files to trust before editing SeedOmni V2.
 
 - `veomni/models/seed_omni/mixins/module_mixin.py`
   - `ModuleMixin`, `Preprocessor`, `pre_forward`, `post_forward`.
-- `veomni/models/seed_omni/graphs/graph.py`
+- `veomni/models/seed_omni/graphs/base.py`
   - endpoint parsing and common graph schema.
 - `veomni/models/seed_omni/graphs/training_graph.py`
   - training DAG execution and `conversation_list` merge semantics.

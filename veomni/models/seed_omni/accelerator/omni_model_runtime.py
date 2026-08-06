@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from ....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
 from ....utils.logging import get_logger
-from ..graphs.graph import NodeDef
+from ..graphs.base import NodeDef
 from ..mixins.metric_meter_mixin import MetricMeterResult
 from ..modeling_omni import _LOSS_KEY, OmniModel, _sum_losses
 from ..utils.graph_profiler import GraphProfiler

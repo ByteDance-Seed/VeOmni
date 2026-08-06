@@ -21,8 +21,8 @@
 #      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
 #      ``model_type → class`` lazily at runtime.
 from .configuration_omni import OmniConfig
+from .graphs.base import END, EdgeDef, NodeDef
 from .graphs.generation_graph import GenerationGraph
-from .graphs.graph import END, EdgeDef, NodeDef
 from .graphs.training_graph import TrainingGraph
 from .mixins.metric_meter_mixin import MetricMeterMixin
 from .mixins.module_mixin import ModuleMixin

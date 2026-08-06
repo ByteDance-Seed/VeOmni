@@ -57,14 +57,14 @@ Exposed surface
 
 See also
 --------
-``graph.py``           — NodeDef / EdgeDef / END shared types.
+``base.py``           — NodeDef / EdgeDef / END shared types.
 ``generation_graph.py`` — FSM view driven by ``OmniConfig.generation_graph``.
 """
 
 from collections import defaultdict, deque
 from typing import Dict, Iterator, List, Optional
 
-from .graph import EdgeDef, NodeDef, is_end
+from .base import EdgeDef, NodeDef, is_end
 
 
 def _mermaid_id(name: str) -> str:

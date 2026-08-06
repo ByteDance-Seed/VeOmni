@@ -32,7 +32,7 @@ old layout** — resolve them with the path/import maps below.
 | `veomni/models/seed_omni/module.py` | `veomni/models/seed_omni/mixins/module_mixin.py` | class is still `ModuleMixin`; adds `Preprocessor` |
 | `veomni/models/seed_omni/metric_meter_mixin.py` | `veomni/models/seed_omni/mixins/metric_meter_mixin.py` | |
 | `veomni/models/seed_omni/conversation.py` | `veomni/models/seed_omni/utils/conversation.py` | |
-| `veomni/models/seed_omni/graph.py` | `veomni/models/seed_omni/graphs/graph.py` | `NodeDef` / `EdgeDef` / `END` |
+| `veomni/models/seed_omni/graph.py` | `veomni/models/seed_omni/graphs/base.py` | `NodeDef` / `EdgeDef` / `END` |
 | `veomni/models/seed_omni/generation_graph.py` | `veomni/models/seed_omni/graphs/generation_graph.py` | `GenerationGraph`, `FSM_SIGNAL_KEY` |
 | `veomni/models/seed_omni/training_graph.py` | `veomni/models/seed_omni/graphs/training_graph.py` | now an FSM-style stepper |
 | `veomni/models/seed_omni/convert_registry.py` | `veomni/models/seed_omni/utils/convert_registry.py` | `OMNI_CONVERT_REGISTRY`, `convert_checkpoint` |
@@ -53,7 +53,7 @@ Absolute imports (search-and-replace across your branch):
 veomni.models.seed_omni.module            → veomni.models.seed_omni.mixins.module_mixin
 veomni.models.seed_omni.metric_meter_mixin        → veomni.models.seed_omni.mixins.metric_meter_mixin
 veomni.models.seed_omni.conversation      → veomni.models.seed_omni.utils.conversation
-veomni.models.seed_omni.graph             → veomni.models.seed_omni.graphs.graph
+veomni.models.seed_omni.graph             → veomni.models.seed_omni.graphs.base
 veomni.models.seed_omni.generation_graph  → veomni.models.seed_omni.graphs.generation_graph
 veomni.models.seed_omni.training_graph    → veomni.models.seed_omni.graphs.training_graph
 veomni.models.seed_omni.convert_registry  → veomni.models.seed_omni.utils.convert_registry

@@ -14,8 +14,8 @@
 
 """SeedOmni V2 graph layer: shared edge/node types + training DAG + inference FSM."""
 
+from .base import END, EdgeDef, NodeDef, is_end
 from .generation_graph import FSM_SIGNAL_KEY, GenerationGraph
-from .graph import END, EdgeDef, NodeDef, is_end
 from .training_graph import TrainingGraph
 
 

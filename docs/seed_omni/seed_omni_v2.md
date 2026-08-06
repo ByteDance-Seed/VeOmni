@@ -203,7 +203,7 @@ micro-batch that lacks its modality (e.g. a text-only sample has no image). The
 backbone skips dummy rows when packing but folds a `+ value.mean()*0.0` anchor
 so FSDP gradient-sync stays aligned across ranks.
 
-### 2.3 Two graph views (`graphs/graph.py`, `graphs/training_graph.py`, `graphs/generation_graph.py`)
+### 2.3 Two graph views (`graphs/base.py`, `graphs/training_graph.py`, `graphs/generation_graph.py`)
 
 There is **no shared `nodes` / `edges` pool**. Both views are written as plain
 lists of **edges** (`{from, to}`), and each endpoint is a self-describing
@@ -425,7 +425,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
 | `utils/conversation.py` | `ConversationItem` + carrier helpers |
 | `utils/convert_registry.py` | HF → split-checkpoint conversion registry |
-| `graphs/graph.py` | shared `NodeDef` / `EdgeDef` / `END` |
+| `graphs/base.py` | shared `NodeDef` / `EdgeDef` / `END` |
 | `graphs/training_graph.py` | DAG view (topological forward order) |
 | `graphs/generation_graph.py` | FSM view (states / transitions / signals) |
 | `configuration_omni.py` | `OmniConfig` — plain `PretrainedConfig`, checkpoint read/write only |

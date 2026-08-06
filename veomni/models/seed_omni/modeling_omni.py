@@ -49,8 +49,8 @@ from transformers import PreTrainedModel
 
 from ...utils import helper
 from .configuration_omni import OmniConfig
+from .graphs.base import NodeDef
 from .graphs.generation_graph import GenerationGraph
-from .graphs.graph import NodeDef
 from .graphs.training_graph import TrainingGraph
 from .mixins.module_mixin import ModuleMixin
 from .modules import OMNI_MODEL_REGISTRY, read_model_type
