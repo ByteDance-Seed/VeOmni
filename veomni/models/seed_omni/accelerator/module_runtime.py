@@ -45,7 +45,7 @@ from ....utils import helper, logging
 from ....utils.device import get_device_type
 from ....utils.model_utils import pretty_print_trainable_parameters
 from ..mixins.metric_meter_mixin import MetricMeterMixin, MetricMeterResult
-from .checkpoint import OmniModuleCheckpointManager
+from ..utils.checkpoint import OmniModuleCheckpointManager
 from .dispatch import unwrap_module_chain
 
 
@@ -634,4 +634,4 @@ class ModuleRuntime:
         return assets
 
 
-__all__ = ["ModuleRuntime", "OmniModuleCheckpointManager"]
+__all__ = ["ModuleRuntime"]

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-module checkpoint/resume for :class:`~ModuleRuntime`."""
+"""Per-module checkpoint/resume for :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`."""
 
 from __future__ import annotations
 
@@ -24,14 +24,14 @@ import torch.distributed as dist
 from ....checkpoint import CheckpointerBase, build_checkpointer
 from ....utils import helper, logging
 from ....utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
+from ..accelerator.dispatch import unwrap_module_chain
 from ..mixins.offline_encoding import OfflineEncodingMixin
-from .dispatch import unwrap_module_chain
 
 
 if TYPE_CHECKING:
     from ....omni_arguments.arguments_types import OmniModuleRuntimeArguments
     from ....trainer.callbacks import TrainerState
-    from .module_runtime import ModuleRuntime
+    from ..accelerator.module_runtime import ModuleRuntime
 
 
 logger = logging.get_logger(__name__)

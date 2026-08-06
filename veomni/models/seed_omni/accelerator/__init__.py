@@ -14,10 +14,10 @@
 
 """VeOmni accelerator layer over :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`.
 
-Lightweight exports only — ``module_runtime`` / ``checkpoint`` / ``dispatch`` are
-submodules; import them explicitly (``from
-veomni.models.seed_omni.accelerator.module_runtime import …``) to avoid pulling
-trainer/distributed setup into every ``seed_omni`` import.
+Lightweight exports only — ``module_runtime`` / ``dispatch`` are submodules; import
+them explicitly (``from veomni.models.seed_omni.accelerator.module_runtime import …``)
+to avoid pulling trainer/distributed setup into every ``seed_omni`` import.
+Per-module checkpoint I/O lives in ``veomni.models.seed_omni.utils.checkpoint``.
 """
 
 from .executor import execute_generation_node, execute_train_node

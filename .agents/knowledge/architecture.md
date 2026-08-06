@@ -32,6 +32,7 @@ veomni/
 │       │                           all generation scenarios keyed by infer_type)
 │       ├── modeling_omni.py        OmniModel (eager graph forward/generate)
 │       ├── utils/                  Shared SeedOmni helpers
+│       │   ├── checkpoint.py       OmniModuleCheckpointManager (per-module DCP/HF/LoRA)
 │       │   ├── graph_profiler.py   GraphProfiler (request-local node timing)
 │       │   └── visualize.py        Mermaid export for training/generation graphs
 │       └── accelerator/          VeOmni runtime (graph loops + per-module FSDP)
