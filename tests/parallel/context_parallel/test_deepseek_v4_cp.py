@@ -50,6 +50,26 @@ def _build_causal_mask(seq_len: int, sliding_window: int | None, device, dtype) 
     return full_mask.masked_fill(~causal, torch.finfo(dtype).min)
 
 
+def _build_packed_causal_mask(seq_len: int, sliding_window: int | None, sample_slices, device, dtype) -> torch.Tensor:
+    """``_build_causal_mask`` with attention additionally confined to each packed sample.
+
+    Spelled out here rather than taken from ``isolate_packed_causal_mask_``, for
+    the same reason ``_window_starts`` is: a fixture that derives its expectation
+    from the code under test cannot contradict it.
+    """
+    mask = _build_causal_mask(seq_len, sliding_window, device, dtype)
+    sample_ids = torch.zeros(seq_len, dtype=torch.long, device=device)
+    for index, (begin, end) in enumerate(sample_slices):
+        sample_ids[begin:end] = index
+    crosses_samples = sample_ids.view(-1, 1) != sample_ids.view(1, -1)
+    return mask.masked_fill(crosses_samples.view(1, 1, seq_len, seq_len), torch.finfo(dtype).min)
+
+
+def _packed_position_ids(sample_slices, device) -> torch.Tensor:
+    """Per-sample positions restarting at every packed boundary."""
+    return torch.cat([torch.arange(end - begin, device=device) for begin, end in sample_slices]).view(1, -1)
+
+
 def _init_position_bias(compressor) -> None:
     """Give ``position_bias`` real values.
 
@@ -99,6 +119,7 @@ def _init_cp_attention(
     with_compressor: bool,
     layer_idx: int = 0,
     batch_size: int = 1,
+    sample_slices=None,
 ):
     """Enter the process group, build the shared layer, and return the fixture.
 
@@ -107,6 +128,13 @@ def _init_cp_attention(
     batch dimension and is concatenated onto the mask, so a batch-1 mask beside
     batch-2 hidden states fails on that concatenation instead of on whatever the
     case was written to exercise.
+
+    ``sample_slices`` packs several sequences into the batch row: positions
+    restart at each boundary and the mask stops attention crossing one. Without a
+    compressor those two are the *whole* of what packing means to this layer --
+    the packed kwargs go only to the compressor -- so they are not passed, and
+    what the case then covers is the mask narrowing at ``query_offset`` and a
+    sliding window reaching back across a shard edge inside one sample.
     """
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -139,14 +167,20 @@ def _init_cp_attention(
 
     full_hidden = torch.randn(batch_size, seq_len, config.hidden_size, device=device_type, dtype=torch.float32)
     dist.broadcast(full_hidden, src=0)
-    full_position_ids = torch.arange(seq_len, device=device_type).view(1, -1).repeat(batch_size, 1)
+    if sample_slices is None:
+        full_position_ids = torch.arange(seq_len, device=device_type).view(1, -1)
+        full_mask = _build_causal_mask(seq_len, config.sliding_window, device_type, torch.float32)
+    else:
+        full_position_ids = _packed_position_ids(sample_slices, device_type)
+        full_mask = _build_packed_causal_mask(
+            seq_len, config.sliding_window, sample_slices, device_type, torch.float32
+        )
+    full_position_ids = full_position_ids.repeat(batch_size, 1)
+    full_mask = full_mask.repeat(batch_size, 1, 1, 1)
 
     rotary = dsv4.DeepseekV4RotaryEmbedding(config).to(device=device_type)
     _broadcast_module(rotary)
 
-    full_mask = _build_causal_mask(seq_len, config.sliding_window, device_type, torch.float32).repeat(
-        batch_size, 1, 1, 1
-    )
     return dsv4, layer, _make_forward(layer, rotary), full_hidden, full_position_ids, full_mask
 
 
@@ -158,11 +192,12 @@ def _run_attention_cp(
     with_compressor: bool,
     layer_idx: int = 0,
     batch_size: int = 1,
+    sample_slices=None,
 ) -> None:
     from veomni.distributed.parallel_state import clear_parallel_state
 
     _, layer, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
-        rank, world_size, init_file, seq_len, with_compressor, layer_idx, batch_size
+        rank, world_size, init_file, seq_len, with_compressor, layer_idx, batch_size, sample_slices
     )
 
     # Baseline: whole sequence with the parallel state stubbed out. Re-initialising
@@ -775,6 +810,43 @@ def test_deepseek_v4_attention_cp_sliding_only(cp_size):
         )
 
 
+# Packed samples for the compressor-free attention cases. Without a compressor
+# the packed kwargs have nowhere to go, so what packing means to this layer is
+# per-sample positions and a mask that refuses to cross a boundary:
+#
+#   * the boundary at 70 falls strictly inside a shard at both sizes -- rank 2's
+#     [64, 96) at cp_size=4, rank 1's [64, 128) at cp_size=2 -- so in each case
+#     one rank holds rows belonging to two different samples;
+#   * the sliding window is 32, so the query at 70 sees only itself, while the
+#     query at 96 reaches back to 65, across the cp_size=4 shard edge at 96 but
+#     not across the sample boundary. Those are the rows where the mask
+#     narrowing at ``query_offset`` and the per-sample isolation interact.
+_PACKED_SLIDING_SAMPLES = ((0, 70), (70, 128))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_deepseek_v4_attention_cp_packed_sliding_only(cp_size):
+    """A CP shard of a packed batch matches the full forward and backward without a compressor.
+
+    The parity criterion asks for packed and unpacked at both sizes with and
+    without the compressor; this is the compressor-free half of the packed
+    column. It is genuinely weaker than the compressor cases -- no window
+    arithmetic, no halo, no compressed-row gather -- and what remains is the KV
+    all-gather and the mask, which is the whole of the sliding-only CP path.
+    """
+    if torch.cuda.device_count() < cp_size:
+        pytest.skip(f"needs {cp_size} devices")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _run_attention_cp,
+            args=(cp_size, init_file, 128, False, 0, 1, _PACKED_SLIDING_SAMPLES),
+            nprocs=cp_size,
+            join=True,
+        )
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_sparse_indices(cp_size):
@@ -856,34 +928,52 @@ def test_deepseek_v4_compressor_cp_unpacked(kind, cp_size):
 # Packed lengths that are deliberately not multiples of the compression rate, so
 # that a window straddles a shard boundary, a sample boundary falls inside a
 # shard, and the ranks own different numbers of windows. Aligned lengths
-# exercise none of that.
+# exercise none of that. Keyed by ``cp_size`` as well as by rate, because a
+# layout tuned to straddle the edges at one shard width need not straddle any at
+# another -- the ``cp_size=4`` fixtures cross only at 48 and 96, both of which
+# stop being boundaries at ``cp_size=2``.
 #
 # ``csa`` (rate 4, cp_size=4, L=16): starts
 # [0,4,8,12,16,20,24,28,32,38,42,46,50,54,58], counts [4,4,4,3]. The window at
 # 46 covers 46..49 and crosses the rank 2/3 edge at 48; rank 2 owns the window
 # at 32 whose overlap half lives at 28..31, on rank 1.
 #
+# ``csa`` (rate 4, cp_size=2, L=32): sample 1 ends at 30, so its last window is
+# 24..27 and its 28..29 tail is dropped; sample 2 restarts the stride at 30.
+# Starts [0,4,..,24, 30,34,..,58], counts [8,7]. The window at 30 covers 30..33
+# and crosses the single edge at 32, and rank 1's first owned window at 34 takes
+# its overlap half from 30..33, which spans both ranks.
+#
 # ``hca`` (rate 32, cp_size=4, L=32): starts [0,32,70], counts [1,1,1,0]. The
 # window at 70 covers 70..101 and crosses the rank 2/3 edge at 96, and rank 3
 # owns nothing at all. The rate is the halo width, so the shard cannot be
 # narrower than 32 here.
+#
+# ``hca`` (rate 32, cp_size=2, L=64): sample 1 holds one window and drops its
+# 32..39 tail; sample 2 starts at 40. Starts [0,40,72], counts [2,1]. The window
+# at 40 covers 40..71 and crosses the edge at 64.
 _PACKED_COMPRESSOR_FIXTURES = {
-    "csa": (64, ((0, 38), (38, 64))),
-    "hca": (128, ((0, 70), (70, 128))),
+    ("csa", 4): (64, ((0, 38), (38, 64))),
+    ("csa", 2): (64, ((0, 30), (30, 64))),
+    ("hca", 4): (128, ((0, 70), (70, 128))),
+    ("hca", 2): (128, ((0, 40), (40, 128))),
 }
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("kind", ["hca", "csa"])
-def test_deepseek_v4_compressor_cp_packed_straddling(kind):
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_deepseek_v4_compressor_cp_packed_straddling(kind, cp_size):
     """Windows that cross a shard boundary still land in the right global slot."""
-    seq_len, sample_slices = _PACKED_COMPRESSOR_FIXTURES[kind]
+    if torch.cuda.device_count() < cp_size:
+        pytest.skip(f"needs {cp_size} devices")
+    seq_len, sample_slices = _PACKED_COMPRESSOR_FIXTURES[(kind, cp_size)]
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
         mp.spawn(
             _run_compressor_cp,
-            args=(4, init_file, kind, seq_len, sample_slices),
-            nprocs=4,
+            args=(cp_size, init_file, kind, seq_len, sample_slices),
+            nprocs=cp_size,
             join=True,
         )
 
