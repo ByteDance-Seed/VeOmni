@@ -15,13 +15,18 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 if IS_NPU_AVAILABLE:
     import torch_npu
 from transformers import PreTrainedModel
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm as TransformersQwen2RMSNorm
 from transformers.utils import ModelOutput
 
+from ......ops.dispatch import OpSlot
 from ......ops.kernels.attention import fused_attention_forward
 from .configuration import BagelQwen2MoTConfig
 from .masking import build_mot_block_mask
 from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
+
+
+veomni_rms_norm = OpSlot("rms_norm", "standard")
 
 
 @contextmanager
@@ -231,6 +236,21 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         cos = cos * self.attention_scaling
         sin = sin * self.attention_scaling
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class Qwen2RMSNorm(TransformersQwen2RMSNorm):
+    """Qwen2 RMSNorm using the configured VeOmni ops backend."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Empty modality branches retain zero-gradient FSDP anchors. Liger's
+        # Triton kernel cannot launch the resulting zero-row grid.
+        if hidden_states.numel() == 0:
+            return super().forward(hidden_states)
+
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
+        return super().forward(hidden_states)
 
 
 class BagelQwen2MoTAttention(nn.Module):
