@@ -10,13 +10,11 @@ import torch.nn as nn
 
 from veomni.arguments import OmniGraphProfileArguments
 from veomni.models.seed_omni import EdgeDef, NodeDef
-from veomni.models.seed_omni.accelerator import OmniModelRuntime
+from veomni.models.seed_omni.accelerator import GraphProfiler, OmniModelRuntime, profiling
+from veomni.models.seed_omni.accelerator.executor import execute_generation_node, execute_train_node
 from veomni.models.seed_omni.configuration_omni import OmniConfig
-from veomni.models.seed_omni.graphs import profiling
-from veomni.models.seed_omni.graphs.executor import execute_generation_node, execute_train_node
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.graphs.graph import END
-from veomni.models.seed_omni.graphs.profiling import GraphProfiler
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel

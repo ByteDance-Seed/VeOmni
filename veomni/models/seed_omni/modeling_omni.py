@@ -21,7 +21,7 @@ Architecture
                           registry).  Under VeOmni training they may be
                           FSDP/DDP-wrapped; the graph resolves graph hooks
                           (``pre_forward`` / ``post_forward``) through
-                          :func:`~veomni.models.seed_omni.graphs.dispatch.unwrap_graph_module`.
+                          :func:`~veomni.models.seed_omni.accelerator.dispatch.unwrap_graph_module`.
                           Parallel/acceleration build hooks live on
                           :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
                           (or a customized runtime subclass), not on
@@ -49,7 +49,6 @@ from transformers import PreTrainedModel
 
 from ...utils import helper
 from .configuration_omni import OmniConfig
-from .graphs.dispatch import unwrap_graph_module, unwrap_module_chain
 from .graphs.generation_graph import GenerationGraph
 from .graphs.graph import NodeDef
 from .graphs.training_graph import TrainingGraph
@@ -105,7 +104,7 @@ class OmniModel(PreTrainedModel):
         VeOmni trainers/inferencers compose them into :class:`OmniModel` and run
         graph loops via :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`.
         Training may attach FSDP/DDP wrappers around each entry;
-        graph hooks are resolved via :func:`~veomni.models.seed_omni.graphs.dispatch.unwrap_graph_module`.
+        graph hooks are resolved via :func:`~veomni.models.seed_omni.accelerator.dispatch.unwrap_graph_module`.
     """
 
     config_class = OmniConfig
@@ -274,6 +273,10 @@ class OmniModel(PreTrainedModel):
         attribute lookups to ``.module``) — unwrap first so ``config`` / processor
         / tokenizer resolve regardless of ``dp_mode``.
         """
+        # Local import: `.accelerator` eagerly imports `omni_model_runtime`, which
+        # imports this module — a module-level import here would be circular.
+        from .accelerator.dispatch import unwrap_module_chain
+
         module = unwrap_module_chain(module)
         cfg = getattr(module, "config", None)
         if cfg is not None and hasattr(cfg, "save_pretrained"):
@@ -489,10 +492,12 @@ class OmniModel(PreTrainedModel):
         """Yield ``(name, raw)`` for every graph participant.
 
         ``raw`` is the :class:`ModuleMixin` resolved through
-        :func:`~veomni.models.seed_omni.graphs.dispatch.unwrap_graph_module`
+        :func:`~veomni.models.seed_omni.accelerator.dispatch.unwrap_graph_module`
         (bare in the eager path; unwrapped from FSDP/DDP/LoRA wrappers under
         VeOmni).  Non-:class:`ModuleMixin` entries are skipped.
         """
+        from .accelerator.dispatch import unwrap_graph_module  # see _save_module_assets
+
         for name in self._module_names:
             module = getattr(self, name)
             if not _is_omni_module(module):
@@ -534,6 +539,8 @@ def merge_generation_kwargs(
 
 def _is_omni_module(mod: nn.Module) -> bool:
     """True when ``mod`` (possibly wrapped) resolves to a :class:`ModuleMixin`."""
+    from .accelerator.dispatch import unwrap_module_chain  # see OmniModel._save_module_assets
+
     return isinstance(unwrap_module_chain(mod), ModuleMixin)
 
 

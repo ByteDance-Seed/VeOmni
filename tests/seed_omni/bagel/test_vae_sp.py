@@ -13,7 +13,7 @@ from torch.distributed.tensor import DTensor
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
-from veomni.models.seed_omni.graphs.dispatch import call_graph_endpoint
+from veomni.models.seed_omni.accelerator.dispatch import call_graph_endpoint
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
 from veomni.models.seed_omni.utils.conversation import ConversationItem

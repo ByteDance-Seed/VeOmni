@@ -344,7 +344,7 @@ class GenerationGraph:
 
         Selection only — the graph never runs a model forward. The caller
         executes each yielded node — see
-        :func:`~veomni.models.seed_omni.graphs.executor.execute_generation_node`
+        :func:`~veomni.models.seed_omni.accelerator.executor.execute_generation_node`
         — mutating ``ctx`` in place; this generator reads the mutated ``ctx``
         *after* each yield to honour a terminating ``module_signal`` (it stops
         yielding) and the body's feed-forward fan-in gating. Mirror of

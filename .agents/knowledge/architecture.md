@@ -34,7 +34,9 @@ veomni/
 │       └── accelerator/          VeOmni runtime (graph loops + per-module FSDP)
 │           ├── omni_model_runtime.py  OmniModelRuntime (composed graph loops)
 │           ├── module_runtime.py      ModuleRuntime (per sub-module FSDP/opt/ckpt)
-│           └── executor.py            execute_train_node / execute_generation_node
+│           ├── executor.py            execute_train_node / execute_generation_node
+│           ├── dispatch.py            unwrap FSDP/DDP/LoRA wrappers, call_graph_endpoint
+│           └── profiling.py           GraphProfiler
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW

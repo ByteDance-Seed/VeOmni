@@ -208,7 +208,7 @@ class TrainingGraph:
         knows nothing about profiling / parallel infra (it is model-bound and
         meant to travel with the pure modeling definition). The caller executes
         each yielded node — see
-        :func:`~veomni.models.seed_omni.graphs.executor.execute_train_node` —
+        :func:`~veomni.models.seed_omni.accelerator.executor.execute_train_node` —
         mutating the shared ``conversation_list`` carrier in place. After the
         caller consumes a node, this generator advances the cursor
         (:meth:`maybe_transition`) and yields the next, until :meth:`is_done`.

@@ -39,8 +39,7 @@ import torch
 import torch.distributed as dist
 
 from ...arguments import OmniArguments
-from ...models.seed_omni.accelerator import OmniModelRuntime
-from ...models.seed_omni.graphs import GraphProfiler
+from ...models.seed_omni.accelerator import GraphProfiler, OmniModelRuntime
 from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing import OmniProcessor
 from ...omni_arguments.arguments_types import OmniModuleRuntimeArguments

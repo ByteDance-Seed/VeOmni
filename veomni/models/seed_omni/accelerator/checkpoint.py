@@ -24,8 +24,8 @@ import torch.distributed as dist
 from ....checkpoint import CheckpointerBase, build_checkpointer
 from ....utils import helper, logging
 from ....utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
-from ..graphs.dispatch import unwrap_module_chain
 from ..mixins.offline_encoding import OfflineEncodingMixin
+from .dispatch import unwrap_module_chain
 
 
 if TYPE_CHECKING:

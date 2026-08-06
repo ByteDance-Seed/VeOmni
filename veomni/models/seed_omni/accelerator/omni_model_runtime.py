@@ -24,8 +24,8 @@ import torch.nn as nn
 
 from ....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
 from ....models.seed_omni.accelerator.executor import execute_generation_node, execute_train_node
+from ....models.seed_omni.accelerator.profiling import GraphProfiler
 from ....models.seed_omni.graphs.graph import NodeDef
-from ....models.seed_omni.graphs.profiling import GraphProfiler
 from ....models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 from ....models.seed_omni.modeling_omni import _LOSS_KEY, OmniModel, _sum_losses
 from ....utils.logging import get_logger

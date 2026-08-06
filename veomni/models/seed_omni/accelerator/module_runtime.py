@@ -44,9 +44,9 @@ from ....trainer.base import _collect_muon_kwargs
 from ....utils import helper, logging
 from ....utils.device import get_device_type
 from ....utils.model_utils import pretty_print_trainable_parameters
-from ..graphs.dispatch import unwrap_module_chain
 from ..mixins.metric_meter_mixin import MetricMeterMixin, MetricMeterResult
 from .checkpoint import OmniModuleCheckpointManager
+from .dispatch import unwrap_module_chain
 
 
 if TYPE_CHECKING:

@@ -16,7 +16,6 @@
 
 from .generation_graph import FSM_SIGNAL_KEY, GenerationGraph
 from .graph import END, EdgeDef, NodeDef, is_end
-from .profiling import GraphProfiler
 from .training_graph import TrainingGraph
 
 
@@ -28,5 +27,4 @@ __all__ = [
     "TrainingGraph",
     "GenerationGraph",
     "FSM_SIGNAL_KEY",
-    "GraphProfiler",
 ]

@@ -14,17 +14,20 @@
 
 """VeOmni accelerator layer over :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`.
 
-Lightweight exports only — ``module_runtime`` is a submodule; import it explicitly
-(``from veomni.models.seed_omni.accelerator.module_runtime import …``) to avoid
-pulling trainer/distributed setup into every ``seed_omni`` import.
+Lightweight exports only — ``module_runtime`` / ``checkpoint`` / ``dispatch`` are
+submodules; import them explicitly (``from
+veomni.models.seed_omni.accelerator.module_runtime import …``) to avoid pulling
+trainer/distributed setup into every ``seed_omni`` import.
 """
 
 from .executor import execute_generation_node, execute_train_node
 from .omni_model_runtime import OmniModelRuntime
+from .profiling import GraphProfiler
 
 
 __all__ = [
     "OmniModelRuntime",
     "execute_train_node",
     "execute_generation_node",
+    "GraphProfiler",
 ]
