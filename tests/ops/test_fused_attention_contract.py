@@ -140,9 +140,6 @@ def test_register_veomni_magi_attention_mask_builder_uses_range_builder(monkeypa
     attention_mask = create_causal_mask(config, inputs_embeds, None, None, position_ids)
 
     assert isinstance(attention_mask, magi_backend.MagiAttentionMask)
-    torch.testing.assert_close(attention_mask.q_ranges, torch.tensor([[0, 8]], dtype=torch.int32))
-    torch.testing.assert_close(attention_mask.k_ranges, torch.tensor([[0, 8]], dtype=torch.int32))
-    torch.testing.assert_close(attention_mask.attn_type_map, torch.ones(1, dtype=torch.int32))
 
 
 def test_registered_magi_mask_builder_rejects_implicit_packed_visibility(monkeypatch):

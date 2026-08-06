@@ -15,6 +15,8 @@
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = REPO_ROOT / "scripts" / "kernel" / "install_magi_sm90.sh"
@@ -78,15 +80,18 @@ def test_magi_sm90_installer_canonicalizes_cli_overrides() -> None:
     }
 
 
-def test_magi_sm90_installer_rejects_unsupported_fp16_only_build() -> None:
-    result = _run_installer("--dtype", "fp16", "--print-config")
+@pytest.mark.parametrize(
+    ("arguments", "expected_message"),
+    [
+        (("--dtype", "fp16"), "cannot disable BF16"),
+        (("--dim", "80"), "--dim supports only 64,96,128,192,256"),
+    ],
+)
+def test_magi_sm90_installer_rejects_invalid_configuration(
+    arguments: tuple[str, ...],
+    expected_message: str,
+) -> None:
+    result = _run_installer(*arguments, "--print-config")
 
     assert result.returncode == 2
-    assert "cannot disable BF16" in result.stderr
-
-
-def test_magi_sm90_installer_rejects_invalid_head_dim() -> None:
-    result = _run_installer("--dim", "80", "--print-config")
-
-    assert result.returncode == 2
-    assert "--dim supports only 64,96,128,192,256" in result.stderr
+    assert expected_message in result.stderr

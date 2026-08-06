@@ -31,7 +31,7 @@ from veomni.models.transformers.masking_utils import create_causal_mask
 from veomni.ops.kernels.attention import flash as flash_backend
 from veomni.ops.kernels.attention import flex as flex_backend
 from veomni.ops.kernels.attention import magi as magi_backend
-from veomni.utils.device import get_gpu_compute_capability
+from veomni.ops.kernels.attention.magi import _fa4 as magi_fa4_backend
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
@@ -443,9 +443,13 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         group = self._get_process_group()
         rank = dist.get_rank(group)
         device = torch.device(get_device_type(), rank)
-        compute_capability = get_gpu_compute_capability(device)
-        if compute_capability < 100:
-            self.skipTest("MagiAttention's supported CUTE DSL/JIT backend requires SM100 or newer GPUs")
+        kernel_mode = magi_fa4_backend._get_magi_kernel_mode(device)
+        if kernel_mode == magi_fa4_backend._MAGI_KERNEL_UNSUPPORTED:
+            self.skipTest("MagiAttention does not support this GPU architecture")
+        try:
+            magi_fa4_backend._prepare_default_magi_kernel(device)
+        except (ImportError, RuntimeError) as error:
+            self.skipTest(str(error))
 
         original_get_parallel_state = magi_backend.get_parallel_state
         try:

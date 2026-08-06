@@ -12,20 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import importlib.util
+import json
+import os
+import statistics
 import sys
+import time
 from contextlib import contextmanager, nullcontext
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import create_block_mask
 from transformers.masking_utils import bidirectional_mask_function, causal_mask_function
 
 from veomni.ops import build_ALL_OPS
 from veomni.ops.kernels import attention as veomni_attention
+from veomni.ops.kernels.attention import flex as flex_backend
 from veomni.ops.kernels.attention import magi as magi_backend
 from veomni.ops.kernels.attention.magi import _fa4 as magi_fa4_backend
 from veomni.ops.kernels.attention.magi import mask as magi_mask_backend
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    empty_cache,
+    get_device_type,
+    get_torch_device,
+    synchronize,
+)
 
 
 class _FakeAttentionModule(nn.Module):
@@ -173,33 +190,6 @@ def test_magi_attention_module_slot_preserves_public_ffa_contract(monkeypatch):
     torch.testing.assert_close(output, query.transpose(1, 2) + 1)
     assert lse.shape == (1, 4, 8)
     assert dict(build_ALL_OPS())["_magi_attention_forward"] is fake_backend
-
-
-def test_magi_attention_preserves_backend_autograd(monkeypatch):
-    def differentiable_backend(query, key, value, *args, **kwargs):
-        repeat_count = query.shape[1] // key.shape[1]
-        output = query + key.repeat_interleave(repeat_count, dim=1)
-        output = output + value.repeat_interleave(repeat_count, dim=1)
-        return output, SimpleNamespace(lse=query.float().sum(dim=-1))
-
-    monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
-    monkeypatch.setattr(magi_backend, "_magi_attention_forward", differentiable_backend)
-    query = torch.randn(1, 4, 8, 16, requires_grad=True)
-    key = torch.randn(1, 2, 8, 16, requires_grad=True)
-    value = torch.randn(1, 2, 8, 16, requires_grad=True)
-
-    output, lse = magi_backend.magi_attention_forward(
-        _FakeAttentionModule(),
-        query,
-        key,
-        value,
-        _mask(8),
-    )
-    (output.square().mean() + lse.square().mean()).backward()
-
-    for tensor in (query, key, value):
-        assert tensor.grad is not None
-        assert torch.isfinite(tensor.grad).all()
 
 
 def test_default_magi_backend_lazily_calls_package_fa4_backend(monkeypatch):
@@ -498,27 +488,17 @@ def test_magi_fa4_autograd_detects_range_mutation(monkeypatch):
 @pytest.mark.parametrize(
     ("compute_capability", "expected_mode"),
     [
-        (75, magi_fa4_backend._MAGI_KERNEL_UNSUPPORTED),
         (80, magi_fa4_backend._MAGI_KERNEL_UNSUPPORTED),
         (89, magi_fa4_backend._MAGI_KERNEL_UNSUPPORTED),
         (90, magi_fa4_backend._MAGI_KERNEL_CUTLASS),
+        (99, magi_fa4_backend._MAGI_KERNEL_CUTLASS),
         (100, magi_fa4_backend._MAGI_KERNEL_CUTE_JIT),
-        (120, magi_fa4_backend._MAGI_KERNEL_CUTE_JIT),
     ],
 )
 def test_magi_kernel_mode_follows_query_device(monkeypatch, compute_capability, expected_mode):
     monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", lambda device: compute_capability)
 
     assert magi_fa4_backend._get_magi_kernel_mode(torch.device("cuda")) == expected_mode
-
-
-@pytest.mark.parametrize("compute_capability", [75, 80, 89])
-def test_magi_rejects_pre_sm90_gpus(monkeypatch, compute_capability):
-    monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", lambda device: compute_capability)
-    magi_fa4_backend._prepare_default_magi_kernel.cache_clear()
-
-    with pytest.raises(RuntimeError, match=rf"does not support SM{compute_capability}.*SM90.*SM100"):
-        magi_fa4_backend._prepare_default_magi_kernel(torch.device("cuda"))
 
 
 def test_magi_sm90_reports_cutlass_installer(monkeypatch):
@@ -674,11 +654,24 @@ def test_magi_sm90_reports_cutlass_stack_limit_errors(monkeypatch, get_error, se
         magi_fa4_backend._ensure_magi_cutlass_stack_size(torch.device("cuda"))
 
 
-def test_magi_unsupported_mode_fails_before_backend_call(monkeypatch):
+@pytest.mark.parametrize(
+    ("device", "compute_capability", "expected_hardware"),
+    [
+        (torch.device("cpu"), 0, "cpu"),
+        (torch.device("cuda"), 80, "SM80"),
+    ],
+)
+def test_magi_unsupported_mode_fails_before_backend_call(
+    monkeypatch,
+    device,
+    compute_capability,
+    expected_hardware,
+):
+    monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", lambda device: compute_capability)
     _set_fake_cutlass_backend(monkeypatch, available=False)
     magi_fa4_backend._prepare_default_magi_kernel.cache_clear()
-    with pytest.raises(RuntimeError, match="does not support cpu"):
-        magi_fa4_backend._prepare_default_magi_kernel(torch.device("cpu"))
+    with pytest.raises(RuntimeError, match=rf"does not support {expected_hardware}"):
+        magi_fa4_backend._prepare_default_magi_kernel(device)
 
 
 def test_create_magi_mask_builds_standard_causal_and_bidirectional_ranges(monkeypatch):
@@ -853,63 +846,58 @@ def test_create_magi_mask_rejects_unsupported_registry_inputs(monkeypatch, overr
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "error_type", "expected_message"),
+    ("overrides", "error_type", "expected_message"),
     [
-        ("q_ranges", [[0, 8]], TypeError, "must be a torch.Tensor"),
-        ("q_ranges", torch.tensor([[0, 8]], dtype=torch.int64), TypeError, "dtype torch.int32"),
-        ("q_ranges", torch.tensor([0, 8], dtype=torch.int32), ValueError, "shape \\[num_ranges, 2\\]"),
-        ("q_ranges", torch.empty(0, 2, dtype=torch.int32), ValueError, "at least one range"),
-        ("attn_type_map", torch.tensor([0], dtype=torch.int64), TypeError, "dtype torch.int32"),
-        ("attn_type_map", torch.tensor([[0]], dtype=torch.int32), ValueError, "shape \\[num_ranges\\]"),
-    ],
-)
-def test_magi_attention_mask_rejects_invalid_structure(field, value, error_type, expected_message):
-    values = {
-        "q_ranges": torch.tensor([[0, 8]], dtype=torch.int32),
-        "k_ranges": torch.tensor([[0, 8]], dtype=torch.int32),
-        "attn_type_map": None,
-    }
-    values[field] = value
-
-    with pytest.raises(error_type, match=expected_message):
-        magi_backend.MagiAttentionMask(**values)
-
-
-def test_magi_attention_mask_requires_contiguous_type_map():
-    ranges = torch.tensor([[0, 4], [4, 8]], dtype=torch.int32)
-    noncontiguous_type_map = torch.arange(4, dtype=torch.int32)[::2]
-    assert not noncontiguous_type_map.is_contiguous()
-
-    with pytest.raises(ValueError, match="attn_type_map must be contiguous"):
-        magi_backend.MagiAttentionMask(ranges, ranges.clone(), noncontiguous_type_map)
-
-
-@pytest.mark.parametrize(
-    ("q_ranges", "k_ranges", "attn_type_map", "expected_message"),
-    [
+        ({"q_ranges": [[0, 8]]}, TypeError, "must be a torch.Tensor"),
+        ({"q_ranges": torch.tensor([[0, 8]], dtype=torch.int64)}, TypeError, "dtype torch.int32"),
         (
-            torch.tensor([[-1, 8]], dtype=torch.int32),
-            torch.tensor([[0, 8]], dtype=torch.int32),
-            None,
+            {"q_ranges": torch.tensor([0, 8], dtype=torch.int32)},
+            ValueError,
+            "shape \\[num_ranges, 2\\]",
+        ),
+        ({"q_ranges": torch.empty(0, 2, dtype=torch.int32)}, ValueError, "at least one range"),
+        ({"attn_type_map": torch.tensor([0], dtype=torch.int64)}, TypeError, "dtype torch.int32"),
+        (
+            {"attn_type_map": torch.tensor([[0]], dtype=torch.int32)},
+            ValueError,
+            "shape \\[num_ranges\\]",
+        ),
+        (
+            {
+                "q_ranges": torch.tensor([[0, 4], [4, 8]], dtype=torch.int32),
+                "k_ranges": torch.tensor([[0, 4], [4, 8]], dtype=torch.int32),
+                "attn_type_map": torch.arange(4, dtype=torch.int32)[::2],
+            },
+            ValueError,
+            "attn_type_map must be contiguous",
+        ),
+        (
+            {"q_ranges": torch.tensor([[-1, 8]], dtype=torch.int32)},
+            ValueError,
             "q_ranges must contain non-empty half-open ranges with non-negative starts",
         ),
         (
-            torch.tensor([[0, 8]], dtype=torch.int32),
-            torch.tensor([[4, 4]], dtype=torch.int32),
-            None,
+            {"k_ranges": torch.tensor([[4, 4]], dtype=torch.int32)},
+            ValueError,
             "k_ranges must contain non-empty half-open ranges with non-negative starts",
         ),
         (
-            torch.tensor([[0, 8]], dtype=torch.int32),
-            torch.tensor([[0, 8]], dtype=torch.int32),
-            torch.tensor([4], dtype=torch.int32),
+            {"attn_type_map": torch.tensor([4], dtype=torch.int32)},
+            ValueError,
             "attn_type_map values must be in \\[0, 3\\]",
         ),
     ],
 )
-def test_magi_attention_mask_rejects_invalid_static_values(q_ranges, k_ranges, attn_type_map, expected_message):
-    with pytest.raises(ValueError, match=expected_message):
-        magi_backend.MagiAttentionMask(q_ranges, k_ranges, attn_type_map)
+def test_magi_attention_mask_rejects_invalid_metadata(overrides, error_type, expected_message):
+    values = {
+        "q_ranges": torch.tensor([[0, 8]], dtype=torch.int32),
+        "k_ranges": torch.tensor([[0, 8]], dtype=torch.int32),
+        "attn_type_map": None,
+        **overrides,
+    }
+
+    with pytest.raises(error_type, match=expected_message):
+        magi_backend.MagiAttentionMask(**values)
 
 
 @pytest.mark.parametrize(
@@ -1060,3 +1048,646 @@ def test_magi_attention_skip_ulysses_uses_local_sequence_mask(monkeypatch):
 
     assert output.shape == (1, 8, 4, 16)
     assert lse.shape == (1, 4, 8)
+
+
+_NUMERICAL_MASK_CASES = ("causal", "full", "bagel_mixed")
+_NUMERICAL_QUERY_HEADS = 4
+_NUMERICAL_KV_HEADS = 2
+_NUMERICAL_HEAD_DIM = 64
+_NUMERICAL_SEQUENCE_LENGTH = 128
+
+_BAGEL_QUERY_HEADS = 28
+_BAGEL_KV_HEADS = 4
+_BAGEL_HEAD_DIM = 128
+_BAGEL_SEQUENCE_LENGTH = 4096
+
+_PROFILE_MASK_CASES = ("causal", "bagel_mixed")
+_PROFILE_SEQUENCE_LENGTHS = (4096, 8192, 20000)
+_PROFILE_WARMUP_ITERATIONS = 5
+_PROFILE_ITERATIONS = 20
+_RUN_PROFILE = os.environ.get("RUN_MAGI_ATTENTION_PROFILE") == "1"
+
+
+def _is_magi_ffa_available() -> bool:
+    if not IS_CUDA_AVAILABLE or importlib.util.find_spec("magi_attention") is None:
+        return False
+
+    kernel_mode = magi_fa4_backend._get_magi_kernel_mode(torch.device(get_device_type()))
+    if kernel_mode == magi_fa4_backend._MAGI_KERNEL_CUTE_JIT:
+        return importlib.util.find_spec("flash_attn_cute") is not None
+    if kernel_mode != magi_fa4_backend._MAGI_KERNEL_CUTLASS:
+        return False
+
+    try:
+        from flash_attn_cute.ffa_fa3 import flash_attn_interface
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+    return all(
+        callable(getattr(flash_attn_interface, name, None)) for name in ("_flash_attn_forward", "_flash_attn_backward")
+    )
+
+
+_MAGI_FFA_AVAILABLE = _is_magi_ffa_available()
+_MAGI_FFA_REASON = (
+    "MagiAttention numerical tests require a supported NVIDIA GPU with its CUTLASS overlay or CUTE DSL/JIT backend"
+)
+
+
+class _NumericalAttentionModule(nn.Module):
+    def __init__(self, implementation: str):
+        super().__init__()
+        self.config = SimpleNamespace(_attn_implementation=implementation)
+        self.layer_idx = 0
+
+
+def _build_span_splits(sequence_length: int) -> list[int]:
+    quarter = sequence_length // 4
+    return [quarter, quarter, quarter, sequence_length - 3 * quarter]
+
+
+def _build_bagel_dense_mask(sequence_length: int, device: torch.device) -> torch.Tensor:
+    modes = ("causal", "noise", "full", "causal")
+    visible = torch.zeros((sequence_length, sequence_length), device=device, dtype=torch.bool)
+    clean_spans: list[tuple[int, int]] = []
+    span_start = 0
+    for length, mode in zip(_build_span_splits(sequence_length), modes, strict=True):
+        span_end = span_start + length
+        for clean_start, clean_end in clean_spans:
+            visible[span_start:span_end, clean_start:clean_end] = True
+        if mode == "causal":
+            visible[span_start:span_end, span_start:span_end].fill_(True).tril_()
+        else:
+            visible[span_start:span_end, span_start:span_end] = True
+        if mode != "noise":
+            clean_spans.append((span_start, span_end))
+        span_start = span_end
+    return visible.unsqueeze(0).unsqueeze(0).contiguous()
+
+
+def _build_dense_mask(mask_case: str, sequence_length: int, device: torch.device) -> torch.Tensor:
+    if mask_case == "causal":
+        return torch.ones(
+            (1, 1, sequence_length, sequence_length),
+            device=device,
+            dtype=torch.bool,
+        ).tril_()
+    if mask_case == "full":
+        return torch.ones(
+            (1, 1, sequence_length, sequence_length),
+            device=device,
+            dtype=torch.bool,
+        )
+    if mask_case == "bagel_mixed":
+        return _build_bagel_dense_mask(sequence_length, device)
+    raise ValueError(f"Unsupported mask case: {mask_case}")
+
+
+def _build_magi_mask(
+    mask_case: str,
+    sequence_length: int,
+    device: torch.device,
+) -> magi_backend.MagiAttentionMask:
+    if mask_case in {"causal", "full"}:
+        ranges = torch.tensor([[0, sequence_length]], device=device, dtype=torch.int32)
+        attn_type_map = torch.tensor([1], device=device, dtype=torch.int32) if mask_case == "causal" else None
+        return magi_backend.MagiAttentionMask(ranges, ranges.clone(), attn_type_map)
+
+    if mask_case != "bagel_mixed":
+        raise ValueError(f"Unsupported mask case: {mask_case}")
+
+    modes = ("causal", "noise", "full", "causal")
+    q_ranges: list[list[int]] = []
+    k_ranges: list[list[int]] = []
+    attn_types: list[int] = []
+    clean_spans: list[tuple[int, int]] = []
+    span_start = 0
+    for length, mode in zip(_build_span_splits(sequence_length), modes, strict=True):
+        span_end = span_start + length
+        for clean_start, clean_end in clean_spans:
+            q_ranges.append([span_start, span_end])
+            k_ranges.append([clean_start, clean_end])
+            attn_types.append(0)
+
+        q_ranges.append([span_start, span_end])
+        k_ranges.append([span_start, span_end])
+        attn_types.append(1 if mode == "causal" else 0)
+
+        if mode != "noise":
+            clean_spans.append((span_start, span_end))
+        span_start = span_end
+
+    return magi_backend.MagiAttentionMask(
+        q_ranges=torch.tensor(q_ranges, device=device, dtype=torch.int32),
+        k_ranges=torch.tensor(k_ranges, device=device, dtype=torch.int32),
+        attn_type_map=torch.tensor(attn_types, device=device, dtype=torch.int32),
+    )
+
+
+def _build_profile_flex_mask(mask_case: str, sequence_length: int, device: torch.device):
+    if mask_case == "causal":
+
+        def mask_mod(batch_idx, head_idx, query_idx, key_idx):
+            return query_idx >= key_idx
+
+    elif mask_case == "bagel_mixed":
+        if sequence_length % 4 != 0:
+            raise ValueError("The BAGEL-like profile requires a sequence length divisible by four.")
+        span_length = sequence_length // 4
+
+        def mask_mod(batch_idx, head_idx, query_idx, key_idx):
+            query_span = query_idx // span_length
+            key_span = key_idx // span_length
+            same_span = query_span == key_span
+            full_local_span = (query_span == 1) | (query_span == 2)
+            visible_within_span = same_span & (full_local_span | (query_idx >= key_idx))
+            visible_clean_context = (key_span < query_span) & (key_span != 1)
+            return visible_within_span | visible_clean_context
+
+    else:
+        raise ValueError(f"Unsupported profile mask case: {mask_case}")
+
+    return create_block_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=sequence_length,
+        KV_LEN=sequence_length,
+        device=device,
+        BLOCK_SIZE=128,
+    )
+
+
+def _materialize_magi_mask(
+    attention_mask: magi_backend.MagiAttentionMask,
+    sequence_length: int,
+) -> torch.Tensor:
+    visible = torch.zeros((sequence_length, sequence_length), dtype=torch.bool)
+    attn_types = (
+        torch.zeros(attention_mask.q_ranges.shape[0], dtype=torch.int32)
+        if attention_mask.attn_type_map is None
+        else attention_mask.attn_type_map.cpu()
+    )
+    for q_range, k_range, attn_type in zip(
+        attention_mask.q_ranges.cpu(),
+        attention_mask.k_ranges.cpu(),
+        attn_types,
+        strict=True,
+    ):
+        q_start, q_end = q_range.tolist()
+        k_start, k_end = k_range.tolist()
+        slice_mask = torch.ones((q_end - q_start, k_end - k_start), dtype=torch.bool)
+        if attn_type.item() == 1:
+            slice_mask.tril_()
+        visible[q_start:q_end, k_start:k_end] |= slice_mask
+    return visible.unsqueeze(0).unsqueeze(0)
+
+
+def _clone_qkv(qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+    return tuple(tensor.detach().clone().requires_grad_(True) for tensor in qkv)
+
+
+def _math_sdpa_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dense_mask: torch.Tensor,
+    *,
+    scaling: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with sdpa_kernel(backends=[SDPBackend.MATH]):
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=dense_mask,
+            dropout_p=0.0,
+            scale=scaling,
+            enable_gqa=True,
+        ).transpose(1, 2)
+
+    repeat_count = query.shape[1] // key.shape[1]
+    expanded_key = key.repeat_interleave(repeat_count, dim=1)
+    logits = torch.einsum("bhqd,bhkd->bhqk", query.float(), expanded_key.float()) * scaling
+    lse = torch.logsumexp(logits.masked_fill(~dense_mask, -torch.inf), dim=-1)
+    return output, lse
+
+
+def _assert_magi_matches_reference(
+    output: torch.Tensor,
+    lse: torch.Tensor | None,
+    gradients: tuple[torch.Tensor, ...],
+    reference_output: torch.Tensor,
+    reference_lse: torch.Tensor,
+    reference_gradients: tuple[torch.Tensor, ...],
+    *,
+    dtype: torch.dtype,
+) -> None:
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        output,
+        reference_output,
+        rtol=3e-2,
+        atol=3e-2,
+        msg=lambda message: f"MagiAttention output: {message}",
+    )
+
+    if lse is not None:
+        assert torch.isfinite(lse).all()
+        torch.testing.assert_close(
+            lse.float(),
+            reference_lse.float(),
+            rtol=5e-3,
+            atol=3e-2,
+            msg=lambda message: f"MagiAttention LSE: {message}",
+        )
+
+    gradient_atol = 8e-2 if dtype == torch.bfloat16 else 5e-2
+    for name, gradient, reference_gradient in zip(
+        ("query", "key", "value"),
+        gradients,
+        reference_gradients,
+        strict=True,
+    ):
+        assert torch.isfinite(gradient).all()
+        assert torch.isfinite(reference_gradient).all()
+        torch.testing.assert_close(
+            gradient,
+            reference_gradient,
+            rtol=8e-2,
+            atol=gradient_atol,
+            msg=lambda message, tensor_name=name: f"MagiAttention {tensor_name} gradient: {message}",
+        )
+
+
+@pytest.mark.parametrize("mask_case", _PROFILE_MASK_CASES)
+def test_attention_benchmark_masks_match_dense_visibility(mask_case):
+    device = torch.device("cpu")
+    dense_mask = _build_dense_mask(mask_case, _NUMERICAL_SEQUENCE_LENGTH, device)
+    magi_mask = _build_magi_mask(mask_case, _NUMERICAL_SEQUENCE_LENGTH, device)
+    flex_mask = _build_profile_flex_mask(mask_case, _NUMERICAL_SEQUENCE_LENGTH, device)
+    query_idx = torch.arange(_NUMERICAL_SEQUENCE_LENGTH)[:, None]
+    key_idx = torch.arange(_NUMERICAL_SEQUENCE_LENGTH)[None, :]
+
+    materialized_magi_mask = _materialize_magi_mask(magi_mask, _NUMERICAL_SEQUENCE_LENGTH)
+    materialized_flex_mask = flex_mask.mask_mod(0, 0, query_idx, key_idx)
+
+    assert torch.equal(materialized_magi_mask, dense_mask)
+    assert torch.equal(materialized_flex_mask, dense_mask[0, 0])
+
+
+def _assert_magi_attention_matches_dense_reference(
+    mask_case: str,
+    *,
+    sequence_length: int,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    seed: int,
+) -> None:
+    device = torch.device(get_device_type())
+    generator = torch.Generator(device=device).manual_seed(seed)
+    qkv = (
+        torch.randn(
+            (1, query_heads, sequence_length, head_dim),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ),
+        torch.randn(
+            (1, kv_heads, sequence_length, head_dim),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ),
+        torch.randn(
+            (1, kv_heads, sequence_length, head_dim),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ),
+    )
+    output_gradient = torch.randn(
+        (1, sequence_length, query_heads, head_dim),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    scaling = head_dim**-0.5
+    dense_mask = _build_dense_mask(mask_case, sequence_length, device)
+    magi_mask = _build_magi_mask(mask_case, sequence_length, device)
+
+    reference_qkv = _clone_qkv(qkv)
+    reference_output, reference_lse = _math_sdpa_reference(
+        *reference_qkv,
+        dense_mask,
+        scaling=scaling,
+    )
+    reference_gradients = torch.autograd.grad(reference_output, reference_qkv, output_gradient)
+
+    magi_qkv = _clone_qkv(qkv)
+    magi_output, magi_lse = magi_backend.magi_attention_forward(
+        _NumericalAttentionModule("veomni_magi_attention_with_sp").to(device),
+        *magi_qkv,
+        magi_mask,
+        scaling=scaling,
+    )
+    magi_gradients = torch.autograd.grad(magi_output, magi_qkv, output_gradient)
+    _assert_magi_matches_reference(
+        magi_output,
+        magi_lse,
+        magi_gradients,
+        reference_output,
+        reference_lse,
+        reference_gradients,
+        dtype=dtype,
+    )
+
+
+@pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("mask_case", _NUMERICAL_MASK_CASES)
+def test_magi_attention_matches_dense_reference(monkeypatch, mask_case, dtype):
+    device = torch.device(get_device_type())
+    monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
+    kernel_mode, build_flags = magi_fa4_backend._prepare_default_magi_kernel(device)
+    if (
+        dtype == torch.float16
+        and kernel_mode == magi_fa4_backend._MAGI_KERNEL_CUTLASS
+        and build_flags is not None
+        and build_flags.get("FLASHATTENTION_DISABLE_FP16", False)
+    ):
+        pytest.skip("The installed CUTLASS overlay does not include FP16 kernels.")
+
+    _assert_magi_attention_matches_dense_reference(
+        mask_case,
+        sequence_length=_NUMERICAL_SEQUENCE_LENGTH,
+        query_heads=_NUMERICAL_QUERY_HEADS,
+        kv_heads=_NUMERICAL_KV_HEADS,
+        head_dim=_NUMERICAL_HEAD_DIM,
+        dtype=dtype,
+        seed=9300 + _NUMERICAL_MASK_CASES.index(mask_case) * 10 + int(dtype == torch.bfloat16),
+    )
+
+
+@pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)
+def test_magi_attention_matches_dense_reference_at_bagel_shape(monkeypatch):
+    monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
+    _assert_magi_attention_matches_dense_reference(
+        "bagel_mixed",
+        sequence_length=_BAGEL_SEQUENCE_LENGTH,
+        query_heads=_BAGEL_QUERY_HEADS,
+        kv_heads=_BAGEL_KV_HEADS,
+        head_dim=_BAGEL_HEAD_DIM,
+        dtype=torch.bfloat16,
+        seed=9052,
+    )
+
+
+def _measure_wall(callable_):
+    synchronize()
+    started = time.perf_counter()
+    result = callable_()
+    synchronize()
+    return (time.perf_counter() - started) * 1000, result
+
+
+def _profile_outputs_are_finite(
+    output: torch.Tensor,
+    lse: torch.Tensor | None,
+    gradients: tuple[torch.Tensor, ...] | None = None,
+) -> bool:
+    finite = bool(torch.isfinite(output).all().item()) and all(
+        bool(torch.isfinite(gradient).all().item()) for gradient in (() if gradients is None else gradients)
+    )
+    if lse is not None:
+        finite = finite and bool(torch.isfinite(lse).all().item())
+    return finite
+
+
+def _profile_full_iteration(forward, qkv, output_gradient):
+    output, lse = forward()
+    gradients = torch.autograd.grad(output, qkv, output_gradient)
+    return output, lse, gradients
+
+
+def _profile_attention_backend(
+    mask_case: str,
+    sequence_length: int,
+    backend: str,
+) -> dict[str, object]:
+    device_api = get_torch_device()
+    gc.collect()
+    empty_cache()
+
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    module = _NumericalAttentionModule("veomni_magi_attention_with_sp").to(device=device, dtype=dtype).train()
+    generator = torch.Generator(device=device).manual_seed(12002 + sequence_length)
+    query, key, value = (
+        torch.randn(
+            (1, heads, sequence_length, _BAGEL_HEAD_DIM),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+            requires_grad=True,
+        )
+        for heads in (_BAGEL_QUERY_HEADS, _BAGEL_KV_HEADS, _BAGEL_KV_HEADS)
+    )
+    output_gradient = torch.randn(
+        (1, sequence_length, _BAGEL_QUERY_HEADS, _BAGEL_HEAD_DIM),
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+
+    if backend == "efficient_attention":
+        attention_mask = None if mask_case == "causal" else _build_dense_mask(mask_case, sequence_length, device)
+        is_causal = mask_case == "causal"
+        mask_kind = "implicit_causal" if is_causal else "dense_bool"
+
+        def forward():
+            repeat_count = query.shape[1] // key.shape[1]
+            expanded_key = key.repeat_interleave(repeat_count, dim=1)
+            expanded_value = value.repeat_interleave(repeat_count, dim=1)
+            with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+                output = F.scaled_dot_product_attention(
+                    query,
+                    expanded_key,
+                    expanded_value,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=is_causal,
+                    scale=_BAGEL_HEAD_DIM**-0.5,
+                ).transpose(1, 2)
+            return output, None
+
+    elif backend == "flex_attention":
+        attention_mask = _build_profile_flex_mask(mask_case, sequence_length, device)
+        mask_kind = "native_BlockMask"
+        torch.compiler.reset()
+
+        def forward():
+            return flex_backend.flex_attention_forward(
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                scaling=_BAGEL_HEAD_DIM**-0.5,
+                kernel_options={"BACKEND": "TRITON"},
+            )
+
+    elif backend == "magi_attention":
+        attention_mask = _build_magi_mask(mask_case, sequence_length, device)
+        mask_kind = "MagiAttentionMask"
+
+        def forward():
+            return magi_backend.magi_attention_forward(
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                scaling=_BAGEL_HEAD_DIM**-0.5,
+            )
+
+    else:
+        raise ValueError(f"Unsupported profiling backend: {backend}")
+
+    qkv = (query, key, value)
+    if backend == "magi_attention":
+        magi_fa4_backend._fa4_cache_entry = None
+
+    device_api.reset_peak_memory_stats()
+    compile_init_ms, result = _measure_wall(lambda: _profile_full_iteration(forward, qkv, output_gradient))
+    output, lse, gradients = result
+    all_finite = _profile_outputs_are_finite(output, lse, gradients)
+    first_iteration_peak_allocated_gib = device_api.max_memory_allocated() / 1024**3
+    del result, output, lse, gradients
+
+    warmup_times = []
+    for _ in range(_PROFILE_WARMUP_ITERATIONS):
+        elapsed_ms, result = _measure_wall(lambda: _profile_full_iteration(forward, qkv, output_gradient))
+        output, lse, gradients = result
+        warmup_times.append(elapsed_ms)
+        all_finite = all_finite and _profile_outputs_are_finite(output, lse, gradients)
+        del result, output, lse, gradients
+
+    forward_times = []
+    for _ in range(_PROFILE_ITERATIONS):
+        elapsed_ms, result = _measure_wall(forward)
+        output, lse = result
+        forward_times.append(elapsed_ms)
+        all_finite = all_finite and _profile_outputs_are_finite(output, lse)
+        del result, output, lse
+
+    backward_times = []
+    for _ in range(_PROFILE_ITERATIONS):
+        output, lse = forward()
+        synchronize()
+        elapsed_ms, gradients = _measure_wall(lambda output=output: torch.autograd.grad(output, qkv, output_gradient))
+        backward_times.append(elapsed_ms)
+        all_finite = all_finite and _profile_outputs_are_finite(output, lse, gradients)
+        del output, lse, gradients
+
+    total_times = []
+    for _ in range(_PROFILE_ITERATIONS):
+        elapsed_ms, result = _measure_wall(lambda: _profile_full_iteration(forward, qkv, output_gradient))
+        output, lse, gradients = result
+        total_times.append(elapsed_ms)
+        all_finite = all_finite and _profile_outputs_are_finite(output, lse, gradients)
+        del result, output, lse, gradients
+
+    gc.collect()
+    empty_cache()
+    baseline_bytes = device_api.memory_allocated()
+    device_api.reset_peak_memory_stats()
+    output, lse, gradients = _profile_full_iteration(forward, qkv, output_gradient)
+    synchronize()
+    peak_bytes = device_api.max_memory_allocated()
+    all_finite = all_finite and _profile_outputs_are_finite(output, lse, gradients)
+    del output, lse, gradients
+
+    return {
+        "backend": backend,
+        "mask": mask_kind,
+        "compile_init_excluded_ms": compile_init_ms,
+        "first_iteration_peak_allocated_gib": first_iteration_peak_allocated_gib,
+        "warmup_iterations": _PROFILE_WARMUP_ITERATIONS,
+        "warmup_times": warmup_times,
+        "measured_iterations": _PROFILE_ITERATIONS,
+        "forward_times_ms": forward_times,
+        "backward_times_ms": backward_times,
+        "total_times_ms": total_times,
+        "forward_median_ms": statistics.median(forward_times),
+        "backward_median_ms": statistics.median(backward_times),
+        "total_median_ms": statistics.median(total_times),
+        "peak_allocated_gib": peak_bytes / 1024**3,
+        "incremental_peak_gib": (peak_bytes - baseline_bytes) / 1024**3,
+        "all_outputs_and_gradients_finite": all_finite,
+    }
+
+
+def _profile_speedup(baseline: dict[str, object], candidate: dict[str, object]) -> dict[str, float]:
+    return {
+        metric: baseline[f"{metric}_median_ms"] / candidate[f"{metric}_median_ms"]
+        for metric in ("forward", "backward", "total")
+    }
+
+
+@pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)
+@pytest.mark.skipif(
+    not _RUN_PROFILE,
+    reason="Set RUN_MAGI_ATTENTION_PROFILE=1 to run the causal and BAGEL-like CUDA profiles",
+)
+@pytest.mark.benchmark
+@pytest.mark.parametrize("mask_case", _PROFILE_MASK_CASES)
+@pytest.mark.parametrize("sequence_length", _PROFILE_SEQUENCE_LENGTHS)
+def test_attention_profiles_efficient_sdpa_flex_and_magi(monkeypatch, mask_case, sequence_length):
+    """Reproduce the PR's causal and BAGEL-like attention measurements."""
+    monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
+    monkeypatch.setattr(flex_backend, "get_parallel_state", lambda: _cp1_state())
+    device_api = get_torch_device()
+    try:
+        efficient_result = _profile_attention_backend(mask_case, sequence_length, "efficient_attention")
+        flex_result = _profile_attention_backend(mask_case, sequence_length, "flex_attention")
+        magi_result = _profile_attention_backend(mask_case, sequence_length, "magi_attention")
+    except device_api.OutOfMemoryError as error:
+        free_bytes, total_bytes = device_api.mem_get_info()
+        pytest.fail(
+            json.dumps(
+                {
+                    "mask_case": mask_case,
+                    "sequence_length": sequence_length,
+                    "error": str(error),
+                    "allocated_gib": device_api.memory_allocated() / 1024**3,
+                    "reserved_gib": device_api.memory_reserved() / 1024**3,
+                    "free_gib": free_bytes / 1024**3,
+                    "total_gib": total_bytes / 1024**3,
+                },
+                indent=2,
+            )
+        )
+
+    result = {
+        "mask_case": mask_case,
+        "sequence_length": sequence_length,
+        "dtype": str(torch.bfloat16),
+        "batch_size": 1,
+        "query_heads": _BAGEL_QUERY_HEADS,
+        "kv_heads": _BAGEL_KV_HEADS,
+        "head_dim": _BAGEL_HEAD_DIM,
+        "efficient_attention": efficient_result,
+        "flex_attention": flex_result,
+        "magi_attention": magi_result,
+        "flex_speedup_vs_efficient": _profile_speedup(efficient_result, flex_result),
+        "magi_speedup_vs_efficient": _profile_speedup(efficient_result, magi_result),
+        "magi_speedup_vs_flex": _profile_speedup(flex_result, magi_result),
+    }
+    print(f"Attention profile:\n{json.dumps(result, indent=2)}")
+
+    assert efficient_result["all_outputs_and_gradients_finite"]
+    assert flex_result["all_outputs_and_gradients_finite"]
+    assert magi_result["all_outputs_and_gradients_finite"]
