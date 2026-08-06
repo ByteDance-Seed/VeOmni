@@ -48,7 +48,7 @@ config.add_import(
 )
 config.add_import(
     "veomni.schedulers.flow_matching",
-    names=["flow_matching_loss", "prepare_reference_flow_batch"],
+    names=["derive_flow_seed", "flow_matching_loss", "prepare_reference_flow_batch"],
 )
 config.add_import(
     "veomni.utils.model_outputs",
@@ -404,6 +404,12 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
 
         self.pad_id = config.pad_id
         self.vocab_size = config.vocab_size
+        # Flow-matching RNG state (posterior noise / timestep / diffusion noise
+        # -- see veomni.schedulers.flow_matching). Owned by the model so DCP model
+        # load restores it via get/set_extra_state -- no trainer-side callback, no
+        # per-batch identity plumbing. Lazily initialized on first forward call so
+        # the (DP-rank-aware) seed and the (CUDA-resident) device are both known.
+        self._flow_generator = None
         self.post_init()
         self.apply_component_policy()
         # --- Patch.1 ---
@@ -483,13 +489,77 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
         self.apply_component_policy()
         return self
 
+    def _ensure_flow_generator(self, device):
+        # Lazy init: first forward call on this rank creates one CUDA generator
+        # seeded from ``(config.flow["seed"], dp_rank)``. Two invariants underpin
+        # correctness:
+        #   1. Same DP replica (varying SP/EP rank) → same seed → same draw. Flow
+        #      matching requires bit-identical noised_latents/flow_target across
+        #      SP-shard peers or the gradient stops being flow-matching loss.
+        #   2. Different DP replica → different seed → different draw, so DP
+        #      variance averaging is preserved.
+        # The base seed rides on the model config -- it is part of the flow recipe,
+        # so it lands in the checkpoint's config.json and a re-run reproduces the
+        # noise without depending on the launcher. Mirrors how
+        # ``dit_trainer._build_condition_model`` passes its noise seed through the
+        # config. Only ``dp_rank`` -- genuine topology -- comes from ParallelState.
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if self._flow_generator is not None:
+            stored = self._flow_generator.device
+            # ``torch.Generator(device="cuda")`` normalizes to ``device('cuda', 0)``
+            # on most builds but not all; treat missing indices on either side as
+            # matching the current CUDA device rather than tripping the guard.
+            same = stored == device or (
+                stored.type == device.type
+                and stored.type == "cuda"
+                and (stored.index is None or device.index is None or stored.index == device.index)
+            )
+            if not same:
+                raise RuntimeError(f"Flow generator was initialized on {stored} but forward is running on {device}.")
+            return self._flow_generator
+        seed = derive_flow_seed(self.config.flow["seed"], get_parallel_state().dp_rank)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        self._flow_generator = generator
+        return generator
+
+    def get_extra_state(self):
+        # Serialize the flow generator so DCP model load resumes the noise stream
+        # where it stopped instead of replaying it from the top -- under frequent
+        # preemption a restart-from-seed would over-sample the same sigma prefix.
+        # Uninitialized generators (checkpointing before the first forward)
+        # serialize to an empty payload and re-seed lazily on restore.
+        if self._flow_generator is None:
+            return {"flow_generator": None}
+        return {
+            "flow_generator": {
+                "device_type": self._flow_generator.device.type,
+                "state": self._flow_generator.get_state(),
+            }
+        }
+
+    def set_extra_state(self, state):
+        if not isinstance(state, dict):
+            raise TypeError("HunyuanImage3ForCausalMM extra_state must be a dict.")
+        payload = state.get("flow_generator")
+        if payload is None:
+            self._flow_generator = None
+            return
+        if not isinstance(payload, dict):
+            raise TypeError("flow_generator extra_state entry must be a dict or None.")
+        device = torch.device(payload["device_type"])
+        generator = torch.Generator(device=device)
+        generator.set_state(payload["state"])
+        self._flow_generator = generator
+
     # --- Patch.2 ---
     def forward(
         self,
         input_ids=None,
         component_inputs=None,
         hy3_sequence_metadata=None,
-        flow_step_context=None,
         use_cache=False,
         return_dict=True,
         **kwargs,
@@ -506,7 +576,6 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
             input_ids=input_ids,
             component_inputs=component_inputs,
             hy3_sequence_metadata=hy3_sequence_metadata,
-            flow_step_context=flow_step_context,
             return_dict=return_dict,
         )
 
@@ -516,7 +585,6 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
         input_ids,
         component_inputs,
         hy3_sequence_metadata,
-        flow_step_context,
         return_dict,
     ):
         # Packed production path: two-call varlen GCA + optional Ulysses SP,
@@ -531,12 +599,17 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
         posterior_mean, posterior_logvar = self._get_latent_posterior(component_inputs, input_ids)
         if posterior_mean.shape[0] != num_samples:
             raise ValueError("Packed latent posterior must carry one entry per packed sample.")
+        # Keep this draw here, at the top of forward and outside every
+        # activation-checkpointing boundary. VeOmni applies AC per decoder layer,
+        # so the backward recompute never re-enters this line; widening AC to wrap
+        # the whole model would make recompute draw fresh noise against the
+        # forward's targets and silently corrupt the gradient.
         flow_batch = prepare_reference_flow_batch(
             posterior_mean,
             posterior_logvar,
             vae_config=self.config.vae,
             flow_config=self.config.flow,
-            flow_step_context=flow_step_context,
+            generator=self._ensure_flow_generator(posterior_mean.device),
         )
         grid_height, grid_width = self._validate_reference_grid(metadata["grid_hw"], flow_batch["noised_latents"])
 

@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Deterministic reference flow-matching training-path helpers.
+"""Reference flow-matching training-path helpers.
 
-Every random draw is derived from logical step identity (train seed,
-data-replica rank, optimizer/micro step, RNG stream name) rather than from
-ambient global RNG state, so the noise / timestep sequence is reproducible
-byte-for-byte across ranks and across a DCP resume.
+The caller owns a single :class:`torch.Generator` (in practice, a per-DP-replica
+generator on the model — see the HunyuanImage 3 modeling for the canonical
+implementation) and hands it in per call.
 
 :func:`normalize_flow_config` is the single source of truth for which flow
 recipes are supported. Model configs call it at build, so an unsupported recipe
@@ -28,9 +27,7 @@ whatever mapping it is handed, so the two callers cannot drift apart.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Mapping
-from dataclasses import dataclass
 
 import torch
 
@@ -41,46 +38,28 @@ DEFAULT_REFERENCE_FLOW_CONFIG = {
     "training_shift": 1.0,
     "prediction_type": "velocity",
     "loss_weighting": "uniform",
+    # Base seed for the flow generator. Part of the recipe, not of the launcher:
+    # it rides on the model config so it is written into the checkpoint's
+    # config.json and a resumed / re-run job reproduces the same noise without
+    # depending on the CLI. Mirrors ``dit_trainer._build_condition_model``, which
+    # likewise passes the noise seed through the model config. Note this is
+    # deliberately independent of ``args.train.seed`` (which seeds the global RNG
+    # and the dataloader) -- change ``flow.seed`` to change the noise stream.
+    "seed": 0,
 }
 
-# Not a whitelist: ``derive_seed_v1`` accepts any stream name. These are the
-# streams ``prepare_reference_flow_batch`` draws internally.
-REFERENCE_RNG_STREAMS = ("posterior", "diffusion_noise", "timestep")
 
+def derive_flow_seed(flow_seed: int, data_replica_rank: int) -> int:
+    """Derive the flow generator seed for one DP replica.
 
-@dataclass(frozen=True)
-class _ReferenceFlowConfig:
-    num_train_timesteps: int
-    training_shift: float
-
-
-def derive_seed_v1(
-    train_seed: int,
-    data_replica_rank: int,
-    optimizer_step: int,
-    micro_step: int,
-    stream_name: str,
-) -> int:
-    """Derive a stable, non-negative 63-bit seed from logical step identity.
-
-    Frozen BLAKE2b of the JSON-serialised ``(train_seed, data_replica_rank,
-    optimizer_step, micro_step, stream_name)`` tuple. Same identity → same
-    seed on every rank and across DCP resume; different ``stream_name`` →
-    independent seed for that stream.
+    Adding the two (``flow_seed + dp_rank``) collides across runs: seed 41 on
+    replica 1 draws exactly what seed 42 on replica 0 draws. Hashing the pair
+    keeps neighbouring run seeds independent. blake2b rather than the builtin
+    ``hash()`` because the latter is salted per process for bytes, which would
+    change the stream on every restart.
     """
-    integer_fields = (train_seed, data_replica_rank, optimizer_step, micro_step)
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_fields):
-        raise TypeError("Flow RNG identity fields must be integers.")
-    if data_replica_rank < 0 or optimizer_step < 0 or micro_step < 0:
-        raise ValueError("Flow RNG rank and step fields must be non-negative.")
-    if not isinstance(stream_name, str) or not stream_name:
-        raise TypeError("stream_name must be a non-empty string.")
-    payload = json.dumps(
-        [train_seed, data_replica_rank, optimizer_step, micro_step, stream_name],
-        separators=(",", ":"),
-    ).encode("utf-8")
-    digest = hashlib.blake2b(payload, digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="big") & ((1 << 63) - 1)
+    material = f"veomni.flow-matching:{int(flow_seed)}:{int(data_replica_rank)}".encode()
+    return int.from_bytes(hashlib.blake2b(material, digest_size=8).digest(), "big")
 
 
 def prepare_reference_flow_batch(
@@ -89,9 +68,19 @@ def prepare_reference_flow_batch(
     *,
     vae_config: Mapping[str, object],
     flow_config: Mapping[str, object] | None,
-    flow_step_context: Mapping[str, object],
+    generator: torch.Generator,
 ) -> dict[str, torch.Tensor]:
-    """Sample cached posteriors, timesteps, and diffusion noise reproducibly."""
+    """Sample posterior, timestep, and diffusion noise from ``generator``.
+
+    **Draw order**: posterior noise, then timestep sigma, then diffusion noise.
+    All three draws come from the single shared ``generator``. Every SP/EP rank
+    inside a DP replica must call this with the same generator state, or the
+    ranks desync and the summed gradient stops being the flow-matching gradient.
+
+    ``generator`` is a state machine, so this must be called exactly once per
+    micro-batch: keep the call outside any activation-checkpointing boundary, or
+    the backward recompute draws fresh noise and silently corrupts the gradient.
+    """
     if posterior_mean.ndim != 4 or posterior_logvar.shape != posterior_mean.shape:
         raise ValueError("Cached posterior mean and logvar must have identical [B, C, H, W] shapes.")
     if not posterior_mean.is_floating_point() or not posterior_logvar.is_floating_point():
@@ -100,19 +89,26 @@ def prepare_reference_flow_batch(
         raise ValueError("Cached posterior mean and logvar must be on the same device.")
     if not isinstance(vae_config, Mapping):
         raise TypeError("vae_config must be a mapping.")
-    normalized_flow = _normalize_flow_config(flow_config)
-    identity = _normalize_step_context(flow_step_context)
+    if not isinstance(generator, torch.Generator):
+        raise TypeError("generator must be a torch.Generator instance.")
+    gen_device = generator.device
+    post_device = posterior_mean.device
+    # ``torch.Generator(device="cuda")`` may leave the index unset; treat that as
+    # matching the posterior's concrete CUDA index (the actual draw happens on
+    # ``posterior_mean.device`` below regardless).
+    same_device = gen_device == post_device or (
+        gen_device.type == post_device.type
+        and gen_device.type == "cuda"
+        and (gen_device.index is None or post_device.index is None or gen_device.index == post_device.index)
+    )
+    if not same_device:
+        raise ValueError(f"generator device {gen_device} must match posterior device {post_device}.")
+    num_train_timesteps = normalize_flow_config(flow_config)["num_train_timesteps"]
 
-    generators = {
-        stream_name: _make_generator(
-            posterior_mean.device,
-            derive_seed_v1(*identity, stream_name),
-        )
-        for stream_name in REFERENCE_RNG_STREAMS
-    }
+    # --- Draw 1: posterior noise ---
     posterior_noise = torch.randn(
         posterior_mean.shape,
-        generator=generators["posterior"],
+        generator=generator,
         device=posterior_mean.device,
         dtype=posterior_mean.dtype,
     )
@@ -125,23 +121,24 @@ def prepare_reference_flow_batch(
         raise ValueError("vae.scaling_factor must be non-zero for the reference flow path.")
     latents = latents * float(scaling_factor)
 
-    uniform_sigma = torch.rand(
+    # --- Draw 2: timestep sigma ---
+    sigmas = torch.rand(
         (posterior_mean.shape[0],),
-        generator=generators["timestep"],
+        generator=generator,
         device=posterior_mean.device,
         dtype=torch.float32,
     )
-    sigmas = uniform_sigma
+    # --- Draw 3: diffusion noise ---
     diffusion_noise = torch.randn(
         posterior_mean.shape,
-        generator=generators["diffusion_noise"],
+        generator=generator,
         device=posterior_mean.device,
         dtype=posterior_mean.dtype,
     )
     broadcast_sigmas = sigmas.to(dtype=latents.dtype).reshape(-1, 1, 1, 1)
     noised_latents = (1.0 - broadcast_sigmas) * latents + broadcast_sigmas * diffusion_noise
     flow_target = diffusion_noise - latents
-    timesteps = sigmas * normalized_flow.num_train_timesteps
+    timesteps = sigmas * num_train_timesteps
     return {
         "latents": latents,
         "noised_latents": noised_latents,
@@ -187,45 +184,16 @@ def normalize_flow_config(flow_config: Mapping[str, object] | None) -> dict:
         raise ValueError("The reference flow path supports only velocity prediction.")
     if values["loss_weighting"] != "uniform":
         raise ValueError("The reference flow path supports only uniform flow loss weighting.")
+    seed = values["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("flow seed must be a non-negative integer.")
     values["training_shift"] = float(training_shift)
     return values
 
 
-def _normalize_flow_config(flow_config: Mapping[str, object] | None) -> _ReferenceFlowConfig:
-    values = normalize_flow_config(flow_config)
-    return _ReferenceFlowConfig(
-        num_train_timesteps=values["num_train_timesteps"],
-        training_shift=values["training_shift"],
-    )
-
-
-def _normalize_step_context(flow_step_context: Mapping[str, object]) -> tuple[int, int, int, int]:
-    if not isinstance(flow_step_context, Mapping):
-        raise TypeError("flow_step_context must be a mapping.")
-    required = ("train_seed", "data_replica_rank", "optimizer_step", "micro_step")
-    missing = [name for name in required if name not in flow_step_context]
-    unknown = sorted(set(flow_step_context).difference(required))
-    if missing or unknown:
-        raise ValueError(f"Invalid flow_step_context fields; missing={missing}, unknown={unknown}.")
-    identity = tuple(flow_step_context[name] for name in required)
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in identity):
-        raise TypeError("flow_step_context values must be integers.")
-    train_seed, data_replica_rank, optimizer_step, micro_step = identity
-    if data_replica_rank < 0 or optimizer_step < 0 or micro_step < 0:
-        raise ValueError("Flow RNG rank and step fields must be non-negative.")
-    return train_seed, data_replica_rank, optimizer_step, micro_step
-
-
-def _make_generator(device: torch.device, seed: int) -> torch.Generator:
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
-    return generator
-
-
 __all__ = [
     "DEFAULT_REFERENCE_FLOW_CONFIG",
-    "REFERENCE_RNG_STREAMS",
-    "derive_seed_v1",
+    "derive_flow_seed",
     "flow_matching_loss",
     "normalize_flow_config",
     "prepare_reference_flow_batch",

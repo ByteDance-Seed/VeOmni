@@ -51,7 +51,7 @@ from veomni.models.transformers.hunyuan_image_3.sequence_layout import (
 )
 from veomni.schedulers.flow_matching import (
     DEFAULT_REFERENCE_FLOW_CONFIG,
-    derive_seed_v1,
+    derive_flow_seed,
     prepare_reference_flow_batch,
 )
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
@@ -106,6 +106,18 @@ def _to_device(metadata, device):
 def _dense_oracle(metadata):
     """Same compiled metadata, dense edge mask instead of the two-call split."""
     return {**metadata, "dense_reference_attention": True}
+
+
+def _pin_flow_generator(model, *, device, seed=0):
+    """Pin ``model._flow_generator`` so paired forwards draw identical noise.
+
+    The model lazily instantiates its flow generator on the first forward from
+    ``derive_flow_seed(config.flow["seed"], dp_rank)`` and threads it through
+    training. Tests that call ``model(...)`` twice expecting bit-identical
+    outputs need to reset the stream between calls; that is what this helper
+    does. Keep the seed constant across a paired call to compare like-for-like.
+    """
+    model._flow_generator = torch.Generator(device=device).manual_seed(seed)
 
 
 # ----------------------------- CPU invariants --------------------------------
@@ -193,33 +205,95 @@ def test_reference_2d_rope_preserves_official_frequency_interleave():
     torch.testing.assert_close(sin[0, 1], expected_angles.sin())
 
 
-def test_reference_flow_rng_is_stable_and_stream_scoped():
-    """Per-micro-step RNG identity: same context -> same noise; changing the
-    micro_step must produce different noise (otherwise resume can silently
-    reuse a stale flow sample)."""
-    assert derive_seed_v1(1234, 2, 17, 3, "posterior") == 7220414926050156979
+def test_reference_flow_generator_is_deterministic_and_seed_scoped():
+    """Model-owned flow generator: same seed -> same noise; different seed -> different noise.
+
+    The forward's ``_ensure_flow_generator`` lazily creates one generator per rank
+    from ``derive_flow_seed(config.flow["seed"], dp_rank)`` and draws posterior /
+    diffusion noise from it in a fixed order. This test pins the equivalent
+    invariants at the scheduler level: a fresh generator with seed S produces
+    byte-identical draws twice, and seed S' yields a different noised_latents.
+    """
     posterior_mean = torch.zeros(2, 4, 2, 2)
     posterior_logvar = torch.zeros_like(posterior_mean)
     vae_config = {"scaling_factor": 0.5, "shift_factor": None}
-    step_context = {"train_seed": 1234, "data_replica_rank": 2, "optimizer_step": 17, "micro_step": 3}
 
-    first = prepare_reference_flow_batch(
-        posterior_mean, posterior_logvar, vae_config=vae_config, flow_config=None, flow_step_context=step_context
-    )
-    second = prepare_reference_flow_batch(
-        posterior_mean, posterior_logvar, vae_config=vae_config, flow_config=None, flow_step_context=step_context
-    )
-    changed = prepare_reference_flow_batch(
-        posterior_mean,
-        posterior_logvar,
-        vae_config=vae_config,
-        flow_config=None,
-        flow_step_context=dict(step_context, micro_step=4),
-    )
+    def _draw(seed):
+        generator = torch.Generator(device=posterior_mean.device).manual_seed(seed)
+        return prepare_reference_flow_batch(
+            posterior_mean,
+            posterior_logvar,
+            vae_config=vae_config,
+            flow_config=None,
+            generator=generator,
+        )
+
+    first = _draw(1234)
+    second = _draw(1234)
+    changed = _draw(4321)
 
     for name in first:
         torch.testing.assert_close(first[name], second[name])
     assert not torch.equal(first["noised_latents"], changed["noised_latents"])
+
+
+def test_derive_flow_seed_separates_neighbouring_run_seeds():
+    """``flow_seed + dp_rank`` would alias; the hash must not.
+
+    Plain addition makes (seed=41, dp=1) draw exactly what (seed=42, dp=0) draws,
+    so two runs whose seeds differ by one share a noise stream. The derivation
+    must also be stable across processes -- Python's builtin ``hash()`` is salted
+    for bytes and would change the stream on every restart.
+    """
+    assert derive_flow_seed(41, 1) != derive_flow_seed(42, 0)
+    assert derive_flow_seed(0, 0) != derive_flow_seed(0, 1)
+    # Same inputs -> same seed, and inside torch's accepted range.
+    assert derive_flow_seed(7, 3) == derive_flow_seed(7, 3)
+    assert 0 <= derive_flow_seed(7, 3) < 2**64
+    torch.Generator().manual_seed(derive_flow_seed(7, 3))
+
+    # Stable across interpreters (guards against a salted-hash regression).
+    # ``import veomni`` logs to stdout, so read the value off the last line.
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from veomni.schedulers.flow_matching import derive_flow_seed; print(derive_flow_seed(7, 3))",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=_REPO_ROOT,
+        check=True,
+    )
+    assert int(completed.stdout.strip().splitlines()[-1]) == derive_flow_seed(7, 3)
+
+
+def test_flow_generator_extra_state_round_trip_resumes_the_stream():
+    """``get_extra_state``/``set_extra_state`` must resume the stream, not restart it.
+
+    Under frequent preemption a restart-from-seed would replay the same sigma
+    prefix after every crash, over-sampling that slice of the flow trajectory.
+    The round trip below is the contract that prevents it; the ``None`` payload
+    case is the old-checkpoint path, which falls back to lazy re-seeding.
+    """
+    model = _build_toy_model_with_vae()[1]
+
+    model._flow_generator = torch.Generator().manual_seed(derive_flow_seed(11, 0))
+    torch.randn(8, generator=model._flow_generator)  # advance past the initial state
+
+    payload = model.get_extra_state()
+    expected = torch.randn(8, generator=model._flow_generator)
+
+    resumed = _build_toy_model_with_vae()[1]
+    resumed.set_extra_state(payload)
+    torch.testing.assert_close(torch.randn(8, generator=resumed._flow_generator), expected)
+
+    # A checkpoint saved before the first forward (or an older one with no entry)
+    # restores to "uninitialized" so the next forward re-seeds lazily.
+    fresh = _build_toy_model_with_vae()[1]
+    assert fresh.get_extra_state() == {"flow_generator": None}
+    resumed.set_extra_state({"flow_generator": None})
+    assert resumed._flow_generator is None
 
 
 def test_config_materializes_the_flow_recipe_and_rejects_unsupported_ones():
@@ -239,6 +313,15 @@ def test_config_materializes_the_flow_recipe_and_rejects_unsupported_ones():
     with pytest.raises(ValueError, match="only velocity prediction"):
         HunyuanImage3Config(flow={"prediction_type": "epsilon"})
 
+    # The noise seed is part of the recipe, so it survives the config round trip
+    # and lands in the checkpoint's config.json rather than living in a runtime
+    # singleton -- a re-run reproduces the noise without the original CLI.
+    seeded = HunyuanImage3Config(flow={"seed": 1234})
+    assert seeded.flow["seed"] == 1234
+    assert HunyuanImage3Config(**seeded.to_dict()).flow["seed"] == 1234
+    with pytest.raises(ValueError, match="flow seed must be a non-negative integer"):
+        HunyuanImage3Config(flow={"seed": -1})
+
 
 def test_online_pixel_values_match_cached_posterior():
     """Online (pixel_values -> vae.encode -> posterior) must equal a fed cached posterior.
@@ -250,25 +333,24 @@ def test_online_pixel_values_match_cached_posterior():
     layout = T2ILayout(text_len=2, grid_h=2, grid_w=2)
     metadata = compile_single_gen_t2i_packed([layout])
     input_ids = torch.arange(layout.seq_len, dtype=torch.long).unsqueeze(0)
-    flow_step_context = {"train_seed": 7, "data_replica_rank": 0, "optimizer_step": 1, "micro_step": 0}
 
     pixel_values = torch.rand(1, config.vae["in_channels"], 2, 2)
     posterior = model.vae.encode(pixel_values)
     cached_mean = posterior.mean.squeeze(2)
     cached_logvar = posterior.logvar.squeeze(2)
 
+    _pin_flow_generator(model, device=pixel_values.device, seed=7)
     online = model(
         input_ids=input_ids,
         component_inputs={"pixel_values": pixel_values},
         hy3_sequence_metadata=metadata,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
+    _pin_flow_generator(model, device=pixel_values.device, seed=7)
     cached = model(
         input_ids=input_ids,
         component_inputs={"latent_posterior": {"mean": cached_mean, "logvar": cached_logvar}},
         hy3_sequence_metadata=metadata,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
     torch.testing.assert_close(online.latents, cached.latents, rtol=0, atol=0)
@@ -417,23 +499,22 @@ def test_packed_fast_path_matches_dense_oracle():
     mean, logvar = _cached_posterior(1, config, device=device, dtype=dtype, grid=grid)
     component_inputs = {"latent_posterior": {"mean": mean, "logvar": logvar}}
     input_ids = torch.arange(layout.seq_len, device=device, dtype=torch.long).unsqueeze(0)
-    flow_step_context = {"train_seed": 5, "data_replica_rank": 0, "optimizer_step": 1, "micro_step": 0}
 
     packed_metadata = _to_device(compile_single_gen_t2i_packed([layout]), device)
     dense_metadata = _dense_oracle(packed_metadata)
 
+    _pin_flow_generator(model, device=device, seed=5)
     dense = model(
         input_ids=input_ids,
         component_inputs=component_inputs,
         hy3_sequence_metadata=dense_metadata,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
+    _pin_flow_generator(model, device=device, seed=5)
     packed = model(
         input_ids=input_ids,
         component_inputs=component_inputs,
         hy3_sequence_metadata=packed_metadata,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
     torch.testing.assert_close(packed.diffusion_prediction, dense.diffusion_prediction, **_ORACLE_TOLERANCE)
@@ -475,22 +556,21 @@ def test_packed_varlen_multi_sample_matches_dense_block_diagonal():
     ]
     mean, logvar = _cached_posterior(2, config, device=device, dtype=dtype, grid=grid)
     component_inputs = {"latent_posterior": {"mean": mean, "logvar": logvar}}
-    flow_step_context = {"train_seed": 9, "data_replica_rank": 0, "optimizer_step": 2, "micro_step": 0}
 
     packed_metadata = _to_device(compile_single_gen_t2i_packed(layouts), device)
     packed_ids = _packed_input_ids(layouts, device)
+    _pin_flow_generator(model, device=device, seed=9)
     dense = model(
         input_ids=packed_ids,
         component_inputs=component_inputs,
         hy3_sequence_metadata=_dense_oracle(packed_metadata),
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
+    _pin_flow_generator(model, device=device, seed=9)
     packed = model(
         input_ids=packed_ids,
         component_inputs=component_inputs,
         hy3_sequence_metadata=packed_metadata,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
     torch.testing.assert_close(packed.diffusion_prediction, dense.diffusion_prediction, **_ORACLE_TOLERANCE)
@@ -511,24 +591,23 @@ def test_packed_heterogeneous_has_no_cross_sample_attention():
     ]
     packed_metadata = _to_device(compile_single_gen_t2i_packed(layouts), device)
     packed_ids = _packed_input_ids(layouts, device)
-    flow_step_context = {"train_seed": 9, "data_replica_rank": 0, "optimizer_step": 2, "micro_step": 0}
 
     mean, logvar = _cached_posterior(2, config, device=device, dtype=dtype, grid=grid, seed=0)
+    _pin_flow_generator(model, device=device, seed=9)
     baseline = model(
         input_ids=packed_ids,
         component_inputs={"latent_posterior": {"mean": mean, "logvar": logvar}},
         hy3_sequence_metadata=packed_metadata,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
 
     perturbed_mean = mean.clone()
     perturbed_mean[1] = perturbed_mean[1] + 3.0
+    _pin_flow_generator(model, device=device, seed=9)
     perturbed = model(
         input_ids=packed_ids,
         component_inputs={"latent_posterior": {"mean": perturbed_mean, "logvar": logvar}},
         hy3_sequence_metadata=packed_metadata,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
     torch.testing.assert_close(
@@ -566,7 +645,6 @@ def _sp_worker(rank, world_size, grid, text_tokens, return_dict):
 
     config, model = _build_model(device=device, dtype=dtype, overrides=_SP_HEAD_OVERRIDES)
     layouts = [T2ILayout(text_len=text_tokens + i, grid_h=grid[0], grid_w=grid[1]) for i in range(world_size)]
-    flow_step_context = {"train_seed": 3, "data_replica_rank": 0, "optimizer_step": 1, "micro_step": 0}
     mean, logvar = _cached_posterior(len(layouts), config, device=device, dtype=dtype, grid=grid)
     component_inputs = {"latent_posterior": {"mean": mean, "logvar": logvar}}
 
@@ -578,22 +656,25 @@ def _sp_worker(rank, world_size, grid, text_tokens, return_dict):
     set_ulysses_sequence_parallel_group(None)
     reference_packed = _to_device(compile_single_gen_t2i_packed(layouts), device)
     reference_ids = torch.arange(reference_packed["sequence_length"], device=device, dtype=torch.long).unsqueeze(0)
+    _pin_flow_generator(model, device=device, seed=3)
     reference = model(
         input_ids=reference_ids,
         component_inputs=component_inputs,
         hy3_sequence_metadata=reference_packed,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
     reference_loss = float(reference.loss["image_decoder_loss"].detach().float().cpu())
 
     # SP path: every rank sees the full replicated inputs; the model slices.
+    # Pin the same seed on every rank so SP and non-SP arms consume identical
+    # noise -- mirrors the runtime invariant that ranks within a DP replica
+    # share ``derive_flow_seed(config.flow["seed"], dp_rank)``.
     set_ulysses_sequence_parallel_group(group)
+    _pin_flow_generator(model, device=device, seed=3)
     sp_output = model(
         input_ids=input_ids,
         component_inputs=component_inputs,
         hy3_sequence_metadata=packed,
-        flow_step_context=flow_step_context,
         use_cache=False,
     )
     sp_loss = float(sp_output.loss["image_decoder_loss"].detach().float().cpu())
