@@ -28,7 +28,7 @@ from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs, _has_trainable_lora_parameters
+from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs
 
 
 logger = helper.create_logger(__name__)
@@ -56,8 +56,10 @@ def _get_vlm_visual_module(model):
     return None
 
 
-def _has_trainable_parameters(module: torch.nn.Module | None) -> bool:
-    return module is not None and any(param.requires_grad for param in module.parameters())
+def _get_trainable_parameter_sizes(module: torch.nn.Module | None) -> dict[str, int]:
+    if module is None:
+        return {}
+    return {name: param.numel() for name, param in module.named_parameters() if param.requires_grad}
 
 
 @dataclass
@@ -205,10 +207,10 @@ class VLMTrainer:
                 )
                 audio_proj.requires_grad_(True)
 
-        # FLOPs accounting must follow the resulting parameter state rather
-        # than infer vision-adapter trainability from freeze_vit.
-        self.base.vision_lora_enabled = _has_trainable_lora_parameters(visual)
-        self.base.vision_requires_grad = _has_trainable_parameters(visual)
+        # Preserve the actual post-freeze/post-LoRA state for FLOPs accounting.
+        # Names distinguish backbone and merger adapters; sizes make rank-pattern
+        # and exclude-module configurations observable without re-parsing config.
+        self.base.vision_trainable_parameters = _get_trainable_parameter_sizes(visual)
 
         pretty_print_trainable_parameters(self.base.model)
         helper.print_device_mem_info("VRAM usage after building model")

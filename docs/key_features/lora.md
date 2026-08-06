@@ -172,10 +172,13 @@ collected from the current batch and follows this logic:
 1. If the batch has no vision tokens, ViT FLOPs are zero.
 2. If the batch has vision tokens but no vision parameter is trainable, the ViT is treated
    as frozen and only its forward-pass FLOPs are counted.
-3. If a supported ViT module has a trainable adapter, base forward/input-gradient work and
-   the matched LoRA forward/backward work are counted.
-4. If only vision biases are trainable (for example, `bias: all` with language-only adapter
-   targets), base forward/input-gradient work is counted without adapter FLOPs.
+3. If a transformer-block adapter is trainable, backward work is counted from the earliest
+   adapted block through the vision output. Excluded earlier blocks remain forward-only.
+4. A merger-only adapter counts merger parameter-gradient work at the post-merge token count;
+   it does not cause backward through the patch embedding or transformer blocks.
+5. If only vision biases are trainable (for example, `bias: all` with language-only adapter
+   targets), the counter follows the resulting activation-gradient path but does not charge
+   a frozen patch-convolution weight gradient.
 
 The native LoRA implementation currently adapts two kinds of weights:
 

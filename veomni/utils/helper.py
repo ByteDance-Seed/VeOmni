@@ -251,8 +251,7 @@ class EnvironMeter:
         delta_time: float,
         global_step: int,
         lora_config: Optional["VeOmniLoraConfig"] = None,
-        vision_lora_enabled: Optional[bool] = None,
-        vision_requires_grad: Optional[bool] = None,
+        vision_trainable_parameters: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         flops_kwargs = {}
         if self.images_seqlens:
@@ -261,16 +260,14 @@ class EnvironMeter:
         if lora_config is not None:
             if self.supports_lora_flops:
                 flops_kwargs["lora_config"] = lora_config
-                if vision_lora_enabled is not None:
-                    flops_kwargs["vision_lora_enabled"] = vision_lora_enabled
-                if vision_requires_grad is not None:
-                    flops_kwargs["vision_requires_grad"] = vision_requires_grad
             elif not self._warned_unsupported_lora_flops:
                 logger.warning_rank0(
                     "LoRA FLOPs are unavailable because the configured FLOP counter does not accept "
                     "VeOmniLoraConfig. Returning zero FLOPs so training can continue."
                 )
                 self._warned_unsupported_lora_flops = True
+        if vision_trainable_parameters is not None and self.supports_lora_flops:
+            flops_kwargs["vision_trainable_parameters"] = vision_trainable_parameters
         flops_achieved, flops_promised = self.estimate_flops(
             self.batch_seqlens,
             delta_time,

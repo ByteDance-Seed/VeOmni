@@ -154,6 +154,21 @@ class VeomniFlopsCounter:
         return (base_factor * base_params + 6 * lora_params) * tokens
 
     @staticmethod
+    def _compute_lora_ab_sizes(lora_config, module_shapes):
+        """Return LoRA A/B parameter counts for config-only fallback accounting."""
+        a_params = b_params = 0
+        for module in lora_config.target_modules or ():
+            if module not in module_shapes:
+                continue
+            shape_groups = module_shapes[module]
+            if isinstance(shape_groups, tuple):
+                shape_groups = (shape_groups,)
+            for in_features, out_features, count in shape_groups:
+                a_params += lora_config.r * in_features * count
+                b_params += lora_config.r * out_features * count
+        return a_params, b_params
+
+    @staticmethod
     def _get_lora_validation_error(model_type, lora_config):
         if lora_config is None:
             return None
@@ -664,8 +679,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
-                vision_lora_enabled=kargs.get("vision_lora_enabled"),
-                vision_requires_grad=kargs.get("vision_requires_grad"),
+                vision_trainable_parameters=kargs.get("vision_trainable_parameters"),
             )
         else:
             vit_flops = 0
@@ -697,8 +711,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
-                vision_lora_enabled=kargs.get("vision_lora_enabled"),
-                vision_requires_grad=kargs.get("vision_requires_grad"),
+                vision_trainable_parameters=kargs.get("vision_trainable_parameters"),
             )
         else:
             vit_flops = 0
@@ -729,8 +742,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
-                vision_lora_enabled=kargs.get("vision_lora_enabled"),
-                vision_requires_grad=kargs.get("vision_requires_grad"),
+                vision_trainable_parameters=kargs.get("vision_trainable_parameters"),
             )
         else:
             vit_flops = 0
@@ -744,8 +756,7 @@ class VeomniFlopsCounter:
         images_seqlens,
         config,
         lora_config=None,
-        vision_lora_enabled=None,
-        vision_requires_grad=None,
+        vision_trainable_parameters=None,
     ):
         """
         Estimate the FLOPs of the Qwen3-family vision encoder.
@@ -767,7 +778,8 @@ class VeomniFlopsCounter:
         head_dim = dim // num_heads
 
         # every vision token's patch_embed comes from a conv of (C, T, H, W) -> (dim,)
-        patch_embed_N = dim * config.in_channels * config.temporal_patch_size * config.patch_size * config.patch_size
+        in_channels = getattr(config, "in_channels", getattr(config, "in_chans", 3))
+        patch_embed_N = dim * in_channels * config.temporal_patch_size * config.patch_size * config.patch_size
         # Qwen3 VL vision mlp does not use GLU, thus 2.
         mlp_N = dim * mlp_hidden_dim * 2
         attn_linear_N = dim * (4 * dim)  # qkv and output proj
@@ -776,57 +788,99 @@ class VeomniFlopsCounter:
         # Qwen3 VL uses deep stack, one merger for every deepstack layer
         merger_count = 1 + len(getattr(config, "deepstack_visual_indexes", ()))
         deepstack_merger_N = merger_N * (merger_count - 1)
-        # non-attn all_layer parm
-        dense_N = patch_embed_N + (mlp_N + attn_linear_N) * depth + deepstack_merger_N + merger_N
-
-        vision_module_shapes = {
+        block_N = mlp_N + attn_linear_N
+        block_module_shapes = {
             "qkv": (dim, 3 * dim, depth),
             "proj": (dim, dim, depth),
-            "linear_fc1": [
-                (dim, mlp_hidden_dim, depth),
-                (dim * spatial_merge_size**2, dim * spatial_merge_size**2, merger_count),
-            ],
-            "linear_fc2": [
-                (mlp_hidden_dim, dim, depth),
-                (dim * spatial_merge_size**2, out_hidden_size, merger_count),
-            ],
+            "linear_fc1": (dim, mlp_hidden_dim, depth),
+            "linear_fc2": (mlp_hidden_dim, dim, depth),
         }
-        target_modules = lora_config.target_modules if lora_config is not None else ()
-        vision_has_lora = vision_lora_enabled is not False and any(
-            module in vision_module_shapes for module in target_modules or ()
-        )
-        if vision_requires_grad is None:
-            vision_requires_grad = vision_has_lora or (lora_config is not None and lora_config.bias == "all")
-
-        if lora_config is None:
-            dense_N_flops = 6 * dense_N * tokens_sum
-        elif not vision_requires_grad:
-            dense_N_flops = 2 * dense_N * tokens_sum
-        elif not vision_has_lora:
-            # Bias-only vision training needs activation gradients through the
-            # tower, but not input gradients for the initial patch embedding.
-            adaptable_base_N = dense_N - patch_embed_N
-            dense_N_flops = (2 * patch_embed_N + 4 * adaptable_base_N) * tokens_sum
-        else:
-            # Patch embedding is Conv3d and is not adapted by VeOmni's linear LoRA.
-            adaptable_base_N = dense_N - patch_embed_N
-            dense_N_flops = 2 * patch_embed_N * tokens_sum
-            dense_N_flops += self._compute_linear_flops(
-                adaptable_base_N,
-                tokens_sum,
-                lora_config=lora_config,
-                module_shapes=vision_module_shapes,
+        merger_module_shapes = {
+            "linear_fc1": (dim * spatial_merge_size**2, dim * spatial_merge_size**2, merger_count),
+            "linear_fc2": (dim * spatial_merge_size**2, out_hidden_size, merger_count),
+        }
+        trainable_names = tuple(vision_trainable_parameters or ())
+        if vision_trainable_parameters is None:
+            targets = tuple(lora_config.target_modules or ()) if lora_config is not None else ()
+            block_trainable = (
+                lora_config is None or lora_config.bias == "all" or any(t in block_module_shapes for t in targets)
             )
+            patch_trainable = lora_config is None or (lora_config is not None and lora_config.bias == "all")
+            block_base_trainable = lora_config is None
+            merger_base_trainable = lora_config is None
+            backward_block_count = depth if block_trainable or patch_trainable else 0
+            base_trainable_block_count = depth if block_base_trainable else 0
+        else:
+            trainable_block_indexes = {
+                int(name.split(".", 2)[1])
+                for name in trainable_names
+                if name.startswith("blocks.") and name.split(".", 2)[1].isdigit()
+            }
+            block_trainable = bool(trainable_block_indexes)
+            patch_trainable = any(name.startswith("patch_embed.") for name in trainable_names)
+            merger_base_trainable = any(
+                name.startswith(("merger.", "deepstack_merger_list."))
+                and name.endswith(".weight")
+                and ".lora_A." not in name
+                and ".lora_B." not in name
+                for name in trainable_names
+            )
+            base_trainable_block_indexes = {
+                int(name.split(".", 2)[1])
+                for name in trainable_names
+                if name.startswith("blocks.")
+                and name.split(".", 2)[1].isdigit()
+                and name.endswith(".weight")
+                and ".lora_A." not in name
+                and ".lora_B." not in name
+            }
+            earliest_trainable_block = 0 if patch_trainable else min(trainable_block_indexes, default=depth)
+            backward_block_count = depth - earliest_trainable_block
+            base_trainable_block_count = len(base_trainable_block_indexes)
 
-        # In Qwen3 VL, full attention is used in all vision layers.
-        full_attn_layer_num = depth
+        block_backward = patch_trainable or block_trainable
+        merged_tokens = tokens_sum / (spatial_merge_size**2)
+        patch_weight_trainable = vision_trainable_parameters is None and lora_config is None
+        if vision_trainable_parameters is not None:
+            patch_weight_trainable = "patch_embed.proj.weight" in vision_trainable_parameters
+        patch_factor = 4 if patch_weight_trainable else 2
+        merger_factor = 2 + 2 * block_backward + 2 * merger_base_trainable
+        dense_N_flops = patch_factor * patch_embed_N * tokens_sum
+        dense_N_flops += (2 * depth + 2 * backward_block_count + 2 * base_trainable_block_count) * block_N * tokens_sum
+        dense_N_flops += merger_factor * (merger_N + deepstack_merger_N) * merged_tokens
+
+        if lora_config is not None:
+            if vision_trainable_parameters is None:
+                dense_N_flops += self._compute_linear_flops(
+                    0, tokens_sum, lora_config=lora_config, module_shapes=block_module_shapes
+                )
+                merger_lora_A_N, merger_lora_B_N = self._compute_lora_ab_sizes(lora_config, merger_module_shapes)
+                dense_N_flops += ((6 if block_backward else 4) * merger_lora_A_N + 6 * merger_lora_B_N) * merged_tokens
+            else:
+                block_lora_N = sum(
+                    size
+                    for name, size in vision_trainable_parameters.items()
+                    if name.startswith("blocks.") and (".lora_A." in name or ".lora_B." in name)
+                )
+                merger_lora_A_N = sum(
+                    size
+                    for name, size in vision_trainable_parameters.items()
+                    if name.startswith(("merger.", "deepstack_merger_list.")) and ".lora_A." in name
+                )
+                merger_lora_B_N = sum(
+                    size
+                    for name, size in vision_trainable_parameters.items()
+                    if name.startswith(("merger.", "deepstack_merger_list.")) and ".lora_B." in name
+                )
+                dense_N_flops += 6 * block_lora_N * tokens_sum
+                dense_N_flops += ((6 if block_backward else 4) * merger_lora_A_N + 6 * merger_lora_B_N) * merged_tokens
 
         # full attn layer & all_token fwd & bwd flops
         seqlen_square_sum = 0
         for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attention_factor = 12 if lora_config is None or vision_requires_grad else 4
-        attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
+        attention_layer_factor = 4 * depth + 8 * backward_block_count
+        attn_qkv_flops = attention_layer_factor * seqlen_square_sum * head_dim * num_heads
 
         vit_flops = dense_N_flops + attn_qkv_flops
 
@@ -837,8 +891,7 @@ class VeomniFlopsCounter:
         images_seqlens,
         config,
         lora_config=None,
-        vision_lora_enabled=None,
-        vision_requires_grad=None,
+        vision_trainable_parameters=None,
     ):
         """
         Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
@@ -872,69 +925,125 @@ class VeomniFlopsCounter:
         # Qwen 2.5 VL uses SiLU, thus 3.
         mlp_N = dim * mlp_hidden_dim * (2 if is_qwen2_vl else 3)
         attn_linear_N = dim * (4 * dim)  # qkv and output proj
-        patch_embed_and_merger_N = (out_hidden_size + (dim * (spatial_merge_size**2))) * (
-            dim * (spatial_merge_size**2)
-        )
-
-        # non-attn all_layer parm
-        dense_N = (mlp_N + attn_linear_N) * depth + patch_embed_and_merger_N
+        in_channels = getattr(config, "in_channels", getattr(config, "in_chans", 3))
+        patch_embed_N = dim * in_channels * config.temporal_patch_size * config.patch_size * config.patch_size
+        merger_N = (out_hidden_size + (dim * (spatial_merge_size**2))) * (dim * (spatial_merge_size**2))
+        block_N = mlp_N + attn_linear_N
 
         merger_hidden_size = dim * spatial_merge_size**2
-        vision_module_shapes = {
+        block_module_shapes = {
             "qkv": (dim, 3 * dim, depth),
             "proj": (dim, dim, depth),
-            "mlp.0": (merger_hidden_size, merger_hidden_size, 1),
-            "mlp.2": (merger_hidden_size, out_hidden_size, 1),
         }
         if is_qwen2_vl:
-            vision_module_shapes.update(
+            block_module_shapes.update(
                 {
                     "fc1": (dim, mlp_hidden_dim, depth),
                     "fc2": (mlp_hidden_dim, dim, depth),
                 }
             )
         else:
-            vision_module_shapes.update(
+            block_module_shapes.update(
                 {
                     "gate_proj": (dim, mlp_hidden_dim, depth),
                     "up_proj": (dim, mlp_hidden_dim, depth),
                     "down_proj": (mlp_hidden_dim, dim, depth),
                 }
             )
-        target_modules = lora_config.target_modules if lora_config is not None else ()
-        vision_has_lora = vision_lora_enabled is not False and any(
-            module in vision_module_shapes for module in target_modules or ()
-        )
-        if vision_requires_grad is None:
-            vision_requires_grad = vision_has_lora or (lora_config is not None and lora_config.bias == "all")
-        if lora_config is not None and not vision_requires_grad:
-            dense_N_flops = 2 * dense_N * tokens_sum
-        elif lora_config is not None and not vision_has_lora:
-            dense_N_flops = 4 * dense_N * tokens_sum
-        else:
-            dense_N_flops = self._compute_linear_flops(
-                dense_N,
-                tokens_sum,
-                lora_config=lora_config,
-                module_shapes=vision_module_shapes,
-                detached_without_targets=True,
+        merger_module_shapes = {
+            "mlp.0": (merger_hidden_size, merger_hidden_size, 1),
+            "mlp.2": (merger_hidden_size, out_hidden_size, 1),
+        }
+        trainable_names = tuple(vision_trainable_parameters or ())
+        if vision_trainable_parameters is None:
+            targets = tuple(lora_config.target_modules or ()) if lora_config is not None else ()
+            block_trainable = (
+                lora_config is None or lora_config.bias == "all" or any(t in block_module_shapes for t in targets)
             )
-        attention_factor = 12 if lora_config is None or vision_requires_grad else 4
-
+            patch_trainable = lora_config is None or (lora_config is not None and lora_config.bias == "all")
+            block_base_trainable = lora_config is None
+            merger_base_trainable = lora_config is None
+            backward_block_indexes = set(range(depth)) if block_trainable or patch_trainable else set()
+            base_trainable_block_count = depth if block_base_trainable else 0
+        else:
+            trainable_block_indexes = {
+                int(name.split(".", 2)[1])
+                for name in trainable_names
+                if name.startswith("blocks.") and name.split(".", 2)[1].isdigit()
+            }
+            block_trainable = bool(trainable_block_indexes)
+            patch_trainable = any(name.startswith("patch_embed.") for name in trainable_names)
+            merger_base_trainable = any(
+                name.startswith("merger.")
+                and name.endswith(".weight")
+                and ".lora_A." not in name
+                and ".lora_B." not in name
+                for name in trainable_names
+            )
+            base_trainable_block_indexes = {
+                int(name.split(".", 2)[1])
+                for name in trainable_names
+                if name.startswith("blocks.")
+                and name.split(".", 2)[1].isdigit()
+                and name.endswith(".weight")
+                and ".lora_A." not in name
+                and ".lora_B." not in name
+            }
+            earliest_trainable_block = 0 if patch_trainable else min(trainable_block_indexes, default=depth)
+            backward_block_indexes = set(range(earliest_trainable_block, depth))
+            base_trainable_block_count = len(base_trainable_block_indexes)
+        block_backward = patch_trainable or block_trainable
+        merged_tokens = tokens_sum / (spatial_merge_size**2)
+        patch_weight_trainable = vision_trainable_parameters is None and lora_config is None
+        if vision_trainable_parameters is not None:
+            patch_weight_trainable = "patch_embed.proj.weight" in vision_trainable_parameters
+        dense_N_flops = (4 if patch_weight_trainable else 2) * patch_embed_N * tokens_sum
+        dense_N_flops += (
+            (2 * depth + 2 * len(backward_block_indexes) + 2 * base_trainable_block_count) * block_N * tokens_sum
+        )
+        dense_N_flops += (2 + 2 * block_backward + 2 * merger_base_trainable) * merger_N * merged_tokens
+        if lora_config is not None:
+            if vision_trainable_parameters is None:
+                dense_N_flops += self._compute_linear_flops(
+                    0, tokens_sum, lora_config=lora_config, module_shapes=block_module_shapes
+                )
+                merger_lora_A_N, merger_lora_B_N = self._compute_lora_ab_sizes(lora_config, merger_module_shapes)
+                dense_N_flops += ((6 if block_backward else 4) * merger_lora_A_N + 6 * merger_lora_B_N) * merged_tokens
+            else:
+                block_lora_N = sum(
+                    size
+                    for name, size in vision_trainable_parameters.items()
+                    if name.startswith("blocks.") and (".lora_A." in name or ".lora_B." in name)
+                )
+                merger_lora_A_N = sum(
+                    size
+                    for name, size in vision_trainable_parameters.items()
+                    if name.startswith("merger.") and ".lora_A." in name
+                )
+                merger_lora_B_N = sum(
+                    size
+                    for name, size in vision_trainable_parameters.items()
+                    if name.startswith("merger.") and ".lora_B." in name
+                )
+                dense_N_flops += 6 * block_lora_N * tokens_sum
+                dense_N_flops += ((6 if block_backward else 4) * merger_lora_A_N + 6 * merger_lora_B_N) * merged_tokens
         # In Qwen2.5 VL, windowed attention is used in some layers.
-        full_attn_layer_num = config.depth if is_qwen2_vl else len(config.fullatt_block_indexes)
+        full_attn_indexes = set(range(depth)) if is_qwen2_vl else set(config.fullatt_block_indexes) & set(range(depth))
+        full_attn_layer_num = len(full_attn_indexes)
         window_attn_layer_num = config.depth - full_attn_layer_num
 
         # full attn layer & all_token fwd & bwd flops
         seqlen_square_sum = 0
         for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
+        full_attn_factor = 4 * full_attn_layer_num + 8 * len(full_attn_indexes & backward_block_indexes)
+        attn_qkv_flops = full_attn_factor * seqlen_square_sum * head_dim * num_heads
 
         # If window attention is used, add the window attention flops
         if window_attn_layer_num > 0:
-            window_attn_compute_flops = attention_factor * tokens_sum * (config.window_size**2) * head_dim * num_heads
-            attn_qkv_flops += window_attn_compute_flops * window_attn_layer_num
+            window_attn_indexes = set(range(depth)) - full_attn_indexes
+            window_attn_factor = 4 * window_attn_layer_num + 8 * len(window_attn_indexes & backward_block_indexes)
+            attn_qkv_flops += window_attn_factor * tokens_sum * (config.window_size**2) * head_dim * num_heads
 
         vit_flops = dense_N_flops + attn_qkv_flops
 
@@ -1274,8 +1383,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 getattr(self.config, "vision_config", None),
                 lora_config=lora_config,
-                vision_lora_enabled=kargs.get("vision_lora_enabled"),
-                vision_requires_grad=kargs.get("vision_requires_grad"),
+                vision_trainable_parameters=kargs.get("vision_trainable_parameters"),
             )
         else:
             vit_flops = 0
@@ -1291,8 +1399,7 @@ class VeomniFlopsCounter:
         delta_time,
         lora_config: VeOmniLoraConfig | None = None,
         images_seqlens=None,
-        vision_lora_enabled: bool | None = None,
-        vision_requires_grad: bool | None = None,
+        vision_trainable_parameters: dict[str, int] | None = None,
     ):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
@@ -1302,17 +1409,17 @@ class VeomniFlopsCounter:
             delta_time (float): The time taken to process the batch, in seconds.
             lora_config (VeOmniLoraConfig, optional): Effective LoRA configuration for supported
                 Qwen models. FLOPs estimation reads only ``r``, ``target_modules``,
-                ``target_parameters``, and ``moe_mode``. Other fields and their arithmetic effects
-                are intentionally ignored. A vision tower without a matching target is counted as
-                frozen, forward-only work. Unsupported LoRA configurations emit a warning and
-                return zero achieved FLOPs instead of interrupting training.
+                ``target_parameters``, ``bias``, and ``moe_mode``. Runtime vision parameter
+                state additionally accounts for exclusions and rank overrides after adapter
+                injection. A vision tower without a matching target is counted as frozen,
+                forward-only work. Unsupported LoRA configurations emit a warning and return
+                zero achieved FLOPs instead of interrupting training.
             images_seqlens (List[int], optional): Vision-token sequence lengths for multimodal
                 models.
-            vision_lora_enabled (bool, optional): Whether the trainer permits matched vision
-                adapters to train. ``False`` forces forward-only ViT accounting even when
-                ``target_modules`` contains vision layer names.
-            vision_requires_grad (bool, optional): Whether any vision parameter is trainable.
-                This keeps bias-only vision training from being counted as forward-only work.
+            vision_trainable_parameters (dict[str, int], optional): Actual trainable vision
+                parameters after LoRA injection and freezing, mapped from visual-tower-relative
+                names to parameter sizes. This lets the counter distinguish backbone, patch
+                embedding, and merger backward work and honor exclusions/rank overrides.
 
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
@@ -1333,10 +1440,8 @@ class VeomniFlopsCounter:
             kwargs["lora_config"] = lora_config
         if images_seqlens is not None:
             kwargs["images_seqlens"] = images_seqlens
-        if vision_lora_enabled is not None:
-            kwargs["vision_lora_enabled"] = vision_lora_enabled
-        if vision_requires_grad is not None:
-            kwargs["vision_requires_grad"] = vision_requires_grad
+        if vision_trainable_parameters is not None:
+            kwargs["vision_trainable_parameters"] = vision_trainable_parameters
 
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)
