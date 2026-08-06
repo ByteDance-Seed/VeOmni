@@ -58,6 +58,7 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
         delta_time=0.5,
         global_step=1,
         lora_config=lora_config,
+        freeze_vit=True,
     )
 
     assert calls == [
@@ -67,6 +68,7 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
             {
                 "images_seqlens": [16],
                 "lora_config": lora_config,
+                "freeze_vit": True,
             },
         )
     ]
@@ -75,7 +77,7 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
     meter.supports_lora_flops = False
     meter.batch_seqlens = [7]
     with patch("veomni.utils.helper.logger.warning_rank0") as warning:
-        metrics = meter.step(delta_time=0.25, global_step=2, lora_config=lora_config)
+        metrics = meter.step(delta_time=0.25, global_step=2, lora_config=lora_config, freeze_vit=True)
 
         meter.batch_seqlens = [8]
         meter.step(delta_time=0.25, global_step=3, lora_config=lora_config)

@@ -391,6 +391,14 @@ class TestAllQwenLoraFlops:
             rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_config=make_config(8, modules), **kwargs)
 
             assert 0 < rank4 < rank8 < full_flops, config.model_type
+            if kwargs:
+                text_only, _ = counter.estimate_flops([12, 5], 1.0)
+                frozen_fft, _ = counter.estimate_flops([12, 5], 1.0, freeze_vit=True, **kwargs)
+                frozen_lora, _ = counter.estimate_flops(
+                    [12, 5], 1.0, lora_config=make_config(4, modules), freeze_vit=True, **kwargs
+                )
+                assert frozen_fft - text_only == pytest.approx((full_flops - text_only) / 3), config.model_type
+                assert frozen_lora == rank4, config.model_type
 
     def test_routed_moe_lora_modes_and_topk(self, qwen3_5_moe_counter):
         config = qwen3_5_moe_counter.config

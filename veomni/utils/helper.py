@@ -251,6 +251,7 @@ class EnvironMeter:
         delta_time: float,
         global_step: int,
         lora_config: Optional["VeOmniLoraConfig"] = None,
+        freeze_vit: Optional[bool] = None,
     ) -> Dict[str, Any]:
         flops_kwargs = {}
         if self.images_seqlens:
@@ -265,6 +266,8 @@ class EnvironMeter:
                     "VeOmniLoraConfig. Returning zero FLOPs so training can continue."
                 )
                 self._warned_unsupported_lora_flops = True
+        if freeze_vit is not None and self.supports_lora_flops:
+            flops_kwargs["freeze_vit"] = freeze_vit
         flops_achieved, flops_promised = self.estimate_flops(
             self.batch_seqlens,
             delta_time,

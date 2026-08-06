@@ -180,6 +180,9 @@ collected from the current batch and follows this logic:
 The estimator intentionally uses the framework's existing 2x/4x/6x approximation rather
 than reconstructing the exact autograd graph: 2x is forward-only, 4x includes activation
 gradients through frozen weights, and 6x includes trainable-weight or adapter work.
+During full fine-tuning, `freeze_vit: true` selects the forward-only 2x estimate for the
+entire vision tower. During LoRA training the flag is ignored and adapter targets determine
+the estimate. This intentionally treats Omni's trainable merger as part of the frozen tower.
 
 The native LoRA implementation currently adapts two kinds of weights:
 

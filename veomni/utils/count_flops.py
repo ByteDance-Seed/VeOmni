@@ -664,6 +664,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
+                freeze_vit=kargs.get("freeze_vit", False),
             )
         else:
             vit_flops = 0
@@ -695,6 +696,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
+                freeze_vit=kargs.get("freeze_vit", False),
             )
         else:
             vit_flops = 0
@@ -725,6 +727,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 self.config.vision_config,
                 lora_config=lora_config,
+                freeze_vit=kargs.get("freeze_vit", False),
             )
         else:
             vit_flops = 0
@@ -738,6 +741,7 @@ class VeomniFlopsCounter:
         images_seqlens,
         config,
         lora_config=None,
+        freeze_vit=False,
     ):
         """
         Estimate the FLOPs of the Qwen3-family vision encoder.
@@ -788,7 +792,7 @@ class VeomniFlopsCounter:
         vision_requires_grad = vision_has_lora or (lora_config is not None and lora_config.bias == "all")
 
         if lora_config is None:
-            dense_N_flops = 6 * dense_N * tokens_sum
+            dense_N_flops = (2 if freeze_vit else 6) * dense_N * tokens_sum
         elif not vision_requires_grad:
             dense_N_flops = 2 * dense_N * tokens_sum
         elif not vision_has_lora:
@@ -814,7 +818,10 @@ class VeomniFlopsCounter:
         seqlen_square_sum = 0
         for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attention_factor = 12 if lora_config is None or vision_requires_grad else 4
+        if lora_config is None:
+            attention_factor = 4 if freeze_vit else 12
+        else:
+            attention_factor = 12 if vision_requires_grad else 4
         attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
 
         vit_flops = dense_N_flops + attn_qkv_flops
@@ -826,6 +833,7 @@ class VeomniFlopsCounter:
         images_seqlens,
         config,
         lora_config=None,
+        freeze_vit=False,
     ):
         """
         Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
@@ -891,7 +899,9 @@ class VeomniFlopsCounter:
         target_modules = lora_config.target_modules if lora_config is not None else ()
         vision_has_lora = any(module in vision_module_shapes for module in target_modules or ())
         vision_requires_grad = vision_has_lora or (lora_config is not None and lora_config.bias == "all")
-        if lora_config is not None and not vision_requires_grad:
+        if lora_config is None and freeze_vit:
+            dense_N_flops = 2 * dense_N * tokens_sum
+        elif lora_config is not None and not vision_requires_grad:
             dense_N_flops = 2 * dense_N * tokens_sum
         elif lora_config is not None and not vision_has_lora:
             dense_N_flops = 4 * dense_N * tokens_sum
@@ -903,7 +913,10 @@ class VeomniFlopsCounter:
                 module_shapes=vision_module_shapes,
                 detached_without_targets=True,
             )
-        attention_factor = 12 if lora_config is None or vision_requires_grad else 4
+        if lora_config is None:
+            attention_factor = 4 if freeze_vit else 12
+        else:
+            attention_factor = 12 if vision_requires_grad else 4
 
         # In Qwen2.5 VL, windowed attention is used in some layers.
         full_attn_layer_num = config.depth if is_qwen2_vl else len(config.fullatt_block_indexes)
@@ -1258,6 +1271,7 @@ class VeomniFlopsCounter:
                 images_seqlens,
                 getattr(self.config, "vision_config", None),
                 lora_config=lora_config,
+                freeze_vit=kargs.get("freeze_vit", False),
             )
         else:
             vit_flops = 0
@@ -1273,6 +1287,7 @@ class VeomniFlopsCounter:
         delta_time,
         lora_config: VeOmniLoraConfig | None = None,
         images_seqlens=None,
+        freeze_vit: bool | None = None,
     ):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
@@ -1288,6 +1303,8 @@ class VeomniFlopsCounter:
                 configurations emit a warning and return zero FLOPs instead of interrupting training.
             images_seqlens (List[int], optional): Vision-token sequence lengths for multimodal
                 models.
+            freeze_vit (bool, optional): Whether the vision tower is frozen during full
+                fine-tuning. Ignored when ``lora_config`` is provided.
 
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
@@ -1308,6 +1325,8 @@ class VeomniFlopsCounter:
             kwargs["lora_config"] = lora_config
         if images_seqlens is not None:
             kwargs["images_seqlens"] = images_seqlens
+        if freeze_vit is not None:
+            kwargs["freeze_vit"] = freeze_vit
 
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)
