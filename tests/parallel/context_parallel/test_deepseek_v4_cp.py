@@ -624,27 +624,43 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     return config, _make_forward(layer, rotary), hidden, position_ids, full_mask
 
 
-def test_deepseek_v4_indexer_cp_rejects_a_narrow_shard():
-    """The indexer's halo comes from one neighbour, so a sub-rate shard cannot work.
+# The three modules that compress windows, and the role each names in its
+# refusal. The role is asserted as well as the shared message because a CSA
+# compressor whose own guard regressed would still reach its indexer's, and
+# "some guard fired" is not what these cases are for.
+_WINDOW_COMPRESSORS = {
+    "hca": ("DeepseekV4HCACompressor", "DeepSeek V4 HCA compressor"),
+    "csa": ("DeepseekV4CSACompressor", "DeepSeek V4 CSA compressor"),
+    "indexer": ("DeepseekV4Indexer", "DeepSeek V4 Lightning Indexer"),
+}
+
+
+@pytest.mark.parametrize("kind", list(_WINDOW_COMPRESSORS))
+def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
+    """A halo comes from one neighbour, so a sub-rate shard cannot work.
 
     Pinned with the unusable group, which proves the check runs *before* the halo
     exchange rather than merely somewhere in the forward. A rank that raised after
-    entering a collective would leave its peers stuck in it.
+    entering a collective would leave its peers stuck in it -- and since ``rate``
+    and the shard width are the same on every rank, either all of them raise here
+    or none does, which is the property that keeps this a clean error instead of
+    a ten-minute watchdog timeout.
     """
     from transformers import AutoConfig
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
+    class_name, role = _WINDOW_COMPRESSORS[kind]
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
-    indexer = dsv4.DeepseekV4Indexer(config)
-    local_len = indexer.compress_rate - 1
+    module = getattr(dsv4, class_name)(config)
+    local_len = module.compress_rate - 1
     hidden = torch.randn(1, local_len, config.hidden_size)
     q_residual = torch.randn(1, local_len, config.q_lora_rank)
     position_ids = torch.arange(local_len).view(1, -1)
     with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
-        with pytest.raises(ValueError, match="one compression window wide"):
-            indexer(hidden, q_residual, position_ids, None, 0)
+        with pytest.raises(ValueError, match=f"{role} needs shards at least one compression window wide"):
+            module(hidden, q_residual, position_ids, None, 0)
 
 
 @pytest.mark.parametrize("with_compressor", [False, True])

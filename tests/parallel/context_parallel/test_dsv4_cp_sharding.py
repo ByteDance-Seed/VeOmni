@@ -48,6 +48,19 @@ def test_owner_counts_handle_no_windows():
     assert counts.tolist() == [0, 0, 0, 0]
 
 
+# ``local_len <= 0`` is unreachable from production: every caller derives it from
+# a tensor's sequence dimension, and ``plan_compressor_shard`` refuses
+# ``rate > local_seq_len`` with ``rate >= 1`` before it reaches either function.
+# The guards are pinned rather than deleted because both functions are exported
+# from ``veomni.distributed.context_parallel`` and neither fails usefully without
+# them: this one raises ``ZeroDivisionError`` from inside ``torch.div``, and
+# ``local_window_range`` below does not fail at all.
+@pytest.mark.parametrize("local_len", [0, -4])
+def test_owner_counts_refuse_a_non_positive_local_length(local_len):
+    with pytest.raises(ValueError, match="local_len must be positive"):
+        window_owner_counts(WINDOW_STARTS, local_len, CP_SIZE)
+
+
 def test_local_ranges_tile_the_global_window_array():
     ranges = [local_window_range(WINDOW_STARTS, LOCAL_LEN, r) for r in range(CP_SIZE)]
     assert ranges == [(0, 4), (4, 8), (8, 12), (12, 15)]
@@ -64,6 +77,15 @@ def test_every_window_is_owned_by_the_rank_holding_its_first_token():
         owned = WINDOW_STARTS[begin:end]
         assert torch.all(owned >= rank * LOCAL_LEN)
         assert torch.all(owned < (rank + 1) * LOCAL_LEN)
+
+
+# The other half of the guard pair above. This one is the reason they are worth
+# keeping: without it a non-positive width answers ``(0, 0)``, an empty shard
+# that reads as a rank owning nothing rather than as an error.
+@pytest.mark.parametrize("local_len", [0, -4])
+def test_local_window_range_refuses_a_non_positive_local_length(local_len):
+    with pytest.raises(ValueError, match="local_len must be positive"):
+        local_window_range(WINDOW_STARTS, local_len, 0)
 
 
 def test_rebasing_maps_a_straddling_window_inside_the_haloed_shard():
