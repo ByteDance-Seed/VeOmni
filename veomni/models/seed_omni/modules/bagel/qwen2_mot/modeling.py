@@ -15,7 +15,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 if IS_NPU_AVAILABLE:
     import torch_npu
 from transformers import PreTrainedModel
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
+from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as TransformersQwen2MLP
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm as TransformersQwen2RMSNorm
 from transformers.utils import ModelOutput
 
@@ -27,6 +27,7 @@ from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
 
 
 veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 
 
 @contextmanager
@@ -236,6 +237,25 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         cos = cos * self.attention_scaling
         sin = sin * self.attention_scaling
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class Qwen2MLP(TransformersQwen2MLP):
+    """Qwen2 SwiGLU MLP using the configured VeOmni ops backend."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Empty modality branches retain zero-gradient FSDP anchors. Liger's
+        # Triton kernel cannot launch the resulting zero-row grid.
+        if x.numel() == 0:
+            return super().forward(x)
+
+        if veomni_swiglu_mlp.use_non_eager_impl:
+            if self.config.hidden_act not in {"silu", "swish"}:
+                raise NotImplementedError(
+                    f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}."
+                )
+            return veomni_swiglu_mlp(self, x)
+
+        return super().forward(x)
 
 
 class Qwen2RMSNorm(TransformersQwen2RMSNorm):
