@@ -83,7 +83,14 @@ def _make_forward(layer, rotary):
     return forward
 
 
-def _init_cp_attention(rank: int, world_size: int, init_file: str, seq_len: int, with_compressor: bool):
+def _init_cp_attention(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    seq_len: int,
+    with_compressor: bool,
+    layer_idx: int = 0,
+):
     """Enter the process group, build the shared layer, and return the fixture."""
     device_type = get_device_type()
     get_torch_device().set_device(rank)
@@ -103,9 +110,10 @@ def _init_cp_attention(rank: int, world_size: int, init_file: str, seq_len: int,
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
-    # Layer 0 is HCA on the toy config, which has no sliding-only layer type, so
-    # drop the compressor the way the Ulysses test does to reach pure sliding MQA.
-    layer = dsv4.DeepseekV4Attention(config, layer_idx=0).to(device=device_type, dtype=torch.float32)
+    # Layer 0 is HCA and layer 3 is CSA on the toy config, which has no
+    # sliding-only layer type, so drop the compressor the way the Ulysses test
+    # does to reach pure sliding MQA.
+    layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device_type, dtype=torch.float32)
     if not with_compressor:
         layer.compressor = None
     else:
@@ -124,11 +132,18 @@ def _init_cp_attention(rank: int, world_size: int, init_file: str, seq_len: int,
     return dsv4, layer, _make_forward(layer, rotary), full_hidden, full_position_ids, full_mask
 
 
-def _run_attention_cp(rank: int, world_size: int, init_file: str, seq_len: int, with_compressor: bool) -> None:
+def _run_attention_cp(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    seq_len: int,
+    with_compressor: bool,
+    layer_idx: int = 0,
+) -> None:
     from veomni.distributed.parallel_state import clear_parallel_state
 
     _, layer, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
-        rank, world_size, init_file, seq_len, with_compressor
+        rank, world_size, init_file, seq_len, with_compressor, layer_idx
     )
 
     # Baseline: whole sequence with the parallel state stubbed out. Re-initialising
@@ -217,11 +232,11 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
 class _FixedIndexer(torch.nn.Module):
     """A Lightning Indexer stand-in that always selects compressed slot 0.
 
-    The CSA compressor calls its indexer unconditionally, and the indexer's own
-    context-parallel path is a separate task, so under CP it would still
-    summarise this rank's shard and hand back shard-local slot ids. Holding the
-    selection fixed keeps the compressor's window compression the only thing
-    these tests can distinguish.
+    The CSA compressor calls its indexer unconditionally, and both summarise the
+    same windows, so a real one would let an indexer bug masquerade as a
+    compressor bug and vice versa. Holding the selection fixed keeps the
+    compressor's window compression the only thing these tests can distinguish;
+    the indexer has its own parity test below.
     """
 
     def __init__(self, index_topk: int):
@@ -371,6 +386,128 @@ def _run_compressor_cp(rank: int, world_size: int, init_file: str, kind: str, se
     dist.destroy_process_group()
 
 
+# Packed samples for the indexer, misaligned so that a window straddles a shard
+# boundary at both cp_size 2 and 4 (rate 4, ``seq_len`` 256):
+#
+#   * sample 1 starts at 0, so its window starts are multiples of the rate and
+#     never straddle a shard edge, which is a multiple of 64 either way;
+#   * sample 2 starts at 106, so its starts are 106 + 4k. The window at 126
+#     covers 126..129 and crosses the cp_size=2 edge at 128, and the window at
+#     190 covers 190..193 and crosses the cp_size=4 edge at 192.
+#
+# 63 windows in all, against ``index_topk`` 32, so the selection is a real
+# ranking rather than "every slot that is causally visible".
+_PACKED_INDEXER_SAMPLES = ((0, 106), (106, 256))
+
+
+def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) -> None:
+    """A CP shard's Lightning Indexer picks the same slots the full forward gives its rows.
+
+    The queries arrive already sharded, but the compressed keys the indexer scores
+    them against must stay *global*: a top-k value names a slot in the CSA
+    compressor's replicated compressed KV. So the indexer owns and all-gathers
+    windows exactly as its enclosing compressor does, and only the query axis is
+    local. The packed layout is what forces it to shard the compression metadata
+    it is handed, which is global.
+    """
+    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state
+
+    device_type = get_device_type()
+    get_torch_device().set_device(rank)
+    dist.init_process_group(
+        backend=get_dist_comm_backend(),
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+
+    init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
+    # The TileLang kernel is the production scorer and the only one with a query
+    # partitioning of its own; the eager scorer is covered by the CSA layer test.
+    dsv4.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    torch.manual_seed(0)
+    indexer = dsv4.DeepseekV4Indexer(config).to(device=device_type, dtype=torch.bfloat16)
+    _init_position_bias(indexer)
+    _broadcast_module(indexer)
+
+    hidden = torch.randn(1, seq_len, config.hidden_size, device=device_type, dtype=torch.bfloat16)
+    q_residual = torch.randn(1, seq_len, config.q_lora_rank, device=device_type, dtype=torch.bfloat16)
+    dist.broadcast(hidden, src=0)
+    dist.broadcast(q_residual, src=0)
+
+    # ``use_tilelang`` degrades to the eager scorer rather than failing when the
+    # canonical positions it checks do not line up, and the eager scorer reads the
+    # global ``position_ids`` and so stays right. Without this count, dropping the
+    # query offset entirely would take the kernel out of the comparison and the
+    # parity below would still hold, pinning nothing about the CP query rebasing.
+    kernel_runs = []
+    real_kernel = dsv4.v4_lighting_indexer
+
+    def _counting_kernel(*args, **kwargs):
+        kernel_runs.append(None)
+        return real_kernel(*args, **kwargs)
+
+    local_len = seq_len // world_size
+    begin = rank * local_len
+    compared = []
+    for sample_slices in (None, _PACKED_INDEXER_SAMPLES):
+        if sample_slices is None:
+            position_ids = torch.arange(seq_len, device=device_type).view(1, -1)
+            packed_kwargs = {}
+        else:
+            position_ids = torch.cat(
+                [torch.arange(end - start, device=device_type) for start, end in sample_slices]
+            ).view(1, -1)
+            packed_kwargs = {
+                "packed_sequence_slices": sample_slices,
+                # Global metadata alongside a local shard, which is exactly what
+                # the CSA compressor hands over: only the indexer knows it is
+                # looking at one shard, so only it can do the sharding.
+                "packed_compression_metadata": build_packed_compression_metadata(
+                    hidden, position_ids, sample_slices, (indexer.compress_rate,)
+                ),
+            }
+
+        kernel_runs.clear()
+        with patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counting_kernel):
+            no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
+            with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
+                baseline = indexer(hidden, q_residual, position_ids, None, 0, **packed_kwargs)
+
+            local = indexer(
+                hidden[:, begin : begin + local_len],
+                q_residual[:, begin : begin + local_len],
+                position_ids[:, begin : begin + local_len],
+                None,
+                0,
+                **packed_kwargs,
+            )
+        compared.append((local, baseline[:, begin : begin + local_len], len(kernel_runs)))
+
+    # Both layouts run their collectives before anything is asserted, so a
+    # mismatch fails on every rank at once instead of leaving the ranks that
+    # passed inside the next layout's halo exchange.
+    for local, expected, kernel_run_count in compared:
+        assert kernel_run_count == 2, (
+            f"expected the TileLang scorer on both the baseline and the shard, ran {kernel_run_count} time(s)"
+        )
+        # Sorted, because top-k order follows the scores while it is the
+        # selection that addresses the compressed KV. Exact, because these are
+        # integer slot ids and any tolerance would hide an off-by-one in the
+        # query offset.
+        torch.testing.assert_close(local.sort(dim=-1).values, expected.sort(dim=-1).values, rtol=0, atol=0)
+
+    clear_parallel_state()
+    dist.destroy_process_group()
+
+
 class _UnusableGroup:
     """A truthy stand-in for a CP process group that no collective can use.
 
@@ -423,18 +560,27 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     return config, _make_forward(layer, rotary), hidden, position_ids, full_mask
 
 
-def test_deepseek_v4_attention_cp_rejects_an_indexer_layer():
-    """A CSA layer's Lightning Indexer still scores against shard-local compressed rows.
+def test_deepseek_v4_indexer_cp_rejects_a_narrow_shard():
+    """The indexer's halo comes from one neighbour, so a sub-rate shard cannot work.
 
-    The compressor itself is context-parallel now; the indexer inside it is not,
-    and its selection would be silently wrong rather than mis-shaped.
+    Pinned with the unusable group, which proves the check runs *before* the halo
+    exchange rather than merely somewhere in the forward. A rank that raised after
+    entering a collective would leave its peers stuck in it.
     """
-    _, forward, hidden, position_ids, full_mask = _build_local_attention(
-        with_compressor=True, local_len=32, cp_size=2, layer_idx=3
-    )
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    torch.manual_seed(0)
+    indexer = dsv4.DeepseekV4Indexer(config)
+    local_len = indexer.compress_rate - 1
+    hidden = torch.randn(1, local_len, config.hidden_size)
+    q_residual = torch.randn(1, local_len, config.q_lora_rank)
+    position_ids = torch.arange(local_len).view(1, -1)
     with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=_cp_state()):
-        with pytest.raises(NotImplementedError, match="indexer"):
-            forward(hidden, position_ids, full_mask)
+        with pytest.raises(ValueError, match="one compression window wide"):
+            indexer(hidden, q_residual, position_ids, None, 0)
 
 
 @pytest.mark.parametrize("with_compressor", [False, True])
@@ -562,5 +708,44 @@ def test_deepseek_v4_compressor_cp_packed_straddling(kind):
             _run_compressor_cp,
             args=(4, init_file, kind, seq_len, sample_slices),
             nprocs=4,
+            join=True,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_deepseek_v4_indexer_cp(cp_size):
+    """A CP shard's indexer selection matches the full-query result, packed and unpacked."""
+    if torch.cuda.device_count() < cp_size:
+        pytest.skip(f"needs {cp_size} devices")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(_run_indexer_cp, args=(cp_size, init_file, 256), nprocs=cp_size, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_deepseek_v4_attention_cp_with_csa_compressor(cp_size):
+    """A whole CSA layer under CP -- compressor and Lightning Indexer -- matches the baseline.
+
+    This is what replaces the guard that used to refuse an indexer-bearing
+    compressor under CP. It is the only test that runs the two against each
+    other, which is where the shared assumption lives: the indexer's compressed
+    array must be the same length, and in the same order, as the compressor's, or
+    a top-k value names a different slot on each side.
+
+    Sequence length 128 with the toy CSA rate of 4 gives 32 compressed slots
+    against ``index_topk`` 32, so every causally visible slot is selected and the
+    block bias this produces does not depend on the top-k *order*. The ranking
+    itself is what ``test_deepseek_v4_indexer_cp`` covers.
+    """
+    if torch.cuda.device_count() < cp_size:
+        pytest.skip(f"needs {cp_size} devices")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(
+            _run_attention_cp,
+            args=(cp_size, init_file, 128, True, 3),
+            nprocs=cp_size,
             join=True,
         )

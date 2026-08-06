@@ -433,7 +433,7 @@
 
 
  class DeepseekV4Indexer(nn.Module):
-@@ -492,6 +715,12 @@
+@@ -492,6 +715,15 @@
          self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
          self.rotary_emb = DeepseekV4RotaryEmbedding(config)
 
@@ -442,11 +442,14 @@
 +    # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
 +    #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
 +    #    position layouts retain the upstream eager implementation.
++    # 2. Context parallelism: compress this shard's own windows and all-gather the
++    #    compressed rows, so the keys stay global while the queries stay local, and
++    #    drop the Ulysses query partitioning, which has nothing left to do.
 +    # ================================================================
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -499,25 +728,48 @@
+@@ -499,25 +731,124 @@
          position_ids: torch.Tensor,
          past_key_values: Cache | None,
          layer_idx: int,
@@ -461,8 +464,63 @@
          gate = self.gate_proj(hidden_states)
 
 -        if cache_layer is None:
-+        if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
++        # --- Patch.2 ---
++        # Under context parallelism the queries arrive already sharded, but a top-k
++        # value names a slot in the enclosing CSA compressor's compressed KV, which is
++        # replicated. So the compressed *keys* have to stay global, and the indexer
++        # runs the same own-your-windows-then-all-gather compression its compressor
++        # does -- it cannot reuse that result, because it summarises the same windows
++        # through its own projections at ``index_head_dim``. Only the query axis is
++        # local, and ``query_offset`` is what keeps a local query row addressing its
++        # absolute position.
++        parallel_state = get_parallel_state()
++        cp_enabled = parallel_state.cp_enabled and cache_layer is None
++        query_offset = 0
++        if cp_enabled:
++            cp_group = parallel_state.cp_group
++            cp_rank = parallel_state.cp_rank
++            local_seq_len = seq_len
++            rate = self.compress_rate
++            query_offset = cp_rank * local_seq_len
++            if rate > local_seq_len:
++                raise ValueError(
++                    "DeepSeek V4 context parallelism needs shards at least one compression window wide; "
++                    f"indexer compress rate {rate} exceeds this rank's {local_seq_len} tokens. An owned "
++                    "window reaches at most one rate past the shard, and that halo is taken from the "
++                    "single adjacent rank, so a narrower shard would have to reach across more than one."
++                )
++            window_starts = (
++                packed_compression_metadata[rate]["window_starts"]
++                if packed_compression_metadata is not None
++                else torch.arange(0, local_seq_len * parallel_state.cp_size - rate + 1, rate, device=kv.device)
++            )
++            window_begin, window_end = local_window_range(window_starts, local_seq_len, cp_rank)
++            cp_counts = window_owner_counts(window_starts, local_seq_len, parallel_state.cp_size)
++            # Every guard is above this line, so no rank enters a collective while its
++            # peers are still deciding whether to raise.
++            kv, gate = exchange_compressor_halos(kv, gate, rate, cp_group)
++
++        # The caller hands over the *global* packed metadata alongside a local shard,
++        # exactly as the attention forward hands it to the compressors: only the module
++        # holding the hidden states knows they are one shard, so only it can shard the
++        # metadata. Both the compression below and the per-query ranges further down
++        # read the sharded copy.
++        rate_metadata = None
++        if cache_layer is None and packed_compression_metadata is not None:
 +            rate_metadata = packed_compression_metadata[self.compress_rate]
++            if cp_enabled:
++                rate_metadata = shard_packed_compression_metadata(
++                    rate_metadata,
++                    window_begin=window_begin,
++                    window_end=window_end,
++                    local_seq_len=local_seq_len,
++                    cp_rank=cp_rank,
++                    halo=rate,
++                )
++        # --- Patch.2 ---
++
++        prior_kv = prior_gate = None
++        if rate_metadata is not None:
 +            compressed = compress_packed_windows(
 +                kv,
 +                gate,
@@ -479,6 +537,27 @@
 +            )
 +            chunk_kv = chunk_gate = None
 +            first_window_position = 0
++        elif cp_enabled:
++            # This rank's own windows, gathered out of the haloed buffer in window
++            # order so the reshape below sees exactly them. Mirrors the CSA
++            # compressor, which windows the same tokens at the model head dim.
++            local_starts = window_starts[window_begin:window_end]
++            window_indices = rebase_window_indices(
++                local_starts[:, None] + torch.arange(rate, device=kv.device), local_seq_len, cp_rank, rate
++            )
++            flat_indices = window_indices.reshape(-1)
++            chunk_kv, chunk_gate = kv[:, flat_indices], gate[:, flat_indices]
++            first_window_position = int(local_starts[0]) if local_starts.numel() > 0 else 0
++            if first_window_position >= rate:
++                # The window before the first owned one, read out of the left halo. It
++                # fills the very slots the decode path fills from the cache. Global
++                # window 0 has no predecessor, so rank 0 leaves that slot at zero-kv /
++                # -inf-gate and never reads the halo's zeros.
++                previous_indices = window_indices[0] - rate
++                prior_kv = kv[:, previous_indices, : self.head_dim]
++                prior_gate = gate[:, previous_indices, : self.head_dim] + self.position_bias[:, : self.head_dim].to(
++                    gate.dtype
++                )
 +        elif cache_layer is None:
              usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
              chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
@@ -486,8 +565,8 @@
              chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights("indexer", kv, gate)
 
 -        if chunk_kv.shape[1] > 0:
-+        if packed_compression_metadata is not None and cache_layer is None:
-+            pass
++        if chunk_kv is None:
++            pass  # The packed branch above already produced ``compressed``.
 +        elif chunk_kv.shape[1] > 0:
              n_windows = chunk_kv.shape[1] // self.compress_rate
              ratio = self.compress_rate
@@ -498,7 +577,37 @@
              new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
              new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
              new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
-@@ -549,31 +801,102 @@
+@@ -527,9 +858,9 @@
+                 new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, : self.head_dim]
+             if cache_layer is not None:
+                 prior_kv, prior_gate = cache_layer.update_overlap_state("indexer", chunk_kv, chunk_gate, self.head_dim)
+-                if prior_kv is not None:
+-                    new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+-                    new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
++            if prior_kv is not None:
++                new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
++                new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+
+             compressed = self.kv_norm(
+                 (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2)
+@@ -540,8 +871,14 @@
+             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
+             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+         else:
+-            compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+-
++            # Empty slices of *both* windows rather than ``new_zeros``, for the reason
++            # given in the compressors: a context-parallel rank can own no window at
++            # all, and a detached result would take it out of the backward of the halo
++            # all-gathers its peers still reach.
++            compressed = chunk_kv[:, :0, : self.head_dim] + chunk_gate[:, :0, : self.head_dim]
++
++        if cp_enabled:
++            compressed = all_gather_compressed_rows(compressed, cp_counts, cp_group)
+         compressed_kv = (
+             compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
+         )
+@@ -549,31 +886,115 @@
          cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
          q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
          q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
@@ -525,10 +634,12 @@
 +                "DeepSeek-V4 does not support "
 +                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
 +            )
-+        canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
-+        packed_ranges = None
-+        if packed_compression_metadata is not None and cache_layer is None:
-+            packed_ranges = packed_compressed_causal_ranges(packed_compression_metadata[self.compress_rate])
++        # A local query row ``i`` is global row ``query_offset + i``; off the context
++        # parallel path ``query_offset`` is zero and this is the arange it always was.
++        canonical_positions = (
++            (torch.arange(seq_len, device=position_ids.device) + query_offset).unsqueeze(0).expand_as(position_ids)
++        )
++        packed_ranges = None if rate_metadata is None else packed_compressed_causal_ranges(rate_metadata)
 +        use_tilelang = (
 +            indexer_implementation == "tilelang"
 +            and hidden_states.is_cuda
@@ -547,8 +658,19 @@
 +            query_weights = weights.transpose(0, 1).contiguous()
 +            query_range_starts = None if packed_ranges is None else packed_ranges[0]
 +            query_range_ends = None if packed_ranges is None else packed_ranges[1]
-+            parallel_state = get_parallel_state()
-+            if parallel_state.ulysses_enabled:
++            # Either sequence-parallel mode has to spell out each query's visible
++            # compressed interval, because the kernel's default derives it from the
++            # query's *row*, which is no longer its position.
++            if cp_enabled and query_range_starts is None:
++                query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
++                query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32) + query_offset
++                query_range_ends = (query_positions + 1) // self.compress_rate
++            # Ulysses partitions the full-sequence queries here and stitches the
++            # selection back together below; CP received them already partitioned and
++            # wants the result per shard, so both halves fall away together. One flag
++            # for both, so a slice can never happen without its matching all-gather.
++            ulysses_query_partition = parallel_state.ulysses_enabled and not cp_enabled
++            if ulysses_query_partition:
 +                if query_range_starts is None and query_range_ends is None:
 +                    query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
 +                    query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32)
@@ -576,7 +698,7 @@
 +                cu_seqlen_ks=query_range_starts,
 +                cu_seqlen_ke=query_range_ends,
 +            )
-+            if parallel_state.ulysses_enabled:
++            if ulysses_query_partition:
 +                top_k_indices = gather_outputs(
 +                    top_k_indices,
 +                    gather_dim=1,
@@ -618,7 +740,7 @@
 
 
  class DeepseekV4CSACompressor(nn.Module):
-@@ -617,13 +940,117 @@
+@@ -617,13 +1038,117 @@
          position_ids: torch.Tensor,
          past_key_values: Cache | None,
          layer_idx: int,
@@ -694,9 +816,9 @@
 +            if cp_enabled:
 +                compressed = all_gather_compressed_rows(compressed, cp_counts, cp_group)
 +            compressed_kv = compressed.unsqueeze(1)
-+            # The indexer keeps the global metadata: its own context-parallel path is
-+            # separate work, and the attention forward refuses a CSA layer under CP
-+            # until that lands.
++            # The indexer gets the global metadata next to a local shard on purpose: it
++            # summarises the same windows through its own projections, so it does its
++            # own sharding rather than reusing this one's.
 +            top_k_indices = self.indexer(
 +                hidden_states,
 +                q_residual,
@@ -738,7 +860,7 @@
              usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
              chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
          else:
-@@ -634,13 +1061,6 @@
+@@ -634,13 +1159,6 @@
              ratio = self.compress_rate
              chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
              chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
@@ -752,7 +874,7 @@
              new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
              new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
              new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
-@@ -652,12 +1072,9 @@
+@@ -652,12 +1170,9 @@
                  prior_kv, prior_gate = cache_layer.update_overlap_state(
                      "compressor", chunk_kv, chunk_gate, self.head_dim
                  )
@@ -768,7 +890,7 @@
              compressed = self.kv_norm(
                  (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2)
              )
-@@ -667,27 +1084,22 @@
+@@ -667,27 +1182,22 @@
              cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
              compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
          else:
@@ -808,7 +930,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -702,6 +1114,19 @@
+@@ -702,6 +1212,19 @@
      return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -828,7 +950,7 @@
  def eager_attention_forward(
      module: nn.Module,
      query: torch.Tensor,
-@@ -712,25 +1137,85 @@
+@@ -712,25 +1235,85 @@
      dropout: float | int = 0.0,
      **kwargs,
  ):
@@ -922,7 +1044,7 @@
 
 
  COMPRESSOR_CLASSES = {
-@@ -738,6 +1223,12 @@
+@@ -738,6 +1321,12 @@
      "compressed_sparse_attention": DeepseekV4CSACompressor,
      "heavily_compressed_attention": DeepseekV4HCACompressor,
  }
@@ -935,7 +1057,7 @@
 
 
  class DeepseekV4Attention(nn.Module):
-@@ -786,6 +1277,16 @@
+@@ -786,6 +1375,16 @@
              COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
          )
 
@@ -952,7 +1074,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -793,47 +1294,153 @@
+@@ -793,47 +1392,143 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -992,16 +1114,6 @@
 +        query_offset = 0
 +        kv_full_len = None
 +        if cp_enabled:
-+            if getattr(self.compressor, "indexer", None) is not None:
-+                # The compressors themselves shard their windows and all-gather the
-+                # compressed rows, but the Lightning Indexer inside a CSA compressor
-+                # still scores against shard-local rows and returns shard-local slot
-+                # ids. Every shape agrees, so its selection would be silently wrong
-+                # rather than an error.
-+                raise NotImplementedError(
-+                    "DeepSeek V4 context parallelism does not implement the compressed-attention "
-+                    f"indexer yet; layer {self.layer_idx} is {self.layer_type}"
-+                )
 +            if past_key_values is not None:
 +                raise NotImplementedError("DeepSeek V4 context parallelism does not support a KV cache")
 +            # Queries stay sharded with every head; KV is replicated so every sparse
@@ -1123,7 +1235,7 @@
          attn_output, attn_weights = attention_interface(
              self,
              q,
-@@ -843,22 +1450,28 @@
+@@ -843,22 +1538,28 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -1160,7 +1272,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -909,22 +1522,30 @@
+@@ -909,22 +1610,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -1202,7 +1314,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -933,11 +1554,14 @@
+@@ -933,11 +1642,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -1220,7 +1332,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -953,10 +1577,27 @@
+@@ -953,10 +1665,27 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1248,7 +1360,7 @@
 
 
  class DeepseekV4MLP(nn.Module):
-@@ -970,16 +1611,60 @@
+@@ -970,16 +1699,60 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -1316,7 +1428,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -990,30 +1675,63 @@
+@@ -990,30 +1763,63 @@
          self.limit = config.swiglu_limit
 
      def forward(
@@ -1393,7 +1505,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1027,14 +1745,26 @@
+@@ -1027,14 +1833,26 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
@@ -1423,7 +1535,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1057,10 +1787,14 @@
+@@ -1057,10 +1875,14 @@
          self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1440,7 +1552,7 @@
          scores = self.score_fn(logits)
          indices = self.tid2eid[input_ids.reshape(-1)].long()
          weights = scores.gather(1, indices)
-@@ -1088,6 +1822,12 @@
+@@ -1088,6 +1910,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1453,7 +1565,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1858,20 @@
+@@ -1118,22 +1946,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -1484,7 +1596,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1971,12 @@
+@@ -1233,6 +2059,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1497,7 +1609,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1996,16 @@
+@@ -1252,6 +2084,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1514,7 +1626,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +2021,94 @@
+@@ -1267,28 +2109,94 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1619,7 +1731,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +2212,12 @@
+@@ -1392,6 +2300,12 @@
      return overall_loss * num_experts
 
 
@@ -1632,7 +1744,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +2236,36 @@
+@@ -1410,49 +2324,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1702,7 +1814,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +2278,64 @@
+@@ -1465,26 +2366,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1781,7 +1893,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2343,17 @@
+@@ -1492,7 +2431,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

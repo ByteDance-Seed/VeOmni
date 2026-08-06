@@ -244,7 +244,9 @@ def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_fil
             sequence_slices = None
             packed_metadata = None
 
-        no_sp_state = SimpleNamespace(ulysses_enabled=False)
+        # The stub has to carry every parallel-state attribute the indexer reads,
+        # or the baseline raises instead of taking the single-rank path.
+        no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
             expected = indexer(
                 hidden_states,
