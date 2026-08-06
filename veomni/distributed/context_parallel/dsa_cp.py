@@ -41,14 +41,26 @@ def all_gather_compressed_rows(
     """Assemble per-rank compressed rows into global window order.
 
     ``counts`` comes from ``window_owner_counts`` and is identical on every rank,
-    so the shapes need no collective to agree on. Ranks own different numbers of
-    windows while ``_all_gather`` requires equal shapes, hence pad-to-max plus a
-    deterministic slice. Concatenating each rank's valid rows in rank order is
-    already global window order, because windows sort by start token and shards
-    sort by rank.
+    so the shapes need no collective to agree on.
+
+    Ranks own different numbers of windows. Padding every rank up to the maximum
+    and slicing the valid rows back out afterwards is a performance choice, not a
+    correctness one: ``_all_gather`` exchanges shapes first and allocates a tensor
+    per rank, so unequal shards would be gathered correctly too. What matched
+    shapes buy is the collective underneath — PyTorch's NCCL ``all_gather``
+    coalesces equally sized outputs into a single ``ncclAllGather``, and falls
+    back to one broadcast per rank when they differ, which is ``cp_size``
+    launches per compressor per layer.
+
+    Concatenating each rank's valid rows in rank order is already global window
+    order, because windows sort by start token and shards sort by rank.
     """
-    cp_size = counts.numel()
-    n_max = int(counts.max()) if cp_size > 0 else 0
+    # One device-to-host sync for every count at once. Reading ``counts.max()``
+    # and then ``counts[rank]`` inside the loop below drains the device queue
+    # ``cp_size + 1`` times per call, and there is one call per compressor and
+    # per indexer per layer.
+    per_rank = counts.tolist()
+    n_max = max(per_rank, default=0)
     if n_max == 0:
         return local_rows.new_zeros(local_rows.shape[0], 0, local_rows.shape[-1])
 
@@ -60,8 +72,8 @@ def all_gather_compressed_rows(
     gathered = gather_outputs(local_rows, gather_dim=1, group=group)
     keep = torch.cat(
         [
-            torch.arange(rank * n_max, rank * n_max + int(counts[rank]), device=gathered.device)
-            for rank in range(cp_size)
+            torch.arange(rank * n_max, rank * n_max + count, device=gathered.device)
+            for rank, count in enumerate(per_rank)
         ]
     )
     return gathered.index_select(1, keep)
