@@ -895,7 +895,12 @@ class VeomniFlopsCounter:
 
         # If window attention is used, add the window attention flops
         if window_attn_layer_num > 0:
-            window_attn_compute_flops = attention_factor * tokens_sum * (config.window_size**2) * head_dim * num_heads
+            # Qwen2.5-VL configures window_size in pixels. Mirror get_vision_window_index's
+            # conversion to the number of ViT tokens on each side of a window. This remains
+            # an upper bound for partially filled windows at image boundaries.
+            merger_window_size = config.window_size // spatial_merge_size // config.patch_size
+            window_token_size = merger_window_size * spatial_merge_size
+            window_attn_compute_flops = attention_factor * tokens_sum * (window_token_size**2) * head_dim * num_heads
             attn_qkv_flops += window_attn_compute_flops * window_attn_layer_num
 
         vit_flops = dense_N_flops + attn_qkv_flops
