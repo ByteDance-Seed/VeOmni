@@ -1316,11 +1316,35 @@ def test_deepseek_v4_attention_cp_unpacked_misaligned():
 
     ``seq_len`` 68 gives ``L=17``. The compressor is dropped because the toy HCA
     rate of 32 is wider than that shard, which its own guard refuses; what is
-    left is the sliding window, which at 32 reaches two shards back.
+    left is the sliding window, which at 32 reaches two shards back. The shard
+    that is narrower than the sliding window is the point of this one;
+    ``test_deepseek_v4_attention_cp_unpacked_misaligned_with_compressor`` is the
+    misaligned case that runs a compressor.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
         mp.spawn(_run_attention_cp, args=(4, init_file, 68, False), nprocs=4, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+def test_deepseek_v4_attention_cp_unpacked_misaligned_with_compressor():
+    """A misaligned shard that is still wide enough to compress.
+
+    ``seq_len`` 160 gives ``L=40``, which is not a multiple of the toy HCA rate
+    of 32 but is wider than it, so the narrow-shard guard admits it and the
+    compressor runs. Window starts are [0, 32, 64, 96, 128] and the owners are
+    [0, 0, 1, 2, 3], so the ranks own unequal numbers of them and the window at
+    32 covers 32..63, crossing the rank 0/1 edge at 40 -- unpacked straddling,
+    which an aligned length cannot produce because there every window sits
+    inside one shard.
+
+    Sequence length is the only free variable here: with four ranks, ``L`` must
+    exceed 32 to keep the compressor and must not be a multiple of 32 to be
+    misaligned, so 160 is the shortest sequence that satisfies both.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "init")
+        mp.spawn(_run_attention_cp, args=(4, init_file, 160, True), nprocs=4, join=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
