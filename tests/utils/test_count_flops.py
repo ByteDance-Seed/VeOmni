@@ -362,6 +362,32 @@ class TestQwen3Flops:
         assert flops == pytest.approx(expected_flops / 1e12, rel=1e-9)
 
 
+class TestQwen25VLFlops:
+    def test_window_size_is_converted_from_pixels_to_tokens(self):
+        config = _load_toy_config("tests/toy_config/qwen25vl_toy").vision_config
+        images_seqlens = [128]
+        counter = VeomniFlopsCounter(_load_toy_config("tests/toy_config/qwen25vl_toy"))
+
+        window_flops = counter._estimate_qwen_vit_flop(images_seqlens, config)
+
+        full_attention_config = deepcopy(config)
+        full_attention_config.fullatt_block_indexes = list(range(config.depth))
+        full_attention_flops = counter._estimate_qwen_vit_flop(images_seqlens, full_attention_config)
+
+        head_dim = config.hidden_size // config.num_heads
+        full_attention_layer_flops = 12 * sum(seqlen**2 for seqlen in images_seqlens) * head_dim * config.num_heads
+        merger_window_size = config.window_size // config.spatial_merge_size // config.patch_size
+        window_token_size = merger_window_size * config.spatial_merge_size
+        window_attention_layer_flops = 12 * sum(images_seqlens) * window_token_size**2 * head_dim * config.num_heads
+        window_layer_num = config.depth - len(config.fullatt_block_indexes)
+
+        assert window_token_size == 8
+        assert window_layer_num == 1
+        assert window_flops == full_attention_flops + window_layer_num * (
+            window_attention_layer_flops - full_attention_layer_flops
+        )
+
+
 class TestAllQwenLoraFlops:
     pytestmark = pytest.mark.usefixtures("mock_device_flops")
 
