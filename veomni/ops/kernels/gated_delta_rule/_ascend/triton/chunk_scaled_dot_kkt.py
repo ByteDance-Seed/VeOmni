@@ -84,7 +84,9 @@ def chunk_scaled_dot_kkt_fwd_kernel(
                 col_indices = tl.arange(0, BT)[None, :]
                 tril_mask = (row_indices > col_indices).to(tl.float32)
                 tril_mask = tril_mask * T_mask[:, None]
-                masked_dot = dot_product * tril_mask
+                # Padded dot lanes can be NaN on Ascend, and multiplying
+                # those lanes by a zero mask does not clear NaN.
+                masked_dot = tl.where(tril_mask != 0.0, dot_product, 0.0)
                 b_A += masked_dot
 
             if USE_G:
