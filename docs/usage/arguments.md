@@ -234,7 +234,9 @@ NPU validation runs at two times:
 | drop_last | `bool` | `True` | Whether to drop the last incomplete batch. |
 | pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
 | worker_num_threads | `Optional[int]` | `None` | Number of PyTorch threads used by each DataLoader worker. |
-| use_background_prefetcher | `bool` | `False` | Enable background prefetching around the DataLoader. |
+| infinity | `bool` | `False` | Restart an exhausted worker-side dynamic-batching iteration. Mutually exclusive with `infinity_padding`. |
+| infinity_padding | `bool` | `False` | Emit zero-loss padding batches after worker-side dynamic batching is exhausted. Mutually exclusive with `infinity`. |
+| use_background_prefetcher | `bool` | `False` | Enable background prefetching around the DataLoader. Incompatible with worker-side dynamic batching. |
 
 ### TrainingArguments
 

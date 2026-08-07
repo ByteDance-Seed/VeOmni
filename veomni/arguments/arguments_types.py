@@ -1331,6 +1331,25 @@ class DataloaderConfig:
         default=None,
         metadata={"help": "Per-worker torch thread count for dataloader subprocesses."},
     )
+    infinity: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "For worker-side dynamic batching, restart the underlying DataLoader iteration after exhaustion. "
+                "This option is used only when train.dyn_bsz=True and train.dyn_bsz_runtime='worker'."
+            )
+        },
+    )
+    infinity_padding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "For worker-side dynamic batching, have DistributedDataloader combine all workers' remaining "
+                "micro batches, then keep padding exhausted ranks for subsequent steps. Mutually exclusive with "
+                "infinity."
+            )
+        },
+    )
     prefetch_factor: int = field(
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},
@@ -1345,8 +1364,14 @@ class DataloaderConfig:
     )
     use_background_prefetcher: bool = field(
         default=False,
-        metadata={"help": "Whether to use BackgroundPrefetcher for dataloader."},
+        metadata={
+            "help": "Whether to use BackgroundPrefetcher for dataloader. Incompatible with worker-side dynamic batching."
+        },
     )
+
+    def __post_init__(self) -> None:
+        if self.infinity and self.infinity_padding:
+            raise ValueError("infinity and infinity_padding are mutually exclusive.")
 
 
 @dataclass
@@ -1446,6 +1471,19 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
+        dataloader = self.data.dataloader
+        worker_dynamic_batching = self.train.dyn_bsz and self.train.dyn_bsz_runtime == "worker"
+        if worker_dynamic_batching and dataloader.use_background_prefetcher:
+            raise ValueError(
+                "Worker-side dynamic batching and data.dataloader.use_background_prefetcher are mutually exclusive."
+            )
+
+        if (dataloader.infinity or dataloader.infinity_padding) and not worker_dynamic_batching:
+            logger.warning_rank0(
+                "data.dataloader.infinity and data.dataloader.infinity_padding are only used when "
+                "train.dyn_bsz=True and train.dyn_bsz_runtime='worker'; ignoring them."
+            )
+
         if self.train.pad_to_length:
             if not self.train.dyn_bsz:
                 logger.warning_rank0(

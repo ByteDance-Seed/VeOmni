@@ -190,6 +190,8 @@ class VeOmniIter:
     def stop(self, timeout: float = 5.0):
         if self.use_background_prefetcher and hasattr(self.iterator, "stop"):
             self.iterator.stop(timeout=timeout)
+        elif hasattr(self.dataloader, "_shutdown_workers"):
+            self.dataloader._shutdown_workers()
 
     def state_dict(self):
         if self.use_background_prefetcher and hasattr(self.iterator, "state_dict"):
@@ -658,9 +660,21 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_train_begin(self.state)
 
+    def _stop_data_iterator(self) -> None:
+        dataloader_args = self.args.data.dataloader
+        data_iterator = getattr(self, "data_iterator", None)
+        train_dataloader = getattr(self, "train_dataloader", None)
+        infinity_enabled = bool(
+            getattr(train_dataloader, "_infinity", False) or getattr(train_dataloader, "_infinity_padding", False)
+        )
+        should_stop = dataloader_args.use_background_prefetcher or infinity_enabled
+        if should_stop and data_iterator is not None and hasattr(data_iterator, "stop"):
+            data_iterator.stop()
+
     def on_train_end(self):
         for callback in self._callbacks:
             callback.on_train_end(self.state)
+        self._stop_data_iterator()
 
     def on_epoch_begin(self):
         for callback in self._callbacks:
@@ -707,7 +721,10 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            outputs.loss,
+            self.micro_batch_token_len,
+            self.micro_batches_token_len,
+            padding_flag=micro_batch.get("padding_flag", False),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
@@ -844,6 +861,12 @@ class BaseTrainer(Stateful, ABC):
         dist.destroy_process_group()
         clear_parallel_state()
 
+    def _create_data_iterator(self) -> VeOmniIter:
+        return VeOmniIter(
+            self.train_dataloader,
+            use_background_prefetcher=self.args.data.dataloader.use_background_prefetcher,
+        )
+
     def train(self):
         args: VeOmniArguments = self.args
         self.on_train_begin()
@@ -863,9 +886,7 @@ class BaseTrainer(Stateful, ABC):
             self.on_epoch_begin()
 
             # Create a batch generator
-            self.data_iterator = VeOmniIter(
-                self.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
-            )
+            self.data_iterator = self._create_data_iterator()
 
             for _ in range(self.start_step, args.train_steps):
                 try:
@@ -880,13 +901,7 @@ class BaseTrainer(Stateful, ABC):
 
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
-            if args.data.dataloader.use_background_prefetcher:
-                self.data_iterator.stop()
-
         self.on_train_end()
-
-        if "data_iterator" in locals() and args.data.dataloader.use_background_prefetcher:
-            self.data_iterator.stop()
 
         synchronize()
 
