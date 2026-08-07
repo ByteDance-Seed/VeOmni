@@ -109,7 +109,7 @@ def _validate_magi_cutlass_inputs(
     value: torch.Tensor,
     softcap: float,
     build_flags: dict[str, object],
-) -> None:
+) -> int:
     """Reject inputs excluded from the installed SM90 CUTLASS matrix."""
     if query.dtype == torch.float16:
         if build_flags.get("FLASHATTENTION_DISABLE_FP16", False):
@@ -131,13 +131,16 @@ def _validate_magi_cutlass_inputs(
     compiled_head_dims = [
         dim for dim in (64, 96, 128, 192, 256) if not build_flags.get(f"FLASHATTENTION_DISABLE_HDIM{dim}", False)
     ]
-    if not any(head_dim <= compiled_dim for compiled_dim in compiled_head_dims):
+    compiled_head_dim = next((dim for dim in compiled_head_dims if head_dim <= dim), None)
+    if compiled_head_dim is None:
         raise ValueError(
             f"The installed MagiAttention SM90 CUTLASS backend does not include a kernel for head_dim={head_dim}."
         )
 
     if softcap != 0.0 and build_flags.get("FLASHATTENTION_DISABLE_SOFTCAP", False):
         raise ValueError("The installed MagiAttention SM90 CUTLASS backend does not include softcap kernels.")
+
+    return compiled_head_dim
 
 
 def _install_magi_tile_size_compatibility() -> None:
@@ -191,16 +194,18 @@ def _get_or_prepare_fa4_attn_arg(
     q_ranges: torch.Tensor,
     k_ranges: torch.Tensor,
     attn_type_map: torch.Tensor | None,
+    metadata_head_dim: int | None = None,
 ) -> object:
     """Reuse prepared FA4 mask metadata across layers with matching inputs."""
     global _fa4_cache_entry
 
-    cache_key = _make_fa4_cache_key(query, key, q_ranges, k_ranges, attn_type_map)
+    metadata_head_dim = query.shape[-1] if metadata_head_dim is None else metadata_head_dim
+    cache_key = _make_fa4_cache_key(query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim)
     with _FA4_CACHE_LOCK:
         if cache_key is not None and _fa4_cache_entry is not None and _fa4_cache_entry.key == cache_key:
             return _fa4_cache_entry.attn_arg
 
-        attn_arg = _prepare_fa4_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
+        attn_arg = _prepare_fa4_attn_arg(query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim)
         _fa4_cache_entry = (
             _FA4CacheEntry(
                 key=cache_key,
@@ -219,8 +224,10 @@ def _prepare_fa4_attn_arg(
     q_ranges: torch.Tensor,
     k_ranges: torch.Tensor,
     attn_type_map: torch.Tensor | None,
+    metadata_head_dim: int | None = None,
 ) -> object:
     """Build upstream FA4 metadata once for a new mask and attention shape."""
+    metadata_head_dim = query.shape[-1] if metadata_head_dim is None else metadata_head_dim
     device_context = torch.cuda.device(query.device) if query.device.type == "cuda" else nullcontext()
     with device_context:
         from magi_attention.common.ranges import AttnRanges
@@ -237,7 +244,7 @@ def _prepare_fa4_attn_arg(
             attn_type_map=attn_type_map_list,
             seqlen_q=query.shape[0],
             seqlen_k=key.shape[0],
-            headdim=query.shape[-1],
+            headdim=metadata_head_dim,
         )
 
 
@@ -247,6 +254,7 @@ def _make_fa4_cache_key(
     q_ranges: torch.Tensor,
     k_ranges: torch.Tensor,
     attn_type_map: torch.Tensor | None,
+    metadata_head_dim: int,
 ) -> tuple[object, ...] | None:
     """Identify unchanged FA4 metadata inputs without reading tensor values."""
     tensor_keys: list[tuple[int, int] | None] = []
@@ -267,6 +275,7 @@ def _make_fa4_cache_key(
         query.dtype,
         tuple(query.shape),
         tuple(key.shape),
+        metadata_head_dim,
         *tensor_keys,
     )
 
@@ -343,10 +352,14 @@ def _default_magi_attention_forward(
 ):
     """Run the architecture-specific FA4 backend with prepared mask metadata."""
     kernel_mode, build_flags = _prepare_default_magi_kernel(query.device)
+    metadata_head_dim = None
     if kernel_mode == _MAGI_KERNEL_CUTLASS:
         if build_flags is None:
             raise RuntimeError("MagiAttention's SM90 CUTLASS backend did not provide build configuration.")
-        _validate_magi_cutlass_inputs(query, value, softcap, build_flags)
+        compiled_head_dim = _validate_magi_cutlass_inputs(query, value, softcap, build_flags)
+        # CUTLASS arbitrary-mask tiles follow the compiled bucket rather than
+        # the smaller runtime head dimension served by that bucket.
+        metadata_head_dim = compiled_head_dim
 
     device_context = torch.cuda.device(query.device) if query.device.type == "cuda" else nullcontext()
     with device_context:
@@ -358,7 +371,14 @@ def _default_magi_attention_forward(
                 "Install VeOmni with the `gpu` extra."
             ) from error
 
-    attn_arg = _get_or_prepare_fa4_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
+    attn_arg = _get_or_prepare_fa4_attn_arg(
+        query,
+        key,
+        q_ranges,
+        k_ranges,
+        attn_type_map,
+        metadata_head_dim,
+    )
     output, lse = _MagiFA4Function.apply(
         query,
         key,

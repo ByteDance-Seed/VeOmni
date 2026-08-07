@@ -196,8 +196,8 @@ def test_default_magi_backend_lazily_calls_package_fa4_backend(monkeypatch):
     captured = {}
     fa4_attn_arg = object()
 
-    def fake_get_attn_arg(query, key, q_ranges, k_ranges, attn_type_map):
-        captured["metadata_inputs"] = (query, key, q_ranges, k_ranges, attn_type_map)
+    def fake_get_attn_arg(query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim=None):
+        captured["metadata_inputs"] = (query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim)
         return fa4_attn_arg
 
     def fake_apply(*args):
@@ -246,6 +246,7 @@ def test_default_magi_backend_lazily_calls_package_fa4_backend(monkeypatch):
     assert captured["metadata_inputs"][2] is ranges
     assert captured["metadata_inputs"][3] is ranges
     assert captured["metadata_inputs"][4] is None
+    assert captured["metadata_inputs"][5] is None
     assert captured["apply_args"][0] is query
     assert captured["apply_args"][1] is key
     assert captured["apply_args"][2] is value
@@ -575,7 +576,7 @@ def test_magi_sm90_accepts_bf16_inputs_in_compiled_head_dim_bucket(monkeypatch):
     assert build_flags is not None
     query = torch.empty(1, 1, 64, dtype=torch.bfloat16)
 
-    magi_fa4_backend._validate_magi_cutlass_inputs(query, query, 0.0, build_flags)
+    assert magi_fa4_backend._validate_magi_cutlass_inputs(query, query, 0.0, build_flags) == 128
 
 
 @pytest.mark.parametrize(
