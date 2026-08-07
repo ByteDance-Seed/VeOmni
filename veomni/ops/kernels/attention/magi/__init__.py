@@ -19,8 +19,8 @@ from typing import Callable, Optional
 import torch
 
 from .....distributed.parallel_state import get_parallel_state
+from .....utils.device import IS_CUDA_AVAILABLE, get_device_type
 from ..ulysses import prepare_ulysses_qkv, restore_ulysses_output
-from ._fa4 import _default_magi_attention_forward
 from .mask import (
     MagiAttentionMask,
     _require_all,
@@ -29,7 +29,49 @@ from .mask import (
 )
 
 
-# Module-level patch slot for the default FA4 backend.
+def _resolve_default_magi_backend(device: torch.device) -> Callable:
+    """Resolve the platform backend while keeping device-specific code isolated."""
+    active_device_type = get_device_type()
+    if device.type != active_device_type:
+        raise RuntimeError(
+            f"VeOmni `magi_attention` received tensors on {device.type}, "
+            f"but the active device type is {active_device_type}."
+        )
+
+    if IS_CUDA_AVAILABLE:
+        from ._fa4_cuda import _fa4_cuda_attention_forward
+
+        return _fa4_cuda_attention_forward
+
+    raise RuntimeError(f"VeOmni `magi_attention` does not yet provide a {active_device_type.upper()} backend.")
+
+
+def _default_magi_attention_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_ranges: torch.Tensor,
+    k_ranges: torch.Tensor,
+    attn_type_map: torch.Tensor | None,
+    *,
+    softmax_scale: float | None,
+    softcap: float,
+):
+    """Dispatch MagiAttention to the backend for the active device platform."""
+    attention_forward = _resolve_default_magi_backend(query.device)
+    return attention_forward(
+        query,
+        key,
+        value,
+        q_ranges,
+        k_ranges,
+        attn_type_map,
+        softmax_scale=softmax_scale,
+        softcap=softcap,
+    )
+
+
+# Module-level patch slot for the default platform backend.
 _magi_attention_forward: Callable = _default_magi_attention_forward
 
 

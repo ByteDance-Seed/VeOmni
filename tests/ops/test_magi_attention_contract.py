@@ -34,7 +34,7 @@ from veomni.ops import build_ALL_OPS
 from veomni.ops.kernels import attention as veomni_attention
 from veomni.ops.kernels.attention import flex as flex_backend
 from veomni.ops.kernels.attention import magi as magi_backend
-from veomni.ops.kernels.attention.magi import _fa4 as magi_fa4_backend
+from veomni.ops.kernels.attention.magi import _fa4_cuda as magi_fa4_backend
 from veomni.ops.kernels.attention.magi import mask as magi_mask_backend
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
@@ -143,6 +143,40 @@ def _set_fake_cuda_runtime(
     monkeypatch.setitem(sys.modules, "cuda.bindings", bindings_package)
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     return set_calls
+
+
+def test_default_magi_backend_resolves_cuda_platform(monkeypatch):
+    cuda_device_type = magi_fa4_backend._CUDA_DEVICE_TYPE
+    monkeypatch.setattr(magi_backend, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(magi_backend, "get_device_type", lambda: cuda_device_type)
+
+    assert magi_backend._resolve_default_magi_backend(torch.device(cuda_device_type)) is (
+        magi_fa4_backend._fa4_cuda_attention_forward
+    )
+
+
+@pytest.mark.parametrize(
+    ("device", "active_device_type", "expected_message"),
+    [
+        (
+            torch.device("cpu"),
+            magi_fa4_backend._CUDA_DEVICE_TYPE,
+            f"received tensors on cpu.*active device type is {magi_fa4_backend._CUDA_DEVICE_TYPE}",
+        ),
+        (torch.device("cpu"), "cpu", "does not yet provide a CPU backend"),
+    ],
+)
+def test_default_magi_backend_rejects_unsupported_platform(
+    monkeypatch,
+    device,
+    active_device_type,
+    expected_message,
+):
+    monkeypatch.setattr(magi_backend, "IS_CUDA_AVAILABLE", active_device_type == "cuda")
+    monkeypatch.setattr(magi_backend, "get_device_type", lambda: active_device_type)
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        magi_backend._resolve_default_magi_backend(device)
 
 
 @pytest.mark.parametrize("attn_implementation", ["magi_attention", "veomni_magi_attention_with_sp"])
@@ -269,7 +303,7 @@ def test_default_magi_backend_lazily_calls_package_fa4_backend(monkeypatch):
     value = torch.randn(8, 2, 16)
     ranges = torch.tensor([[0, 8]], dtype=torch.int32)
 
-    result = magi_fa4_backend._default_magi_attention_forward(
+    result = magi_fa4_backend._fa4_cuda_attention_forward(
         query,
         key,
         value,
@@ -329,7 +363,7 @@ def test_default_magi_backend_cold_import_uses_query_device(monkeypatch):
     query = SimpleNamespace(device=torch.device("cuda:1"))
     ranges = torch.tensor([[0, 8]], dtype=torch.int32)
 
-    output, meta = magi_fa4_backend._default_magi_attention_forward(
+    output, meta = magi_fa4_backend._fa4_cuda_attention_forward(
         query,
         object(),
         object(),

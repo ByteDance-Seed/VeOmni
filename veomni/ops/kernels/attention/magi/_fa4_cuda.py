@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FA4 preparation, autograd, and architecture-specific backend dispatch."""
+"""CUDA FA4 preparation, autograd, and SM-specific backend dispatch."""
 
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -28,6 +28,7 @@ _MAGI_KERNEL_UNSUPPORTED = "unsupported"
 _MAGI_KERNEL_CUTLASS = "cutlass"
 _MAGI_KERNEL_CUTE_JIT = "cute_jit"
 _MAGI_CUTLASS_STACK_SIZE = 8192
+_CUDA_DEVICE_TYPE = "cuda"
 
 
 @dataclass(frozen=True)
@@ -42,8 +43,8 @@ _fa4_cache_entry: _FA4CacheEntry | None = None
 
 
 def _get_magi_kernel_mode(device: torch.device) -> str:
-    """Resolve the FA4 implementation selected for the query device."""
-    if device.type != "cuda":
+    """Resolve the CUDA FA4 implementation selected for the query device."""
+    if device.type != _CUDA_DEVICE_TYPE:
         return _MAGI_KERNEL_UNSUPPORTED
 
     compute_capability = get_gpu_compute_capability(device)
@@ -56,10 +57,10 @@ def _get_magi_kernel_mode(device: torch.device) -> str:
 
 @cache
 def _prepare_default_magi_kernel(device: torch.device) -> tuple[str, dict[str, object] | None]:
-    """Prepare the hardware-specific FA4 implementation once per device."""
+    """Prepare the SM-specific CUDA FA4 implementation once per device."""
     kernel_mode = _get_magi_kernel_mode(device)
     if kernel_mode == _MAGI_KERNEL_UNSUPPORTED:
-        compute_capability = get_gpu_compute_capability(device) if device.type == "cuda" else 0
+        compute_capability = get_gpu_compute_capability(device) if device.type == _CUDA_DEVICE_TYPE else 0
         hardware = f"SM{compute_capability}" if compute_capability else device.type
         raise RuntimeError(
             f"VeOmni `magi_attention` does not support {hardware}; "
@@ -228,7 +229,7 @@ def _prepare_fa4_attn_arg(
 ) -> object:
     """Build upstream FA4 metadata once for a new mask and attention shape."""
     metadata_head_dim = query.shape[-1] if metadata_head_dim is None else metadata_head_dim
-    device_context = torch.cuda.device(query.device) if query.device.type == "cuda" else nullcontext()
+    device_context = torch.cuda.device(query.device) if query.device.type == _CUDA_DEVICE_TYPE else nullcontext()
     with device_context:
         from magi_attention.common.ranges import AttnRanges
         from magi_attention.meta.collection.calc_meta import FA4AttnArg
@@ -297,7 +298,7 @@ class _MagiFA4Function(torch.autograd.Function):
         attn_arg: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         softmax_scale = query.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
-        device_context = torch.cuda.device(query.device) if query.device.type == "cuda" else nullcontext()
+        device_context = torch.cuda.device(query.device) if query.device.type == _CUDA_DEVICE_TYPE else nullcontext()
         with device_context:
             from magi_attention.functional.fa4 import fa4_fwd
 
@@ -319,7 +320,7 @@ class _MagiFA4Function(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, *args: object) -> tuple[torch.Tensor | None, ...]:
         query, key, value, output, lse, _, _, _ = ctx.saved_tensors
-        device_context = torch.cuda.device(query.device) if query.device.type == "cuda" else nullcontext()
+        device_context = torch.cuda.device(query.device) if query.device.type == _CUDA_DEVICE_TYPE else nullcontext()
         with device_context:
             from magi_attention.functional.fa4 import fa4_bwd
 
@@ -339,7 +340,7 @@ class _MagiFA4Function(torch.autograd.Function):
         return grad_query, grad_key, grad_value, None, None, None, None, None, None
 
 
-def _default_magi_attention_forward(
+def _fa4_cuda_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -350,7 +351,7 @@ def _default_magi_attention_forward(
     softmax_scale: float | None,
     softcap: float,
 ):
-    """Run the architecture-specific FA4 backend with prepared mask metadata."""
+    """Run the SM-specific CUDA FA4 backend with prepared mask metadata."""
     kernel_mode, build_flags = _prepare_default_magi_kernel(query.device)
     metadata_head_dim = None
     if kernel_mode == _MAGI_KERNEL_CUTLASS:
@@ -361,7 +362,7 @@ def _default_magi_attention_forward(
         # the smaller runtime head dimension served by that bucket.
         metadata_head_dim = compiled_head_dim
 
-    device_context = torch.cuda.device(query.device) if query.device.type == "cuda" else nullcontext()
+    device_context = torch.cuda.device(query.device) if query.device.type == _CUDA_DEVICE_TYPE else nullcontext()
     with device_context:
         try:
             from magi_attention.api import AttnForwardMeta

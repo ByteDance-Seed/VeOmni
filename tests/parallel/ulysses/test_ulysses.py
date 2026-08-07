@@ -31,7 +31,7 @@ from veomni.models.transformers.masking_utils import create_causal_mask
 from veomni.ops.kernels.attention import flash as flash_backend
 from veomni.ops.kernels.attention import flex as flex_backend
 from veomni.ops.kernels.attention import magi as magi_backend
-from veomni.ops.kernels.attention.magi import _fa4 as magi_fa4_backend
+from veomni.ops.kernels.attention.magi import _fa4_cuda as magi_fa4_backend
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
