@@ -33,6 +33,7 @@ from transformers import (
     JanusVisionConfig,
     JanusVQVAEConfig,
     LlamaConfig,
+    PreTrainedTokenizerFast,
 )
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 from transformers.models.janus.processing_janus import JanusProcessor
@@ -288,6 +289,17 @@ def convert_model(
     # Download or locate model files
     input_path = ensure_model_downloaded(repo_id=repo_id, revision=revision, local_dir=local_dir)
 
+    # Load the raw state dict up front so we can detect whether the source
+    # checkpoint ships a genuinely separate ``language_model.lm_head.weight``
+    # (DeepSeek's Janus-1.3B does, with a norm ~70x smaller than
+    # ``embed_tokens.weight``). ``LlamaConfig`` defaults ``tie_word_embeddings``
+    # to ``True``, and the raw checkpoint's ``config.json`` doesn't set the
+    # field either — so without this check, ``model.tie_weights()`` below
+    # would silently discard the real lm_head and alias it to ``embed_tokens``,
+    # corrupting every logit computed at inference time.
+    raw_state_dict = load_model_state_dict(input_path)
+    text_tie_word_embeddings = not any(k.endswith("lm_head.weight") for k in raw_state_dict)
+
     # Load configuration files
     required_files = ["config.json", "preprocessor_config.json", "special_tokens_map.json", "tokenizer_config.json"]
 
@@ -316,8 +328,21 @@ def convert_model(
     }
 
     if os.path.exists(tokenizer_json_path) and not text_model_id:
-        tokenizer = AutoTokenizer.from_pretrained(
-            input_path,  # This will load tokenizer.json directly
+        # DeepSeek's Janus-1.3B ships a real byte-level BPE ``tokenizer.json``
+        # (``decoder``/``pre_tokenizer`` both ``ByteLevel``) but mislabels
+        # ``tokenizer_config.json["tokenizer_class"] == "LlamaTokenizer"``.
+        # ``AutoTokenizer.from_pretrained`` honors that class hint and rebuilds
+        # a generic SentencePiece/``Metaspace`` pipeline around the vocab —
+        # silently discarding the real ``ByteLevel`` decoder, so every decoded
+        # string loses its BPE space markers (e.g. ``"TheĠimage"`` instead of
+        # ``"The image"``). Load the fast tokenizer directly from
+        # ``tokenizer.json`` instead, bypassing the ``tokenizer_class`` dispatch.
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=tokenizer_json_path,
+            bos_token=special_tokens_map["bos_token"],
+            eos_token=special_tokens_map["eos_token"],
+            pad_token=special_tokens_map["pad_token"],
+            additional_special_tokens=special_tokens_map.get("additional_special_tokens", []),
             model_max_length=tokenizer_config["model_max_length"],
             extra_special_tokens=special_image_tokens,
         )
@@ -384,6 +409,7 @@ def convert_model(
             "pad_token_id": tokenizer.pad_token_id,
             "bos_token_id": tokenizer.bos_token_id,
             "eos_token_id": tokenizer.eos_token_id,
+            "tie_word_embeddings": text_tie_word_embeddings,
         }
     )
 
@@ -417,6 +443,11 @@ def convert_model(
         vq_config=vq_config,
         image_token_id=tokenizer.vocab.get("<image_placeholder>"),
     )
+    # ``JanusForConditionalGeneration.tie_weights()`` checks the *top-level*
+    # ``config.tie_word_embeddings`` (defaults to ``True`` regardless of
+    # ``text_config.tie_word_embeddings``) — keep both in sync so an untied
+    # source checkpoint (e.g. Janus-1.3B) isn't silently re-tied below.
+    config.tie_word_embeddings = text_tie_word_embeddings
 
     # Save the config
     if output_dir:
@@ -437,16 +468,19 @@ def convert_model(
         model.generation_config.generation_kwargs = {}
     model.generation_config.generation_kwargs["boi_token_id"] = tokenizer.vocab.get("<begin_of_image>")
 
-    # Load and convert state dict
-    print("Loading state dict...")
-    state_dict = load_model_state_dict(input_path)
-    state_dict = convert_state_dict_to_hf(state_dict)
+    # Convert the already-loaded raw state dict (see ``text_tie_word_embeddings``
+    # detection above — avoids loading the checkpoint from disk twice).
+    print("Converting state dict...")
+    state_dict = convert_state_dict_to_hf(raw_state_dict)
 
     # Load converted state dict
     print("Loading converted weights into model...")
     model.load_state_dict(state_dict, strict=True, assign=True)
 
-    # Tie weights before any device mapping
+    # Tie weights before any device mapping. With ``text_tie_word_embeddings``
+    # correctly reflecting whether the source checkpoint has a distinct
+    # ``lm_head.weight``, this is a no-op when untied (Janus-1.3B) and only
+    # actually ties when the source checkpoint has none (tied variants).
     print("Tying weights...")
     model.tie_weights()
 
@@ -458,7 +492,7 @@ def convert_model(
         print(f"Pushing model to hub at {output_hub_path}...")
         model.push_to_hub(output_hub_path)
 
-    del state_dict, model
+    del state_dict, raw_state_dict, model
     gc.collect()
 
     # Validate the saved model if saved locally

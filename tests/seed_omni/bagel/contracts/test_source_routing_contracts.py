@@ -7,7 +7,7 @@ import torch
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
-from veomni.models.seed_omni.modules.bagel.flow_connector.accelerated import SIGNAL_IMAGE_COMPLETE
+from veomni.models.seed_omni.modules.bagel.flow_connector.modeling import SIGNAL_IMAGE_COMPLETE
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,

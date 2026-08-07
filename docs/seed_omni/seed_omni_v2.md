@@ -41,33 +41,93 @@ flowchart LR
 
 ## 2. The four building blocks
 
-### 2.1 Module mixins (`modulemixin.py` + `modeling.py`)
+### 2.1 Native / accelerated split (`modeling.py` + `accelerated.py`)
 
-Every sub-model multi-inherits a family ``VeOmniMixin`` and a real HuggingFace /
-diffusers model.  Graph hooks are split across composable mixins in
-``modules/<family>/<sub>/modulemixin.py``; weights and core ``forward`` stay in
-``modeling.py``:
+Every sub-model is defined **twice**: a pure HuggingFace-native class in
+``modeling.py`` (weights, ``forward``, and the FSM ``generate()`` endpoint —
+loadable with plain ``from_pretrained`` / ``AutoModel``, no VeOmni import
+required) and a VeOmni-accelerated wrapper in ``accelerated.py`` that composes
+training-graph mixins around it. This mirrors HF's own split between a model's
+`forward` and its `GenerationMixin.generate`: ``modeling.py`` defines the model
+class's `forward`, plus an in-file `InferenceMixin` (the omni analog of
+`GenerationMixin`) that owns `generate()` and all FSM inference state:
 
 ```python
-# modulemixin.py
-class TrainingMixin(TrainingModuleMixin): ...
-class InferenceMixin(InferenceModuleMixin): ...
-class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin): ...
+# modeling.py — pure HF-native. InferenceMixin owns generate() + FSM state;
+# the model class owns weights + forward, and inherits both.
+class InferenceMixin:
+    """FSM generate() — analog of HF's GenerationMixin."""
 
-# modeling.py
-class JanusSiglip(VeOmniMixin, PreTrainedModel): ...
-class JanusLlama(VeOmniMixin, PreTrainedModel): ...
+    def reset_local_inference_state(self) -> None: ...
+    def reset_global_inference_state(self) -> None: ...
+
+    def generate(self, conversation_list=None, generation_kwargs=None, **kwargs):
+        ...  # one FSM inference step (sample / embed) — CFG cache, etc.
+
+class JanusLlama(InferenceMixin, OmniPreTrainedModel):
+    def forward(self, ...): ...
+
+# accelerated.py — VeOmni-only. Owns training-graph hooks; no InferenceMixin.
+class TrainingMixin(TrainingModuleMixin): ...
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin): ...
+class JanusLlamaAccelerated(VeOmniMixin, JanusLlama): ...
 ```
+
+Rule of thumb: **if a real HF user loading this checkpoint outside VeOmni
+would expect it to work (chat, `generate`, `AutoModel.from_pretrained`), it
+belongs in `modeling.py`.** Only things that are meaningless without the
+VeOmni graph runtime — FSDP dummy inputs, sequence-parallel slicing, the
+per-module metric meter, training pre/post hooks — belong in
+`accelerated.py`. Both classes are registered:
+``OMNI_MODEL_REGISTRY`` → the native class (`OmniModel.from_pretrained`, pure
+HF / eager inference); ``OMNI_ACCELERATED_MODEL_REGISTRY`` → the accelerated
+class (`ModuleRuntime`, training and distributed inference).
 
 Construction: cooperative ``__init__`` through the mixin chain → build
 submodules in ``modeling.py`` → ``self.post_init()`` for HF weight init.
-Core ``forward`` / ``encode`` / … stay in ``modeling.py``; graph hooks
-(``pre_forward``, ``generate``, …) stay in ``modulemixin.py``.
+Core ``forward`` / ``encode`` / … **and** ``generate`` / FSM inference state
+stay in ``modeling.py``; only training-graph hooks (``pre_forward`` /
+``post_forward`` / ``dummy_inputs`` / SP-awareness) stay in
+``accelerated.py``. If accelerated behavior genuinely differs from native
+inference (e.g. a module needs SP-aware dispatch during distributed
+inference), override the relevant method on the accelerated class — do not
+duplicate the whole method.
+
+#### `InferenceMixin` (`modeling.py`) — the `GenerationMixin` analog
+
+Each module's ``modeling.py`` defines its own ``InferenceMixin`` holding
+``generate()`` plus whatever FSM inference state / sampling helpers it needs
+(`reset_local_inference_state`, `reset_global_inference_state`, `finalize`,
+top-p / sampling utilities, …). The model class lists it **first**:
+``class JanusLlama(InferenceMixin, OmniPreTrainedModel)``. Order matters:
+``OmniPreTrainedModel`` ships dead-by-default `reset_local_inference_state` /
+`reset_global_inference_state` / `finalize` stubs (kept as a safety net for
+modules that don't need real inference state — e.g. the FSM runtime's
+unconditional `module.finalize(ctx=...)` call), and Python MRO resolves
+left-to-right, so listing `OmniPreTrainedModel` first would let those no-ops
+silently shadow the real implementations in `InferenceMixin`.
+
+`accelerated.py` needs **no `InferenceMixin`** of its own any more:
+`generate()` / `reset_*` / `finalize` reach the accelerated wrapper unshadowed
+through normal inheritance from the native class (`JanusLlamaAccelerated`
+inherits `JanusLlama`, which already has the real `InferenceMixin` ahead of
+`OmniPreTrainedModel` in its own MRO). Only add accelerated-only inference
+behavior by overriding the relevant method directly on the `Accelerated`
+class if it genuinely differs from native inference — do not reintroduce an
+empty `InferenceMixin` marker in `accelerated.py`.
+
+A few backbones (`qwen3/llm`, `qwen3_moe/llm`) share a family-wide
+`SimpleArGenerationMixin` (`modules/base/llm_packing.py`) instead of a
+per-module `InferenceMixin` — same MRO rule applies: it's listed before
+`OmniPreTrainedModel`.
 
 #### IDE type stubs (static analysis only)
 
-Hooks call modeling APIs via ``self.method(...)``, but the mixin class does not
-contain the implementation. Declare **only what that mixin’s hooks use**:
+`accelerated.py`'s ``TrainingMixin`` hooks call native modeling APIs via
+``self.method(...))``, but the mixin class does not contain the
+implementation (it lives on ``modeling.py``, mixed in only at
+``JanusLlamaAccelerated(VeOmniMixin, JanusLlama)``). Declare **only what that
+mixin's hooks use**:
 
 ```python
 class TrainingMixin(TrainingModuleMixin):
@@ -92,24 +152,35 @@ Rules:
 - Properties defined on ``VeOmniMixin`` in the same file use
   ``IDE stub — see :class:`VeOmniMixin` below (``config.field``).``
 - Do **not** copy modeling logic into the mixin.
+- `generate()` and its FSM helpers live entirely on the native class now —
+  `accelerated.py` needs no IDE stub for `generate` itself unless a training
+  hook calls a `generate`-only helper.
 
 See ``.agents/skills/seedomni-v2/references/modulemixin-ide-stubs.md`` and
-``modules/bagel/flow_connector/modulemixin.py`` for the full convention.
+``modules/bagel/flow_connector/accelerated.py`` for the full convention.
 
-The mixins expose **optional hooks** with safe defaults:
+`accelerated.py`'s mixins expose **optional training-graph hooks** with safe
+defaults; `generate` / FSM inference lives natively on `modeling.py` (see
+§2.1) and is not part of this hook table:
 
 | Hook | When | Purpose |
 |------|------|---------|
 | `forward(**kwargs)` | training | the node's main compute; may return one `_loss` |
 | `pre_forward(method, **kwargs)` | training | prep inputs (read from conversation list) |
 | `post_forward(method, **outputs)` | training | write results back onto conversation list |
-| `generate(...)` / `generate_step` | inference | one FSM step (sample / embed) |
-| `finalize(*, ctx)` | inference | flush buffered output if `max_new_tokens` hit |
 | `freeze_model()` | build | freeze a parameter subset |
 | `get_parallel_plan()` | build | per-module FSDP/SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders to keep FSDP aligned |
 | `metric_meter_set_seqlens(...)` / `metric_meter_add(...)` / `metric_meter_collect(...)` | training | **optional** per-module token + theoretical-FLOPs meter (`MetricMeterMixin`; tokens stashed in `pre_forward` before any SP slice, drained right after) |
+
+Native `modeling.py` hooks (used during inference, no VeOmni graph required):
+
+| Hook | When | Purpose |
+|------|------|---------|
+| `generate(conversation_list, generation_kwargs, **kwargs)` | inference | one FSM step (sample / embed); implemented per module |
+| `reset_local_inference_state()` / `reset_global_inference_state()` | inference | clear per-request / per-generation FSM state |
+| `finalize(*, ctx)` | inference | flush buffered output if `max_new_tokens` hit |
 
 #### Optional per-module metric meter (`mixins/metric_meter_mixin.py`, `MetricMeterMixin`)
 
@@ -400,23 +471,28 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
    to break the upstream HF checkpoint into one self-contained subfolder per
    module (`config.json` + `model.safetensors` + any processor/tokenizer JSON).
 
-2. **Write each module triplet** under
+2. **Write each module** under
    `veomni/models/seed_omni/modules/<family>/<sub>/`:
    - `configuration.py` — a `PretrainedConfig` with a unique `model_type`.
-   - `modulemixin.py` — `TrainingMixin` / `InferenceMixin` / `VeOmniMixin`
-     with graph hooks **and IDE type stubs** for modeling APIs used by those
-     hooks (see §2.1).
-   - `modeling.py` — `class X(VeOmniMixin, <HFBase>)` with `__init__`,
-     `forward`, and submodule layout.  Janus modules under
-     `modules/janus/*/` are the reference pattern.
+   - `modeling.py` — `class X(InferenceMixin, OmniPreTrainedModel)` — pure
+     HF-native: `__init__`, submodule layout, `forward` on `X`, and (if
+     inference-capable) an in-file `InferenceMixin` (§2.1) holding the FSM
+     `generate()` plus its state/helpers, listed **before**
+     `OmniPreTrainedModel` in `X`'s bases. This class must load and run under
+     plain `from_pretrained` with no VeOmni import.
+   - `accelerated.py` — `TrainingMixin` / `VeOmniMixin` (no `InferenceMixin` —
+     see §2.1) **and** IDE type stubs for native APIs those training hooks
+     call (see §2.1). `class XAccelerated(VeOmniMixin, X)`. Janus modules
+     under `modules/janus/*/` are the reference pattern.
    - `processing.py` (optional) — if the module consumes raw images / audio.
 
    Reuse cross-family helpers in `modules/base/` where possible.
 
 3. **Register** the classes in `modules/__init__.py`
-   (`OMNI_CONFIG_REGISTRY` / `OMNI_MODEL_REGISTRY` / `OMNI_PROCESSOR_REGISTRY`),
-   keyed by `model_type`. The trainer resolves a module by reading
-   `config.json` → `model_type` → registry.
+   (`OMNI_CONFIG_REGISTRY` / `OMNI_MODEL_REGISTRY` — native `modeling.py`
+   classes — / `OMNI_ACCELERATED_MODEL_REGISTRY` — `accelerated.py` classes —
+   / `OMNI_PROCESSOR_REGISTRY`), keyed by `model_type`. The trainer resolves a
+   module by reading `config.json` → `model_type` → registry.
 
 4. **Write the YAML** (`configs/seed_omni/<model>/`):
    - `base.yaml` — top-level launcher: `model.*` (incl. `modules` / `train_graph`
@@ -461,7 +537,8 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 |------|----------------|
 | `mixins/base_mixin.py` | shared assets, `_omni_hook_name` registry |
 | `mixins/training_module_mixin.py` | `pre_forward` / `post_forward` dispatch |
-| `mixins/inference_module_mixin.py` | `pre_generate` / `post_generate` dispatch |
+| `mixins/inference_module_mixin.py` | `pre_generate` / `post_generate` dispatch (opt-in; not used by the standard `InferenceMixin` pattern — see §2.1) |
+| `omni_pretrained_model.py` | `OmniPreTrainedModel` — base for every native `modeling.py` class; ships no-op `reset_local_inference_state` / `reset_global_inference_state` / `finalize` defaults, shadowed by each module's `InferenceMixin` (§2.1) |
 | `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
 | `utils/conversation.py` | `ConversationItem` + carrier helpers |
 | `utils/convert_registry.py` | HF → split-checkpoint conversion registry |
@@ -471,7 +548,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `configuration_omni.py` | `OmniConfig` — plain `PretrainedConfig`, checkpoint read/write only |
 | `omni_arguments/arguments_types.py` | launcher argument schema (`OmniArguments`) + parse/merge the launcher YAML into `OmniModelRuntimeArguments`; `.to_hf_config()` projects it onto `OmniConfig` |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
-| `modules/<family>/<sub>/` | per-module `configuration.py`, `modulemixin.py`, `modeling.py` [, `processing.py`] |
+| `modules/<family>/<sub>/` | per-module `configuration.py`, `modeling.py` (native, incl. `generate`), `accelerated.py` (training-graph hooks) [, `processing.py`] |
 | `veomni/trainer/omni/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
 | `veomni/trainer/omni/omni_inferencer.py` | request loop, `reset` + `finalize` |
 | `configs/seed_omni/<model>/` | `base.yaml` + `modules_train.yaml` + `graph_train.yaml` (+ `modules_infer.yaml` / `graph_infer_*.yaml`) |

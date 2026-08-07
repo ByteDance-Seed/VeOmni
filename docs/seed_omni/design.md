@@ -1,5 +1,16 @@
 # SeedOmni V2 架构设计
 
+> **2026-08 更新**：本文档是历史设计记录，其中 `module.py` / `ModuleMixin` / `modulemixin.py`
+> 的写法已重构为「`modeling.py`（HF-native，权重 + `forward`，外加模块自带的
+> `InferenceMixin`——类比 HF `GenerationMixin`，持有 `generate()` 及其 FSM 状态/采样
+> helper，`class X(InferenceMixin, OmniPreTrainedModel)`，`InferenceMixin` 必须排在
+> `OmniPreTrainedModel` 之前以免被其 no-op 默认实现遮蔽）+ `accelerated.py`（VeOmni
+> 训练图钩子，仅 `TrainingMixin` / `VeOmniMixin`，不再需要 `InferenceMixin`）」两层——
+> 见 [`seed_omni_v2.md` §2.1](seed_omni_v2.md) 获取当前权威说明；本文里凡提到
+> `modulemixin.py` 或 `XxxModuleMixin` 的地方，一律理解为 `accelerated.py` 里的
+> `VeOmniMixin`，且 `generate` 已经不在其列——它现在是 native `modeling.py` 里
+> `InferenceMixin` 的方法。以下正文保留原文，只作历史参考。
+
 > SeedOmni V2 (`veomni/models/seed_omni/`) 重写——把固定的 `Encoder → Foundation → Decoder` 三元结构换成**显式图声明**的模块化系统。`ModuleMixin` 是共享 mixin 基类；每个子模型再写 `XxxModuleMixin(ModuleMixin)`（`modulemixin.py`）并与 HuggingFace `PreTrainedModel` 多继承（`modeling.py`）。`training_graph` 是一条条 edge（`{from, to}`，端点为 `module[.method]`），node 由 endpoints 自动并出；同一 module 可挂多个 method。每个 node 必有出边——指向另一个 node 或保留关键字 `end`（虚拟终点），保证图无孤岛、无环。训练执行序由 topo sort 推导（可视化时画出 forward queue + `data` 伪节点）；推理由 FSM 驱动，每个 state 的 `body` 也是一条条内联 edge，可无限循环（text→image→text→image→...）。**数据完全 model-agnostic**：raw_batch 起点只有 `conversation_list`（list of dict，含 type / value / role / loss_mask），chat template / tokenize / image processor / boundary marker 注入全部由对应 module 在 forward 阶段自管——同一份数据可同时喂给任意 ug 模型；每个 module 的 `forward(**kwargs) -> Dict` 返回 dict 被框架写回共享 `raw_batch`（data 100% 走 raw_batch、module 之间不互相返回值）；collator helper / SP slice 由各 module 自己在 pre_forward 中按需调用（ViT 切 image batch、text encoder 切 sequence，各管各的）。loss 按 `_loss` 后缀隐式收集——每个 module 一次 forward 内部把所有 micro-batch 跑完，`post_forward` 自己做 token-level mean，OmniModel 顶层只把各 module 的标量 `_loss` 加起来。并行采用全局单一 `ParallelState`，OmniModel 顶层单次 `build_parallelize_model` 包装，`ParallelPlan` 由子模块递归聚合。生命周期上 weights 走 `build_foundation_model` + `build_parallelize_model`（多模块 path dict）、save 由各 module-trainer 的 `OmniModuleHfCallback` / `OmniModuleLoraCallback` 写到各 subfolder（config + 可选 processor/tokenizer 资产）。**配置拆分**：`base.yaml`（`model.model.model_path` + `model.model.model_config.modules` + `model.model.model_config.train_graph` + `model.accelerator` + `infer` 块）→ `OmniArguments.resolve_model()`（`omni_arguments/arguments_types.py`）合并 train/infer module 覆盖并解析相对 `model.model.model_path`，产出 runtime config（`OmniModelRuntimeArguments`）；`.to_hf_config()` 才投影成 HF `OmniConfig`。**FSM 转移**：只有 `module_signal` 与 `default` 两种 condition；text 侧由 `JanusTextEncoder` 通过 `module._tokenizer` 解析后发出 `start_image_gen` / `text_done` 等信号。**不保留 V1 兼容**。
 
 ## 总纲（不变量）
@@ -85,44 +96,117 @@ janus_llama       ──→            - {from: janus_llama,               to: j
 
 ## 核心抽象
 
-### 1. `ModuleMixin`：mixin 形式的钩子集
+### 1. Native / accelerated 两层：`modeling.py`（HF-native）+ `accelerated.py`（VeOmni 训练钩子）
 
-`ModuleMixin`（`module.py`）提供共享默认实现；每个子模型在 `modulemixin.py` 里写 `XxxModuleMixin(ModuleMixin)`，在 `modeling.py` 里写 `class Xxx(XxxModuleMixin, PreTrainedModel)`。核心 `forward` 留在 `modeling.py`；图钩子（`pre_forward` / `post_forward` / `generate` / `init_omni_state`）留在 `modulemixin.py`。
+> **2026-08 更新**：原先 `module.py` / `ModuleMixin` + `modulemixin.py` 的写法已重构为
+> native/accelerated 两层，见下。历史决策记录（"D2.x" 等）中提到 `modulemixin.py` 的地方
+> 保留不改，只反映当时的状态；本节描述**当前**的实现约定。
+
+每个子模型现在有**两个类**：`modeling.py` 里的纯 HuggingFace-native 类
+（权重 + `forward`；可以脱离 VeOmni 用普通 `from_pretrained` 加载运行）和
+`accelerated.py` 里的 VeOmni 训练包装类（组合训练图 mixin）。类比 HF 自身
+`forward` / `GenerationMixin.generate` 的分工：`modeling.py` 里除了模型类本身，
+还定义一个同文件的 `InferenceMixin`（omni 版 `GenerationMixin`），持有
+`generate()` 及其 FSM 状态 / 采样 helper：
+
+```python
+# modeling.py —— 纯 HF-native。InferenceMixin 持有 generate() + FSM 状态；
+# 模型类持有权重 + forward，同时继承二者。
+class InferenceMixin:
+    """FSM generate() —— 类比 HF 的 GenerationMixin。"""
+
+    def reset_local_inference_state(self) -> None: ...
+    def reset_global_inference_state(self) -> None: ...
+
+    def generate(self, conversation_list=None, generation_kwargs=None, **kwargs):
+        ...  # FSM 单步推理（CFG cache 等 Janus 特有状态也在这里）
+
+class JanusLlama(InferenceMixin, OmniPreTrainedModel):
+    def forward(self, ...): ...
+
+# accelerated.py —— 仅 VeOmni 训练图钩子，不再需要 InferenceMixin。
+class TrainingMixin(TrainingModuleMixin): ...
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin): ...
+class JanusLlamaAccelerated(VeOmniMixin, JanusLlama): ...
+```
+
+判断标准：**脱离 VeOmni、单纯拿这个 checkpoint 做 HF 推理（chat / `generate` /
+`AutoModel.from_pretrained`）时用户会期望能跑通的东西，都放 `modeling.py`**；
+只有离开 VeOmni 图 runtime 就没意义的东西（FSDP dummy 输入、SP slice、
+per-module 计量、训练 pre/post 钩子）才放 `accelerated.py`。两个类分别注册到
+`OMNI_MODEL_REGISTRY`（native，供 `OmniModel.from_pretrained` / eager 推理）和
+`OMNI_ACCELERATED_MODEL_REGISTRY`（accelerated，供 `ModuleRuntime` 训练 / 分布式推理）。
+
+**`InferenceMixin`（`modeling.py`）为什么要排在 `OmniPreTrainedModel` 之前**：
+`OmniPreTrainedModel` 自带 no-op 的 `reset_local_inference_state` /
+`reset_global_inference_state` / `finalize`（作为安全网，供不需要真实推理状态的
+模块兜底——例如 FSM runtime 会无条件调用 `module.finalize(ctx=...)`）。Python
+MRO 从左到右解析，所以模型类必须写成
+`class JanusLlama(InferenceMixin, OmniPreTrainedModel)`——若顺序反过来，
+`OmniPreTrainedModel` 的 no-op 会**先于** `InferenceMixin` 里真正的实现被解析到，
+静默 shadow 掉它们。`accelerated.py` 不再需要自己的 `InferenceMixin`：
+`JanusLlamaAccelerated` 继承 `JanusLlama`，`generate()` / `reset_*` / `finalize`
+通过对 native 类的常规继承、不经 shadow 直达 accelerated 包装类。只有当某个模块
+确实需要"纯 accelerated、没有 native 对应实现"的推理行为时，才直接在
+`Accelerated` 类上 override 对应方法——不要在 `accelerated.py` 里重新引入空的
+`InferenceMixin` 标记类。少数骨干（`qwen3/llm`、`qwen3_moe/llm`）复用跨家族的
+`SimpleArGenerationMixin`（`modules/base/llm_packing.py`）代替各自的
+`InferenceMixin`，同样的 MRO 规则——排在 `OmniPreTrainedModel` 之前。
 
 **初始化链**（不要在 mixin 里 override `post_init`）：
 
 ```python
-class JanusSiglip(JanusSiglipModuleMixin, PreTrainedModel):
+# modeling.py —— native 类的 __init__ 只知道 PreTrainedModel
+# （InferenceMixin 不定义 __init__，不影响这条链）。
+class JanusSiglip(InferenceMixin, OmniPreTrainedModel):
     def __init__(self, config):
-        super().__init__(config)      # → PreTrainedModel + init_omni_state()
+        super().__init__(config)      # → PreTrainedModel
         ... 构建子模块 ...
         self.post_init()              # HF 权重初始化 / tied keys / parallel plan
+
+# accelerated.py —— JanusSiglipAccelerated(VeOmniMixin, JanusSiglip) 时，
+# cooperative __init__ 先过 VeOmniMixin 的 mixin 链，再落到上面这个 __init__。
 ```
 
-**主要钩子**（除训练图节点外均可选）：
+**`accelerated.py` 训练图钩子**（除训练图节点外均可选；`generate` 类钩子已不在此列，见下）：
 
 | 钩子 | 用途 |
 |------|------|
-| `init_omni_state()` | 设置 `_conversation_carrier`、KV / VQ 缓冲区等运行时状态 |
 | `pre_forward(method, **kwargs)` | 从 `conversation_list` 抽输入；FSDP dummy；SP slice |
 | `forward(**kwargs)` | 训练计算；可返回标量 `_loss` |
 | `post_forward(method, **outputs)` | 写回 `conversation_list`；`loss` → `_loss` |
-| `generate` / `generate_step` | FSM 单步推理 |
 | `dummy_inputs` | 缺模态时的零张量（训练 FSDP 对齐） |
-| `reset_*_inference_state` / `finalize` | 推理生命周期 |
 | `get_parallel_plan` / `get_assets` | 并行与 checkpoint 资产 |
+
+**`modeling.py` native 推理钩子**（推理期专用，不依赖 VeOmni 图 runtime）：
+
+| 钩子 | 用途 |
+|------|------|
+| `generate(conversation_list, generation_kwargs, **kwargs)` | FSM 单步推理；每个模块各自实现 |
+| `reset_local_inference_state()` / `reset_global_inference_state()` | 清理单次请求 / 单次生成的 FSM 状态 |
+| `finalize(*, ctx)` | `max_new_tokens` 达到时 flush 缓冲输出 |
 
 模块**实际继承形态**：
 
 ```python
-class JanusLlama(JanusLlamaModuleMixin, PreTrainedModel):
+# modeling.py
+class InferenceMixin:
+    """generate() + FSM 状态；见本文件（下同）。"""
+
+class JanusLlama(InferenceMixin, OmniPreTrainedModel):
     """纯 backbone；wte/lm_head 在 janus_text_encoder。"""
 
-class JanusVqvae(JanusVqvaeModuleMixin, PreTrainedModel):
+class JanusVqvae(InferenceMixin, OmniPreTrainedModel):
     """VQ codec：encode / decode 两个 graph method；forward 在 modeling.py。"""
 
-class JanusTextEncoder(JanusTextEncoderModuleMixin, TextEncoder):
-    """继承 base TextEncoder；Janus chat template + FSM module_signal。"""
+class JanusTextEncoder(TextEncoder):
+    """继承 base TextEncoder（已含 InferenceMixin）；Janus chat template +
+    FSM module_signal + 覆写 generate()。"""
+
+# accelerated.py
+class JanusLlamaAccelerated(VeOmniMixin, JanusLlama): ...
+class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae): ...
+class JanusTextEncoderAccelerated(VeOmniMixin, JanusTextEncoder): ...
 ```
 
 - `model_type` 写在 `configuration.py`（HF `PretrainedConfig.model_type`），**不写在 YAML**——train YAML 的 `modules.*.model.model_path` 指向子目录，`read_model_type` 读 `config.json` 后在 `OMNI_MODEL_REGISTRY` 解析类。
@@ -1339,37 +1423,37 @@ veomni/models/seed_omni/                    # 整个目录完全重写，不保�
 ├── configuration_omni.py                   # OmniConfig：纯 HF PretrainedConfig（checkpoint 读写 + graph sidecar）
 ├── omni_arguments/arguments_types.py       # OmniArguments launcher schema + resolve_omni_model / build_omni_model_runtime：launcher YAML -> OmniModelRuntimeArguments；.to_hf_config() 投影成 HF OmniConfig
 ├── modeling_omni.py                        # OmniModel：DAG forward + FSM generate + parallel plan 聚合 + 多模块 build/load/save
-└── modules/                                # 每个子模块：configuration + modulemixin + modeling [+ processing]
+└── modules/                                # 每个子模块：configuration + modeling（native）+ accelerated（训练钩子）[+ processing]
     ├── base/                                # 跨 family 复用的轻量模块
     │   ├── text_encoder/
     │   │   ├── configuration.py
-    │   │   ├── modulemixin.py               # TextEncoderModuleMixin
-    │   │   └── modeling.py                  # TextEncoder(TextEncoderModuleMixin, PreTrainedModel)
+    │   │   ├── modeling.py                  # TextEncoder(InferenceMixin, OmniPreTrainedModel) —— InferenceMixin 含 generate()
+    │   │   └── accelerated.py               # TextEncoderAccelerated(VeOmniMixin, TextEncoder) —— 训练钩子
     │   └── mlp_adapter/                     # 计划中：1024→2048 等通用投影
     │       ├── configuration.py
     │       └── modeling.py
     ├── janus/                               # janus 全家桶
-    │   ├── llama/        {configuration, modulemixin, modeling}.py
-    │   ├── siglip/       {configuration, modulemixin, modeling, processing}.py
-    │   ├── vqvae/        {configuration, modulemixin, modeling, processing}.py
-    │   └── text_encoder/ {configuration, modulemixin, modeling, processing}.py
+    │   ├── llama/        {configuration, modeling, accelerated}.py
+    │   ├── siglip/       {configuration, modeling, accelerated, processing}.py
+    │   ├── vqvae/        {configuration, modeling, accelerated, processing}.py
+    │   └── text_encoder/ {configuration, modeling, accelerated, processing}.py
     ├── qwen_omni/                           # qwen-omni 全家桶（thinker + talker + ...）
     │   ├── thinker/
     │   │   ├── configuration.py
     │   │   └── modeling.py
     │   └── ...
     ├── qwen3/                                # qwen3-moe/text 全家桶
-    │   └── text_encoder/ {configuration, modulemixin, modeling, processing}.py
+    │   └── text_encoder/ {configuration, modeling, accelerated, processing}.py
     ├── qwen3vl/                              # qwen3-vl 全家桶
-    │   ├── text_encoder/ {configuration, modulemixin, modeling, processing}.py
-    │   └── vision/        {configuration, modulemixin, modeling, processing}.py
+    │   ├── text_encoder/ {configuration, modeling, accelerated, processing}.py
+    │   └── vision/        {configuration, modeling, accelerated, processing}.py
     ├── bagel/
     │   ├── llama/
     │   │   ├── configuration.py
     │   │   └── modeling.py
-    │   ├── siglip_navit/ {configuration, modulemixin, modeling, processing}.py
-    │   ├── vae/           {configuration, modulemixin, modeling, processing}.py
-    │   ├── text_encoder/  {configuration, modulemixin, modeling, processing}.py
+    │   ├── siglip_navit/ {configuration, modeling, accelerated, processing}.py
+    │   ├── vae/           {configuration, modeling, accelerated, processing}.py
+    │   ├── text_encoder/  {configuration, modeling, accelerated, processing}.py
     │   └── ...
     └── ...
 ```

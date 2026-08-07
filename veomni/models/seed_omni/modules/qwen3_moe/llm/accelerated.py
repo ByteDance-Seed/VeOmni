@@ -11,6 +11,25 @@ from typing import List
 
 from torch.distributed._tensor import Shard
 
+# Re-export the patched module's OpSlots into THIS module's namespace too.
+# ``build_foundation_model`` (the distributed/FSDP path — ``ModuleRuntime.
+# _build_module_model``) resolves the model class for ``model_type ==
+# "qwen3_moe_llm"`` via ``OMNI_ACCELERATED_MODEL_REGISTRY``, i.e. THIS
+# accelerated class, and binds OpSlots by walking `sys.modules[model_cls.
+# __module__]` — this file, not ``modeling.py``. ``modeling.py`` already
+# re-exports these for the eager/native ``OmniModel.from_pretrained`` path
+# (which resolves the class via ``OMNI_MODEL_REGISTRY`` instead), but that
+# re-export alone is invisible here: without duplicating it, the fused
+# EP-aware MoE kernel is never bound under FSDP/EP training or distributed
+# inference, so the eager experts loop runs and crashes (it indexes the
+# EP-sharded experts weight with un-translated global expert ids).
+from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (  # noqa: F401
+    veomni_apply_rotary_pos_emb,
+    veomni_moe_experts_forward,
+    veomni_rms_norm,
+    veomni_swiglu_mlp,
+)
+
 from ......distributed.parallel_plan import ParallelPlan
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ...qwen3.llm.accelerated import VeOmniMixin as Qwen3LlmVeOmniMixin

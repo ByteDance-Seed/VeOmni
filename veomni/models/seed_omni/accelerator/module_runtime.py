@@ -50,7 +50,7 @@ from .dispatch import unwrap_module_chain
 
 
 if TYPE_CHECKING:
-    from ....omni_arguments.arguments_types import OmniModuleRuntimeArguments
+    from ....omni_arguments.arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
     from ....trainer.callbacks import TrainerState
 
 
@@ -83,9 +83,13 @@ class ModuleRuntime:
       module's still-trainable params. Optimizer is built during :meth:`__init__`
       after FSDP wrap + freeze; the lr-scheduler is built later by
       :func:`~veomni.trainer.omni.omni_trainer.build_module_lr_schedulers` once
-      ``train_steps`` is fixed from the dataset — this class holds no reference to
-      the global :class:`OmniTrainingArguments` itself, only the ``total_steps``
-      the caller passes to :meth:`_build_lr_scheduler`.
+      ``train_steps`` is fixed from the dataset — building it needs no reference
+      to the global :class:`OmniTrainingArguments`, only the ``total_steps`` the
+      caller passes to :meth:`_build_lr_scheduler`. Checkpointing is the one
+      exception: :attr:`train` (the global :class:`OmniTrainingArguments`,
+      threaded in from :func:`~veomni.trainer.omni.omni_trainer.build_omni_model`)
+      carries the shared ``checkpoint`` paths (``save_path``/``output_dir``/
+      ``load_path``) every module saves under.
     * :meth:`_init_checkpoint` — builds :class:`OmniModuleCheckpointManager` for
       DCP / HF / LoRA save-load; trace / metering callbacks belong to the
       orchestrator, never here.
@@ -108,6 +112,7 @@ class ModuleRuntime:
     module_name: str
     model: Any
     model_config: Any
+    train: Optional["OmniTrainingArguments"] = None
     optimizer: Optional[Any] = None
     lr_scheduler: Optional[Any] = None
     _has_trainable_parameters: Optional[bool] = None
@@ -118,10 +123,12 @@ class ModuleRuntime:
         args: "OmniModuleRuntimeArguments",
         module_name: str,
         *,
+        train: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
     ):
         self.args = args
         self.module_name = module_name
+        self.train = train
         self.optimizer = None
         self.lr_scheduler = None
 

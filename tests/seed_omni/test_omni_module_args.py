@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -68,11 +69,28 @@ def test_to_hf_config_projects_onto_the_checkpoint_view():
     assert "optimizer" not in cfg.modules["janus_siglip"]
     assert "train" not in cfg.modules["janus_siglip"]
     assert "data" not in cfg.modules["janus_siglip"]
-    # Absolute launcher paths are a runtime concern and must not reach a checkpoint.
-    assert "model_path" not in cfg.modules["janus_siglip"].get("model", {})
+    # The resolved absolute `model_path` IS carried into this in-memory runtime
+    # view (needed so `OmniModel.from_pretrained` / `OmniProcessor.from_config`
+    # resolve a module living outside the composed checkpoint root — e.g. Qwen3
+    # visual-instruction-tuning's ViT sourced from a different HF model — instead
+    # of silently re-deriving the wrong `checkpoint_root/module_name` path). It
+    # still never reaches an actually persisted checkpoint: `copy_for_hf_export` /
+    # `normalize_modules_for_hf_export` rebuild each module's `model` block from
+    # only `ops_implementation` + `model_config`, dropping `model_path`.
+    assert cfg.modules["janus_siglip"]["model"]["model_path"] == runtime_cfg.modules["janus_siglip"].model_path
     for name in ("janus_vqvae", "janus_llama"):
         runtime_ops = runtime_cfg.modules[name].ops_implementation
         assert cfg.module_ops_implementation(name)["attn_implementation"] == runtime_ops.attn_implementation
+
+
+def test_hf_export_strips_model_path_from_the_persisted_checkpoint():
+    """`model_path` lives on the in-memory runtime view only, never on disk."""
+    runtime_cfg = _janus_model_runtime()
+    cfg = runtime_cfg.to_hf_config()
+    assert "model_path" in cfg.modules["janus_siglip"]["model"]  # sanity: present in-memory
+
+    exported = cfg.copy_for_hf_export()
+    assert "model_path" not in exported.modules["janus_siglip"].get("model", {})
 
 
 def test_to_hf_config_carries_graphs_and_scenario_selection():
@@ -251,6 +269,16 @@ def test_training_keeps_module_fsdp_modes():
 
 
 def test_runtime_to_hf_config_roundtrips_through_checkpoint(tmp_path):
+    """Graphs / ops survive an export round-trip; module identity re-anchors under the new root.
+
+    ``hf_cfg`` (pre-export, in-memory) carries each module's resolved absolute
+    ``model_path`` (see ``test_to_hf_config_projects_onto_the_checkpoint_view``),
+    so its own ``module_subfolder`` returns that absolute path. ``save_pretrained``
+    strips it (``normalize_modules_for_hf_export``): the persisted config only
+    ever names each module by its subfolder *relative to wherever it is
+    reloaded from* — a self-contained checkpoint re-roots every module under
+    itself rather than the original (possibly foreign) launcher path.
+    """
     runtime_cfg = _janus_model_runtime(model_path=str(tmp_path))
     export_root = tmp_path / "exported"
     hf_cfg = runtime_cfg.to_hf_config()
@@ -261,7 +289,8 @@ def test_runtime_to_hf_config_roundtrips_through_checkpoint(tmp_path):
     assert reloaded.training_graph == hf_cfg.training_graph
     assert set(reloaded.module_names) == set(hf_cfg.module_names)
     for name in hf_cfg.module_names:
-        assert reloaded.module_subfolder(name) == hf_cfg.module_subfolder(name)
+        assert reloaded.module_subfolder(name) == name
+        assert os.path.basename(hf_cfg.module_subfolder(name)) == name
         assert reloaded.module_ops_implementation(name) == hf_cfg.module_ops_implementation(name)
 
 

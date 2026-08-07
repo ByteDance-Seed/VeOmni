@@ -32,8 +32,8 @@ def register_qwen3vl_vision_processor():
     Note this registry is only a convenience for convert-time tooling; at
     train / inference time both processors are loaded by
     ``Qwen3VLVisionPreprocessor.from_pretrained`` (see
-    ``modulemixin.Qwen3VLVisionEncoderModuleMixin.preprocessor_class``) and bound
-    onto the model as ``self._image_processor`` / ``self._video_processor`` via
+    ``modeling.Qwen3VLVisionEncoder.preprocessor_class``) and bound onto the
+    model as ``self._image_processor`` / ``self._video_processor`` via
     ``bind_module_assets`` (see ``veomni.models.seed_omni.processing.binding``).
     """
     from .processing import Qwen3VLVisionImageProcessor, Qwen3VLVisionVideoProcessor

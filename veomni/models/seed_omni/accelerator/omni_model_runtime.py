@@ -87,9 +87,15 @@ class OmniModelRuntime:
         cls,
         model_runtime: OmniModelRuntimeArguments,
         *,
+        train: Any = None,
         for_inference: bool = False,
     ) -> OmniModelRuntime:
-        """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`."""
+        """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`.
+
+        ``train`` is the global :class:`~....omni_arguments.arguments_types.OmniTrainingArguments`
+        (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
+        checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
+        """
         from .module_runtime import ModuleRuntime
 
         omni_config = model_runtime.to_hf_config()
@@ -101,6 +107,7 @@ class OmniModelRuntime:
             module_runtime = ModuleRuntime(
                 module_args,
                 module_name=name,
+                train=train,
                 for_inference=for_inference,
             )
             module_runtime.checkpoint_subfolder = omni_config.module_checkpoint_subfolder(name)

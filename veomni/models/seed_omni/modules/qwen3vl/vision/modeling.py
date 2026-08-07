@@ -19,17 +19,136 @@ trainable projection. Since a stock checkpoint's ``linear_fc2`` then has the wro
 shape, :class:`_MergerProjectionConverter` drops it at load so it's re-initialised.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
 from veomni.utils import logging
 from veomni.utils.device import IS_NPU_AVAILABLE
 
+from ......distributed.parallel_state import get_parallel_state
 from ......models.checkpoint_tensor_loading import ConvertedCheckpointTensor
 from ....omni_pretrained_model import OmniPreTrainedModel
+from ....utils.conversation import ConversationItem
 from .configuration import Qwen3VLVisionEncoderConfig
-from .processing import Qwen3VLVisionImageProcessor, Qwen3VLVisionVideoProcessor
+from .processing import (
+    _OMNI_GRID,
+    _SOURCE,
+    Qwen3VLVisionImageProcessor,
+    Qwen3VLVisionPreprocessor,
+    Qwen3VLVisionVideoProcessor,
+)
+
+
+class _VisualOutputSlot(NamedTuple):
+    """How ``forward_post`` scatters one encoded image/video back onto the carrier.
+
+    The ViT returns all items' merged patch tokens as one flat ``(sum_merged,
+    hidden)`` tensor. One slot per encoded item, in the ViT's concat order, records
+    how to split + place that item's slice — the qwen3vl analog of the text
+    backbone's ``_pack_inputs_embeds_shape`` (which unflattens the packed hidden
+    states back into per-item segments):
+
+    * ``item``        — the ``ConversationItem`` to receive its merged tokens.
+    * ``grid``        — its ``(t, h, w)`` grid, restashed on ``item.meta`` for the
+                        backbone's M-RoPE.
+    * ``num_merged``  — its merged-token count, i.e. the split size along dim 0.
+    """
+
+    item: ConversationItem
+    grid: torch.Tensor
+    num_merged: int
+
+
+def pixels_and_grid_from_items(items: list) -> Tuple[torch.Tensor, list[list[int]]]:
+    """Concat CPU-preprocessed patch tensors and pop stashed grid metadata."""
+    pixel_values = torch.cat([it.value for it in items], dim=0)
+    grids = [it.meta.pop(_OMNI_GRID) for it in items]
+    return pixel_values, grids
+
+
+def process_qwen3vl_visual_items(
+    image_items: list,
+    video_items: list,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    spatial_merge_size: int,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], List[_VisualOutputSlot]]:
+    """Build one ViT batch from preprocessed image/video items (training + inference)."""
+    if not image_items and not video_items:
+        return None, None, []
+
+    pv_list: list[torch.Tensor] = []
+    grid_rows: list[list[int]] = []
+    output_slots: List[_VisualOutputSlot] = []
+    merge_area = spatial_merge_size**2
+
+    def _add(items: list) -> None:
+        pixel_values, grids = pixels_and_grid_from_items(items)
+        pv_list.append(pixel_values)
+        for it, g in zip(items, grids):
+            grid_rows.append(g)
+            output_slots.append(
+                _VisualOutputSlot(
+                    item=it,
+                    grid=torch.tensor(g, dtype=torch.long, device=device),
+                    num_merged=int(g[0] * g[1] * g[2]) // merge_area,
+                )
+            )
+
+    if image_items:
+        _add(image_items)
+    if video_items:
+        _add(video_items)
+
+    pixel_values = torch.cat(pv_list, dim=0).to(device=device, dtype=dtype)
+    grid_thw = torch.tensor(grid_rows, dtype=torch.long, device=device)
+    return pixel_values, grid_thw, output_slots
+
+
+def build_qwen3vl_vit_metadata(
+    grid_thw_list: list[list[int]],
+    spatial_merge_size: int,
+) -> Dict[str, Any]:
+    """Host-side ViT cu_seqlens metadata (training + inference)."""
+    cu: list[int] = [0]
+    for t, h, w in grid_thw_list:
+        frame_len = h * w
+        for _ in range(t):
+            cu.append(cu[-1] + frame_len)
+    max_seqlen = max((c2 - c1 for c1, c2 in zip(cu, cu[1:])), default=0)
+    ps = get_parallel_state()
+    if ps.sp_enabled:
+        merge_area = spatial_merge_size**2
+        total = cu[-1]
+        scale = ps.sp_size * merge_area
+        padded_total = ((total + scale - 1) // scale) * scale
+        sp_pad_seq_len = padded_total - total
+        if sp_pad_seq_len > 0:
+            cu.append(padded_total)
+            max_seqlen = max(max_seqlen, sp_pad_seq_len)
+    return {
+        "grid_thw_list": grid_thw_list,
+        "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
+        "max_seqlen": max_seqlen,
+    }
+
+
+def scatter_qwen3vl_visual_embeds(
+    output_slots: List[_VisualOutputSlot],
+    embeds: torch.Tensor,
+    deepstack_features: List[torch.Tensor],
+) -> None:
+    """Scatter merged ViT tokens back onto conversation items."""
+    sizes = [slot.num_merged for slot in output_slots]
+    embeds_split = torch.split(embeds, sizes, dim=0)
+    deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
+    for idx, slot in enumerate(output_slots):
+        slot.item.value = embeds_split[idx]
+        slot.item.source = _SOURCE
+        slot.item.meta["grid_thw"] = slot.grid
+        slot.item.meta["deepstack"] = [layer[idx] for layer in deepstack_split]
 
 
 if IS_NPU_AVAILABLE:
@@ -74,12 +193,51 @@ class _MergerProjectionConverter:
         return []
 
 
-class Qwen3VLVisionEncoder(OmniPreTrainedModel):
+class InferenceMixin:
+    """FSM ``generate`` — reads patchified image/video items, runs the ViT, scatters
+    merged tokens + DeepStack features back onto the carrier.
+
+    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    :class:`Qwen3VLVisionEncoder`'s bases so MRO resolves this concrete
+    ``generate`` (there are no inference-state resets to worry about shadowing
+    here — this module is stateless across FSM steps).
+    """
+
+    def generate(
+        self,
+        conversation_list: Optional[List[ConversationItem]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        image_items = [p for p in conversation_list if p.type == "image" and p.role == "user"]
+        video_items = [p for p in conversation_list if p.type == "video" and p.role == "user"]
+        if not image_items and not video_items:
+            return {"conversation_list": conversation_list}
+
+        # Items were patchified by the inference CPU preprocessor before the FSM
+        # (patches on ``value`` + grid on ``meta``, exactly as in training), so this
+        # only reads them back, runs the ViT, and scatters the merged tokens.
+        merge = self.config.vision_config.spatial_merge_size
+        pixel_values, grid_thw, output_slots = process_qwen3vl_visual_items(
+            image_items,
+            video_items,
+            device=self.device,
+            dtype=self.dtype,
+            spatial_merge_size=merge,
+        )
+        vit_metadata = build_qwen3vl_vit_metadata(grid_thw.tolist(), merge)
+        image_embeds, deepstack_features = self._encode(pixel_values, grid_thw, vit_metadata)
+        scatter_qwen3vl_visual_embeds(output_slots, image_embeds, deepstack_features)
+        return {"conversation_list": conversation_list}
+
+
+class Qwen3VLVisionEncoder(InferenceMixin, OmniPreTrainedModel):
     """Qwen3-VL vision tower for image understanding."""
 
     config_class = Qwen3VLVisionEncoderConfig
     image_processor_class = Qwen3VLVisionImageProcessor
     video_processor_class = Qwen3VLVisionVideoProcessor
+    preprocessor_class = Qwen3VLVisionPreprocessor
     base_model_prefix = "qwen3vl_vision"
     main_input_name = "pixel_values"
     _no_split_modules = ["Qwen3VLVisionBlock"]

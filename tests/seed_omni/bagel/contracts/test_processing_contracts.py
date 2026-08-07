@@ -18,7 +18,7 @@ from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, Conversatio
 
 
 def test_bagel_training_text_embed_meta_preserves_grad():
-    from veomni.models.seed_omni.modules.bagel.text_encoder.accelerated import scatter_bagel_text_embeds
+    from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import scatter_bagel_text_embeds
 
     item = ConversationItem(
         type="text",

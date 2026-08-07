@@ -1,4 +1,9 @@
-"""VeOmni-accelerated Qwen3Llm — training / inference graph hooks."""
+"""VeOmni-accelerated Qwen3Llm — training-graph hooks only.
+
+``generate()`` and inference-state management live on the native
+:class:`Qwen3Llm` in ``modeling.py`` — this file overrides them only if
+FSDP/DDP/SP needs a different inference path (it doesn't, today).
+"""
 
 from typing import Any, Dict, List, Optional
 
@@ -10,7 +15,6 @@ from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_posit
 from veomni.utils.tensor_utils import unflatten
 
 from ....mixins.base_mixin import BaseMixin
-from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy
@@ -123,92 +127,6 @@ class TrainingMixin(TrainingModuleMixin):
         return {"conversation_list": conversation}
 
 
-class InferenceMixin(InferenceModuleMixin):
-    config: Qwen3LlmConfig
-    device: torch.device
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._past_key_values: Any = None
-
-    def reset_local_inference_state(self) -> None:
-        return
-
-    def reset_global_inference_state(self) -> None:
-        self.reset_local_inference_state()
-        self._past_key_values = None
-
-    def generate(
-        self,
-        conversation_list: Optional[List[ConversationItem]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        del kwargs
-        if self._past_key_values is None:
-            inputs_embeds, attention_mask, position_ids, _ = pack_llm_conversations_for_forward(
-                [conversation_list], self.device
-            )
-            (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-                position_ids
-            )
-
-            # GenerationGraph invokes this endpoint through ``self.__call__`` so
-            # FSDP/DDP hooks have already fired; its dispatch trampoline restores
-            # the real ``forward`` while this endpoint runs.
-            outputs = self.forward(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=self._past_key_values,
-                cu_seq_lens_q=cu_seq_lens_q,
-                cu_seq_lens_k=cu_seq_lens_k,
-                max_length_q=max_length_q,
-                max_length_k=max_length_k,
-                use_cache=True,
-            )
-            self._past_key_values = outputs["past_key_values"]
-
-            hidden_states = outputs["hidden_states"]
-            conversation_list.append(
-                ConversationItem(
-                    type="output",
-                    value=self._tail_hidden_from_forward(hidden_states),
-                    role="assistant",
-                )
-            )
-            return {"conversation_list": conversation_list}
-
-        tail_part = conversation_list[-1]
-        assert tail_part.type == "output"
-
-        inputs_embeds: torch.Tensor = tail_part.value[-1:].to(self.device)
-        inputs_embeds = inputs_embeds.unsqueeze(0)
-
-        outputs = self.forward(
-            inputs_embeds=inputs_embeds,
-            attention_mask=None,
-            past_key_values=self._past_key_values,
-            use_cache=True,
-        )
-        self._past_key_values = outputs["past_key_values"]
-        hidden_states = outputs["hidden_states"]
-
-        conversation_list.append(
-            ConversationItem(
-                type="output",
-                value=self._tail_hidden_from_forward(hidden_states),
-                role="assistant",
-            )
-        )
-        return {"conversation_list": conversation_list}
-
-    @staticmethod
-    def _tail_hidden_from_forward(hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-            hidden_states = hidden_states.squeeze(0)
-            return hidden_states[-1:].contiguous()
-        return hidden_states[:, -1:, :].contiguous()
-
-
 class MeterMixin(MetricMeterMixin):
     """Per-module training meter for the Qwen3 backbone (transformer layers only)."""
 
@@ -237,8 +155,11 @@ class MeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
-    pass
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
+    """``generate()`` and inference-state reset already live on the native
+    :class:`~.modeling.Qwen3Llm` (via ``SimpleArGenerationMixin``), so no
+    ``InferenceMixin`` is needed here.
+    """
 
 
 def _fold_fsdp_dummy_anchors(

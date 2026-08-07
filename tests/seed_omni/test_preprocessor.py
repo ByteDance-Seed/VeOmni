@@ -32,10 +32,10 @@ from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
     BagelSiglipNavitProcessor,
 )
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
-from veomni.models.seed_omni.modules.bagel.text_encoder.accelerated import (
+from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
+from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import (
     _OMNI_TOKENIZED as BAGEL_TOK,
 )
-from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
 from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
     BagelTextEncoderPreprocessor,
 )

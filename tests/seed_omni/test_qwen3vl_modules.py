@@ -11,8 +11,28 @@ from veomni.models.seed_omni.modules import (
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
 )
-from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import qwen3vl_vision_position_ids
+from veomni.models.seed_omni.modules.qwen3vl.llm.modeling import qwen3vl_vision_position_ids
 from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import build_qwen3vl_vit_metadata
+
+
+def _save_fake_fast_tokenizer(module_path: Path) -> None:
+    """Write a minimal ``PreTrainedTokenizerFast`` sidecar (no sentencepiece needed).
+
+    Text-encoder ``preprocessor_class`` binding (``bind_module_assets``) always
+    calls ``AutoTokenizer.from_pretrained`` on the checkpoint dir — real
+    checkpoints always ship a tokenizer, so save-reload roundtrip tests need
+    one too, matching what a real converted checkpoint looks like.
+    """
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {"<unk>": 0, "<pad>": 1, "<s>": 2, "</s>": 3, "a": 4, "b": 5}
+    backend = Tokenizer(BPE(vocab=vocab, merges=[], unk_token="<unk>"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="<unk>", pad_token="<pad>", bos_token="<s>", eos_token="</s>"
+    )
+    tokenizer.save_pretrained(module_path)
 
 
 def test_registry_resolves_qwen3vl_modules():
@@ -134,6 +154,7 @@ def test_text_encoder_save_reload_via_registry(tmp_path: Path):
 
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=True))
     te.save_pretrained(tmp_path)
+    _save_fake_fast_tokenizer(tmp_path)
 
     rcfg = TextEncoderConfig.from_pretrained(tmp_path)
     assert rcfg.model_type == "qwen3vl_text_encoder"

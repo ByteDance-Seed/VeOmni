@@ -27,10 +27,11 @@ from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_g
 )
 
 from ....omni_pretrained_model import OmniPreTrainedModel
+from ...base.llm_packing import SimpleArGenerationMixin
 from .configuration import Qwen3MoeLlmConfig
 
 
-class Qwen3MoeLlm(OmniPreTrainedModel):
+class Qwen3MoeLlm(SimpleArGenerationMixin, OmniPreTrainedModel):
     """Qwen3-MoE backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling text encoder and live
@@ -39,6 +40,9 @@ class Qwen3MoeLlm(OmniPreTrainedModel):
     are stored in the v5 fused layout (``experts.gate_up_proj`` /
     ``experts.down_proj``); Expert Parallel is applied via
     :meth:`Qwen3MoeLlmModuleMixin.get_parallel_plan`.
+
+    ``generate()`` / inference-state reset come from :class:`SimpleArGenerationMixin`
+    — shared verbatim with the dense Qwen3 backbone (:class:`~...qwen3.llm.modeling.Qwen3Llm`).
     """
 
     config_class = Qwen3MoeLlmConfig
@@ -52,6 +56,7 @@ class Qwen3MoeLlm(OmniPreTrainedModel):
         self.config = config
         self.language_model = Qwen3MoeModel._from_config(self.config.text_config)
         self.language_model.set_input_embeddings(nn.Identity())
+        self._past_key_values: Any = None
         self.post_init()
 
     def forward(  # type: ignore[override]

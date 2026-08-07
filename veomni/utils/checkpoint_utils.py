@@ -32,7 +32,22 @@ _GLOBAL_STEP_PREFIX = "global_step_"
 
 
 def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
-    """Return the checkpoint step if the entry is a valid DCP checkpoint, otherwise None."""
+    """Return the checkpoint step if the entry is a valid DCP checkpoint, otherwise None.
+
+    Two on-disk layouts are valid here:
+
+    * Classic single-model VeOmni: the DCP shards land directly under
+      ``global_step_N/`` (``global_step_N/.metadata``).
+    * SeedOmni V2 (``OmniTrainer``): each module gets its own nested DCP
+      checkpoint (``global_step_N/<module_name>/.metadata``), so there is no
+      ``.metadata`` directly under ``global_step_N/``. The orchestrator's own
+      ``global_step_N/trainer_state.pt`` (written by
+      ``OmniGlobalStateCallback.save_global_state`` in the same step as the
+      per-module DCP saves) is used as the step-completeness marker instead —
+      cheaper than enumerating and stat-ing every module subfolder, and it is
+      exactly the file :meth:`OmniGlobalStateCallback.load_global_state` reads
+      when it later resumes from this same path.
+    """
     if not entry.startswith(_GLOBAL_STEP_PREFIX):
         return None
     # get the letters after "global_step_" in the given path, which should be numbers
@@ -47,7 +62,8 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
         return None
 
     metadata_path = os.path.join(checkpoint_path, ".metadata")
-    if not exists(metadata_path):
+    trainer_state_path = os.path.join(checkpoint_path, "trainer_state.pt")
+    if not exists(metadata_path) and not exists(trainer_state_path):
         return None
 
     return step

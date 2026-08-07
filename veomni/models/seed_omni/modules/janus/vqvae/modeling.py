@@ -20,7 +20,7 @@ Graph entry points (YAML ``module: janus_vqvae.<method>``):
   ``generate`` — inference VQ AR step (lm_head → sample → embed → merge).
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -31,12 +31,151 @@ from transformers.models.janus.modeling_janus import (
     JanusVQVAEHead,
 )
 
+from veomni.utils import helper
+
+from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....omni_pretrained_model import OmniPreTrainedModel
+from ....utils.conversation import ConversationItem, maybe_merge_outputs, seal_outputs
 from .configuration import JanusVqvaeConfig
-from .processing import JanusVqvaeProcessor
+from .processing import JanusVqvaePreprocessor, JanusVqvaeProcessor
 
 
-class JanusVqvae(OmniPreTrainedModel):
+logger = helper.create_logger(__name__)
+
+
+class InferenceMixin:
+    """FSM ``generate`` (VQ AR sampling + CFG) — HF ``GenerationMixin`` analog.
+
+    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    :class:`JanusVqvae`'s bases: ``OmniPreTrainedModel`` ships a no-op
+    ``finalize`` default (kept as a safety net for modules that don't need
+    real inference state), and MRO resolves left-to-right — put second, that
+    no-op would shadow the real one below.
+    """
+
+    def generate(
+        self,
+        conversation_list: Optional[List[ConversationItem]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        tail_part = conversation_list[-1]
+        hidden_states: torch.Tensor = tail_part.value
+        hidden_states = hidden_states.to(self.device)
+        batch_size = hidden_states.size(0)
+        sampling = self._extract_sampling_kwargs(generation_kwargs)
+        cfg_w = sampling.pop("guidance_scale", None)
+
+        if batch_size == 2 and cfg_w > 1.0:
+            cond_logits = self.generation_head(hidden_states[:1, -1:, :]).squeeze(1)
+            uncond_logits = self.generation_head(hidden_states[1:, -1:, :]).squeeze(1)
+            last_logits = uncond_logits + cfg_w * (cond_logits - uncond_logits)
+        elif batch_size == 1:
+            last_logits = self.generation_head(hidden_states[:, -1:, :]).squeeze(1)
+        else:
+            raise NotImplementedError(
+                f"JanusVqvae.generate received hidden_states with B={batch_size}. "
+                "Supported: B=1 (no CFG) or B=2 (CFG cond/uncond pair)."
+            )
+
+        sampled = self._sample_vq_token(last_logits, **sampling)
+        token_id_int = int(sampled[0].item())
+        self._vq_buffer.append(token_id_int)
+
+        outputs: Dict[str, Any] = {}
+        target = self._image_processor.num_image_tokens
+        if len(self._vq_buffer) == target:
+            generated = self._emit_buffered_image()
+
+            tail_part = conversation_list.pop()
+            seal_outputs(conversation_list, new_type="image")
+            conversation_list.append(tail_part)
+
+            outputs["generated"] = generated
+            outputs[FSM_SIGNAL_KEY] = "image_complete"
+        else:
+            input_embeds = self.generation_aligner(self.generation_embeddings(sampled))
+            tail_part.value = input_embeds
+            maybe_merge_outputs(conversation_list)
+
+        outputs["conversation_list"] = conversation_list
+        return outputs
+
+    def _emit_buffered_image(self) -> Optional[Dict[str, Any]]:
+        token_ids = torch.tensor([self._vq_buffer], dtype=torch.long, device=self.device)
+        self._vq_buffer.clear()
+        with torch.inference_mode():
+            decoded = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)
+        if self._image_processor is None:
+            raise RuntimeError(
+                "JanusVqvae: cannot postprocess VQVAE output — no processor was "
+                "loaded. Ensure `preprocessor_config.json` ships next to the weights."
+            )
+        image_pil = self._image_processor.postprocess(decoded)[0]
+        return {"type": "image", "value": image_pil}
+
+    def reset_local_inference_state(self) -> None:
+        self._vq_buffer.clear()
+
+    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        del ctx
+        target = self._image_processor.num_image_tokens
+        n = len(self._vq_buffer)
+        if n == 0:
+            return {}
+        if n < target:
+            logger.warning_rank0(
+                f"JanusVqvae.finalize: incomplete VQ grid ({n}/{target} tokens) — "
+                "discarding partial sequence (no image emitted)."
+            )
+            self._vq_buffer.clear()
+            return {}
+        if n == target:
+            generated = self._emit_buffered_image()
+            return {"generated": generated}
+        raise RuntimeError(
+            "JanusVqvae.finalize: VQ buffer overflowed the grid — "
+            "_emit_buffered_image should have fired inside generate() when n == target."
+        )
+
+    @staticmethod
+    def _extract_sampling_kwargs(generation_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "do_sample": True,
+            "guidance_scale": 1.0,
+        }
+        if generation_kwargs:
+            for k in ("temperature", "top_p", "do_sample", "guidance_scale"):
+                if k in generation_kwargs:
+                    merged[k] = generation_kwargs[k]
+        return merged
+
+    @staticmethod
+    def _sample_vq_token(
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+    ) -> torch.Tensor:
+        if not do_sample:
+            return logits.argmax(dim=-1)
+        if temperature != 1.0:
+            logits = logits / max(temperature, 1e-6)
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            to_remove = cumulative - sorted_probs > top_p
+            sorted_logits = sorted_logits.masked_fill(to_remove, float("-inf"))
+            logits = logits.scatter(1, sorted_indices, sorted_logits)
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+class JanusVqvae(InferenceMixin, OmniPreTrainedModel):
     """VQVAE + generation head for Janus VQ image generation.
 
     The VQVAE encoder/decoder is frozen by default (matching the Janus
@@ -47,6 +186,7 @@ class JanusVqvae(OmniPreTrainedModel):
 
     config_class = JanusVqvaeConfig
     image_processor_class = JanusVqvaeProcessor
+    preprocessor_class = JanusVqvaePreprocessor
     base_model_prefix = "janus_vqvae"
     main_input_name = "pixel_values"
     _no_split_modules: list = []
@@ -59,6 +199,7 @@ class JanusVqvae(OmniPreTrainedModel):
         self.generation_aligner = JanusVQVAEAlignerMLP(config.vq_config)
         self.generation_head = JanusVQVAEHead(config.vq_config)
         self._image_processor: JanusVqvaeProcessor = None
+        self._vq_buffer: List[int] = []
         self.post_init()
 
     def freeze_model(self) -> None:
@@ -141,3 +282,6 @@ class JanusVqvae(OmniPreTrainedModel):
         ce_sum = F.cross_entropy(logits.reshape(-1, logits.size(-1)), flat_labels, ignore_index=-100, reduction="sum")
         n_valid_local = (flat_labels != -100).sum().clamp(min=1)
         return ce_sum / n_valid_local
+
+
+__all__ = ["InferenceMixin", "JanusVqvae"]

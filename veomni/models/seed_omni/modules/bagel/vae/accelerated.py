@@ -1,4 +1,9 @@
-"""SeedOmni V2 carrier hooks for BAGEL's latent VAE module."""
+"""SeedOmni V2 carrier hooks for BAGEL's latent VAE module — training-graph hooks only.
+
+``encode_context()`` and ``decode_generated()`` (the FSM generation nodes) live
+natively on :class:`~.modeling.BagelVAE` — this file only carries the training
+pre/forward/post hooks and offline-encoding-cache endpoints.
+"""
 
 from __future__ import annotations
 
@@ -12,30 +17,14 @@ from veomni.utils.device import get_device_id, get_device_type
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs, slice_input_tensor
 from ....mixins.base_mixin import BaseMixin
-from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
-from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
+from ....utils.conversation import ConversationItem
+from ..sources import BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
-from .modeling import BagelVAE
-from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
-
-
-def select_bagel_vae_context_items(
-    conversation_list: list[list[ConversationItem]] | None,
-    *,
-    exclude_dummy: bool = False,
-) -> list[ConversationItem]:
-    """Select VAE context image items (training includes dummies; inference skips them)."""
-    if conversation_list is None:
-        raise ValueError("BagelVAE requires conversation_list to select VAE context items.")
-
-    items = list(iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]))
-    if exclude_dummy:
-        return [item for item in items if not is_dummy(item)]
-    return items
+from .modeling import BagelVAE, select_bagel_vae_context_items
+from .processing import BAGEL_VAE_PIXEL_SHAPE, crop_latent_to_image_shape
 
 
 def _posterior_from_cache(
@@ -261,89 +250,6 @@ class TrainingMixin(TrainingModuleMixin):
         self.metric_meter_set_seqlens("offline_encode", lengths)
 
 
-class InferenceMixin(InferenceModuleMixin):
-    config: BagelVAEConfig
-    device: torch.device
-    dtype: torch.dtype
-    _image_processor: BagelVAEProcessor
-
-    def encode_context(
-        self,
-        conversation_list: list[ConversationItem] | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del generation_kwargs, kwargs
-        if conversation_list is None:
-            return {"conversation_list": conversation_list}
-
-        batched = [conversation_list]
-        image_items = select_bagel_vae_context_items(batched, exclude_dummy=True)
-        if not image_items:
-            return {"conversation_list": conversation_list}
-
-        pixel_values = torch.stack([item.value for item in image_items], dim=0).to(
-            device=self.device, dtype=self.dtype, non_blocking=True
-        )
-        outputs = self.encode(pixel_values=pixel_values)
-        for image_item, latent in zip(image_items, outputs["latents"], strict=True):
-            latent = crop_latent_to_image_shape(
-                latent,
-                image_item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
-                downsample=int(self.config.downsample),
-            )
-            image_item.value = latent.to(device=self.device, dtype=self.dtype)
-            image_item.source = BAGEL_VAE_CONTEXT
-        return {"conversation_list": conversation_list}
-
-    def decode_generated(
-        self,
-        conversation_list: list[ConversationItem] | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del generation_kwargs, kwargs
-        if conversation_list is None:
-            return {"conversation_list": conversation_list}
-
-        batched = [conversation_list]
-        decode_items = self._select_vae_decode_items(batched)
-        if not decode_items:
-            return {"conversation_list": conversation_list}
-
-        latents = []
-        for item in decode_items:
-            latents.append(
-                item.value.detach().squeeze(0)
-                if item.value.dim() == 4 and item.value.shape[0] == 1
-                else item.value.detach()
-            )
-        latents = torch.stack(latents, dim=0).to(device=self.device, dtype=self.dtype)
-
-        outputs = self.decode(latents=latents)
-        pixel_values = outputs["pixel_values"]
-        for item, image in zip(decode_items, pixel_values, strict=True):
-            item.type = "image"
-            item.value = image.to(device=self.device, dtype=self.dtype)
-        return {
-            "conversation_list": conversation_list,
-            "generated": {"type": "image", "value": self._image_processor.postprocess(pixel_values[-1])[0]},
-        }
-
-    def _select_vae_decode_items(
-        self, conversation_list: list[list[ConversationItem]] | None
-    ) -> list[ConversationItem]:
-        if conversation_list is None:
-            raise ValueError("BagelVAE decode requires conversation_list to select latent items.")
-
-        # Final image decode consumes the completed latent emitted by the flow connector.
-        decode_items: list[ConversationItem] = []
-        for item in iter_desired_items(conversation_list, types=["output"], sources=[BAGEL_GENERATED_LATENT]):
-            if not is_dummy(item):
-                decode_items.append(item)
-        return decode_items
-
-
 class MeterMixin(MetricMeterMixin):
     """Per-module training meter for BAGEL's latent VAE codec (FLUX-style conv AE)."""
 
@@ -397,11 +303,15 @@ class MeterMixin(MetricMeterMixin):
         return 6 * total_macs / 1e12
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, BagelVAEOfflineMixin, OfflineEncodingMixin, InferenceMixin, MeterMixin):
-    """Carrier hooks for raw-image VAE encode and latent decode."""
+class VeOmniMixin(BaseMixin, TrainingMixin, BagelVAEOfflineMixin, OfflineEncodingMixin, MeterMixin):
+    """Carrier hooks for raw-image VAE encode and latent decode.
+
+    ``encode_context()`` / ``decode_generated()`` already live on the native
+    :class:`~.modeling.BagelVAE` (via its own :class:`~.modeling.InferenceMixin`),
+    so no ``InferenceMixin`` is needed here.
+    """
 
     config: BagelVAEConfig
-    preprocessor_class = BagelVAEPreprocessor
 
     def save_full_hf_checkpoint(self, output_dir: str, *, source_path: str, trainer: Any, state: Any) -> None:
         del trainer, state

@@ -29,6 +29,42 @@ def _model_cls(model_type: str):
     return OMNI_MODEL_REGISTRY[model_type]()
 
 
+def _save_fake_fast_tokenizer(module_path: Path) -> None:
+    """Write a minimal ``PreTrainedTokenizerFast`` sidecar (no sentencepiece needed).
+
+    Text-encoder ``preprocessor_class`` binding (``bind_module_assets``) always
+    calls ``AutoTokenizer.from_pretrained`` on the checkpoint dir — real
+    checkpoints always ship a tokenizer, so save-reload roundtrip tests need
+    one too, matching what a real converted checkpoint looks like.
+    """
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {
+        "<unk>": 0,
+        "<pad>": 1,
+        "<s>": 2,
+        "</s>": 3,
+        "<begin_of_image>": 4,
+        "<end_of_image>": 5,
+        "a": 6,
+        "b": 7,
+    }
+    backend = Tokenizer(BPE(vocab=vocab, merges=[], unk_token="<unk>"))
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+        pad_token="<pad>",
+        bos_token="<s>",
+        eos_token="</s>",
+        # Janus-specific chat-template markers — harmless extra attrs for other families.
+        boi_token="<begin_of_image>",
+        eoi_token="<end_of_image>",
+    )
+    tokenizer.save_pretrained(module_path)
+
+
 def _patch_parallel_state(monkeypatch, **attrs):
     import veomni.distributed.parallel_state as ps_utils
 
@@ -267,6 +303,7 @@ def test_janus_text_encoder_save_reload_via_registry(tmp_path: Path):
     )
     jte = JanusTextEncoder(cfg)
     jte.save_pretrained(tmp_path)
+    _save_fake_fast_tokenizer(tmp_path)
 
     rcfg = JanusTextEncoderConfig.from_pretrained(tmp_path)
     assert rcfg.model_type == "janus_text_encoder"
@@ -522,6 +559,7 @@ def test_qwen3_text_encoder_save_reload_via_registry(tmp_path: Path):
 
     te = Qwen3TextEncoder(Qwen3TextEncoderConfig(vocab_size=128, hidden_size=64, tie_word_embeddings=True))
     te.save_pretrained(tmp_path)
+    _save_fake_fast_tokenizer(tmp_path)
 
     rcfg = Qwen3TextEncoderConfig.from_pretrained(tmp_path)
     assert rcfg.model_type == "qwen3_text_encoder"

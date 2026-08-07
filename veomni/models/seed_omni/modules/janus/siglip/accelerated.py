@@ -13,7 +13,7 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from .configuration import JanusSiglipConfig
 from .modeling import JanusSiglip
-from .processing import JanusSiglipPreprocessor, JanusSiglipProcessor
+from .processing import JanusSiglipProcessor
 
 
 _SOURCE = "janus_siglip"
@@ -101,7 +101,6 @@ class MeterMixin(MetricMeterMixin):
 class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     config: JanusSiglipConfig
     _image_processor: JanusSiglipProcessor
-    preprocessor_class = JanusSiglipPreprocessor
 
 
 class JanusSiglipAccelerated(VeOmniMixin, JanusSiglip):

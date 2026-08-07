@@ -1,4 +1,8 @@
-"""SeedOmni V2 hooks for BAGEL's SigLIP NaViT vision encoder."""
+"""SeedOmni V2 training-graph hooks for BAGEL's SigLIP NaViT vision encoder.
+
+``generate()`` lives natively on :class:`~.modeling.BagelSiglipNavit` — this
+file only carries the SP-aware training pre/forward/post hooks.
+"""
 
 from __future__ import annotations
 
@@ -9,76 +13,18 @@ import torch
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_outputs
 from ....mixins.base_mixin import BaseMixin
-from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
-from .modeling import BagelSiglipNavit
-from .processing import _OMNI_POSITION_IDS, _OMNI_TOKEN_LEN, BagelSiglipNavitPreprocessor
-
-
-def select_siglip_image_items(
-    conversation_list: list[list[ConversationItem]] | None,
-) -> list[ConversationItem]:
-    """Select BAGEL SigLIP image carriers (training + inference)."""
-    if conversation_list is None:
-        raise ValueError("BagelSiglipNavit requires conversation_list to select image items.")
-
-    return list(
-        iter_desired_items(
-            conversation_list,
-            types=["image"],
-            sources=[BAGEL_SIGLIP_CONTEXT],
-        )
-    )
-
-
-def siglip_inputs_from_preprocessed_items(
-    image_items: list[ConversationItem],
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> dict[str, Any]:
-    """Build NaViT forward inputs from CPU-preprocessed image items."""
-    token_lens = torch.tensor(
-        [int(item.meta[_OMNI_TOKEN_LEN]) for item in image_items],
-        dtype=torch.int32,
-        device=device,
-    )
-    return {
-        "patchified_pixel_values": torch.cat([item.value for item in image_items], dim=0).to(
-            device=device, dtype=dtype, non_blocking=True
-        ),
-        "patchified_position_ids": torch.cat(
-            [item.meta[_OMNI_POSITION_IDS] for item in image_items],
-            dim=0,
-        ).to(device=device, dtype=torch.long, non_blocking=True),
-        "cu_seqlens": torch.nn.functional.pad(torch.cumsum(token_lens, dim=0), (1, 0)).to(torch.int32),
-        "max_seqlen": int(token_lens.max().item()),
-        "token_lens": token_lens,
-    }
-
-
-def scatter_siglip_image_embeds(
-    image_items: list[ConversationItem],
-    image_embeds: torch.Tensor,
-    token_lens: torch.Tensor,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    """Scatter NaViT outputs back onto conversation image items."""
-    offset = 0
-    lengths = token_lens.detach().cpu().reshape(-1).tolist()
-    for item, length in zip(image_items, lengths, strict=True):
-        item.value = image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype)
-        item.source = BAGEL_SIGLIP_CONTEXT
-        offset += int(length)
-
-    if offset != int(image_embeds.shape[0]):
-        raise RuntimeError("BAGEL SigLIP token count mismatch during feature scatter.")
+from .modeling import (
+    BagelSiglipNavit,
+    scatter_siglip_image_embeds,
+    select_siglip_image_items,
+    siglip_inputs_from_preprocessed_items,
+)
+from .processing import _OMNI_TOKEN_LEN
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -206,35 +152,6 @@ class TrainingMixin(TrainingModuleMixin):
         return sample_lens
 
 
-class InferenceMixin(InferenceModuleMixin):
-    config: BagelSiglipNavitConfig
-    device: torch.device
-    dtype: torch.dtype
-
-    def generate(
-        self,
-        conversation_list: list[ConversationItem] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del kwargs
-        batched = [conversation_list]
-        image_items = select_siglip_image_items(batched)
-        if not image_items:
-            return {"conversation_list": conversation_list}
-
-        inputs = siglip_inputs_from_preprocessed_items(image_items, device=self.device, dtype=self.dtype)
-        outputs = self.forward(**inputs)
-        token_lens = outputs.get("token_lens", inputs["token_lens"])
-        scatter_siglip_image_embeds(
-            image_items,
-            outputs["image_embeds"],
-            token_lens,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        return {"conversation_list": batched[0]}
-
-
 class MeterMixin(MetricMeterMixin):
     """Per-module training trace for BAGEL SigLIP NaViT."""
 
@@ -257,10 +174,13 @@ class MeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
-    """Carrier hooks for BAGEL visual-understanding image features."""
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
+    """Carrier hooks for BAGEL visual-understanding image features.
 
-    preprocessor_class = BagelSiglipNavitPreprocessor
+    ``generate()`` already lives on the native :class:`~.modeling.BagelSiglipNavit`
+    (via its own :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is
+    needed here.
+    """
 
 
 class BagelSiglipNavitAccelerated(VeOmniMixin, BagelSiglipNavit):

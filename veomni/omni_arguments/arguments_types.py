@@ -132,10 +132,25 @@ class OmniModuleRuntimeArguments(BaseOmniModelArguments):
         return self._resolve_fqn_to_index_mapping()
 
     def to_hf_config(self, module_name: str) -> dict:
-        """Project onto this module's slim :class:`OmniConfig` entry."""
+        """Project onto this module's slim :class:`OmniConfig` entry.
+
+        ``model_path`` is carried through explicitly (not just ``subfolder:
+        module_name``): by the time this runs, ``build_module_runtime_args`` /
+        ``_resolve_model_path`` has already resolved it to an absolute path —
+        usually ``<checkpoint_root>/<module_name>``, but a launcher YAML module
+        override may point it at a wholly different checkpoint (e.g. Qwen3
+        visual-instruction-tuning composing ``qwen3_llm``/``qwen3_text_encoder``
+        from one HF model with ``qwen3vl_vision`` from another). Dropping it
+        and re-deriving ``checkpoint_root/module_name`` downstream (as
+        :meth:`~....models.seed_omni.configuration_omni.OmniConfig.resolve_module_path`
+        does for anything without an explicit ``model_path``) would silently
+        resolve to the wrong path for that module.
+        """
         model_block: dict = {
             "ops_implementation": asdict(self.ops_implementation),
         }
+        if self.model_path:
+            model_block["model_path"] = self.model_path
         overrides = _hf_module_model_config(self.model_config)
         if overrides:
             model_block["model_config"] = deepcopy(overrides)

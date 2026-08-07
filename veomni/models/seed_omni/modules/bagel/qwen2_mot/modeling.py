@@ -22,38 +22,22 @@ from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
 from ......ops.kernels.attention import flash_attention_forward
 from ....omni_pretrained_model import OmniPreTrainedModel
+from ....utils.conversation import ConversationItem, get_tail_output_item
+from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY, BAGEL_VAE_CONTEXT
 from .configuration import BagelQwen2MoTConfig
+from .generation_state import MotCacheContext, MotGenerationState
+from .processing import PackedConversation, PackedSpan, preprocess_mot_inputs
 
 
-class BagelQwen2MoT(OmniPreTrainedModel):
-    config_class = BagelQwen2MoTConfig
-    base_model_prefix = "bagel_qwen2_mot"
-    main_input_name = "inputs_embeds"
-    _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
-    supports_gradient_checkpointing = True
+class InferenceMixin:
+    """FSM ``generate`` / denoise-branch / velocity-collection — HF ``GenerationMixin`` analog.
 
-    def __init__(self, config: BagelQwen2MoTConfig):
-        super().__init__(config)
-        self.model = BagelQwen2MoTBackbone(config)
-        self.post_init()
-
-    def forward(  # type: ignore[override]
-        self,
-        packed_sequence: torch.Tensor,
-        packed_position_ids: torch.Tensor,
-        packed_token_type_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> Dict[str, Any]:
-        packed_und_token_indexes = torch.nonzero(packed_token_type_ids == 0, as_tuple=False).flatten()
-        packed_gen_token_indexes = torch.nonzero(packed_token_type_ids == 1, as_tuple=False).flatten()
-        output = self.model(
-            packed_sequence=packed_sequence,
-            packed_position_ids=packed_position_ids,
-            attention_mask=attention_mask,
-            packed_und_token_indexes=packed_und_token_indexes,
-            packed_gen_token_indexes=packed_gen_token_indexes,
-        )
-        return {"hidden_states": output.packed_query_sequence}
+    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    :class:`BagelQwen2MoT`'s bases: ``OmniPreTrainedModel`` ships a no-op
+    ``reset_local_inference_state`` default (kept as a safety net for modules
+    that don't need real inference state), and MRO resolves left-to-right —
+    put second, that no-op would shadow the real one below.
+    """
 
     def forward_inference(
         self,
@@ -93,6 +77,358 @@ class BagelQwen2MoT(OmniPreTrainedModel):
             "hidden_states": output.packed_query_sequence,
             "past_key_values": output.past_key_values,
         }
+
+    def reset_local_inference_state(self) -> None:
+        self._generation_state.reset()
+
+    def generate(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL Qwen2-MoT generate requires conversation_list.")
+
+        generation_kwargs = generation_kwargs or {}
+        infer_mode = self._generation_state.update_infer_mode(generation_kwargs)
+        if self._generation_state.main.cache is None or infer_mode == "gen":
+            hidden_states = self._prefill_prompt(conversation_list, generation_kwargs)
+        else:
+            hidden_states = self._decode_next_token(conversation_list)
+
+        if infer_mode != "gen":
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                hidden_states = hidden_states.squeeze(0)
+            if hidden_states.dim() != 2:
+                raise ValueError(f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}.")
+            conversation_list.append(
+                ConversationItem(
+                    type="output",
+                    value=hidden_states[-1:].contiguous(),
+                    role="assistant",
+                )
+            )
+        return {"conversation_list": conversation_list}
+
+    def denoise_branch(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL Qwen2-MoT denoise_branch requires conversation_list.")
+
+        self._generation_state.validate_cfg_request(generation_kwargs or {})
+        self._generation_state.main.require_ready()
+        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_QUERY])
+        if tail is None or not torch.is_tensor(tail.value):
+            raise ValueError("BAGEL Qwen2-MoT denoise branch requires source='bagel_flow_query'.")
+
+        query = tail.value
+        if query.dim() == 3 and query.shape[0] == 1:
+            query = query.squeeze(0)
+        if query.dim() != 2:
+            raise ValueError(f"BAGEL Qwen2-MoT denoise branch expects rank-2 query tensor, got {tuple(query.shape)}.")
+        if int(query.shape[-1]) != int(self.config.hidden_size):
+            raise ValueError(
+                "BAGEL Qwen2-MoT denoise branch hidden-size mismatch: "
+                f"got {query.shape[-1]}, expected {self.config.hidden_size}."
+            )
+        if int(query.shape[0]) < 3:
+            raise ValueError("BAGEL Qwen2-MoT denoise query must include start/end marker embeddings.")
+
+        inputs = self._generation_state.preprocess_parallel_denoise_inputs(
+            query,
+            generation_kwargs or {},
+            timestep=tail.meta.get("timestep"),
+            empty_cache_factory=self._new_empty_cache,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        outputs = self.forward_inference(
+            **inputs,
+            update_past_key_values=False,
+            is_causal=False,
+            mode="gen",
+        )
+
+        tail.source = BAGEL_FLOW_HIDDEN
+        tail.value = outputs["hidden_states"].to(device=self.device, dtype=self.dtype)
+        return {"conversation_list": conversation_list}
+
+    def collect_velocity(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL Qwen2-MoT collect_velocity requires conversation_list.")
+
+        self._generation_state.validate_cfg_request(generation_kwargs or {})
+        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
+        if tail is None or not torch.is_tensor(tail.value):
+            raise ValueError("BAGEL Qwen2-MoT velocity collection requires source='bagel_flow_velocity'.")
+
+        velocity = tail.value
+        if velocity.dim() == 3 and velocity.shape[0] == 1:
+            velocity = velocity.squeeze(0)
+        if velocity.dim() != 2:
+            raise ValueError(
+                f"BAGEL Qwen2-MoT velocity collection expects rank-2 velocity, got {tuple(velocity.shape)}."
+            )
+
+        tail.value = self._generation_state.collect_velocity(
+            velocity,
+            generation_kwargs or {},
+            device=self.device,
+            dtype=self.dtype,
+        )
+        return {"conversation_list": conversation_list}
+
+    def _prefill_prompt(
+        self,
+        conversation_list: list[ConversationItem],
+        generation_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        packed = preprocess_mot_inputs(
+            [conversation_list],
+            device=self.device,
+            dtype=self.dtype,
+            hidden_size=int(self.config.hidden_size),
+        )
+        if packed is None:
+            raise ValueError("BAGEL Qwen2-MoT generate requires at least one embedded text/image item.")
+
+        state = self._generation_state
+        main_context = state.main
+        main_context.reset()
+        main_context.ensure_empty(empty_cache_factory=self._new_empty_cache, device=self.device)
+        outputs = None
+
+        for span in packed.spans:
+            if span.item.type == "text":
+                # Text CFG branches start from the main prompt cache before
+                # the current text span, so snapshot before pre-filling it.
+                self._generation_state.cfg_text.snapshot(
+                    cache=main_context.cache,
+                    key_values_lens=main_context.key_values_lens,
+                    packed_key_value_indexes=main_context.packed_key_value_indexes,
+                    next_position_id=packed.packed_position_ids[span.start],
+                    empty_cache_factory=self._new_empty_cache,
+                    device=self.device,
+                )
+                self._prefill_text_cfg_contexts(span, packed, generation_kwargs=generation_kwargs)
+
+            outputs = self._prefill_main_prompt_span(span, packed, main_context)
+
+            if span.item.type == "image":
+                # After image context is in the main cache, text CFG should
+                # keep that visual context while dropping later text condition.
+                state.cfg_text.snapshot(
+                    cache=main_context.cache,
+                    key_values_lens=main_context.key_values_lens,
+                    packed_key_value_indexes=main_context.packed_key_value_indexes,
+                    next_position_id=main_context.next_position_ids,
+                    empty_cache_factory=self._new_empty_cache,
+                    device=self.device,
+                )
+
+        if outputs is None:
+            raise RuntimeError("BAGEL Qwen2-MoT prefill produced no outputs.")
+        return outputs["hidden_states"]
+
+    def _decode_next_token(self, conversation_list: list[ConversationItem]) -> torch.Tensor:
+        main_context = self._generation_state.main
+        main_context.require_ready()
+        tail = conversation_list[-1]
+        if tail.type != "output":
+            raise ValueError(f"BAGEL Qwen2-MoT decode expects tail output item, got {tail.type!r}.")
+
+        packed_query_sequence = tail.value
+        if not torch.is_tensor(packed_query_sequence):
+            raise ValueError("BAGEL Qwen2-MoT decode expects tail output.value to be an embedding tensor.")
+        if packed_query_sequence.dim() == 3 and packed_query_sequence.shape[0] == 1:
+            packed_query_sequence = packed_query_sequence.squeeze(0)
+        if packed_query_sequence.dim() != 2:
+            raise ValueError(
+                f"BAGEL Qwen2-MoT expected tail output embedding rank 2, got {tuple(packed_query_sequence.shape)}."
+            )
+        packed_query_sequence = packed_query_sequence[-1:].contiguous().to(device=self.device, dtype=self.dtype)
+
+        query_lens, packed_query_indexes, packed_position_ids = main_context.packed_query_args(
+            1,
+            device=self.device,
+        )
+        outputs = self.forward_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_query_indexes,
+            past_key_values=main_context.cache,
+            key_values_lens=main_context.key_values_lens,
+            packed_key_value_indexes=main_context.packed_key_value_indexes,
+            update_past_key_values=True,
+            is_causal=True,
+            mode="und",
+        )
+        main_context.append_packed_query(
+            cache=outputs["past_key_values"],
+            query_lens=query_lens,
+            device=self.device,
+        )
+
+        return outputs["hidden_states"]
+
+    def _prefill_main_prompt_span(
+        self,
+        span: PackedSpan,
+        packed: PackedConversation,
+        main_context: MotCacheContext,
+    ) -> Any:
+        span_end = span.start + span.length
+        span_position_ids = packed.packed_position_ids[span.start : span_end]
+        query_lens, packed_query_indexes, packed_position_ids = main_context.packed_query_args(
+            span.length,
+            device=self.device,
+            position_ids=span_position_ids,
+        )
+        call_kwargs = {
+            "packed_query_sequence": packed.packed_sequence[span.start : span_end],
+            "query_lens": query_lens,
+            "packed_query_position_ids": packed_position_ids,
+            "packed_query_indexes": packed_query_indexes,
+            "past_key_values": main_context.cache,
+            "key_values_lens": main_context.key_values_lens,
+            "packed_key_value_indexes": main_context.packed_key_value_indexes,
+            "update_past_key_values": True,
+            "is_causal": span.item.type == "text",
+            "mode": "und",
+        }
+        if span.item.type == "output":
+            if span.length < 3:
+                raise ValueError("BAGEL Qwen2-MoT output query must include start/end marker embeddings.")
+            # Runtime flow query output remains marker-wrapped: marker tokens
+            # stay on the text path, while interior latent tokens use the gen expert.
+            call_kwargs["is_causal"] = False
+            call_kwargs["mode"] = "gen"
+            call_kwargs["packed_text_indexes"] = torch.tensor([0, span.length - 1], device=self.device)
+            call_kwargs["packed_vae_token_indexes"] = torch.arange(
+                1,
+                span.length - 1,
+                device=self.device,
+                dtype=torch.long,
+            )
+        elif span.item.type == "image" and span.item.source == BAGEL_VAE_CONTEXT:
+            # Prompt/edit VAE context is now source-routed as an image carrier.
+            # Surrounding vision marker rows stay on the text path while the
+            # image span itself uses the generation expert.
+            call_kwargs["is_causal"] = False
+            call_kwargs["mode"] = "gen"
+            if span.is_image_triplet:
+                call_kwargs["packed_text_indexes"] = torch.tensor(
+                    [0, span.length - 1],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                start = span.primary_start
+                end = start + span.primary_length
+            else:
+                start = 0
+                end = span.length
+            call_kwargs["packed_vae_token_indexes"] = torch.arange(
+                start,
+                end,
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        outputs = self.forward_inference(**call_kwargs)
+        main_context.append_packed_query(
+            cache=outputs["past_key_values"],
+            query_lens=query_lens,
+            device=self.device,
+            next_position_ids=packed_position_ids.max().reshape(1) + 1,
+        )
+        return outputs
+
+    def _prefill_text_cfg_contexts(
+        self,
+        span: PackedSpan,
+        packed: PackedConversation,
+        *,
+        generation_kwargs: dict[str, Any],
+    ) -> None:
+        # Text-only image CFG is only needed when image guidance is active.
+        if not self._generation_state.cfg_img_requested(generation_kwargs):
+            return
+
+        # Image CFG keeps text conditioning while excluding image conditioning,
+        # so it needs an independent text prefill branch.
+        cfg_img_context = self._generation_state.cfg_img
+        cfg_img_context.ensure_empty(empty_cache_factory=self._new_empty_cache, device=self.device)
+        query_lens, packed_query_indexes, packed_position_ids = cfg_img_context.packed_query_args(
+            span.length,
+            device=self.device,
+        )
+        span_end = span.start + span.length
+        outputs = self.forward_inference(
+            packed_query_sequence=packed.packed_sequence[span.start : span_end],
+            query_lens=query_lens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_query_indexes,
+            past_key_values=cfg_img_context.cache,
+            key_values_lens=cfg_img_context.key_values_lens,
+            packed_key_value_indexes=cfg_img_context.packed_key_value_indexes,
+            update_past_key_values=True,
+            is_causal=True,
+            mode="und",
+        )
+        cfg_img_context.append_packed_query(
+            cache=outputs["past_key_values"],
+            query_lens=query_lens,
+            device=self.device,
+        )
+
+    def _new_empty_cache(self) -> Any:
+        return NaiveCache(len(self.model.layers))
+
+
+class BagelQwen2MoT(InferenceMixin, OmniPreTrainedModel):
+    config_class = BagelQwen2MoTConfig
+    base_model_prefix = "bagel_qwen2_mot"
+    main_input_name = "inputs_embeds"
+    _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
+    supports_gradient_checkpointing = True
+
+    def __init__(self, config: BagelQwen2MoTConfig):
+        super().__init__(config)
+        self.model = BagelQwen2MoTBackbone(config)
+        self._generation_state = MotGenerationState()
+        self.post_init()
+
+    def forward(  # type: ignore[override]
+        self,
+        packed_sequence: torch.Tensor,
+        packed_position_ids: torch.Tensor,
+        packed_token_type_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Dict[str, Any]:
+        packed_und_token_indexes = torch.nonzero(packed_token_type_ids == 0, as_tuple=False).flatten()
+        packed_gen_token_indexes = torch.nonzero(packed_token_type_ids == 1, as_tuple=False).flatten()
+        output = self.model(
+            packed_sequence=packed_sequence,
+            packed_position_ids=packed_position_ids,
+            attention_mask=attention_mask,
+            packed_und_token_indexes=packed_und_token_indexes,
+            packed_gen_token_indexes=packed_gen_token_indexes,
+        )
+        return {"hidden_states": output.packed_query_sequence}
 
 
 class NaiveCache:
@@ -854,4 +1190,4 @@ class BagelQwen2MoTBackbone(nn.Module):
         return self._forward_packed_inference(*args, **kwargs)
 
 
-__all__ = ["BaseNavitOutputWithPast", "BagelQwen2MoT", "NaiveCache"]
+__all__ = ["BaseNavitOutputWithPast", "BagelQwen2MoT", "InferenceMixin", "NaiveCache"]

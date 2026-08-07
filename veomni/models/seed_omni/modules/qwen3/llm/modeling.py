@@ -8,15 +8,19 @@ import torch.nn as nn
 from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3Model
 
 from ....omni_pretrained_model import OmniPreTrainedModel
+from ...base.llm_packing import SimpleArGenerationMixin
 from .configuration import Qwen3LlmConfig
 
 
-class Qwen3Llm(OmniPreTrainedModel):
+class Qwen3Llm(SimpleArGenerationMixin, OmniPreTrainedModel):
     """Qwen3 backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling text encoder and live
     on the ``conversation_list`` items.  :meth:`pre_forward` concatenates every
     non-dummy item's ``value`` in order into one packed bs=1 sequence.
+
+    ``generate()`` / inference-state reset come from :class:`SimpleArGenerationMixin`
+    — shared verbatim with the Qwen3-MoE backbone (:class:`~...qwen3_moe.llm.modeling.Qwen3MoeLlm`).
     """
 
     config_class = Qwen3LlmConfig
@@ -30,6 +34,7 @@ class Qwen3Llm(OmniPreTrainedModel):
         self.config = config
         self.language_model = Qwen3Model._from_config(self.config.text_config)
         self.language_model.set_input_embeddings(nn.Identity())
+        self._past_key_values: Any = None
         self.post_init()
 
     def freeze_model(self) -> None:

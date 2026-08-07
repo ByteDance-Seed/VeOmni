@@ -19,6 +19,8 @@ import torch.nn as nn
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 from ....omni_pretrained_model import OmniPreTrainedModel
+from ....utils.conversation import ConversationItem, iter_desired_items
+from ..sources import BAGEL_SIGLIP_CONTEXT
 
 
 if IS_CUDA_AVAILABLE:
@@ -29,12 +31,108 @@ if IS_NPU_AVAILABLE:
 from transformers.activations import ACT2FN
 
 from .configuration import BagelSiglipNavitConfig
-from .processing import BagelSiglipNavitProcessor
+from .processing import _OMNI_POSITION_IDS, _OMNI_TOKEN_LEN, BagelSiglipNavitPreprocessor, BagelSiglipNavitProcessor
 
 
-class BagelSiglipNavit(OmniPreTrainedModel):
+def select_siglip_image_items(
+    conversation_list: list[list[ConversationItem]] | None,
+) -> list[ConversationItem]:
+    """Select BAGEL SigLIP image carriers (training + inference)."""
+    if conversation_list is None:
+        raise ValueError("BagelSiglipNavit requires conversation_list to select image items.")
+
+    return list(
+        iter_desired_items(
+            conversation_list,
+            types=["image"],
+            sources=[BAGEL_SIGLIP_CONTEXT],
+        )
+    )
+
+
+def siglip_inputs_from_preprocessed_items(
+    image_items: list[ConversationItem],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Build NaViT forward inputs from CPU-preprocessed image items."""
+    token_lens = torch.tensor(
+        [int(item.meta[_OMNI_TOKEN_LEN]) for item in image_items],
+        dtype=torch.int32,
+        device=device,
+    )
+    return {
+        "patchified_pixel_values": torch.cat([item.value for item in image_items], dim=0).to(
+            device=device, dtype=dtype, non_blocking=True
+        ),
+        "patchified_position_ids": torch.cat(
+            [item.meta[_OMNI_POSITION_IDS] for item in image_items],
+            dim=0,
+        ).to(device=device, dtype=torch.long, non_blocking=True),
+        "cu_seqlens": torch.nn.functional.pad(torch.cumsum(token_lens, dim=0), (1, 0)).to(torch.int32),
+        "max_seqlen": int(token_lens.max().item()),
+        "token_lens": token_lens,
+    }
+
+
+def scatter_siglip_image_embeds(
+    image_items: list[ConversationItem],
+    image_embeds: torch.Tensor,
+    token_lens: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Scatter NaViT outputs back onto conversation image items."""
+    offset = 0
+    lengths = token_lens.detach().cpu().reshape(-1).tolist()
+    for item, length in zip(image_items, lengths, strict=True):
+        item.value = image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype)
+        item.source = BAGEL_SIGLIP_CONTEXT
+        offset += int(length)
+
+    if offset != int(image_embeds.shape[0]):
+        raise RuntimeError("BAGEL SigLIP token count mismatch during feature scatter.")
+
+
+class InferenceMixin:
+    """FSM ``generate`` — HF ``GenerationMixin`` analog.
+
+    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    :class:`BagelSiglipNavit`'s bases for consistency with every other
+    module's native / accelerated split (see ``janus/llama/modeling.py`` for
+    the full MRO rationale where a competing no-op default exists).
+    """
+
+    def generate(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        batched = [conversation_list]
+        image_items = select_siglip_image_items(batched)
+        if not image_items:
+            return {"conversation_list": conversation_list}
+
+        inputs = siglip_inputs_from_preprocessed_items(image_items, device=self.device, dtype=self.dtype)
+        outputs = self.forward(**inputs)
+        token_lens = outputs.get("token_lens", inputs["token_lens"])
+        scatter_siglip_image_embeds(
+            image_items,
+            outputs["image_embeds"],
+            token_lens,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        return {"conversation_list": batched[0]}
+
+
+class BagelSiglipNavit(InferenceMixin, OmniPreTrainedModel):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
+    preprocessor_class = BagelSiglipNavitPreprocessor
     base_model_prefix = "bagel_siglip_navit"
     main_input_name = "patchified_pixel_values"
     _no_split_modules = ["BagelSiglipEncoderLayer"]
@@ -445,4 +543,5 @@ class BagelSiglipVisionTransformer(nn.Module):
 __all__ = [
     "BagelSiglipNavit",
     "BagelSiglipNavitConfig",
+    "InferenceMixin",
 ]

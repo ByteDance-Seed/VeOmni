@@ -1,6 +1,11 @@
-"""VeOmni-accelerated TextEncoder — training / inference graph hooks."""
+"""VeOmni-accelerated TextEncoder — training graph hooks.
 
-from abc import abstractmethod
+FSM ``generate`` + its sampling helpers now live natively on
+:class:`~.modeling.TextEncoder` (see its docstring) so pure HF usage of a
+family's native class works without this accelerated wrapper. Only the
+SP-aware training pre/forward/post hooks stay here.
+"""
+
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -17,31 +22,12 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.base_mixin import BaseMixin
 from ....mixins.emb_parallel_mixin import EmbParallelMixin
-from ....mixins.inference_module_mixin import InferenceModuleMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem, is_dummy, seal_outputs
+from ....utils.conversation import ConversationItem, is_dummy
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
-from .modeling import TextEncoder
-
-
-_SAMPLING_KWARGS = ("temperature", "top_p", "do_sample")
-
-
-def scatter_text_encoder_embeds(
-    conversation_list: list[list[ConversationItem]],
-    segment_embeds: list[torch.Tensor],
-) -> None:
-    """Write packed text embeds back onto conversation text segments."""
-    segment_embeds_iterator = iter(segment_embeds)
-    for sample in conversation_list:
-        for part in sample:
-            if part.type != "text":
-                continue
-            part.value = next(segment_embeds_iterator)
-    if next(segment_embeds_iterator, None) is not None:
-        raise RuntimeError("TextEncoder text segment count mismatch during embed scatter.")
+from .modeling import TextEncoder, scatter_text_encoder_embeds
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -118,6 +104,16 @@ class TrainingMixin(TrainingModuleMixin):
         # TODO: scatter logits for rl training
         return {"conversation_list": conversation}
 
+    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Vocab-parallel lookup when the ``emb`` extra-parallel group is active.
+
+        Overrides the native ``self.embed_tokens(input_ids)`` shortcut so every
+        family picks up ``AllToAllEmbedding`` under ``emb`` (mixed in via
+        :class:`~....mixins.emb_parallel_mixin.EmbParallelMixin`); off ``emb`` it
+        is exactly the native call.
+        """
+        return self.emb_parallel_lookup(self.embed_tokens, input_ids)
+
     def _prepare_encode_inputs(
         self,
         conversation_list: Optional[list[list[ConversationItem]]],
@@ -167,6 +163,74 @@ class TrainingMixin(TrainingModuleMixin):
         shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, shift_labels
 
+    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Tied-head projection that stays FSDP2-safe.
+
+        The native :meth:`~.modeling.TextEncoder._project` reads
+        ``embed_tokens.weight`` directly, which is only safe off-FSDP (pure HF
+        inference): under FSDP2 that read bypasses the embedding's own
+        unshard/reshard hook (``encode`` and ``decode`` are separate graph-node
+        forward calls, so there's no guarantee ``embed_tokens`` was unsharded by
+        this call), leaving a sharded ``DTensor`` that a plain ``F.linear``
+        can't multiply against the (unsharded) activation. ``emb_parallel_project``
+        (mixed in via :class:`~....mixins.emb_parallel_mixin.EmbParallelMixin`)
+        explicitly gathers the weight first — vocab-parallel when the ``emb``
+        extra-parallel group is active, otherwise a plain ``full_tensor()``
+        all-gather — so this override, not the native one, must run at train time.
+        """
+        if not self.config.tie_word_embeddings:
+            return self.lm_head(hidden_states)
+        return self.emb_parallel_project(hidden_states, self.embed_tokens.weight)
+
+    def decode(
+        self,
+        hidden_states: torch.Tensor | None = None,
+        labels: torch.LongTensor | None = None,
+        shift_labels: torch.LongTensor | None = None,
+        **kwargs: Any,
+    ) -> dict:
+        """FSDP2/SP-safe counterpart of :meth:`~.modeling.TextEncoder.decode`.
+
+        Same loss math, but (a) projects via :meth:`_project` above instead of
+        the native tied-weight shortcut, and (b) token-weights the loss mean
+        across the whole ``dp_sp`` (``fsdp_group``) mesh via
+        :func:`~veomni.distributed.sequence_parallel.reduce_sequence_parallel_loss`
+        — required once SP is enabled, since each rank only scores its own
+        (unsliced, per :meth:`decode_pre`) span.
+        """
+        logits = self._project(hidden_states)
+        loss: torch.Tensor | None = None
+
+        if shift_labels is not None:
+            flat_labels = shift_labels.view(-1)
+            ce_sum = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            n_valid_local = (flat_labels != -100).sum()
+            local_mean = ce_sum / n_valid_local.clamp(min=1)
+            loss = reduce_sequence_parallel_loss(
+                local_mean, n_valid_local.to(local_mean.dtype), group=get_parallel_state().fsdp_group
+            )
+        elif labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_targets = labels[..., 1:].contiguous()
+            ce_sum = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_targets.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            n_valid = (shift_targets != -100).sum().clamp(min=1)
+            loss = ce_sum / n_valid
+
+        return {
+            "loss": loss,
+            "logits": logits,
+        }
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._conversation_carrier: Any = None
@@ -174,141 +238,6 @@ class TrainingMixin(TrainingModuleMixin):
         # Active sample's packed token count. Under SP the encode output-gather hook
         # (``encode_sp_post``) narrows the all-gathered (seq-padded) embeds to it.
         self._sp_own_len: Optional[int] = None
-
-
-class InferenceMixin(InferenceModuleMixin):
-    """Generation-FSM hooks shared by every text encoder."""
-
-    config: TextEncoderConfig
-    device: torch.device
-    _chat_template: TextEncoderChatTemplate
-    _tokenizer: Any
-    _prompt_encoded: bool
-    _text_token_cache: list[int]
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._text_token_cache: list[int] = []
-        self._bos_injected: bool = False
-        # First FSM step embeds the whole (pre-templated, pre-tokenized) prompt;
-        # later steps autoregress. Set once the prompt has been encoded.
-        self._prompt_encoded: bool = False
-
-    def reset_local_inference_state(self) -> None:
-        self._text_token_cache.clear()
-
-    def reset_global_inference_state(self) -> None:
-        self.reset_local_inference_state()
-        self._bos_injected = False
-        self._prompt_encoded = False
-
-    def _encode_prompt(self, conversation_list: List[ConversationItem]) -> Dict[str, Any]:
-        """First FSM step: embed the already-prepared prompt + scatter back.
-
-        The inference CPU preprocessor (run before the FSM, mirroring training's
-        collator) has already applied the chat template, appended the generation
-        prompt and tokenized every text row, so this only packs the token ids,
-        embeds them through :meth:`encode`, and scatters the segment embeds — the
-        text-encoder twin of the per-step "pack → encode → scatter". Subsequent
-        ``generate`` calls autoregress (``_prompt_encoded`` guards re-entry).
-        """
-        self._prompt_encoded = True
-        for part in conversation_list:
-            part.meta.pop("labels", None)
-        input_ids = self._chat_template.pack_input_ids(conversation_list)
-        input_ids, batch_shape = naflatten(input_ids)
-        input_ids = input_ids.to(self.device)
-        inputs_embeds = self.encode(input_ids)["inputs_embeds"]
-        scatter_text_encoder_embeds([conversation_list], unflatten(inputs_embeds, batch_shape))
-        return {"conversation_list": conversation_list}
-
-    @abstractmethod
-    def generate(
-        self,
-        conversation_list: Optional[List[ConversationItem]] = None,
-        generation_kwargs: Dict[str, Any] = dict,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """One FSM inference step — implemented per module.
-
-        Inference differs substantially across text encoders (Qwen ChatML
-        autoregression keyed on eos / ``<|im_end|>``; Janus T2I with ``<boi>`` /
-        ``<eoi>`` + classifier-free guidance), so each concrete module owns its
-        ``generate``. The base provides only the shared sampling / embedding
-        helpers (:meth:`_sample_token`, :meth:`_token_id_tensor`,
-        :func:`scatter_text_encoder_embeds`, :meth:`_flush_text_generated`).
-        """
-        raise NotImplementedError
-
-    @staticmethod
-    def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
-        sorted_indices_to_remove = cumulative - sorted_probs > top_p
-        sorted_logits[sorted_indices_to_remove] = float("-inf")
-        return logits.scatter(1, sorted_indices, sorted_logits)
-
-    def _sample_token(
-        self,
-        hidden_states: torch.Tensor,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        do_sample: bool = True,
-        **kwargs,
-    ) -> int:
-        del kwargs
-        hidden_states = hidden_states.to(self.device)
-        last = hidden_states[:, -1, :]
-        logits = self._project(last) if last.dim() == 2 else self._project(last.squeeze(0))
-        if not do_sample:
-            return int(logits.argmax(dim=-1).item())
-        if temperature != 1.0:
-            logits = logits / max(temperature, 1e-6)
-        if top_p < 1.0:
-            logits = self._top_p_filter(logits, top_p)
-        probs = F.softmax(logits, dim=-1)
-        token = torch.multinomial(probs, num_samples=1)
-        return token
-
-    def _token_id_tensor(self, token_id: int) -> torch.Tensor:
-        device = self.device
-        return torch.tensor([[token_id]], dtype=torch.long, device=device)
-
-    @staticmethod
-    def _extract_sampling_kwargs(
-        generation_kwargs: Optional[Dict[str, Any]],
-        temperature: float,
-        top_p: float,
-        kwargs: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        merged: Dict[str, Any] = {"temperature": temperature, "top_p": top_p, "do_sample": True}
-        if generation_kwargs:
-            for k in _SAMPLING_KWARGS:
-                if k in generation_kwargs:
-                    merged[k] = generation_kwargs[k]
-        for k in _SAMPLING_KWARGS:
-            if k in kwargs:
-                merged[k] = kwargs[k]
-        return merged
-
-    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
-        if not self._text_token_cache:
-            return {}
-        flushed = self._flush_text_generated(ctx["conversation_list"])
-        if not flushed:
-            return {}
-        return {"generated": flushed}
-
-    def _flush_text_generated(self, conversation_list: List[ConversationItem]) -> Dict[str, Any]:
-        token_ids = list(self._text_token_cache)
-        self._text_token_cache.clear()
-        if not token_ids:
-            return {}
-        meta = {"token_ids": token_ids}
-        text = self._tokenizer.decode(token_ids, skip_special_tokens=True)
-        seal_outputs(conversation_list, new_type="text")
-        return {"type": "text", "value": text, "meta": meta}
 
 
 class MeterMixin(MetricMeterMixin):
@@ -329,16 +258,27 @@ class MeterMixin(MetricMeterMixin):
     # default ``metric_meter_token_lengths`` (drains the stash) is used as-is.
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin, EmbParallelMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin, EmbParallelMixin):
     """Shared training / inference plumbing for every text encoder.
 
-    Concrete modules (janus / qwen3 / qwen3vl / bagel) subclass this and define
-    ``XxxTextEncoderPreprocessor`` in their ``processing.py`` by subclassing
+    No ``InferenceMixin`` here: FSM ``generate`` and its sampling /
+    prompt-embedding helpers already live natively on
+    :class:`~.modeling.TextEncoder` via its own
+    :class:`~.modeling.InferenceMixin` (and each family's ``generate``
+    override) — every ``XxxTextEncoderAccelerated(VeOmniMixin, XxxTextEncoder)``
+    inherits that through its native base, so nothing needs to be re-declared
+    here. Concrete modules (janus / qwen3 / qwen3vl / bagel) subclass this and
+    define ``XxxTextEncoderPreprocessor`` in their ``processing.py`` by
+    subclassing
     :class:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor`
     and implementing :meth:`~veomni.models.seed_omni.modules.base.text_encoder.processing.TextEncoderPreprocessor.build_chat_template`
     with the module-local chat template.  Register via ``preprocessor_class`` on
-    the family mixin, plus the ``encode_pre`` / ``encode_post`` / ``decode_pre`` /
-    ``decode_post`` pass-through hooks in each module's ``accelerated.py``.
+    the family's HF-native ``modeling.py`` class (parallel to ``image_processor_class``
+    on vision/codec modules) — :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor`
+    resolves it through ``OMNI_MODEL_REGISTRY`` (the native class), so it must live
+    there, not on this accelerated mixin. Each module's ``accelerated.py`` still owns
+    the ``encode_pre`` / ``encode_post`` / ``decode_pre`` / ``decode_post`` pass-through
+    hooks.
     """
 
     _chat_template: TextEncoderChatTemplate
@@ -359,54 +299,13 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin, EmbParal
 
 
 class TextEncoderAccelerated(VeOmniMixin, TextEncoder):
-    """Training/runtime text encoder — vocab-parallel embed + SP-aware CE."""
+    """Training/runtime text encoder — vocab-parallel embed + SP-aware CE.
 
-    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.emb_parallel_lookup(self.embed_tokens, input_ids)
-
-    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if not self.config.tie_word_embeddings:
-            return self.lm_head(hidden_states)
-        return self.emb_parallel_project(hidden_states, self.embed_tokens.weight)
-
-    def decode(
-        self,
-        hidden_states: torch.Tensor | None = None,
-        labels: torch.LongTensor | None = None,
-        shift_labels: torch.LongTensor | None = None,
-        **kwargs: Any,
-    ) -> dict:
-        logits = self._project(hidden_states)
-        loss: torch.Tensor | None = None
-
-        if shift_labels is not None:
-            flat_labels = shift_labels.view(-1)
-            ce_sum = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                flat_labels,
-                ignore_index=-100,
-                reduction="sum",
-            )
-            ps = get_parallel_state()
-            n_valid_local = (flat_labels != -100).sum()
-            local_mean = ce_sum / n_valid_local.clamp(min=1)
-            loss = reduce_sequence_parallel_loss(local_mean, n_valid_local.to(local_mean.dtype), group=ps.fsdp_group)
-        elif labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_targets = labels[..., 1:].contiguous()
-            ce_sum = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_targets.view(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
-            n_valid = (shift_targets != -100).sum().clamp(min=1)
-            loss = ce_sum / n_valid
-
-        return {
-            "loss": loss,
-            "logits": logits,
-        }
+    ``_embed_tokens`` / ``_project`` / ``decode`` overrides (FSDP2-/``emb``-safe)
+    live on :class:`TrainingMixin` above so every family's own accelerated
+    composition — which mixes in *its own* ``TrainingMixin(BaseTrainingMixin)``
+    rather than this class — inherits them too.
+    """
 
 
 __all__ = ["TextEncoderAccelerated", "scatter_text_encoder_embeds"]

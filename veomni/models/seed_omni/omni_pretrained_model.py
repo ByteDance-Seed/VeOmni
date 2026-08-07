@@ -35,10 +35,19 @@ class OmniPreTrainedModel(PreTrainedModel):
         from .processing.binding import bind_module_assets
 
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        # ``kwargs`` may carry an HF ``config=<PretrainedConfig>`` (the loaded
+        # module config, forwarded by ``OmniModel._load_modules``) — that's a
+        # different "config" than the launcher/runtime overrides dict
+        # ``config_overrides`` represents (``support_cache`` / ``train_type`` /
+        # …). Some preprocessors' ``from_pretrained`` forward ``config_overrides``
+        # as ``**kwargs`` into helpers that also take a positional ``config``
+        # (e.g. ``OfflineEncodingMixin.patch_config``), so a passthrough ``config``
+        # key here would collide with it — strip it before binding.
+        config_overrides = {k: v for k, v in kwargs.items() if k != "config"}
         bind_module_assets(
             model,
             checkpoint_path=str(pretrained_model_name_or_path),
-            config_overrides=kwargs,
+            config_overrides=config_overrides,
         )
         return model
 

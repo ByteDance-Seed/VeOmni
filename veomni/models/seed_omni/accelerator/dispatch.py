@@ -8,6 +8,7 @@ from typing import Any
 import torch.nn as nn
 
 from ..mixins.base_mixin import BaseMixin
+from ..omni_pretrained_model import OmniPreTrainedModel
 
 
 def unwrap_module_chain(wrapped: nn.Module) -> nn.Module:
@@ -48,12 +49,12 @@ def unwrap_module_chain(wrapped: nn.Module) -> nn.Module:
     return current
 
 
-def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> BaseMixin:
-    """Return the raw :class:`BaseMixin` behind a graph-callable module.
+def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> nn.Module:
+    """Return the raw graph-callable module behind a (possibly wrapped) module.
 
     ``wrapped`` is the object that must be called so DDP/FSDP hooks run.  The
-    raw :class:`BaseMixin` owns graph endpoint methods and the shared
-    :meth:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin._omni_hook_name`
+    common case is a :class:`BaseMixin`, which owns graph endpoint methods and
+    the shared :meth:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin._omni_hook_name`
     registry.  Training call-sites dispatch ``pre_forward`` / ``post_forward``
     through :class:`TrainingModuleMixin`; inference call-sites dispatch
     ``pre_generate`` / ``post_generate`` through :class:`InferenceModuleMixin`.
@@ -72,20 +73,27 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> BaseMixin:
     at ``base_model.model.forward``, so the :func:`call_graph_endpoint`
     trampoline (which swaps that module's ``forward``) keeps working — we only
     need to return the inner :class:`BaseMixin` here.
+
+    A ``fsdp_mode: eager`` module (``ModuleRuntime._init_eager_inference`` in
+    ``module_runtime.py``) is a bare native :class:`OmniPreTrainedModel` from
+    plain ``from_pretrained`` — no FSDP/DDP wrap, no ``BaseMixin``. It is only
+    reachable from generation nodes (training always builds the wrapped
+    ``BaseMixin`` path — eager is gated behind ``for_inference``), which need
+    no ``pre_forward``/``post_forward``, so it dispatches straight through.
     """
     raw = unwrap_module_chain(wrapped)
-    if not isinstance(raw, BaseMixin):
-        raise TypeError(
-            f"Graph module '{module_name}' must be a BaseMixin or wrap one on "
-            f"`.module` / LoRA base; got {type(wrapped).__name__} "
-            f"(resolved {type(raw).__name__})."
-        )
-    return raw
+    if isinstance(raw, (BaseMixin, OmniPreTrainedModel)):
+        return raw
+    raise TypeError(
+        f"Graph module '{module_name}' must be a BaseMixin (or eager "
+        f"OmniPreTrainedModel) or wrap one on `.module` / LoRA base; got "
+        f"{type(wrapped).__name__} (resolved {type(raw).__name__})."
+    )
 
 
 def call_graph_endpoint(
     wrapped: nn.Module,
-    raw: BaseMixin,
+    raw: nn.Module,
     *,
     method: str,
     kwargs: Mapping[str, Any],

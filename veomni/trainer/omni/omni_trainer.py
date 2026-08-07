@@ -214,7 +214,7 @@ def build_omni_model(
         module_args = model_runtime.modules[name]
         module_args.model_config = dict(module_args.model_config or {})
         module_args.model_config["train_type"] = global_args.train.train_type
-    return OmniModelRuntime.from_model_runtime(model_runtime, for_inference=False)
+    return OmniModelRuntime.from_model_runtime(model_runtime, train=global_args.train, for_inference=False)
 
 
 # ── OmniTrainer ────────────────────────────────────────────────────────────────

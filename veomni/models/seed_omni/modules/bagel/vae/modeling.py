@@ -7,6 +7,10 @@ Tensor call-sites:
 The VAE module is a codec boundary only. Flow timestep/noise sampling, latent
 patchification, packed MoT indexes, and conversation-carrier mutation belong to
 the Bagel VAE module mixin and downstream Bagel nodes.
+
+``encode_context()`` (image-understanding VAE encode) and ``decode_generated()``
+(final generated-latent decode) are the FSM generation-node methods, native here
+so pure HF inference (no accelerated mixins) can run BAGEL's generation graphs.
 """
 
 from __future__ import annotations
@@ -21,13 +25,126 @@ from torch import Tensor
 
 from ....mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ....omni_pretrained_model import OmniPreTrainedModel
+from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
+from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
-from .processing import BagelVAEProcessor
+from .processing import BAGEL_VAE_PIXEL_SHAPE, BagelVAEPreprocessor, BagelVAEProcessor, crop_latent_to_image_shape
 
 
-class BagelVAE(OmniPreTrainedModel):
+def select_bagel_vae_context_items(
+    conversation_list: list[list[ConversationItem]] | None,
+    *,
+    exclude_dummy: bool = False,
+) -> list[ConversationItem]:
+    """Select VAE context image items (training includes dummies; inference skips them)."""
+    if conversation_list is None:
+        raise ValueError("BagelVAE requires conversation_list to select VAE context items.")
+
+    items = list(iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]))
+    if exclude_dummy:
+        return [item for item in items if not is_dummy(item)]
+    return items
+
+
+class InferenceMixin:
+    """FSM ``encode_context`` / ``decode_generated`` — HF ``GenerationMixin`` analog.
+
+    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
+    :class:`BagelVAE`'s bases for consistency with every other module's
+    native / accelerated split (see ``janus/llama/modeling.py`` for the full
+    MRO rationale where a competing no-op default exists — this module
+    doesn't override ``reset_local_inference_state`` / ``finalize`` so there
+    is nothing to shadow here).
+    """
+
+    def encode_context(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """FSM node: encode image-understanding context images into VAE latents."""
+        del generation_kwargs, kwargs
+        if conversation_list is None:
+            return {"conversation_list": conversation_list}
+
+        batched = [conversation_list]
+        image_items = select_bagel_vae_context_items(batched, exclude_dummy=True)
+        if not image_items:
+            return {"conversation_list": conversation_list}
+
+        pixel_values = torch.stack([item.value for item in image_items], dim=0).to(
+            device=self.device, dtype=self.dtype, non_blocking=True
+        )
+        outputs = self.encode(pixel_values=pixel_values)
+        for image_item, latent in zip(image_items, outputs["latents"], strict=True):
+            latent = crop_latent_to_image_shape(
+                latent,
+                image_item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                downsample=int(self.config.downsample),
+            )
+            image_item.value = latent.to(device=self.device, dtype=self.dtype)
+            image_item.source = BAGEL_VAE_CONTEXT
+        return {"conversation_list": conversation_list}
+
+    def decode_generated(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """FSM node: decode the flow connector's completed latent into a PIL image."""
+        del generation_kwargs, kwargs
+        if conversation_list is None:
+            return {"conversation_list": conversation_list}
+
+        batched = [conversation_list]
+        decode_items = self._select_vae_decode_items(batched)
+        if not decode_items:
+            return {"conversation_list": conversation_list}
+
+        latents = []
+        for item in decode_items:
+            latents.append(
+                item.value.detach().squeeze(0)
+                if item.value.dim() == 4 and item.value.shape[0] == 1
+                else item.value.detach()
+            )
+        latents = torch.stack(latents, dim=0).to(device=self.device, dtype=self.dtype)
+
+        outputs = self.decode(latents=latents)
+        pixel_values = outputs["pixel_values"]
+        for item, image in zip(decode_items, pixel_values, strict=True):
+            item.type = "image"
+            item.value = image.to(device=self.device, dtype=self.dtype)
+        if self._image_processor is None:
+            raise RuntimeError(
+                "BagelVAE: cannot postprocess decoded image — no image processor was "
+                "loaded. Ensure `preprocessor_config.json` ships next to the weights."
+            )
+        return {
+            "conversation_list": conversation_list,
+            "generated": {"type": "image", "value": self._image_processor.postprocess(pixel_values[-1])[0]},
+        }
+
+    def _select_vae_decode_items(
+        self, conversation_list: list[list[ConversationItem]] | None
+    ) -> list[ConversationItem]:
+        if conversation_list is None:
+            raise ValueError("BagelVAE decode requires conversation_list to select latent items.")
+
+        # Final image decode consumes the completed latent emitted by the flow connector.
+        decode_items: list[ConversationItem] = []
+        for item in iter_desired_items(conversation_list, types=["output"], sources=[BAGEL_GENERATED_LATENT]):
+            if not is_dummy(item):
+                decode_items.append(item)
+        return decode_items
+
+
+class BagelVAE(InferenceMixin, OmniPreTrainedModel):
     config_class = BagelVAEConfig
     image_processor_class = BagelVAEProcessor
+    preprocessor_class = BagelVAEPreprocessor
     base_model_prefix = "bagel_vae"
     main_input_name = "pixel_values"
     _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
@@ -388,4 +505,6 @@ class Decoder(nn.Module):
 __all__ = [
     "BagelVAE",
     "BagelVAEConfig",
+    "InferenceMixin",
+    "select_bagel_vae_context_items",
 ]
