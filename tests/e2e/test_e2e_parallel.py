@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
@@ -551,7 +552,21 @@ def test_qwen3vl_parallel_align(
     )
 
 
-def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset):
+def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
+    lora_config_path = tmp_path / "qwen3vl_lora_smoke.yaml"
+    lora_config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "lora_config": {
+                        "rank": 4,
+                        "alpha": 8,
+                        "lora_modules": ["q_proj", "qkv"],
+                    }
+                }
+            }
+        )
+    )
     results = main(
         task_name="train_vlm_test",
         model_name="qwen3vl",
@@ -563,7 +578,7 @@ def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset):
         max_sp_size=1,
         compare_alignment=False,
         extra_args=[
-            '--model.lora_config={"rank":4,"alpha":8,"lora_modules":["q_proj","qkv"]}',
+            str(lora_config_path),
             "--train.freeze_vit=True",
         ],
     )
