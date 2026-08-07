@@ -15,6 +15,7 @@
 from . import (
     deepseek_v3,
     deepseek_v4,
+    deepspec_draft,
     flux,
     gemma3,
     glm_moe_dsa,
@@ -41,6 +42,7 @@ from . import (
 __all__ = [
     "deepseek_v3",
     "deepseek_v4",
+    "deepspec_draft",
     "flux",
     "gemma3",
     "gpt_oss",

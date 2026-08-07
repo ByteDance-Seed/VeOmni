@@ -1,0 +1,68 @@
+# DeepSpec Eagle3 draft model (target: Qwen/Qwen3-4B), trained on VeOmni.
+#
+# Prereqs:
+#   1. Build the target cache with DeepSpec (scripts/data/prepare_target_cache.py).
+#   2. Build the draft init checkpoint + config with:
+#        python scripts/deepspec/prepare_draft_init.py --algorithm eagle3 --arch qwen3 \
+#            --target_model_name_or_path Qwen/Qwen3-4B \
+#            --output_dir ~/deepspec_init/eagle3_qwen3_4b \
+#            --target_layer_ids 1 17 33 \
+#            --draft_num_hidden_layers 1 --ttt_length 7 --step_loss_decay 0.8
+#   3. Launch:
+#        bash train.sh tasks/train_deepspec_draft.py configs/deepspec/eagle3_qwen3_4b.yaml
+#
+# ttt_length / step_loss_decay are persisted in the draft config.json (they are
+# read from the model), so they need not be repeated under model.model_config.
+
+model:
+  config_path: ~/deepspec_init/eagle3_qwen3_4b
+  model_path: ~/deepspec_init/eagle3_qwen3_4b
+  tokenizer_path: Qwen/Qwen3-4B
+  ops_implementation:
+    attn_implementation: sdpa
+
+data:
+  train_path: ~/target_cache/qwen3_4b
+  data_type: plaintext
+  max_seq_len: 4096
+  train_sample: 1000000
+  dataloader:
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+
+train:
+  accelerator:
+    ulysses_size: 1
+    tp_size: 1
+    ep_size: 1
+    pp_size: 1
+    cp_size: 1
+    dp_replicate_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+  gradient_checkpointing:
+    enable: true
+  dyn_bsz: false
+  global_batch_size: 512
+  micro_batch_size: 1
+  num_train_epochs: 10
+  init_device: meta
+  optimizer:
+    type: adamw
+    lr: 6.0e-4
+    lr_decay_style: cosine
+    lr_warmup_ratio: 0.04
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: ~/checkpoints/deepspec/eagle3_qwen3_4b_veomni
+    manager: dcp
+    save_steps: 3000
+    save_hf_weights: true
+  wandb:
+    project: VeOmni-DeepSpec
+    name: eagle3_qwen3_4b_veomni

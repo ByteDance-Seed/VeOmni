@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable
 
 from ._normalize import ruff_fix_and_format
-from .codegen import ModelingCodeGenerator, load_patch_config_module
+from .codegen import CodegenError, ModelingCodeGenerator, load_patch_config_module
 from .run_codegen import (
     DiscoveryConfig,
     build_unified_diff,
@@ -74,7 +74,13 @@ def check_config(
 
     # -- generate to a temp file ------------------------------------------------
     generator = ModelingCodeGenerator(config)
-    generator.load_source()
+    try:
+        generator.load_source()
+    except CodegenError:
+        if config.optional:
+            print(f"  SKIP  {config.source_module} (optional source not importable)")
+            return True
+        raise
     generated = generator.generate()
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:

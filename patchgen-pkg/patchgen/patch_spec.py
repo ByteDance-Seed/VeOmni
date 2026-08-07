@@ -130,6 +130,11 @@ class PatchConfig:
     # Optional: specify HF transformers version this is based on
     transformers_version: Optional[str] = None
 
+    # When True, the drift check skips this config if its ``source_module``
+    # cannot be imported (e.g. an optional third-party dependency like
+    # ``deepspec`` that isn't installed in the default CI environment).
+    optional: bool = False
+
     def replace_class(
         self,
         target_class: str,

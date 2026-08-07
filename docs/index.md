@@ -93,6 +93,7 @@ design/kernel_selection.md
 design/fused_moe_kernels.md
 design/local_parallel_state.md
 design/patchgen.md
+design/deepspec_draft_integration.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
 ```
