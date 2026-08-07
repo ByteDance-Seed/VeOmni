@@ -13,6 +13,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON="${REPO_ROOT}/.venv/bin/python"
+# MagiAttention upstream designates this contributor-maintained support fork
+# for its arbitrary-mask ffa-fa3 overlay. Pin it until an organization-owned
+# source publishes an equivalent package.
 FFA_REV="ee1d15159cda6f3f97bfab9e487da146a8254970"
 FFA_REQUIREMENT="ffa-fa3 @ git+https://github.com/demonatic/flash-attention.git@${FFA_REV}#subdirectory=hopper"
 SUPPORTED_HEAD_DIMS=(64 96 128 192 256)

@@ -88,6 +88,8 @@ gpu = [
   "peft==0.18.1",
   "megatron-energon>=7.2.1",
   "hf_transfer",
+  # MagiAttention 1.1.1 imports debugpy unconditionally from
+  # magi_attention.utils.debug but omits it from package metadata.
   "debugpy",
   "create-block-mask-cuda==0.1; sys_platform == 'linux'",
   "flash-attn-cute==0.0.2; sys_platform == 'linux'",
@@ -204,6 +206,10 @@ conflicts = [
 [tool.uv.sources]
 patchgen = { path = "patchgen-pkg", editable = true }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
+# MagiAttention upstream designates this contributor-maintained support branch
+# for its arbitrary-mask FA4 packages and SM90 ffa-fa3 overlay. Dao-AILab does
+# not publish equivalent packages.
+# Keep the immutable shared revision until an organization-owned source exists.
 create-block-mask-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/create_block_mask" }
 flash-attn-cute = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "flash_attn" }
 magi-to-hstu-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/magi_to_hstu" }
@@ -289,6 +295,14 @@ name = "flash-qla"
 version = "0.1.0"
 requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
 
+# The Magi packages below intentionally use empty static runtime metadata.
+# Their companion extensions declare no runtime requirements upstream, while
+# MagiAttention omits project dependencies and keeps a separate requirements
+# file that targets CUDA 12 NVSHMEM and an older Quack release. VeOmni skips
+# the communication extension and supplies the CUDA 13-compatible runtime
+# closure explicitly through the complete gpu extra: torch, CUTLASS DSL,
+# Quack, the three companion packages, and the otherwise undeclared debugpy.
+# Re-audit those direct dependencies whenever the pinned revisions change.
 [[tool.uv.dependency-metadata]]
 name = "magi-attention"
 version = "1.1.1"

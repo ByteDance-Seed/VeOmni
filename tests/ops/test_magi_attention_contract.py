@@ -145,6 +145,48 @@ def _set_fake_cuda_runtime(
     return set_calls
 
 
+@pytest.mark.parametrize("attn_implementation", ["magi_attention", "veomni_magi_attention_with_sp"])
+def test_build_foundation_model_rejects_magi_context_parallelism_before_config_load(monkeypatch, attn_implementation):
+    from veomni import ops as ops_module
+    from veomni.models import auto as model_auto
+
+    apply_calls = []
+    monkeypatch.setattr(ops_module, "apply_ops_config", lambda config: apply_calls.append(config))
+    monkeypatch.setattr(model_auto, "get_parallel_state", lambda: SimpleNamespace(cp_size=2))
+    monkeypatch.setattr(
+        model_auto,
+        "build_config",
+        lambda *args, **kwargs: pytest.fail("MagiAttention CP validation must run before loading model config."),
+    )
+
+    with pytest.raises(ValueError, match=r"MagiAttention.*cp_size == 1.*cp_size=2"):
+        model_auto.build_foundation_model(
+            config_path="unused",
+            ops_implementation=SimpleNamespace(attn_implementation=attn_implementation),
+        )
+    assert apply_calls == []
+
+
+def test_build_foundation_model_rejects_preinstalled_magi_context_parallelism_before_config_load(monkeypatch):
+    from veomni.models import auto as model_auto
+    from veomni.ops.config import singleton as ops_singleton
+
+    monkeypatch.setattr(
+        ops_singleton,
+        "get_ops_config",
+        lambda: SimpleNamespace(attn_implementation="veomni_magi_attention_with_sp"),
+    )
+    monkeypatch.setattr(model_auto, "get_parallel_state", lambda: SimpleNamespace(cp_size=2))
+    monkeypatch.setattr(
+        model_auto,
+        "build_config",
+        lambda *args, **kwargs: pytest.fail("MagiAttention CP validation must run before loading model config."),
+    )
+
+    with pytest.raises(ValueError, match=r"MagiAttention.*cp_size == 1.*cp_size=2"):
+        model_auto.build_foundation_model(config_path="unused")
+
+
 def test_magi_attention_module_slot_preserves_public_ffa_contract(monkeypatch):
     captured = {}
 
