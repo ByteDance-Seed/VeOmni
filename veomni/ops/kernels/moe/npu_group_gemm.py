@@ -244,6 +244,7 @@ def npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    assume_distinct_experts: bool = False,  # accepted for a uniform dispatch interface; the NPU group GEMM has no max_M launch bound to tighten.
 ):
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(
