@@ -31,6 +31,7 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
     main_input_name = "inputs_embeds"
     _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
 
     def __init__(self, config: BagelQwen2MoTConfig):
         super().__init__(config)
