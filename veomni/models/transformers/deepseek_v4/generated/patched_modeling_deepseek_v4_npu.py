@@ -37,6 +37,8 @@
 #      Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path (fused_npu backend)
+#    - method_override: DeepseekV4SparseMoeBlock.__init__
+#      Flag routed experts to use the conservative max_M bound under non-distinct hash routing
 #    - method_override: DeepseekV4ForCausalLM.forward
 #      OpSlot guard for fused cross entropy in DeepseekV4ForCausalLM.forward
 #    - method_override: DeepseekV4ForCausalLM.get_parallel_plan
@@ -1412,11 +1414,12 @@ class DeepseekV4Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
-        # See the GPU patch: hash routing has no distinct-expert guarantee, so
-        # ``DeepseekV4SparseMoeBlock`` overrides this to False for hash_moe layers.
-        # (The NPU group GEMM ignores the flag, but it is kept for a uniform
-        # experts interface across backends.)
-        self.assume_distinct_experts = True
+        # Per-expert grouped-GEMM ``max_M`` launch bound selector. Defaults to
+        # the conservative ``T * top_k`` (``assume_distinct_experts`` False):
+        # ``DeepseekV4SparseMoeBlock`` opts the learned top-k layers into the
+        # tight ``T`` bound and keeps hash layers conservative. See
+        # ``compute_max_expert_tokens``.
+        self.assume_distinct_experts = False
 
     def forward(
         self,
@@ -1547,16 +1550,36 @@ class DeepseekV4HashRouter(nn.Module):
         return logits, weights * self.routed_scaling_factor, indices
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4SparseMoeBlock
+# Methods patched: __init__
+# ======================================================================
+
+
 class DeepseekV4SparseMoeBlock(nn.Module):
-    def __init__(self, config: DeepseekV4Config, layer_idx: int):
+    # ================================================================
+    # Patch: DeepseekV4SparseMoeBlock.__init__
+    # Tell the routed experts whether every token contributes at most one row
+    # per expert. The learned top-k router (``torch.topk``) always selects
+    # distinct experts, so the fused grouped-GEMM can use the tight
+    # ``max_M = num_tokens`` launch bound. Hash routing (``mlp_layer_types ==
+    # "hash_moe"``) selects experts from a frozen ``tid2eid`` table with no
+    # distinct-per-token guarantee — a token may map to the same expert twice —
+    # so it must fall back to the conservative ``max_M = num_tokens * top_k``.
+    # ================================================================
+    def __init__(self, config: "DeepseekV4Config", layer_idx: int):
+        # ``nn.Module.__init__(self)`` rather than ``super().__init__()``: this
+        # function is defined at module scope and installed as the class ``__init__``
+        # by ``override_method``, so a zero-arg ``super()`` has no ``__class__`` cell
+        # to bind and would raise. Do not "fix" this back to ``super().__init__()``.
         nn.Module.__init__(self)
         self.is_hash = config.mlp_layer_types[layer_idx] == "hash_moe"
         self.gate = DeepseekV4HashRouter(config) if self.is_hash else DeepseekV4TopKRouter(config)
         self.experts = DeepseekV4Experts(config)
-        # Hash routing uses a frozen token->expert table that may map a token's
-        # top_k slots to non-distinct experts, so a single token can contribute
-        # more than one row to the same expert. In that case the tight max_M = T
-        # bound is unsafe; fall back to the conservative max_M = T * top_k bound.
+        # Only the learned top-k router (``torch.topk``) guarantees distinct experts
+        # per token, so opt those layers into the tight ``max_M = T`` grouped-GEMM
+        # bound. Hash routing reads a frozen ``tid2eid`` table that may repeat an
+        # expert within a token's slots, so it keeps the conservative default.
         self.experts.assume_distinct_experts = not self.is_hash
         self.shared_experts = DeepseekV4MLP(config)
 

@@ -656,7 +656,7 @@ def quack_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
-    assume_distinct_experts: bool = True,  # noqa: ARG001 - accepted for a uniform dispatch interface; the CUTLASS varlen GEMM has no max_M launch bound to tighten.
+    assume_distinct_experts: bool = False,  # accepted for a uniform dispatch interface; the CUTLASS varlen GEMM has no max_M launch bound to tighten.
 ):
     """Quack GEMM fused MoE forward pass.
 

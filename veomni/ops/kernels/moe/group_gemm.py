@@ -54,7 +54,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         fc1_2_weight,
         fc2_weight,
         swiglu_limit=None,
-        assume_distinct_experts=True,
+        assume_distinct_experts=False,
     ):
         # MOE Step 3: dispatch input tokens to the experts
         # result shape is (batch_size * sequence_len * topk, hidden_size)
@@ -85,12 +85,17 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # With standard top-k routing (``torch.topk`` over the router logits)
         # every token picks ``top_k`` *distinct* experts, so a given expert
         # receives at most one row per token: ``max_e counts[e] <= T`` where
-        # ``T = expert_index.shape[0]`` is the token count. Using ``T`` instead
-        # of the full scattered row count ``T * top_k`` (``scatter_output.shape[0]``)
-        # is therefore safe and shrinks the launched grid ``top_k``x on the
-        # M dimension. Routers without a distinct guarantee (e.g. the DeepSeek-V4
-        # hash router) pass ``assume_distinct_experts=False`` and fall back to the
-        # conservative ``T * top_k`` bound. See ``compute_max_expert_tokens``.
+        # ``T = expert_index.shape[0]`` is the token count. A caller that has
+        # verified its router is distinct opts in with
+        # ``assume_distinct_experts=True`` to use ``T`` instead of the full
+        # scattered row count ``T * top_k`` (``scatter_output.shape[0]``),
+        # shrinking the launched grid ``top_k``x on the M dimension. The default
+        # is ``False`` (conservative ``T * top_k``): the grouped-GEMM output is
+        # ``torch.empty`` and tiles past ``max_M`` never launch, so an unsafe
+        # tight bound leaves uninitialized rows rather than zeros. Distinctness
+        # is a per-router property, so ``T`` must be opted into explicitly (e.g.
+        # DeepSeek-V4's learned top-k layers) and hash-style routers keep the
+        # conservative default. See ``compute_max_expert_tokens``.
         max_expert_tokens = compute_max_expert_tokens(
             expert_index, expert_index.shape[1], assume_distinct_experts
         )
@@ -354,7 +359,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         fc1_1_2_weight,
         fc2_weight,
         swiglu_limit=None,
-        assume_distinct_experts=True,
+        assume_distinct_experts=False,
     ):
         splits = expert_histogram(expert_index, num_experts)
         _, scatter_index = compute_expert_scatter_index(expert_index)
@@ -364,8 +369,9 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # See ``TritonFusedMoeExpertFunction.forward`` for why ``T`` (the token
         # count) is a valid, tighter per-expert launch bound than the full
-        # scattered row count under distinct top-k routing. Non-distinct routers
-        # pass ``assume_distinct_experts=False`` for the conservative bound.
+        # scattered row count under distinct top-k routing. The default is the
+        # conservative ``T * top_k`` bound; distinct routers opt in explicitly
+        # with ``assume_distinct_experts=True``.
         max_expert_tokens = compute_max_expert_tokens(
             expert_index, expert_index.shape[1], assume_distinct_experts
         )
@@ -560,7 +566,7 @@ def group_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
-    assume_distinct_experts: bool = True,
+    assume_distinct_experts: bool = False,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -578,12 +584,13 @@ def group_gemm_fused_moe_forward(
     MoE model).
 
     ``assume_distinct_experts``: whether every token routes to ``top_k``
-    *distinct* experts (true for all ``torch.topk``-gated routers). When
-    ``True`` (default) the non-EP grouped GEMM uses the tight ``max_M = T``
-    launch bound; when ``False`` (e.g. DeepSeek-V4 hash routing, whose frozen
-    ``tid2eid`` table is not guaranteed distinct) it uses the conservative
-    ``T * top_k`` bound. Only affects the non-EP Triton path; the EP path bounds
-    ``max_M`` by the post-all-to-all row count independently.
+    *distinct* experts (true for all ``torch.topk``-gated routers). Defaults to
+    ``False`` (the conservative ``T * top_k`` launch bound, reproducing the
+    pre-change behaviour); a caller that has verified its router is distinct
+    opts in with ``True`` to get the tight ``max_M = T`` bound. The default is
+    conservative because under-bounding ``max_M`` leaves uninitialized rows in
+    the grouped-GEMM output. Only affects the non-EP Triton path; the EP path
+    bounds ``max_M`` by the post-all-to-all row count independently.
     """
     if get_parallel_state().ep_enabled:
         if fc1_1_2_weight is not None:

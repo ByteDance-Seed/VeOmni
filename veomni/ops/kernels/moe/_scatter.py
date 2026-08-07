@@ -82,7 +82,7 @@ def compute_expert_scatter_index(
 def compute_max_expert_tokens(
     expert_index: torch.Tensor,
     top_k: int,
-    assume_distinct_experts: bool = True,
+    assume_distinct_experts: bool = False,
 ) -> int:
     """Safe, tight per-expert row bound (``max_M``) for the grouped GEMM grid.
 
@@ -103,32 +103,51 @@ def compute_max_expert_tokens(
         ``max_e counts[e] <= T``. So ``T`` is a valid bound and is ``top_k``x
         smaller than the full scattered row count ``T * top_k``
         (``scatter_output.shape[0]``), shrinking the launched grid accordingly.
+        A caller that has verified its router is distinct opts in with
+        ``assume_distinct_experts=True`` (e.g. every ``torch.topk``-gated non-EP
+        fused-MoE path in VeOmni: Qwen3-MoE, Qwen3.5-MoE, gpt-oss, DeepSeek-V4
+        ``DeepseekV4TopKRouter``).
 
-        This holds for every ``torch.topk``-gated non-EP fused-MoE path in
-        VeOmni (Qwen3-MoE, Qwen3.5-MoE, gpt-oss, DeepSeek-V4 ``DeepseekV4TopKRouter``).
-
-    When it does NOT hold (``assume_distinct_experts=False``):
+    Why the default is conservative (``assume_distinct_experts=False``):
         Some routers select experts *without* a distinct guarantee — e.g. the
         DeepSeek-V4 hash router looks up a frozen ``tid2eid`` table whose per-token
         rows are not verified to be distinct. If one token maps to the same expert
-        more than once, that expert can receive up to ``T * top_k`` rows and ``T``
-        would under-count, silently dropping rows. Callers in that regime pass
-        ``assume_distinct_experts=False`` to get the conservative
-        ``T * top_k`` bound (== ``scatter_output.shape[0]``), which is always safe.
+        more than once, that expert can receive up to ``T * top_k`` rows; with the
+        tight ``T`` bound the overflow tiles are never launched, so those output
+        rows keep the **uninitialized memory** of ``torch.empty`` (not zeros, not a
+        detectable dropped-row pattern) — silent, unreproducible garbage. Failing
+        toward this bound would be unsafe, so ``T`` must be an explicit opt-in and
+        the default returns the conservative ``T * top_k`` bound
+        (== ``scatter_output.shape[0]``), which reproduces the pre-change behaviour
+        and is safe for arbitrary routing.
 
     Args:
-        expert_index: ``[T, top_k]`` integer expert assignments per token.
-        top_k: number of expert slots per token (``expert_index.shape[1]``);
-            taken explicitly so the conservative bound is exact even if the
-            caller flattened the index.
-        assume_distinct_experts: when ``True`` (default) return the tight ``T``
-            bound valid under distinct top-k routing; when ``False`` return the
-            conservative ``T * top_k`` bound safe for arbitrary routing.
+        expert_index: ``[T, top_k]`` integer expert assignments per token. Must
+            be 2-D: ``T = expert_index.shape[0]`` is the token count and both
+            return values are derived from it, so a flattened ``[T * top_k]``
+            index would make ``T`` wrong (``T * top_k``) and silently corrupt
+            both bounds. The 2-D contract is enforced with a ``ValueError``.
+        top_k: number of expert slots per token (``expert_index.shape[1]``),
+            taken explicitly so callers that already hold it avoid a redundant
+            ``.shape`` read; it is only used for the conservative branch.
+        assume_distinct_experts: when ``True`` return the tight ``T`` bound,
+            valid only under distinct top-k routing; when ``False`` (default)
+            return the conservative ``T * top_k`` bound safe for arbitrary
+            routing. The default is conservative on purpose: under-bounding
+            ``max_M`` leaves uninitialized rows in the grouped-GEMM output
+            (see ``group_gemm_same_nk``), so the tight bound must be opted into
+            explicitly by a caller that has verified its router is distinct.
 
     Returns:
         A Python ``int`` usable directly as ``max_M`` (no host/device sync,
         unlike ``int(counts.max())``).
     """
+    if expert_index.ndim != 2:
+        raise ValueError(
+            "compute_max_expert_tokens expects a 2-D [T, top_k] expert_index; "
+            f"got shape {tuple(expert_index.shape)}. A flattened index would make "
+            "the token count T ambiguous and corrupt the max_M bound."
+        )
     T = expert_index.shape[0]
     if assume_distinct_experts:
         return T
