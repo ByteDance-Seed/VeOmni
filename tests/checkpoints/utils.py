@@ -103,6 +103,7 @@ def get_checkpoint_test_command(
         "--train.checkpoint.manager dcp",
         "--train.checkpoint.save_async True",
         f"--train.checkpoint.save_hf_weights {save_hf_weights}",
+        "--train.enable_full_determinism True",
     ]
     # HSDP: split the FSDP dim into (dp_replicate, dp_shard). dp_shard is
     # inferred as dp_size // dp_replicate_size by the argument resolver, and the
