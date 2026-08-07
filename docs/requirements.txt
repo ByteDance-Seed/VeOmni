@@ -1,11 +1,14 @@
-# markdown suport
-myst-parser
+# Sphinx build
+sphinx==9.1.0
 
-# theme default book
-sphinx-book-theme
+# Markdown support
+myst-parser==5.1.0
 
-# markdown table suport
-sphinx-markdown-tables
+# Default book theme
+sphinx-book-theme==1.4.0
 
-# crate-docs-theme
-sphinx-rtd-theme
+# Markdown table support
+sphinx-markdown-tables==0.0.17
+
+# Read the Docs theme
+sphinx-rtd-theme==3.1.0
