@@ -205,7 +205,7 @@ docker stop ascend-a2-container && docker rm ascend-a2-container
 | Dependency Manager | uv | pip |
 | Virtual Environment | Required | Not Required |
 | Activation Command | `source /app/.venv/bin/activate` | N/A |
-| Installation Command | `uv sync --locked --all-packages --extra npu --extra audio --dev` | `pip install -e .[npu_aarch64]` |
+| Installation Command | `uv sync --locked --all-packages --extra npu --dev` | `pip install -e .[npu_aarch64]` |
 
 ### Device Access
 The container requires access to all Ascend devices for proper functionality. The `--device` flags in the run command grant access to these devices.

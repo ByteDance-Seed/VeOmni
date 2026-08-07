@@ -348,7 +348,7 @@ class WanT2VDataset(Dataset):
     WIDTH = 16
     TEXT_SEQ_LEN = 10
     TEXT_DIM = 512  # matches toy config text_dim
-    TIMESTEP = 500.0
+    TIMESTEP = 0.5
 
     def __init__(self, size: int = 16) -> None:
         self.size = size

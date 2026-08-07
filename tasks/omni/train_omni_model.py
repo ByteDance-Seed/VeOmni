@@ -27,6 +27,7 @@ from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
@@ -40,6 +41,7 @@ MAX_PIXELS = 768 * 28 * 28
 
 @dataclass
 class MyDataArguments(DataArguments):
+    supports_torch_compile = False
     max_image_nums: Optional[int] = field(
         default=None,
         metadata={"help": "The max number of images in the sample."},
@@ -95,6 +97,8 @@ class Arguments(VeOmniArguments):
 
 def main():
     args = parse_args(Arguments)
+    if args.train.chunk_mbs_config.enable:
+        raise ValueError("ChunkMBS is not supported by tasks/omni/train_omni_model.py yet.")
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
@@ -207,6 +211,8 @@ def main():
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train_steps,
         dyn_bsz=args.train.dyn_bsz,
+        dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+        dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
@@ -245,6 +251,16 @@ def main():
     if hasattr(model, "get_parallel_plan"):
         cpu_load_param_name = getattr(model.get_parallel_plan(), "cpu_load_param_name", None)
 
+    skip_hf_weight_load = should_skip_hf_weight_load(
+        args.train.checkpoint.load_path,
+        getattr(args.model, "lora_config", None),
+    )
+    if skip_hf_weight_load:
+        logger.info_rank0(
+            f"Checkpoint resume path set ({args.train.checkpoint.load_path}); "
+            f"will skip HF weight load from {args.model.model_path}."
+        )
+
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
@@ -259,6 +275,7 @@ def main():
         broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
         cpu_load_param_name=cpu_load_param_name,
         max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+        should_skip_hf_weight_load=skip_hf_weight_load,
     )
     optimizer = build_optimizer(
         model,

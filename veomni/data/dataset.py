@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import math
 import os
 import random
 import traceback
@@ -37,6 +38,7 @@ except ImportError:
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from ..utils.constants import IGNORE_INDEX
 from ..utils.dist_utils import main_process_first
 from ..utils.multisource_utils import parse_multisource_config
 
@@ -251,13 +253,103 @@ class EnergonDataset(IterativeDataset):
             logger.debug(f"Dataset {type(self._data).__name__} does not support set_epoch or state reset")
 
 
+def _sum_sequence_like(value: Any) -> int:
+    """Return the sum of tensor, ndarray, list, tuple, or scalar values."""
+    if isinstance(value, torch.Tensor):
+        return int(value.sum().item())
+    if isinstance(value, np.ndarray):
+        return int(value.sum())
+    if isinstance(value, (list, tuple)):
+        return int(sum(value))
+    return int(value)
+
+
+def _numel_sequence_like(value: Any) -> int:
+    """Return the flattened element count of tensor, ndarray, list, tuple, or scalar values."""
+    if isinstance(value, torch.Tensor):
+        return int(value.numel())
+    if isinstance(value, np.ndarray):
+        return int(value.size)
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return int(value)
+
+
 def get_length_by_attention_mask_fn(sample):
     """Return token length from ``attention_mask``.
 
     Defined as a top-level helper instead of an inline lambda because ``spawn``
     worker mode requires the callable to be pickleable.
     """
-    return int(sample["attention_mask"].sum())
+    return _sum_sequence_like(sample["attention_mask"])
+
+
+def get_length_by_input_ids_fn(sample):
+    """Return physical token length from ``input_ids``."""
+    return _numel_sequence_like(sample["input_ids"])
+
+
+def get_length_by_labels_fn(sample: Any) -> int:
+    """Return effective token length from ``labels`` (i.e. tokens contributing to loss).
+
+    A token contributes to loss iff its label is not ``IGNORE_INDEX``. Falls back to
+    ``attention_mask`` when ``labels`` is absent (e.g. some unsupervised pipelines).
+
+    Note: this counts pre-pack labels; ``PackingCollator`` and SP label shifting may
+    set additional ``IGNORE_INDEX`` positions later, but balancing is decided here at
+    sample ingestion time.
+    """
+    if sample is None:
+        return 0
+    if isinstance(sample, list):
+        return sum(get_length_by_labels_fn(item) for item in sample)
+    if not isinstance(sample, dict):
+        return 1
+
+    if "labels" in sample:
+        labels = sample["labels"]
+        if isinstance(labels, torch.Tensor):
+            return int((labels != IGNORE_INDEX).sum().item())
+        if isinstance(labels, np.ndarray):
+            return int((labels != IGNORE_INDEX).sum())
+        if isinstance(labels, list):
+            return sum(1 for label in labels if label != IGNORE_INDEX)
+
+    if "attention_mask" in sample:
+        attention_mask = sample["attention_mask"]
+        if isinstance(attention_mask, torch.Tensor):
+            return int(attention_mask.sum().item())
+        if isinstance(attention_mask, np.ndarray):
+            return int(attention_mask.sum())
+        if isinstance(attention_mask, list):
+            return int(sum(attention_mask))
+
+    if "input_ids" in sample:
+        input_ids = sample["input_ids"]
+        if isinstance(input_ids, torch.Tensor):
+            return int(input_ids.numel())
+        if isinstance(input_ids, np.ndarray):
+            return int(input_ids.size)
+        if isinstance(input_ids, list):
+            return len(input_ids)
+
+    return 1
+
+
+def get_length_fn_by_count_mode(count_mode: str):
+    """Return the per-sample length callable selected by ``count_mode``.
+
+    - ``"total"``: count all tokens via ``attention_mask`` (legacy behavior; matches
+      the physical-token budget ``micro_batch_size * max_seq_len``).
+    - ``"effective"``: count only tokens with ``labels != IGNORE_INDEX``. A separate
+      physical-token cap should still be enforced by dynamic batching to avoid
+      unbounded prompt-heavy micro batches.
+    """
+    if count_mode == "total":
+        return get_length_by_attention_mask_fn
+    if count_mode == "effective":
+        return get_length_by_labels_fn
+    raise ValueError(f"Unknown dyn_bsz count_mode: {count_mode!r} (expected 'total' or 'effective')")
 
 
 def _supports_output_index_for_resume(dataset: Any) -> bool:
@@ -721,6 +813,181 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._just_resumed = True
 
 
+class _MapStyleSamplerWrapper(IterableDataset):
+    """Internal wrapper that re-creates the sampler for a map-style dataset.
+
+    This is *not* a general-purpose dataset and is not meant to be used directly.
+    It exists only for one internal path: ``DynamicBatchingSizeDataset``
+    (``dyn_bsz_runtime="worker"``) accepts iterable upstreams only, so a map-style
+    dataset gets wrapped into an ``IterableDataset`` *before* the sampler decision in
+    ``build_native_dataloader`` and silently loses the ``StatefulDistributedSampler``
+    that would otherwise shard it. This wrapper puts that sampler back, inline, on top
+    of the map-style dataset:
+
+    1. Rank split: indices are deterministically shuffled with ``seed + epoch`` and
+       partitioned across ``num_replicas`` with the exact same padding and
+       strided-slice scheme as ``torch.utils.data.DistributedSampler``.
+    2. Worker split: inside each DataLoader worker, the rank's indices are further
+       strided-sliced by ``worker_id`` so that workers read disjoint samples with
+       balanced counts (difference <= 1).
+    3. Resume: the number of yielded samples is tracked per worker and exposed via
+       ``state_dict()`` / ``load_state_dict()``, composing with ``StatefulDataLoader``
+       per-worker snapshots (the same ``num_workers`` must be used on resume). On
+       resume the iterator skips the already-consumed prefix of the same
+       deterministic permutation.
+
+    It also implements the ``get_item()`` / ``output_index_for_resume`` protocol
+    required by ``DynamicBatchingSizeDataset(save_by_idx=True)``: yielded resume
+    indices are *global* dataset indices, so buffered samples are refetched in O(1)
+    on resume, independent of epoch or permutation.
+
+    Note:
+        With ``save_by_idx=True``, ``dataset[idx]`` must be deterministic: resume
+        rebuilds the buffer by re-fetching saved indices, so the same index must
+        yield the same sample(s). A transform expanding one index into a ``list`` is
+        fine (``DynamicBatchingSizeDataset`` tracks the sub-index), as long as that
+        expansion is reproducible.
+
+    Attributes:
+        dataset: The underlying map-style dataset (must support ``len()`` and
+            integer indexing).
+        num_replicas: Number of data-parallel ranks.
+        rank: This process's data-parallel rank.
+        shuffle: Whether to shuffle indices with ``seed + epoch`` each epoch.
+        seed: Base random seed shared by all ranks.
+    """
+
+    def __init__(
+        self,
+        dataset: "Dataset",
+        num_replicas: int = 1,
+        rank: int = 0,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> None:
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self._dataset_size = len(self.dataset)
+        # Set by DynamicBatchingSizeDataset.save_by_idx; when True, yield (sample, global_idx).
+        self.output_index_for_resume = False
+
+        self.num_samples = math.ceil(self._dataset_size / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+        self._yielded = 0
+        # When resumed from a checkpoint, __iter__ keeps the restored _yielded instead of
+        # resetting it to 0, mirroring DynamicBatchingSizeDataset's resume handling.
+        self._just_resumed = False
+
+    def __len__(self) -> int:
+        """Number of samples assigned to this rank (across all of its workers)."""
+        return self.num_samples
+
+    def _rank_indices(self) -> torch.Tensor:
+        """Compute this rank's global indices, mirroring ``DistributedSampler.__iter__``."""
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(self._dataset_size, generator=g)
+        else:
+            indices = torch.arange(self._dataset_size)
+
+        # Pad by wrapping around so every rank gets the same number of samples.
+        padding_size = self.total_size - len(indices)
+        if padding_size > 0:
+            if padding_size <= len(indices):
+                padding = indices[:padding_size]
+            else:
+                padding = indices.repeat(math.ceil(padding_size / len(indices)))[:padding_size]
+            indices = torch.cat((indices, padding))
+        assert len(indices) == self.total_size
+
+        return indices[self.rank : self.total_size : self.num_replicas]
+
+    def __iter__(self):
+        if not self._just_resumed:
+            self._yielded = 0
+        else:
+            self._just_resumed = False
+            if hasattr(self.dataset, "_just_resumed"):
+                self.dataset._just_resumed = False
+
+        return self._iter()
+
+    def _iter(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        # Strided worker split keeps per-worker counts balanced (difference <= 1).
+        indices = self._rank_indices()[worker_id::num_workers].tolist()
+        if self._yielded > len(indices):
+            raise RuntimeError(
+                f"Restored yielded count {self._yielded} exceeds this worker's {len(indices)} assigned samples."
+            )
+
+        for idx in indices[self._yielded :]:
+            self._yielded += 1
+            sample = self.dataset[idx]
+            if self.output_index_for_resume:
+                yield sample, int(idx)
+            else:
+                yield sample
+
+    def get_item(self, idx: int):
+        """Refetch a sample by global dataset index (used by ``save_by_idx`` resume)."""
+        return self.dataset[idx]
+
+    def _sampler_fingerprint(self) -> Dict[str, Any]:
+        return {
+            "num_replicas": self.num_replicas,
+            "seed": self.seed,
+            "dataset_size": self._dataset_size,
+            "shuffle": self.shuffle,
+        }
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "epoch": self.epoch,
+            "yielded": self._yielded,
+            **self._sampler_fingerprint(),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        missing_keys = self._sampler_fingerprint().keys() - state_dict.keys()
+        if missing_keys:
+            raise RuntimeError(
+                f"Cannot restore _MapStyleSamplerWrapper: checkpoint is missing sampler fingerprint fields "
+                f"{sorted(missing_keys)}."
+            )
+
+        mismatches = []
+        for key, current_value in self._sampler_fingerprint().items():
+            checkpoint_value = state_dict[key]
+            if checkpoint_value != current_value:
+                mismatches.append(f"{key}: checkpoint={checkpoint_value!r}, current={current_value!r}")
+        if mismatches:
+            raise RuntimeError(
+                f"Cannot restore _MapStyleSamplerWrapper with a different sampler setup: {'; '.join(mismatches)}"
+            )
+
+        self.epoch = state_dict["epoch"]
+        self._yielded = state_dict["yielded"]
+        self._just_resumed = True
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        if hasattr(self.dataset, "set_epoch") and callable(self.dataset.set_epoch):
+            self.dataset.set_epoch(epoch)
+
+
 class DynamicBatchingSizeDataset(IterableDataset):
     """Dynamic batching dataset that yields micro batches based on token count.
 
@@ -759,6 +1026,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
         dynamic_batching_collate_fn: Callable,
         save_by_idx: bool = True,
         get_length_fn: Optional[Callable] = get_length_by_attention_mask_fn,
+        physical_token_cap: Optional[int] = None,
+        get_physical_length_fn: Optional[Callable] = get_length_by_attention_mask_fn,
         force_generate_long_sequence: bool = False,
     ) -> None:
         """Initialize the DynamicBatchingSizeDataset.
@@ -823,6 +1092,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self.ready_for_micro_batch_threshold = ready_for_micro_batch_threshold
         self.micro_batch_seq_length = micro_batch_seq_length
         self.get_length_fn = get_length_fn
+        self.physical_token_cap = physical_token_cap
+        self.get_physical_length_fn = get_physical_length_fn
 
         self.save_by_idx = save_by_idx
 
@@ -833,6 +1104,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         self._buffer = []
         self._buffer_of_output_index = []
         self._buffer_token_count = 0
+        self._buffer_physical_token_count = 0
 
         self._just_resumed = False  # Flag to indicate if the dataset has just been resumed from a checkpoint, used to skip buffer checks on the first iteration after resume.
 
@@ -851,36 +1123,42 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self.dataset.output_index_for_resume = value
 
     def __iter__(self):
-        """Iterate over the dataset and yield dynamically batched micro batches.
+        """
+        Iterate over the dataset and yield dynamically batched micro batches.
 
         Buffers samples from the underlying dataset and yields micro batches when
         the buffer contains enough samples and tokens. Each yielded batch is collated
         using the dynamic_batching_collate_fn.
-
-        Yields:
-            Collated micro batch when buffer conditions are met.
-
-        Raises:
-            Exception: Re-raises any exception other than StopIteration encountered
-                during iteration.
         """
-        self._data_iter = iter(self.dataset)
-
         if not self._just_resumed:
             # Clear buffer state on new iteration unless we just resumed from a checkpoint,
             # in which case we want to keep the buffer contents.
             self._buffer = []
             self._buffer_of_output_index = []
             self._buffer_token_count = 0
+            self._buffer_physical_token_count = 0
+            if hasattr(self.dataset, "_just_resumed"):
+                self.dataset._just_resumed = False
         else:
             self._just_resumed = False
 
+        return self._iter()
+
+    def _iter(self):
+        self._data_iter = iter(self.dataset)
+
         while True:
             try:
-                if (
+                effective_ready = (
                     len(self._buffer) >= self.ready_for_micro_batch_threshold
                     and self._buffer_token_count >= self.micro_batch_seq_length
-                ):
+                )
+                physical_ready = (
+                    len(self._buffer) >= self.ready_for_micro_batch_threshold
+                    and self.physical_token_cap is not None
+                    and self._buffer_physical_token_count >= self.physical_token_cap
+                )
+                if effective_ready or physical_ready:
                     micro_batch = self._get_micro_batch()
                     micro_batch = self.dynamic_batching_collate_fn(micro_batch)
                     if micro_batch is not None:
@@ -897,14 +1175,16 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 samples_to_add = item if isinstance(item, list) else [item]
                 for sample_idx, sample in enumerate(samples_to_add):
                     length = self.get_length_fn(sample)
+                    physical_length = (
+                        self.get_physical_length_fn(sample) if self.get_physical_length_fn is not None else length
+                    )
                     if length > self.micro_batch_seq_length and not self.force_generate_long_sequence:
                         # TODO: record the count of discarded long examples for monitoring
                         logger.warning(
                             f"Sample length {length} exceeds micro batch seq length {self.micro_batch_seq_length}, skipping. If you want to force generate a micro batch with this sample, enable force_generate_long_sequence."
                         )
                         continue
-
-                    self._buffer.append((sample, length))
+                    self._buffer.append((sample, length, physical_length))
                     if self.save_by_idx:
                         # Save one output-index entry per buffered sample.
                         # An upstream dataset may yield ``list[dict]`` in one
@@ -912,6 +1192,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
                         # sample within that list during resume.
                         self._buffer_of_output_index.append((output_index, sample_idx))
                     self._buffer_token_count += length
+                    self._buffer_physical_token_count += physical_length
 
             except Exception as e:
                 if isinstance(e, StopIteration):
@@ -948,10 +1229,12 @@ class DynamicBatchingSizeDataset(IterableDataset):
         """
         micro_batch = []
         seq_length = 0
+        physical_seq_length = 0
         indices_to_remove_from_buffer = []
 
         for idx, item in enumerate(self._buffer):
             sample, length = item[0], item[1]
+            physical_length = item[2] if len(item) > 2 else length
 
             if length + seq_length > self.micro_batch_seq_length:
                 if seq_length > 0:
@@ -960,9 +1243,18 @@ class DynamicBatchingSizeDataset(IterableDataset):
                     # Usually it is impossible to reach this branch because too long samples would not be added to the buffer if force_generate_long_sequence is False.
                     continue
 
+            if self.physical_token_cap is not None and physical_length + physical_seq_length > self.physical_token_cap:
+                if seq_length > 0:
+                    continue
+                logger.warning(
+                    f"Sample physical length {physical_length} exceeds physical token cap {self.physical_token_cap}; emitting it alone."
+                )
+
             micro_batch.append(sample)
             seq_length += length
+            physical_seq_length += physical_length
             self._buffer_token_count -= length
+            self._buffer_physical_token_count -= physical_length
             indices_to_remove_from_buffer.append(idx)
 
             if seq_length >= self.micro_batch_seq_length:
@@ -995,6 +1287,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
             "save_by_idx": self.save_by_idx,
             # Make sure we store an integer instead of any tensor
             "buffer_token_count": int(self._buffer_token_count),
+            "buffer_physical_token_count": int(self._buffer_physical_token_count),
         }
 
         # the state_dict might be called frequently with StatefulDataloaders(see more details of snapshot_every_n_steps)
@@ -1049,17 +1342,33 @@ class DynamicBatchingSizeDataset(IterableDataset):
                     cached_output_index = output_index
                 restored_sample = cached_restored_samples[sample_idx]
                 length = self.get_length_fn(restored_sample)
-                self._buffer.append((restored_sample, length))
+                physical_length = (
+                    self.get_physical_length_fn(restored_sample) if self.get_physical_length_fn is not None else length
+                )
+                self._buffer.append((restored_sample, length, physical_length))
                 if self.save_by_idx:
                     self._buffer_of_output_index.append(output_index_entry)
                 self._buffer_token_count += length
+                self._buffer_physical_token_count += physical_length
         else:
-            self._buffer = state_dict["buffer"]
+            self._buffer = [
+                item
+                if len(item) > 2
+                else (
+                    item[0],
+                    item[1],
+                    self.get_physical_length_fn(item[0]) if self.get_physical_length_fn is not None else item[1],
+                )
+                for item in state_dict["buffer"]
+            ]
             if self.save_by_idx and len(self._buffer) > 0:
                 raise ValueError("save_by_idx is True, but previous buffer contains valid samples instead of indices")
             self._buffer_of_output_index = []
 
         self._buffer_token_count = state_dict["buffer_token_count"]
+        self._buffer_physical_token_count = state_dict.get(
+            "buffer_physical_token_count", sum(item[2] if len(item) > 2 else item[1] for item in self._buffer)
+        )
         # Verify buffer_token_count matches the sum of token lengths
         assert self._buffer_token_count == sum([item[1] for item in self._buffer]), (
             "buffer_token_count does not match the sum of token lengths in buffer"
@@ -1067,7 +1376,9 @@ class DynamicBatchingSizeDataset(IterableDataset):
         assert self._buffer_token_count == sum(self.get_length_fn(item[0]) for item in self._buffer), (
             "buffer_token_count does not match the sum of lengths computed from samples in buffer"
         )
-        del state_dict["buffer"]
+        assert self._buffer_physical_token_count == sum(
+            item[2] if len(item) > 2 else item[1] for item in self._buffer
+        ), "buffer_physical_token_count does not match the sum of physical lengths in buffer"
 
         if "dynamic_batch_upstream_dataset_state" in state_dict:
             self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])

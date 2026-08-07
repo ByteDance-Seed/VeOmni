@@ -1,5 +1,6 @@
 """
 LoRA checkpoint save/load test using BaseTrainer + toy Qwen3 model (FSDP2).
+Runs on both GPU and NPU CI (the NPU unit-test workflow runs this too).
 
 Flow:
   1. Train 3 steps with LoRA adapter.

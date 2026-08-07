@@ -27,7 +27,7 @@ import difflib
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from ._normalize import ruff_fix_and_format
 from .codegen import CodegenError, ModelingCodeGenerator, load_patch_config_module
@@ -57,7 +57,7 @@ class DiscoveryConfig:
 
     search_root: Path
     package_prefix: str
-    legacy_patches_prefix: Optional[str] = None
+    legacy_patches_prefix: str | None = None
     ruff_extra_ignore: tuple[str, ...] = ()
     ruff_isolated: bool = False  # pass --isolated to ruff (line-length 88, no project config)
 
@@ -205,15 +205,15 @@ def print_config_summary(config: PatchConfig) -> None:
 
 def run_codegen(
     patch_module: str,
-    output_dir: Optional[Path],
+    output_dir: Path | None,
     config_name: str = "config",
     dry_run: bool = False,
     save_diff: bool = False,
     verbose: bool = False,
     ruff_extra_ignore: tuple[str, ...] = (),
     ruff_isolated: bool = False,
-    discovery: Optional[DiscoveryConfig] = None,
-) -> Optional[str]:
+    discovery: DiscoveryConfig | None = None,
+) -> str | None:
     """
     Run code generation for a patch configuration.
 
@@ -332,7 +332,7 @@ def run_codegen(
         return None
 
 
-def _build_parser(prog_name: Optional[str] = None) -> argparse.ArgumentParser:
+def _build_parser(prog_name: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog_name,
         description="Modeling Code Generator - Generate patched HuggingFace modeling code",
@@ -466,8 +466,8 @@ def _run_with_discovery(
 
 def build_cli(
     discovery: DiscoveryConfig,
-    prog_name: Optional[str] = None,
-) -> Callable[[Optional[list[str]]], int]:
+    prog_name: str | None = None,
+) -> Callable[[list[str] | None], int]:
     """Return a ``main()``-shaped callable that runs the run_codegen CLI
     rooted at ``discovery``.
 
@@ -478,7 +478,7 @@ def build_cli(
     """
     parser = _build_parser(prog_name=prog_name)
 
-    def _main(argv: Optional[list[str]] = None) -> int:
+    def _main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
         return _run_with_discovery(args, discovery, parser)
 

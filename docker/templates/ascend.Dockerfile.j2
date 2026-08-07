@@ -1,0 +1,88 @@
+{% for comment in header_comments %}# {{ comment }}
+{% endfor %}FROM {{ base_image }}
+
+# Define environments
+ENV MAX_JOBS=16
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_ROOT_USER_ACTION=ignore
+
+# Define installation arguments
+ARG APT_SOURCE={{ apt_source }}
+ARG PIP_INDEX={{ pip_index }}
+
+# ubuntu 22.04 line-format /etc/apt/sources.list (not the deb822 format used
+# by 24.04+). Only override on non-default APT_SOURCE. Wider regex matches any
+# `…/ubuntu[/]` URL so CANN bases preconfigured with Huawei Cloud / Aliyun
+# mirrors get rewritten too — anchoring on archive.ubuntu.com would silently
+# no-op there.
+RUN if [ "${APT_SOURCE}" != "{{ apt_source }}" ]; then \
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
+    sed -E -i "s#https?://[^[:space:]]+/ubuntu/?#${APT_SOURCE}#g" /etc/apt/sources.list; \
+    fi
+
+# Change pip source (only when --build-arg PIP_INDEX=... is overridden)
+RUN if [ "${PIP_INDEX}" != "{{ pip_index }}" ]; then \
+        pip config set global.index-url "${PIP_INDEX}" && \
+        pip config set global.extra-index-url "${PIP_INDEX}"; \
+    fi && \
+    pip config set global.no-cache-dir "true" && \
+    python -m pip install --upgrade pip
+
+# Ubuntu 22.04 base does not preinstall tzdata, unlike the CUDA base.
+RUN apt-get update -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y tzdata && \
+    echo "Setting timezone to CST (China Standard Time)..." && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone && \
+    dpkg-reconfigure -f noninteractive tzdata
+
+# gcc/g++/cmake/build-essential — compile sdists with no NPU/aarch64 wheel.
+# libnuma-dev — required by the Ascend runtime.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        gcc g++ cmake libnuma-dev sudo wget git curl jq vim build-essential ssh ca-certificates ffmpeg \
+    && apt-get clean
+
+# Add tiger user, remove default user if uid=1000 is occupied
+RUN userdel -r $(id -un 1000) 2>/dev/null || true && \
+    groupadd --non-unique -g 1000 tiger && \
+    useradd -g 1000 -u 1000 -d /home/tiger -m tiger && \
+    mkdir -p /home/tiger/.service/ && \
+    mkdir -p /home/tiger/.local/share/code-server/User/ && \
+    chown -R tiger:tiger /home/tiger && \
+    mkdir -p /opt/tiger && \
+    chown tiger:tiger /opt/tiger && \
+    mkdir -p /opt/log/tiger && \
+    chown -R tiger:tiger /opt/log && \
+    mkdir -p /var/log/tiger && \
+    chown tiger:tiger /var/log/tiger
+
+# enable VFS (Virtual File System) used by UCX for tiger user
+RUN mkdir -p /run/user/1000 && chown tiger:tiger /run/user/1000
+
+# Enable sudo for tiger user
+RUN mkdir -p /etc/sudoers.d && \
+    echo "tiger ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tiger && \
+    chmod 0440 /etc/sudoers.d/tiger
+
+# Add tiger python install permission
+RUN groupadd python-users && \
+    usermod -aG python-users root && \
+    usermod -aG python-users tiger && \
+    chown -R root:python-users {{ python_dist_packages }} && \
+    chmod -R g+w {{ python_dist_packages }} && \
+    chmod g+s {{ python_dist_packages }}
+
+USER tiger
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:{{ uv_version }} /uv /uvx /bin/
+ENV PATH="/bin/:$PATH"
+ENV UV_CACHE_DIR=/home/tiger/.cache/uv
+
+# uv sync
+WORKDIR {{ workdir }}
+COPY --chown=tiger:tiger . ./
+RUN {{ uv_sync_command }}
+
+USER root

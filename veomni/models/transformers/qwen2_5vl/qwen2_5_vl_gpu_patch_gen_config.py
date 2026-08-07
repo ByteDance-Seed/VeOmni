@@ -195,6 +195,14 @@ def qwen2_5_vl_vision_block_forward_patched(
     position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     **kwargs,
 ) -> torch.Tensor:
+    r"""
+    cu_seqlens (`torch.Tensor`):
+        Cumulative sequence lengths for variable-length vision attention.
+    max_seqlen (`int`):
+        Maximum per-image or per-video sequence length in the packed vision batch.
+    rotary_pos_emb (`torch.Tensor`, *optional*):
+        Precomputed rotary position embeddings for vision attention.
+    """
     hidden_states = hidden_states + self.attn(
         self.norm1(hidden_states),
         cu_seqlens=cu_seqlens,
@@ -581,6 +589,8 @@ def qwen2_5_vl_model_forward_patched(
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5_VLModelOutputWithPast:
     r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
     image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
         The temporal, height and width of feature shape of each image in LLM.
     video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
@@ -610,7 +620,7 @@ def qwen2_5_vl_model_forward_patched(
     if video_mask is None and image_mask is None:
         input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
         dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-        image_mask, video_mask = self.get_placeholder_mask(torch.cat(input_ids_list, dim=0))
+        image_mask, video_mask = self.get_placeholder_mask(torch.cat(input_ids_list, dim=1))
     # --- Patch.2 ---
 
     # --- Patch.3 ---
@@ -886,6 +896,8 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5_VLCausalLMOutputWithLogProbs:
     r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
     image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
         The temporal, height and width of feature shape of each image in LLM.
     video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):

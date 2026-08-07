@@ -49,7 +49,7 @@ jobs:
     runs-on: [self-hosted, 910b-8]
     timeout-minutes: 90
     container:
-      image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-tingyang_chore_bump_uv
+      image: quay.io/ascend/veomni:veomni-9.0.0-910b-ubuntu22.04-py3.11-torch2.10.0-latest
       volumes:
         - /usr/local/dcmi:/usr/local/dcmi
         - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
@@ -92,6 +92,10 @@ jobs:
       # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
+      # CANN 9.0.0: let OS assign HCCL ports (auto) to avoid port exhaustion
+      # and counter overflow to 65536 when many sub-communicators run sequentially.
+      HCCL_HOST_SOCKET_PORT_RANGE: "auto"
+      HCCL_NPU_SOCKET_PORT_RANGE: "auto"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
@@ -124,13 +128,6 @@ jobs:
           fi
           echo "ASCEND_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
           echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
-      # - name: Set up proxy
-      #   run: |
-      #     CURRENT_PROXY=$(cat /tmp/latest_proxy)
-      #     echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-      #     echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-      #     echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
-      #     echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
       - name: Check npu and CANN info
         run: |
           cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
@@ -145,7 +142,7 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --extra audio --group dev
+          uv sync --frozen --python 3.11 --extra npu --group dev
       - name: Check final pip list
         run: |
           uv pip list
@@ -156,6 +153,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_slice_input_tensor.py
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
+          uv run --frozen pytest -v -s -x tests/parallel/test_chunk_mbs.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
@@ -166,6 +164,12 @@ jobs:
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
+      - name: Run MoE ep_sharded_stream_load matrix (non-PEFT)
+        # Device-agnostic loader matrix (build_parallelize_model + the 3 weight
+        # loaders over EP+FSDP2 on a fake MoE model; no Triton / MoE kernel, so
+        # it runs on NPU via hccl).
+        run: |
+          uv run --frozen pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
       - name: Run checkpoint callback unit tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_checkpoint_callback.py
@@ -186,3 +190,22 @@ jobs:
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
+      - name: Run LoRA save/load test
+        # peft ships under the `npu` extra, so the earlier
+        # `uv sync --extra npu --group dev` step already installs it — no extra
+        # sync needed here.
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
+      - name: Run MoE-LoRA NPU fused vs eager parity
+        # Numerical gate for the new NPU fused MoE-LoRA autograd composition
+        # (shared + independent; forward + A/B grads; EP=1 vs non-EP).
+        # Cheap single-process; run before the multi-process stream-load test.
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_fused_npu.py
+      - name: Run MoE-LoRA ep_sharded_stream_load (PEFT, EP=2)
+        # Exercises the PEFT ep_sharded adapter streaming *and* the NPU
+        # fused MoE-LoRA EP kernel (fused_npu): the test auto-selects
+        # fused_npu on Ascend, so both the loader path and the EP forward
+        # are validated on NPU here.
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py

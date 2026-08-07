@@ -21,8 +21,8 @@ from .launch_utils import find_free_port
 # ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton) and
 # raise on NPU at config validation time, so every NPU test must override
 # every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
-# ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3, Qwen-VL family) pin specific
-# fields to ``eager`` where the model has no NPU kernel.
+# ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3/V4, Qwen-VL family) pin
+# specific fields to ``eager`` where the model has no NPU kernel.
 _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "attn_implementation": "flash_attention_2",
     "moe_implementation": "fused_npu",
@@ -39,6 +39,14 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v3": {
         # batch-invariant RMSNorm + deterministic RoPE are GPU-only Triton
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    "deepseek_v4": {
+        # DeepSeek-V4 attention is eager-only and its clamped SwiGLU requires
+        # swiglu_limit support that the NPU fused-MoE kernel does not yet have.
+        "attn_implementation": "eager",
+        "moe_implementation": "eager",
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
@@ -71,13 +79,14 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
-# backend. Wan's ``rope_apply(x, **kwargs)`` signature is incompatible with
-# the registry-default Liger RoPE — ``device_patch.py`` marks ``liger_kernel``
-# as explicitly disabled, so any non-eager value would raise. Wan training
-# YAMLs pin ``rotary_pos_emb_implementation: eager``, but e2e tests build CLI
-# args directly (no training YAML), so we pin here as well.
+# backend. Wan uses FA2 in real DiT configs, while RoPE stays eager because
+# its ``rope_apply(x, **kwargs)`` signature is incompatible with the
+# registry-default Liger RoPE.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
-    "wan_t2v": {"rotary_pos_emb_implementation": "eager"},
+    "wan_t2v": {
+        "attn_implementation": "flash_attention_2",
+        "rotary_pos_emb_implementation": "eager",
+    },
     # Qwen-Image runs its dual-stream joint attention through diffusers' own
     # attention dispatch (Ulysses SP is handled by QwenImageSPAttnProcessor, not
     # the VeOmni FA2 op), so keep the VeOmni attn/rope ops on eager.
@@ -90,6 +99,26 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # L20 runners where another job is still holding part of the card.
     "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
     "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
+    # GPT-OSS intentionally does not register a Triton MoE backend because its
+    # native interleaved gate/up training layout needs either eager reference
+    # math or the dedicated SM90-only Quack path. Keep the shared helper on the
+    # portable eager baseline; capability-gated tests append FA4/Quack flags.
+    "gpt_oss": {
+        "attn_implementation": "eager",
+        "moe_implementation": "eager",
+        "cross_entropy_loss_implementation": "eager",
+        "load_balancing_loss_implementation": "eager",
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    # DeepSeek-V4 attention and partial interleaved RoPE are eager-only. MoE
+    # uses the GPU-default fused_triton backend, while weighted/unweighted
+    # RMSNorm and the shared-expert MLP use their default Liger OpSlots.
+    "deepseek_v4": {
+        "attn_implementation": "eager",
+        "moe_implementation": "fused_triton",
+        "rotary_pos_emb_implementation": "eager",
+    },
 }
 
 
@@ -104,9 +133,10 @@ def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
     """Return ``--model.ops_implementation.X=Y`` flags for the active hardware.
 
     On GPU returns per-model overrides for models whose patched ops disable a
-    default backend (currently Wan); empty otherwise — dataclass defaults are
-    GPU-optimal. On NPU returns the NPU-supported backend per op, with
-    per-model eager fallbacks for ops without an NPU kernel for that model.
+    default backend (for example Wan's RoPE and DeepSeek-V4's eager-only
+    attention); empty otherwise — dataclass defaults are GPU-optimal. On NPU
+    returns the NPU-supported backend per op, with per-model eager fallbacks for
+    ops without an NPU kernel for that model.
     """
     if not is_torch_npu_available():
         overrides = _GPU_PER_MODEL_OVERRIDES.get(model_name, {}) if model_name else {}

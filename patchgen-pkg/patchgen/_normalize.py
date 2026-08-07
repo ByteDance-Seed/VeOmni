@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 
 DEFAULT_IGNORE = ("E402", "B007")
@@ -47,7 +46,7 @@ DEFAULT_IGNORE = ("E402", "B007")
 def ruff_fix_and_format(
     path: Path,
     *,
-    extra_ignore: Optional[tuple[str, ...]] = None,
+    extra_ignore: tuple[str, ...] | None = None,
     isolated: bool = False,
 ) -> None:
     """Run ``ruff check --fix`` + ``ruff format`` on *path*.

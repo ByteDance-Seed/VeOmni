@@ -29,14 +29,30 @@ logger = logging.get_logger(__name__)
 class DynBszBuffer:
     """
     A buffer to store samples for dynamic batch size.
+
+    Args:
+        get_length_fn: optional callable returning the per-sample token count used to
+            decide when a micro batch is ready. Defaults to ``attention_mask.sum()``
+            (i.e. total tokens). Pass a callable counting only ``labels != IGNORE_INDEX``
+            to balance by effective (loss-contributing) tokens.
+        get_physical_length_fn: optional callable returning the physical per-sample
+            token count used as a hard cap while selecting a micro batch.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        get_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+        get_physical_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+    ):
         self._buffer = []
         self._buffer_sample_lens = []
+        self._buffer_physical_lens = []
         self.del_idxs = []
         self.cur_idx = 0
         self.all_token_cnt = 0
+        self.all_physical_token_cnt = 0
+        self._get_length_fn = get_length_fn
+        self._get_physical_length_fn = get_physical_length_fn
 
     def append(self, item: Dict[str, Any]):
         """
@@ -47,28 +63,48 @@ class DynBszBuffer:
                 whose ``.sum()`` gives the number of valid tokens for batching.
         """
         self._buffer.append(item)
-        if "attention_mask" not in item:
-            raise KeyError("Expected 'attention_mask' in item")
-        self._buffer_sample_lens.append(item["attention_mask"].sum())
-        self.all_token_cnt += self._buffer_sample_lens[-1]
+        if self._get_length_fn is not None:
+            length = self._get_length_fn(item)
+        else:
+            if "attention_mask" not in item:
+                raise KeyError("Expected 'attention_mask' in item")
+            length = int(item["attention_mask"].sum())
+        if self._get_physical_length_fn is not None:
+            physical_length = self._get_physical_length_fn(item)
+        else:
+            physical_length = length
+        self._buffer_sample_lens.append(length)
+        self._buffer_physical_lens.append(physical_length)
+        self.all_token_cnt += length
+        self.all_physical_token_cnt += physical_length
 
-    def get_samples(self, n_token_per_iter: int, force: bool = True):
+    def get_samples(self, n_token_per_iter: int, force: bool = True, physical_token_cap: Optional[int] = None):
         """
         get samples from the buffer.
         Args:
             n_token_per_iter: the number of tokens to get.
             force: if True, the first sample will be returned even if it is not full.
+            This can emit one sample that exceeds ``physical_token_cap`` by itself,
+            but the cap still prevents adding more samples to that micro batch.
         Returns:
             samples: a list of samples.
         """
         cum_seq_len = 0
+        cum_physical_len = 0
         samples = []
         while self.cur_idx < len(self._buffer) and cum_seq_len < n_token_per_iter:
             seq_len = self._buffer_sample_lens[self.cur_idx]
+            physical_seq_len = self._buffer_physical_lens[self.cur_idx]
+            fits_effective_budget = seq_len <= n_token_per_iter - cum_seq_len
+            fits_physical_cap = physical_token_cap is None or (
+                physical_seq_len <= physical_token_cap - cum_physical_len
+            )
+            first_forced_sample = force is True and cum_seq_len == 0
             if self.cur_idx not in self.del_idxs and (
-                (force is True and cum_seq_len == 0) or (seq_len <= n_token_per_iter - cum_seq_len)
+                first_forced_sample or (fits_effective_budget and fits_physical_cap)
             ):
                 cum_seq_len += seq_len
+                cum_physical_len += physical_seq_len
                 samples.append(self._buffer[self.cur_idx])
                 self.del_idxs.append(self.cur_idx)
             self.cur_idx += 1
@@ -84,10 +120,14 @@ class DynBszBuffer:
         """
         self.cur_idx = 0
         self.all_token_cnt -= sum([self._buffer_sample_lens[idx] for idx in self.del_idxs])
+        self.all_physical_token_cnt -= sum([self._buffer_physical_lens[idx] for idx in self.del_idxs])
         buffer_len = len(self._buffer)
         self._buffer = [self._buffer[idx] for idx in range(buffer_len) if idx not in self.del_idxs]
         self._buffer_sample_lens = [
             self._buffer_sample_lens[idx] for idx in range(buffer_len) if idx not in self.del_idxs
+        ]
+        self._buffer_physical_lens = [
+            self._buffer_physical_lens[idx] for idx in range(buffer_len) if idx not in self.del_idxs
         ]
         self.del_idxs = []
 
@@ -129,6 +169,11 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         bsz_warmup_steps: the number of steps to warm up the batch size.
         bsz_warmup_init_mbtoken: the initial number of tokens to get for each request.
         buffer_size: the size of the buffer.
+        get_length_fn: optional per-sample length callable; see ``DynBszBuffer``.
+        physical_token_cap: optional hard cap on the total physical tokens selected
+            into each micro batch.
+        get_physical_length_fn: optional per-sample physical length callable; see
+            ``DynBszBuffer``.
     """
 
     def __init__(
@@ -137,6 +182,9 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         buffer_size: int = 500,
         bsz_warmup_steps: int = 0,
         bsz_warmup_init_mbtoken: int = 200,
+        get_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+        physical_token_cap: Optional[int] = None,
+        get_physical_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
     ) -> None:
         super().__init__()
         self._step = 0
@@ -147,10 +195,18 @@ class TextBatchingStrategy(BaseBatchingStrategy):
             assert self.bsz_warmup_init_mbtoken > 0
 
         self.buffer_size = buffer_size  # minimum samples in buffer
-        self.buffer = DynBszBuffer()
+        self.physical_token_cap = physical_token_cap
+        self.get_physical_length_fn = get_physical_length_fn
+        self.buffer = DynBszBuffer(get_length_fn=get_length_fn, get_physical_length_fn=get_physical_length_fn)
 
     def is_ready_for_micro_batch(self) -> bool:
-        return len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
+        effective_ready = len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz
+        physical_ready = (
+            len(self.buffer) >= self.buffer_size
+            and self.physical_token_cap is not None
+            and self.buffer.all_physical_token_cnt >= self.physical_token_cap
+        )
+        return effective_ready or physical_ready
 
     def put_item(self, item: Dict[str, Any]):
         if item["input_ids"].shape[-1] <= 1:
@@ -178,7 +234,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
 
         self._step = step
         cur_token_micro_bsz = self.get_cur_token_micro_bsz()
-        samples = self.buffer.get_samples(cur_token_micro_bsz)
+        samples = self.buffer.get_samples(cur_token_micro_bsz, physical_token_cap=self.physical_token_cap)
         self.buffer.flush()  # remove the selected samples.
         return samples
 

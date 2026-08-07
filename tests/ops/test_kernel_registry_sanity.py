@@ -91,6 +91,7 @@ class TestHardwareRequirement:
 EXPECTED_NPU_OPS = [
     ("rms_norm", "standard"),
     ("rms_norm", "residual_add"),
+    ("rms_norm", "unweighted"),
     ("rms_norm", "qwen3_5"),
     ("rotary_pos_emb", "full"),
     ("rotary_pos_emb_vision", "full"),

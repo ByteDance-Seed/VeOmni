@@ -1,0 +1,47 @@
+model:
+  model_path: google/gemma-3-270m
+  ops_implementation:
+    attn_implementation: flex_attention
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 4096
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  dyn_bsz: false
+  accelerator:
+    ulysses_size: 2
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  num_train_epochs: 3
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: gemma-3-270m-sft-tulu
+    manager: dcp
+    save_steps: 100
+    save_epochs: 1
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: gemma-3-270m-sft-tulu

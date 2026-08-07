@@ -31,7 +31,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from ..data.data_collator import MainCollator as Preforward
 from ..data.data_collator import PostCollator as Postforward
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from .base import BaseTrainer, VeOmniArguments, build_dataloader
 
@@ -39,7 +39,17 @@ from .base import BaseTrainer, VeOmniArguments, build_dataloader
 class BaseRLTrainer(BaseTrainer):
     def __init__(self, args: VeOmniArguments):
         super().__init__(args)
-        self._build_preforward_postforward()
+        # ``super().__init__`` builds under its own ``use_parallel_state`` scope
+        # and exits it; the collators built here also read the current
+        # ParallelState, so re-enter this trainer's state for them.
+        with use_parallel_state("base"):
+            self._build_preforward_postforward()
+
+    def _setup(self):
+        if self.args.train.chunk_mbs_config.enable:
+            raise ValueError("ChunkMBS is not supported by RL trainers yet.")
+
+        super()._setup()
 
     # post init preforward and postforward hooks
     def _build_preforward_postforward(self):
@@ -65,6 +75,8 @@ class BaseRLTrainer(BaseTrainer):
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             build_collate_fn=False,

@@ -6,7 +6,7 @@ This guide explains how VeOmni processes image and video inputs for vision-langu
 
 The multimodal data pipeline lives in `veomni/data/multimodal/` and handles:
 
-1. **Preprocessing** (`preprocess.py`) — converts raw data samples into a unified conversation format via the [Preprocessor Registry](../../key_features/preprocessor_registry.md).
+1. **Preprocessing** (`preprocess.py`) — converts raw data samples into a unified conversation format via the [Preprocessor Registry](../key_features/preprocessor_registry.md).
 2. **Image processing** (`image_utils.py`) — loads images, resizes them to fit pixel budgets while preserving aspect ratio and ViT patch alignment.
 3. **Video processing** (`video_utils.py`) — loads videos (via torchcodec), samples frames by FPS, resizes spatially, and optionally extracts audio.
 4. **Transform** (`multimodal_transform.py`) — orchestrates the above into tokenized model inputs with proper masking.

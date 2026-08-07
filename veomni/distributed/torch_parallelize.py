@@ -27,11 +27,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
-from ..models import load_model_weights, rank0_load_and_broadcast_weights
+from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .chunk_mbs import apply_chunk_mbs
+from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
+from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
 from .utils import sort_fqn_by_submodule_first
 
 
@@ -43,6 +46,60 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         module._is_hf_initialized = False
     for child in module.children():
         _reset_hf_initialized_flag(child)
+
+
+def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
+    """Materialize parameters without discarding config-derived buffers.
+
+    Distributed checkpoints restore ``state_dict()``, which excludes buffers
+    registered with ``persistent=False``. Snapshot those buffers before
+    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
+    materialization path without duplicating persistent buffers that DCP loads.
+    """
+    buffers = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:
+            buffer = module._buffers.get(name)
+            if buffer is not None:
+                buffers.append((module, name, buffer.detach().clone()))
+
+    model.to_empty(device=device)
+
+    for module, name, buffer in buffers:
+        materialized_buffer = module._buffers[name]
+        materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
+
+
+def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
+    """``fully_shard(..., shard_placement_fn=...)`` hook: shard on a model-chosen
+    dimension instead of the FSDP2 default ``Shard(0)``.
+
+    A model opts a specific parameter in by tagging it with a
+    ``_veomni_fsdp_shard_dim`` attribute in its own ``__init__`` (e.g. DeepSeek-V4's
+    compressor/indexer ``position_bias`` -- shape ``(compress_rate, head_dim*k)``
+    where ``compress_rate`` can be as small as 4, but the trailing dim is a large,
+    reliably-divisible power of 2). Sharding such a param on dim-0 across a large
+    FSDP world leaves most ranks with a genuinely empty local shard; redirecting it
+    to a dimension that divides evenly avoids that at no memory cost. Returning
+    ``None`` for untagged params keeps the FSDP2 default (``Shard(0)``).
+    """
+    dim = getattr(param, "_veomni_fsdp_shard_dim", None)
+    return Shard(dim) if dim is not None else None
+
+
+def _move_buffers_to_device(model: nn.Module, device: str) -> None:
+    """Place every buffer on ``device``.
+
+    ``CPUOffloadPolicy`` only offloads parameters, gradients and optimizer states:
+    ``fully_shard`` puts buffers on the FSDP device once at wrap time and never stages
+    them again. Meta init defers that move, so a CPU materialization leaves buffers such
+    as the DeepSeek-V4 hash-router ``tid2eid`` table or rotary ``inv_freq`` on CPU while
+    the activations are on the accelerator.
+    """
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if buffer is not None and buffer.device.type != device:
+                module._buffers[name] = buffer.to(device)
 
 
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
@@ -80,6 +137,8 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -105,6 +164,8 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
 
@@ -123,11 +184,14 @@ def parallelize_model_fsdp2(
     ]
     logger.info_rank0(f"target classes to shard: {target_classes}")
 
+    model._veomni_compile_enabled = False
+    compile_config = compile_config or CompileConfig()
+
     # Step 1: Apply ExtraParallel
     #   e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
     #        Apply embed parallelism (slice embed tensors [64,H] -> [16,H])
     if parallel_state.any_extra_parallel_enabled:
-        parallel_plan = model.get_parallel_plan()
+        parallel_plan = get_runtime_parallel_plan(model)
         assert parallel_plan is not None, (
             "ExtraParallel needs parallel plan defined in the model! \
             Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
@@ -142,7 +206,14 @@ def parallelize_model_fsdp2(
         _extra_parallel_mesh = {}
         _extra_parallel_map = {}
         for para in parallel_state.extra_parallel_names:
-            if parallel_state.extra_parallel_enabled(para):
+            # A globally-enabled ExtraParallel (e.g. ``ep``) may not be declared by
+            # THIS model's plan -- e.g. a text-encoder / over-encoder has no experts,
+            # so ``ep`` shards nothing here even though a MoE sibling module uses it.
+            # Treat such a para as a no-op for this model (``None``) instead of
+            # crashing in ``get_extra_parallel_fsdp_no_shard_info`` (which requires
+            # >=1 matching module). Nothing downstream wraps it (its layer para_mods
+            # stay empty).
+            if parallel_state.extra_parallel_enabled(para) and para in parallel_plan.extra_parallel_plan:
                 _extra_parallel_mesh[para] = parallel_state.extra_parallel_fsdp_device_mesh[para]
                 _extra_parallel_map[para] = parallel_plan.get_extra_parallel_fsdp_no_shard_info(model, para)
             else:
@@ -176,24 +247,57 @@ def parallelize_model_fsdp2(
         if parallel_state.any_extra_parallel_enabled:
             for para in parallel_state.extra_parallel_names:
                 if _extra_parallel_map[para] is not None:
-                    para_mod = next(
-                        (
-                            para_mod
-                            for para_mod_fqn, para_mod in _extra_parallel_map[para].items()
-                            if para_mod_fqn.startswith(layer_fqn)
-                        ),
-                        None,
-                    )
+                    # Collect ALL extra-parallel (e.g. ep) modules under this layer,
+                    # not just the first. A single layer may hold more than one such
+                    # module (e.g. multiple experts modules in one decoder layer), and
+                    # EACH must be fully_shard'd over the ep_fsdp mesh. If only the
+                    # first were wrapped, the others would fall through to the regular
+                    # ``fully_shard(layer_mod)`` below and be re-sharded over the
+                    # FSDP mesh -- but their params were already EP-sliced (each rank
+                    # holds a *different* [E/ep, ...] slice), so that second shard
+                    # scrambles them and corrupts the experts.
+                    # Match ``layer_fqn + "."`` (not a bare ``startswith``) so e.g.
+                    # ``model.layers.1`` does not also swallow ``model.layers.10``.
+                    para_mods = [
+                        para_mod
+                        for para_mod_fqn, para_mod in _extra_parallel_map[para].items()
+                        if para_mod_fqn == layer_fqn or para_mod_fqn.startswith(layer_fqn + ".")
+                    ]
                 else:
-                    para_mod = None
-                extra_parallel_mod[para] = para_mod
+                    para_mods = []
+                extra_parallel_mod[para] = para_mods
         layer_pair.append(extra_parallel_mod)
         layer_pairs[layer_fqn] = tuple(layer_pair)
 
     logger.info_rank0(f"extra_parallel layer pairs: {layer_pairs}")
 
+    if compile_config.enable:
+        validate_compile_runtime(
+            compile_config,
+            device_type=get_device_type(),
+            fsdp_enabled=parallel_state.fsdp_enabled,
+            fsdp_mode=parallel_state.dp_mode,
+            any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
+            enable_reshard_after_forward=enable_reshard_after_forward,
+        )
+
+        compiled_count = compile_decoder_blocks(
+            model,
+            compile_config,
+            sequence_parallel_enabled=parallel_state.sp_enabled,
+            async_enabled=parallel_state.async_enabled,
+        )
+        if compiled_count == 0:
+            raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
+        model._veomni_compile_enabled = True
+        model._veomni_compile_uses_cuda_graphs = compile_config.uses_cuda_graphs()
+
     # Step 2: Update fsdp2 kwargs
-    fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
+    fsdp_kwargs = {
+        "mesh": parallel_state.fsdp_mesh,
+        "reshard_after_forward": enable_reshard_after_forward,
+        "shard_placement_fn": _veomni_shard_placement_fn,
+    }
     # prepare mp_policy kwargs
     if mixed_precision.enable:
         mp_policy = MixedPrecisionPolicy(
@@ -208,7 +312,16 @@ def parallelize_model_fsdp2(
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
         logger.info_rank0("Enable FSDP2 CPU offload for parameters, gradients, and optimizer states.")
-        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
+        # ``CPUOffloadPolicy`` defaults to ``pin_memory=True``: the offloaded CPU
+        # param shards are page-locked, which (a) is accounted as non-reclaimable
+        # ``Shmem`` against the container memcg and (b) cannot be swapped/evicted.
+        # For a very large model (e.g. the ~1.5 TiB MoT experts) each rank pins
+        # its whole shard, so N ranks/host pin ~N * shard_size of Shmem and OOM
+        # the cgroup during load. ``fsdp_offload_pin_memory=False`` keeps the
+        # shards in ordinary pageable anon memory (what a bespoke manual offload
+        # does) at the cost of a non-pinned (slightly slower) H2D per layer.
+        offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
+        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=offload_pin_memory)
 
     if hasattr(model, "get_ignore_modules_in_mixed_precision"):
         modules_to_ignore_in_mixed_precision = model.get_ignore_modules_in_mixed_precision()
@@ -233,14 +346,19 @@ def parallelize_model_fsdp2(
     extra_parallel_fsdp_kwargs = {}
     for para in parallel_state.extra_parallel_names:
         if parallel_state.extra_parallel_enabled(para):
-            para_fsdp_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para][f"{para}_fsdp"]
+            para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
+            para_mesh_dim_names = para_mesh.mesh_dim_names
+            # exclude para_size dimension:
+            # - (ep_fsdp, ep) -> (ep_fsdp,)
+            # - (ep_replicate, ep_fsdp, ep) -> (ep_replicate, ep_fsdp)
+            para_fsdp_mesh = para_mesh[para_mesh_dim_names[:-1]]
             para_fsdp_kwargs = dict(fsdp_kwargs)
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
             shard_dim_for_para = 1
             # Muon zero-comm needs whole experts per rank; otherwise keep the
             # default hidden-dim sharding.
             if muon_expert_zero_comm:
-                ep_fsdp_size = parallel_state.extra_parallel_fsdp_size(para)
+                ep_fsdp_size = para_mesh["ep_fsdp"].size()
                 divisible = _check_extra_parallel_dim0_divisibility(model, para, ep_fsdp_size)
                 if divisible:
                     shard_dim_for_para = 0
@@ -257,6 +375,11 @@ def parallelize_model_fsdp2(
                     )
             para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
+            # Record the FSDP shard dim on the spec_info so the checkpointer can
+            # build correct DTensor placements (EP dim vs FSDP dim) on save/load.
+            for spec_info in getattr(model, "_fqn2spec_info", {}).values():
+                if spec_info.para_name == para:
+                    spec_info.fsdp_shard_dim = shard_dim_for_para
         else:
             extra_parallel_fsdp_kwargs[para] = None
 
@@ -291,14 +414,16 @@ def parallelize_model_fsdp2(
         layer_mod._fsdp_modules = []
 
         for para in parallel_state.extra_parallel_names:
-            # para (e.g. ep, emb) enabled and this layer contains the para (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens) module
-            if (
-                parallel_state.extra_parallel_enabled(para)
-                and extra_parallel_mod[para] is not None
-                and not isinstance(extra_parallel_mod[para], FSDPModule)
-            ):
+            # para (e.g. ep, emb) enabled and this layer contains the para module(s)
+            # (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens). A layer
+            # may hold more than one (e.g. multiple experts modules) -- wrap each.
+            if not parallel_state.extra_parallel_enabled(para):
+                continue
+            for _para_mod in extra_parallel_mod[para]:
+                if isinstance(_para_mod, FSDPModule):
+                    continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                fully_shard(extra_parallel_mod[para], **extra_parallel_fsdp_kwargs[para])
+                fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
@@ -307,11 +432,11 @@ def parallelize_model_fsdp2(
                 logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
-                    extra_parallel_mod[para].set_reduce_scatter_divide_factor(gradient_divide_factor)
+                    _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
                 else:
                     # from torch 2.8
-                    extra_parallel_mod[para].set_gradient_divide_factor(gradient_divide_factor)
-                layer_mod._fsdp_modules.append(extra_parallel_mod[para])
+                    _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                layer_mod._fsdp_modules.append(_para_mod)
 
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
@@ -368,16 +493,35 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    if weights_path is None:
-        model.to_empty(device=materialize_device)
+    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
+    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
+    # and still need the HF base weights.
+    is_peft_model = kwargs.pop("is_peft_model", False)
+    adapter_path = kwargs.pop("adapter_path", None)
+    if should_skip_hf_weight_load and is_peft_model:
+        raise ValueError(
+            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
+            "trainable-only and the frozen base must still be loaded from weights_path."
+        )
+
+    if weights_path is None or should_skip_hf_weight_load:
+        if should_skip_hf_weight_load:
+            logger.info_rank0(
+                "Skipping pretrained weight load for checkpoint resume; "
+                "parameters will be restored from the distributed checkpoint."
+            )
+        if should_skip_hf_weight_load:
+            _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        else:
+            model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
-        model.init_weights()
+        # Random init is unnecessary when the checkpoint will overwrite every parameter.
+        if not should_skip_hf_weight_load:
+            model.init_weights()
     else:
         from torch.distributed.tensor import distribute_tensor
 
         logger.info_rank0(f"starting to load model weights from {weights_path}...")
-        is_peft_model = kwargs.pop("is_peft_model", False)
-        adapter_path = kwargs.pop("adapter_path", None)
         if is_peft_model:
             if adapter_path is not None:
                 logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
@@ -399,17 +543,41 @@ def parallelize_model_fsdp2(
                 fqn_to_index_mapping=fqn_to_index_mapping,
             )
         else:
-            logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
             _dt_local_split = partial(distribute_tensor, src_data_rank=None)
-            load_model_weights(
-                model,
-                weights_path,
-                materialize_device,
-                dtensor_factory=_dt_local_split,
-                is_peft_model=is_peft_model,
-                adapter_path=adapter_path,
-                fqn_to_index_mapping=fqn_to_index_mapping,
-            )
+            if kwargs.get("ep_sharded_stream_load"):
+                # Opt-in fast/low-memory path for large MoE checkpoints: each rank
+                # reads only its ExtraParallel dim-0 slice of the expert tensors
+                # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
+                # Only valid on the every-rank-reads (non-broadcast) path. An
+                # unsupported model/checkpoint raises ``NotImplementedError``, which we
+                # surface directly rather than silently falling back -- an opt-in flag
+                # that quietly degrades is hard to reason about, so fail early instead.
+                logger.info_rank0(
+                    "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
+                )
+                load_model_weights_ep_sharded(
+                    model,
+                    weights_path,
+                    materialize_device,
+                    dtensor_factory=_dt_local_split,
+                    is_peft_model=is_peft_model,
+                    adapter_path=adapter_path,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                )
+            else:
+                logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
+                load_model_weights(
+                    model,
+                    weights_path,
+                    materialize_device,
+                    dtensor_factory=_dt_local_split,
+                    is_peft_model=is_peft_model,
+                    adapter_path=adapter_path,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                )
+
+    if materialize_device == "cpu":
+        _move_buffers_to_device(model, get_device_type())
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
@@ -427,6 +595,8 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -435,8 +605,18 @@ def build_parallelize_model(
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
+    compile_config = compile_config or CompileConfig()
+    chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)
+
+    if chunk_mbs_config is not None and chunk_mbs_config.enable:
+        if compile_config.enable:
+            raise ValueError("ChunkMBS is not supported with torch.compile yet.")
+        if enable_gradient_checkpointing and kwargs.get("enable_reentrant", False):
+            raise ValueError("ChunkMBS requires non-reentrant gradient checkpointing.")
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
@@ -445,18 +625,26 @@ def build_parallelize_model(
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
 
+    checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
         use_reentrant = kwargs.pop("enable_reentrant", False)
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
+        gradient_checkpointing_kwargs = {
+            "use_reentrant": use_reentrant,
+            "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+        }
+        if not use_reentrant:
+            gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop
+
         model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={
-                "use_reentrant": use_reentrant,
-                "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
-            },
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
+
+    if chunk_mbs_config is not None and chunk_mbs_config.enable:
+        model = apply_chunk_mbs(model, chunk_mbs_config)
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")
@@ -475,9 +663,15 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                compile_config=compile_config,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
             )
         else:
+            if compile_config.enable:
+                raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
             model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+    elif compile_config.enable:
+        raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
 
     return model

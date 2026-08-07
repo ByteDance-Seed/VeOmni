@@ -1,6 +1,6 @@
 """Tests for DynamicBatchingSizeDataset functionality.
 
-This module tests the ``DynamicBatchingSizeDataset`` class using ``ShardedIterableDataset``.
+This module tests ``DynamicBatchingSizeDataset`` with iterable and map-style datasets.
 It validates that ``DynamicBatchingSizeDataset`` can properly:
 
 1. Batch samples based on token count (``micro_batch_seq_length``).
@@ -23,8 +23,8 @@ The test suite includes:
 
     End-to-end distributed tests (require ``torchrun`` with 2 processes):
         - ``test_dynamic_batching_dataset_distributed`` – parametrised over
-          ``shuffle × save_by_idx × multi_sample_per_iteration`` (5 combinations), verifying that resumed
-          batches are byte-for-byte identical to the original run.
+          dataset type, shuffle, save_by_idx, and multi-sample transforms, verifying
+          that resumed batches are byte-for-byte identical to the original run.
 """
 
 import argparse
@@ -40,6 +40,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import numpy as np
 import pytest
 import torch
 from tools import resolve_ops_overrides
@@ -49,6 +50,7 @@ from transformers import PretrainedConfig
 from utils import (
     FakeModel,
     ShardedIterableDataset,
+    ShardedMappingDataset,
     StepAwareResumeCheckpointerCallback,
     compare_global_batch,
     compare_items,
@@ -60,11 +62,19 @@ from utils import (
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
-from veomni.data.dataset import DynamicBatchingSizeDataset
+from veomni.data.dataset import (
+    DynamicBatchingSizeDataset,
+    get_length_by_attention_mask_fn,
+    get_length_by_input_ids_fn,
+    get_length_by_labels_fn,
+    get_length_fn_by_count_mode,
+)
+from veomni.data.dynamic_batching import TextBatchingStrategy
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
+from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type
 
 
@@ -78,6 +88,16 @@ DATASET_SIZE = 50
 
 def get_length_fn(item):
     return item["attention_mask"].sum()
+
+
+def _make_sample(token_id: int, total_tokens: int = 4, effective_tokens: int = 2) -> Dict[str, torch.Tensor]:
+    labels = torch.full((total_tokens,), IGNORE_INDEX, dtype=torch.long)
+    labels[:effective_tokens] = token_id
+    return {
+        "input_ids": torch.full((total_tokens,), token_id, dtype=torch.long),
+        "attention_mask": torch.ones(total_tokens, dtype=torch.long),
+        "labels": labels,
+    }
 
 
 def single_sample_transform(sample: Dict[str, torch.Tensor]):
@@ -285,6 +305,174 @@ def test_dynamic_batching_without_get_item():
         )
 
 
+def test_get_length_fn_by_count_mode():
+    sample = _make_sample(token_id=7, total_tokens=5, effective_tokens=3)
+
+    assert get_length_by_attention_mask_fn(sample) == 5
+    assert get_length_by_labels_fn(sample) == 3
+    assert get_length_by_input_ids_fn(sample) == 5
+    assert get_length_fn_by_count_mode("total")(sample) == 5
+    assert get_length_fn_by_count_mode("effective")(sample) == 3
+    assert get_length_by_labels_fn({"attention_mask": sample["attention_mask"]}) == 5
+
+    list_sample = {
+        "input_ids": [1, 2, 3, 4, 5],
+        "attention_mask": [1, 1, 1, 1, 0],
+        "labels": [IGNORE_INDEX, 2, IGNORE_INDEX, 4, 5],
+    }
+    assert get_length_by_attention_mask_fn(list_sample) == 4
+    assert get_length_by_labels_fn(list_sample) == 3
+    assert get_length_by_input_ids_fn(list_sample) == 5
+
+    np_sample = {
+        "input_ids": np.arange(5),
+        "attention_mask": np.array([1, 1, 1, 0, 0]),
+        "labels": np.array([IGNORE_INDEX, 1, 2, IGNORE_INDEX, IGNORE_INDEX]),
+    }
+    assert get_length_by_attention_mask_fn(np_sample) == 3
+    assert get_length_by_labels_fn(np_sample) == 2
+    assert get_length_by_input_ids_fn(np_sample) == 5
+
+    unsupported_labels_sample = {
+        "input_ids": [1, 2, 3],
+        "attention_mask": [1, 1, 0],
+        "labels": (IGNORE_INDEX, 1, 2),
+    }
+    assert get_length_by_labels_fn(unsupported_labels_sample) == 2
+
+    input_ids_only_sample = {"input_ids": np.arange(4)}
+    assert get_length_by_labels_fn(input_ids_only_sample) == 4
+    assert get_length_by_labels_fn([list_sample, np_sample]) == 5
+    assert get_length_by_labels_fn(None) == 0
+    assert get_length_by_labels_fn("raw-sample") == 1
+    assert get_length_by_labels_fn({}) == 1
+
+    with pytest.raises(ValueError, match="Unknown dyn_bsz count_mode"):
+        get_length_fn_by_count_mode("bad-mode")
+
+
+def test_text_batching_strategy_effective_count_mode():
+    total_strategy = TextBatchingStrategy(token_micro_bsz=4, buffer_size=1)
+    effective_strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+    )
+    samples = [_make_sample(token_id=1), _make_sample(token_id=2)]
+
+    for sample in samples:
+        total_strategy.put_item(sample)
+        effective_strategy.put_item(sample)
+
+    total_batch = total_strategy.get_micro_batch(step=0)
+    effective_batch = effective_strategy.get_micro_batch(step=0)
+
+    assert len(total_batch) == 1
+    assert len(effective_batch) == 2
+    assert sum(batch_sample["attention_mask"].sum().item() for batch_sample in effective_batch) == 8
+
+
+def test_text_batching_strategy_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=6,
+        get_physical_length_fn=get_length_by_attention_mask_fn,
+    )
+    samples = [
+        _make_sample(token_id=1, total_tokens=3, effective_tokens=2),
+        _make_sample(token_id=2, total_tokens=3, effective_tokens=2),
+        _make_sample(token_id=3, total_tokens=3, effective_tokens=2),
+    ]
+
+    for sample in samples:
+        strategy.put_item(sample)
+
+    micro_batch = strategy.get_micro_batch(step=0)
+
+    assert [sample["input_ids"][0].item() for sample in micro_batch] == [1, 2]
+    assert sum(sample["labels"].ne(IGNORE_INDEX).sum().item() for sample in micro_batch) == 4
+    assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 6
+
+
+def test_text_batching_strategy_effective_mode_honors_physical_cap():
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_by_attention_mask_fn,
+    )
+    samples = [
+        _make_sample(token_id=1, total_tokens=6, effective_tokens=2),
+        _make_sample(token_id=2, total_tokens=6, effective_tokens=2),
+        _make_sample(token_id=3, total_tokens=2, effective_tokens=2),
+    ]
+
+    for sample in samples:
+        strategy.put_item(sample)
+
+    micro_batch = strategy.get_micro_batch(step=0)
+
+    assert [sample["input_ids"][0].item() for sample in micro_batch] == [1, 3]
+    assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 8
+    assert strategy.buffer.all_token_cnt == 2
+    assert strategy.buffer.all_physical_token_cnt == 6
+
+
+def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
+    class PromptHeavyDataset(IterableDataset):
+        def __iter__(self):
+            yield from [
+                _make_sample(token_id=1, total_tokens=3, effective_tokens=2),
+                _make_sample(token_id=2, total_tokens=3, effective_tokens=2),
+                _make_sample(token_id=3, total_tokens=3, effective_tokens=2),
+            ]
+
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=PromptHeavyDataset(),
+        micro_batch_seq_length=4,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda samples: samples,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=6,
+        get_physical_length_fn=get_length_by_attention_mask_fn,
+        save_by_idx=False,
+    )
+
+    micro_batches = list(dynamic_ds)
+
+    assert [[sample["input_ids"][0].item() for sample in batch] for batch in micro_batches] == [[1, 2], [3]]
+    assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 3]
+
+
+def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
+    class PromptHeavyDataset(IterableDataset):
+        def __iter__(self):
+            yield from [
+                _make_sample(token_id=1, total_tokens=6, effective_tokens=2),
+                _make_sample(token_id=2, total_tokens=6, effective_tokens=2),
+                _make_sample(token_id=3, total_tokens=2, effective_tokens=2),
+            ]
+
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=PromptHeavyDataset(),
+        micro_batch_seq_length=4,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda samples: samples,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_by_attention_mask_fn,
+        save_by_idx=False,
+    )
+
+    micro_batches = list(dynamic_ds)
+
+    assert [[sample["input_ids"][0].item() for sample in batch] for batch in micro_batches] == [[1], [2, 3]]
+    assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
+
+
 @pytest.mark.parametrize("save_by_idx", [False, True])
 def test_save_load_state_dict(save_by_idx):
     """Unit test for DynamicBatchingSizeDataset state_dict and load_state_dict.
@@ -345,22 +533,26 @@ def test_save_load_state_dict(save_by_idx):
 
 
 @pytest.mark.parametrize(
-    "shuffle,save_by_idx,multi_sample_per_iteration",
+    "dataset_type,shuffle,save_by_idx,multi_sample_per_iteration",
     [
-        (False, False, False),
-        (False, True, False),
-        (True, False, False),
-        (True, True, False),
-        (True, True, True),
+        ("iterable", False, False, False),
+        ("iterable", False, True, False),
+        ("iterable", True, False, False),
+        ("iterable", True, True, False),
+        ("iterable", True, True, True),
+        ("mapping", True, True, False),
+        ("mapping", True, True, True),
+        ("mapping", True, False, False),
     ],
 )
-def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample_per_iteration):
+def test_dynamic_batching_dataset_distributed(dataset_type, shuffle, save_by_idx, multi_sample_per_iteration):
     """Test DynamicBatchingSizeDataset in distributed setting.
 
     Runs _main_distributed_test() by torchrun with or without data shuffling
     and with or without save_by_idx for checkpoint buffer saving.
 
     Args:
+        dataset_type: Whether the upstream is iterable or map-style.
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
         multi_sample_per_iteration: Whether one dataset iteration emits two samples.
@@ -369,6 +561,7 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample
         subprocess.CalledProcessError: If the distributed test fails.
     """
     command = build_command(
+        dataset_type=dataset_type,
         shuffle=shuffle,
         save_by_idx=save_by_idx,
         multi_sample_per_iteration=multi_sample_per_iteration,
@@ -378,13 +571,14 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample
     assert result.returncode == 0
 
 
-def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
+def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
     """Build torchrun command for distributed testing.
 
     Constructs a command to launch the test script with torchrun for
     distributed execution with 2 processes.
 
     Args:
+        dataset_type: Whether to build an iterable or map-style upstream dataset.
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
         multi_sample_per_iteration: Whether one dataset iteration emits two samples.
@@ -415,6 +609,7 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",
         "--train.dyn_bsz_runtime=worker",
+        f"--dataset_type={dataset_type}",
         f"--save_by_idx={str(save_by_idx).lower()}",
         f"--multi_sample_per_iteration={str(multi_sample_per_iteration).lower()}",
         "--train.seed=42",
@@ -436,17 +631,19 @@ class TrainerTest(BaseTrainer):
     def __init__(
         self,
         args: VeOmniArguments,
+        dataset_type: str,
         shuffle: bool,
         save_by_idx: bool,
         multi_sample_per_iteration: bool,
     ):
+        self.dataset_type = dataset_type
         self.shuffle = shuffle
         self.save_by_idx = save_by_idx
         self.multi_sample_per_iteration = multi_sample_per_iteration
         super().__init__(args)
 
     def _setup(self):
-        self.device = setup_test_distributed(self.args)
+        self.device, _ = setup_test_distributed(self.args)
 
     def _freeze_model_module(self):
         pass
@@ -464,12 +661,18 @@ class TrainerTest(BaseTrainer):
     def _build_dataset(self):
         args = self.args
         transform = multi_sample_transform if self.multi_sample_per_iteration else single_sample_transform
-        self.train_dataset = ShardedIterableDataset(
-            size=DATASET_SIZE,
-            shuffle=self.shuffle,
-            seed=args.train.seed,
-            transform=transform,
-        )
+        if self.dataset_type == "mapping":
+            self.train_dataset = ShardedMappingDataset(
+                size=DATASET_SIZE, transform=transform, sample_length_range=(6, 7)
+            )
+        else:
+            self.train_dataset = ShardedIterableDataset(
+                size=DATASET_SIZE,
+                shuffle=self.shuffle,
+                seed=args.train.seed,
+                transform=transform,
+                sample_length_range=(6, 7),
+            )
         effective_dataset_size = DATASET_SIZE * (2 if self.multi_sample_per_iteration else 1)
         args.compute_train_steps(effective_dataset_size)
         args.train.num_train_epochs = 2
@@ -492,6 +695,8 @@ class TrainerTest(BaseTrainer):
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             dyn_bsz_dataset_save_by_idx=self.save_by_idx,
             seed=args.train.seed,
@@ -625,6 +830,7 @@ def _main_distributed_test():
         patch("veomni.utils.device.empty_cache", mock_empty_cache),
     ):
         _parser = argparse.ArgumentParser()
+        _parser.add_argument("--dataset_type", choices=["iterable", "mapping"], default="iterable")
         _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--multi_sample_per_iteration", type=lambda x: x.lower() == "true", default=False)
@@ -634,6 +840,7 @@ def _main_distributed_test():
         args = parse_args(VeOmniArguments)
         trainer = TrainerTest(
             args,
+            dataset_type=test_args.dataset_type,
             shuffle=test_args.shuffle,
             save_by_idx=test_args.save_by_idx,
             multi_sample_per_iteration=test_args.multi_sample_per_iteration,

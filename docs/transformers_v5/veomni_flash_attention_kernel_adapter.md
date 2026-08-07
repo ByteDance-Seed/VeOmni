@@ -80,5 +80,5 @@ After `import veomni`:
 - FA4 (`veomni_flash_attention_4_with_sp`) has no such branch in
   `_lazy_imports` and always falls through to the hub-kernel path. The
   adapter is the **critical** component that makes FA4 usable.
-- FA4 requires the `flash-attn-cute` package (`flash_attn.cute`). To install
-  FA4: `uv sync --extra gpu --extra fa4`.
+- FA4 requires the `flash-attn-cute` package (`flash_attn.cute`), shipped
+  in the `gpu` extra; `uv sync --extra gpu` source-builds it.

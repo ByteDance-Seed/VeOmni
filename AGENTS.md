@@ -5,7 +5,7 @@
 **VeOmni** is a modular distributed training framework for multi-modality models (text, vision, audio, diffusion, omni) across various accelerators (GPUs, NPUs). Developed by ByteDance Seed Team.
 
 - Homepage: https://github.com/ByteDance-Seed/VeOmni
-- Python: `>=3.11, <3.12`
+- Python: `>=3.11, <3.13`
 - Package: `veomni`
 
 **Language**: Match user's language (English).
@@ -16,6 +16,7 @@ On session start, read the following:
 - `.agents/knowledge/constraints.md` — hard constraints to check before any code change
 - `.agents/knowledge/architecture.md` — module map, trainer hierarchy, data flow
 - `.agents/knowledge/uv.md` — dependency management architecture (uv, extras, lockfile)
+- `.agents/knowledge/cloud_env.md` — Cursor Cloud (CPU-only VM) setup; read when running on the Cursor Cloud VM
 
 ---
 
@@ -34,14 +35,14 @@ On session start, read the following:
 ## Setup
 
 ```bash
-uv sync --extra gpu --extra audio --dev
+uv sync --extra gpu --dev
 source .venv/bin/activate
 ```
 
-This installs `transformers==5.9.0` (pinned by the `transformers-stable`
-default dependency group in `pyproject.toml`). Always activate `.venv/`
-before running any commands. New code must target transformers v5 and FSDP2.
-See `.agents/knowledge/constraints.md` for details.
+This installs `transformers==5.9.0` via the `transformers-stable` dependency
+group. `gpu` / `npu` / `npu_aarch64` are the only extras — each a complete
+superset, mutually exclusive. New code must target transformers v5 and FSDP2.
+See `.agents/knowledge/uv.md` and `.agents/knowledge/constraints.md`.
 
 ---
 
@@ -95,6 +96,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
 | Performance profiling | `/veomni-profile` |
+| Create or update a pull request | `/create-pr` |
 
 ### Quick Decision Guide
 
@@ -105,3 +107,4 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 - **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
 - **"Update package X" / "bump uv" / "upgrade torch"** → `/veomni-uv-update`
 - **"Analyze this trace" / "why is training slow" / "profile" / "MFU"** → `/veomni-profile`
+- **"Create a PR" / "submit PR"** → `/create-pr`

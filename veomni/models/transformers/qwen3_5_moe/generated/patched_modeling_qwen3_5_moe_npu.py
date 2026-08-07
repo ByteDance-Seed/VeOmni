@@ -28,7 +28,7 @@
 #    - method_override: Qwen3_5MoeVisionModel.fast_pos_embed_interpolate
 #      Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.
 #    - method_override: Qwen3_5MoeVisionModel.forward
-#      Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens.
+#      Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens. Keep cu_seqlens on CPU to avoid per-layer NPU→CPU sync.
 #    - method_override: Qwen3_5MoeVisionModel.dummy_forward
 #      Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.
 #    - method_override: Qwen3_5MoeModel.forward
@@ -48,7 +48,9 @@
 #    - method_override: Qwen3_5MoeTextModel._update_linear_attn_mask
 #      Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.
 #    - method_override: Qwen3_5MoeDecoderLayer.forward
-#      Extract and pass cu_seq_lens_q for varlen linear attention in Qwen3_5MoeDecoderLayer.forward
+#      Extract and pass cu_seq_lens_q + precomputed varlen metadata for AscendC GDN kernels in Qwen3_5MoeDecoderLayer.forward
+#    - method_override: Qwen3_5MoeTextModel.forward
+#      Precompute varlen metadata (cu_seqlens_list, chunk_indices, chunk_indices_list) once for all AscendC GDN layers to avoid per-layer tolist overhead
 #    - method_override: Qwen3_5MoeForCausalLM.forward
 #      Support fused cross entropy path in Qwen3_5MoeForCausalLM.forward
 #    - method_override: Qwen3_5MoeForConditionalGeneration.forward
@@ -81,7 +83,6 @@ from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
     BaseModelOutputWithPooling,
     ModelOutput,
     MoeModelOutputWithPast,
@@ -635,6 +636,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         attention_mask: torch.Tensor | None = None,
         # Modification: plumb varlen sequence metadata to FLA kernels.
         cu_seq_lens_q: torch.Tensor | None = None,
+        cu_seqlens_list: list[int] | None = None,
+        chunk_indices: dict | None = None,
+        chunk_indices_list: dict | None = None,
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
@@ -769,8 +773,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 raise RuntimeError(
                     "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
                     "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
-                    "(and install flash-linear-attention) or 'flash_qla' (with the optional flash-qla "
-                    "extra) in OpsImplementationConfig."
+                    "(and install flash-linear-attention) or 'flash_qla' (ships under the gpu extra, "
+                    "Hopper sm90 only) in OpsImplementationConfig."
                 )
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -784,6 +788,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
                     cu_seqlens=cu_seq_lens_q.npu(),
+                    cu_seqlens_list=cu_seqlens_list,
+                    chunk_indices=chunk_indices,
+                    chunk_indices_list=chunk_indices_list,
                 )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
@@ -1176,7 +1183,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    # ── DecoderLayer forward ────────────────────────────────────────────────────────
+    # ── DecoderLayer forward (NPU: plumb precomputed varlen metadata to GDN) ───────
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1197,16 +1204,23 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
             "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
             "and to remove the full Flash Attention CPU-GPU sync."
         )
+        linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
+        linear_attn_cu_seqlens_list = kwargs.pop("cu_seqlens_list_q", None)
+        linear_attn_chunk_indices = kwargs.pop("chunk_indices_q", None)
+        linear_attn_chunk_indices_list = kwargs.pop("chunk_indices_list_q", None)
 
         # Token Mixer
         if self.layer_type == "linear_attention":
-            # Modification: pass cu_seq_lens_q through to Qwen3_5MoeGatedDeltaNet.forward.
+            # Modification: pass linear-attention cu_seqlens + precomputed metadata through to GatedDeltaNet.forward.
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
-                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_q=linear_attn_cu_seq_lens_q,
+                cu_seqlens_list=linear_attn_cu_seqlens_list,
+                chunk_indices=linear_attn_chunk_indices,
+                chunk_indices_list=linear_attn_chunk_indices_list,
             )
         elif self.layer_type == "full_attention":
             # Self Attention
@@ -1773,6 +1787,10 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
                 kwargs["vision_max_seqlen"] = max(max_frame_len, pad_seq_len)
         # --- Patch.5 ---
 
+        # --- Patch.6: Keep cu_seqlens on CPU to avoid per-layer NPU→CPU sync. ---
+        cu_seqlens = cu_seqlens.to("cpu")
+        # --- Patch.6 ---
+
         for blk in self.blocks:
             hidden_states = blk(
                 hidden_states,
@@ -1902,7 +1920,7 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeTextModel
-# Methods patched: _update_linear_attn_mask
+# Methods patched: _update_linear_attn_mask, forward
 # ======================================================================
 
 
@@ -1921,6 +1939,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    # ── TextModel forward (NPU: precompute varlen metadata once for all GDN layers) ─
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -1933,7 +1952,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
+    ) -> Qwen3_5MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1965,6 +1984,27 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             position_ids=text_position_ids,
         )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
+
+        # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
+        if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
+            from veomni.ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule import precompute_varlen_metadata
+
+            # Use the Ulysses-local head count so that the precomputed cumsum-block
+            # key matches the per-layer _ensure_varlen_metadata computation (which
+            # derives h from g.shape[-1], i.e. the local head count after SP split).
+            num_v_heads = self.config.linear_num_value_heads
+            if get_parallel_state().sp_enabled:
+                num_v_heads //= get_parallel_state().sp_size
+            cu_seqlens_list, chunk_indices, chunk_indices_list = precompute_varlen_metadata(
+                cu_seqlens=cu_seq_lens_q,
+                num_heads=num_v_heads,
+                chunk_size=64,
+                device=inputs_embeds.device,
+            )
+            kwargs["cu_seqlens_list_q"] = cu_seqlens_list
+            kwargs["chunk_indices_q"] = chunk_indices
+            kwargs["chunk_indices_list_q"] = chunk_indices_list
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -2344,6 +2384,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             The temporal, height and width of feature shape of each video in LLM.
         mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Token type IDs for multimodal inputs.
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -2363,7 +2405,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             if get_parallel_state().sp_enabled:
                 input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
                 dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-                input_ids = torch.cat(input_ids_list, dim=0)
+                input_ids = torch.cat(input_ids_list, dim=1)
             image_mask, video_mask = self.get_placeholder_mask(input_ids)
         # --- Patch.1 ---
 
@@ -2682,6 +2724,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence.
 
         Example:
 

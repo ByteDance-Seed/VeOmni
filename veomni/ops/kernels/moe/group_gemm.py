@@ -14,10 +14,32 @@
 
 import torch
 
-from ....distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
+from ....distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, dispatch_to_ep_class
 from ....distributed.parallel_state import get_parallel_state
 from ._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from ._scatter import compute_expert_scatter_index
+
+
+def _apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
+    """gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation.
+
+    Returns ``(fc1_1_clamped, fc1_2_clamped, mask_fc1_1, mask_fc1_2)``.
+    When ``swiglu_limit`` is ``None`` this is a no-op and masks are ``None``;
+    callers may skip the corresponding mask multiplications in backward.
+
+    Semantics mirror ``torch.clamp`` autograd: gradients vanish where the
+    pre-clamp value falls outside the bound. ``gate`` is upper-bounded only
+    (``max=limit``) so the negative tail still feeds SiLU; ``up`` is
+    symmetrically clamped to ``[-limit, +limit]``.
+    """
+    if swiglu_limit is None:
+        return fc1_1_output, fc1_2_output, None, None
+    mask_fc1_1 = fc1_1_output <= swiglu_limit
+    mask_fc1_2 = (fc1_2_output >= -swiglu_limit) & (fc1_2_output <= swiglu_limit)
+    fc1_1_output = fc1_1_output.clamp(max=swiglu_limit)
+    fc1_2_output = fc1_2_output.clamp(min=-swiglu_limit, max=swiglu_limit)
+    return fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2
 
 
 class TritonFusedMoeExpertFunction(torch.autograd.Function):
@@ -31,6 +53,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
+        swiglu_limit=None,
     ):
         # MOE Step 3: dispatch input tokens to the experts
         # result shape is (batch_size * sequence_len * topk, hidden_size)
@@ -40,8 +63,10 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 3-2: compute the each token's index in result
         # scatter_index shape (batch_size * sequence_len, topk)
-        # TODO(wenyawei): opt it
-        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        # ``argsort().argsort()`` is two O(N log N) sorts back-to-back; the second
+        # is only inverting a permutation of [0..N) and can be done in O(N).
+        # ``compute_expert_scatter_index`` inlines that.
+        _, scatter_index = compute_expert_scatter_index(expert_index)
 
         # MOE Step 3-3: compute the result, select tokens by scatter_index, and put them together
         # scatter_output shape (batch_size * sequence_len * topk, hidden_size)
@@ -70,6 +95,13 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             transpose_b=True,
         )
 
+        # MOE Step 5a: gpt-oss-style clamped SwiGLU. No-op when swiglu_limit
+        # is None (the legacy path). Saved tensors use the clamped values so
+        # backward recomputation stays consistent.
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
+
         # MOE Step 5: compute the actication of linear layer 1-1
         # TODO(wenyawei): act function
         # fc1_1_activation shape is (batch_size * sequence_len * topk, ffn_dim)
@@ -78,7 +110,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 7: compute final result of linear layer 1
         fc1_activation = fc1_1_activation * fc1_2_output
 
-        # MOE Step 8: compute the the weighted linear layer 1 result
+        # MOE Step 8: compute the weighted linear layer 1 result
         # MOE Step 8-1: compute scattered_gate_weight, shape is (batch_size * sequence_len * topk)
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
@@ -99,13 +131,14 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             transpose_b=True,
         )
 
-        # MOE Step 10: gather the final token result by averate the the topk token results
+        # MOE Step 10: gather the final token result by averaging the top-k token results
         expert_output = moe_gather(fc2_output, scatter_index)
 
         # reshape the output with input shape
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(
             gate_weights,
             fc1_1_weight,
@@ -120,6 +153,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_activation,
             scattered_gate_weight,
             fc1_weighted_output,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
 
         return output
@@ -140,12 +175,19 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_activation,
             scattered_gate_weight,
             fc1_weighted_output,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
+        swiglu_limit = ctx.swiglu_limit
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
         # MOE Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
+        # top-k routes can make one expert receive more rows than the original
+        # token count, so the total scattered row count is a safe bound.
+        num_scattered_tokens = grad_fc2_output.shape[0]
 
         # MOE Step 9
         # grad_fc1_weighted_output = torch.empty_like(fc1_weighted_output)
@@ -155,7 +197,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -168,7 +210,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=fc1_weighted_output,
                 c=grad_fc2_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
@@ -189,6 +231,12 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
         grad_fc1_2_output = fc1_1_activation * grad_fc1_activation
 
+        # MOE Step 5a (backward): zero out gradients in the saturated SwiGLU
+        # clamp regions; mirrors ``torch.clamp`` autograd. No-op when
+        # ``swiglu_limit`` is None (mask tensors are placeholders).
+        if swiglu_limit is not None:
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
+
         # MOE Step 6
         # grad_scatter_output_2 = torch.empty_like(scatter_output)
 
@@ -197,7 +245,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc1_2_output,
             b=fc1_2_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -210,13 +258,15 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=scatter_output,
                 c=grad_fc1_2_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
 
         # MOE Step 5
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        if swiglu_limit is not None:
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
         # MOE Step 4
         # grad_scatter_output_1 = torch.empty_like(scatter_output)
@@ -226,7 +276,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc1_1_output,
             b=fc1_1_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -239,7 +289,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=scatter_output,
                 c=grad_fc1_1_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
@@ -263,6 +313,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc1_1_weight,  # fc1_1_weight
             grad_fc1_2_weight,  # fc1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # swiglu_limit
         )
 
 
@@ -282,9 +333,10 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         hidden_states,
         fc1_1_2_weight,
         fc2_weight,
+        swiglu_limit=None,
     ):
         splits = expert_histogram(expert_index, num_experts)
-        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        _, scatter_index = compute_expert_scatter_index(expert_index)
         scatter_output = moe_scatter(hidden_states, scatter_index)
 
         cumsum_t = torch.cumsum(splits, dim=0)
@@ -301,6 +353,14 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # chunk is a view, no copy
         fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
+
+        # gpt-oss-style clamped SwiGLU pre-activation. ``_apply_swiglu_clamp``
+        # creates new tensors when ``swiglu_limit is not None`` (so the saved
+        # halves are independent of the underlying ``fc1_output`` storage);
+        # otherwise it returns the original views and is a no-op.
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
 
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_activation = fc1_1_activation * fc1_2_output
@@ -324,6 +384,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -337,6 +398,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_activation,
             scattered_gate_weight,
             fc1_weighted_output,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
 
         return output
@@ -356,19 +419,26 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_activation,
             scattered_gate_weight,
             fc1_weighted_output,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
+        swiglu_limit = ctx.swiglu_limit
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
         # MOE Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
+        # top-k routes can make one expert receive more rows than the original
+        # token count, so the total scattered row count is a safe bound.
+        num_scattered_tokens = grad_fc2_output.shape[0]
 
         # MOE Step 9 - dgrad
         grad_fc1_weighted_output = group_gemm_same_nk(
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -381,7 +451,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=fc1_weighted_output,
                 c=grad_fc2_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
@@ -404,6 +474,11 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 5
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
 
+        # Step 5a (backward): zero out gradients in saturated SwiGLU clamp regions.
+        if swiglu_limit is not None:
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
+
         # Merge grad_fc1_1_output and grad_fc1_2_output back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
 
@@ -412,7 +487,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc1_output,
             b=fc1_1_2_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -425,7 +500,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=scatter_output,
                 c=grad_fc1_1_2_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
@@ -441,6 +516,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_hidden_states,  # hidden_states
             grad_fc1_1_2_weight,  # fc1_1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # swiglu_limit
         )
 
 
@@ -453,6 +529,7 @@ def group_gemm_fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -463,65 +540,40 @@ def group_gemm_fused_moe_forward(
       merged weights are provided, or ``TritonFusedMoeExpertFunction`` when split
       weights are provided.  No format conversion is performed.
     - EP path: always resolves to split format for ``EPGroupGemm``.
+
+    ``swiglu_limit``: gpt-oss / DeepSeek-V4 style clamp on the SwiGLU
+    pre-activations (``gate.clamp(max=L)``, ``up.clamp(min=-L, max=L)``).
+    ``None`` disables the clamp (default, zero overhead — used by every legacy
+    MoE model).
     """
     if get_parallel_state().ep_enabled:
         if fc1_1_2_weight is not None:
             if fc1_1_weight is not None or fc1_2_weight is not None:
                 raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
+            final_hidden_states = dispatch_to_ep_class(
+                EPMergedFc1GroupGemm,
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
+                fc1_1_2_weight,
+                fc2_weight,
+                swiglu_limit,
+            )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
                 raise ValueError("EP requires split fc1 weights (fc1_1_weight and fc1_2_weight).")
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-        # preprocess, permute token for ep
-        input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-            preprocess(
-                expert_mask=expert_mask,
-                num_experts=num_experts,
-                ep_group=get_parallel_state().ep_group,
-            )
-        )
-        permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
-            hidden_states=hidden_states,
-            expert_mask=expert_mask,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            ep_group=get_parallel_state().ep_group,
-        )
-
-        cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
-
-        if fc1_1_2_weight is not None:
-            final_permute_tokens = EPMergedFc1GroupGemm.apply(
-                permute_tokens,
-                cumsum,
-                fc1_1_2_weight,
-                fc2_weight,
-            )
-        else:
-            final_permute_tokens = EPGroupGemm.apply(
-                permute_tokens,
-                cumsum,
+            final_hidden_states = dispatch_to_ep_class(
+                EPGroupGemm,
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
                 fc1_1_weight,
                 fc1_2_weight,
                 fc2_weight,
+                swiglu_limit,
             )
-
-        # unpermute with routing_weight
-        final_hidden_states = tokens_post_all2all(
-            expert_outputs=final_permute_tokens,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            routing_map=routing_map,
-            local_input_permutation_mapping=local_input_permutation_mapping,
-            org_hidden_states_shape=org_hidden_states_shape,
-            ep_group=get_parallel_state().ep_group,
-        )
     else:
         if fc1_1_2_weight is not None:
             if fc1_1_weight is not None or fc1_2_weight is not None:
@@ -533,6 +585,7 @@ def group_gemm_fused_moe_forward(
                 hidden_states,
                 fc1_1_2_weight,
                 fc2_weight,
+                swiglu_limit,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
@@ -545,5 +598,6 @@ def group_gemm_fused_moe_forward(
                 fc1_1_weight,
                 fc1_2_weight,
                 fc2_weight,
+                swiglu_limit,
             )
     return final_hidden_states

@@ -467,7 +467,7 @@ def qwen3_5_gated_deltanet_forward_patched(
             raise RuntimeError(
                 "Varlen training requires a non-eager chunk_gated_delta_rule kernel. "
                 "Set chunk_gated_delta_rule_implementation='fla' (and install flash-linear-attention) "
-                "or 'flash_qla' (with the optional flash-qla extra) in OpsImplementationConfig."
+                "or 'flash_qla' (ships under the gpu extra, Hopper sm90 only) in OpsImplementationConfig."
             )
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -574,16 +574,17 @@ def qwen3_5_decoder_layer_forward_patched(
         "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
         "and to remove the full Flash Attention CPU-GPU sync."
     )
+    linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 
     # Token Mixer
     if self.layer_type == "linear_attention":
-        # Modification: pass cu_seq_lens_q through to Qwen3_5GatedDeltaNet.forward.
+        # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
             cache_params=past_key_values,
             cache_position=cache_position,
             attention_mask=attention_mask,
-            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
     elif self.layer_type == "full_attention":
         # Self Attention
@@ -1107,6 +1108,8 @@ def qwen3_5_model_forward(
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5ModelOutputWithPast:
     r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
     image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
         The temporal, height and width of feature shape of each image in LLM.
     video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
@@ -1135,7 +1138,7 @@ def qwen3_5_model_forward(
         if get_parallel_state().sp_enabled:
             input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
             dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-            input_ids = torch.cat(input_ids_list, dim=0)
+            input_ids = torch.cat(input_ids_list, dim=1)
         image_mask, video_mask = self.get_placeholder_mask(input_ids)
     # --- Patch.1 ---
 
@@ -1338,6 +1341,8 @@ def qwen3_5_forcausallm_forward_patched(
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
     r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
     labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
         Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
         config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored

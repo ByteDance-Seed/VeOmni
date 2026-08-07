@@ -21,13 +21,13 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed._tensor import DeviceMesh, DTensor, Shard
+from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
     load,
 )
-from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -39,6 +39,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
+from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.device import empty_cache, synchronize
@@ -51,11 +52,42 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
 
 
+class _ModelStrictLoadPlanner(DefaultLoadPlanner):
+    """Allow partial optimizer state while requiring a complete full-model DCP."""
+
+    def __init__(self, strict_model: bool):
+        super().__init__(allow_partial_load=True)
+        self.strict_model = strict_model
+
+    def create_local_plan(self):
+        plan = super().create_local_plan()
+        if not self.strict_model:
+            return plan
+
+        assert self.metadata is not None
+        missing_model_keys = sorted(
+            key
+            for key, path in self.mappings.items()
+            if path and path[0] == "model" and key not in self.metadata.state_dict_metadata
+        )
+        if missing_model_keys:
+            preview = ", ".join(missing_model_keys[:10])
+            suffix = " ..." if len(missing_model_keys) > 10 else ""
+            raise RuntimeError(
+                f"DCP is missing {len(missing_model_keys)} model key(s) required for a full-model resume: "
+                f"{preview}{suffix}"
+            )
+
+        return plan
+
+
 def _validate_extra_parallel_meshes(parallel_state) -> None:
     """Fail-fast precondition for ExtraParallel state dict preprocessing.
 
     At least one ExtraParallel mesh must be non-None, and at least one
-    of those meshes must be 2D (the ExtraParallel + FSDP composition).
+    of those meshes must carry the ExtraParallel + FSDP composition:
+    2D ``(ep_fsdp, ep)`` for plain FSDP or 3D
+    ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
     """
     extra_parallel_mesh = {
         para: parallel_state.extra_parallel_fsdp_device_mesh[para][para]
@@ -68,9 +100,12 @@ def _validate_extra_parallel_meshes(parallel_state) -> None:
     )
     assert any(
         parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
-        and parallel_state.extra_parallel_fsdp_device_mesh[para].ndim == 2
+        and parallel_state.extra_parallel_fsdp_device_mesh[para].ndim in (2, 3)
         for para in parallel_state.extra_parallel_names
-    ), "At least one extra_parallel fsdp_device_mesh should be not None"
+    ), (
+        "At least one extra_parallel fsdp_device_mesh must carry the ExtraParallel+FSDP "
+        "composition: 2D (ep_fsdp, ep) for plain FSDP or 3D (ep_replicate, ep_fsdp, ep) for HSDP"
+    )
 
 
 def _apply_extra_parallel_dim(
@@ -129,11 +164,24 @@ def _apply_extra_parallel_dim(
 
         assert spec_info.para_fsdp_mesh is not None, f"ExtraParallel spec {name} must have an ExtraParallel FSDP mesh"
 
-        fsdp_submesh = spec_info.para_fsdp_mesh[f"{spec_info.para_name}_fsdp"]
+        # Drop the innermost ExtraParallel (e.g. ``ep``) dim and keep the FSDP
+        # sub-mesh: 1D ``(ep_fsdp,)`` for plain FSDP, or 2D
+        # ``(ep_replicate, ep_fsdp)`` for HSDP. Mirrors the mesh slicing used
+        # when sharding the module in ``torch_parallelize``.
+        fsdp_submesh = spec_info.para_fsdp_mesh[spec_info.para_fsdp_mesh.mesh_dim_names[:-1]]
+        # The ExtraParallel (e.g. ``ep``) dim shards the tensor along
+        # ``spec_info.placement.dim`` (dim 0 for experts), while FSDP shards it
+        # along ``spec_info.fsdp_shard_dim`` (1 by default, 0 for Muon zero-comm).
+        # These are two DIFFERENT tensor dims, so the placements must use each
+        # one explicitly instead of a fixed ``[Shard(0), Shard(1)]``.
+        ep_shard_dim = spec_info.placement.dim
+        fsdp_shard_dim = spec_info.fsdp_shard_dim
         if action == "drop":
-            tensor = drop_extra_parallel_dim(tensor, fsdp_submesh)
+            tensor = drop_extra_parallel_dim(tensor, fsdp_submesh, fsdp_shard_dim)
         else:
-            tensor = restore_extra_parallel_dim(tensor, spec_info.para_fsdp_mesh, fsdp_submesh)
+            tensor = restore_extra_parallel_dim(
+                tensor, spec_info.para_fsdp_mesh, fsdp_submesh, ep_shard_dim, fsdp_shard_dim
+            )
         state_dict[name] = tensor
 
     return state_dict
@@ -151,13 +199,13 @@ class ModelState(Stateful):
             (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model, trainable_only: bool = False):
+    def __init__(self, model, trainable_only: bool = False, parallel_state=None):
         self.model = model
         self.trainable_only = trainable_only
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
-        self.parallel_state = get_parallel_state()
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -217,15 +265,15 @@ class OptimizerState(Stateful):
     equivalent to what AdamW would create on the next ``step()`` call.
 
     Note: ``allow_partial_load`` is set globally on the DCP planner (it
-    cannot be scoped to optimizer-only).  Model-weight integrity is still
-    enforced by ``set_model_state_dict(strict=True)`` inside
-    ``ModelState.load_state_dict`` for non-LoRA loads.
+    cannot be scoped to optimizer-only). ``_ModelStrictLoadPlanner`` therefore
+    validates model-key completeness from checkpoint metadata before loading a
+    non-LoRA full-model DCP.
     """
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, parallel_state=None):
         self.model = model
         self.optimizer = optimizer
-        self.parallel_state = get_parallel_state()
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -256,14 +304,26 @@ class OptimizerState(Stateful):
             )
             # Delegate to MultiOptimizer (it will split/filter correctly)
             self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
+            # MultiOptimizer sub-optimizers can also lose param-group hyperparams
+            # (betas/...) for empty groups after load; restore recurses into them.
+            restore_optimizer_param_group_defaults(self.optimizer)
             return
 
-        # Single torch optimizer
+        # Single torch optimizer.
+        # ``strict=False`` matches the DCP planner's allow_partial_load intent:
+        # params that never received a gradient (and thus have no saved Adam
+        # state) keep the default-initialized state that
+        # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
+        # Torch 2.11+ raises under the default strict=True when any
+        # requires_grad param is missing from the checkpoint (DeepSeek-V4
+        # indexer ``position_bias`` is one such case on short toy runs).
         set_optimizer_state_dict(
             model=self.model,
             optimizers=self.optimizer,
             optim_state_dict=optim_state_from_dcp_load,
+            options=StateDictOptions(strict=False),
         )
+        restore_optimizer_param_group_defaults(self.optimizer)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         return _apply_extra_parallel_dim(
@@ -275,42 +335,90 @@ class OptimizerState(Stateful):
         )
 
 
-def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
+def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
     """
-    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused
+    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
+
+    ``device_mesh`` is the FSDP sub-mesh (ExtraParallel dim already excluded):
+    1D ``(ep_fsdp,)`` for plain FSDP, or 2D ``(ep_replicate, ep_fsdp)`` for HSDP.
+    ``fsdp_shard_dim`` is the tensor dim FSDP shards along (1 by default, 0 for
+    the Muon zero-comm layout). The number of placements on the loaded DTensor
+    reflects the full saved mesh:
+
+    * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
+    * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(fsdp_shard_dim)`` on
+      the 1D sub-mesh.
+    * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
+      ``[Replicate(), Shard(fsdp_shard_dim)]`` on the 2D sub-mesh.
     """
 
-    if len(loaded_tensor.placements) == 2:
-        tensor_to_put = DTensor.from_local(loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(1)])
-    elif len(loaded_tensor.placements) == 1:
+    num_placements = len(loaded_tensor.placements)
+    if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
+    elif num_placements == 2:
+        tensor_to_put = DTensor.from_local(
+            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
+        )
+    elif num_placements == 3:
+        tensor_to_put = DTensor.from_local(
+            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
+        )
     else:
         raise RuntimeError(
-            f"Expect ExtraParallel paramters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (ExtraParallel+FSDP), got {loaded_tensor}"
+            "Expect ExtraParallel parameters from checkpoints to be DTensor with 1-dim (no FSDP), "
+            f"2-dim (ExtraParallel+FSDP) or 3-dim (ExtraParallel+HSDP), got {loaded_tensor}"
         )
 
     return tensor_to_put
 
 
 def restore_extra_parallel_dim(
-    orgin_tensor: torch.Tensor, fsdp_mesh: DeviceMesh, extra_parallel_fsdp_mesh: DeviceMesh
+    orgin_tensor: torch.Tensor,
+    fsdp_mesh: DeviceMesh,
+    extra_parallel_fsdp_mesh: DeviceMesh,
+    ep_shard_dim: int = 0,
+    fsdp_shard_dim: int = 1,
 ):
     """
     Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
 
-    args:
-        orgin_tensor (torch.Tensor): The orgin tensor.
-        fsdp_mesh (DeviceMesh): The extra_parallel fsdp device mesh.
-        shard (Shard): The shard info, default Shard(0).
+    The ExtraParallel (e.g. ``ep``) dim and the FSDP dim shard the tensor along
+    DIFFERENT axes: ``ep_shard_dim`` (the EP plan's ``Shard.dim``, dim 0 for
+    experts) and ``fsdp_shard_dim`` (1 by default, 0 for the Muon zero-comm
+    layout). They must be mapped to the matching mesh dims explicitly.
 
+    args:
+        orgin_tensor (torch.Tensor): The orgin tensor (FSDP-local shard).
+        fsdp_mesh (DeviceMesh): The full ExtraParallel mesh, i.e. 2D
+            ``(ep_fsdp, ep)`` for plain FSDP or 3D
+            ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
+        extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
+            dim excluded), used for the pure-ExtraParallel (no FSDP) path.
+        ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
+        fsdp_shard_dim (int): Tensor dim FSDP shards along.
+
+    Note:
+        When ``ep_shard_dim == fsdp_shard_dim`` (e.g. the Muon zero-comm layout
+        shards experts on dim 0 just like EP), both mesh dims split the SAME
+        tensor dim. The mesh order ``(ep_fsdp, ep)`` then composes ``ep_fsdp``
+        OUTER of ``ep``, whereas the physical layout is EP-outer / FSDP-inner,
+        so the reconstructed GLOBAL tensor is block-transposed along that dim.
+        Save->load into the SAME parallel config still round-trips correctly
+        (drop is the exact inverse); only resharding / external reads of such a
+        checkpoint see the permuted layout. Fixing this needs the EP mesh dims
+        reordered so ``ep`` precedes ``ep_fsdp`` (a parallel_state change).
     """
-    assert fsdp_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {fsdp_mesh.ndim}"
+    assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
 
     if isinstance(orgin_tensor, DTensor):
-        # ExtraParallel+FSDP2
-        dtensor = DTensor.from_local(
-            orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=[Shard(0), Shard(1)]
-        )
+        # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
+        # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
+        # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
+        if fsdp_mesh.ndim == 3:
+            placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+        else:
+            placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
         dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
@@ -338,6 +446,8 @@ class DistributedCheckpointer(CheckpointerBase):
         global_steps: int = None,
         storage_writer: Optional[FileSystemWriter] = None,
         trainable_only: bool = False,
+        save_to_lowest_rank: bool = False,
+        parallel_state=None,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -354,6 +464,15 @@ class DistributedCheckpointer(CheckpointerBase):
                 state is already trainable-only by construction (the optimizer is built
                 from ``filter(lambda p: p.requires_grad, ...)``), so this flag only
                 affects the model state dump.
+            save_to_lowest_rank: forwarded to the DCP ``DefaultSavePlanner``. When True, each
+                replicated shard is written by the lowest global rank that holds it, instead of
+                being load-balanced across all replica holders. On a non-shared filesystem this
+                concentrates the (already deduplicated) copy onto the lowest-ranked replica group
+                instead of scattering it across replicas; in the standard HSDP layout (shard within
+                a node, replicate across nodes) that group is one node, which then holds a complete
+                checkpoint. Note this only consolidates *replicated* data: unique shards from
+                expert/tensor/pipeline parallelism are never deduplicated and remain distributed.
+                See ``CheckpointConfig.dcp_save_to_lowest_rank``.
         return:
             None
         """
@@ -366,14 +485,23 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        save_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
+        save_state = {
+            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        }
         if "optimizer" in state:
-            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])
+            save_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+            )
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
 
-        cls.execute_save(save_state=save_state, storage_writer=storage_writer, save_async=save_async)
+        cls.execute_save(
+            save_state=save_state,
+            storage_writer=storage_writer,
+            save_async=save_async,
+            save_to_lowest_rank=save_to_lowest_rank,
+        )
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -385,6 +513,7 @@ class DistributedCheckpointer(CheckpointerBase):
         process_group=None,
         storage_reader: Optional[FileSystemReader] = None,
         trainable_only: bool = False,
+        parallel_state=None,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -410,9 +539,13 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        load_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
+        load_state = {
+            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        }
         if "optimizer" in state:
-            load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+            load_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+            )  # type: ignore[index]
 
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)
@@ -421,7 +554,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict=load_state,
             storage_reader=storage_reader,
             process_group=process_group,
-            planner=DefaultLoadPlanner(allow_partial_load=True),
+            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
         )
 
         cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
@@ -462,8 +595,14 @@ class DistributedCheckpointer(CheckpointerBase):
         save_state: Dict[str, Any],
         storage_writer: FileSystemWriter,
         save_async: bool,
+        save_to_lowest_rank: bool = False,
     ) -> None:
-        """Execute DCP save with optional async support."""
+        """Execute DCP save with optional async support.
+
+        ``save_to_lowest_rank`` is forwarded to ``DefaultSavePlanner``; the default
+        (False) preserves DCP's load-balanced write assignment across replica holders.
+        """
+        planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         if save_async:
             # Lazily create a dedicated Gloo process group for async DCP saves
             if cls._async_process_group is None:
@@ -475,11 +614,13 @@ class DistributedCheckpointer(CheckpointerBase):
                 state_dict=save_state,
                 storage_writer=storage_writer,
                 process_group=cls._async_process_group,
+                planner=planner,
             )
         else:
             dcp.save(
                 state_dict=save_state,
                 storage_writer=storage_writer,
+                planner=planner,
             )
             if dist.is_initialized():
                 dist.barrier()
@@ -538,18 +679,7 @@ class DistributedCheckpointer(CheckpointerBase):
 
 def get_dtype_size(dtype: torch.dtype) -> int:
     """Return size in bytes for a given dtype."""
-    size_map = {
-        torch.float32: 4,
-        torch.float16: 2,
-        torch.bfloat16: 2,
-        torch.int64: 8,
-        torch.int32: 4,
-        torch.int16: 2,
-        torch.int8: 1,
-        torch.uint8: 1,
-        torch.bool: 1,
-    }
-    return size_map.get(dtype, 4)
+    return torch.empty((), dtype=dtype).element_size()
 
 
 def _normalize_key(key: str) -> Optional[str]:
@@ -559,6 +689,9 @@ def _normalize_key(key: str) -> Optional[str]:
     Conversion rules:
     - "model.model.*" -> "model.*" (remove first "model." prefix)
     - "model.lm_head.weight" -> "lm_head.weight" (special case)
+    - "model.base_model.*" -> "base_model.*" (PEFT LoRA adapter case;
+      ``save_lora_adapter_with_dcp`` re-prefixes already-PEFT-prefixed keys
+      with ``model.`` so DCP keeps them, and we strip that here on read)
     - Other "model.*" keys -> log warning and strip "model." prefix
     """
     if not key.startswith("model."):
@@ -570,6 +703,14 @@ def _normalize_key(key: str) -> Optional[str]:
     elif key == "model.lm_head.weight":
         # Special case: model.lm_head.weight -> lm_head.weight
         return "lm_head.weight"
+    elif key.startswith("model.base_model."):
+        # PEFT LoRA adapter save: ``save_lora_adapter_with_dcp`` writes keys
+        # of the form ``model.base_model.model.<...>.lora_A.weight`` so the
+        # DCP-side ``model.`` filter keeps them. The HF-side adapter file is
+        # the standard PEFT layout ``base_model.model.<...>.lora_A.weight``,
+        # which is exactly ``key[6:]``. This is a known, expected pattern
+        # — silent strip, no warning.
+        return key[6:]
     else:
         # Other keys with single "model." prefix - log and strip prefix
         logger.warning(
@@ -606,14 +747,15 @@ def _get_sharding_plan(
         hf_key = _normalize_key(key)
         if hf_key:
             # Determine dtype for size calculation
-            if save_dtype:
+            if not hasattr(tensor_meta.properties, "dtype"):
+                raise ValueError(
+                    f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
+                )
+            source_dtype = tensor_meta.properties.dtype
+            if save_dtype and source_dtype.is_floating_point:
                 dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
             else:
-                if not hasattr(tensor_meta.properties, "dtype"):
-                    raise ValueError(
-                        f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
-                    )
-                dtype = tensor_meta.properties.dtype
+                dtype = source_dtype
 
             # Calculate tensor size in bytes
             numel = 1
@@ -697,7 +839,7 @@ def _process_shard(
         if hasattr(tensor, "full_tensor"):
             tensor = tensor.full_tensor()
 
-        if target_dtype:
+        if target_dtype and tensor.is_floating_point():
             tensor = tensor.to(dtype=target_dtype)
 
         # Explicitly move to CPU and detach to avoid memory retention

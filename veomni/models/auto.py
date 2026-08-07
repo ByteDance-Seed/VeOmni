@@ -26,7 +26,7 @@ from transformers import (
 
 from ..arguments.arguments_types import OpsImplementationConfig
 from ..distributed.parallel_state import get_parallel_state
-from ..ops.dispatch import OpSlot
+from ..ops.dispatch import OpsConfigSlot, OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
 from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
@@ -69,6 +69,10 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     moe_experts_kernel: Optional[str] = None
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
+        if isinstance(obj, OpsConfigSlot):
+            obj.bind(ops_config)
+            bound.append(f"{obj.field_name} ({obj.value})")
+            continue
         if not isinstance(obj, OpSlot):
             continue
         # ``moe_experts`` reads ``moe_implementation`` (not the
@@ -82,7 +86,7 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
                 if ops_config.moe_implementation == "eager"
                 else ops_config.moe_implementation.removeprefix("fused_")
             )
-            if impl_name != "eager":
+            if impl_name != "eager" and obj.variant == "standard":
                 moe_experts_kernel = impl_name
         else:
             impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
@@ -118,6 +122,8 @@ def build_foundation_model(
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
+            "veomni_flex_attention_with_sp",
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
             "veomni_flash_attention_4_with_sp",
@@ -224,12 +230,13 @@ def build_foundation_model(
     }
 
     if attn_implementation not in (
+        "veomni_flex_attention_with_sp",
         "veomni_flash_attention_2_with_sp",
         "veomni_flash_attention_3_with_sp",
         "veomni_flash_attention_4_with_sp",
     ):
         logger.warning_rank0(
-            f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use veomni_flash_attention_2_with_sp or veomni_flash_attention_3_with_sp for SP."
+            f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use a veomni_*_with_sp attention implementation for SP."
         )
 
     if (init_device == "cpu" and get_parallel_state().global_rank != 0) or init_device == "meta":

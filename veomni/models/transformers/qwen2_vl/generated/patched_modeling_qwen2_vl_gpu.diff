@@ -455,7 +455,7 @@
 
          return vision_outputs
 
-@@ -1204,12 +1449,15 @@
+@@ -1204,15 +1449,20 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -472,7 +472,12 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen2VLModelOutputWithPast:
          r"""
-@@ -1220,27 +1468,107 @@
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices describing the positions of the input sequence tokens in the cache.
+         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+             The temporal, height and width of feature shape of each image in LLM.
+         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+@@ -1220,27 +1470,107 @@
          rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
              The rope index difference between sequence length and multimodal rope.
          """
@@ -590,7 +595,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1250,6 +1578,10 @@
+@@ -1250,6 +1580,10 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -601,7 +606,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1258,15 +1590,27 @@
+@@ -1258,15 +1592,27 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -630,7 +635,7 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1320,97 +1664,96 @@
+@@ -1320,97 +1666,98 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -652,6 +657,8 @@
 -            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
 -            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
 -            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices describing the positions of the input sequence tokens in the cache.
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
@@ -779,7 +786,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1628,5 +1971,46 @@
+@@ -1628,5 +1975,46 @@
 
          return input_ids, model_kwargs
 

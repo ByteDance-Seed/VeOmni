@@ -41,7 +41,7 @@ First, create new modeling file for your model implementation. Note that the cus
 
 ### 2. Register Your Model
 
-See [enable_new_models.md](support-new-models#in-your-model-file) for more details.
+See the [new-model guide](../usage/support_new_models/guide_and_checklist.md) for more details.
 
 
 ### 3. Model Configuration
@@ -94,7 +94,8 @@ from veomni.models import build_foundation_model
 model = build_foundation_model(
     config_path=args.model.config_path,
     weights_path=args.model.model_path,
-    ...
+    ops_implementation=args.model.ops_implementation,
+    # Add other optional keyword arguments as needed.
 )
 ```
 

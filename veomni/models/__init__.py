@@ -18,6 +18,7 @@ from .auto import build_foundation_model, build_processor, build_tokenizer
 from .module_utils import (
     init_empty_weights,
     load_model_weights,
+    load_model_weights_ep_sharded,
     rank0_load_and_broadcast_weights,
     save_model_assets,
     save_model_weights,
@@ -30,6 +31,7 @@ __all__ = [
     "build_tokenizer",
     "init_empty_weights",
     "load_model_weights",
+    "load_model_weights_ep_sharded",
     "rank0_load_and_broadcast_weights",
     "save_model_assets",
     "save_model_weights",
