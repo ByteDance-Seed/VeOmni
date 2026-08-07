@@ -138,9 +138,11 @@ config.add_import(
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
     names=[
+        "build_sparse_attention_indices",
         "build_packed_compression_metadata",
         "compress_packed_windows",
         "isolate_packed_causal_mask_",
+        "mask_sparse_attention_indices",
         "packed_compressed_block_bias",
         "packed_compressed_causal_ranges",
     ],
