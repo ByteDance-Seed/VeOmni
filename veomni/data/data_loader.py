@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import copy
 import math
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -49,14 +50,109 @@ def build_dataloader(dataloader_type: str, **kwargs):
 
 
 class DistributedDataloader(StatefulDataLoader):
+    _INFINITY_STATE_KEY = "_distributed_dataloader_infinity_state"
+
     dataset: "Dataset"
     sampler: "StatefulDistributedSampler"
+
+    def __init__(self, *args, infinity: bool = False, infinity_padding: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._infinity = infinity
+        self._infinity_padding = infinity_padding
+        self._infinity_padding_upstream_exhausted = False
+        self._infinity_padding_last_micro_batches = None
+        self._infinity_just_resumed = False
 
     def set_epoch(self, epoch: int) -> None:
         if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
             self.sampler.set_epoch(epoch)
         elif hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)
+
+    def __iter__(self):
+        if not (self._infinity or self._infinity_padding):
+            return super().__iter__()
+
+        if self._infinity_just_resumed:
+            self._infinity_just_resumed = False
+        else:
+            self._infinity_padding_upstream_exhausted = False
+            self._infinity_padding_last_micro_batches = None
+
+        return self._iter_worker()
+
+    def _iter_worker(self):
+        infinity_just_restarted = False
+
+        upstream_iter = None if self._infinity_padding_upstream_exhausted else super().__iter__()
+
+        while True:
+            if self._infinity_padding_upstream_exhausted:
+                if self._infinity_padding_last_micro_batches is None:
+                    raise RuntimeError("A rank exhausted before producing a batch to use for infinity padding.")
+
+                infinity_padding_micro_batches = [
+                    {**micro_batch, "padding_flag": True} for micro_batch in self._infinity_padding_last_micro_batches
+                ]
+
+                yield infinity_padding_micro_batches
+                continue
+
+            try:
+                upstream_micro_batches = next(upstream_iter)
+                if self._infinity_padding:
+                    self._infinity_padding_last_micro_batches = [
+                        micro_batch.copy() for micro_batch in upstream_micro_batches
+                    ]
+            except StopIteration:
+                if self._infinity:
+                    if infinity_just_restarted:
+                        raise RuntimeError(
+                            "infinity=True but the dataloader produced no batch after a restart; "
+                            "refusing to spin forever on an empty dataloader."
+                        ) from None
+                    upstream_iter = super().__iter__()
+                    infinity_just_restarted = True
+                elif self._infinity_padding:
+                    self._infinity_padding_upstream_exhausted = True
+                continue
+
+            infinity_just_restarted = False
+
+            yield upstream_micro_batches
+
+    def state_dict(self) -> Dict[str, Any]:
+        state_dict = super().state_dict()
+        if self._infinity or self._infinity_padding:
+            state_dict = dict(state_dict)
+            state_dict[self._INFINITY_STATE_KEY] = {
+                "mode": "infinity" if self._infinity else "infinity_padding",
+                "infinity_padding_last_micro_batches": copy.deepcopy(self._infinity_padding_last_micro_batches),
+                "infinity_upstream_exhausted": self._infinity_padding_upstream_exhausted,
+            }
+        return state_dict
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        state_dict = dict(state_dict)
+        infinity_state = state_dict.pop(self._INFINITY_STATE_KEY, None)
+        mode = "infinity" if self._infinity else "infinity_padding" if self._infinity_padding else None
+        saved_mode = infinity_state.get("mode") if infinity_state else None
+        if mode != saved_mode:
+            raise ValueError(f"Cannot restore {saved_mode} dataloader state with the current mode set to {mode}.")
+
+        super().load_state_dict(state_dict)
+
+        if infinity_state:
+            self._infinity_padding_last_micro_batches = copy.deepcopy(
+                infinity_state["infinity_padding_last_micro_batches"]
+            )
+            self._infinity_padding_upstream_exhausted = infinity_state["infinity_upstream_exhausted"]
+            self._infinity_just_resumed = True
+
+    def _shutdown_workers(self) -> None:
+        iterator = getattr(self, "_iterator", None)
+        if hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
 
 
 def _build_worker_init_fn(worker_num_threads: int) -> Callable[[int], None]:
@@ -91,6 +187,8 @@ def build_native_dataloader(
     in_order: bool = True,
     shuffle: bool = True,
     seed: int = 0,
+    infinity: bool = False,
+    infinity_padding: bool = False,
     collate_fn: Optional[Callable] = None,
     build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
@@ -145,6 +243,11 @@ def build_native_dataloader(
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
+        infinity: In worker-side dynamic batching, restart the underlying DataLoader
+            iteration after exhaustion without advancing the dataset epoch.
+        infinity_padding: In worker-side dynamic batching, pad a rank after its
+            DataLoader is exhausted.
+            Padding batches carry ``padding_flag=True`` and contribute zero loss.
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
@@ -268,6 +371,8 @@ def build_native_dataloader(
         worker_init_fn=worker_init_fn,
         multiprocessing_context=multiprocessing_context,
         snapshot_every_n_steps=snapshot_every_n_steps,
+        infinity=dyn_bsz and dyn_bsz_runtime == "worker" and infinity,
+        infinity_padding=dyn_bsz and dyn_bsz_runtime == "worker" and infinity_padding,
     )
 
     if dyn_bsz and dyn_bsz_runtime == "main":

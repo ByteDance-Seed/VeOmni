@@ -582,13 +582,8 @@ class DiTTrainer:
             self.on_epoch_end()
             self.base.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-            if args.data.dataloader.use_background_prefetcher:
-                self.base.data_iterator.stop()
 
         self.on_train_end()
-
-        if args.data.dataloader.use_background_prefetcher:
-            self.base.data_iterator.stop()
 
         synchronize()
 
