@@ -42,6 +42,12 @@ MAX_PIXELS = 768 * 28 * 28
 
 
 def _get_vlm_visual_module(model):
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        base_model = get_base_model()
+        if base_model is not model:
+            return _get_vlm_visual_module(base_model)
+
     # Qwen-VL wrappers are not consistent across transformers versions:
     # older releases may expose `visual` directly on the conditional model
     # for backward compatibility, while newer ones only keep `model.visual`.
@@ -60,11 +66,11 @@ def _get_vlm_visual_module(model):
 class VLMTrainingArguments(TrainingArguments):
     freeze_vit: bool = field(
         default=False,
-        metadata={"help": "Whether or not to freeze the vit parameters."},
+        metadata={"help": "Whether to freeze ViT parameters during full tuning; ignored when LoRA is enabled."},
     )
     freeze_audio_tower: bool = field(
         default=False,
-        metadata={"help": "Whether or not to freeze the audio tower parameters."},
+        metadata={"help": "Whether to freeze audio tower parameters during full tuning; ignored with LoRA."},
     )
     vit_lr: float = field(
         default=1e-6,
@@ -188,29 +194,44 @@ class VLMTrainer:
     def _freeze_model_module(self):
         args: VeOmniVLMArguments = self.base.args
         model_config = self.base.model_config
+        lora_enabled = bool(args.model.lora_config)
         if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             self.base.model.disable_talker()
 
-        if args.train.freeze_vit:
-            if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
-                self.base.model.thinker.visual.requires_grad_(False)
-                self.base.model.thinker.visual.merger.requires_grad_(True)
-            else:
-                # Resolve both flat and nested visual-module layouts to cover
-                # both the plain `model.visual` shape and Qwen3.5-VL's nested
-                # layout.
-                visual = _get_vlm_visual_module(self.base.model)
-                if visual is None:
-                    raise AttributeError(f"Cannot find visual module for model_type={model_config.model_type}.")
-                visual.requires_grad_(False)
+        # VLMTrainer composes BaseTrainer instead of calling its constructor, so
+        # it must opt into the shared LoRA setup explicitly. The wrapper freezes
+        # all base weights and re-enables only matched adapter parameters.
+        if lora_enabled:
+            self.base._setup_lora()
 
-        if args.train.freeze_audio_tower and model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
-            self.base.model.thinker.audio_tower.requires_grad_(False)
-            # Qwen2.5-Omni uses audio_tower.proj; Qwen3-Omni-MoE uses audio_tower.proj1.
-            audio_proj = (
-                getattr(self.base.model.thinker.audio_tower, "proj1", None) or self.base.model.thinker.audio_tower.proj
-            )
-            audio_proj.requires_grad_(True)
+        is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
+        visual = self.base.model.thinker.visual if is_omni else _get_vlm_visual_module(self.base.model)
+
+        # LoRA setup is authoritative for trainability. It already freezes every
+        # untargeted parameter, so the legacy tower flags apply only to full tuning.
+        if not lora_enabled:
+            if args.train.freeze_vit:
+                if is_omni:
+                    self.base.model.thinker.visual.requires_grad_(False)
+                    # Preserve the existing full-tuning policy: freeze the
+                    # visual backbone while continuing to train the merger.
+                    self.base.model.thinker.visual.merger.requires_grad_(True)
+                else:
+                    # Resolve both flat and nested visual-module layouts to cover
+                    # both the plain `model.visual` shape and Qwen3.5-VL's nested
+                    # layout.
+                    if visual is None:
+                        raise AttributeError(f"Cannot find visual module for model_type={model_config.model_type}.")
+                    visual.requires_grad_(False)
+
+            if args.train.freeze_audio_tower and is_omni:
+                self.base.model.thinker.audio_tower.requires_grad_(False)
+                # Qwen2.5-Omni uses audio_tower.proj; Qwen3-Omni-MoE uses audio_tower.proj1.
+                audio_proj = (
+                    getattr(self.base.model.thinker.audio_tower, "proj1", None)
+                    or self.base.model.thinker.audio_tower.proj
+                )
+                audio_proj.requires_grad_(True)
 
         pretty_print_trainable_parameters(self.base.model)
         helper.print_device_mem_info("VRAM usage after building model")
@@ -274,8 +295,8 @@ class VLMTrainer:
                 else:
                     other_params.append(param)
 
-        # Only create groups that have trainable params. An empty vit group
-        # (freeze_vit=true) has no optimizer state under DCP and would raise
+        # Only create groups that have trainable params. An empty visual group
+        # has no optimizer state under DCP and would raise
         # KeyError: 'betas' on the first step after resume. VLMRLTrainer
         # inherits this method, so the guard covers both trainers.
         param_groups = []

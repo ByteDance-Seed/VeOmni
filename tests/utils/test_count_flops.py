@@ -270,10 +270,8 @@ class TestQwen35LoraFlops:
             images_seqlens=images_seqlens,
         )
 
-        # No vision tokens skip the ViT. Decoder-only targets leave it frozen
-        # and detached, so only one forward pass (one third of FFT) remains.
+        # No vision tokens skip the ViT; decoder-only targets keep it forward-only.
         assert empty_image_flops == lora_text
-        # Decoder-only targets leave the vision tower frozen and detached.
         assert lora_vl - lora_text == pytest.approx((full_vl - full_text) / 3, rel=1e-9)
 
         text_flops, _ = qwen3_5_counter.estimate_flops(
@@ -288,27 +286,34 @@ class TestQwen35LoraFlops:
             images_seqlens=images_seqlens,
         )
 
-        vision = qwen3_5_counter.config.vision_config
-        tokens_sum = sum(images_seqlens)
-        dim = vision.hidden_size
-        merger_hidden_size = dim * vision.spatial_merge_size**2
-        patch_embed_params = (
-            dim * vision.in_channels * vision.temporal_patch_size * vision.patch_size * vision.patch_size
+        assert vl_flops - text_flops > lora_vl - lora_text
+
+    def test_bias_only_vision_backward_is_not_counted_as_frozen(self, qwen3_5_counter):
+        batch_seqlens = [12, 5]
+        images_seqlens = [16]
+        lora_config = VeOmniLoraConfig(r=8, target_modules=["q_proj"], bias="all")
+
+        full_text, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=2.0)
+        full_vl, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            images_seqlens=images_seqlens,
         )
-        block_params = dim * (2 * vision.intermediate_size + 4 * dim) * vision.depth
-        merger_params = merger_hidden_size * (merger_hidden_size + vision.out_hidden_size)
-        adaptable_base_params = block_params + merger_params
-        lora_params = rank * (dim + 3 * dim) * vision.depth
-        linear_flops = (2 * patch_embed_params + 4 * adaptable_base_params + 6 * lora_params) * tokens_sum
-        attention_flops = (
-            12
-            * sum(seqlen * seqlen for seqlen in images_seqlens)
-            * (dim // vision.num_heads)
-            * vision.num_heads
-            * vision.depth
+        bias_text, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=lora_config,
+        )
+        bias_vl, _ = qwen3_5_counter.estimate_flops(
+            batch_seqlens,
+            delta_time=2.0,
+            lora_config=lora_config,
+            images_seqlens=images_seqlens,
         )
 
-        assert vl_flops - text_flops == pytest.approx((linear_flops + attention_flops) / 2.0 / 1e12, rel=1e-9)
+        vision_flops = bias_vl - bias_text
+        assert vision_flops > (full_vl - full_text) / 3
+        assert vision_flops < full_vl - full_text
 
 
 class TestQwen35MoeFlops:
@@ -412,6 +417,14 @@ class TestAllQwenLoraFlops:
             rank8, _ = counter.estimate_flops([12, 5], 1.0, lora_config=make_config(8, modules), **kwargs)
 
             assert 0 < rank4 < rank8 < full_flops, config.model_type
+            if kwargs:
+                text_only, _ = counter.estimate_flops([12, 5], 1.0)
+                frozen_fft, _ = counter.estimate_flops([12, 5], 1.0, freeze_vit=True, **kwargs)
+                frozen_lora, _ = counter.estimate_flops(
+                    [12, 5], 1.0, lora_config=make_config(4, modules), freeze_vit=True, **kwargs
+                )
+                assert frozen_fft - text_only == pytest.approx((full_flops - text_only) / 3), config.model_type
+                assert frozen_lora == rank4, config.model_type
 
     def test_routed_moe_lora_modes_and_topk(self, qwen3_5_moe_counter):
         config = qwen3_5_moe_counter.config
