@@ -308,19 +308,6 @@ def main():
         model_assets = [model_config, processor]
         save_model_assets(args.train.checkpoint.model_assets_dir, model_assets)
 
-    if args.train.profile.this_rank:
-        profiler = helper.create_profiler(
-            start_step=args.train.profile.start_step,
-            end_step=args.train.profile.end_step,
-            trace_dir=args.train.profile.trace_dir,
-            record_shapes=args.train.profile.record_shapes,
-            profile_memory=args.train.profile.profile_memory,
-            with_stack=args.train.profile.with_stack,
-            with_modules=args.train.profile.with_modules,
-            global_rank=args.train.global_rank,
-        )
-        profiler.start()
-
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
     environ_meter = helper.EnvironMeter(
@@ -349,6 +336,49 @@ def main():
 
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
+
+    profiler = None
+    profiler_failed = False
+    profiler_stopped = False
+    profile_active = False
+    if args.train.profile.enable:
+        # Validate on every rank before the this_rank branch. Otherwise an
+        # invalid rank0-only configuration can strand peers in collectives.
+        helper.validate_npu_profile_config(
+            args.train.profile.trace_dir,
+            args.train.profile.npu_analysis_mode,
+        )
+        first_profile_step = max(args.train.profile.start_step, global_step + 1)
+        profile_active = first_profile_step < args.train.profile.end_step
+        if not profile_active:
+            logger.warning_rank0(
+                f"Profiling window [{args.train.profile.start_step}, {args.train.profile.end_step}) "
+                f"has no remaining steps after global step {global_step}; profiling is skipped."
+            )
+        elif args.train.profile.this_rank:
+            try:
+                profiler = helper.create_profiler(
+                    start_step=first_profile_step - global_step,
+                    end_step=args.train.profile.end_step - global_step,
+                    trace_dir=args.train.profile.trace_dir,
+                    record_shapes=args.train.profile.record_shapes,
+                    profile_memory=args.train.profile.profile_memory,
+                    with_stack=args.train.profile.with_stack,
+                    with_modules=args.train.profile.with_modules,
+                    global_rank=args.train.global_rank,
+                    npu_analysis_mode=args.train.profile.npu_analysis_mode,
+                )
+                profiler.start()
+            except Exception as exc:
+                if not helper.IS_NPU_AVAILABLE:
+                    raise
+                profiler = None
+                profiler_failed = True
+                profiler_stopped = True
+                logger.warning(
+                    "NPU profiler initialization failed; profiling is disabled for this rank and training will "
+                    f"continue. Error: {exc}"
+                )
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
@@ -458,11 +488,44 @@ def main():
                     train_metrics.update({f"training/{k}": v for k, v in step_info.items()})
                     wandb.log(train_metrics, step=global_step)
 
-            if args.train.profile.this_rank and global_step <= args.train.profile.end_step:
-                profiler.step()
-                if global_step == args.train.profile.end_step:
-                    profiler.stop()
-                    helper.upload_trace(args.train.wandb.project, args.train.wandb.name, args.train.profile.trace_dir)
+            # Align with ProfileTraceCallback: barrier around Ascend raw finalize
+            # and optional async-analysis submission so rank0 cannot race peers.
+            synchronize_profile_finalize = (
+                profile_active
+                and helper.IS_NPU_AVAILABLE
+                and global_step == args.train.profile.end_step - 1
+                and dist.is_available()
+                and dist.is_initialized()
+            )
+            if synchronize_profile_finalize:
+                dist.barrier()
+            profile_error = None
+            try:
+                if (
+                    profiler is not None
+                    and not profiler_failed
+                    and not profiler_stopped
+                    and global_step <= args.train.profile.end_step
+                ):
+                    try:
+                        profiler.step()
+                        if global_step == args.train.profile.end_step:
+                            profiler.stop()
+                            profiler_stopped = True
+                            # Persistence/upload is owned by create_profiler.on_trace_ready.
+                    except Exception as exc:
+                        if not helper.IS_NPU_AVAILABLE:
+                            raise
+                        profile_error = exc
+                        profiler_failed = True
+            finally:
+                if synchronize_profile_finalize:
+                    dist.barrier()
+            if profile_error is not None:
+                logger.warning(
+                    "NPU profiler finalization failed; profiling is disabled for this rank and training will "
+                    f"continue after all ranks leave the finalization barrier. Error: {profile_error}"
+                )
 
             if args.train.checkpoint.save_steps and global_step % args.train.checkpoint.save_steps == 0:
                 helper.empty_cache()
@@ -502,6 +565,31 @@ def main():
             Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+
+    synchronize_profile_cleanup = (
+        profile_active and helper.IS_NPU_AVAILABLE and dist.is_available() and dist.is_initialized()
+    )
+    if synchronize_profile_cleanup:
+        dist.barrier()
+    try:
+        if profiler is not None and not profiler_stopped:
+            try:
+                profiler.stop()
+            except Exception as exc:
+                if not helper.IS_NPU_AVAILABLE:
+                    raise
+                profiler_failed = True
+                logger.warning(
+                    "NPU profiler cleanup failed; training completion will continue after all ranks leave the "
+                    f"cleanup barrier. Error: {exc}"
+                )
+            finally:
+                profiler_stopped = True
+    finally:
+        if synchronize_profile_cleanup:
+            dist.barrier()
+    if profiler is not None:
+        helper.wait_npu_profile_sidecars(profiler)
 
     synchronize()
     # release memory

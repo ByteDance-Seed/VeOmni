@@ -349,6 +349,8 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | with_stack | `bool` | `True` | Record stack traces. |
 | with_modules | `bool` | `False` | Record module hierarchy in profiler traces. |
 | rank0_only | `bool` | `True` | Profile rank 0 only. |
+| npu_analysis_mode | `Literal["offline", "async"]` | `"offline"` | Ascend only. `offline` finalizes raw data and auto-uploads a postprocessed profiling asset in Merlin through a platform file uploader or `merlin-cli`; if neither uploader is available, it preserves raw data. JSON/base64 SDK upload is intentionally avoided for large traces. `async` uses torch_npu's online process pool (`analyse_flag=True, async_mode=True`). Use a pod-local directory for `async`. Distributed barriers cover raw finalization and handler submission, not background analysis. |
+| npu_offline_analysis | `Optional[bool]` | `None` | Deprecated migration alias. `true` maps to `npu_analysis_mode="offline"`; `false` is rejected because synchronous online parsing was removed. |
 
 ### ChannelLossConfig
 
