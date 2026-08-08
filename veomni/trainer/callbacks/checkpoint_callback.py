@@ -19,16 +19,9 @@ import torch
 import torch.distributed as dist
 
 from ...checkpoint import CheckpointerBase, build_checkpointer
-from ...checkpoint.checkpoint_manifest import (
-    build_checkpoint_manifest,
-    read_checkpoint_manifest,
-    validate_checkpoint_manifest,
-    write_checkpoint_manifest,
-)
 from ...checkpoint.rng_state import restore_rng_state, snapshot_rng_state
 from ...models import save_model_assets
 from ...utils import helper
-from ...utils.device import get_torch_device
 from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from .base import Callback, TrainerState
 
@@ -68,68 +61,6 @@ class CheckpointerCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._load_checkpoint()
 
-    def _manifest_identity(self):
-        """Return ``(extra_hashes, soft_fields)`` for the checkpoint manifest.
-
-        Both hard-gated identities (component lifecycle policy, flow recipe) are
-        model-config fields, so a model that declares neither keeps a generic manifest.
-        """
-        args: "VeOmniArguments" = self.trainer.args
-        model_config = getattr(self.trainer, "model_config", None)
-        extra = {}
-        soft = {}
-
-        component_policy = getattr(model_config, "component_policy", None)
-        if component_policy:
-            extra["component_policy"] = dict(component_policy)
-        flow = getattr(model_config, "flow", None)
-        if flow:
-            extra["flow"] = dict(flow)
-
-        seed = getattr(args.train, "seed", None)
-        if seed is not None:
-            soft["train_seed"] = seed
-        return extra, soft
-
-    def _assert_manifest_compatible(self, load_path: str) -> None:
-        """Validate the saved manifest and agree across ranks BEFORE the DCP load.
-
-        The all-reduce makes every rank raise identically on a hard mismatch, rather
-        than one rank bailing out while the rest deadlock in the load collective. A
-        missing manifest (pre-feature checkpoint) only warns.
-        """
-        saved = read_checkpoint_manifest(load_path)
-        if saved is None:
-            logger.warning_rank0(
-                f"No checkpoint_manifest.json in {load_path}; skipping same-topology validation "
-                "(checkpoint predates the manifest). Ensure the resume topology matches."
-            )
-            return
-
-        extra, soft = self._manifest_identity()
-        current = build_checkpoint_manifest(
-            model_config=self.trainer.model_config,
-            parallel_state=self.parallel_state,
-            extra_hashes=extra,
-            soft_fields=soft,
-        )
-        hard_reasons, soft_reasons = validate_checkpoint_manifest(saved, current)
-        for reason in soft_reasons:
-            logger.warning_rank0(f"Checkpoint manifest soft mismatch on resume: {reason}")
-
-        local_ok = len(hard_reasons) == 0
-        agreed_ok = local_ok
-        if dist.is_available() and dist.is_initialized():
-            flag = torch.tensor([1 if local_ok else 0], dtype=torch.int64, device=get_torch_device().current_device())
-            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
-            agreed_ok = bool(flag.item() > 0)
-        if not agreed_ok:
-            detail = "; ".join(hard_reasons) if hard_reasons else "another rank reported an incompatible manifest"
-            raise ValueError(
-                f"Incompatible checkpoint resume rejected by the same-topology manifest gate: {detail}. "
-                "Resume under the exact saved mesh/model/policy, or start a fresh run."
-            )
-
     def _load_checkpoint(self):
         """Load checkpoint from path."""
         args: "VeOmniArguments" = self.trainer.args
@@ -143,10 +74,6 @@ class CheckpointerCallback(Callback):
         }
 
         self.trainer.checkpointer.wait_for_pending_save()
-
-        # Must run before the DCP load collective: a topology/identity mismatch would
-        # otherwise deadlock or reshard incorrectly mid-collective.
-        self._assert_manifest_compatible(args.train.checkpoint.load_path)
 
         self.trainer.checkpointer.load(
             args.train.checkpoint.load_path,
@@ -243,16 +170,6 @@ class CheckpointerCallback(Callback):
         # Empty cache and barrier
         helper.empty_cache()
         dist.barrier()
-
-        if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-            extra, soft = self._manifest_identity()
-            manifest = build_checkpoint_manifest(
-                model_config=self.trainer.model_config,
-                parallel_state=self.parallel_state,
-                extra_hashes=extra,
-                soft_fields=soft,
-            )
-            write_checkpoint_manifest(save_checkpoint_path, manifest)
 
         self._last_saved_step = state.global_step
         logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
