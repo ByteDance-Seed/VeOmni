@@ -61,6 +61,11 @@ def test_ignored_patterns_resolve_to_matching_params():
     for fqn, param in model.named_parameters():
         if fqn.startswith("vae."):
             assert id(param) in ignored_ids, f"expected {fqn!r} to be ignored"
+            # Mapping value must carry both the matched FQN and the pattern that
+            # picked it up -- that is what powers the assertion error in
+            # ``_assert_ignored_params_not_in_sharded_submodules``.
+            label = ignored[param]
+            assert fqn in label and "vae.*" in label, f"missing FQN/pattern label: {label!r}"
         else:
             assert id(param) not in ignored_ids, f"unexpected non-vae {fqn!r} ignored"
 
@@ -73,15 +78,17 @@ def test_no_patterns_returns_none():
 
 
 def test_patterns_matching_nothing_warns_and_returns_none():
-    """Declared-but-unused patterns log a warning and don't wrongly return ``set()``."""
+    """Declared-but-unused patterns log a warning and don't wrongly return an empty match."""
     model = _ToyModel()
     plan = ParallelPlan(
         extra_parallel_plan={"ep": {"model.0.weight": Shard(0)}},
         fsdp_ignored_param_fqn_patterns=["nonexistent.*"],
     )
     ignored = plan.get_fsdp_ignored_params(model)
-    # ``None`` signals "no ignored set" to the FSDP call site so it stays default.
-    assert ignored is None or ignored == set()
+    # ``None`` signals "no ignored set" to the FSDP call site so it stays default;
+    # an empty mapping is tolerated (falsy) but should never be silently non-None with
+    # zero entries.
+    assert ignored is None or not ignored
 
 
 def _mark_fsdp_wrapped(module):
@@ -105,7 +112,22 @@ def test_nested_sharded_assertion_flags_param_inside_wrapped_submodule():
     _mark_fsdp_wrapped(model.vae)
 
     ignored = {p for _, p in model.vae.named_parameters()}
-    with pytest.raises(AssertionError, match="lives inside submodule"):
+    with pytest.raises(ValueError, match="lives inside submodule"):
+        _assert_ignored_params_not_in_sharded_submodules(model, ignored)
+
+
+def test_nested_sharded_assertion_names_matched_pattern_when_given_mapping():
+    """When the helper receives the ``{param: label}`` mapping produced by
+    ``ParallelPlan.get_fsdp_ignored_params``, the error must name the matched
+    pattern so a user can tell *which* declaration pulled the offending param in."""
+    model = _ToyModel()
+    _mark_fsdp_wrapped(model.vae)
+    plan = ParallelPlan(
+        extra_parallel_plan={"ep": {"model.0.weight": Shard(0)}},
+        fsdp_ignored_param_fqn_patterns=["vae.*"],
+    )
+    ignored = plan.get_fsdp_ignored_params(model)
+    with pytest.raises(ValueError, match=r"matched by pattern 'vae\.\*'"):
         _assert_ignored_params_not_in_sharded_submodules(model, ignored)
 
 

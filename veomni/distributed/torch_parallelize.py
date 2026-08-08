@@ -102,16 +102,22 @@ def _move_buffers_to_device(model: nn.Module, device: str) -> None:
                 module._buffers[name] = buffer.to(device)
 
 
-def _assert_ignored_params_not_in_sharded_submodules(model: "nn.Module", ignored_params: set) -> None:
+def _assert_ignored_params_not_in_sharded_submodules(model: "nn.Module", ignored_params) -> None:
     """Reject ignored params that a nested ``fully_shard`` already claimed.
 
     ``ignored_params`` is only honored by the outermost ``fully_shard``, so a param
     inside a submodule wrapped earlier in ``parallelize_model_fsdp2`` would still be
     sharded / mixed-precision-cast despite being declared ignored. Fail loudly here
     rather than silently violating that contract.
+
+    ``ignored_params`` may be either a set of params (legacy shape) or a
+    ``{param: "<fqn> (matched by pattern ...)"}`` mapping from
+    ``ParallelPlan.get_fsdp_ignored_params``; the mapping form lets this error
+    name the matched pattern.
     """
     if not ignored_params:
         return
+    pattern_label = ignored_params if isinstance(ignored_params, dict) else {}
     ignored_ids = {id(p) for p in ignored_params}
     for module_fqn, submodule in model.named_modules():
         if not isinstance(submodule, FSDPModule):
@@ -121,8 +127,9 @@ def _assert_ignored_params_not_in_sharded_submodules(model: "nn.Module", ignored
         for param_name, param in submodule.named_parameters():
             if id(param) in ignored_ids:
                 full_fqn = f"{module_fqn}.{param_name}" if module_fqn else param_name
-                raise AssertionError(
-                    f"ParallelPlan.fsdp_ignored_param_fqn_patterns matched param {full_fqn!r} "
+                label = pattern_label.get(param, full_fqn)
+                raise ValueError(
+                    f"ParallelPlan.fsdp_ignored_param_fqn_patterns matched param {label} "
                     f"but that param lives inside submodule {module_fqn!r} which was already "
                     f"wrapped by fully_shard earlier in parallelize_model_fsdp2. "
                     "``ignored_params`` is only honored by the *root* fully_shard call, so this "
@@ -506,17 +513,23 @@ def parallelize_model_fsdp2(
     plan_obj = plan_from_hook() if plan_from_hook is not None else None
     if plan_obj is not None:
         root_ignored_params = plan_obj.get_fsdp_ignored_params(model)
-    # The model-level hook is a fallback for models with no plan entry, but is called
-    # either way for its dtype/mode side effects (e.g. a VAE ``.float()`` cast that
-    # must land before the root fully_shard reads the current dtype).
-    legacy_hook = getattr(model, "get_fsdp_ignored_params", None)
-    if legacy_hook is not None:
-        legacy_ret = legacy_hook()
-        if root_ignored_params is None and legacy_ret:
-            root_ignored_params = set(legacy_ret)
+    # Separate, explicit contract for models that need to MUTATE param dtype before
+    # the root ``fully_shard`` reads it (e.g. cast a frozen VAE to FP32 while still
+    # on meta so the disk FP32 weights load without a BF16 round-trip). Invoked
+    # unconditionally, no return value -- the set of ignored params stays purely
+    # declarative on ``ParallelPlan``. This ordering (dtype policy before shard) is
+    # the whole reason the hook exists: FSDP2 latches mixed-precision the first
+    # time it sees the module.
+    dtype_policy = getattr(model, "apply_pre_fsdp_dtype_policy", None)
+    if dtype_policy is not None:
+        dtype_policy()
     if root_ignored_params:
         _assert_ignored_params_not_in_sharded_submodules(model, root_ignored_params)
-    fully_shard(model, **root_fsdp_kwargs, ignored_params=root_ignored_params)
+    # ``fully_shard`` wants a plain iterable of Parameters; unwrap the pattern-labelled
+    # mapping from ``get_fsdp_ignored_params`` (kept as a dict so the assert above can
+    # name the matched pattern).
+    fully_shard_ignored = set(root_ignored_params) if root_ignored_params else None
+    fully_shard(model, **root_fsdp_kwargs, ignored_params=fully_shard_ignored)
 
     # configure manual prefetching when needed
     need_manual_prefetch = (

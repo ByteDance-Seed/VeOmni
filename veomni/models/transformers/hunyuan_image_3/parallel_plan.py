@@ -26,10 +26,11 @@ def get_parallel_plan() -> ParallelPlan:
             }
         },
         # The frozen VAE encoder must stay replicated FP32 on every rank -- BF16
-        # perturbs the online latents by 4-6%. This declaration is authoritative;
-        # the model's ``get_fsdp_ignored_params`` hook is still called, but only
-        # for its ``.float()`` side effect (the meta-path cast must precede the
-        # root shard). When a recipe builds no VAE the pattern matches nothing.
+        # perturbs the online latents by 4-6%. This declaration is authoritative
+        # for keeping VAE params out of sharding / MP; the dtype cast that must
+        # precede the root shard is owned separately by
+        # ``apply_pre_fsdp_dtype_policy`` on the model. When a recipe builds no
+        # VAE the pattern matches nothing.
         fsdp_ignored_param_fqn_patterns=["vae.*"],
     )
 

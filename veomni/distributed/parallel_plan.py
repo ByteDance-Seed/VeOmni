@@ -73,19 +73,21 @@ class ParallelPlan:
         }
         self.fsdp_ignored_param_fqn_patterns = fsdp_ignored_param_fqn_patterns or []
 
-    def get_fsdp_ignored_params(self, model: nn.Module) -> Optional[set]:
+    def get_fsdp_ignored_params(self, model: nn.Module) -> Optional[Dict[nn.Parameter, str]]:
         """Resolve ``fsdp_ignored_param_fqn_patterns`` against the model's live
-        parameters. Returns ``None`` when nothing was declared, so the caller keeps its
-        default (no ``ignored_params``) root-shard path."""
+        parameters. Returns a ``{param: "<fqn> (matched by pattern <pattern>)"}``
+        mapping so the caller can both feed the params into ``fully_shard`` and,
+        on the misconfiguration path, name *which* declared pattern pulled in a
+        param that turned out to live inside a nested-sharded submodule. Returns
+        ``None`` when nothing was declared, so the caller keeps its default
+        (no ``ignored_params``) root-shard path."""
         if not self.fsdp_ignored_param_fqn_patterns:
             return None
-        matched: set = set()
-        matched_fqns: List[str] = []
+        matched: Dict[nn.Parameter, str] = {}
         for fqn, param in model.named_parameters():
             for pattern in self.fsdp_ignored_param_fqn_patterns:
                 if check_fqn_match(pattern, fqn):
-                    matched.add(param)
-                    matched_fqns.append(fqn)
+                    matched[param] = f"{fqn} (matched by pattern {pattern!r})"
                     break
         if not matched:
             logger.warning_rank0(
@@ -93,9 +95,10 @@ class ParallelPlan:
                 f"matched 0 parameters on {type(model).__name__} -- declared but unused."
             )
         else:
+            sample = list(matched.values())[:3]
             logger.info_rank0(
                 f"FSDP2 root ignored_params (from ParallelPlan): {len(matched)} params "
-                f"matched by {self.fsdp_ignored_param_fqn_patterns} -- e.g. {matched_fqns[:3]}"
+                f"matched by {self.fsdp_ignored_param_fqn_patterns} -- e.g. {sample}"
             )
         return matched
 

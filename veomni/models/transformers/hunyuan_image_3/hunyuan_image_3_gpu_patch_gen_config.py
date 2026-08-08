@@ -426,17 +426,17 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
     def get_parallel_plan(self):
         return get_parallel_plan()
 
-    def get_fsdp_ignored_params(self):
-        # The frozen VAE encoder must stay replicated FP32 -- out of FSDP sharding
-        # AND mixed precision -- so BF16 does not perturb the online latents
-        # (measured bf16 latent-mean rel_max ~4-6%). parallelize_model_fsdp2 calls
-        # this right before the root fully_shard, while params are still on meta, so
-        # casting here means the disk FP32 weights load without a BF16 round-trip.
-        # None when the component policy marks vae_encoder absent.
-        if not hasattr(self, "vae"):
-            return None
-        self.vae.float()
-        return set(self.vae.parameters())
+    def apply_pre_fsdp_dtype_policy(self) -> None:
+        # MUTATES model dtype in place. ``parallelize_model_fsdp2`` calls this once,
+        # unconditionally, right before the root ``fully_shard`` -- while params are
+        # still on meta -- so the disk FP32 VAE weights load without a BF16 round-trip.
+        # The set of ignored params is declared separately (and authoritatively) by
+        # ``ParallelPlan.fsdp_ignored_param_fqn_patterns=["vae.*"]``; this hook only
+        # owns the dtype cast that must precede the root shard.
+        # Why FP32: BF16 perturbs the online latents by 4-6% (rel_max on latent-mean),
+        # which drifts image quality. No-op when the component policy dropped the VAE.
+        if hasattr(self, "vae"):
+            self.vae.float()
 
     def get_position_id_func(self):
         # The single_gen_t2i_v1 transform emits no position_ids; the packed
@@ -473,8 +473,8 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
                 component.requires_grad_(self.component_policy.state(policy_name) == "trainable")
         if hasattr(self, "vae"):
             self.vae.requires_grad_(False)
-            # Frozen encoder runs FP32. On the FSDP path get_fsdp_ignored_params
-            # keeps it out of sharding/MP; cast here too so non-FSDP paths are FP32 as well.
+            # Frozen encoder runs FP32. On the FSDP path apply_pre_fsdp_dtype_policy
+            # runs before root shard; cast here too so non-FSDP paths are FP32 as well.
             self.vae.float()
             self.vae.eval()
         return self
@@ -807,8 +807,9 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
         if self.component_policy.vae_encoder != "frozen" or not hasattr(self, "vae"):
             raise RuntimeError("Online pixel_values latents require component_policy vae_encoder='frozen'.")
         pixel_values = self._stack_packed_samples(pixel_values, name="pixel_values")
-        # The frozen encoder is kept FP32 (out of FSDP sharding/MP via
-        # get_fsdp_ignored_params); match its dtype AND device so the encode runs
+        # The frozen encoder is kept FP32 (declared via ParallelPlan
+        # fsdp_ignored_param_fqn_patterns=["vae.*"] and cast by
+        # apply_pre_fsdp_dtype_policy); match its dtype AND device so the encode runs
         # FP32 end to end. The device co-cast is not cosmetic: ``pack_mode="list"``
         # staging survives the trainer's batch-to-device sweep on CPU (the sweep
         # recurses into dicts but not into ``List[Tensor]``), so without it
