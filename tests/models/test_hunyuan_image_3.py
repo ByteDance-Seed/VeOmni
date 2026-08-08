@@ -49,7 +49,7 @@ from veomni.models.transformers.hunyuan_image_3.sequence_layout import (
     UnsupportedSequenceLayout,
     compile_single_gen_t2i_packed,
 )
-from veomni.schedulers.flow_matching import (
+from veomni.schedulers.flow_matching_loss import (
     DEFAULT_REFERENCE_FLOW_CONFIG,
     derive_flow_seed,
     prepare_reference_flow_batch,
@@ -258,7 +258,7 @@ def test_derive_flow_seed_separates_neighbouring_run_seeds():
         [
             sys.executable,
             "-c",
-            "from veomni.schedulers.flow_matching import derive_flow_seed; print(derive_flow_seed(7, 3))",
+            "from veomni.schedulers.flow_matching_loss import derive_flow_seed; print(derive_flow_seed(7, 3))",
         ],
         capture_output=True,
         text=True,

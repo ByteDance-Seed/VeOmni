@@ -14,9 +14,9 @@
 
 """Scheduler / loss primitives for diffusion-style training.
 
-Two near-identically named modules live here: ``flow_match`` holds the
+Two modules live here with distinct roles: ``flow_match`` holds the
 inference-time ``FlowMatchScheduler`` (Wan / Flux DiT sampling), while
-``flow_matching`` holds the training-path helpers (flow recipe validation,
-per-DP-replica seed derivation, posterior / timestep / noise sampling from a
-caller-owned generator, velocity-MSE loss).
+``flow_matching_loss`` holds the training-path helpers (flow recipe
+validation, per-DP-replica seed derivation, posterior / timestep / noise
+sampling from a caller-owned generator, velocity-MSE loss).
 """

@@ -71,7 +71,7 @@ from veomni.models.transformers.hunyuan_image_3.vae import HunyuanImage3VAE
 
 # Additional import blocks for patches
 from veomni.ops.dispatch import OpSlot
-from veomni.schedulers.flow_matching import derive_flow_seed, flow_matching_loss, prepare_reference_flow_batch
+from veomni.schedulers.flow_matching_loss import derive_flow_seed, flow_matching_loss, prepare_reference_flow_batch
 from veomni.utils.model_outputs import HunyuanImage3ReferenceOutput
 
 
@@ -802,7 +802,7 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
         self.pad_id = config.pad_id
         self.vocab_size = config.vocab_size
         # Flow-matching RNG state (posterior noise / timestep / diffusion noise
-        # -- see veomni.schedulers.flow_matching). Owned by the model so DCP model
+        # -- see veomni.schedulers.flow_matching_loss). Owned by the model so DCP model
         # load restores it via get/set_extra_state -- no trainer-side callback, no
         # per-batch identity plumbing. Lazily initialized on first forward call so
         # the (DP-rank-aware) seed and the (CUDA-resident) device are both known.

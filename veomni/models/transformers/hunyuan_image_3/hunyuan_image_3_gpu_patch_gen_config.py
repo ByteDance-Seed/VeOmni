@@ -47,7 +47,7 @@ config.add_import(
     names=["get_parallel_plan"],
 )
 config.add_import(
-    "veomni.schedulers.flow_matching",
+    "veomni.schedulers.flow_matching_loss",
     names=["derive_flow_seed", "flow_matching_loss", "prepare_reference_flow_batch"],
 )
 config.add_import(
@@ -405,7 +405,7 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
         self.pad_id = config.pad_id
         self.vocab_size = config.vocab_size
         # Flow-matching RNG state (posterior noise / timestep / diffusion noise
-        # -- see veomni.schedulers.flow_matching). Owned by the model so DCP model
+        # -- see veomni.schedulers.flow_matching_loss). Owned by the model so DCP model
         # load restores it via get/set_extra_state -- no trainer-side callback, no
         # per-batch identity plumbing. Lazily initialized on first forward call so
         # the (DP-rank-aware) seed and the (CUDA-resident) device are both known.

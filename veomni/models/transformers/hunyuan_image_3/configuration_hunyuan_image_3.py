@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 from transformers.models.hunyuan_v1_moe.configuration_hunyuan_v1_moe import HunYuanMoEV1Config
 
-from ....schedulers.flow_matching import normalize_flow_config
+from ....schedulers.flow_matching_loss import normalize_flow_config
 from .component_policy import HunyuanImage3ComponentPolicy
 
 
