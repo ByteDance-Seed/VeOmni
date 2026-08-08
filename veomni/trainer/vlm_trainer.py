@@ -360,6 +360,7 @@ class VLMTrainer:
         for micro_step, micro_batch in enumerate(micro_batches):
             mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
             self.base.model_reshard(micro_step, num_micro_steps)
+            self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
