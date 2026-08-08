@@ -55,6 +55,10 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
     "--model.ops_implementation.dsa_attention_implementation=tilelang",
     "--model.ops_implementation.mhc_implementation=tilelang",
 ]
+_QWEN3_VL_CHUNK_MBS_TRAINING_ARGS = [
+    "--train.chunk_mbs_config.enable=True",
+    "--train.chunk_mbs_config.chunk_mbs=1",
+]
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -267,6 +271,18 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        False,  # chunk_mbs_enabled
+        id="qwen3vl",
+    ),
+    pytest.param(
+        "qwen3vl",
+        "./tests/toy_config/qwen3vl_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        True,  # chunk_mbs_enabled
+        id="qwen3vl-chunk-mbs",
     ),
     pytest.param(
         "qwen3vlmoe",
@@ -275,6 +291,18 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        False,  # chunk_mbs_enabled
+        id="qwen3vlmoe",
+    ),
+    pytest.param(
+        "qwen3vlmoe",
+        "./tests/toy_config/qwen3vlmoe_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        True,  # chunk_mbs_enabled
+        id="qwen3vlmoe-chunk-mbs",
     ),
     pytest.param(
         "qwen3_5_moe",
@@ -283,6 +311,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        False,  # chunk_mbs_enabled
         marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
@@ -292,6 +321,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        False,  # chunk_mbs_enabled
         marks=_qwen3_5_npu_skip,
     ),
 ]
@@ -396,6 +426,14 @@ def dummy_qwen2vl_dataset():
 @pytest.fixture(scope="session")
 def dummy_qwen3vl_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen3vl")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_qwen3vl_chunk_mbs_dataset():
+    dummy_dataset = DummyDataset(seq_len=1024, dataset_type="qwen3vl", cache_name="qwen3vl_chunk_mbs")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
@@ -530,7 +568,10 @@ def test_qwen2vl_parallel_align(
     )
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen3vl_test_cases)
+@pytest.mark.parametrize(
+    "model_name, config_path, is_moe, rtol, atol, max_sp_size, chunk_mbs_enabled",
+    qwen3vl_test_cases,
+)
 def test_qwen3vl_parallel_align(
     model_name: str,
     config_path: str,
@@ -538,8 +579,10 @@ def test_qwen3vl_parallel_align(
     rtol: float,
     atol: float,
     max_sp_size: int | None,
-    dummy_qwen3vl_dataset,
+    chunk_mbs_enabled: bool,
+    request: pytest.FixtureRequest,
 ):
+    dataset_fixture = "dummy_qwen3vl_chunk_mbs_dataset" if chunk_mbs_enabled else "dummy_qwen3vl_dataset"
     main(
         task_name="train_vlm_test",
         model_name=model_name,
@@ -548,7 +591,8 @@ def test_qwen3vl_parallel_align(
         rtol=rtol,
         atol=atol,
         max_sp_size=max_sp_size,
-        train_path=dummy_qwen3vl_dataset,
+        train_path=request.getfixturevalue(dataset_fixture),
+        extra_args=_QWEN3_VL_CHUNK_MBS_TRAINING_ARGS if chunk_mbs_enabled else None,
     )
 
 
