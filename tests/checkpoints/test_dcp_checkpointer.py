@@ -75,6 +75,124 @@ class TestOptimizerStateNoFill:
             OptimizerState(model, optimizer, fill_missing_optimizer_states=True)
 
 
+@patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
+class TestOptimizerStateMultiOptimizer:
+    """OptimizerState must delegate to MultiOptimizer's own Stateful API.
+
+    Regression test: with optimizer_type="muon" and no ExtraParallel,
+    build_optimizer returns a MultiOptimizer, and the plain torch DCP path
+    crashed at the first save with
+    ``AttributeError: 'MultiOptimizer' object has no attribute 'state'``
+    (torch's ``_init_optim_state`` introspects a single optimizer)."""
+
+    def _muon_optimizer(self, model):
+        from veomni.optim import build_optimizer
+        from veomni.optim.optimizer import MultiOptimizer
+
+        optimizer = build_optimizer(
+            model,
+            lr=1e-4,
+            weight_decay=0.01,
+            optimizer_type="muon",
+            muon_kwargs={"lr": 1e-2, "adjust_lr_fn": "match_rms_adamw"},
+        )
+        assert isinstance(optimizer, MultiOptimizer)
+        return optimizer
+
+    def _toy_model(self):
+        torch.manual_seed(0)
+        return nn.Sequential(
+            nn.Embedding(8, 4),  # forced to AdamW by split_muon_adamw_params
+            nn.Linear(4, 8, bias=True),  # 2D weight (Muon), 1D bias (AdamW)
+            nn.LayerNorm(8),  # AdamW
+        )
+
+    def test_state_dict_and_load_roundtrip(self, mock_gps):
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        model = self._toy_model()
+        optimizer = self._muon_optimizer(model)
+        for p in model.parameters():
+            p.grad = torch.randn_like(p)
+        optimizer.step()
+
+        wrapper = OptimizerState(model, optimizer)
+        sd = wrapper.state_dict()
+        assert sd, "MultiOptimizer state_dict must be non-empty"
+        assert any("momentum_buffer" in k for k in sd), f"expected Muon state in {sorted(sd)[:8]}"
+        assert any("exp_avg" in k for k in sd), f"expected AdamW state in {sorted(sd)[:8]}"
+
+        model_b = self._toy_model()
+        model_b.load_state_dict(model.state_dict())
+        optimizer_b = self._muon_optimizer(model_b)
+        wrapper_b = OptimizerState(model_b, optimizer_b)
+        wrapper_b.load_state_dict(sd)
+
+        sd_after = wrapper_b.state_dict()
+        # Hyperparam keys (param_groups.*) may legitimately differ (e.g. flags
+        # recorded only after a step); the per-param optimizer state is what
+        # matters for a resume, so compare only the state.* entries.
+        state_keys = {k for k in sd if k.startswith("state.")}
+        assert state_keys, "expected per-param state keys in MultiOptimizer state_dict"
+        assert state_keys <= set(sd_after.keys())
+        for key in state_keys:
+            value, after = sd[key], sd_after[key]
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, after, atol=0.0, rtol=0.0, msg=f"mismatch at {key}")
+            else:
+                assert value == after, f"mismatch at {key}: {value!r} vs {after!r}"
+
+    @pytest.mark.xfail(
+        reason=(
+            "Known in-tree limitation: MultiOptimizer.load_state_dict "
+            "(veomni/optim/optimizer.py) feeds the merged flattened dict to torch's "
+            "set_optimizer_state_dict, whose un-flattening hands the sub-optimizer "
+            "an empty dict state for parameters that have param_groups.* entries "
+            "but no state.* entries (i.e. never received a gradient — unrouted MoE "
+            "experts, frozen weights). AdamW __setstate__ then raises "
+            "TypeError: float() argument must be a string or a real number, not "
+            "'dict'. Pre-existing limitation, previously only reachable with "
+            "ExtraParallel; this test becomes a regression guard once the fix lands."
+        ),
+        strict=True,
+    )
+    def test_partial_state_resume_param_without_gradient(self, mock_gps):
+        """A parameter that never received a gradient (no state.* entries in the
+        checkpoint) must not crash the MultiOptimizer resume path."""
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        model = self._toy_model()
+        optimizer = self._muon_optimizer(model)
+        for name, p in model.named_parameters():
+            if name == "2.weight":  # LayerNorm weight: never receives a gradient
+                continue
+            p.grad = torch.randn_like(p)
+        optimizer.step()
+
+        wrapper = OptimizerState(model, optimizer)
+        sd = wrapper.state_dict()
+        assert not any(k.startswith("state.2.weight") for k in sd), (
+            "grad-less param should have no state entries in the checkpoint"
+        )
+
+        model_b = self._toy_model()
+        model_b.load_state_dict(model.state_dict())
+        optimizer_b = self._muon_optimizer(model_b)
+        wrapper_b = OptimizerState(model_b, optimizer_b)
+        wrapper_b.load_state_dict(sd)  # currently raises TypeError (see xfail reason)
+
+        # Stepped params must still round-trip exactly.
+        sd_after = wrapper_b.state_dict()
+        for key in (k for k in sd if k.startswith("state.")):
+            value, after = sd[key], sd_after[key]
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(value, after, atol=0.0, rtol=0.0, msg=f"mismatch at {key}")
+            else:
+                assert value == after, f"mismatch at {key}: {value!r} vs {after!r}"
+
+
 class TestAllowPartialLoad:
     """DCP load may be partial for optimizer state, but not full model state."""
 
