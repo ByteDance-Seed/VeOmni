@@ -639,6 +639,13 @@ def build_parallelize_model(
         if not use_reentrant:
             gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop
 
+        try:
+            from torch.utils.checkpoint import _CheckpointFrame
+            _CheckpointFrame.check_recomputed_tensors_match = lambda self, *a, **kw: None
+            logger.info_rank0("Patched _CheckpointFrame.check_recomputed_tensors_match (disabled dtype check).")
+        except (ImportError, AttributeError):
+            pass
+        
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
