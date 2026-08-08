@@ -55,6 +55,11 @@ def _eager_rms_norm_qwen3_5(x, weight, eps):
     return ((1.0 + weight.to(torch.float32)) * x_norm).to(x.dtype)
 
 
+def _eager_rms_norm_residual_add(x, residual, weight, eps):
+    updated_residual = residual + x
+    return _eager_rms_norm_standard(updated_residual, weight, eps), updated_residual
+
+
 def _rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -151,6 +156,18 @@ class TestNPURmsNorm:
         out_kernel = slot(x, w, 1e-6).to(torch.float32)
         out_eager = _eager_rms_norm_qwen3_5(x, w, 1e-6).to(torch.float32)
         assert torch.allclose(out_kernel, out_eager, atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.parametrize("batch,seq,hidden", [(2, 16, 128), (1, 8, 64)])
+    def test_residual_add_matches_eager_bf16(self, batch, seq, hidden):
+        slot = OpSlot("rms_norm", "residual_add")
+        slot.bind("npu")
+        x = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(hidden, device=DEVICE, dtype=torch.bfloat16)
+        out_kernel, residual_kernel = slot(x, residual, w, 1e-6)
+        out_eager, residual_eager = _eager_rms_norm_residual_add(x, residual, w, 1e-6)
+        assert torch.allclose(out_kernel.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
+        assert torch.allclose(residual_kernel.float(), residual_eager.float(), atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------

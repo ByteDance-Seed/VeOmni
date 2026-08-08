@@ -56,6 +56,11 @@ def _eager_rms_norm_qwen3_5(x, weight, eps):
     return ((1.0 + weight.to(torch.float32)) * x_norm).to(x.dtype)
 
 
+def _eager_rms_norm_residual_add(x, residual, weight, eps):
+    updated_residual = residual + x
+    return _eager_rms_norm_standard(updated_residual, weight, eps), updated_residual
+
+
 def _rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -90,6 +95,18 @@ def test_rms_norm_qwen3_5_liger_matches_eager():
     out_kernel = slot(x, w, 1e-6).to(torch.float32)
     out_eager = _eager_rms_norm_qwen3_5(x, w, 1e-6).to(torch.float32)
     assert torch.allclose(out_kernel, out_eager, atol=1e-4, rtol=1e-4)
+
+
+def test_rms_norm_residual_add_liger_matches_eager():
+    pytest.importorskip("liger_kernel")
+    slot = _fresh_slot("rms_norm", "residual_add", "liger_kernel")
+    x = torch.randn(2, 16, 128, device=DEVICE, dtype=torch.bfloat16)
+    residual = torch.randn(2, 16, 128, device=DEVICE, dtype=torch.bfloat16)
+    w = torch.randn(128, device=DEVICE, dtype=torch.bfloat16)
+    out_kernel, residual_kernel = slot(x, residual, w, 1e-6)
+    out_eager, residual_eager = _eager_rms_norm_residual_add(x, residual, w, 1e-6)
+    assert torch.allclose(out_kernel, out_eager, atol=2e-3, rtol=2e-3)
+    assert torch.allclose(residual_kernel, residual_eager, atol=2e-3, rtol=2e-3)
 
 
 def test_rotary_pos_emb_liger_matches_eager():

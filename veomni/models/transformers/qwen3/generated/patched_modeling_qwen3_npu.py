@@ -13,6 +13,8 @@
 #      OpSlot guard for NPU fused RMSNorm (standard formulation)
 #    - method_override: Qwen3MLP.forward
 #      OpSlot guard for NPU fused SwiGLU MLP
+#    - method_override: Qwen3DecoderLayer.forward
+#      OpSlot guard for fused residual-add + RMSNorm in Qwen3DecoderLayer.forward
 #    - function_replacement: apply_rotary_pos_emb
 #      OpSlot guard for NPU fused RoPE
 #    - method_override: Qwen3ForCausalLM.forward
@@ -62,6 +64,7 @@ from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
 veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_rms_norm_residual_add = OpSlot("rms_norm", "residual_add")
 veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
 veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -333,6 +336,12 @@ class Qwen3Attention(nn.Module):
         return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3DecoderLayer
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen3DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
@@ -344,6 +353,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    # ── Decoder Layer (residual-add + RMSNorm fast path) ─────────────────────────
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -366,11 +376,19 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if veomni_rms_norm_residual_add.use_non_eager_impl:
+            hidden_states, residual = veomni_rms_norm_residual_add(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states

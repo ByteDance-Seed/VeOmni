@@ -26,6 +26,7 @@ This file itself is not runnable. It's used to generate the runnable explicitly 
 
 from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import (
     apply_rotary_pos_emb_patched,
+    qwen3_decoder_layer_forward_patched,
     qwen3_forcausallm_forward_patched,
     qwen3_mlp_forward_patched,
     qwen3_rmsnorm_forward_patched,
@@ -72,6 +73,13 @@ config.override_method(
     "Qwen3MLP.forward",
     replacement=qwen3_mlp_forward_patched,
     description="OpSlot guard for NPU fused SwiGLU MLP",
+)
+
+
+config.override_method(
+    "Qwen3DecoderLayer.forward",
+    replacement=qwen3_decoder_layer_forward_patched,
+    description="OpSlot guard for fused residual-add + RMSNorm in Qwen3DecoderLayer.forward",
 )
 
 

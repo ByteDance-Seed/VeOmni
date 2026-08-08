@@ -67,10 +67,28 @@ KERNEL_REGISTRY.register(
 )
 
 
+def _npu_residual_add_rms_norm_factory():
+    from .npu import standard_rms_norm_residual_add_forward_npu
+
+    return standard_rms_norm_residual_add_forward_npu
+
+
 def _npu_unweighted_rms_norm_factory():
     from .npu import unweighted_rms_norm_forward_npu
 
     return unweighted_rms_norm_forward_npu
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="rms_norm",
+        variant="residual_add",
+        factory=_npu_residual_add_rms_norm_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="standard fused residual-add + RMSNorm on NPU",
+    )
+)
 
 
 KERNEL_REGISTRY.register(

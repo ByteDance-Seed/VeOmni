@@ -56,6 +56,7 @@ config.add_post_import_block(
     # These are bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
     veomni_rms_norm = OpSlot("rms_norm", "standard")
+    veomni_rms_norm_residual_add = OpSlot("rms_norm", "residual_add")
     veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
     veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -119,6 +120,53 @@ def apply_rotary_pos_emb_patched(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+# ── Decoder Layer (residual-add + RMSNorm fast path) ─────────────────────────
+
+
+@config.override_method(
+    "Qwen3DecoderLayer.forward",
+    description="OpSlot guard for fused residual-add + RMSNorm in the post-attention path",
+)
+def qwen3_decoder_layer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    use_cache: bool | None = False,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> torch.Tensor:
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+    # Self Attention
+    hidden_states, _ = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        use_cache=use_cache,
+        position_embeddings=position_embeddings,
+        **kwargs,
+    )
+
+    if veomni_rms_norm_residual_add.use_non_eager_impl:
+        hidden_states, residual = veomni_rms_norm_residual_add(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
+    else:
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+    return hidden_states
 
 
 # ── Qwen3ForCausalLM.forward (fused cross-entropy via OpSlot) ────────────────
