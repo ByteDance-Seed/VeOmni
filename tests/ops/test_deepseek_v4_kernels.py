@@ -452,16 +452,19 @@ def test_deepseek_v4_stateless_model_reaches_tilelang_indexer(monkeypatch):
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
 
 
-def test_deepseek_v4_packed_compressors_match_independent_sequences():
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+def test_deepseek_v4_packed_compressors_match_independent_sequences(backend):
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
     from veomni.models.transformers.deepseek_v4.packed_utils import (
         build_packed_compression_metadata,
         build_sparse_attention_indices,
         mask_sparse_attention_indices,
     )
 
+    modeling = importlib.import_module(
+        f"veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_{backend}"
+    )
     torch.manual_seed(5)
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     segment_lengths = (64, 96)

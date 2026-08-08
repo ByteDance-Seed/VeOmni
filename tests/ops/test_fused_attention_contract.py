@@ -31,6 +31,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.ops.kernels import attention as veomni_attention
 from veomni.ops.kernels.attention import flex as flex_backend
+from veomni.ops.kernels.attention import magi as magi_backend
+from veomni.ops.kernels.attention.magi import mask as magi_mask_backend
 
 
 _FLASH_IMPLEMENTATIONS = (
@@ -39,6 +41,7 @@ _FLASH_IMPLEMENTATIONS = (
     "veomni_flash_attention_4_with_sp",
 )
 _FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
+_MAGI_IMPLEMENTATION = "veomni_magi_attention_with_sp"
 
 
 class _FakeAttentionModule(nn.Module):
@@ -49,7 +52,11 @@ class _FakeAttentionModule(nn.Module):
 
 @pytest.mark.parametrize(
     "backend",
-    [veomni_attention.flash_attention_forward, veomni_attention.flex_attention_forward],
+    [
+        veomni_attention.flash_attention_forward,
+        veomni_attention.flex_attention_forward,
+        veomni_attention.magi_attention_forward,
+    ],
 )
 def test_fused_attention_forward_matches_backend_public_signatures(backend):
     fused_signature = inspect.signature(veomni_attention.fused_attention_forward)
@@ -74,11 +81,16 @@ def test_apply_veomni_attention_patch_registers_custom_facade_names(monkeypatch)
         "register_veomni_flex_attention_mask_builder",
         lambda: patch_calls.append("flex_mask_builder"),
     )
+    monkeypatch.setattr(
+        veomni_attention,
+        "register_veomni_magi_attention_mask_builder",
+        lambda: patch_calls.append("magi_mask_builder"),
+    )
 
     veomni_attention.apply_veomni_attention_patch()
 
-    assert patch_calls == ["hub_kernel_loader", "flex_mask_builder"]
-    for implementation in (*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION):
+    assert patch_calls == ["hub_kernel_loader", "flex_mask_builder", "magi_mask_builder"]
+    for implementation in (*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION, _MAGI_IMPLEMENTATION):
         assert ALL_ATTENTION_FUNCTIONS[implementation] is veomni_attention.fused_attention_forward
     assert ALL_ATTENTION_FUNCTIONS["flex_attention"] is hf_flex_attention_forward
 
@@ -104,6 +116,53 @@ def test_register_veomni_flex_attention_mask_builder_uses_sp_aware_wrapper(monke
     assert isinstance(causal_mask, BlockMask)
     assert isinstance(sliding_window_mask, BlockMask)
     assert causal_mask.shape == sliding_window_mask.shape == (1, 1, 8, 8)
+
+
+def test_register_veomni_magi_attention_mask_builder_uses_range_builder(monkeypatch):
+    mask_mapping = ALL_MASK_ATTENTION_FUNCTIONS._global_mapping
+    monkeypatch.setitem(mask_mapping, _MAGI_IMPLEMENTATION, object())
+    monkeypatch.setattr(
+        magi_mask_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=False, ulysses_size=1),
+    )
+
+    veomni_attention.register_veomni_magi_attention_mask_builder()
+    veomni_attention.register_veomni_magi_attention_mask_builder()
+
+    assert ALL_MASK_ATTENTION_FUNCTIONS[_MAGI_IMPLEMENTATION] is magi_backend.create_magi_mask
+
+    config = PreTrainedConfig()
+    config._attn_implementation = _MAGI_IMPLEMENTATION
+    inputs_embeds = torch.randn(1, 8, 16)
+    position_ids = torch.arange(8).unsqueeze(0)
+
+    attention_mask = create_causal_mask(config, inputs_embeds, None, None, position_ids)
+
+    assert isinstance(attention_mask, magi_backend.MagiAttentionMask)
+
+
+def test_registered_magi_mask_builder_rejects_implicit_packed_visibility(monkeypatch):
+    monkeypatch.setattr(
+        magi_mask_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=False, ulysses_size=1),
+    )
+    veomni_attention.register_veomni_magi_attention_mask_builder()
+    config = PreTrainedConfig()
+    config._attn_implementation = _MAGI_IMPLEMENTATION
+    inputs_embeds = torch.randn(1, 8, 16)
+    attention_mask = torch.ones(1, 8, dtype=torch.long)
+    packed_position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
+
+    with pytest.raises(ValueError, match="cannot recover packed boundaries"):
+        create_causal_mask(
+            config,
+            inputs_embeds,
+            attention_mask,
+            None,
+            packed_position_ids,
+        )
 
 
 def test_veomni_flex_attention_mask_builder_uses_ulysses_global_sequence_length(monkeypatch):
@@ -172,7 +231,7 @@ def test_veomni_flex_attention_mask_builder_rejects_incomplete_ulysses_metadata(
         create_causal_mask(config, local_inputs_embeds, attention_mask, None)
 
 
-@pytest.mark.parametrize("implementation", [*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION])
+@pytest.mark.parametrize("implementation", [*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION, _MAGI_IMPLEMENTATION])
 def test_fused_attention_forward_dispatches_to_selected_adapter(monkeypatch, implementation):
     captured = {}
 
@@ -242,3 +301,11 @@ def test_veomni_ops_config_rewrites_flex_to_sp_aware_registration(monkeypatch):
     config = OpsImplementationConfig(attn_implementation="flex_attention")
 
     assert config.attn_implementation == _FLEX_IMPLEMENTATION
+
+
+def test_veomni_ops_config_rewrites_magi_to_sp_aware_registration(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+    config = OpsImplementationConfig(attn_implementation="magi_attention")
+
+    assert config.attn_implementation == _MAGI_IMPLEMENTATION
