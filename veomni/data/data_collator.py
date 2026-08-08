@@ -146,8 +146,10 @@ class DataCollateInfo:
         )
         if self.pack_mode not in ("cat", "list"):
             raise ValueError(f"pack_mode must be 'cat' or 'list', got {self.pack_mode!r}.")
-        if self.pack_mode == "list" and self.sp_slice:
-            raise ValueError("pack_mode='list' is incompatible with sp_slice=True.")
+        if self.pack_mode == "list" and (self.sp_slice or self.sp_pad_value is not None):
+            raise ValueError(
+                "pack_mode='list' skips SP pad/slice; sp_slice and sp_pad_value must be unset."
+            )
 
 
 # pack_dim, sp_slice, sp_pad_value, sp_pad_scale

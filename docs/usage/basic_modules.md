@@ -333,6 +333,7 @@ The `DataCollateInfo` is defined as:
 > `labels` is -100, and `image_mask` is 0.
 - sp_pad_scale: sp_pad scale of a sequence in batch. Default is 1.
 > `pixel_values` is merge_size ** 2 for qwen-vl-series.
+- pack_mode: How to combine per-sample tensors at collate time. `"cat"` (default) does `torch.cat` along `pack_dim`. `"list"` keeps the raw per-sample list and skips SP pad/slice, for keys whose per-sample semantics must survive collate (e.g. HunyuanImage 3's `hy3_pixel_values` — one image per sample flowing into the online VAE encoder). `pack_mode="list"` is mutually exclusive with `sp_slice=True` and `sp_pad_value` (both must be unset).
 2. seq_classification
 If seq_classification is True, the collate function will not shift and mask the labels during packing and sp_slice.
 3. pad_to_length
