@@ -24,6 +24,7 @@ def test_triton_ascend_configuration_is_reproducible():
 
     installer.validate_configuration()
     assert [(name, version) for name, version, _url, _hash in installer.WHEELS] == [
+        ("pybind11", "2.13.6"),
         ("triton", "3.2.0"),
         ("triton-ascend", "3.2.1"),
     ]

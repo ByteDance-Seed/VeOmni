@@ -13,11 +13,19 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-# Triton-Ascend 3.2.1 exposes exact pins for its development stack as runtime
-# dependencies. Installing the two runtime wheels without dependency resolution
-# preserves VeOmni's locked NPU environment. Hashes make the direct URLs
-# immutable even if their hosts replace an artifact.
+# Triton-Ascend 3.2.1 declares development packages and backend runtime
+# requirements in the same dependency list. Installing only the wheels required
+# by the backend without dependency resolution preserves VeOmni's locked NPU
+# environment. Hashes make the direct URLs immutable even if their hosts replace
+# an artifact.
 WHEELS = (
+    (
+        "pybind11",
+        "2.13.6",
+        "https://files.pythonhosted.org/packages/13/2f/0f24b288e2ce56f51c920137620b4434a38fd80583dbbe24fc2a1656c388/"
+        "pybind11-2.13.6-py3-none-any.whl",
+        "237c41e29157b962835d356b370ededd57594a26d5894a795960f0047cb5caf5",
+    ),
     (
         "triton",
         "3.2.0",
@@ -93,7 +101,9 @@ def ensure_supported_platform() -> None:
     if current != ("Linux", "x86_64", (3, 11)):
         system, machine, python_version = current
         version = ".".join(map(str, python_version))
-        wheel_names = ", ".join(Path(urlparse(url).path).name for _name, _version, url, _sha256 in WHEELS)
+        wheel_names = ", ".join(
+            Path(urlparse(url).path).name for name, _version, url, _sha256 in WHEELS if name != "pybind11"
+        )
         raise RuntimeError(
             f"The pinned Triton-Ascend wheels are cp311-only ({wheel_names}) and require Linux x86_64 with Python 3.11; "
             f"got {system} {machine} with Python {version}."
@@ -101,7 +111,7 @@ def ensure_supported_platform() -> None:
 
 
 def install_wheels() -> None:
-    """Overlay the Ascend backend on the matching upstream Triton runtime."""
+    """Install the minimal pinned runtime required by the Ascend backend."""
     for _distribution, _version, url, sha256 in WHEELS:
         subprocess.run(
             ["uv", "pip", "install", "--no-deps", f"{url}#sha256={sha256}"],
@@ -110,7 +120,7 @@ def install_wheels() -> None:
 
 
 def verify_installation() -> None:
-    """Check both distributions and the backend file before launching tests."""
+    """Check pinned distributions and the backend file before launching tests."""
     for distribution, expected_version, _url, _sha256 in WHEELS:
         installed_version = metadata.version(distribution)
         if installed_version != expected_version:
@@ -121,7 +131,7 @@ def verify_installation() -> None:
         raise RuntimeError(f"Triton-Ascend backend is missing: {backend}")
 
     importlib.import_module("triton.backends.ascend")
-    print("Verified triton==3.2.0 with triton-ascend==3.2.1.")
+    print("Verified pybind11==2.13.6, triton==3.2.0, and triton-ascend==3.2.1.")
 
 
 def main() -> None:
