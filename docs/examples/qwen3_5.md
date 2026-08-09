@@ -110,6 +110,136 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
 
+## Start training on NPU
+
+Qwen3.5 runs on Ascend NPUs, but its GatedDeltaNet kernels are **not** auto-selected: all three
+OpSlot-driven ops (`rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule`) default to `fla`,
+which requires a GPU and raises on NPU. They must be set explicitly.
+
+### Kernel backends
+
+`npu` provides vendored MindSpeed-MM Triton kernels for all three ops:
+
+```yaml
+model:
+  ops_implementation:
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu
+```
+
+These kernels need the `triton-ascend` package, which is not a declared VeOmni dependency.
+VeOmni main pins PyTorch and `torch_npu` 2.10.0; the corresponding CANN 9.0.0 CI stack uses
+Triton-Ascend 3.2.1. From a VeOmni source checkout, install the locked NPU environment and
+the tested Triton wheels with:
+
+```bash
+uv sync --frozen --python 3.11 --extra npu
+uv run --frozen python scripts/ci/install_triton_ascend.py
+```
+
+The helper intentionally supports Linux x86_64 and Python 3.11 only. It installs fixed wheel
+URLs with SHA256 verification without applying the upstream wheel's development-only dependency
+pins. Keep the Qwen3.5 vendored Triton kernels disabled on aarch64 or other Python versions until
+a compatible package set is available and validated.
+
+See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
+for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
+and `triton-ascend` on a mutually compatible release set.
+
+> **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
+> (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`
+> rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
+> from upstream MindSpeed-MM.
+
+### `npu_ascendc` — AscendC fused backend (`chunk_gated_delta_rule` only)
+
+`npu_ascendc` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
+compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
+package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
+`_ascend/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
+Set only `chunk_gated_delta_rule` to `npu_ascendc`; keep `rms_norm_gated` / `causal_conv1d` on `npu`:
+
+```yaml
+model:
+  ops_implementation:
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu_ascendc
+```
+
+`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It supports Ascend
+910B (A2) / 910_93 (A3), both non-arch35 chips where the `solve_tril` step runs the vendored
+Triton kernel (the arch35 native path is gated behind `is_arch35()`). arch35 (`Ascend910_95` /
+`Ascend950`) is not supported end-to-end: the vendored `causal_conv1d` raises there (see above).
+
+The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
+bundle `fla_npu`:
+
+- A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
+- A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
+
+To build on a bare host instead, install from the
+[`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources:
+
+```bash
+git clone https://github.com/flashserve/flash-linear-attention-npu
+cd flash-linear-attention-npu
+git checkout c2e3d83f
+
+source /usr/local/Ascend/cann/set_env.sh          # source your actual CANN path
+
+# --soc must match the chip: {ascend910b, ascend910_93, ascend950}
+bash build.sh --soc=ascend910b --pkg --vendor_name=fla_npu
+bash build_out/fla-npu_*.run
+cd torch_custom/fla_npu/ && bash build.sh
+
+pip list | grep fla_npu   # verify it is installed
+```
+
+If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error at
+`OpSlot.bind()` time (pointing back to the install step or to `npu` / `eager`).
+
+### Qwen3.5-9B VL Training
+
+There is no dedicated dense NPU config; reuse the GPU one and set the GatedDeltaNet kernels on the
+command line. Nothing else needs overriding: the YAML's `attn_implementation: flash_attention_2` is
+also the recommended NPU value (see [NPU-friendly operator
+configurations](../hardware_support/typical_usage.md)), and `rms_norm`, `rotary_pos_emb`,
+`swiglu_mlp` and `cross_entropy_loss` are left at their dataclass defaults there, so VeOmni
+normalizes them to NPU-compatible values automatically
+([`_NPU_DEFAULT_FALLBACK`](../../veomni/arguments/arguments_types.py#L979)). The three
+GatedDeltaNet ops are deliberately **not** in that table, which is why they must be explicit:
+
+```shell
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
+    --model.model_path ${HOME}/Qwen3.5-9B \
+    --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
+    --model.ops_implementation.rms_norm_gated_implementation npu \
+    --model.ops_implementation.causal_conv1d_implementation npu \
+    --model.ops_implementation.chunk_gated_delta_rule_implementation npu_ascendc \
+    --train.max_steps 20
+```
+
+Drop `chunk_gated_delta_rule_implementation` to `npu` if `fla_npu` is not installed.
+
+### Qwen3.5 MoE 35B VL Training
+
+A ready-to-run MoE-VL config wired for `npu_ascendc` (plus `fused_npu` MoE, NPU RMSNorm/RoPE and
+Ulysses SP) is provided at
+[`configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml`](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml):
+
+```shell
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml \
+    --model.model_path ${HOME}/Qwen3.5-35B-A3B \
+    --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
+    --train.max_steps 20
+```
+
+The config sets `ulysses_size: 4`, so the world size must be a multiple of 4. To run without
+sequence parallelism, override `--train.accelerator.ulysses_size 1`; the attention kernels adapt
+on their own.
+
 ## ChunkMBS
 
 Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,
@@ -166,51 +296,11 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 ### Selecting linear-attention kernels
 
 GatedDeltaNet has three OpSlot-driven kernels: `rms_norm_gated`, `causal_conv1d`, and
-`chunk_gated_delta_rule`. All three default to `fla`. Recommended value per platform:
-
-- **GPU** — `fla` (the FLA Triton kernels shipped under the `gpu` extra; required for
-  varlen training).
-- **NPU** — `npu` (vendored MindSpeed-MM Triton kernels for all three ops; needs the
-  `triton-ascend` package — see below). Not auto-selected — the default `fla`
-  requires a GPU and raises on NPU, so set the fields explicitly:
-
-```yaml
-model:
-  ops_implementation:
-    rms_norm_gated_implementation: npu
-    causal_conv1d_implementation: npu
-    chunk_gated_delta_rule_implementation: npu
-```
-
-VeOmni main pins PyTorch and `torch_npu` 2.10.0; the corresponding CANN 9.0.0
-CI stack uses Triton-Ascend 3.2.1. From a VeOmni source checkout, install the
-locked NPU environment and the tested Triton wheels with:
-
-```bash
-uv sync --frozen --python 3.11 --extra npu
-uv run --frozen python scripts/ci/install_triton_ascend.py
-```
-
-The helper intentionally supports Linux x86_64 and Python 3.11 only. It installs
-fixed wheel URLs with SHA256 verification without applying the upstream wheel's
-development-only dependency pins. Keep the Qwen3.5 vendored Triton kernels
-disabled on aarch64 or other Python versions until a compatible package set is
-available and validated.
-
-See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
-for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
-and `triton-ascend` on a mutually compatible release set.
-
-> **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
-> (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`
-> rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
-> from upstream MindSpeed-MM.
-
-VeOmni's NPU VLM E2E and text FSDP-equivalence suites select these three
-`npu` implementations automatically for Qwen3.5 Dense and MoE toy models.
+`chunk_gated_delta_rule`. All three default to `fla` — the FLA Triton kernels shipped under the
+`gpu` extra, which is the recommended value on GPU and required for varlen training.
 
 To switch `chunk_gated_delta_rule` to QwenLM's [`flash-qla`](https://github.com/QwenLM/FlashQLA)
-kernel (already shipped under the `gpu` extra), set the field explicitly:
+kernel (also shipped under the `gpu` extra), set the field explicitly:
 
 ```yaml
 model:
@@ -218,57 +308,8 @@ model:
     chunk_gated_delta_rule_implementation: flash_qla
 ```
 
-#### `npu_ascendc` — AscendC fused backend (NPU, `chunk_gated_delta_rule` only)
-
-`npu_ascendc` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
-compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
-package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
-`_ascend/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
-Set only `chunk_gated_delta_rule` to `npu_ascendc`; keep `rms_norm_gated` / `causal_conv1d` on `npu`:
-
-```yaml
-model:
-  ops_implementation:
-    rms_norm_gated_implementation: npu
-    causal_conv1d_implementation: npu
-    chunk_gated_delta_rule_implementation: npu_ascendc
-```
-
-A ready-to-run MoE-VL training config wired for this backend (plus `fused_npu` MoE and
-Ulysses SP) is provided at
-[`configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml`](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml).
-
-`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It supports Ascend
-910B (A2) / 910_93 (A3), both non-arch35 chips where the `solve_tril` step runs the vendored
-Triton kernel (the arch35 native path is gated behind `is_arch35()`). arch35 (`Ascend910_95` /
-`Ascend950`) is not supported end-to-end: the vendored `causal_conv1d` raises there (see above).
-
-The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
-bundle `fla_npu`:
-
-- A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
-- A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
-
-To build on a bare host instead, install from the
-[`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources:
-
-```bash
-git clone https://github.com/flashserve/flash-linear-attention-npu
-cd flash-linear-attention-npu
-git checkout c2e3d83f
-
-source /usr/local/Ascend/cann/set_env.sh          # source your actual CANN path
-
-# --soc must match the chip: {ascend910b, ascend910_93, ascend950}
-bash build.sh --soc=ascend910b --pkg --vendor_name=fla_npu
-bash build_out/fla-npu_*.run
-cd torch_custom/fla_npu/ && bash build.sh
-
-pip list | grep fla_npu   # verify it is installed
-```
-
-If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error at
-`OpSlot.bind()` time (pointing back to the install step or to `npu` / `eager`).
+On NPU the default `fla` raises, so all three fields must be set explicitly — see
+[Kernel backends](#kernel-backends) under *Start training on NPU*.
 
 ### How It Works
 
