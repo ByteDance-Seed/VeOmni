@@ -14,7 +14,6 @@
 
 """Unit tests for MindSpeed-style async activation offload helpers."""
 
-import copy
 
 import pytest
 import torch
@@ -23,9 +22,11 @@ import torch.nn as nn
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,
+    PinnedBufferPool,
     apply_async_activation_offload,
     base_check_fn,
     get_offload_modules,
+    reset_async_activation_offload,
 )
 
 
@@ -174,6 +175,7 @@ def test_async_offload_manager_resets_after_forward_error():
     assert manager.getcnt._block_tensor_nums == {}
 
 
+
 def test_async_offload_rejects_tensor_views_with_shared_storage():
     base = torch.arange(8.0)
     view = base[2:6]
@@ -182,32 +184,98 @@ def test_async_offload_rejects_tensor_views_with_shared_storage():
     torch.testing.assert_close(base, torch.arange(8.0))
 
 
+def test_pinned_buffer_pool_reuses_matching_layout():
+    pool = PinnedBufferPool()
+    source = torch.empty((2, 3), dtype=torch.float32)
+    first, key = pool.acquire(source)
+    pool.release(first, key)
+    second, second_key = pool.acquire(source)
+
+    assert first.data_ptr() == second.data_ptr()
+    assert key == second_key
+    assert pool.allocations == 1
+    assert pool.reuses == 1
+
+
+def test_async_offload_manager_resets_at_step_boundary():
+    model = nn.Sequential(nn.Linear(2, 2))
+    apply_async_activation_offload(model, ["0"])
+    manager = model[0]._veomni_offload_manager
+    manager.get_cnt(9)
+
+    reset_async_activation_offload(model)
+
+    assert not manager.items
+    assert manager.getcnt._block_idx == -1
+    assert manager.getcnt._block_tensor_nums == {}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for async D2H/H2D validation")
-def test_async_offload_cuda_gradient_parity():
+def test_async_offload_cuda_gradient_parity_and_peak_memory():
     class Block(nn.Module):
         def __init__(self):
             super().__init__()
-            self.proj = nn.Linear(16, 16)
+            self.proj = nn.Linear(512, 512)
 
         def forward(self, hidden_states):
             return torch.nn.functional.gelu(self.proj(hidden_states))
 
+    def make_model():
+        return nn.Sequential(*(Block() for _ in range(4))).cuda()
+
     torch.manual_seed(0)
-    baseline = nn.Sequential(Block(), Block(), Block()).cuda()
-    offloaded = copy.deepcopy(baseline)
-    apply_async_activation_offload(offloaded, ["0", "1", "2"])
+    baseline = make_model()
+    initial_state = {name: parameter.detach().cpu().clone() for name, parameter in baseline.state_dict().items()}
+    input_cpu = torch.randn(4, 128, 512)
 
-    baseline_input = torch.randn(4, 16, device="cuda", requires_grad=True)
-    offloaded_input = baseline_input.detach().clone().requires_grad_(True)
-
+    torch.cuda.reset_peak_memory_stats()
+    baseline_before = torch.cuda.memory_allocated()
+    baseline_input = input_cpu.cuda().requires_grad_(True)
     baseline_output = baseline(baseline_input)
     baseline_output.square().mean().backward()
+    torch.cuda.synchronize()
+    baseline_peak = torch.cuda.max_memory_allocated() - baseline_before
+
+    baseline_output_cpu = baseline_output.detach().cpu()
+    baseline_input_grad_cpu = baseline_input.grad.detach().cpu()
+    baseline_parameter_grads = [parameter.grad.detach().cpu() for parameter in baseline.parameters()]
+
+    del baseline_output, baseline_input, baseline
+    torch.cuda.empty_cache()
+
+    offloaded = make_model()
+    offloaded.load_state_dict(initial_state)
+    apply_async_activation_offload(offloaded, ["0", "1", "2", "3"])
+
+    torch.cuda.reset_peak_memory_stats()
+    offloaded_before = torch.cuda.memory_allocated()
+    offloaded_input = input_cpu.cuda().requires_grad_(True)
     offloaded_output = offloaded(offloaded_input)
     offloaded_output.square().mean().backward()
     torch.cuda.synchronize()
+    offloaded_peak = torch.cuda.max_memory_allocated() - offloaded_before
 
-    torch.testing.assert_close(offloaded_output, baseline_output)
-    torch.testing.assert_close(offloaded_input.grad, baseline_input.grad)
-    for offloaded_parameter, baseline_parameter in zip(offloaded.parameters(), baseline.parameters()):
-        torch.testing.assert_close(offloaded_parameter.grad, baseline_parameter.grad)
-    assert not offloaded[0]._veomni_offload_manager.items
+    manager = offloaded[0]._veomni_offload_manager
+    assert not manager.items
+    assert manager.host_buffer_pool.allocations > 0
+
+    torch.testing.assert_close(offloaded_output.detach().cpu(), baseline_output_cpu)
+    torch.testing.assert_close(offloaded_input.grad.detach().cpu(), baseline_input_grad_cpu)
+    for offloaded_parameter, baseline_parameter_grad in zip(offloaded.parameters(), baseline_parameter_grads):
+        torch.testing.assert_close(offloaded_parameter.grad.detach().cpu(), baseline_parameter_grad)
+
+    # This is a numerical and memory gate, not only an execution smoke test:
+    # offloading must preserve gradients and must not increase peak allocated
+    # device memory for the same model and input.
+    assert offloaded_peak <= baseline_peak, (
+        f"async offload increased peak allocated memory: "
+        f"baseline={baseline_peak}, offloaded={offloaded_peak}"
+    )
+
+    del offloaded_output, offloaded_input
+    offloaded.zero_grad(set_to_none=True)
+    second_input = input_cpu.cuda().requires_grad_(True)
+    second_output = offloaded(second_input)
+    second_output.square().mean().backward()
+    torch.cuda.synchronize()
+    assert manager.host_buffer_pool.reuses > 0

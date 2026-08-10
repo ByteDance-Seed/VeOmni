@@ -56,7 +56,7 @@ from ..data import (
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
-from ..distributed.async_offload import apply_async_activation_offload
+from ..distributed.async_offload import apply_async_activation_offload, reset_async_activation_offload
 from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
@@ -527,7 +527,7 @@ class BaseTrainer(Stateful, ABC):
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
         # Apply async activation offload BEFORE FSDP2 sharding.
-        # Uses class-level __call__ patching so that async_save_on_cpu is
+        # Uses per-instance __call__ patching so that async_save_on_cpu is
         # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
         # matching MindSpeed-MM's GC+async offload behavior: hidden_states
         # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
@@ -692,6 +692,8 @@ class BaseTrainer(Stateful, ABC):
             callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None, **kwargs):
+        if self.args.train.accelerator.offload_config.enable_async_activation:
+            reset_async_activation_offload(self.model)
         for callback in self._callbacks:
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 

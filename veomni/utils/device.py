@@ -125,12 +125,31 @@ def is_sm90_or_above() -> bool:
 
 def create_stream(device: torch.device | None = None, priority: int = 0) -> Any:
     """Create a device stream (CUDA/NPU-agnostic)."""
-    return get_torch_device().Stream(device=device, priority=priority)
+    device_type = get_device_type()
+    device_api = get_torch_device()
+
+    # ``torch.cpu.Stream`` intentionally has a smaller constructor than the
+    # CUDA/NPU stream implementations.  Passing ``device`` or ``priority``
+    # through unconditionally makes CPU-only unit tests fail before they can
+    # exercise the device-agnostic caller.
+    if device_type == "cpu":
+        return device_api.Stream()
+
+    kwargs = {}
+    if device is not None:
+        kwargs["device"] = device
+    if priority:
+        kwargs["priority"] = priority
+    return device_api.Stream(**kwargs)
 
 
 def create_event(enable_timing: bool = False, blocking: bool = False) -> Any:
     """Create a device event (CUDA/NPU-agnostic)."""
-    return get_torch_device().Event(enable_timing=enable_timing, blocking=blocking)
+    device_api = get_torch_device()
+    if get_device_type() == "cpu":
+        # ``torch.cpu.Event`` is a no-argument synchronization marker.
+        return device_api.Event()
+    return device_api.Event(enable_timing=enable_timing, blocking=blocking)
 
 
 def get_current_stream() -> Any:

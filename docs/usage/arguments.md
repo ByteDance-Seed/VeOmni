@@ -469,6 +469,14 @@ validation instead of applying ChunkMBS to multiple stacks.
 | enable_async_activation | `bool` | `False` | Enable async activation offload via stream-based D2H/H2D. Mutually exclusive with `enable_activation`. When `activation_offload_modules` is empty, targets are discovered from `model._no_split_modules`; missing or unmatched model metadata fails closed. |
 | activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
 
+Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
+through unchanged. Only private, dense, contiguous activations are swapped so
+shared-storage views are never resized. Host buffers are pooled per model and
+keyed by shape, stride, and dtype. The manager is reset at every training-step
+boundary, including before a step after a failed forward/backward, so stale
+autograd keys cannot affect the next step. The path wraps selected module instances
+and is not intended to be captured by `torch.compile`.
+
 ### CheckpointConfig
 
 `train.checkpoint.*` — Checkpoint saving and loading.

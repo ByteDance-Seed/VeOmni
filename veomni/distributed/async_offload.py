@@ -45,12 +45,67 @@ def _module_name_match(pattern: str, name: str) -> bool:
 
 
 def base_check_fn(tensor) -> bool:
+    if tensor.device.type not in ("cuda", "npu"):
+        return False
     if isinstance(tensor, torch.nn.parameter.Parameter) or tensor._base is not None:
         return False
     storage_nbytes = tensor.untyped_storage().nbytes()
-    if storage_nbytes <= 0 or storage_nbytes != tensor.numel() * tensor.element_size():
+    if storage_nbytes <= 0 or storage_nbytes != tensor.numel() * tensor.element_size() or not tensor.is_contiguous():
         return False
     return True
+
+
+class PinnedBufferPool:
+    """Reuse host buffers so async offload does not allocate pinned memory per tensor."""
+
+    def __init__(self):
+        self._free_buffers = {}
+        self.allocations = 0
+        self.reuses = 0
+
+    @staticmethod
+    def _key(tensor):
+        # Strides are part of the key even though the current offload
+        # predicate accepts contiguous tensors only; this keeps the pool safe
+        # if another dense layout is supported later.
+        return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+
+    def acquire(self, tensor):
+        key = self._key(tensor)
+        free_buffers = self._free_buffers.get(key)
+        if free_buffers:
+            self.reuses += 1
+            return free_buffers.pop(), key
+
+        pin_memory = tensor.device.type in ("cuda", "npu")
+        try:
+            buffer = torch.empty_strided(
+                tensor.shape,
+                tensor.stride(),
+                dtype=tensor.dtype,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+        except RuntimeError:
+            if not pin_memory:
+                raise
+            logger.warning_rank0(
+                "Pinned host allocation for async activation offload failed; "
+                "falling back to pageable host memory."
+            )
+            buffer = torch.empty_strided(
+                tensor.shape,
+                tensor.stride(),
+                dtype=tensor.dtype,
+                device="cpu",
+                pin_memory=False,
+            )
+        self.allocations += 1
+        return buffer, key
+
+    def release(self, buffer, key):
+        if buffer is not None:
+            self._free_buffers.setdefault(key, []).append(buffer)
 
 
 class GetCnt:
@@ -99,20 +154,45 @@ class GetCnt:
 
 
 class SwapTensor:
-    def __init__(self, tensor, key):
-        if tensor._base is not None or tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size():
+    def __init__(self, tensor, key, pool):
+        if (
+            tensor._base is not None
+            or tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size()
+            or not tensor.is_contiguous()
+        ):
             raise ValueError("Async activation offload requires a tensor with private, dense storage.")
 
         self.tensor = tensor
         self.size = tensor.size()
         self.storage_nbytes = tensor.untyped_storage().nbytes()
-        self.tensor_cpu = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True, device="cpu")
+        self.pool = pool
+        self.tensor_cpu, self._host_buffer_key = pool.acquire(tensor)
+        self._host_buffer_released = False
 
         self.stat = "device"
         self.key = key
 
         self.d2h_event = create_event()
         self.h2d_event = create_event()
+
+    def release_host_buffer(self):
+        if self._host_buffer_released or self.tensor_cpu is None:
+            return
+        if self.stat == "d2h":
+            self.d2h_event.synchronize()
+        elif self.stat == "host":
+            self.d2h_event.synchronize()
+        elif self.stat == "h2d":
+            self.h2d_event.synchronize()
+        self.pool.release(self.tensor_cpu, self._host_buffer_key)
+        self.tensor_cpu = None
+        self._host_buffer_released = True
+
+    def __del__(self):
+        try:
+            self.release_host_buffer()
+        except Exception:
+            pass
 
     def launch_d2h(self, stream):
         if self.stat != "device":
@@ -123,7 +203,7 @@ class SwapTensor:
         with torch.no_grad():
             with switch_to_specified_stream(stream):
                 stream.wait_event(forward_event)
-                self.tensor_cpu.untyped_storage().copy_(self.tensor.untyped_storage(), non_blocking=True)
+                self.tensor_cpu.copy_(self.tensor, non_blocking=True)
                 self.d2h_event.record()
                 self.stat = "d2h"
 
@@ -146,7 +226,7 @@ class SwapTensor:
             with switch_to_specified_stream(h2d_stream):
                 h2d_stream.wait_event(backward_event)
                 self.tensor.untyped_storage().resize_(self.storage_nbytes)
-                self.tensor.untyped_storage().copy_(self.tensor_cpu.untyped_storage(), non_blocking=True)
+                self.tensor.copy_(self.tensor_cpu, non_blocking=True)
                 self.h2d_event.record()
                 self.stat = "h2d"
 
@@ -158,6 +238,8 @@ class OffloadManager:
         self.items = WeakValueDictionary()
         self.getcnt = GetCnt()
         self.swap_stream = create_stream()
+
+        self.host_buffer_pool = PinnedBufferPool()
 
     def get_cnt(self, block_idx):
         return self.getcnt.get_cnt(block_idx)
@@ -216,6 +298,25 @@ class OffloadManager:
             self.items.pop(key)
 
 
+def reset_async_activation_offload(model):
+    """Reset all async-offload managers attached to ``model``.
+
+    The saved-tensor graph normally releases ``SwapTensor`` objects after
+    backward.  A failed loss/backward step can leave the graph alive, though,
+    so the next training step must explicitly discard its keys and counters.
+    The host pool remains attached to the model and can still reuse buffers
+    once the old graph is collected.
+    """
+    managers = {}
+    for module in model.modules():
+        manager = getattr(module, "_veomni_offload_manager", None)
+        if manager is not None:
+            managers[id(manager)] = manager
+
+    for manager in managers.values():
+        manager.reset()
+
+
 class async_save_on_cpu(saved_tensors_hooks):
     def __init__(
         self,
@@ -241,7 +342,7 @@ class async_save_on_cpu(saved_tensors_hooks):
             if block_idx == depth - 1:
                 return tensor
 
-            swap_tensor = SwapTensor(tensor, key)
+            swap_tensor = SwapTensor(tensor, key, manager.host_buffer_pool)
 
             if block_idx < depth - 1:
                 swap_tensor.launch_d2h(d2h_stream)
@@ -258,6 +359,7 @@ class async_save_on_cpu(saved_tensors_hooks):
             swap_tensor.launch_h2d(h2d_stream)
 
             get_current_stream().wait_event(swap_tensor.h2d_event)
+            swap_tensor.release_host_buffer()
             swap_tensor.stat = "device"
 
             block_idx, tensor_idx = swap_tensor.key.split("_")
