@@ -436,14 +436,14 @@ def _chunk_loss_dispatch(
         )
         return None, None, FusedLinearAuxOutput(log_probs=log_probs, entropy=entropy)
 
-    # ``chunk_loss_function`` owns a fixed causal shift and cannot consume the
-    # pre-shifted, potentially flattened targets used by SeedOmni V2 modules.
-    # Fail instead of silently violating the selected ops implementation.
-    if "loss_reduction_group" in kwargs and kwargs.get("shift_labels") is not None:
+    # ``chunk_loss_function`` owns a fixed causal shift and cannot consume any
+    # explicitly pre-shifted targets, including the potentially flattened
+    # targets used by SeedOmni V2 modules. This remains unsupported even when
+    # the caller's explicit reduction group is ``None``.
+    if kwargs.get("shift_labels") is not None:
         raise NotImplementedError(
             "cross_entropy_loss_implementation='chunk_loss'/'npu' does not support "
-            "SeedOmni V2 pre-shifted targets with an explicit loss reduction group. "
-            "Use 'eager', or use 'liger_kernel' on GPU."
+            "explicitly pre-shifted targets. Use 'eager', or use 'liger_kernel' on GPU."
         )
 
     loss, logits_out = chunk_loss_function(*args, **kwargs)

@@ -71,8 +71,12 @@ def test_causal_lm_loss_reduces_explicit_group_without_sequence_parallel(monkeyp
     assert captured["group"] is explicit_group
 
 
-def test_chunk_loss_rejects_seed_omni_pre_shifted_contract():
-    with pytest.raises(NotImplementedError, match="does not support SeedOmni V2 pre-shifted targets"):
+@pytest.mark.parametrize(
+    "reduction_group",
+    [pytest.param(object(), id="group"), pytest.param(None, id="none")],
+)
+def test_chunk_loss_rejects_pre_shifted_contract_for_any_reduction_group(reduction_group):
+    with pytest.raises(NotImplementedError, match="does not support explicitly pre-shifted targets"):
         cross_entropy._chunk_loss_dispatch(
             logits=None,
             labels=torch.tensor([1, 2]),
@@ -80,5 +84,17 @@ def test_chunk_loss_rejects_seed_omni_pre_shifted_contract():
             vocab_size=4,
             hidden_states=torch.randn(2, 3),
             weights=torch.randn(4, 3),
-            loss_reduction_group=object(),
+            loss_reduction_group=reduction_group,
+        )
+
+
+def test_chunk_loss_rejects_pre_shifted_contract_without_reduction_group():
+    with pytest.raises(NotImplementedError, match="does not support explicitly pre-shifted targets"):
+        cross_entropy._chunk_loss_dispatch(
+            logits=None,
+            labels=torch.tensor([1, 2]),
+            shift_labels=torch.tensor([2, -100]),
+            vocab_size=4,
+            hidden_states=torch.randn(2, 3),
+            weights=torch.randn(4, 3),
         )

@@ -50,7 +50,10 @@ def test_qwen2_mot_swiglu_rejects_unsupported_fused_activation(monkeypatch):
     monkeypatch.setattr(modeling, "veomni_swiglu_mlp", UnexpectedSlot())
 
     mlp = modeling.Qwen2MLP(_config(hidden_act="gelu"))
-    with pytest.raises(NotImplementedError, match="requires hidden_act='silu' or 'swish'"):
+    with pytest.raises(
+        ValueError,
+        match="Set model.ops_implementation.swiglu_mlp_implementation='eager'",
+    ):
         mlp(torch.randn(2, 128))
 
 

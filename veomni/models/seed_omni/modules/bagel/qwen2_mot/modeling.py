@@ -295,8 +295,10 @@ class Qwen2MLP(TransformersQwen2MLP):
 
         if veomni_swiglu_mlp.use_non_eager_impl:
             if self.config.hidden_act not in {"silu", "swish"}:
-                raise NotImplementedError(
-                    f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}."
+                raise ValueError(
+                    f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}. "
+                    "Set model.ops_implementation.swiglu_mlp_implementation='eager' "
+                    "to use the Transformers reference implementation."
                 )
             return veomni_swiglu_mlp(self, x)
 
