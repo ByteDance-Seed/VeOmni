@@ -592,7 +592,7 @@ def parallelize_model_fsdp2(
                     fqn_to_index_mapping=fqn_to_index_mapping,
                 )
 
-    if enable_fsdp_cpu_offload:
+    if materialize_device == "cpu":
         device_type = get_device_type()
         compute_device = (
             torch.device(device_type, get_device_id()) if device_type != "cpu" else torch.device(device_type)
