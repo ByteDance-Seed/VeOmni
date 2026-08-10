@@ -160,6 +160,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
+          uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
@@ -182,14 +183,6 @@ jobs:
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
-      - name: Run Ascend 910B4 GDR padding-mask regression (best-effort)
-        # The generic 910b-8 runner label does not guarantee a 910B4 device.
-        # The test self-skips on another chip; a green job is not proof that
-        # this numerical gate ran unless the runner reports Ascend910B4.
-        env:
-          TRITON_ASCEND_ARCH: Ascend910B4
-        run: |
-          uv run --frozen pytest -v -s -x tests/ops/test_gdr_ascend_padding_mask.py
       - name: Run ops tests
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py

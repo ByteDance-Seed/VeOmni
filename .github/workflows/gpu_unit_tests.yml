@@ -134,6 +134,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
+          uv run --frozen pytest -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -s -x tests/models/test_models_logits_equal_v5.py
           uv run --frozen pytest -s -x tests/models/test_model_forward_no_implicit_sync.py
@@ -160,9 +161,10 @@ jobs:
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
-      - name: Run distributed tests (dummy_forward)
+      - name: Run distributed tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -s -x tests/data
