@@ -14,7 +14,6 @@
 
 """Unit tests for MindSpeed-style async activation offload helpers."""
 
-
 import pytest
 import torch
 import torch.nn as nn
@@ -66,6 +65,9 @@ def test_get_cnt_unique_keys_across_second_pass():
     assert second == ["0_1", "1_1", "2_1"]
     assert set(first).isdisjoint(second)
 
+    cnt = GetCnt()
+    assert [cnt.get_cnt(i)[1] for i in (0, 5, 2)] == [None, 0, 5]
+
 
 def test_get_prefetch_keys_use_previous_offloaded_layer_and_its_tensor_count():
     cnt = GetCnt()
@@ -114,6 +116,10 @@ def test_apply_async_activation_offload_auto_discovers_no_split_modules():
     apply_async_activation_offload(model, [])
 
     assert [layer._veomni_offload_layer_idx for layer in model.layers] == [0, 1]
+    # FSDP2 and torch.compile discover blocks by exact class name after this
+    # hook is installed, so the private wrapper must preserve that identity.
+    assert [layer.__class__.__name__ for layer in model.layers] == ["DecoderLayer", "DecoderLayer"]
+    assert len([module for module in model.modules() if module.__class__.__name__ in model._no_split_modules]) == 2
     assert all(layer._veomni_offload_depth == 2 for layer in model.layers)
     assert model.layers[0]._veomni_offload_manager is model.layers[1]._veomni_offload_manager
 
@@ -173,7 +179,6 @@ def test_async_offload_manager_resets_after_forward_error():
     assert not manager.items
     assert manager.getcnt._block_idx == -1
     assert manager.getcnt._block_tensor_nums == {}
-
 
 
 def test_async_offload_rejects_tensor_views_with_shared_storage():
@@ -268,8 +273,7 @@ def test_async_offload_cuda_gradient_parity_and_peak_memory():
     # offloading must preserve gradients and must not increase peak allocated
     # device memory for the same model and input.
     assert offloaded_peak <= baseline_peak, (
-        f"async offload increased peak allocated memory: "
-        f"baseline={baseline_peak}, offloaded={offloaded_peak}"
+        f"async offload increased peak allocated memory: baseline={baseline_peak}, offloaded={offloaded_peak}"
     )
 
     del offloaded_output, offloaded_input

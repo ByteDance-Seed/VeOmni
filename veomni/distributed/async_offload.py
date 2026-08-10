@@ -90,8 +90,7 @@ class PinnedBufferPool:
             if not pin_memory:
                 raise
             logger.warning_rank0(
-                "Pinned host allocation for async activation offload failed; "
-                "falling back to pageable host memory."
+                "Pinned host allocation for async activation offload failed; falling back to pageable host memory."
             )
             buffer = torch.empty_strided(
                 tensor.shape,
@@ -114,14 +113,12 @@ class GetCnt:
         self._block_tensor_nums = {}
 
     def get_cnt(self, block_idx):
-        after_block = False
+        previous_block_idx = self._block_idx if self._block_idx >= 0 and block_idx != self._block_idx else None
         if block_idx > self._block_idx:
             if block_idx in self._block_tensor_nums:
                 self._block_tensor_nums[block_idx] += 1
             else:
                 self._block_tensor_nums[block_idx] = 1
-            if self._block_idx >= 0:
-                after_block = True
             self._block_idx = block_idx
         elif block_idx == self._block_idx:
             self._block_tensor_nums[block_idx] += 1
@@ -133,7 +130,7 @@ class GetCnt:
             self._block_idx = block_idx
 
         offload_tensor_key = "{}_{}".format(self._block_idx, self._block_tensor_nums[self._block_idx] - 1)
-        return offload_tensor_key, after_block
+        return offload_tensor_key, previous_block_idx
 
     def reset(self):
         self._block_idx = -1
@@ -333,11 +330,11 @@ class async_save_on_cpu(saved_tensors_hooks):
             if (custom_check_fn is not None) and (not custom_check_fn(tensor)):
                 return tensor
 
-            key, after_block = manager.get_cnt(block_idx)
+            key, previous_block_idx = manager.get_cnt(block_idx)
             d2h_stream = manager.swap_stream
 
-            if after_block:
-                manager.wait_d2h_finished("{}_".format(block_idx - 1))
+            if previous_block_idx is not None:
+                manager.wait_d2h_finished("{}_".format(previous_block_idx))
 
             if block_idx == depth - 1:
                 return tensor
@@ -536,7 +533,7 @@ def _patch_instance_call(module):
             raise
 
     async_offload_cls = type(
-        f"AsyncOffload{cls.__name__}",
+        cls.__name__,
         (cls,),
         {
             "__call__": patched_call,
