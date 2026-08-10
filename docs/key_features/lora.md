@@ -137,6 +137,64 @@ else:
     self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
 ```
 
+### 2.1 LoRA MFU and FLOPs accounting
+
+`EnvironMeterCallback` passes the effective `VeOmniLoraConfig` from the wrapped model to
+`VeomniFlopsCounter`, so the reported FLOPs and MFU reflect the work performed by LoRA
+training instead of using the full-fine-tuning estimate. Full-fine-tuning accounting is
+unchanged when no LoRA config is present.
+
+LoRA FLOPs estimation currently supports only the Qwen-family model types registered in
+`LORA_MODULES_BY_MODEL_TYPE`. An unsupported model or LoRA target emits a warning and
+reports zero achieved FLOPs and zero MFU rather than interrupting training or reporting a
+misleading value. `scripts/profile/compare_lora_flops.py` exercises this path against real
+Hugging Face Qwen configs and compares full fine-tuning with several LoRA target sets and
+ranks.
+
+`VLMTrainer` uses the same native LoRA setup, FSDP2 loading, and adapter checkpoint path as
+the text trainer. During LoRA training, the LoRA configuration determines which adapters
+and optional bias parameters are trainable:
+
+- `freeze_vit` and `freeze_audio_tower` are ignored. They control only full tuning.
+- Vision and audio modules explicitly matched by `target_modules` remain trainable.
+- With the default `bias: none`, untargeted towers remain frozen and do not participate
+  in backward. Other bias policies explicitly opt additional bias parameters into training.
+- Full merger or audio-projection weights that are normally retained by the non-LoRA freeze
+  policy are not trained in LoRA mode, because those full weights are not part of the
+  exported adapter.
+
+Qwen3-VL vision adapters may target `qkv`, `proj`, `linear_fc1`, and `linear_fc2`;
+language targets such as `q_proj` and `v_proj` can be used in the same config.
+
+For Qwen VLM configurations, vision-tower accounting uses the vision-token sequence lengths
+collected from the current batch and follows this logic:
+
+1. If the batch has no vision tokens, ViT FLOPs are zero.
+2. If the batch has vision tokens but no vision parameter is trainable, the ViT is treated
+   as frozen and only its forward-pass FLOPs are counted.
+3. If a supported ViT module has a trainable adapter, the tower uses the existing coarse
+   forward/backward estimate and includes matched LoRA work.
+4. If only vision biases are trainable (for example, `bias: all` with language-only adapter
+   targets), base forward/input-gradient work is counted without adapter FLOPs.
+
+The estimator intentionally uses the framework's existing 2x/4x/6x approximation rather
+than reconstructing the exact autograd graph: 2x is forward-only, 4x includes activation
+gradients through frozen weights, and 6x includes trainable-weight or adapter work.
+During full fine-tuning, `freeze_vit: true` selects the forward-only 2x estimate for the
+entire vision tower. During LoRA training the flag is ignored and adapter targets determine
+the estimate. This intentionally treats Omni's trainable merger as part of the frozen tower.
+
+The native LoRA implementation currently adapts two kinds of weights:
+
+- `nn.Linear` modules selected through `target_modules`.
+- Fused routed-MoE expert weights, represented as 3-D `nn.Parameter`s and selected through
+  `target_parameters`.
+
+The MoE experts are not `nn.Embedding` layers. The FLOPs estimator counts adapter work for
+both supported categories above. Within the ViT, only matched linear layers receive LoRA
+FLOPs; non-linear projections such as Qwen's `Conv3d` patch embedding are not supported LoRA
+targets. Adding a convolution name to `target_modules` does not adapt it.
+
 ---
 
 ## 3. Weight Loading with LoRA

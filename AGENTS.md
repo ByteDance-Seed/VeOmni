@@ -16,6 +16,7 @@ On session start, read the following:
 - `.agents/knowledge/constraints.md` — hard constraints to check before any code change
 - `.agents/knowledge/architecture.md` — module map, trainer hierarchy, data flow
 - `.agents/knowledge/uv.md` — dependency management architecture (uv, extras, lockfile)
+- `.agents/knowledge/cloud_env.md` — Cursor Cloud (CPU-only VM) setup; read when running on the Cursor Cloud VM
 
 ---
 

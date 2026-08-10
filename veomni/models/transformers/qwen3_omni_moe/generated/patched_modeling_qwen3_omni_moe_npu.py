@@ -51,6 +51,8 @@
 #      Register Qwen3-Omni-MoE thinker expert parallel plan for v5 generated modeling
 #    - function_replacement: apply_rotary_pos_emb_vision
 #      Replace with the fusion operator on Ascend.
+#    - method_override: Qwen3OmniMoeThinkerTextRMSNorm.forward
+#      NPU fused RMSNorm -- reduces pow+mean+rsqrt to single npu_rms_norm call
 #
 # ==============================================================================
 
@@ -68,7 +70,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch_npu import npu_rotary_mul
+from torch_npu import npu_rms_norm, npu_rotary_mul
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -1797,6 +1799,12 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3OmniMoeThinkerTextRMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3OmniMoeThinkerTextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -1808,11 +1816,10 @@ class Qwen3OmniMoeThinkerTextRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """NPU optimized implementation for RMSNorm"""
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        out_fp32 = npu_rms_norm(hidden_states.float(), self.weight.float(), epsilon=self.variance_epsilon)[0]
+        return out_fp32.to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
