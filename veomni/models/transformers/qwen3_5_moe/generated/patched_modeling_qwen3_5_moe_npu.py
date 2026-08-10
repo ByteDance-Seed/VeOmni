@@ -114,9 +114,9 @@ from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indic
 
 
 # Additional import blocks for patches
-# NPU has no fla/flash_qla backend registered today; selecting a non-eager
-# linear-attention impl raises at OpSlot.bind() time. These None
-# placeholders preserve the upstream HF top-level
+# Upstream FLA symbols stay unavailable on NPU; VeOmni's NPU GDN backends
+# are bound independently through OpSlot. These None placeholders preserve
+# the upstream HF top-level
 # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
 # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
 # assignments in __init__ resolve to torch.
@@ -128,7 +128,7 @@ fused_recurrent_gated_delta_rule = None
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
-from veomni.ops.dispatch import OpSlot
+from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 
 
 veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
@@ -140,6 +140,7 @@ veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
 veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
 veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+veomni_chunk_gated_delta_rule_implementation = OpsConfigSlot("chunk_gated_delta_rule_implementation")
 
 _VEOMNI_VISION_ATTENTION_PATCHED = False
 
@@ -1987,7 +1988,11 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
 
         # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
-        if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
+        if (
+            cu_seq_lens_q is not None
+            and "cu_seqlens_list_q" not in kwargs
+            and veomni_chunk_gated_delta_rule_implementation.value == "npu_ascendc"
+        ):
             from veomni.ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule import precompute_varlen_metadata
 
             # Use the Ulysses-local head count so that the precomputed cumsum-block

@@ -116,9 +116,9 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
-    # linear-attention impl raises at OpSlot.bind() time. These None
-    # placeholders preserve the upstream HF top-level
+    # Upstream FLA symbols stay unavailable on NPU; VeOmni's NPU GDN backends
+    # are bound independently through OpSlot. These None placeholders preserve
+    # the upstream HF top-level
     # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
     # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
     # assignments in __init__ resolve to torch.
@@ -133,7 +133,7 @@ config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpsConfigSlot, OpSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
     veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
@@ -143,6 +143,7 @@ config.add_post_import_block(
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_chunk_gated_delta_rule_implementation = OpsConfigSlot("chunk_gated_delta_rule_implementation")
     """
 )
 
@@ -155,6 +156,7 @@ slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+veomni_chunk_gated_delta_rule_implementation = None  # OpsConfigSlot, declared in post-import block above
 
 # Mirror the qwen3_5 NPU sentinel: this NPU config reuses
 # qwen3_5_vision_model_forward (Patch.5) but does NOT register the
