@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import typing
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -68,8 +69,8 @@ class VLMTrainingArguments(TrainingArguments):
 
 @dataclass
 class VLMMDataArguments(DataArguments):
-    supports_torch_compile = False
-    data_modality: ClassVar[Literal["text", "multimodal", "diffusion"]] = "multimodal"
+    supports_torch_compile = True
+    data_modality: typing.ClassVar[typing.Literal["text", "multimodal", "diffusion"]] = "multimodal"
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
