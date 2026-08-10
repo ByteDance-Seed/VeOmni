@@ -356,15 +356,19 @@ def _finalize_token_accounting(
         aligned = int(batch["linear_attn_cu_seq_lens_q"][-1].item()) - int(tail_padding_length)
     else:
         aligned = physical - int(tail_padding_length)
-    stats = build_token_accounting(
-        physical_window_tokens=physical,
-        aligned_compute_tokens=aligned,
-        source_input_tokens=int(partial["source_input_tokens"]),
-        loss_tokens=loss_tokens,
-        num_documents=int(partial["num_documents"]),
-        max_document_length=int(partial["max_document_length"]),
-        sum_document_len_squared=int(partial["sum_document_len_squared"]),
-    )
+    try:
+        stats = build_token_accounting(
+            physical_window_tokens=physical,
+            aligned_compute_tokens=aligned,
+            source_input_tokens=int(partial["source_input_tokens"]),
+            loss_tokens=loss_tokens,
+            num_documents=int(partial["num_documents"]),
+            max_document_length=int(partial["max_document_length"]),
+            sum_document_len_squared=int(partial["sum_document_len_squared"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning_rank0("Skipping invalid token-accounting metadata: %s", exc)
+        return
     attach_token_accounting(batch, stats)
 
 

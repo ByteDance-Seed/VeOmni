@@ -88,6 +88,24 @@ def test_observability_validation_is_nonfatal():
     assert metrics == {}
 
 
+def test_collator_accounting_validation_is_nonfatal():
+    import veomni.data.data_collator as data_collator
+
+    batch = {"position_ids": torch.arange(8).unsqueeze(0)}
+    data_collator._finalize_token_accounting(
+        batch,
+        partial={
+            "source_input_tokens": 12,
+            "num_documents": 2,
+            "max_document_length": 7,
+            "sum_document_len_squared": 74,
+        },
+        loss_tokens=10,
+        tail_padding_length=0,
+    )
+
+    assert TOKEN_ACCOUNTING_KEY not in batch
+
 
 def test_metrics_distinguish_capacity_source_and_loss():
     totals = TokenAccounting(16, 12, 12, 10, 2, 7, 74)
