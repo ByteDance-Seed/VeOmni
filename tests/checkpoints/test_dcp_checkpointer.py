@@ -175,6 +175,11 @@ class TestSkipHfWeightLoadOnResume:
         assert parallelize_fsdp2.call_args.kwargs["should_skip_hf_weight_load"] is True
 
     def test_cpu_offload_dcp_resume_restores_persistent_and_nonpersistent_buffers(self, monkeypatch, tmp_path):
+        """CPU regression for the accelerator-only FSDP2 offload subprocess tests.
+
+        The persistent registration is checkpoint-authoritative while the
+        non-persistent-only alias keeps its config-derived value.
+        """
         class ModelWithDerivedBuffer(nn.Module):
             _no_split_modules = []
 

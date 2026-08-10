@@ -94,7 +94,9 @@ def _move_model_buffers_to_device(model: nn.Module, device: torch.device) -> tup
     PyTorch's ``Module._apply`` replaces buffer tensor objects during device
     conversion, so external references are not guaranteed to retain object
     identity. This helper follows that contract while memoizing by object
-    identity so multiple registrations of the same buffer remain aliased.
+    identity so multiple registrations of the same buffer remain aliased. The
+    byte count is based on each buffer's local storage, which is the actual
+    memory moved for a DTensor rather than its global logical shape.
     Tensor subclasses such as DTensor keep their type through ``Tensor.to``.
     """
 
@@ -114,7 +116,11 @@ def _move_model_buffers_to_device(model: nn.Module, device: torch.device) -> tup
                 continue
 
             moved_count += 1
-            moved_bytes += buffer.numel() * buffer.element_size()
+            local_buffer = buffer
+            to_local = getattr(buffer, "to_local", None)
+            if callable(to_local):
+                local_buffer = to_local()
+            moved_bytes += local_buffer.numel() * local_buffer.element_size()
             moved_buffer = buffer.to(device=device)
             moved_by_id[buffer_id] = moved_buffer
             module._buffers[name] = moved_buffer

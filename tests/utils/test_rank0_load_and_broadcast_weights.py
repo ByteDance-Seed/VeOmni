@@ -312,7 +312,13 @@ def test_move_model_buffers_to_device_preserves_dtensor_aliases(tmp_path: Path) 
     )
     try:
         mesh = DeviceMesh("cpu", [0])
-        buffer = DTensor.from_local(torch.ones(3), mesh, [Replicate()])
+        buffer = DTensor.from_local(
+            torch.ones(3),
+            mesh,
+            [Shard(0)],
+            shape=torch.Size([6]),
+            stride=(1,),
+        )
         model = nn.Module()
         model.register_buffer("distributed_buffer", buffer)
         model.register_buffer("distributed_buffer_alias", buffer, persistent=False)
@@ -320,6 +326,8 @@ def test_move_model_buffers_to_device_preserves_dtensor_aliases(tmp_path: Path) 
         moved_count, moved_bytes = _move_model_buffers_to_device(model, torch.device("meta"))
 
         assert moved_count == 1
+        # ``buffer.numel()`` is the global logical size (6), while only the
+        # local shard (3 elements) is transferred by ``Tensor.to``.
         assert moved_bytes == 3 * torch.tensor([], dtype=torch.float32).element_size()
         assert isinstance(model.distributed_buffer, DTensor)
         assert model.distributed_buffer.to_local().device.type == "meta"
@@ -647,6 +655,9 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
 )
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: bool) -> None:
+    """Run the accelerator-only subprocess path; CPU buffer semantics are covered
+    by ``test_cpu_offload_dcp_resume_restores_persistent_and_nonpersistent_buffers``.
+    """
     checkpoint_dir = tmp_path / "ckpt"
     weights_path = _write_checkpoint(checkpoint_dir, is_parallel=True)
 
@@ -819,6 +830,10 @@ def run_load_weights_test(args: Arguments) -> None:
 def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     """
     Regression test for https://github.com/ByteDance-Seed/VeOmni/issues/637.
+
+    This launches FSDP2 with an accelerator because CPU-only FSDP2 does not
+    exercise the device-residency behavior. The CPU checkpoint path has a
+    separate regression test in ``tests/checkpoints/test_dcp_checkpointer.py``.
 
     Ensures load_model_weights with src_data_rank=None (all-ranks-read path)
     loads bit-for-bit correct parameters into an FSDP2 model.
