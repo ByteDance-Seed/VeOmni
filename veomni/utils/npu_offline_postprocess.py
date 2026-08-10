@@ -179,11 +179,17 @@ def run_analyse(raw_dir: Path, max_process_number: Optional[int] = None) -> None
 
 
 def _upload_argv(upload_cmd: str | list[str], trace_file: Path) -> list[str]:
-    argv = list(upload_cmd) if isinstance(upload_cmd, list) else shlex.split(upload_cmd)
+    is_prebuilt_argv = isinstance(upload_cmd, list)
+    argv = list(upload_cmd) if is_prebuilt_argv else shlex.split(upload_cmd)
     if not argv:
         raise ValueError("upload command is empty")
     if any("{trace}" in arg for arg in argv):
         return [arg.replace("{trace}", str(trace_file)) for arg in argv]
+    # A list is an already-complete argv, used by structured uploaders such as
+    # merlin-cli where the trace path is embedded in the JSON payload. Only
+    # the user-facing string form has the historical "append the trace" contract.
+    if is_prebuilt_argv:
+        return argv
     return [*argv, str(trace_file)]
 
 

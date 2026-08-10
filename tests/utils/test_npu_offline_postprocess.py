@@ -284,7 +284,10 @@ def test_merlin_upload_uses_argv_without_shell(tmp_path, monkeypatch):
     assert packed is not None
     argv = calls[0][0][0]
     assert argv[:4] == ["merlin-cli", "profiling", "upload", "--json"]
-    assert json.loads(argv[4])["name"] == "npu trace"
+    assert len(argv) == 5
+    payload = json.loads(argv[4])
+    assert payload["name"] == "npu trace"
+    assert payload["file_path"] == str(packed)
     assert calls[0][1] == {"check": True}
 
 
