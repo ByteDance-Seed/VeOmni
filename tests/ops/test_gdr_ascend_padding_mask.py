@@ -74,15 +74,19 @@ def test_varlen_padded_dot_mask_is_finite_and_strictly_lower_triangular():
     device_name = torch.npu.get_device_name(device_index)
     if device_name not in _SUPPORTED_DEVICE_NAMES:
         pytest.skip(f"requires Ascend 910B4, got {device_name!r}")
-    assert os.environ.get("TRITON_ASCEND_ARCH") == "Ascend910B4", (
-        "set TRITON_ASCEND_ARCH=Ascend910B4 before importing Triton on Ascend 910B4"
-    )
+    if os.environ.get("TRITON_ASCEND_ARCH") != "Ascend910B4":
+        pytest.skip("set TRITON_ASCEND_ARCH=Ascend910B4 to run the Ascend 910B4 Triton regression")
 
     from veomni.ops.kernels.gated_delta_rule._ascend.triton.chunk_scaled_dot_kkt import (
+        _DEFAULT_BK,
+        _DEFAULT_KERNEL_NUM,
         chunk_scaled_dot_kkt_fwd_kernel,
     )
     from veomni.ops.kernels.gated_delta_rule._ascend.triton.cumsum import chunk_local_cumsum
     from veomni.ops.kernels.gated_delta_rule._ascend.triton.utils import prepare_chunk_indices
+    from veomni.ops.kernels.gated_delta_rule._ascend.triton_core.chunk_scaled_dot_kkt import (
+        chunk_scaled_dot_kkt_fwd as chunk_scaled_dot_kkt_core_fwd,
+    )
 
     torch.manual_seed(42)
     device = torch.device(f"npu:{device_index}")
@@ -111,7 +115,7 @@ def test_varlen_padded_dot_mask_is_finite_and_strictly_lower_triangular():
             device=device,
             dtype=torch.float32,
         )
-        chunk_scaled_dot_kkt_fwd_kernel[(24,)](
+        chunk_scaled_dot_kkt_fwd_kernel[(_DEFAULT_KERNEL_NUM,)](
             k=k,
             g=transposed_g,
             beta=transposed_beta,
@@ -122,7 +126,7 @@ def test_varlen_padded_dot_mask_is_finite_and_strictly_lower_triangular():
             H=_HEADS,
             K=_KEY_DIM,
             BT=_CHUNK_SIZE,
-            BK=128,
+            BK=_DEFAULT_BK,
             NT=len(chunk_indices),
             B=1,
             TOTAL_TASKS=len(chunk_indices),
@@ -133,6 +137,19 @@ def test_varlen_padded_dot_mask_is_finite_and_strictly_lower_triangular():
         outputs.append(output_cpu)
 
     reference = _cpu_elementwise_reference(k, g_cumsum, beta)
+    core_output = chunk_scaled_dot_kkt_core_fwd(
+        k=k.transpose(1, 2).contiguous(),
+        g=g_cumsum,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=_CHUNK_SIZE,
+        output_dtype=torch.float32,
+    )
+    torch.npu.synchronize()
+    core_output_cpu = core_output.detach().float().cpu()
+    _assert_finite_strict_lower(core_output_cpu, poison="triton_core")
+    torch.testing.assert_close(core_output_cpu, reference, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(outputs[0], reference, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(outputs[1], reference, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(outputs[0], outputs[1], atol=0.0, rtol=0.0)

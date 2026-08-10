@@ -189,6 +189,11 @@ Install `triton-ascend` on the NPU host. VeOmni main pins PyTorch and
 pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
 ```
 
+For Ascend 910B4 Triton code generation, export TRITON_ASCEND_ARCH=Ascend910B4
+before the first Triton import. The NPU CI regression step sets this variable
+explicitly; on a non-910B4 runner the regression test skips after checking the
+runtime device name.
+
 See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
