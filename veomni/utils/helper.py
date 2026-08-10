@@ -95,10 +95,7 @@ def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     if "linear_attn_cu_seq_lens_q" in micro_batch:
         # This metadata remains global when an attention backend replaces
         # cu_seq_lens_q with sequence-parallel local boundaries.
-        parallel_state = get_parallel_state()
         tail_padding_length = int(micro_batch.get("tail_padding_length", 0) or 0)
-        if getattr(parallel_state, "cp_enabled", False):
-            tail_padding_length *= int(parallel_state.sp_size)
         seqlens = valid_seqlens_from_cu_seqlens(
             micro_batch["linear_attn_cu_seq_lens_q"],
             tail_padding_length=tail_padding_length,
@@ -106,15 +103,14 @@ def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
         return seqlens.tolist()
 
     if "cu_seq_lens_q" in micro_batch:
-        # packed micro batch
-        parallel_state = get_parallel_state()
+        # Packed micro batch. Under CP/Ulysses this may be rank-local. Do not
+        # multiply each document fragment by sp_size: boundaries need not
+        # align across ranks, and the FLOPs estimator squares these lengths.
         tail_padding_length = micro_batch.get("tail_padding_length")
         seqlens = valid_seqlens_from_cu_seqlens(
             micro_batch["cu_seq_lens_q"],
             tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
         )
-        if getattr(parallel_state, "cp_enabled", False):
-            seqlens = seqlens * int(parallel_state.sp_size)
         return seqlens.tolist()
 
     elif "attention_mask" in micro_batch:
@@ -175,6 +171,23 @@ def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]
     else:
         # unpacked sample
         return [ds_idx]
+
+
+def _safe_token_accounting_metrics(
+    totals: TokenAccounting,
+    *,
+    delta_time: float,
+) -> tuple[Dict[str, float], bool]:
+    """Validate observability counters without making training fail closed."""
+    try:
+        totals.validate_training_step()
+    except ValueError as exc:
+        logger.warning_rank0(
+            "Token accounting validation failed; keeping the training step alive and suppressing derived metrics: %s",
+            exc,
+        )
+        return {}, False
+    return metrics_from_totals(totals, delta_time=delta_time), True
 
 
 class EnvironMeter:
@@ -264,6 +277,9 @@ class EnvironMeter:
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
         else:  # dit diffusers model
+            samples = micro_batch if isinstance(micro_batch, List) else [micro_batch]
+            for sample in samples:
+                pop_token_accounting(sample)
             self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
     def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
@@ -361,9 +377,12 @@ class EnvironMeter:
                 max_document_length=int(max_document_length),
                 sum_document_len_squared=int(sum_document_len_squared),
             )
-            totals.validate_training_step()
-            metrics.update(metrics_from_totals(totals, delta_time=delta_time))
-            metrics["token_accounting/collator_accounting_hook"] = 1.0
+            token_metrics, accounting_valid = _safe_token_accounting_metrics(totals, delta_time=delta_time)
+            if accounting_valid:
+                metrics.update(token_metrics)
+                metrics["token_accounting/collator_accounting_hook"] = 1.0
+            else:
+                metrics["token_accounting/collator_accounting_hook"] = 0.0
         else:
             metrics["token_accounting/collator_accounting_hook"] = 0.0
 

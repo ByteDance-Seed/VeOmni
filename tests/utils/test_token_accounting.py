@@ -76,6 +76,19 @@ def test_training_step_gate_rejects_schema_only_zero_counters():
     TokenAccounting(16, 12, 12, 10, 2, 7, 74).validate_training_step()
 
 
+def test_observability_validation_is_nonfatal():
+    from veomni.utils.helper import _safe_token_accounting_metrics
+
+    metrics, valid = _safe_token_accounting_metrics(
+        TokenAccounting(16, 12, 0, 0, 0, 0),
+        delta_time=1.0,
+    )
+
+    assert valid is False
+    assert metrics == {}
+
+
+
 def test_metrics_distinguish_capacity_source_and_loss():
     totals = TokenAccounting(16, 12, 12, 10, 2, 7, 74)
     metrics = metrics_from_totals(totals, delta_time=2.0)
@@ -108,10 +121,25 @@ def test_compute_seqlens_prefers_global_linear_attention_boundaries(monkeypatch)
     micro_batch = {
         "cu_seq_lens_q": torch.tensor([0, 3, 4], dtype=torch.int32),
         "linear_attn_cu_seq_lens_q": torch.tensor([0, 12, 16], dtype=torch.int32),
-        "tail_padding_length": torch.tensor(1, dtype=torch.int32),
+        "tail_padding_length": torch.tensor(4, dtype=torch.int32),
     }
 
     assert helper._compute_seqlens(micro_batch) == [12]
+
+
+def test_compute_seqlens_does_not_scale_rank_local_documents_under_cp(monkeypatch):
+    from veomni.utils import helper
+
+    monkeypatch.setattr(
+        helper,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(cp_enabled=True, sp_size=4),
+    )
+    micro_batch = {"cu_seq_lens_q": torch.tensor([0, 3, 7], dtype=torch.int32)}
+
+    # CP boundaries are rank-local fragments. Multiplying each fragment would
+    # inflate the quadratic attention term used by the FLOPs estimator.
+    assert helper._compute_seqlens(micro_batch) == [3, 4]
 
 
 def test_environ_meter_consumes_accounting_before_model_forward(monkeypatch):

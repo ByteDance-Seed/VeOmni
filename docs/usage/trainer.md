@@ -121,7 +121,10 @@ slicing and reduced only across data-parallel ranks:
 
 This distinction is important when a sequence-parallel attention backend uses
 rank-local `cu_seq_lens_q`; kernel-local boundaries are not a valid source-token
-throughput counter.
+throughput counter. When only rank-local `cu_seq_lens_q` is available under
+CP/Ulysses, the legacy FLOPs meter leaves those boundaries unchanged; it does
+not multiply each document by the SP degree. The collator counters above remain
+the authoritative global token totals.
 
 ### Custom Callbacks
 

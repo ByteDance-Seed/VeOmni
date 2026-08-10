@@ -328,12 +328,14 @@ class PackingCollator(DataCollator):
                 loss_tokens = count_loss_tokens(shifted_labels)
             else:
                 loss_tokens = count_loss_tokens(batch["labels"]) if "labels" in batch else 0
-            _finalize_token_accounting(
-                batch,
-                partial=batch.pop(_TOKEN_ACCOUNTING_PARTIAL),
-                loss_tokens=loss_tokens,
-                tail_padding_length=linear_attn_tail_padding_length,
-            )
+            partial_accounting = batch.pop(_TOKEN_ACCOUNTING_PARTIAL, None)
+            if partial_accounting is not None:
+                _finalize_token_accounting(
+                    batch,
+                    partial=partial_accounting,
+                    loss_tokens=loss_tokens,
+                    tail_padding_length=linear_attn_tail_padding_length,
+                )
         elif linear_attn_tail_padding_length:
             batch[_LINEAR_ATTN_TAIL_PADDING_LENGTH] = linear_attn_tail_padding_length
         return batch
@@ -422,7 +424,7 @@ class SequenceParallelCollator(DataCollator):
             return torch.cat((feature, pad), dim=dim)
 
     def __call__(self, batch: Dict[str, Union[torch.Tensor, List[torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        partial_accounting = batch.pop(_TOKEN_ACCOUNTING_PARTIAL)
+        partial_accounting = batch.pop(_TOKEN_ACCOUNTING_PARTIAL, None)
         if not self.seq_classification:
             # shift labels
             labels = batch["labels"][..., 1:].contiguous()
@@ -469,12 +471,13 @@ class SequenceParallelCollator(DataCollator):
                 batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
         add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
-        _finalize_token_accounting(
-            batch,
-            partial=partial_accounting,
-            loss_tokens=loss_tokens,
-            tail_padding_length=linear_attn_tail_padding_length,
-        )
+        if partial_accounting is not None:
+            _finalize_token_accounting(
+                batch,
+                partial=partial_accounting,
+                loss_tokens=loss_tokens,
+                tail_padding_length=linear_attn_tail_padding_length,
+            )
 
         batch["position_ids"] = self.sp_slice(
             "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
