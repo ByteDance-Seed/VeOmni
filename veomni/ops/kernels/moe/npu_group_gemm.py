@@ -244,8 +244,15 @@ def npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
-    assume_distinct_experts: bool = False,  # accepted for a uniform dispatch interface; the NPU group GEMM has no max_M launch bound to tighten.
+    assume_distinct_experts: bool = False,  # intentionally unused; see the del below
 ):
+    # ``assume_distinct_experts`` only tightens the grouped-GEMM ``max_M``
+    # launch bound in the Triton backend. The NPU group GEMM has no such launch
+    # bound to tighten, so the flag is a no-op here. It stays in the signature
+    # only so the unified ``fused_moe_forward`` dispatch and the OpSlot adapter
+    # can forward it to any backend uniformly.
+    del assume_distinct_experts
+
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(
             num_experts,
