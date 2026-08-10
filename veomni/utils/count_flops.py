@@ -15,6 +15,7 @@
 
 from transformers import PretrainedConfig
 
+from ..lora.config import LORA_MODULES_BY_MODEL_TYPE, VeOmniLoraConfig
 from . import logging
 from .device import get_device_name
 
@@ -23,6 +24,16 @@ logger = logging.get_logger(__name__)
 
 
 def get_device_flops(unit="T"):
+    """Peak dense BF16 FLOPS of the current device.
+
+    All entries follow one convention: SM count x per-SM dense BF16 FLOPs per clock
+    (2048 Ampere, 4096 Hopper, 8192 Blackwell) x tensor-core boost clock. NVIDIA
+    publishes that boost clock up to Hopper, so the datasheet numbers already match;
+    for Blackwell it is the clock the deployed part actually runs at (`nvidia-smi
+    --query-gpu=clocks.max.sm`), which is higher than the clock behind the datasheet.
+    H20 and 910B are throughput-capped SKUs the formula does not describe.
+    """
+
     def unit_convert(number, level):
         units = ["B", "K", "M", "G", "T", "P"]
         if number <= 0:
@@ -47,8 +58,10 @@ def get_device_flops(unit="T"):
         flops = 148e12
     elif "910B" in device_name or "910_93" in device_name:
         flops = 354e12
+    elif "GB200" in device_name:
+        flops = 2565e12
     elif "B200" in device_name:
-        flops = 2250e12
+        flops = 2382e12
     elif "GB300" in device_name:
         flops = 2500e12
     elif "B300" in device_name:
@@ -89,12 +102,14 @@ class VeomniFlopsCounter:
             "qwen3": self._estimate_qwen2_flops,
             "seed_oss": self._estimate_seed_flops,
             "qwen3_5": self._estimate_qwen3_5_family_flops,
+            "qwen3_5_text": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
             "gpt_oss": self._estimate_gpt_oss_flops,
         }
 
         self.config = config
+        self._warned_lora_validation_errors = set()
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
@@ -104,7 +119,114 @@ class VeomniFlopsCounter:
         # nn.Embedding is a table lookup, so only the lm_head matmul contributes FLOPs.
         return vocab_size * hidden_size
 
-    def _compute_qwen_dense_text_flops(self, config, tokens_sum, batch_seqlens):
+    @staticmethod
+    def _compute_linear_flops(
+        base_params,
+        tokens,
+        lora_config=None,
+        module_shapes=None,
+        detached_without_targets=False,
+    ):
+        """Count linear-layer work for full fine-tuning or LoRA.
+
+        Full fine-tuning performs forward, input-gradient, and weight-gradient
+        matmuls (factor 6). A frozen LoRA base still needs its input gradient to
+        reach earlier adapters (factor 4). A fully frozen component whose inputs
+        need no gradients, such as an unadapted vision tower, is forward-only
+        (factor 2).
+        """
+        if lora_config is None:
+            return 6 * base_params * tokens
+
+        module_shapes = module_shapes or {}
+        target_modules = lora_config.target_modules or []
+        matched_modules = [module for module in target_modules if module in module_shapes]
+        lora_params = 0
+        for module in matched_modules:
+            shape_groups = module_shapes[module]
+            if isinstance(shape_groups, tuple):
+                shape_groups = (shape_groups,)
+            lora_params += sum(
+                lora_config.r * (in_features + out_features) * count
+                for in_features, out_features, count in shape_groups
+            )
+        base_factor = 2 if detached_without_targets and not matched_modules else 4
+        return (base_factor * base_params + 6 * lora_params) * tokens
+
+    @staticmethod
+    def _get_lora_validation_error(model_type, lora_config):
+        if lora_config is None:
+            return None
+        if not isinstance(lora_config, VeOmniLoraConfig):
+            return f"`lora_config` must be a VeOmniLoraConfig or None, got {type(lora_config).__name__}."
+
+        supported_modules = LORA_MODULES_BY_MODEL_TYPE.get(model_type)
+        if supported_modules is None:
+            return (
+                f"LoRA FLOPs estimation supports Qwen model types {sorted(LORA_MODULES_BY_MODEL_TYPE)}, "
+                f"got {model_type!r}."
+            )
+
+        target_modules = lora_config.target_modules or []
+        if isinstance(target_modules, str):
+            return "LoRA FLOPs estimation does not support regex-string `target_modules`."
+        if not isinstance(target_modules, list) or not all(isinstance(module, str) for module in target_modules):
+            return "`lora_config.target_modules` must be a list of projection names or None."
+        if len(target_modules) != len(set(target_modules)):
+            return f"`lora_config.target_modules` must not contain duplicates, got {target_modules!r}."
+
+        unsupported_modules = set(target_modules) - set(supported_modules)
+        if unsupported_modules:
+            return (
+                f"Unsupported {model_type} LoRA modules: {sorted(unsupported_modules)}. "
+                f"Supported modules: {list(supported_modules)}."
+            )
+
+        target_parameters = lora_config.target_parameters or []
+        if not isinstance(target_parameters, list) or not all(
+            isinstance(pattern, str) for pattern in target_parameters
+        ):
+            return "`lora_config.target_parameters` must be a list of parameter patterns or None."
+        if target_parameters:
+            supported_moe_types = {"qwen3_moe", "qwen3_vl_moe", "qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"}
+            if model_type not in supported_moe_types:
+                return f"`target_parameters` is not supported for non-MoE model type {model_type!r}."
+            supported_suffixes = ("gate_up_proj", "down_proj")
+            unsupported_patterns = [
+                pattern for pattern in target_parameters if not pattern.endswith(supported_suffixes)
+            ]
+            if unsupported_patterns:
+                return (
+                    "LoRA FLOPs estimation only supports fused routed-expert target parameters ending in "
+                    f"{supported_suffixes}, got {unsupported_patterns!r}."
+                )
+        return None
+
+    @staticmethod
+    def _compute_routed_moe_lora_flops(config, tokens, lora_config):
+        """Count fused routed-expert adapters selected through ``target_parameters``."""
+        if lora_config is None or not lora_config.target_parameters:
+            return 0
+
+        hidden_size = config.hidden_size
+        intermediate_size = config.moe_intermediate_size
+        experts_per_token = config.num_experts_per_tok
+        num_hidden_layers = config.num_hidden_layers
+        if (lora_config.moe_mode or "independent") == "shared":
+            adapter_uses_per_layer = 2 + experts_per_token  # gate/up once, down per routed expert
+        else:
+            adapter_uses_per_layer = 3 * experts_per_token
+
+        lora_params = lora_config.r * (hidden_size + intermediate_size) * adapter_uses_per_layer * num_hidden_layers
+        return 6 * lora_params * tokens
+
+    def _compute_qwen_dense_text_flops(
+        self,
+        config,
+        tokens_sum,
+        batch_seqlens,
+        lora_config=None,
+    ):
         """Compute raw text FLOPs shared by dense Qwen text and VL models."""
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -116,14 +238,34 @@ class VeomniFlopsCounter:
         mlp_N = hidden_size * config.intermediate_size * 3
         attn_linear_N = hidden_size * (2 * q_size + 2 * kv_size)
         lm_head_N = self._compute_lm_head_params(hidden_size, config.vocab_size)
-        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
-        dense_N_flops = 6 * dense_N * tokens_sum
+        base_N = (mlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
+        module_shapes = {
+            "q_proj": (hidden_size, q_size, num_hidden_layers),
+            "k_proj": (hidden_size, kv_size, num_hidden_layers),
+            "v_proj": (hidden_size, kv_size, num_hidden_layers),
+            "o_proj": (q_size, hidden_size, num_hidden_layers),
+            "gate_proj": (hidden_size, config.intermediate_size, num_hidden_layers),
+            "up_proj": (hidden_size, config.intermediate_size, num_hidden_layers),
+            "down_proj": (config.intermediate_size, hidden_size, num_hidden_layers),
+        }
+        linear_flops = self._compute_linear_flops(
+            base_N,
+            tokens_sum,
+            lora_config=lora_config,
+            module_shapes=module_shapes,
+        )
 
         seqlen_square_sum = sum(seqlen * seqlen for seqlen in batch_seqlens)
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-        return dense_N_flops + attn_qkv_flops
+        attention_core_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        return linear_flops + attention_core_flops
 
-    def _compute_qwen3_moe_text_flops(self, config, tokens_sum, batch_seqlens):
+    def _compute_qwen3_moe_text_flops(
+        self,
+        config,
+        tokens_sum,
+        batch_seqlens,
+        lora_config=None,
+    ):
         """Compute raw text FLOPs shared by Qwen3 MoE text and VL models."""
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
@@ -132,16 +274,28 @@ class VeomniFlopsCounter:
         q_size = num_attention_heads * head_dim
         kv_size = config.num_key_value_heads * head_dim
 
-        moe_gata_N = hidden_size * config.num_experts
-        moe_expertmlp_N = hidden_size * config.moe_intermediate_size * config.num_experts_per_tok * 3
+        router_N = hidden_size * config.num_experts
+        active_expert_N = hidden_size * config.moe_intermediate_size * config.num_experts_per_tok * 3
         attn_linear_N = hidden_size * (2 * q_size + 2 * kv_size)
         lm_head_N = self._compute_lm_head_params(hidden_size, config.vocab_size)
-        moe_N = (moe_gata_N + moe_expertmlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
-        dense_N_flops = 6 * moe_N * tokens_sum
+        base_N = (router_N + active_expert_N + attn_linear_N) * num_hidden_layers + lm_head_N
+        module_shapes = {
+            "q_proj": (hidden_size, q_size, num_hidden_layers),
+            "k_proj": (hidden_size, kv_size, num_hidden_layers),
+            "v_proj": (hidden_size, kv_size, num_hidden_layers),
+            "o_proj": (q_size, hidden_size, num_hidden_layers),
+        }
+        linear_flops = self._compute_linear_flops(
+            base_N,
+            tokens_sum,
+            lora_config=lora_config,
+            module_shapes=module_shapes,
+        )
+        linear_flops += self._compute_routed_moe_lora_flops(config, tokens_sum, lora_config)
 
         seqlen_square_sum = sum(seqlen * seqlen for seqlen in batch_seqlens)
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
-        return dense_N_flops + attn_qkv_flops
+        attention_core_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        return linear_flops + attention_core_flops
 
     def _estimate_seed_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size
@@ -345,8 +499,19 @@ class VeomniFlopsCounter:
         flops_all_token = linear_flops + mhc_residual_flops + attention_flops + indexer_flops
         return flops_all_token * (1.0 / delta_time) / 1e12
 
-    def _estimate_qwen3_moe_flops(self, tokens_sum, batch_seqlens, delta_time):
-        flops_all_token = self._compute_qwen3_moe_text_flops(self.config, tokens_sum, batch_seqlens)
+    def _estimate_qwen3_moe_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        lora_config=None,
+    ):
+        flops_all_token = self._compute_qwen3_moe_text_flops(
+            self.config,
+            tokens_sum,
+            batch_seqlens,
+            lora_config,
+        )
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
@@ -426,8 +591,19 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen2_flops(self, tokens_sum, batch_seqlens, delta_time):
-        flops_all_token = self._compute_qwen_dense_text_flops(self.config, tokens_sum, batch_seqlens)
+    def _estimate_qwen2_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        lora_config=None,
+    ):
+        flops_all_token = self._compute_qwen_dense_text_flops(
+            self.config,
+            tokens_sum,
+            batch_seqlens,
+            lora_config,
+        )
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
@@ -465,14 +641,31 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen2_vl_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
+    def _estimate_qwen2_vl_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        lora_config=None,
+        **kargs,
+    ):
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
-        text_flops = self._compute_qwen_dense_text_flops(text_config, tokens_sum, batch_seqlens)
+        text_flops = self._compute_qwen_dense_text_flops(
+            text_config,
+            tokens_sum,
+            batch_seqlens,
+            lora_config,
+        )
 
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
-            vit_flops = self._estimate_qwen_vit_flop(images_seqlens, self.config.vision_config)
+        if images_seqlens:
+            vit_flops = self._estimate_qwen_vit_flop(
+                images_seqlens,
+                self.config.vision_config,
+                lora_config=lora_config,
+                freeze_vit=kargs.get("freeze_vit", False),
+            )
         else:
             vit_flops = 0
 
@@ -481,13 +674,30 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_vl_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
-        text_flops = self._compute_qwen_dense_text_flops(self.config.text_config, tokens_sum, batch_seqlens)
+    def _estimate_qwen3_vl_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        lora_config=None,
+        **kargs,
+    ):
+        text_flops = self._compute_qwen_dense_text_flops(
+            self.config.text_config,
+            tokens_sum,
+            batch_seqlens,
+            lora_config,
+        )
 
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
-            vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, self.config.vision_config)
+        if images_seqlens:
+            vit_flops = self._estimate_qwen3_vit_flop(
+                images_seqlens,
+                self.config.vision_config,
+                lora_config=lora_config,
+                freeze_vit=kargs.get("freeze_vit", False),
+            )
         else:
             vit_flops = 0
 
@@ -496,12 +706,29 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_vl_moe_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
-        text_flops = self._compute_qwen3_moe_text_flops(self.config.text_config, tokens_sum, batch_seqlens)
+    def _estimate_qwen3_vl_moe_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        lora_config=None,
+        **kargs,
+    ):
+        text_flops = self._compute_qwen3_moe_text_flops(
+            self.config.text_config,
+            tokens_sum,
+            batch_seqlens,
+            lora_config,
+        )
         # vit flops
         images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
-            vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, self.config.vision_config)
+        if images_seqlens:
+            vit_flops = self._estimate_qwen3_vit_flop(
+                images_seqlens,
+                self.config.vision_config,
+                lora_config=lora_config,
+                freeze_vit=kargs.get("freeze_vit", False),
+            )
         else:
             vit_flops = 0
         # all_layer & all_token fwd & bwd flops
@@ -509,9 +736,15 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_vit_flop(self, images_seqlens, config):
+    def _estimate_qwen3_vit_flop(
+        self,
+        images_seqlens,
+        config,
+        lora_config=None,
+        freeze_vit=False,
+    ):
         """
-        Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
+        Estimate the FLOPs of the Qwen3-family vision encoder.
         """
 
         if config is None:
@@ -537,12 +770,46 @@ class VeomniFlopsCounter:
         merger_N = (out_hidden_size + (dim * (spatial_merge_size**2))) * (dim * (spatial_merge_size**2))
 
         # Qwen3 VL uses deep stack, one merger for every deepstack layer
-        deepstack_merger_N = merger_N * len(config.deepstack_visual_indexes)
+        merger_count = 1 + len(getattr(config, "deepstack_visual_indexes", ()))
+        deepstack_merger_N = merger_N * (merger_count - 1)
         # non-attn all_layer parm
         dense_N = patch_embed_N + (mlp_N + attn_linear_N) * depth + deepstack_merger_N + merger_N
 
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * dense_N * tokens_sum
+        vision_module_shapes = {
+            "qkv": (dim, 3 * dim, depth),
+            "proj": (dim, dim, depth),
+            "linear_fc1": [
+                (dim, mlp_hidden_dim, depth),
+                (dim * spatial_merge_size**2, dim * spatial_merge_size**2, merger_count),
+            ],
+            "linear_fc2": [
+                (mlp_hidden_dim, dim, depth),
+                (dim * spatial_merge_size**2, out_hidden_size, merger_count),
+            ],
+        }
+        target_modules = lora_config.target_modules if lora_config is not None else ()
+        vision_has_lora = any(module in vision_module_shapes for module in target_modules or ())
+        vision_requires_grad = vision_has_lora or (lora_config is not None and lora_config.bias == "all")
+
+        if lora_config is None:
+            dense_N_flops = (2 if freeze_vit else 6) * dense_N * tokens_sum
+        elif not vision_requires_grad:
+            dense_N_flops = 2 * dense_N * tokens_sum
+        elif not vision_has_lora:
+            # Bias-only vision training needs activation gradients through the
+            # tower, but not input gradients for the initial patch embedding.
+            adaptable_base_N = dense_N - patch_embed_N
+            dense_N_flops = (2 * patch_embed_N + 4 * adaptable_base_N) * tokens_sum
+        else:
+            # Patch embedding is Conv3d and is not adapted by VeOmni's linear LoRA.
+            adaptable_base_N = dense_N - patch_embed_N
+            dense_N_flops = 2 * patch_embed_N * tokens_sum
+            dense_N_flops += self._compute_linear_flops(
+                adaptable_base_N,
+                tokens_sum,
+                lora_config=lora_config,
+                module_shapes=vision_module_shapes,
+            )
 
         # In Qwen3 VL, full attention is used in all vision layers.
         full_attn_layer_num = depth
@@ -551,13 +818,23 @@ class VeomniFlopsCounter:
         seqlen_square_sum = 0
         for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
+        if lora_config is None:
+            attention_factor = 4 if freeze_vit else 12
+        else:
+            attention_factor = 12 if vision_requires_grad else 4
+        attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
 
         vit_flops = dense_N_flops + attn_qkv_flops
 
         return vit_flops
 
-    def _estimate_qwen_vit_flop(self, images_seqlens, config):
+    def _estimate_qwen_vit_flop(
+        self,
+        images_seqlens,
+        config,
+        lora_config=None,
+        freeze_vit=False,
+    ):
         """
         Estimate the FLOPS of the vision encoder for Qwen2 and Qwen2.5
         """
@@ -597,8 +874,49 @@ class VeomniFlopsCounter:
         # non-attn all_layer parm
         dense_N = (mlp_N + attn_linear_N) * depth + patch_embed_and_merger_N
 
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * dense_N * tokens_sum
+        merger_hidden_size = dim * spatial_merge_size**2
+        vision_module_shapes = {
+            "qkv": (dim, 3 * dim, depth),
+            "proj": (dim, dim, depth),
+            "mlp.0": (merger_hidden_size, merger_hidden_size, 1),
+            "mlp.2": (merger_hidden_size, out_hidden_size, 1),
+        }
+        if is_qwen2_vl:
+            vision_module_shapes.update(
+                {
+                    "fc1": (dim, mlp_hidden_dim, depth),
+                    "fc2": (mlp_hidden_dim, dim, depth),
+                }
+            )
+        else:
+            vision_module_shapes.update(
+                {
+                    "gate_proj": (dim, mlp_hidden_dim, depth),
+                    "up_proj": (dim, mlp_hidden_dim, depth),
+                    "down_proj": (mlp_hidden_dim, dim, depth),
+                }
+            )
+        target_modules = lora_config.target_modules if lora_config is not None else ()
+        vision_has_lora = any(module in vision_module_shapes for module in target_modules or ())
+        vision_requires_grad = vision_has_lora or (lora_config is not None and lora_config.bias == "all")
+        if lora_config is None and freeze_vit:
+            dense_N_flops = 2 * dense_N * tokens_sum
+        elif lora_config is not None and not vision_requires_grad:
+            dense_N_flops = 2 * dense_N * tokens_sum
+        elif lora_config is not None and not vision_has_lora:
+            dense_N_flops = 4 * dense_N * tokens_sum
+        else:
+            dense_N_flops = self._compute_linear_flops(
+                dense_N,
+                tokens_sum,
+                lora_config=lora_config,
+                module_shapes=vision_module_shapes,
+                detached_without_targets=True,
+            )
+        if lora_config is None:
+            attention_factor = 4 if freeze_vit else 12
+        else:
+            attention_factor = 12 if vision_requires_grad else 4
 
         # In Qwen2.5 VL, windowed attention is used in some layers.
         full_attn_layer_num = config.depth if is_qwen2_vl else len(config.fullatt_block_indexes)
@@ -608,11 +926,16 @@ class VeomniFlopsCounter:
         seqlen_square_sum = 0
         for seqlen in images_seqlens:
             seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
+        attn_qkv_flops = attention_factor * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
 
         # If window attention is used, add the window attention flops
         if window_attn_layer_num > 0:
-            window_attn_compute_flops = 12 * tokens_sum * (config.window_size**2) * head_dim * num_heads
+            # Qwen2.5-VL configures window_size in pixels. Mirror get_vision_window_index's
+            # conversion to the number of ViT tokens on each side of a window. This remains
+            # an upper bound for partially filled windows at image boundaries.
+            merger_window_size = config.window_size // spatial_merge_size // config.patch_size
+            window_token_size = merger_window_size * spatial_merge_size
+            window_attn_compute_flops = attention_factor * tokens_sum * (window_token_size**2) * head_dim * num_heads
             attn_qkv_flops += window_attn_compute_flops * window_attn_layer_num
 
         vit_flops = dense_N_flops + attn_qkv_flops
@@ -749,7 +1072,13 @@ class VeomniFlopsCounter:
             * num_gdn_layers
         )
 
-    def _estimate_qwen3_next_flops(self, tokens_sum, batch_seqlens, delta_time):
+    def _estimate_qwen3_next_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        lora_config=None,
+    ):
         """
         Estimate the FLOPS of the Qwen3 Next model.
         """
@@ -762,17 +1091,48 @@ class VeomniFlopsCounter:
             self._compute_hybrid_attn_params(self.config)
         )
 
-        # moe per layer parm
-        # TopkGate layer and gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
+        # MoE per-layer parameters: top-k router, routed/shared SwiGLU experts,
+        # and the scalar sigmoid gate applied to the shared expert output.
         moe_gata_N = hidden_size * self.config.num_experts
         moe_sharedexpertmlp_N = hidden_size * self.config.shared_expert_intermediate_size * 3
+        moe_sharedexpert_gate_N = hidden_size
         moe_expertmlp_N = hidden_size * self.config.moe_intermediate_size * self.config.num_experts_per_tok * 3
-        moe_N = (moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N) * num_hidden_layers
+        moe_N = (moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N + moe_sharedexpert_gate_N) * num_hidden_layers
 
         # lm head param
         lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
-        # non-attn all_layer & all_token fwd & bwd flops
-        dense_N_flops = 6 * (moe_N + attn_linear_N + lm_head_N) * tokens_sum
+        head_dim = getattr(self.config, "head_dim", hidden_size // self.config.num_attention_heads)
+        q_size = self.config.num_attention_heads * head_dim
+        kv_size = self.config.num_key_value_heads * head_dim
+        linear_k_size = self.config.linear_num_key_heads * self.config.linear_key_head_dim
+        linear_v_size = self.config.linear_num_value_heads * self.config.linear_value_head_dim
+        module_shapes = {
+            "q_proj": (hidden_size, 2 * q_size, num_full_attn_layers),
+            "k_proj": (hidden_size, kv_size, num_full_attn_layers),
+            "v_proj": (hidden_size, kv_size, num_full_attn_layers),
+            "o_proj": (q_size, hidden_size, num_full_attn_layers),
+            "in_proj_qkvz": (
+                hidden_size,
+                2 * linear_k_size + 2 * linear_v_size,
+                num_linear_attn_layers,
+            ),
+            "in_proj_ba": (
+                hidden_size,
+                2 * self.config.linear_num_value_heads,
+                num_linear_attn_layers,
+            ),
+            "out_proj": (linear_v_size, hidden_size, num_linear_attn_layers),
+            "gate_proj": (hidden_size, self.config.shared_expert_intermediate_size, num_hidden_layers),
+            "up_proj": (hidden_size, self.config.shared_expert_intermediate_size, num_hidden_layers),
+            "down_proj": (self.config.shared_expert_intermediate_size, hidden_size, num_hidden_layers),
+        }
+        dense_N_flops = self._compute_linear_flops(
+            moe_N + attn_linear_N + lm_head_N,
+            tokens_sum,
+            lora_config=lora_config,
+            module_shapes=module_shapes,
+        )
+        dense_N_flops += self._compute_routed_moe_lora_flops(self.config, tokens_sum, lora_config)
         # attn all_layer & all_token fwd & bwd flops, only count full attention layers
         seqlen_square_sum = 0
         for seqlen in batch_seqlens:
@@ -787,7 +1147,14 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def _estimate_qwen3_5_family_flops(self, tokens_sum, batch_seqlens, delta_time, **kargs):
+    def _estimate_qwen3_5_family_flops(
+        self,
+        tokens_sum,
+        batch_seqlens,
+        delta_time,
+        lora_config=None,
+        **kargs,
+    ):
         """
         Estimate the FLOPS of the Qwen3.5 model family (dense/MoE MLP + hybrid attention + ViT).
 
@@ -811,6 +1178,8 @@ class VeomniFlopsCounter:
                     gate_proj:  hidden_size -> shared_expert_intermediate_size
                     up_proj:    hidden_size -> shared_expert_intermediate_size
                     down_proj:  shared_expert_intermediate_size -> hidden_size
+                Shared expert gate:
+                    shared_expert_gate: hidden_size -> 1
 
             Hybrid attention: see _compute_hybrid_attn_params docstring.
 
@@ -837,19 +1206,59 @@ class VeomniFlopsCounter:
         # MLP params: MoE or dense depending on config
         is_moe = hasattr(text_config, "num_experts")
         if is_moe:
-            # MoE per layer: router gate + routed expert MLPs (top-k) + shared expert MLP
+            # MoE per layer: router, routed expert MLPs (top-k), shared expert
+            # MLP, and the scalar sigmoid gate on the shared expert output.
             moe_gata_N = hidden_size * text_config.num_experts
             moe_expertmlp_N = hidden_size * text_config.moe_intermediate_size * text_config.num_experts_per_tok * 3
             moe_sharedexpertmlp_N = hidden_size * text_config.shared_expert_intermediate_size * 3
-            mlp_N = (moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N) * num_hidden_layers
+            moe_sharedexpert_gate_N = hidden_size
+            mlp_N = (
+                moe_gata_N + moe_expertmlp_N + moe_sharedexpertmlp_N + moe_sharedexpert_gate_N
+            ) * num_hidden_layers
         else:
             # dense MLP per layer: gate_proj + up_proj + down_proj (SwiGLU)
             mlp_N = hidden_size * text_config.intermediate_size * 3 * num_hidden_layers
 
         # lm_head only; embed_tokens is a table lookup.
         lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
-        # linear projection flops: 6 (fwd + bwd) * params * tokens
-        dense_N_flops = 6 * (mlp_N + attn_linear_N + lm_head_N) * tokens_sum
+        q_size = text_config.num_attention_heads * head_dim
+        kv_size = text_config.num_key_value_heads * head_dim
+        linear_k_size = text_config.linear_num_key_heads * text_config.linear_key_head_dim
+        linear_v_size = text_config.linear_num_value_heads * text_config.linear_value_head_dim
+        module_shapes = {
+            "q_proj": (hidden_size, 2 * q_size, num_full_attn_layers),
+            "k_proj": (hidden_size, kv_size, num_full_attn_layers),
+            "v_proj": (hidden_size, kv_size, num_full_attn_layers),
+            "o_proj": (q_size, hidden_size, num_full_attn_layers),
+            "in_proj_qkv": (
+                hidden_size,
+                2 * linear_k_size + linear_v_size,
+                num_linear_attn_layers,
+            ),
+            "in_proj_z": (hidden_size, linear_v_size, num_linear_attn_layers),
+            "in_proj_b": (hidden_size, text_config.linear_num_value_heads, num_linear_attn_layers),
+            "in_proj_a": (hidden_size, text_config.linear_num_value_heads, num_linear_attn_layers),
+            "out_proj": (linear_v_size, hidden_size, num_linear_attn_layers),
+        }
+        if is_moe:
+            mlp_size = text_config.shared_expert_intermediate_size
+        else:
+            mlp_size = text_config.intermediate_size
+        module_shapes.update(
+            {
+                "gate_proj": (hidden_size, mlp_size, num_hidden_layers),
+                "up_proj": (hidden_size, mlp_size, num_hidden_layers),
+                "down_proj": (mlp_size, hidden_size, num_hidden_layers),
+            }
+        )
+        dense_N_flops = self._compute_linear_flops(
+            mlp_N + attn_linear_N + lm_head_N,
+            tokens_sum,
+            lora_config=lora_config,
+            module_shapes=module_shapes,
+        )
+        if is_moe:
+            dense_N_flops += self._compute_routed_moe_lora_flops(text_config, tokens_sum, lora_config)
 
         # quadratic attention flops (Q@K and attn@V), only for full attention layers
         seqlen_square_sum = 0
@@ -862,8 +1271,13 @@ class VeomniFlopsCounter:
 
         # vit flops (Qwen3-VL ViT)
         images_seqlens = kargs.get("images_seqlens", None)
-        if images_seqlens is not None:
-            vit_flops = self._estimate_qwen3_vit_flop(images_seqlens, self.config.vision_config)
+        if images_seqlens:
+            vit_flops = self._estimate_qwen3_vit_flop(
+                images_seqlens,
+                getattr(self.config, "vision_config", None),
+                lora_config=lora_config,
+                freeze_vit=kargs.get("freeze_vit", False),
+            )
         else:
             vit_flops = 0
 
@@ -872,18 +1286,53 @@ class VeomniFlopsCounter:
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
 
-    def estimate_flops(self, batch_seqlens, delta_time, **kwargs):
+    def estimate_flops(
+        self,
+        batch_seqlens,
+        delta_time,
+        lora_config: VeOmniLoraConfig | None = None,
+        images_seqlens=None,
+        freeze_vit: bool | None = None,
+    ):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
 
         Args:
             batch_seqlens (List[int]): A list where each element represents the number of valid tokens in the current batch.
             delta_time (float): The time taken to process the batch, in seconds.
+            lora_config (VeOmniLoraConfig, optional): Effective LoRA configuration for supported
+                Qwen models. FLOPs estimation reads only ``r``, ``target_modules``,
+                ``target_parameters``, ``bias``, and ``moe_mode``. Vision FLOPs use a coarse
+                config-level approximation: 2x for forward-only work, 4x when activation
+                gradients are needed, and 6x for trainable weights/adapters. Unsupported LoRA
+                configurations emit a warning and return zero FLOPs instead of interrupting training.
+            images_seqlens (List[int], optional): Vision-token sequence lengths for multimodal
+                models.
+            freeze_vit (bool, optional): Whether the vision tower is frozen during full
+                fine-tuning. Ignored when ``lora_config`` is provided.
 
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
             promised_flops (float): The expected FLOPS of the current device.
         """
+        lora_validation_error = self._get_lora_validation_error(self.config.model_type, lora_config)
+        if lora_validation_error is not None:
+            if lora_validation_error not in self._warned_lora_validation_errors:
+                logger.warning_rank0(
+                    "LoRA FLOPs are unavailable: %s Returning zero FLOPs so training can continue.",
+                    lora_validation_error,
+                )
+                self._warned_lora_validation_errors.add(lora_validation_error)
+            return 0, get_device_flops()
+
+        kwargs = {}
+        if lora_config is not None:
+            kwargs["lora_config"] = lora_config
+        if images_seqlens is not None:
+            kwargs["images_seqlens"] = images_seqlens
+        if freeze_vit is not None:
+            kwargs["freeze_vit"] = freeze_vit
+
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)
         estimated_flops = func(tokens_sum, batch_seqlens, delta_time, **kwargs)

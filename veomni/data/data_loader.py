@@ -31,7 +31,12 @@ from .data_collator import (
     NoopDataCollator,
     UnpackDataCollator,
 )
-from .dataset import DynamicBatchingSizeDataset, get_length_by_attention_mask_fn, get_length_fn_by_count_mode
+from .dataset import (
+    DynamicBatchingSizeDataset,
+    _MapStyleSamplerWrapper,
+    get_length_by_attention_mask_fn,
+    get_length_fn_by_count_mode,
+)
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
@@ -137,6 +142,8 @@ def build_native_dataloader(
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
+    persistent_workers: bool = False,
+    in_order: bool = True,
     shuffle: bool = True,
     seed: int = 0,
     collate_fn: Optional[Callable] = None,
@@ -267,6 +274,17 @@ def build_native_dataloader(
 
             collate_fn = UnpackDataCollator()
         else:
+            if not isinstance(dataset, IterableDataset):
+                # Map-style datasets lose their DistributedSampler once wrapped into the
+                # (iterable) DynamicBatchingSizeDataset. Adapt them to a per-rank,
+                # per-worker iterable with sampler-equivalent index assignment.
+                dataset = _MapStyleSamplerWrapper(
+                    dataset,
+                    num_replicas=parallel_state.dp_size,
+                    rank=parallel_state.dp_rank,
+                    shuffle=shuffle,
+                    seed=seed,
+                )
             dataset = DynamicBatchingSizeDataset(
                 dataset=dataset,
                 micro_batch_seq_length=batching_token_len,
@@ -300,6 +318,11 @@ def build_native_dataloader(
         )
 
     worker_init_fn = _build_worker_init_fn(worker_num_threads) if worker_num_threads is not None else None
+    if not in_order and num_workers > 0:
+        logger.warning_rank0(
+            "data.dataloader.in_order=False can improve throughput for uneven worker loads, "
+            "but StatefulDataLoader does not guarantee exact checkpoint/resume ordering in this mode."
+        )
     # Snapshot is only consumed at save; widen to save_steps in worker mode (1:1 next/step), else keep the every-step default so resume sees a fresh snapshot.
     if save_steps and save_steps > 0 and not (dyn_bsz and dyn_bsz_runtime == "main"):
         snapshot_every_n_steps = save_steps
@@ -315,6 +338,8 @@ def build_native_dataloader(
         pin_memory_device=get_device_type(),
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers and num_workers > 0,
+        in_order=in_order,
         worker_init_fn=worker_init_fn,
         multiprocessing_context=multiprocessing_context,
         snapshot_every_n_steps=snapshot_every_n_steps,

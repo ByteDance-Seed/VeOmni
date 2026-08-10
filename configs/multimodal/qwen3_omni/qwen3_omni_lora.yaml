@@ -4,6 +4,10 @@
 # `thinker.model.layers.*.mlp.experts.{gate_up_proj,down_proj}`. The wrapper
 # auto-detects the fused experts layout regardless of where the experts module
 # sits in the model tree.
+# Tower freeze flags are ignored during LoRA training. LoRA targets determine
+# which vision/audio adapters train; with the default `bias: none`, untargeted
+# towers remain frozen. Other bias policies control additional trainability
+# (`modules_to_save` is not currently supported).
 
 model:
   model_path: Qwen3-Omni-30B-A3B-Instruct
