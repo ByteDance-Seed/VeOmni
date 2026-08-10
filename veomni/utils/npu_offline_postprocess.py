@@ -178,19 +178,19 @@ def run_analyse(raw_dir: Path, max_process_number: Optional[int] = None) -> None
     )
 
 
-def run_upload_cmd(upload_cmd: str | list[str], trace_file: Path) -> None:
-    if isinstance(upload_cmd, list):
-        logger.info("Uploading with argv: %s", shlex.join(upload_cmd))
-        subprocess.run(upload_cmd, check=True)
-        return
+def _upload_argv(upload_cmd: str | list[str], trace_file: Path) -> list[str]:
+    argv = list(upload_cmd) if isinstance(upload_cmd, list) else shlex.split(upload_cmd)
+    if not argv:
+        raise ValueError("upload command is empty")
+    if any("{trace}" in arg for arg in argv):
+        return [arg.replace("{trace}", str(trace_file)) for arg in argv]
+    return [*argv, str(trace_file)]
 
-    quoted_trace = shlex.quote(str(trace_file))
-    if "{trace}" in upload_cmd:
-        command = upload_cmd.replace("{trace}", quoted_trace)
-    else:
-        command = f"{upload_cmd} {quoted_trace}"
-    logger.info("Uploading with command: %s", command)
-    subprocess.run(command, shell=True, check=True, executable="/bin/bash")
+
+def run_upload_cmd(upload_cmd: str | list[str], trace_file: Path) -> None:
+    argv = _upload_argv(upload_cmd, trace_file)
+    logger.info("Uploading with argv: %s", shlex.join(argv))
+    subprocess.run(argv, check=True)
 
 
 def build_merlin_upload_cmd(trace_file: Path, name: Optional[str] = None) -> list[str]:
@@ -287,7 +287,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--upload-cmd",
         default=None,
-        help="Shell command to upload the parsed trace. Use {trace} or append the path.",
+        help="argv-style upload command to run on the parsed trace; use {trace} or append the path (no shell syntax).",
     )
     parser.add_argument(
         "--merlin-upload",

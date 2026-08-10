@@ -201,7 +201,7 @@ class ProfileConfig:
     )
     profile_memory: bool = field(
         default=True,
-        metadata={"help": "Whether or not to profile the memory usage."},
+        metadata={"help": "Whether to record memory events; on NPU these are kept in the profiler trace."},
     )
     with_stack: bool = field(
         default=True,
@@ -221,42 +221,34 @@ class ProfileConfig:
         default="offline",
         metadata={
             "help": (
-                "Ascend trace analysis mode. 'offline' finalizes raw data during training and automatically "
-                "postprocesses/uploads it in Merlin through a file-based platform uploader or merlin-cli (disable with "
-                "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=0); 'async' starts torch_npu online analysis in its background "
+                "Ascend trace analysis mode. 'offline' finalizes raw data during training and postprocesses it in a "
+                "detached sidecar; 'async' starts torch_npu online analysis in its background "
                 "process pool. This option only affects NPU profiling."
             )
         },
     )
-    npu_offline_analysis: Optional[bool] = field(
-        default=None,
+    npu_postprocess: bool = field(
+        default=True,
         metadata={
             "help": (
-                "Deprecated compatibility alias. true maps to npu_analysis_mode=offline; false is rejected because "
-                "synchronous online analysis was removed. Use npu_analysis_mode explicitly."
+                "Run offline NPU trace analysis and durable copy in a detached sidecar after raw finalization."
             )
         },
+    )
+    npu_upload: bool = field(
+        default=True,
+        metadata={"help": "Allow the detached NPU postprocess sidecar to upload a parsed trace asset."},
+    )
+    npu_sidecar_wait_timeout: float = field(
+        default=300.0,
+        metadata={"help": "Maximum seconds to wait for detached NPU postprocessing after training."},
     )
 
     def __post_init__(self) -> None:
         if self.npu_analysis_mode not in {"offline", "async"}:
             raise ValueError(f"Invalid npu_analysis_mode={self.npu_analysis_mode!r}; expected one of: offline, async.")
-        if self.npu_offline_analysis is True:
-            if self.npu_analysis_mode == "async":
-                raise ValueError(
-                    "Conflicting NPU profiler options: npu_offline_analysis=true and npu_analysis_mode=async."
-                )
-            logger.warning("train.profile.npu_offline_analysis is deprecated; use npu_analysis_mode=offline.")
-            self.npu_analysis_mode = "offline"
-        elif self.npu_offline_analysis is False:
-            if self.enable:
-                raise ValueError(
-                    "train.profile.npu_offline_analysis=false requested removed synchronous online analysis; "
-                    "choose npu_analysis_mode=async or npu_analysis_mode=offline explicitly."
-                )
-            logger.warning(
-                "Ignoring deprecated train.profile.npu_offline_analysis=false because NPU profiling is disabled."
-            )
+        if self.npu_sidecar_wait_timeout < 0:
+            raise ValueError("train.profile.npu_sidecar_wait_timeout must be non-negative.")
 
 
 @dataclass

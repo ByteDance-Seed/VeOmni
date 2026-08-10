@@ -209,6 +209,8 @@ class ProfileTraceCallback(Callback):
                     with_modules=args.train.profile.with_modules,
                     global_rank=args.train.global_rank,
                     npu_analysis_mode=args.train.profile.npu_analysis_mode,
+                    npu_postprocess=getattr(args.train.profile, "npu_postprocess", True),
+                    npu_upload=getattr(args.train.profile, "npu_upload", True),
                 )
                 self.profiler.start()
             except Exception as exc:
@@ -354,7 +356,10 @@ class ProfileTraceCallback(Callback):
             f"NPU_PROFILE_TRAIN_END mode={effective_mode} step={state.global_step} wall_time_seconds={time.time():.6f}"
         )
         if self.profiler is not None:
-            helper.wait_npu_profile_sidecars(self.profiler)
+            helper.wait_npu_profile_sidecars(
+                self.profiler,
+                timeout_seconds=getattr(args.train.profile, "npu_sidecar_wait_timeout", 300.0),
+            )
         logger.info_rank0(
             f"NPU_PROFILE_TEARDOWN_DONE mode={effective_mode} step={state.global_step} "
             f"wall_time_seconds={time.time():.6f}"

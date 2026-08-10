@@ -355,6 +355,8 @@ def main():
                     with_modules=args.train.profile.with_modules,
                     global_rank=args.train.global_rank,
                     npu_analysis_mode=args.train.profile.npu_analysis_mode,
+                    npu_postprocess=getattr(args.train.profile, "npu_postprocess", True),
+                    npu_upload=getattr(args.train.profile, "npu_upload", True),
                 )
                 profiler.start()
             except Exception as exc:
@@ -576,9 +578,6 @@ def main():
     finally:
         if synchronize_profile_cleanup:
             dist.barrier()
-    if profiler is not None:
-        helper.wait_npu_profile_sidecars(profiler)
-
     synchronize()
     # release memory
     del optimizer, lr_scheduler
@@ -598,6 +597,11 @@ def main():
         )
 
     dist.barrier()
+    if profiler is not None:
+        helper.wait_npu_profile_sidecars(
+            profiler,
+            timeout_seconds=getattr(args.train.profile, "npu_sidecar_wait_timeout", 300.0),
+        )
     dist.destroy_process_group()
 
 

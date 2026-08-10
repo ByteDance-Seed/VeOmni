@@ -15,7 +15,10 @@ VeOmni's profiling configuration is located under the `train.profile.*` namespac
 | end_step | int | 2 | The step to end profiling |
 | trace_dir | str | "./trace" | Directory to save profiling traces |
 | record_shapes | bool | True | Whether to record input tensor shapes |
-| profile_memory | bool | True | Whether to profile memory usage |
+| profile_memory | bool | True | Whether to profile memory usage; on NPU memory events stay in the torch_npu trace and no CUDA `.pkl` allocator snapshot is emitted |
+| npu_postprocess | bool | True | Run offline NPU trace analysis and durable copy in a detached sidecar |
+| npu_upload | bool | True | Allow the sidecar to upload a parsed trace asset |
+| npu_sidecar_wait_timeout | float | 300.0 | Maximum seconds to wait for detached postprocessing after training |
 | with_stack | bool | True | Whether to record stack traces |
 | with_modules | bool | False | Whether to record module hierarchy in profiling traces |
 | rank0_only | bool | True | Whether to profile only rank 0 |
@@ -67,16 +70,13 @@ Use pod-local storage for large Ascend captures, then copy / parse / upload outs
 
 In `offline` mode, VeOmni can spawn a detached postprocess sidecar after raw finalization:
 
-| Env | Effect |
+| Config / integration | Effect |
 |-----|--------|
-| unset (default) | In a Merlin job, auto-spawn sidecar: analyse → gzip → profiling upload through a platform file uploader or `merlin-cli`; associate with the current Trial for the JobRun Profiling tab (JobRun fallback when no Trial is available); otherwise preserve raw data |
-| `VEOMNI_UPLOAD_CMD=...` | Auto-spawn sidecar: analyse → run the command on `trace_view.json.gz` (`{trace}` placeholder supported) |
-| `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1` | Force Merlin upload through a platform file uploader or `merlin-cli` (job/trial read from Merlin env) |
-| `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=0` | Disable automatic Merlin upload |
-| `VEOMNI_NPU_OFFLINE_POSTPROCESS=1` | Force-spawn sidecar analysis; also copy when `trace_dir` is `hdfs://` |
-| `VEOMNI_NPU_OFFLINE_POSTPROCESS=0` | Disable automatic postprocessing; raw data remains pod-local, with no synchronous fallback |
+| `npu_postprocess: true` (default) | Analyse the finalized raw capture in a detached sidecar; copy it when `trace_dir` is `hdfs://` |
+| `npu_upload: true` (default) in a Merlin job | Upload through the platform file uploader or `merlin-cli`, associating the asset with the current Trial when available |
+| `VEOMNI_UPLOAD_CMD=...` | Optional explicit user uploader; the command is parsed as argv and runs on `trace_view.json.gz` (`{trace}` placeholder supported) |
 
-VeOmni waits for an automatically spawned sidecar for up to 300 seconds when training ends. A timeout is non-fatal and leaves the raw local capture in place; for very large captures, use the manual postprocess command below while the pod remains alive.
+VeOmni waits for an automatically spawned sidecar for up to `npu_sidecar_wait_timeout` seconds when training ends. A timeout is non-fatal and leaves the raw local capture in place; for very large captures, use the manual postprocess command below while the pod remains alive.
 
 Manual / external postprocess (recommended when the train pod may exit soon after capture; `--merlin-upload` requires `merlin-cli` on `PATH`):
 
@@ -112,9 +112,8 @@ An `hdfs://` trace directory is supported in `offline` mode. VeOmni captures loc
 
 Async analysis can compete with training for host CPU and disk bandwidth, and torch_npu waits for its process pool during interpreter exit. Use `offline` for the lowest training interference or very large traces. If the training process is a multiprocessing daemon, VeOmni logs a warning and safely falls back from `async` to `offline` because torch_npu refuses daemon-process analysis.
 
-The former `npu_offline_analysis: true` setting remains as a deprecated alias for `npu_analysis_mode: offline`. Explicit `npu_offline_analysis: false` is rejected because it selected the removed synchronous online parser; choose `async` or `offline` explicitly.
 
-The current trainer callback and `tasks/omni/train_omni_model.py` support both modes. Deprecated standalone training entrypoints reject NPU profiling explicitly because they cannot honor the distributed synchronization contract.
+The current trainer callback and `tasks/omni/train_omni_model.py` support both modes. Deprecated standalone training entrypoints warn and disable NPU profiling because they cannot honor the distributed synchronization contract.
 
 ## Profiling Analysis Tool - MindStudio Insight
 

@@ -336,12 +336,14 @@ NPU validation runs at two times:
 | end_step | `int` | `2` | End step for profiling. |
 | trace_dir | `str` | `"./trace"` | Directory to save profiling traces. |
 | record_shapes | `bool` | `True` | Record input tensor shapes. |
-| profile_memory | `bool` | `True` | Record memory usage. |
+| profile_memory | `bool` | `True` | Record memory events; on NPU they are kept in the torch_npu trace rather than a CUDA `.pkl` allocator snapshot. |
 | with_stack | `bool` | `True` | Record stack traces. |
 | with_modules | `bool` | `False` | Record module hierarchy in profiler traces. |
 | rank0_only | `bool` | `True` | Profile rank 0 only. |
 | npu_analysis_mode | `Literal["offline", "async"]` | `"offline"` | Ascend only. `offline` finalizes raw data and auto-uploads a postprocessed profiling asset in Merlin through a platform file uploader or `merlin-cli`; if neither uploader is available, it preserves raw data. JSON/base64 SDK upload is intentionally avoided for large traces. `async` uses torch_npu's online process pool (`analyse_flag=True, async_mode=True`). Use a pod-local directory for `async`. Distributed barriers cover raw finalization and handler submission, not background analysis. |
-| npu_offline_analysis | `Optional[bool]` | `None` | Deprecated migration alias. `true` maps to `npu_analysis_mode="offline"`; `false` is rejected because synchronous online parsing was removed. |
+| npu_postprocess | `bool` | `True` | Run offline NPU trace analysis and durable copy in a detached sidecar after raw finalization. |
+| npu_upload | `bool` | `True` | Allow the detached sidecar to upload a parsed trace asset when a supported uploader and JobRun context are available. |
+| npu_sidecar_wait_timeout | `float` | `300.0` | Maximum seconds to wait for detached NPU postprocessing after training. |
 
 ### ChannelLossConfig
 

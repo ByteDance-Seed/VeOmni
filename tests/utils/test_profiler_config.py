@@ -1,11 +1,9 @@
-from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from veomni.arguments.arguments_types import ProfileConfig
-from veomni.arguments.parser import parse_args
 from veomni.trainer.callbacks import trace_callback
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils import helper
@@ -33,6 +31,7 @@ class _FakeNpuProfiler:
 
     def __init__(self):
         self.trace_handler_calls = []
+        self.profile_calls = []
 
     def tensorboard_trace_handler(self, trace_dir, **kwargs):
         self.trace_handler_calls.append((trace_dir, kwargs))
@@ -45,6 +44,7 @@ class _FakeNpuProfiler:
         return kwargs
 
     def profile(self, **kwargs):
+        self.profile_calls.append(kwargs)
         return SimpleNamespace(**kwargs)
 
 
@@ -103,64 +103,15 @@ def test_npu_async_hdfs_validation_runs_on_unprofiled_rank(monkeypatch):
         callback.on_train_begin(TrainerState(global_step=0))
 
 
-def test_legacy_npu_offline_true_maps_to_offline(monkeypatch):
-    warnings = []
-    monkeypatch.setattr("veomni.arguments.arguments_types.logger.warning", warnings.append)
+def test_profile_config_exposes_typed_sidecar_controls():
+    config = ProfileConfig(npu_postprocess=False, npu_upload=False, npu_sidecar_wait_timeout=0.0)
 
-    config = ProfileConfig(npu_offline_analysis=True)
+    assert config.npu_postprocess is False
+    assert config.npu_upload is False
+    assert config.npu_sidecar_wait_timeout == 0.0
 
-    assert config.npu_analysis_mode == "offline"
-    assert any("deprecated" in warning for warning in warnings)
-
-
-def test_legacy_npu_offline_false_requires_explicit_safe_mode():
-    with pytest.raises(ValueError, match="removed synchronous online analysis"):
-        ProfileConfig(enable=True, npu_offline_analysis=False)
-
-
-def test_disabled_profile_loads_legacy_saved_false_value(monkeypatch, tmp_path):
-    @dataclass
-    class _TrainConfig:
-        profile: ProfileConfig = field(default_factory=ProfileConfig)
-
-    @dataclass
-    class _SavedConfig:
-        train: _TrainConfig = field(default_factory=_TrainConfig)
-
-    config_path = tmp_path / "legacy_veomni_cli.yaml"
-    config_path.write_text(
-        "train:\n  profile:\n    enable: false\n    npu_offline_analysis: false\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr("sys.argv", ["test", str(config_path)])
-
-    parsed = parse_args(_SavedConfig)
-
-    assert parsed.train.profile.enable is False
-    assert parsed.train.profile.npu_offline_analysis is False
-    assert parsed.train.profile.npu_analysis_mode == "offline"
-
-
-def test_create_profiler_accepts_legacy_offline_true(monkeypatch, tmp_path):
-    fake_profiler = _FakeNpuProfiler()
-    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
-    monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
-
-    with pytest.deprecated_call(match="npu_offline_analysis"):
-        helper.create_profiler(
-            start_step=1,
-            end_step=2,
-            trace_dir=str(tmp_path),
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-            with_modules=False,
-            global_rank=0,
-            npu_offline_analysis=True,
-        )
-
-    assert fake_profiler.trace_handler_calls == [(str(tmp_path), {"analyse_flag": False})]
+    with pytest.raises(ValueError, match="npu_sidecar_wait_timeout"):
+        ProfileConfig(npu_sidecar_wait_timeout=-1.0)
 
 
 @pytest.mark.parametrize("analysis_mode", ["offline", "async"])
@@ -183,6 +134,7 @@ def test_npu_analysis_does_not_record_unused_memory_history(monkeypatch, tmp_pat
     )
 
     assert not isinstance(profiler, helper.ProfilerWithMem)
+    assert fake_profiler.profile_calls[0]["profile_memory"] is True
 
 
 def test_npu_offline_spawns_async_upload_sidecar(monkeypatch, tmp_path):
@@ -194,8 +146,6 @@ def test_npu_offline_spawns_async_upload_sidecar(monkeypatch, tmp_path):
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "upload-trace")
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper, "get_torch_device", lambda: pytest.fail("offline mode must not dump memory snapshots"))
     monkeypatch.setattr(
@@ -365,8 +315,6 @@ def test_npu_offline_defers_hdfs_copy_to_sidecar(monkeypatch, tmp_path):
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setattr(helper, "CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper.hdfs_io, "makedirs", lambda *args, **kwargs: None)
@@ -395,7 +343,7 @@ def test_npu_offline_defers_hdfs_copy_to_sidecar(monkeypatch, tmp_path):
     assert sidecar_calls == [
         (
             (str(raw_dir),),
-            {"copy_to": trace_dir, "analyse": False, "upload_cmd": None, "merlin_upload": False},
+            {"copy_to": trace_dir, "analyse": True, "upload_cmd": None, "merlin_upload": False},
         )
     ]
 
@@ -412,8 +360,6 @@ def test_npu_offline_sidecar_opt_out_never_falls_back_to_sync_hdfs_copy(monkeypa
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", "0")
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setattr(helper, "CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper.hdfs_io, "makedirs", lambda *args, **kwargs: None)
@@ -436,6 +382,7 @@ def test_npu_offline_sidecar_opt_out_never_falls_back_to_sync_hdfs_copy(monkeypa
         with_modules=False,
         global_rank=0,
         npu_analysis_mode="offline",
+        npu_postprocess=False,
     )
     profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
 
@@ -453,8 +400,7 @@ def test_npu_offline_spawns_merlin_upload_sidecar(monkeypatch, tmp_path):
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", "1")
+    monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper, "get_torch_device", lambda: pytest.fail("offline mode must not dump memory snapshots"))
     monkeypatch.setattr(
@@ -493,8 +439,6 @@ def test_npu_offline_auto_uploads_in_merlin(monkeypatch, tmp_path):
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(
@@ -547,8 +491,6 @@ def test_npu_offline_merlin_upload_precedence(
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "/opt/platform/default-standalone-upload")
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
     if explicit_upload_cmd is not None:
         monkeypatch.setenv("VEOMNI_UPLOAD_CMD", explicit_upload_cmd)
@@ -592,8 +534,6 @@ def test_npu_offline_merlin_upload_opt_out_disables_platform_default(monkeypatch
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "/opt/platform/default-standalone-upload")
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", "0")
     monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(
@@ -612,10 +552,16 @@ def test_npu_offline_merlin_upload_opt_out_disables_platform_default(monkeypatch
         with_modules=False,
         global_rank=0,
         npu_analysis_mode="offline",
+        npu_upload=False,
     )
     profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
 
-    assert sidecar_calls == []
+    assert sidecar_calls == [
+        (
+            (str(raw_dir),),
+            {"copy_to": None, "analyse": True, "upload_cmd": None, "merlin_upload": False},
+        )
+    ]
 
 
 def test_npu_offline_auto_upload_uses_sidecar_without_merlin_cli(monkeypatch, tmp_path):
@@ -627,8 +573,6 @@ def test_npu_offline_auto_upload_uses_sidecar_without_merlin_cli(monkeypatch, tm
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setenv("MERLIN_JOB_ID", "job-123")
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(
@@ -668,8 +612,6 @@ def test_npu_offline_sidecar_failure_preserves_raw_without_sync_fallback(monkeyp
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "upload-trace")
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper, "spawn_npu_offline_sidecar", lambda *args, **kwargs: None)
     monkeypatch.setattr(helper, "copy", lambda *args, **kwargs: pytest.fail("must not sync-copy"))
@@ -723,8 +665,6 @@ def test_npu_async_does_not_race_background_analysis_with_upload(monkeypatch, tm
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "upload-trace")
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", "1")
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", "1")
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(
         helper, "spawn_npu_offline_sidecar", lambda *args, **kwargs: sidecar_calls.append((args, kwargs))
@@ -768,8 +708,6 @@ def test_npu_async_submission_failure_preserves_raw_and_does_not_fail_training(m
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
-    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper.logger, "warning", warnings.append)
     monkeypatch.setattr(helper.logger, "info", logs.append)
@@ -906,7 +844,7 @@ def test_npu_profile_finalize_error_still_releases_post_barrier(monkeypatch):
         stop=lambda: events.append("stop"),
     )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler: events.append("wait"))
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
@@ -954,7 +892,7 @@ def test_npu_profile_scheduled_stop_error_is_retried_at_train_end(monkeypatch):
         stop=stop_profiler,
     )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler: events.append("wait"))
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
@@ -1148,7 +1086,7 @@ def test_npu_profile_train_end_stops_early_window_and_waits_for_sidecar(monkeypa
         stop=lambda: events.append("stop"),
     )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler: events.append("wait"))
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
@@ -1176,7 +1114,7 @@ def test_npu_profile_train_end_does_not_stop_twice(monkeypatch):
         stop=lambda: pytest.fail("profiler already stopped"),
     )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler: events.append("wait"))
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
     monkeypatch.setattr(trace_callback.logger, "info_rank0", lambda message: None)
 
     callback.on_train_end(TrainerState(global_step=30))
@@ -1202,7 +1140,7 @@ def test_npu_profile_train_end_stop_error_is_nonfatal_and_releases_barrier(monke
 
     callback.profiler = SimpleNamespace(_veomni_npu_analysis_mode="offline", stop=fail_stop)
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler: events.append("wait"))
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))

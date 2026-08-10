@@ -1,6 +1,5 @@
 import gzip
 import json
-import shlex
 import sys
 import types
 
@@ -260,13 +259,13 @@ def test_custom_upload_preserves_json_braces_and_quotes_trace_path(tmp_path, mon
     calls = []
     monkeypatch.setattr(post.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
 
-    command = 'upload --json {"asset_type":"perfetto"} --file {trace}'
+    command = 'upload --json \'{"asset_type":"perfetto"}\' --file {trace}'
     post.run_upload_cmd(command, trace)
 
     assert calls == [
         (
-            (f'upload --json {{"asset_type":"perfetto"}} --file {shlex.quote(str(trace))}',),
-            {"shell": True, "check": True, "executable": "/bin/bash"},
+            (["upload", "--json", '{"asset_type":"perfetto"}', "--file", str(trace)],),
+            {"check": True},
         )
     ]
 
