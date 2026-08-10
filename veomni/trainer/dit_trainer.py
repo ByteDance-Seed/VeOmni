@@ -396,6 +396,8 @@ class DiTTrainer:
                 drop_last=args.data.dataloader.drop_last,
                 pin_memory=args.data.dataloader.pin_memory,
                 prefetch_factor=args.data.dataloader.prefetch_factor,
+                persistent_workers=args.data.dataloader.persistent_workers,
+                in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
@@ -444,7 +446,7 @@ class DiTTrainer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = outputs.loss
-        loss_dict = {k: v / self.base.args.train.micro_batch_size for k, v in loss_dict.items()}
+        loss_dict = {k: v / self.base.num_micro_batches for k, v in loss_dict.items()}
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
@@ -510,7 +512,7 @@ class DiTTrainer:
 
         self.on_step_begin(micro_batches=micro_batches)
 
-        synchronize()
+        self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(float)

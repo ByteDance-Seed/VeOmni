@@ -74,6 +74,8 @@ def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="SM90 or later"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp8_weight_quant(torch.empty(0))
 
 
 def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
@@ -90,6 +92,8 @@ def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp8_weight_quant(torch.empty(0))
 
 
 def _require_tilelang_cuda():
@@ -248,6 +252,47 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
         assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+
+def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monkeypatch):
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+    from veomni.ops.kernels.deepseek_v4 import tilelang_sparse_mla_bwd as sparse_mla_bwd
+
+    kv_block = sparse_mla_bwd.KV_BLOCK
+    requested_kv_lengths = []
+    original_bwd = sparse_mla_bwd.bwd
+
+    def tracking_bwd(B, S, S_kv, *args, **kwargs):
+        requested_kv_lengths.append(S_kv)
+        return original_bwd(B, S, S_kv, *args, **kwargs)
+
+    monkeypatch.setattr(sparse_mla_bwd, "bwd", tracking_bwd)
+
+    batch, seqlen, heads, dim, topk = 1, 32, 8, 512, 64
+    scale = dim**-0.5
+    # All three round up to one KV block, so one compiled kernel must serve them all;
+    # the last one needs no padding at all.
+    for kv_len in (48, 129, kv_block):
+        torch.manual_seed(4)
+        q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+        indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+        # Out of range for the real KV but inside the padded KV: must stay masked out.
+        indices[..., -2:] = kv_len
+
+        actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+        expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+        grad = torch.randn_like(actual)
+        expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+        actual.backward(grad)
+        assert kv.grad.shape == kv.shape
+        for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+            assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+    # One specialization key for all three lengths, so TileLang compiles once.
+    assert set(requested_kv_lengths) == {kv_block}
 
 
 def test_deepseek_v4_generated_attention_dispatch_matches_eager():
@@ -411,7 +456,11 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
     from transformers import AutoConfig
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
-    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.models.transformers.deepseek_v4.packed_utils import (
+        build_packed_compression_metadata,
+        build_sparse_attention_indices,
+        mask_sparse_attention_indices,
+    )
 
     torch.manual_seed(5)
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
@@ -449,6 +498,48 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
             packed_sequence_slices=sequence_slices,
             packed_compression_metadata=packed_metadata,
         )
+        compact_result = compressor(
+            hidden_states,
+            q_residual,
+            position_ids,
+            None,
+            0,
+            packed_sequence_slices=sequence_slices,
+            packed_compression_metadata=packed_metadata,
+            return_topk_indices=True,
+        )
+        compact_kv, compact_bias, compact_indices = compact_result
+        torch.testing.assert_close(compact_kv, packed_kv)
+        torch.testing.assert_close(compact_bias, packed_bias)
+        if compressor_cls is modeling.DeepseekV4CSACompressor:
+            assert compact_indices is not None
+            valid = compact_indices >= 0
+            safe_indices = compact_indices.clamp_min(0).unsqueeze(1)
+            selected_bias = packed_bias.gather(-1, safe_indices)
+            assert (selected_bias[valid.unsqueeze(1)] == 0).all()
+
+            sliding_bias = hidden_states.new_full((1, 1, total_len, total_len), float("-inf"))
+            for start, end in sequence_slices:
+                for query_idx in range(start, end):
+                    window_start = max(start, query_idx - config.sliding_window + 1)
+                    sliding_bias[:, :, query_idx, window_start : query_idx + 1] = 0
+            full_bias = torch.cat((sliding_bias, packed_bias), dim=-1)
+            candidates = build_sparse_attention_indices(
+                batch_size=1,
+                seq_len=total_len,
+                sliding_window=config.sliding_window,
+                compressed_len=packed_kv.shape[2],
+                compressed_indices=compact_indices,
+                device=hidden_states.device,
+            )
+            filtered_indices = mask_sparse_attention_indices(full_bias, candidates)
+            for query_idx in range(total_len):
+                actual_indices = filtered_indices[0, query_idx]
+                actual_indices = actual_indices[actual_indices >= 0].sort().values
+                expected_indices = torch.where(full_bias[0, 0, query_idx] == 0)[0].to(torch.int32)
+                torch.testing.assert_close(actual_indices, expected_indices)
+        else:
+            assert compact_indices is None
 
         segment_outputs = []
         segment_biases = []
@@ -474,6 +565,45 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
             assert torch.isneginf(packed_bias[:, :, start:end, :kv_offset]).all()
             assert torch.isneginf(packed_bias[:, :, start:end, kv_end:]).all()
             kv_offset = kv_end
+
+
+def test_deepseek_v4_compact_sparse_indices_match_attention_mask():
+    from veomni.models.transformers.deepseek_v4.packed_utils import (
+        build_sparse_attention_indices,
+        mask_sparse_attention_indices,
+    )
+
+    seq_len, compressed_len, sliding_window = 6, 3, 3
+    attention_mask = torch.full((1, 1, seq_len, seq_len + compressed_len), float("-inf"))
+    segment_starts = (0, 0, 0, 3, 3, 3)
+    compressed_ranges = ((0, 1), (0, 1), (0, 2), (2, 2), (2, 2), (2, 3))
+    for query_idx, (segment_start, (compressed_start, compressed_end)) in enumerate(
+        zip(segment_starts, compressed_ranges, strict=True)
+    ):
+        window_start = max(segment_start, query_idx - sliding_window + 1)
+        attention_mask[0, 0, query_idx, window_start : query_idx + 1] = 0
+        attention_mask[
+            0,
+            0,
+            query_idx,
+            seq_len + compressed_start : seq_len + compressed_end,
+        ] = 0
+
+    candidates = build_sparse_attention_indices(
+        batch_size=1,
+        seq_len=seq_len,
+        sliding_window=sliding_window,
+        compressed_len=compressed_len,
+        compressed_indices=None,
+        device=attention_mask.device,
+    )
+    actual = mask_sparse_attention_indices(attention_mask, candidates)
+
+    for query_idx in range(seq_len):
+        actual_indices = actual[0, query_idx]
+        actual_indices = actual_indices[actual_indices >= 0].sort().values
+        expected_indices = torch.where(attention_mask[0, 0, query_idx] == 0)[0].to(torch.int32)
+        torch.testing.assert_close(actual_indices, expected_indices)
 
 
 def test_deepseek_v4_packed_causal_mask_blocks_previous_samples():
@@ -541,3 +671,187 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
     expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
+
+
+def _fp8_weight_quant_reference(x, block_size=128, round_scale=False):
+    """Bit-exact torch model of the TileLang block-wise FP8 weight quantizer.
+
+    Both compute the scale in FP32 from the tile amax, so the divide, the
+    clamp and the round-to-nearest-even FP8 cast all match exactly.
+    """
+    rows, cols = x.shape
+    tiles = x.float().contiguous().view(rows // block_size, block_size, cols // block_size, block_size)
+    amax = tiles.abs().amax(dim=(1, 3)).clamp_min(1e-4)
+    scales = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0))) if round_scale else amax / 448.0
+    quantized = (tiles / scales[:, None, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return quantized.view(rows, cols), scales
+
+
+def _weight_quant_test_input():
+    """A 2x3 grid of 128x128 tiles, each exercising a different scale regime."""
+    torch.manual_seed(6)
+    tiles = [
+        torch.randn(128, 128),
+        torch.zeros(128, 128),  # amax clamp: must not divide by zero
+        torch.full((128, 128), 1e-8),  # below the clamp floor
+        torch.randn(128, 128) * 1e4,  # large magnitudes
+        torch.randn(128, 128) * 1e-3,  # small magnitudes
+        torch.randn(128, 128),
+    ]
+    tiles[4][7, 11] = 500.0  # lone outlier: the tile scale must absorb it
+    rows = [torch.cat(tiles[:3], dim=1), torch.cat(tiles[3:], dim=1)]
+    return torch.cat(rows, dim=0).to(device=DEVICE, dtype=torch.bfloat16)
+
+
+def _tiles_above_amax_floor():
+    """Mask of the _weight_quant_test_input tiles whose amax clears the 1e-4 floor.
+
+    The other two tiles keep the floor scale, so they neither saturate nor
+    stretch to the FP8 range and have to be excluded from range assertions.
+    """
+    return torch.tensor([[True, False, False], [True, True, True]], device=DEVICE)
+
+
+def test_tilelang_fp8_weight_quant_matches_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128)
+    reference_quantized, reference_scales = _fp8_weight_quant_reference(x)
+
+    assert quantized.shape == x.shape
+    assert quantized.dtype == torch.float8_e4m3fn
+    # A non-square tile grid catches a swapped block index or transposed scales.
+    assert scales.shape == (2, 3)
+    assert scales.dtype == torch.float32
+    assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
+    assert torch.equal(scales, reference_scales)
+    assert not quantized.float().isnan().any()
+
+    # The scale is derived per tile, so each tile stretches to the FP8 max on
+    # its own. The two tiles whose amax falls under the 1e-4 clamp keep the
+    # floor scale instead and therefore stay far below saturation.
+    tile_amax = quantized.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    assert torch.equal(tile_amax == 448.0, _tiles_above_amax_floor())
+    assert tile_amax[0, 1] == 0.0
+    assert 0.0 < tile_amax[0, 2] < 1.0
+    assert scales[0, 1] == 1e-4 / 448.0
+    assert scales[0, 2] == 1e-4 / 448.0
+
+
+def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128)
+
+    dequantized = quantized.float().view(2, 128, 3, 128) * scales[:, None, :, None]
+    dequantized = dequantized.view(x.shape)
+    # E4M3 keeps 3 mantissa bits, so a correctly scaled tile round-trips to
+    # within one ulp (~2^-4) relative to that tile's amax.
+    tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    tolerance = (tile_amax / 16.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
+    assert ((dequantized - x.float()).abs() <= tolerance).all()
+
+    transposed = x.t().contiguous().t()
+    assert not transposed.is_contiguous()
+    transposed_quantized, transposed_scales = fp8_weight_quant(transposed, block_size=128)
+    assert torch.equal(transposed_quantized.view(torch.uint8), quantized.view(torch.uint8))
+    assert torch.equal(transposed_scales, scales)
+
+
+def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+    reference_quantized, reference_scales = _fp8_weight_quant_reference(x, round_scale=True)
+
+    assert quantized.shape == x.shape
+    assert quantized.dtype == torch.float8_e4m3fn
+    assert scales.shape == (2, 3)
+    assert scales.dtype == torch.float8_e8m0fnu
+    # E8M0 stores the exponent alone, so a power-of-two scale survives the cast
+    # bit for bit and matches the FP32 value the kernel divided by.
+    assert torch.equal(scales.float().log2(), scales.float().log2().round())
+    assert torch.equal(scales.float(), reference_scales)
+    assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
+    assert not quantized.float().isnan().any()
+
+    # Rounding the scale up costs at most one binade of range, so unlike the
+    # FP32 mode no tile saturates, yet every tile above the amax floor still
+    # reaches at least half of the FP8 max.
+    tile_amax = quantized.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    assert (tile_amax <= 448.0).all()
+    assert (tile_amax[_tiles_above_amax_floor()] >= 224.0).all()
+
+
+def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
+    """scale_fmt decides how the scale is computed, scale_dtype only how it is stored."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    _, exact_scales = fp8_weight_quant(x, block_size=128)
+    rounded_quantized, rounded_scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0")
+    e8m0_quantized, e8m0_scales = fp8_weight_quant(
+        x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu
+    )
+
+    assert rounded_scales.dtype == torch.float32
+    assert torch.equal(rounded_scales, e8m0_scales.float())
+    assert torch.equal(rounded_quantized.view(torch.uint8), e8m0_quantized.view(torch.uint8))
+    # Rounding goes upward and never overshoots by a full binade.
+    assert (rounded_scales >= exact_scales).all()
+    assert (rounded_scales < 2.0 * exact_scales).all()
+
+
+def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
+    """An amax that already divides to a power of two must not gain a binade."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = torch.zeros(128, 128, device=DEVICE, dtype=torch.bfloat16)
+    x[3, 5] = 56.0  # 448 * 2**-3, exact in BF16, so ceil(log2(amax / 448)) == -3
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+
+    assert scales.shape == (1, 1)
+    assert scales.float().item() == 0.125
+    assert quantized.float()[3, 5] == 448.0
+
+
+def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+
+    dequantized = quantized.float().view(2, 128, 3, 128) * scales.float()[:, None, :, None]
+    dequantized = dequantized.view(x.shape)
+    # Rounding the scale up spends up to one of E4M3's 3 mantissa bits, so the
+    # round-trip budget is twice the ~2^-4 of the exact-scale mode.
+    tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    tolerance = (tile_amax / 8.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
+    assert ((dequantized - x.float()).abs() <= tolerance).all()
+
+
+def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    with pytest.raises(AssertionError, match="2D weight"):
+        fp8_weight_quant(torch.empty(2, 128, 128, device=DEVICE, dtype=torch.bfloat16))
+    with pytest.raises(AssertionError, match="bfloat16 weight"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.float32))
+    with pytest.raises(AssertionError, match="divisible by block_size"):
+        fp8_weight_quant(torch.empty(128, 200, device=DEVICE, dtype=torch.bfloat16))
+    with pytest.raises(AssertionError, match="float32 and float8_e8m0fnu"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float16)
+    # An E8M0 scale cannot represent the unrounded FP32 scale the kernel would
+    # divide by, so the pairing has to be rejected instead of drifting.
+    with pytest.raises(AssertionError, match="powers of two"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)
