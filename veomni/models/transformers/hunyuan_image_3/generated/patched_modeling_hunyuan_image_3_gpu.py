@@ -20,6 +20,7 @@
 
 from collections.abc import Callable
 from functools import partial
+from io import BytesIO
 from typing import Optional
 
 import torch
@@ -922,25 +923,107 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
         self._flow_generator = generator
         return generator
 
+    def _flow_rng_logger(self):
+        # Local import: the generated modeling module has no module-level logger,
+        # and these paths run once per checkpoint load.
+        from veomni.utils.logging import get_logger
+
+        return get_logger(__name__)
+
+    def _flow_generator_payload(self):
+        if self._flow_generator is None:
+            return None
+        return {
+            "device_type": self._flow_generator.device.type,
+            "state": self._flow_generator.get_state(),
+        }
+
     def get_extra_state(self):
         # Serialize the flow generator so DCP model load resumes the noise stream
         # where it stopped instead of replaying it from the top -- under frequent
         # preemption a restart-from-seed would over-sample the same sigma prefix.
-        # Uninitialized generators (checkpointing before the first forward)
-        # serialize to an empty payload and re-seed lazily on restore.
-        if self._flow_generator is None:
-            return {"flow_generator": None}
-        return {
-            "flow_generator": {
-                "device_type": self._flow_generator.device.type,
-                "state": self._flow_generator.get_state(),
-            }
-        }
+        #
+        # Two DCP properties shape this payload; both were learned the hard way.
+        #
+        # 1. ``_extra_state`` is NOT a per-rank channel. DCP dedups it, so exactly
+        #    one rank's copy is written and every rank restores that one copy.
+        #    Storing only ``self``'s state therefore collapses every DP replica
+        #    onto a single noise stream from the first resume onward -- silently,
+        #    since each replica still ends up holding a valid generator. So the
+        #    payload carries EVERY replica's state (gathered over the DP group) and
+        #    ``set_extra_state`` picks its own slot back out. Dedup keeping any one
+        #    copy is then correct, because all copies are identical.
+        #
+        # 2. DCP FLATTENS the returned mapping into the checkpoint key space, so
+        #    the payload's *structure* is part of the key set: a nested
+        #    ``{"gen": {"state": tensor}}`` becomes ``_extra_state.gen.state`` and a
+        #    ``{"gen": None}`` becomes ``_extra_state.gen``. Load then fails with
+        #    ``Missing key in checkpoint state_dict`` whenever the two runs disagree
+        #    on shape -- which is the normal resume path, since the saving run has a
+        #    live generator and the loading model has not run a forward yet. Hence
+        #    the single opaque ``bytes`` blob below: one stable key regardless of
+        #    how many replicas there are or whether any generator exists.
+        #
+        # CONTRACT: whatever this returns must be identical on every rank, and its
+        # structure must not depend on runtime state. Violating either reintroduces
+        # one of the two failures above, the first of them silently.
+        #
+        # WARNING: this makes ``model.state_dict()`` a COLLECTIVE call on the DP
+        # group. Every rank must reach it. Calling ``state_dict()`` on a subset of
+        # ranks (a rank0-only debug branch, a single-process script running against
+        # an initialized process group) deadlocks with no diagnostic.
+        own = self._flow_generator_payload()
+        parallel_state = get_parallel_state()
+        dp_size = parallel_state.dp_size
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and dp_size > 1:
+            gathered = [None] * dp_size
+            torch.distributed.all_gather_object(gathered, own, group=parallel_state.dp_group)
+        else:
+            gathered = [own]
+        buffer = BytesIO()
+        torch.save(gathered, buffer)
+        return {"flow_generator_by_dp_rank": buffer.getvalue()}
 
     def set_extra_state(self, state):
         if not isinstance(state, dict):
             raise TypeError("HunyuanImage3ForCausalMM extra_state must be a dict.")
-        payload = state.get("flow_generator")
+        parallel_state = get_parallel_state()
+        dp_rank, dp_size = parallel_state.dp_rank, parallel_state.dp_size
+
+        blob = state.get("flow_generator_by_dp_rank")
+        if blob is None:
+            # Pre-gather checkpoint: a single payload belonging to whichever rank
+            # won the dedup. Adopting it would hand every replica the same stream,
+            # which is the bug this format replaced, so drop it and re-seed lazily
+            # from ``derive_flow_seed(seed, dp_rank)``. Only reachable through a
+            # direct call -- through DCP the key mismatch fails earlier and louder.
+            if "flow_generator" in state:
+                self._flow_generator = None
+                self._flow_rng_logger().warning_rank0(
+                    "Checkpoint carries the legacy single-payload 'flow_generator' extra_state. "
+                    "It cannot be attributed to a DP replica, so the flow noise stream is re-seeded "
+                    "from scratch rather than shared across replicas. Resume is not bit-exact for "
+                    "the flow objective; DP independence is preserved."
+                )
+                return
+            raise KeyError("extra_state is missing 'flow_generator_by_dp_rank'.")
+
+        gathered = torch.load(BytesIO(blob), weights_only=True)
+        if not isinstance(gathered, list):
+            raise TypeError("'flow_generator_by_dp_rank' must deserialize to a list indexed by dp_rank.")
+        if len(gathered) != dp_size:
+            # Topology change (dp_size differs from the saving run). No slot is
+            # meaningfully "this replica's", so re-seed lazily -- the new replicas
+            # are then at least independent of each other.
+            self._flow_generator = None
+            self._flow_rng_logger().warning_rank0(
+                f"Checkpoint stored {len(gathered)} flow generator states but this run has "
+                f"dp_size={dp_size}. Re-seeding the flow noise stream instead of adopting a "
+                "mismatched slot."
+            )
+            return
+
+        payload = gathered[dp_rank]
         if payload is None:
             self._flow_generator = None
             return
@@ -1062,8 +1145,9 @@ class HunyuanImage3ForCausalMM(HunYuanMoEV1PreTrainedModel):
         # collator only pads to a multiple of sp_size.
         #
         # The replicated prologue is cheap. The measured SP tax is NCCL launch
-        # overhead from the ~256 A2A/step (docs/design/hunyuan_image_3_sp_toy_perf.md),
-        # which ``async_ulysses_dit`` addresses — moving the slice would not.
+        # overhead from the ~256 A2A/step, not bandwidth -- at SP=2 the all-to-all
+        # stays on intra-node NVLink and the cost still shows up. That is what
+        # ``async_ulysses_dit`` addresses; moving the slice would not.
         sp_group = get_ulysses_sequence_parallel_group()
         hidden_states = slice_input_tensor(hidden_states, dim=1, group=sp_group)
         cos = slice_input_tensor(cos, dim=1, group=sp_group)

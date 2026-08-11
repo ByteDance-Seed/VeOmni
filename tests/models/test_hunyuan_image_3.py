@@ -28,6 +28,7 @@ Everything from ``test_packed_fast_path_matches_dense_oracle`` down requires
 flash-attention varlen and runs in BF16 on an SM80+ CUDA GPU.
 """
 
+import io
 import json
 import math
 import subprocess
@@ -268,13 +269,26 @@ def test_derive_flow_seed_separates_neighbouring_run_seeds():
     assert int(completed.stdout.strip().splitlines()[-1]) == derive_flow_seed(7, 3)
 
 
+def _decode_flow_slots(payload):
+    return torch.load(io.BytesIO(payload["flow_generator_by_dp_rank"]), weights_only=True)
+
+
+def _encode_flow_slots(slots):
+    buffer = io.BytesIO()
+    torch.save(slots, buffer)
+    return buffer.getvalue()
+
+
 def test_flow_generator_extra_state_round_trip_resumes_the_stream():
     """``get_extra_state``/``set_extra_state`` must resume the stream, not restart it.
 
     Under frequent preemption a restart-from-seed would replay the same sigma
     prefix after every crash, over-sampling that slice of the flow trajectory.
-    The round trip below is the contract that prevents it; the ``None`` payload
-    case is the old-checkpoint path, which falls back to lazy re-seeding.
+
+    Single-process, so this pins the round trip only -- it cannot see the DCP
+    dedup that makes the payload rank-invariant. The multi-rank contract (each
+    replica gets *its own* slot back) needs a gloo two-rank case; what is covered
+    here is the shape of the payload and the two fallback paths.
     """
     model = _build_toy_model_with_vae()[1]
 
@@ -282,18 +296,41 @@ def test_flow_generator_extra_state_round_trip_resumes_the_stream():
     torch.randn(8, generator=model._flow_generator)  # advance past the initial state
 
     payload = model.get_extra_state()
+    # One opaque blob under one stable key. The key set must not depend on how many
+    # replicas there are or whether a generator exists, because DCP flattens this
+    # mapping into the checkpoint key space and mismatched shapes fail the load.
+    assert list(payload) == ["flow_generator_by_dp_rank"]
+    assert isinstance(payload["flow_generator_by_dp_rank"], bytes)
+    # Uninitialized process group / dp_size == 1: a single slot, indexed by dp_rank 0.
+    assert len(_decode_flow_slots(payload)) == 1
     expected = torch.randn(8, generator=model._flow_generator)
 
     resumed = _build_toy_model_with_vae()[1]
     resumed.set_extra_state(payload)
     torch.testing.assert_close(torch.randn(8, generator=resumed._flow_generator), expected)
 
-    # A checkpoint saved before the first forward (or an older one with no entry)
-    # restores to "uninitialized" so the next forward re-seeds lazily.
+    # A checkpoint saved before the first forward restores to "uninitialized" so
+    # the next forward re-seeds lazily.
     fresh = _build_toy_model_with_vae()[1]
-    assert fresh.get_extra_state() == {"flow_generator": None}
-    resumed.set_extra_state({"flow_generator": None})
+    fresh_payload = fresh.get_extra_state()
+    assert list(fresh_payload) == ["flow_generator_by_dp_rank"]  # same key as the live case
+    assert _decode_flow_slots(fresh_payload) == [None]
+    resumed.set_extra_state(fresh_payload)
     assert resumed._flow_generator is None
+
+    # Legacy single-payload checkpoints cannot be attributed to a DP replica.
+    # Adopting one would hand every replica the same stream -- the bug this
+    # format replaced -- so the generator is dropped and re-seeded lazily.
+    legacy = _build_toy_model_with_vae()[1]
+    legacy._flow_generator = torch.Generator().manual_seed(7)
+    legacy.set_extra_state({"flow_generator": {"device_type": "cpu", "state": torch.Generator().get_state()}})
+    assert legacy._flow_generator is None
+
+    # dp_size mismatch on resume: no meaningful slot, same lazy re-seed.
+    mismatched = _build_toy_model_with_vae()[1]
+    mismatched._flow_generator = torch.Generator().manual_seed(7)
+    mismatched.set_extra_state({"flow_generator_by_dp_rank": _encode_flow_slots([None, None])})
+    assert mismatched._flow_generator is None
 
 
 def test_config_materializes_the_flow_recipe_and_rejects_unsupported_ones():

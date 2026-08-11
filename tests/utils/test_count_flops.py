@@ -655,3 +655,37 @@ class TestHunyuanImage3Flops:
         assert with_head_flops > flops
         lm_head_flops = 6 * 133120 * 4096 * 4138
         assert (with_head_flops - flops) * 1e12 == pytest.approx(lm_head_flops, rel=1e-12)
+
+    def test_shared_expert_count_is_read_from_config(self, hunyuan_image_3_real_base_config):
+        """``num_shared_expert`` defaults to 1 but is a real config knob. Hardcoding
+        the 1 gives a variant the wrong denominator, which surfaces as an
+        unexplained MFU shift rather than a failure."""
+        counter = VeomniFlopsCounter(hunyuan_image_3_real_base_config)
+        two_shared_config = deepcopy(hunyuan_image_3_real_base_config)
+        two_shared_config.num_shared_expert = 2
+        two_shared_counter = VeomniFlopsCounter(two_shared_config)
+
+        batch_seqlens = [4138]
+        flops, _ = counter.estimate_flops(batch_seqlens, delta_time=1.0)
+        two_shared_flops, _ = two_shared_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+
+        # One extra shared expert on every layer: +1 SwiGLU (3 matmuls) x 32 layers.
+        one_expert_flops = 6 * (4096 * 3072 * 3) * 32 * 4138
+        assert (two_shared_flops - flops) * 1e12 == pytest.approx(one_expert_flops, rel=1e-12)
+
+    def test_per_layer_shared_expert_list_is_summed(self, hunyuan_image_3_real_base_config):
+        """``configuration_hunyuan_image_3`` normalizes the knob into a per-layer
+        list, so a heterogeneous stack must be summed rather than sampled at index 0."""
+        heterogeneous_config = deepcopy(hunyuan_image_3_real_base_config)
+        # Half the layers carry no shared MLP at all.
+        heterogeneous_config.num_shared_expert = [1] * 16 + [0] * 16
+        uniform_config = deepcopy(hunyuan_image_3_real_base_config)
+        uniform_config.num_shared_expert = [1] * 32
+
+        batch_seqlens = [4138]
+        hetero_flops, _ = VeomniFlopsCounter(heterogeneous_config).estimate_flops(batch_seqlens, delta_time=1.0)
+        uniform_flops, _ = VeomniFlopsCounter(uniform_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        # 16 layers lose one SwiGLU each; reading only element 0 would report no change.
+        missing_flops = 6 * (4096 * 3072 * 3) * 16 * 4138
+        assert (uniform_flops - hetero_flops) * 1e12 == pytest.approx(missing_flops, rel=1e-12)

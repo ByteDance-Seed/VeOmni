@@ -526,8 +526,11 @@ class VeomniFlopsCounter:
         touch each (query, key) pair at most once, so ``seqlen**2`` is still the
         right upper bound.
 
-        Like the other counters here this ignores recompute, so MFU under
-        activation checkpointing is a conservative floor.
+        Like the other counters here this ignores recompute. It also omits the
+        T2I-only device work outside the transformer stack: ``patch_embed`` and
+        ``final_layer`` (2D convs over the whole token grid), the three timestep
+        MLPs, and the frozen VAE encode. Every omission is additive, so the
+        number is a floor -- MFU computed from it errs low, not high.
         """
         hidden_size = self.config.hidden_size
         num_hidden_layers = self.config.num_hidden_layers
@@ -535,8 +538,17 @@ class VeomniFlopsCounter:
         num_key_value_heads = self.config.num_key_value_heads
         moe_intermediate_size = self.config.moe_intermediate_size
         moe_num_expert = self.config.num_experts
-        # Routed experts per token plus the one always-on shared MLP.
-        experts_per_token = self.config.moe_topk + 1
+        # Active experts per token = routed top-k + the always-on shared MLPs.
+        # ``num_shared_expert`` is normalized to a per-layer list by
+        # ``configuration_hunyuan_image_3`` and only *defaults* to 1, so read it
+        # rather than hardcoding: a variant declaring 2, or 0 on some layers,
+        # would otherwise get a silently wrong denominator and show up as an
+        # unexplained MFU shift instead of a failure. Summed per layer so
+        # heterogeneous stacks stay exact.
+        num_shared_expert = getattr(self.config, "num_shared_expert", 1)
+        if not isinstance(num_shared_expert, (list, tuple)):
+            num_shared_expert = [num_shared_expert] * num_hidden_layers
+        experts_per_token_sum = sum(self.config.moe_topk + int(shared) for shared in num_shared_expert)
 
         head_dim = getattr(self.config, "attention_head_dim", hidden_size // num_attention_heads)
         q_size = num_attention_heads * head_dim
@@ -544,8 +556,10 @@ class VeomniFlopsCounter:
         v_size = num_key_value_heads * head_dim
 
         router_N = hidden_size * moe_num_expert
-        # SwiGLU: gate_proj + up_proj + down_proj per active expert.
-        expert_mlp_N = hidden_size * moe_intermediate_size * experts_per_token * 3
+        # SwiGLU: gate_proj + up_proj + down_proj per active expert. Already
+        # summed over layers (see ``experts_per_token_sum``), so it stays out of
+        # the ``* num_hidden_layers`` term below.
+        expert_mlp_N_all_layers = hidden_size * moe_intermediate_size * experts_per_token_sum * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
 
         component_policy = getattr(self.config, "component_policy", None) or {}
@@ -554,7 +568,7 @@ class VeomniFlopsCounter:
         else:
             head_N = self._compute_lm_head_params(hidden_size, self.config.vocab_size)
 
-        non_attn_N = (router_N + expert_mlp_N + attn_linear_N) * num_hidden_layers + head_N
+        non_attn_N = (router_N + attn_linear_N) * num_hidden_layers + expert_mlp_N_all_layers + head_N
         dense_N_flops = 6 * non_attn_N * tokens_sum
 
         seqlen_square_sum = 0

@@ -12,7 +12,7 @@ model:
     moe_implementation: fused_triton
   # Training recipe, overlaid onto the model config at build. Only deviations
   # from the defaults need listing; see component_policy.py (lifecycle) and
-  # veomni/schedulers/flow_matching.py DEFAULT_REFERENCE_FLOW_CONFIG (objective).
+  # veomni/schedulers/flow_matching_loss.py DEFAULT_REFERENCE_FLOW_CONFIG (objective).
   model_config:
     component_policy:
       vae_encoder: frozen
