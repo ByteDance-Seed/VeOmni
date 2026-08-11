@@ -1073,7 +1073,8 @@ class OpsImplementationConfig:
         default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
-            "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
+            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
         },
     )
     rotary_pos_emb_vision_implementation: str = field(
