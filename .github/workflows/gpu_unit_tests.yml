@@ -140,6 +140,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_forward_no_implicit_sync.py
           uv run --frozen pytest -s -x tests/models/test_checkpoint_tensor_converter.py
           uv run --frozen pytest -s -x tests/models/test_return_log_probs_e2e.py
+          uv run --frozen pytest -s -x tests/models/test_hunyuan_image_3.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests
         if: steps.changes.outputs.qwen3_5_ulysses == 'true'
         run: |
@@ -175,6 +176,7 @@ jobs:
         # TODO: run all tests under tests/utils/ once all util tests are verified
         run: |
           uv run --frozen pytest -s -x tests/utils/test_count_flops.py
+          uv run --frozen pytest -s -x tests/utils/test_parallel_plan_ignored_params.py
       - name: Run Muon optimizer tests
         run: |
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
