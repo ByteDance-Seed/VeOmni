@@ -523,6 +523,7 @@ class DiTTrainer:
         for micro_step, micro_batch in enumerate(micro_batches):
             if self.training_task != "offline_embedding":
                 self.base.model_reshard(micro_step, num_micro_batches)
+                self.base._configure_hsdp_allreduce(micro_step, num_micro_batches)
 
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]

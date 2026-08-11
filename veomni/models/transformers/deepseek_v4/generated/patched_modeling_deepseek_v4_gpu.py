@@ -1175,8 +1175,18 @@ class DeepseekV4Attention(nn.Module):
 
         block_bias = None
         compressed_topk_indices = None
+        # The device and dtype terms mirror what ``eager_attention_forward`` requires
+        # before it can dispatch to TileLang. Without them this reads the config string
+        # alone and claims the compact path on hosts where the kernel cannot run and the
+        # dispatch silently falls back to eager -- which then ignores the indices and
+        # uses the dense mask, so the compact work is wasted at best. On NPU it is worse
+        # than wasted: that sibling forked the compressors before ``return_topk_indices``
+        # existed, so asking for indices there is a TypeError.
         use_compact_sparse_indices = (
-            veomni_dsa_attention_implementation.value == "tilelang" and past_key_values is None
+            veomni_dsa_attention_implementation.value == "tilelang"
+            and past_key_values is None
+            and q.is_cuda
+            and q.dtype == torch.bfloat16
         )
         if self.compressor is not None:
             compressor_output = self.compressor(

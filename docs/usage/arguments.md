@@ -517,8 +517,8 @@ Extends `TrainingArguments` with ViT / audio tower controls.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| freeze_vit | `bool` | `False` | Freeze ViT parameters. |
-| freeze_audio_tower | `bool` | `False` | Freeze audio tower parameters. |
+| freeze_vit | `bool` | `False` | Freeze ViT parameters during full tuning. Ignored when LoRA is enabled. |
+| freeze_audio_tower | `bool` | `False` | Freeze audio tower parameters during full tuning. Ignored when LoRA is enabled. |
 | vit_lr | `float` | `1e-6` | Maximum learning rate for ViT parameters. |
 
 ### VLMMModelArguments

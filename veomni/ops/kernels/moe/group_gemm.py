@@ -96,9 +96,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # is a per-router property, so ``T`` must be opted into explicitly (e.g.
         # DeepSeek-V4's learned top-k layers) and hash-style routers keep the
         # conservative default. See ``compute_max_expert_tokens``.
-        max_expert_tokens = compute_max_expert_tokens(
-            expert_index, expert_index.shape[1], assume_distinct_experts
-        )
+        max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
         fc1_1_output = group_gemm_same_nk(
             a=scatter_output,
             b=fc1_1_weight,
@@ -372,9 +370,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # scattered row count under distinct top-k routing. The default is the
         # conservative ``T * top_k`` bound; distinct routers opt in explicitly
         # with ``assume_distinct_experts=True``.
-        max_expert_tokens = compute_max_expert_tokens(
-            expert_index, expert_index.shape[1], assume_distinct_experts
-        )
+        max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
 
         # Single fc1 gemm: output shape [T, 2I]
         fc1_output = group_gemm_same_nk(
