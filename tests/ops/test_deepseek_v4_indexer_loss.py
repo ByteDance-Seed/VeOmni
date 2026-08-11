@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
+
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
 def reference_compressed_target(q, kv, attn_sink, topk_idxs, compressed_start, sm_scale):
@@ -83,3 +86,78 @@ def test_reference_target_is_normalised():
     target = reference_compressed_target(q, kv, torch.zeros(4), topk, 4, 16**-0.5)
     assert torch.allclose(target.sum(-1), torch.ones(2, 5), atol=1e-5)
     assert (target >= 0).all()
+
+
+def _require_tilelang_cuda():
+    pytest.importorskip("tilelang")
+    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
+        pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
+    if get_gpu_compute_capability() < 90:
+        pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
+
+
+@pytest.mark.parametrize("heads", [8, 16, 64])
+def test_target_kernel_matches_reference(heads):
+    """``heads=8`` pads to 16 inside the kernel; the padded heads must contribute
+    nothing to the head sum. That is not automatic — a padded head has zero Q and
+    would contribute ``exp2(0 - lse_pad)`` unless its LSE is padded to +inf."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+
+    torch.manual_seed(0)
+    b, s, d, w, c = 2, 8, 64, 64, 64
+    device = "cuda"
+    q = torch.randn(b, s, heads, d, device=device, dtype=torch.bfloat16)
+    kv = torch.randn(b, 256, d, device=device, dtype=torch.bfloat16)
+    sink = torch.randn(heads, device=device, dtype=torch.float32)
+    topk = torch.randint(0, 256, (b, s, w + c), device=device, dtype=torch.int32)
+    topk[0, 0, w] = -1  # a compressed miss
+    scale = d**-0.5
+
+    _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
+    actual = sparse_mqa_target_fwd_interface(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
+    actual = actual / actual.sum(-1, keepdim=True).clamp_min(1e-20)
+
+    expected = reference_compressed_target(q, kv, sink, topk, w, scale)
+    # A normalised entry is ~1/C ~ 0.015 here, so a tolerance of the order of
+    # 1e-2 would exceed the values being compared and accept anything. It is not
+    # a hypothetical: summing the wrong axis of the score tile yields a
+    # per-head row sum whose normalised form sits 1.5e-2 from the truth, i.e.
+    # inside a 2e-2 tolerance. The kernel and this reference consume the same
+    # bf16 inputs and both accumulate in fp32, so they agree to 2e-8 absolute
+    # and 5e-7 relative as measured on GB200; the bounds below leave three
+    # orders of magnitude of headroom for a different GEMM summation order or a
+    # TF32 einsum, while still rejecting the wrong-axis sum by a factor of 60.
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-2)
+
+
+def test_target_kernel_zeroes_invalid_slots():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+
+    torch.manual_seed(2)
+    b, s, heads, d, w, c = 1, 4, 16, 64, 64, 64
+    q = torch.randn(b, s, heads, d, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(b, 256, d, device="cuda", dtype=torch.bfloat16)
+    sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
+    topk = torch.randint(0, 256, (b, s, w + c), device="cuda", dtype=torch.int32)
+    topk[:, :, w + 3] = -1
+    scale = d**-0.5
+
+    _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
+    target = sparse_mqa_target_fwd_interface(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
+    assert (target[:, :, 3] == 0).all()
+
+
+def test_target_kernel_rejects_more_than_64_heads():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+
+    q = torch.randn(1, 2, 128, 64, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(1, 128, 64, device="cuda", dtype=torch.bfloat16)
+    topk = torch.zeros(1, 2, 64, device="cuda", dtype=torch.int32)
+    lse = torch.zeros(1, 2, 128, device="cuda", dtype=torch.float32)
+    with pytest.raises(AssertionError, match="64"):
+        sparse_mqa_target_fwd_interface(q, kv, topk, lse)
