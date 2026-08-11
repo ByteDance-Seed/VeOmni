@@ -28,7 +28,15 @@ import torch
 from torch.autograd.graph import saved_tensors_hooks
 
 from ..utils import logging
-from ..utils.device import create_event, create_stream, get_current_stream, switch_to_specified_stream
+from ..utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    create_event,
+    create_stream,
+    get_current_stream,
+    get_device_type,
+    switch_to_specified_stream,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -44,8 +52,12 @@ def _module_name_match(pattern: str, name: str) -> bool:
     )
 
 
+def _is_active_accelerator_tensor(tensor) -> bool:
+    return (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and tensor.device.type == get_device_type()
+
+
 def base_check_fn(tensor) -> bool:
-    if tensor.device.type not in ("cuda", "npu"):
+    if not _is_active_accelerator_tensor(tensor):
         return False
     if isinstance(tensor, torch.nn.parameter.Parameter) or tensor._base is not None:
         return False
@@ -77,7 +89,7 @@ class PinnedBufferPool:
             self.reuses += 1
             return free_buffers.pop(), key
 
-        pin_memory = tensor.device.type in ("cuda", "npu")
+        pin_memory = _is_active_accelerator_tensor(tensor)
         try:
             buffer = torch.empty_strided(
                 tensor.shape,

@@ -27,6 +27,7 @@ from veomni.distributed.async_offload import (
     get_offload_modules,
     reset_async_activation_offload,
 )
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
 
 def test_offload_config_allows_no_modules_for_auto_discovery():
@@ -189,6 +190,10 @@ def test_async_offload_rejects_tensor_views_with_shared_storage():
     torch.testing.assert_close(base, torch.arange(8.0))
 
 
+def test_async_offload_rejects_cpu_tensors():
+    assert not base_check_fn(torch.ones(4))
+
+
 def test_pinned_buffer_pool_reuses_matching_layout():
     pool = PinnedBufferPool()
     source = torch.empty((2, 3), dtype=torch.float32)
@@ -215,8 +220,11 @@ def test_async_offload_manager_resets_at_step_boundary():
     assert manager.getcnt._block_tensor_nums == {}
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for async D2H/H2D validation")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA is required for async D2H/H2D validation")
 def test_async_offload_cuda_gradient_parity_and_peak_memory():
+    device_api = get_torch_device()
+    device = torch.device(get_device_type())
+
     class Block(nn.Module):
         def __init__(self):
             super().__init__()
@@ -226,39 +234,39 @@ def test_async_offload_cuda_gradient_parity_and_peak_memory():
             return torch.nn.functional.gelu(self.proj(hidden_states))
 
     def make_model():
-        return nn.Sequential(*(Block() for _ in range(4))).cuda()
+        return nn.Sequential(*(Block() for _ in range(4))).to(device)
 
     torch.manual_seed(0)
     baseline = make_model()
     initial_state = {name: parameter.detach().cpu().clone() for name, parameter in baseline.state_dict().items()}
     input_cpu = torch.randn(4, 128, 512)
 
-    torch.cuda.reset_peak_memory_stats()
-    baseline_before = torch.cuda.memory_allocated()
-    baseline_input = input_cpu.cuda().requires_grad_(True)
+    device_api.reset_peak_memory_stats()
+    baseline_before = device_api.memory_allocated()
+    baseline_input = input_cpu.to(device).requires_grad_(True)
     baseline_output = baseline(baseline_input)
     baseline_output.square().mean().backward()
-    torch.cuda.synchronize()
-    baseline_peak = torch.cuda.max_memory_allocated() - baseline_before
+    device_api.synchronize()
+    baseline_peak = device_api.max_memory_allocated() - baseline_before
 
     baseline_output_cpu = baseline_output.detach().cpu()
     baseline_input_grad_cpu = baseline_input.grad.detach().cpu()
     baseline_parameter_grads = [parameter.grad.detach().cpu() for parameter in baseline.parameters()]
 
     del baseline_output, baseline_input, baseline
-    torch.cuda.empty_cache()
+    device_api.empty_cache()
 
     offloaded = make_model()
     offloaded.load_state_dict(initial_state)
     apply_async_activation_offload(offloaded, ["0", "1", "2", "3"])
 
-    torch.cuda.reset_peak_memory_stats()
-    offloaded_before = torch.cuda.memory_allocated()
-    offloaded_input = input_cpu.cuda().requires_grad_(True)
+    device_api.reset_peak_memory_stats()
+    offloaded_before = device_api.memory_allocated()
+    offloaded_input = input_cpu.to(device).requires_grad_(True)
     offloaded_output = offloaded(offloaded_input)
     offloaded_output.square().mean().backward()
-    torch.cuda.synchronize()
-    offloaded_peak = torch.cuda.max_memory_allocated() - offloaded_before
+    device_api.synchronize()
+    offloaded_peak = device_api.max_memory_allocated() - offloaded_before
 
     manager = offloaded[0]._veomni_offload_manager
     assert not manager.items
@@ -278,8 +286,8 @@ def test_async_offload_cuda_gradient_parity_and_peak_memory():
 
     del offloaded_output, offloaded_input
     offloaded.zero_grad(set_to_none=True)
-    second_input = input_cpu.cuda().requires_grad_(True)
+    second_input = input_cpu.to(device).requires_grad_(True)
     second_output = offloaded(second_input)
     second_output.square().mean().backward()
-    torch.cuda.synchronize()
+    device_api.synchronize()
     assert manager.host_buffer_pool.reuses > 0
