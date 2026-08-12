@@ -130,6 +130,96 @@ def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, 
     return True
 
 
+def _normalize_fsdp2_layer_fqn(layer_fqn: str) -> str:
+    """Replace the rightmost numeric layer index with a stack placeholder."""
+    parts = layer_fqn.split(".")
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index].isdecimal():
+            parts[index] = "*"
+            break
+    return ".".join(parts)
+
+
+def _get_fsdp2_prefetch_role(
+    role_kind: str,
+    layer_fqn: str,
+    module_fqn: str,
+    extra_parallel_name: Optional[str] = None,
+) -> tuple[object, ...]:
+    """Return a stable prefetch role within one model stack."""
+    layer_prefix = f"{layer_fqn}."
+    if module_fqn == layer_fqn:
+        relative_module_fqn = "<self>"
+    elif module_fqn.startswith(layer_prefix):
+        relative_module_fqn = module_fqn[len(layer_prefix) :]
+    else:
+        relative_module_fqn = module_fqn
+    return (
+        role_kind,
+        extra_parallel_name,
+        _normalize_fsdp2_layer_fqn(layer_fqn),
+        relative_module_fqn,
+    )
+
+
+def _register_fsdp2_prefetch_module(
+    block: nn.Module,
+    module: FSDPModule,
+    role: tuple[object, ...],
+    roles_by_module_id: dict[int, tuple[object, ...]],
+) -> None:
+    """Register an FSDP module once even if nested target scopes overlap."""
+    module_id = id(module)
+    if module_id in roles_by_module_id:
+        return
+    block._fsdp_modules.append(module)
+    roles_by_module_id[module_id] = role
+
+
+def _build_fsdp2_backward_prefetch_chains(
+    target_modules: list[tuple[str, nn.Module]],
+    roles_by_module_id: dict[int, tuple[object, ...]],
+) -> dict[tuple[object, ...], list[FSDPModule]]:
+    """Build role chains in the model's original module traversal order."""
+    chains: dict[tuple[object, ...], list[FSDPModule]] = {}
+    seen_module_ids: set[int] = set()
+    for _, block in target_modules:
+        for module in block._fsdp_modules:
+            module_id = id(module)
+            if module_id in seen_module_ids:
+                continue
+            seen_module_ids.add(module_id)
+            chains.setdefault(roles_by_module_id[module_id], []).append(module)
+    return chains
+
+
+def _configure_fsdp2_manual_prefetch(
+    blocks: list[nn.Module],
+    backward_prefetch_chains: dict[tuple[object, ...], list[FSDPModule]],
+    enable_forward_prefetch: bool,
+) -> None:
+    """Configure static prefetch topology for nested FSDP2 modules.
+
+    Activation recompute may append nested FSDP groups to PyTorch's dynamic
+    post-forward order. Explicit backward chains keep each group role on a
+    stable path and avoid mistargeted all-gathers. A chain's first group points
+    to itself as a no-op target so it does not fall back to dynamic prefetch.
+    """
+    if enable_forward_prefetch:
+        next_blocks = blocks[1:] + [None]
+        for current_block, next_block in zip(blocks, next_blocks):
+            if next_block is not None:
+                # Prefetch in the execution order expected by the next block.
+                current_block.set_modules_to_forward_prefetch(list(reversed(next_block._fsdp_modules)))
+
+    for chain in backward_prefetch_chains.values():
+        if not chain:
+            continue
+        chain[0].set_modules_to_backward_prefetch([chain[0]])
+        for current_module, previous_module in zip(chain[1:], chain):
+            current_module.set_modules_to_backward_prefetch([previous_module])
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -182,6 +272,7 @@ def parallelize_model_fsdp2(
     target_modules: List[Tuple[str, nn.Module]] = [
         (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
     ]
+    module_fqn_by_id = {id(mod): fqn for fqn, mod in model.named_modules()}
     logger.info_rank0(f"target classes to shard: {target_classes}")
 
     model._veomni_compile_enabled = False
@@ -409,6 +500,8 @@ def parallelize_model_fsdp2(
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
 
+    prefetch_roles_by_module_id: dict[int, tuple[object, ...]] = {}
+
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
@@ -420,30 +513,44 @@ def parallelize_model_fsdp2(
             if not parallel_state.extra_parallel_enabled(para):
                 continue
             for _para_mod in extra_parallel_mod[para]:
-                if isinstance(_para_mod, FSDPModule):
-                    continue
-                # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
-                # average para (e.g. ep) grads across para (e.g. ep) ranks
-                # NOTE: in torch 2.8 and later we should use
-                # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
-                # but for torch 2.7 we still use set_reduce_scatter_divide_factor(parallel_state.ep_size)
-                gradient_divide_factor = parallel_state.extra_parallel_gradient_divide_factor(para)
-                logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
-                if IS_NPU_AVAILABLE:
-                    # NPU is using torch 2.7
-                    _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
-                else:
-                    # from torch 2.8
-                    _para_mod.set_gradient_divide_factor(gradient_divide_factor)
-                layer_mod._fsdp_modules.append(_para_mod)
+                if not isinstance(_para_mod, FSDPModule):
+                    # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
+                    fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
+                    # average para (e.g. ep) grads across para (e.g. ep) ranks
+                    # NOTE: in torch 2.8 and later we should use
+                    # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
+                    # but for torch 2.7 we still use set_reduce_scatter_divide_factor(parallel_state.ep_size)
+                    gradient_divide_factor = parallel_state.extra_parallel_gradient_divide_factor(para)
+                    logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
+                    if IS_NPU_AVAILABLE:
+                        # NPU is using torch 2.7
+                        _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
+                    else:
+                        # from torch 2.8
+                        _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                module_fqn = module_fqn_by_id.get(id(_para_mod), layer_fqn)
+                role = _get_fsdp2_prefetch_role("extra_parallel", layer_fqn, module_fqn, para)
+                _register_fsdp2_prefetch_module(
+                    layer_mod,
+                    _para_mod,
+                    role,
+                    prefetch_roles_by_module_id,
+                )
 
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
-                    fully_shard(sub_mod, **fsdp_kwargs_without_mp)
-                    layer_mod._fsdp_modules.append(sub_mod)
+                    if not isinstance(sub_mod, FSDPModule):
+                        fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                    module_fqn = module_fqn_by_id.get(id(sub_mod), layer_fqn)
+                    role = _get_fsdp2_prefetch_role("mixed_precision_ignored", layer_fqn, module_fqn)
+                    _register_fsdp2_prefetch_module(
+                        layer_mod,
+                        sub_mod,
+                        role,
+                        prefetch_roles_by_module_id,
+                    )
 
         # Shard everything else in the module:
         #   Note:
@@ -453,7 +560,13 @@ def parallelize_model_fsdp2(
         #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
-            layer_mod._fsdp_modules.append(layer_mod)
+        role = _get_fsdp2_prefetch_role("target", layer_fqn, layer_fqn)
+        _register_fsdp2_prefetch_module(
+            layer_mod,
+            layer_mod,
+            role,
+            prefetch_roles_by_module_id,
+        )
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
     # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
@@ -468,26 +581,23 @@ def parallelize_model_fsdp2(
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
 
-    # configure manual prefetching when needed
-    need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
-    ) and kwargs.pop("enable_forward_prefetch", True)
+    # Configure static prefetching for nested FSDP groups. Backward prefetch is
+    # independent from forward prefetch since activation recompute can make the
+    # default dynamic backward order unsafe even when forward prefetch is off.
+    enable_forward_prefetch = kwargs.pop("enable_forward_prefetch", True)
+    need_manual_prefetch = parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
-        next_blocks = blocks[1:] + [None]
-        for current_block, next_block in zip(blocks, next_blocks):
-            if next_block is not None:
-                prefetch_modules = next_block._fsdp_modules
-                # prefetch in order of attn, gate, experts
-                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
-
-        # configure backward prefetch
-        rev_blocks = list(reversed(blocks))
-        prev_blocks = rev_blocks[1:] + [None]
-        for current_block, prev_block in zip(rev_blocks, prev_blocks):
-            if prev_block is not None:
-                prefetch_modules = prev_block._fsdp_modules
-                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+        backward_prefetch_chains = _build_fsdp2_backward_prefetch_chains(
+            target_modules,
+            prefetch_roles_by_module_id,
+        )
+        _configure_fsdp2_manual_prefetch(blocks, backward_prefetch_chains, enable_forward_prefetch)
+        logger.info_rank0(
+            f"FSDP2 manual prefetch configured for {len(backward_prefetch_chains)} backward chain(s) "
+            f"and {sum(len(chain) for chain in backward_prefetch_chains.values())} group(s); "
+            f"forward prefetch enabled={enable_forward_prefetch}."
+        )
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
