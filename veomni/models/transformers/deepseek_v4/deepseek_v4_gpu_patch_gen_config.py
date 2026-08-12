@@ -90,7 +90,6 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_sliding_window_causal_mask
-from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4CSACache,
@@ -101,6 +100,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from veomni.distributed.sequence_parallel import reduce_sequence_parallel_loss
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     CompressedCandidates,
     build_packed_compression_metadata,
@@ -117,7 +117,7 @@ from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, sparse_mqa_target_fwd, v4_lighting_indexer
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
@@ -168,7 +168,12 @@ config.add_import(
 )
 config.add_import(
     "veomni.distributed.sequence_parallel",
-    names=["gather_heads_scatter_seq", "gather_outputs", "gather_seq_scatter_heads"],
+    names=[
+        "gather_heads_scatter_seq",
+        "gather_outputs",
+        "gather_seq_scatter_heads",
+        "reduce_sequence_parallel_loss",
+    ],
 )
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
@@ -194,7 +199,12 @@ config.add_import(
 # the qwen3_5_moe / qwen3_moe fix).
 config.add_import(
     "veomni.utils.model_outputs",
-    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+    names=[
+        "FusedLinearAuxOutput",
+        "FusedLinearAuxOutputMixin",
+        "MoeCausalLMOutputWithLogProbs",
+        "MoeModelOutputWithIndexerKL",
+    ],
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
@@ -255,6 +265,39 @@ def _indexer_loss_enabled(module) -> bool:
             "Use context parallelism instead."
         )
     return True
+
+
+@config.add_helper
+def _builds_indexer_kl(module) -> bool:
+    """Whether *this attention layer* builds a KL, and so returns three values.
+
+    ``module`` is a ``DeepseekV4Attention``. Three call sites act on this answer --
+    the attention forward that returns the third value, the decoder layer that
+    unpacks it, and the model loop that accumulates it -- and they are in three
+    different functions. They read this predicate rather than each re-deriving the
+    condition, because a copy that goes stale in any one of them is an arity
+    mismatch: gating the decoder layer on ``_indexer_loss_enabled`` alone would
+    three-unpack the two-tuple every sliding and HCA layer returns, which is three
+    of the four layers of the reference checkpoint.
+
+    ``_indexer_loss_enabled`` comes first so that its refusals fire on every layer
+    type rather than only on the ones carrying an indexer: a model configured for
+    the loss but built without a single CSA layer would otherwise accept the flag
+    and train nothing. The layer type is what then keeps HCA and sliding layers on
+    their two-value return -- only a CSA layer carries a Lightning Indexer, so only
+    it has a student to train, and the others' compressors hand back a perfectly
+    ordinary ``CompressedCandidates`` carrying causal ranges instead of scores.
+
+    The test is on the layer type rather than on ``module.compressor.indexer``
+    existing, because the two fail in opposite directions. ``layer_type`` comes
+    from the checkpoint's ``layer_types``, so a rename of the compressor's
+    attribute breaks the KL loudly at the attribute access in the attention
+    forward; keying the gate on that attribute's *name* would instead turn the
+    whole auxiliary objective into a no-op, with no error and no change of arity --
+    a plausible loss curve training nothing, which is the failure class this
+    feature exists to prevent.
+    """
+    return _indexer_loss_enabled(module) and module.layer_type == "compressed_sparse_attention"
 
 
 @config.add_helper
@@ -430,10 +473,21 @@ def deepseek_v4_decoder_layer_forward_patched(
     hidden_states: torch.Tensor,
     input_ids: torch.Tensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     dtype = hidden_states.dtype
     post, comb, collapsed = self.attn_hc(hidden_states)
-    attn_output, _ = self.self_attn(self.input_layernorm(collapsed), **kwargs)
+    # --- Patch.3 ---
+    # The attention returns its KL as a third value on exactly the layers
+    # ``_builds_indexer_kl`` selects, so this reads the same predicate rather than
+    # restating the condition or testing the length of what came back: a
+    # length test would read a stale two-tuple from a broken gate as "no KL here"
+    # and train nothing, whereas an arity mismatch against the predicate raises.
+    builds_indexer_kl = _builds_indexer_kl(self.self_attn)
+    if builds_indexer_kl:
+        attn_output, _, indexer_kl = self.self_attn(self.input_layernorm(collapsed), **kwargs)
+    else:
+        attn_output, _ = self.self_attn(self.input_layernorm(collapsed), **kwargs)
+    # --- Patch.3 ---
     if veomni_mhc_post.use_non_eager_impl:
         hidden_states = veomni_mhc_post(attn_output, hidden_states, post, comb)
     else:
@@ -444,10 +498,28 @@ def deepseek_v4_decoder_layer_forward_patched(
     post, comb, collapsed = self.ffn_hc(hidden_states)
     mlp_output = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
     if veomni_mhc_post.use_non_eager_impl:
-        return veomni_mhc_post(mlp_output, hidden_states, post, comb)
-    return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
-        comb.to(dtype).transpose(-1, -2), hidden_states
-    )
+        output = veomni_mhc_post(mlp_output, hidden_states, post, comb)
+    else:
+        output = post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
+            comb.to(dtype).transpose(-1, -2), hidden_states
+        )
+    # --- Patch.3 ---
+    # The KL leaves as an element of the return value, never as an attribute on
+    # ``self`` or on the hidden states. Gradient checkpointing wraps this call, and
+    # a tensor that reaches the model loop by any route other than the checkpointed
+    # function's return value carries no graph: under the reentrant implementation
+    # the first forward runs inside ``torch.no_grad()``, and under either one the
+    # recomputed forward's tensors are the ones the backward is built from. The
+    # indexer would then receive no gradient at all while the logged KL fell.
+    #
+    # A bare tensor when there is no KL, rather than ``(output, None)``: that is
+    # what every existing caller of a DeepSeek-V4 decoder layer unpacks, and the
+    # flag-off path has to stay exactly what it was. It also keeps the checkpointed
+    # return free of non-tensor leaves.
+    if builds_indexer_kl:
+        return output, indexer_kl
+    return output
+    # --- Patch.3 ---
 
 
 # ================================================================
@@ -1016,22 +1088,9 @@ def deepseek_v4_attention_forward_patched(
             device=q.device,
         )
     # --- Patch.3 ---
-    # ``_indexer_loss_enabled`` first, so that its refusals fire on every layer type
-    # rather than only on the ones carrying an indexer: a model configured for the
-    # loss but built without a single CSA layer would otherwise accept the flag and
-    # train nothing. The layer type is what keeps HCA and sliding layers on their
-    # two-value return -- only a CSA layer carries a Lightning Indexer, so only it
-    # has a student to train, and the others' compressors hand back a perfectly
-    # ordinary ``CompressedCandidates`` carrying causal ranges instead of scores.
-    #
-    # The test is on the layer type rather than on ``self.compressor.indexer``
-    # existing, because the two fail in opposite directions. ``layer_type`` comes
-    # from the checkpoint's ``layer_types``, so a rename of the compressor's
-    # attribute breaks the KL loudly at the attribute access below; keying the gate
-    # on that attribute's *name* would instead turn the whole auxiliary objective
-    # into a no-op, with no error and no change of arity -- a plausible loss curve
-    # training nothing, which is the failure class this task exists to prevent.
-    build_indexer_loss = _indexer_loss_enabled(self) and self.layer_type == "compressed_sparse_attention"
+    # The decoder layer above and the model loop above that read this same
+    # predicate to decide how many values to unpack; see its docstring.
+    build_indexer_loss = _builds_indexer_kl(self)
     if build_indexer_loss:
         index_score = compressed_candidates.indexer_scores if compressed_candidates is not None else None
         if index_score is None:
@@ -1282,7 +1341,7 @@ def deepseek_v4_model_forward_patched(
     inputs_embeds: torch.FloatTensor | None = None,
     use_cache: bool | None = None,
     **kwargs: Unpack[TransformersKwargs],
-) -> MoeModelOutputWithPast:
+) -> MoeModelOutputWithIndexerKL:
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
     # Stateless prefill/training must keep the cache absent: the TileLang
@@ -1397,8 +1456,11 @@ def deepseek_v4_model_forward_patched(
         "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
     }
 
+    # --- Patch.3 ---
+    indexer_kl_total = None
+    # --- Patch.3 ---
     for layer in self.layers:
-        hidden_states = layer(
+        layer_output = layer(
             hidden_states,
             position_embeddings=position_embeddings,
             position_ids=position_ids,
@@ -1407,9 +1469,36 @@ def deepseek_v4_model_forward_patched(
             past_key_values=past_key_values,
             **kwargs,
         )
+        # --- Patch.3 ---
+        # Only the CSA layers return a pair; the rest return the bare tensor they
+        # always returned. Summed rather than averaged over the layers, which is
+        # deliberate and matches the MoE router aux loss this sits beside: the
+        # reported number scales with the number of CSA layers.
+        if isinstance(layer_output, tuple):
+            hidden_states, layer_kl = layer_output
+            indexer_kl_total = layer_kl if indexer_kl_total is None else indexer_kl_total + layer_kl
+        else:
+            hidden_states = layer_output
+        # --- Patch.3 ---
 
     hidden_states = self.norm(self.hc_head(hidden_states))
-    return MoeModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=return_cache)
+    # --- Patch.3 ---
+    # ``MoeModelOutputWithIndexerKL`` declares the two fields below; assigning them
+    # onto a ``MoeModelOutputWithPast`` instead would make them invisible to
+    # ``keys()`` and to pytree flattening, and any consumer that reconstructs the
+    # output would drop them without a word. Both are ``None`` with the loss off,
+    # and ``keys()`` skips ``None``, so the flag-off output is unchanged.
+    #
+    # The token count is every local query row, padding included (~0.1% of a packed
+    # row on the reference run). Excluding them would need packed-metadata plumbing
+    # for a correction far below the scale this auxiliary objective is tuned at.
+    return MoeModelOutputWithIndexerKL(
+        last_hidden_state=hidden_states,
+        past_key_values=return_cache,
+        indexer_kl_total=indexer_kl_total,
+        indexer_query_tokens=hidden_states.shape[0] * hidden_states.shape[1] if indexer_kl_total is not None else None,
+    )
+    # --- Patch.3 ---
 
 
 # ================================================================
@@ -1607,7 +1696,7 @@ def deepseek_v4_forcausallm_forward_patched(
         output_router_logits if output_router_logits is not None else self.config.output_router_logits
     )
 
-    outputs: MoeModelOutputWithPast = self.model(
+    outputs: MoeModelOutputWithIndexerKL = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -1676,6 +1765,31 @@ def deepseek_v4_forcausallm_forward_patched(
             loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
         # --- Patch.2 ---
 
+    # --- Patch.3 ---
+    aux_metrics = None
+    if outputs.indexer_kl_total is not None:
+        local_query_tokens = torch.tensor(
+            outputs.indexer_query_tokens, device=outputs.indexer_kl_total.device, dtype=torch.float32
+        )
+        # The model body summed over this rank's query rows; the mean is taken here
+        # because ``reduce_sequence_parallel_loss`` wants a local *mean* and the
+        # local count, and re-weights by that count before dividing by the global
+        # one. Handing it the sum would train perfectly well on a single rank and
+        # converge to the wrong cross-rank weighting -- a discrepancy invisible to
+        # any single-process test of the value.
+        local_mean = outputs.indexer_kl_total / local_query_tokens.clamp_min(1)
+        if get_parallel_state().sp_enabled:
+            indexer_kl = reduce_sequence_parallel_loss(local_mean, local_query_tokens)
+        else:
+            indexer_kl = local_mean
+        aux_metrics = {"indexer_kl": indexer_kl.detach()}
+        # No labels means no loss to fold into -- ``loss`` is ``None`` and the
+        # addition would raise. The metric is still reported: an inference forward
+        # that computed the KL may as well say what it was.
+        if labels is not None:
+            loss = loss + veomni_dsa_indexer_loss_coef.value * indexer_kl.to(loss.device)
+    # --- Patch.3 ---
+
     return MoeCausalLMOutputWithLogProbs(
         loss=loss,
         aux_loss=aux_loss,
@@ -1685,6 +1799,9 @@ def deepseek_v4_forcausallm_forward_patched(
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
         fused_linear_aux=fused_linear_aux,
+        # --- Patch.3 ---
+        aux_metrics=aux_metrics,
+        # --- Patch.3 ---
     )
 
 
