@@ -187,12 +187,15 @@ class OptimizerConfig:
         default=True,
         metadata={
             "help": (
-                "Keep a DSA Lightning Indexer's projections on full-matrix Muon even when "
-                "muon_head_split_modules names one of them. DeepSeek-V4's indexer and the MLA it "
-                "sits in both call their up-projection q_b_proj, so ['q_b_proj'] cannot ask for one "
-                "without the other; true (default) resolves that in favour of the attention, which "
-                "is what the V3.2/V4 papers describe for the indexer. Set false to head-split the "
-                "indexer as well. Indexer-only names, such as GLM MoE DSA's wq_b, are unaffected."
+                "Keep a *known* DSA Lightning Indexer's projections on full-matrix Muon even when "
+                "muon_head_split_modules names one of them -- currently DeepSeek-V4's, listed in "
+                "_DSA_INDEXER_CLASS_NAMES in veomni/optim/muon.py, which is the extension point for "
+                "another. DeepSeek-V4's indexer and the MLA it sits in both call their up-projection "
+                "q_b_proj, so ['q_b_proj'] cannot ask for one without the other; true (default) "
+                "resolves that in favour of the attention, which is what the V3.2/V4 papers describe "
+                "for the indexer. Set false to head-split the indexer as well. An indexer whose class "
+                "is not listed is head-split as named, so GLM MoE DSA's indexer-only wq_b is "
+                "unaffected either way."
             )
         },
     )

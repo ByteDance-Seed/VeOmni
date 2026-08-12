@@ -570,19 +570,21 @@ def infer_head_block_counts(
         for child_name, child in module.named_children():
             if child_name not in allowed:
                 continue
-            if indexer_excluded:
-                # Deliberate, so info rather than a warning.
-                _log_once(
-                    (module.__class__.__name__, child_name, "indexer"),
-                    f"head split skipped for {module_name}.{child_name}: "
-                    f"{module.__class__.__name__} is a DSA indexer, which stays on full-matrix Muon. "
-                    "Set muon_head_split_exclude_indexer=false to head-split it too.",
-                    logger.info_rank0,
-                )
-                continue
             for param_name, param in child.named_parameters(recurse=False):
                 if param.ndim != 2 or not param.requires_grad:
                     continue
+                if indexer_excluded:
+                    # Deliberate, so info rather than a warning. Reported from
+                    # inside the parameter loop so a frozen indexer does not
+                    # advise flipping a flag that would change nothing for it.
+                    _log_once(
+                        (module.__class__.__name__, child_name, "indexer"),
+                        f"head split skipped for {module_name}.{child_name}: "
+                        f"{module.__class__.__name__} is a DSA indexer, which stays on full-matrix "
+                        "Muon. Set muon_head_split_exclude_indexer=false to head-split it too.",
+                        logger.info_rank0,
+                    )
+                    break
                 fqn = ".".join(part for part in (module_name, child_name, param_name) if part)
                 if not head_counts or not strides:
                     _warn_once(

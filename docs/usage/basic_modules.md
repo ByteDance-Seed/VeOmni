@@ -417,7 +417,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
 | `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
 | `muon_head_split_modules` | `[]` | Leaf module names to head-split, matched exactly against the children of an attention module. **Required** when `muon_head_group_size >= 1`; there is no default list. |
-| `muon_head_split_exclude_indexer` | `true` | Keep a DSA indexer's projections on full-matrix Muon even when `muon_head_split_modules` names one of them. See below. |
+| `muon_head_split_exclude_indexer` | `true` | Keep a *known* DSA indexer's projections on full-matrix Muon even when `muon_head_split_modules` names one of them. Recognized by class, currently DeepSeek-V4's only. See below. |
 
 On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `expert_zero_comm`). Whether zero-comm sharding actually activated is logged separately as `[muon_expert_zero_comm]` during parallelize.
 
@@ -473,8 +473,13 @@ Mechanics worth knowing when running an A/B:
   (default `true`) resolves that in favour of the MLA and leaves the indexer's
   `[index_n_heads * index_head_dim, q_lora_rank]` stack on full-matrix Muon,
   which is what the V3.2/V4 papers describe; set it `false` to split the indexer
-  by its 64 heads as well. Indexer-only names such as GLM MoE DSA's `wq_b` are
-  unaffected — nothing else can be asking for them.
+  by its 64 heads as well. The exclusion recognizes the indexer **by class**, not
+  by reasoning about which names collide: `_DSA_INDEXER_CLASS_NAMES` in
+  `veomni/optim/muon.py` lists DeepSeek-V4's and is the extension point for
+  another. An indexer whose class is not listed is head-split exactly as named,
+  with no warning — which is why GLM MoE DSA's `wq_b` behaves the same either
+  way, and why a new DSA model wanting the papers' treatment has to be added to
+  that list.
 - The head count is never guessed from the shape alone: a projection is split
   only when its row count equals a *declared* head count times a *declared*
   per-head dim (`num_heads`/`n_heads`/config equivalents against

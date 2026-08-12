@@ -39,6 +39,7 @@ from veomni.optim.muon import (  # noqa: E402
     DEFAULT_NS_STEPS,
     DistributedMuon,
     _fsdp_all2all_submesh,
+    _is_dsa_indexer,
     _shard_row_sizes,
     batched_gram_newton_schulz,
     batched_newton_schulz,
@@ -783,6 +784,28 @@ class TestHeadSplitInference:
             "self_attn.q_b_proj.weight": 8,
             "self_attn.compressor.indexer.q_b_proj.weight": 64,
         }
+
+    def test_glm_dsa_indexer_is_deliberately_not_excluded(self):
+        """The exclusion is scoped to indexers whose names collide with their attention's.
+
+        GLM MoE DSA's indexer calls its up-projection ``wq_b`` while the attention
+        around it uses ``q_b_proj``, so ``muon_head_split_modules=[wq_b]`` -- which
+        ``docs/usage/basic_modules.md`` recommends -- can only ever be a deliberate
+        request for the indexer. Pinning the omission here makes it a contract rather
+        than an oversight, and makes a future widening of ``_DSA_INDEXER_CLASS_NAMES``
+        to "anything called an indexer" fail on purpose.
+        """
+        glm_indexer = type("GlmMoeDsaIndexer", (nn.Module,), {})()
+        assert not _is_dsa_indexer(glm_indexer)
+
+        glm_indexer.n_heads = 4
+        glm_indexer.head_dim = 32
+        glm_indexer.wq_b = nn.Linear(64, 128, bias=False)
+        model = nn.Module()
+        model.indexer = glm_indexer
+
+        blocks = infer_head_block_counts(model, head_group_size=1, module_names=("wq_b",))
+        assert blocks == {"indexer.wq_b.weight": 4}
 
     def test_exclude_indexer_threads_from_the_optimizer_arguments(self):
         """The knob has to arrive from ``OptimizerConfig``, not only as a direct kwarg.

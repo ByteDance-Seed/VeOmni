@@ -582,7 +582,11 @@ def _build_muon_with_adamw(
     adamw_lr = float(lr)
     head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
     head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
-    head_split_exclude_indexer = bool(muon_kwargs.pop("head_split_exclude_indexer", True))
+    # ``is None`` rather than falsy, unlike the two above: this flag defaults to
+    # True, so folding an absent value into ``bool(None)`` would flip it to the
+    # side that changes the update math.
+    exclude_indexer = muon_kwargs.pop("head_split_exclude_indexer", None)
+    head_split_exclude_indexer = True if exclude_indexer is None else bool(exclude_indexer)
     if head_group_size < 0:
         raise ValueError(f"muon_head_group_size must be >= 0 (0 disables head splitting), got {head_group_size}")
     if head_group_size >= 1 and not head_split_modules:
