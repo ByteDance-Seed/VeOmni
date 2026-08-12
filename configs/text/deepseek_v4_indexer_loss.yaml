@@ -1,0 +1,105 @@
+# DeepSeek-V4-Flash SFT with the Lightning Indexer KL objective (DeepSeek-V3.2 eq. 4).
+#
+# Sibling of configs/text/deepseek_v4.yaml. Two differences carry the feature
+# (model.ops_implementation.dsa_indexer_loss, and max_seq_len); the rest scales the job down
+# to a smoke run on the 4-layer checkpoint.
+#
+# WHY max_seq_len IS 8192 AND NOT THE 2048 THE SIBLING CONFIG SHIPS
+# ----------------------------------------------------------------
+# The indexer objective is only meaningful when the top-k is actually selecting a subset. At
+# max_seq_len 2048 the rate-4 CSA layer compresses to exactly 2048/4 = 512 slots, which is exactly
+# index_topk, so the top-k selects *every visible slot* and there is nothing for the indexer to
+# learn to rank. That is the degenerate boundary, not a safety margin: measured on this branch,
+# at 2048 only 1 of 2048 query rows can even fill its 512-slot candidate list, against 2049 of
+# 4096 at 4096. 8192 puts every row comfortably past it (2048 compressed slots against a
+# 512-slot budget). Lowering this back to 2048 does not make the run cheaper in any useful sense
+# -- it makes the objective vacuous while still costing the KL's compute.
+#
+# The other length-sensitive quantity is index_topk itself (512 here); if you change it, re-derive
+# max_seq_len from `max_seq_len / compress_rate >> index_topk` rather than keeping 8192.
+
+model:
+  model_path: /mnt/hdfs/__MERLIN_USER_DIR__/veomni/models/DeepSeek/DeepSeek-V4-Flash-Base-4L
+  ops_implementation:
+    attn_implementation: eager
+    moe_implementation: fused_triton
+    cross_entropy_loss_implementation: liger_kernel
+    # The indexer loss refuses anything but TileLang on both of these: the eager indexer
+    # discards the per-slot scores the student needs, and the eager attention has no LSE to
+    # build the teacher from. They are already the sibling config's values; they are repeated
+    # here because the flag below depends on them.
+    dsa_attention_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+    # The feature. Off by default everywhere else.
+    dsa_indexer_loss: true
+    # dsa_indexer_loss_coef: 1.0  # default; weight on the KL when it is folded into the loss
+    mhc_implementation: tilelang
+    rms_norm_implementation: liger_kernel
+    swiglu_mlp_implementation: liger_kernel
+    rotary_pos_emb_implementation: triton
+
+data:
+  train_path: /mnt/hdfs/__MERLIN_USER_DIR__/veomni/datasets/tulu-3-sft-mixture/data
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 8192
+  train_size: 100000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  dyn_bsz: false
+  accelerator:
+    # ulysses_size must stay 1: the indexer loss refuses Ulysses, because each rank would hold a
+    # head shard of the index scores and the teacher is built from the full head set.
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    # Non-reentrant (the default). VeOmni's reentrant CheckpointFunction is broken against
+    # transformers v5 for every model, indexer loss or not -- it reads run_function.__self__
+    # while transformers hands it a functools.partial.
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    # Muon + AdamW. The indexer's parameters now carry gradients, so they join Muon's 2D group;
+    # muon_head_split_exclude_indexer (default true) keeps the indexer's q_b_proj on full-matrix
+    # Muon rather than head-split, because it shares its name with the main attention's.
+    type: muon
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.01
+    muon_ns_steps: 5
+    muon_ns_implementation: gram_quack
+    muon_adjust_lr_fn: match_rms_adamw
+    muon_expert_zero_comm: true
+  init_device: meta
+  enable_full_determinism: false
+  # Smoke run. Raise for a real job.
+  max_steps: 50
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: deepseek_v4_4l_indexer_loss_smoke
+    manager: dcp
+    # Nothing is written: a 50-step smoke run has no checkpoint worth 27B parameters of I/O.
+    # save_epochs defaults to 1, so it has to be turned off explicitly, not just left out.
+    save_steps: 0
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: true
+    project: VeOmni
+    name: deepseek_v4_4l_indexer_loss_smoke
