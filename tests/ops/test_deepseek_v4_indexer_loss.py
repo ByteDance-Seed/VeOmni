@@ -363,47 +363,122 @@ def test_sparse_attn_returns_non_differentiable_lse():
     assert q.grad is not None and torch.isfinite(q.grad).all()
 
 
-def test_indexer_loss_refuses_ulysses():
-    """Ulysses shards heads across ranks, so the head sum inside the teacher would
-    only cover this rank's shard. That is a *wrong* teacher rather than a missing
-    one, and it would still produce a decreasing loss curve, so the gate has to
-    refuse rather than warn."""
-    from types import SimpleNamespace
-    from unittest import mock
+class TestIndexerLossGate:
+    """``_indexer_loss_enabled``: the three refusals, and the flag-off path.
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+    Each refusal guards a configuration that would otherwise train the indexer on a
+    wrong signal or on none while the loss curve looked entirely reasonable, so a
+    test here has to fail when *its own* refusal is deleted. Two things are needed
+    for that, and both are easy to get wrong because the gate reads three module
+    globals in sequence:
 
-    modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
-    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
-    modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
-    with mock.patch(
-        "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
-        return_value=SimpleNamespace(ulysses_enabled=True, ulysses_size=2, cp_enabled=False, cp_size=1),
-    ):
-        with pytest.raises(ValueError, match="Ulysses"):
+    * every test binds *all* the slots the gate reads, so a deleted refusal falls
+      through to a supported configuration rather than into the next refusal, and
+    * every ``match=`` names the field its own refusal is about. ``tilelang`` alone
+      does not: it appears in the indexer refusal and the attention refusal both.
+
+    The class exists to scope the autouse fixture below to this group.
+    """
+
+    # Importing the generated modeling module pulls in ``veomni.distributed``, which
+    # imports ``bytedance.hdfs_stdenv``; that package calls the deprecated
+    # ``Logger.warn`` during its own env setup. Third-party and not fixable from
+    # here, so it is filtered rather than left to accumulate in pytest's summary.
+    # The filter is pinned to that package's module path, so the same warning raised
+    # from our own code would still be reported.
+    pytestmark = pytest.mark.filterwarnings(
+        r"ignore:The 'warn' method is deprecated:DeprecationWarning:bytedance\.hdfs_stdenv\..*"
+    )
+
+    @pytest.fixture(autouse=True)
+    def _restore_ops_config_slots(self):
+        """Undo every slot binding a test in this group makes.
+
+        The slots are globals on a module shared with the rest of the session, so
+        without this a test leaks its configuration into whatever runs next — and a
+        refusal test that reads a value some earlier test happened to leave behind
+        proves nothing about the refusal it names. Restoring goes through ``bind``,
+        the same public path the tests use to set the values.
+        """
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+        from veomni.ops.dispatch import OpsConfigSlot
+
+        saved = [(slot, slot.value) for slot in vars(modeling).values() if isinstance(slot, OpsConfigSlot)]
+        yield
+        for slot, value in saved:
+            slot.bind(SimpleNamespace(**{slot.field_name: value}))
+
+    def test_indexer_loss_refuses_ulysses(self):
+        """Ulysses shards heads across ranks, so the head sum inside the teacher would
+        only cover this rank's shard. That is a *wrong* teacher rather than a missing
+        one, and it would still produce a decreasing loss curve, so the gate has to
+        refuse rather than warn.
+
+        The match pins the message's two actionable halves: the size observed, and the
+        one size that is supported.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        with mock.patch(
+            "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
+            return_value=SimpleNamespace(ulysses_enabled=True, ulysses_size=2, cp_enabled=False, cp_size=1),
+        ):
+            with pytest.raises(ValueError, match=r"requires ulysses_size=1, got ulysses_size=2"):
+                modeling._indexer_loss_enabled(object())
+
+    def test_indexer_loss_refuses_eager_indexer(self):
+        """The eager indexer discards its scores, so there would be no student to
+        train against and the KL would have nothing to say.
+
+        Attention is bound to the *supported* value so that deleting the indexer
+        refusal leaves nothing else to raise, and the match names
+        ``dsa_indexer_implementation``, which appears in no other refusal.
+        """
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        with pytest.raises(ValueError, match="dsa_indexer_implementation"):
             modeling._indexer_loss_enabled(object())
 
+    def test_indexer_loss_refuses_eager_attention(self):
+        """The teacher is read off the TileLang attention LSE, which the eager
+        attention path never computes. Unlike the eager indexer, this one has a
+        student and no teacher, but the outcome is the same: a loss that cannot mean
+        what it appears to mean.
 
-def test_indexer_loss_refuses_eager_indexer():
-    """The eager indexer discards its scores, so there would be no student to
-    train against and the KL would have nothing to say."""
-    from types import SimpleNamespace
+        The indexer is bound to the supported value so the earlier refusal cannot
+        stand in for this one, and the match names ``dsa_attention_implementation``.
+        """
+        from types import SimpleNamespace
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-    modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
-    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
-    with pytest.raises(ValueError, match="tilelang"):
-        modeling._indexer_loss_enabled(object())
+        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+        with pytest.raises(ValueError, match="dsa_attention_implementation"):
+            modeling._indexer_loss_enabled(object())
 
+    def test_indexer_loss_off_by_default(self):
+        """With the flag off, none of the refusals above fire: eager everything is a
+        perfectly ordinary configuration until someone asks for the loss."""
+        from types import SimpleNamespace
 
-def test_indexer_loss_off_by_default():
-    """With the flag off, none of the refusals above fire: an eager indexer is a
-    perfectly ordinary configuration until someone asks for the loss."""
-    from types import SimpleNamespace
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
-
-    modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=False))
-    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
-    assert modeling._indexer_loss_enabled(object()) is False
+        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=False))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+        assert modeling._indexer_loss_enabled(object()) is False

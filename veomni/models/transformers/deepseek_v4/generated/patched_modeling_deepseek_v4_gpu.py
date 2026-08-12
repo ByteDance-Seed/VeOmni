@@ -105,6 +105,10 @@ veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
 veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+# ``OpsConfigSlot``'s own default is the string ``"eager"``: right for the
+# ``*_implementation`` slots above, but truthy, and not a number. Left at that
+# default, an unbound ``dsa_indexer_loss`` would read as *on* and an unbound
+# coefficient would be a string, so both defaults are given explicitly.
 veomni_dsa_indexer_loss = OpsConfigSlot("dsa_indexer_loss", default=False)
 veomni_dsa_indexer_loss_coef = OpsConfigSlot("dsa_indexer_loss_coef", default=1.0)
 
@@ -134,10 +138,11 @@ def _indexer_loss_enabled(module) -> bool:
             "distribution is derived from the TileLang attention LSE"
         )
     state = get_parallel_state()
-    if getattr(state, "ulysses_size", 1) > 1:
+    if state.ulysses_size > 1:
         raise ValueError(
-            "dsa_indexer_loss does not support Ulysses: each rank holds a head shard, so the "
-            "head sum in the teacher would be partial. Use context parallelism instead."
+            f"dsa_indexer_loss requires ulysses_size=1, got ulysses_size={state.ulysses_size}: under "
+            "Ulysses each rank holds a head shard, so the head sum in the teacher would be partial. "
+            "Use context parallelism instead."
         )
     return True
 
