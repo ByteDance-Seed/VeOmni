@@ -91,6 +91,11 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
 _HEAD_COUNT_ATTRS: Tuple[str, ...] = ("num_heads", "n_heads", "num_attention_heads", "num_key_value_heads")
 _HEAD_STRIDE_ATTRS: Tuple[str, ...] = ("head_dim", "qk_head_dim")
 
+# DSA indexers kept off head-split Muon by ``exclude_indexer``. Membership means one
+# thing: the class names at least one projection module the attention it sits inside
+# also names, so ``muon_head_split_modules`` cannot address one without the other.
+_DSA_INDEXER_CLASS_NAMES: Tuple[str, ...] = ("DeepseekV4Indexer",)
+
 
 def _as_coeff_schedule(
     ns_coefficients: Sequence[Any],
@@ -488,6 +493,20 @@ def _head_layout_tiers(module: "nn.Module") -> List[Tuple[List[int], List[int]]]
     return tiers
 
 
+def _is_dsa_indexer(module: "nn.Module") -> bool:
+    """Whether ``module`` is a DSA indexer that shares projection names with its attention.
+
+    Matched by class name over the MRO rather than by importing the model, so this
+    module keeps no dependency on ``veomni.models``. GLM MoE DSA's indexer is
+    deliberately absent: its up-projection is ``wq_b`` while the attention around it
+    uses ``q_b_proj``, so listing it in ``muon_head_split_modules`` can only ever be a
+    deliberate request. DeepSeek-V4's indexer shares every projection name it has with
+    the MLA it sits in, so there a request for the attention is indistinguishable from
+    a request for the indexer.
+    """
+    return any(cls.__name__ in _DSA_INDEXER_CLASS_NAMES for cls in type(module).__mro__)
+
+
 def _stacked_head_counts(rows: int, tiers: Sequence[Tuple[Sequence[int], Sequence[int]]]) -> List[int]:
     """Head counts consistent with ``rows == heads * per_head_dim``.
 
@@ -508,12 +527,17 @@ def infer_head_block_counts(
     model: "nn.Module",
     head_group_size: int,
     module_names: Sequence[str],
+    exclude_indexer: bool = True,
 ) -> Dict[str, int]:
     """Map parameter FQN to the number of row blocks for head-split Muon.
 
     A weight is eligible when it lives in a direct child module named in
     ``module_names`` of an attention module that declares both a head count and
     a per-head dim. ``head_group_size`` is the number of heads per block.
+
+    With ``exclude_indexer`` (the default), projections inside a DSA indexer stay
+    on full-matrix Muon even when ``module_names`` covers them, because the name
+    that reaches them is the enclosing attention's -- see ``_is_dsa_indexer``.
 
     Returns only params that end up with >1 block; anything whose head layout
     cannot be pinned down, or whose head count is not divisible by
@@ -531,16 +555,30 @@ def infer_head_block_counts(
     blocks: Dict[str, int] = {}
     warned: set = set()
 
-    def _warn_once(key: Tuple[Any, ...], message: str) -> None:
+    def _log_once(key: Tuple[Any, ...], message: str, log) -> None:
         if key not in warned:
             warned.add(key)
-            logger.warning_rank0(f"[Muon] {message}")
+            log(f"[Muon] {message}")
+
+    def _warn_once(key: Tuple[Any, ...], message: str) -> None:
+        _log_once(key, message, logger.warning_rank0)
 
     for module_name, module in model.named_modules():
         tiers = _head_layout_tiers(module)
         head_counts, strides = tiers[-1]
+        indexer_excluded = exclude_indexer and _is_dsa_indexer(module)
         for child_name, child in module.named_children():
             if child_name not in allowed:
+                continue
+            if indexer_excluded:
+                # Deliberate, so info rather than a warning.
+                _log_once(
+                    (module.__class__.__name__, child_name, "indexer"),
+                    f"head split skipped for {module_name}.{child_name}: "
+                    f"{module.__class__.__name__} is a DSA indexer, which stays on full-matrix Muon. "
+                    "Set muon_head_split_exclude_indexer=false to head-split it too.",
+                    logger.info_rank0,
+                )
                 continue
             for param_name, param in child.named_parameters(recurse=False):
                 if param.ndim != 2 or not param.requires_grad:

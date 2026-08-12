@@ -63,6 +63,8 @@ train:
     # Head-split Muon: heads per Newton-Schulz block (0 = full matrix), plus the
     # projections to split. q_b_proj benefits most: its [num_heads * qk_head_dim,
     # q_lora_rank] stack is rank-capped by q_lora_rank as a single matrix.
+    # The DSA indexer's up-projection is also called q_b_proj; it stays on
+    # full-matrix Muon unless muon_head_split_exclude_indexer is set false.
     # muon_head_group_size: 1
     # muon_head_split_modules: [q_b_proj]
     # MoE + EP: whole-expert Shard(0) when (num_experts/ep_size) % ep_fsdp_size == 0

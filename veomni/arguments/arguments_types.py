@@ -183,6 +183,19 @@ class OptimizerConfig:
             )
         },
     )
+    muon_head_split_exclude_indexer: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Keep a DSA Lightning Indexer's projections on full-matrix Muon even when "
+                "muon_head_split_modules names one of them. DeepSeek-V4's indexer and the MLA it "
+                "sits in both call their up-projection q_b_proj, so ['q_b_proj'] cannot ask for one "
+                "without the other; true (default) resolves that in favour of the attention, which "
+                "is what the V3.2/V4 papers describe for the indexer. Set false to head-split the "
+                "indexer as well. Indexer-only names, such as GLM MoE DSA's wq_b, are unaffected."
+            )
+        },
+    )
     muon_expert_zero_comm: bool = field(
         default=False,
         metadata={

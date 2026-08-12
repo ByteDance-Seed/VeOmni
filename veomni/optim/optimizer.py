@@ -423,6 +423,7 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
         # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
         "head_group_size": int(optimizer_cfg.muon_head_group_size),
         "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
+        "head_split_exclude_indexer": bool(optimizer_cfg.muon_head_split_exclude_indexer),
         # Surface for startup summary only; not a DistributedMuon ctor kwarg.
         "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
     }
@@ -581,6 +582,7 @@ def _build_muon_with_adamw(
     adamw_lr = float(lr)
     head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
     head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
+    head_split_exclude_indexer = bool(muon_kwargs.pop("head_split_exclude_indexer", True))
     if head_group_size < 0:
         raise ValueError(f"muon_head_group_size must be >= 0 (0 disables head splitting), got {head_group_size}")
     if head_group_size >= 1 and not head_split_modules:
@@ -610,7 +612,9 @@ def _build_muon_with_adamw(
     head_blocks_by_param: Dict[int, int] = {}
     head_split_names: List[str] = []
     if head_group_size >= 1:
-        blocks_by_fqn = infer_head_block_counts(model, head_group_size, head_split_modules)
+        blocks_by_fqn = infer_head_block_counts(
+            model, head_group_size, head_split_modules, exclude_indexer=head_split_exclude_indexer
+        )
         muon_name_set = set(muon_names)
         param_by_name = dict(model.named_parameters())
         for fqn, blocks in sorted(blocks_by_fqn.items()):

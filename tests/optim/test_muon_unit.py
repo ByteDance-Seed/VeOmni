@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -90,6 +91,32 @@ def _attention_model(**kwargs) -> nn.Module:
     model = nn.Module()
     model.embed_tokens = nn.Embedding(8, 32)
     model.self_attn = _FakeAttention(**kwargs)
+    return model
+
+
+_DSV4_TOY_CONFIG_DIR = Path(__file__).resolve().parents[1] / "toy_config" / "deepseek_v4_toy"
+
+
+def _dsv4_csa_attention_model() -> nn.Module:
+    """A real ``DeepseekV4Attention`` on a CSA layer, so its indexer is the real class.
+
+    The head-split opt-out is keyed on the indexer's class, so a synthetic stand-in
+    would pass with a class name that matches nothing in the model.
+
+    ``index_n_heads`` / ``index_head_dim`` are raised to the 4-layer checkpoint's
+    64 x 128 (the toy config ships 8 x 128) so the indexer's head count differs from
+    the main attention's 8 and one assertion can tell the two apart.
+    """
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = AutoConfig.from_pretrained(str(_DSV4_TOY_CONFIG_DIR))
+    config.index_n_heads = 64
+    config.index_head_dim = 128
+    torch.manual_seed(0)
+    model = nn.Module()
+    model.self_attn = modeling.DeepseekV4Attention(config, config.layer_types.index("compressed_sparse_attention"))
     return model
 
 
@@ -730,6 +757,75 @@ class TestHeadSplitInference:
 
         blocks = infer_head_block_counts(model, head_group_size=1, module_names=("wq_b",))
         assert blocks == {"indexer.wq_b.weight": 4}
+
+    def test_indexer_q_b_proj_excluded_from_head_split_by_default(self):
+        """The DSA indexer and the attention it sits in both name their up-projection
+        ``q_b_proj``, and the indexer's own ``num_heads``/``head_dim`` resolve its 8192
+        rows to 64 x 128 -- so head-split Muon switches itself on for the indexer the
+        moment the indexer loss populates a gradient, with no configuration change.
+        Excluding by default keeps that from being a side effect of a flag aimed at MLA;
+        the papers describe plain Muon over the whole matrix.
+
+        Both halves in one assertion: an exclusion broad enough to also veto the
+        attention's own ``q_b_proj`` has to fail here.
+        """
+        blocks = infer_head_block_counts(_dsv4_csa_attention_model(), head_group_size=1, module_names=("q_b_proj",))
+        assert blocks == {"self_attn.q_b_proj.weight": 8}
+
+    def test_indexer_head_split_can_be_opted_in(self):
+        blocks = infer_head_block_counts(
+            _dsv4_csa_attention_model(),
+            head_group_size=1,
+            module_names=("q_b_proj",),
+            exclude_indexer=False,
+        )
+        assert blocks == {
+            "self_attn.q_b_proj.weight": 8,
+            "self_attn.compressor.indexer.q_b_proj.weight": 64,
+        }
+
+    def test_exclude_indexer_threads_from_the_optimizer_arguments(self):
+        """The knob has to arrive from ``OptimizerConfig``, not only as a direct kwarg.
+
+        Head-split inference runs at optimizer construction, so the whole path --
+        argument field, ``_collect_muon_kwargs``, ``_build_muon_with_adamw`` -- is what
+        decides the update; a test against ``infer_head_block_counts`` alone would pass
+        with the field unwired.
+        """
+        from veomni.arguments.arguments_types import OptimizerConfig
+        from veomni.optim import build_optimizer
+        from veomni.optim.optimizer import _collect_muon_kwargs
+
+        model = _dsv4_csa_attention_model()
+        cfg = OptimizerConfig(
+            type="muon",
+            lr=1e-4,
+            muon_head_group_size=1,
+            muon_head_split_modules=["q_b_proj"],
+            muon_ns_implementation="std",
+        )
+        assert cfg.muon_head_split_exclude_indexer is True  # the default under test
+
+        def _q_b_proj_blocks() -> dict:
+            opt = build_optimizer(model, lr=cfg.lr, optimizer_type="muon", muon_kwargs=_collect_muon_kwargs(cfg))
+            names = {id(p): n for n, p in model.named_parameters()}
+            return {
+                names[id(p)]: int(group.get("head_blocks", 1))
+                for group in opt.optimizers_dict["muon"].param_groups
+                for p in group["params"]
+                if names[id(p)].endswith("q_b_proj.weight")
+            }
+
+        assert _q_b_proj_blocks() == {
+            "self_attn.q_b_proj.weight": 8,
+            "self_attn.compressor.indexer.q_b_proj.weight": 1,
+        }
+
+        cfg.muon_head_split_exclude_indexer = False
+        assert _q_b_proj_blocks() == {
+            "self_attn.q_b_proj.weight": 8,
+            "self_attn.compressor.indexer.q_b_proj.weight": 64,
+        }
 
 
 class TestHeadSplitUpdate:
