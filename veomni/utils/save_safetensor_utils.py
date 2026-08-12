@@ -208,6 +208,9 @@ def save_hf_safetensor(
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
+    # Distributed HuggingFaceStorageWriter on all platforms. Under HSDP,
+    # replica-rank fp32 -> bf16 casts can differ by ~1 ULP on NPU (see #919);
+    # train with --train.enable_full_determinism True for bit-exact saves.
     use_distributed = is_torch_version_greater_than("2.9") and ckpt_manager == "dcp"
 
     # Ensure all GPU operations are complete before reading tensor data for saving
