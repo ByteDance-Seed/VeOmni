@@ -186,7 +186,7 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
+| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash and Flex values resolve to SP-aware registry names. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. |
 | moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
@@ -231,6 +231,8 @@ NPU validation runs at two times:
 | type | `str` | `"native"` | Type of the dataloader. |
 | num_workers | `int` | `2` | Number of workers for data loading. |
 | prefetch_factor | `int` | `2` | Number of batches loaded in advance per worker. |
+| persistent_workers | `bool` | `False` | Keep DataLoader worker processes alive between iterator recreations. |
+| in_order | `bool` | `True` | Return worker-loaded batches in first-in, first-out order. Set `False` to avoid slow worker head-of-line blocking for uneven sample decode costs; checkpoint/resume ordering is not guaranteed in this mode. |
 | drop_last | `bool` | `True` | Whether to drop the last incomplete batch. |
 | pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
 | worker_num_threads | `Optional[int]` | `None` | Number of PyTorch threads used by each DataLoader worker. |
@@ -258,6 +260,7 @@ NPU validation runs at two times:
 | ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
+| sync_each_train_step | `bool` | `True` | Synchronize the accelerator before each training step's forward/backward work. Disable to allow async dataloader and H2D work to overlap with the next step. |
 | empty_cache_steps | `int` | `500` | Steps between device-cache cleanup calls. A non-positive value disables scheduled cleanup. |
 | gc_steps | `int` | `500` | When positive, disable automatic Python GC and run `gc.collect()` every N steps. A non-positive value leaves automatic GC enabled and disables scheduled collection. |
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
@@ -277,11 +280,13 @@ NPU validation runs at two times:
 
 ### TorchCompileConfig
 
-`train.torch_compile.*` — Per-block `torch.compile` options for text training. This path currently supports text trainers only and requires `train.dyn_bsz=True` plus `train.pad_to_length=True`, so packed inputs have stable shapes. The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `train.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
+`train.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `train.torch_compile.dynamic=False`, `train.accelerator.ulysses_size=1`, `train.accelerator.cp_size=1`, and `train.accelerator.enable_async=False`. Qwen3-VL-MoE, ChunkMBS, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
+
+The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `train.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable | `bool` | `False` | Enable per-block `torch.compile` on FSDP2 decoder blocks. |
+| enable | `bool` | `False` | Enable per-block `torch.compile` on supported FSDP2 decoder blocks. |
 | backend | `Optional[str]` | `"inductor"` | Backend passed to `torch.compile`. |
 | mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `train.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
 | fullgraph | `bool` | `True` | Whether to pass `fullgraph=True` to `torch.compile`. |
@@ -312,6 +317,8 @@ NPU validation runs at two times:
 | muon_ns_coefficients | `List[float]` | `[3.4445, -4.7750, 2.0315]` | Quintic Newton–Schulz polynomial coefficients. |
 | muon_eps | `float` | `1e-7` | Numerical-stability epsilon used in spectral-norm normalization. |
 | muon_adjust_lr_fn | `Literal["original", "match_rms_adamw"]` | `"match_rms_adamw"` | Per-matrix learning-rate adjustment strategy. |
+| muon_head_group_size | `int` | `0` | Attention heads per Newton–Schulz block ("Muon Split"). `0` orthogonalizes each projection as one matrix, `1` is per-head, `g>1` groups `g` heads. Any value `>= 1` requires `muon_head_split_modules`. |
+| muon_head_split_modules | `List[str]` | `[]` | Leaf module names to head-split, e.g. `[q_b_proj]`. No default — required when `muon_head_group_size >= 1`. |
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
@@ -520,8 +527,8 @@ Extends `TrainingArguments` with ViT / audio tower controls.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| freeze_vit | `bool` | `False` | Freeze ViT parameters. |
-| freeze_audio_tower | `bool` | `False` | Freeze audio tower parameters. |
+| freeze_vit | `bool` | `False` | Freeze ViT parameters during full tuning. Ignored when LoRA is enabled. |
+| freeze_audio_tower | `bool` | `False` | Freeze audio tower parameters during full tuning. Ignored when LoRA is enabled. |
 | vit_lr | `float` | `1e-6` | Maximum learning rate for ViT parameters. |
 
 ### VLMMModelArguments
