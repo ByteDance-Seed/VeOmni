@@ -692,6 +692,27 @@ class BaseTrainer(Stateful, ABC):
             getattr(self, "global_micro_batches_token_len", None),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
+        # Diagnostics a forward wants logged next to the losses. Merged *after* the
+        # sum above, because everything in ``loss_dict`` up to that line is the
+        # backward scalar; a metric merged earlier would silently join the objective.
+        # ``getattr`` rather than attribute access: most model outputs in the repo
+        # have no such field.
+        aux_metrics = getattr(outputs, "aux_metrics", None)
+        if aux_metrics:
+            # ``train_step`` reports the *sum* of the micro-batches' ``loss_dict``
+            # values. The losses may be summed because ``mean_global_loss`` has
+            # already scaled each one by its share of the step's tokens; an aux
+            # metric gets no such scaling, so without the 1/N here it would be
+            # reported ``gradient_accumulation_steps`` times too large. 1/N makes the
+            # reported number the mean of the micro-batch values -- for a per-token
+            # metric such as ``indexer_kl`` that is the step's per-token mean when the
+            # micro-batches carry equal token counts, and unlike a token-share
+            # weighting it assumes nothing about which denominator a metric used.
+            # The value is rank-local; ``EnvironMeterCallback.on_step_end`` already
+            # averages it over the FSDP group, and a per-micro-batch collective is
+            # not worth it for a diagnostic.
+            num_micro_batches = getattr(self, "num_micro_batches", 1)
+            loss_dict.update({key: value.detach() / num_micro_batches for key, value in aux_metrics.items()})
         return loss, loss_dict
 
     def forward_backward_step(
@@ -782,6 +803,8 @@ class BaseTrainer(Stateful, ABC):
         self.micro_batches_token_len = count_loss_token(micro_batches)
         self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
+        # Read by postforward to average aux metrics over the step's micro batches.
+        self.num_micro_batches = num_micro_steps
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
             mark_compile_step_begin(getattr(self.model, "_veomni_compile_uses_cuda_graphs", False))
