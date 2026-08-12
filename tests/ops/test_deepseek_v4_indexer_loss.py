@@ -1719,3 +1719,447 @@ class TestAttentionForwardIndexerKL:
             for part in module_name.split("."):
                 module = getattr(module, part)
             assert module.weight.grad is None, f"{module_name} moved on the indexer objective"
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize(
+        "layer_type", ["sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention"]
+    )
+    def test_the_shared_gate_predicts_the_attention_return_arity(self, layer_type, enabled):
+        """``_builds_indexer_kl`` is the *only* thing that may decide the arity, and
+        every caller above reads it rather than re-deriving it.
+
+        Three call sites act on this predicate -- the attention forward that returns
+        the third value, the decoder layer that unpacks it, and the model loop that
+        accumulates it -- and they are in three different functions. A copy of the
+        expression in any of them can go stale independently: the decoder layer gating
+        on ``_indexer_loss_enabled`` alone (the whole expression before Task 5's fix
+        round narrowed it) would three-unpack the two-tuple every sliding and HCA layer
+        returns, which is three of the four layers of the reference checkpoint.
+
+        Reading the predicate twice would prove nothing, so the assertion is against
+        ``len(attn(...))``: what the attention forward actually returned.
+        """
+        _require_tilelang_cuda()
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        _bind_indexer_loss(enabled=enabled)
+        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
+        with _single_rank_parallel_state():
+            verdict = modeling._builds_indexer_kl(attn)
+            result = attn(**inputs)
+
+        assert verdict is (len(result) == 3), (
+            f"the gate says {verdict} for a {layer_type} layer with the flag {enabled}, "
+            f"while the forward returned {len(result)} values"
+        )
+        # And that the verdict itself is the intended one, so that a predicate stuck at
+        # ``False`` against a forward stuck at two values cannot agree vacuously.
+        assert verdict is (enabled and layer_type == "compressed_sparse_attention")
+
+
+# The reference 4-layer DeepSeek-V4 checkpoint. Its ``compress_ratios`` of
+# ``[0, 0, 4, 128]`` is the layer schedule this whole task is about: two sliding
+# layers, one CSA layer at rate 4 and one HCA layer at rate 128, i.e. exactly one
+# layer carrying a Lightning Indexer and three that must pass a flag-on forward
+# through untouched.
+_CHECKPOINT_4L = Path("/mnt/hdfs/__MERLIN_USER_DIR__/veomni/models/DeepSeek/DeepSeek-V4-Flash-Base-4L")
+
+
+def _4layer_test_config():
+    """The 4-layer checkpoint's own config, with the widths nothing here reads reduced.
+
+    Everything the indexer loss touches comes from the checkpoint verbatim:
+    ``layer_types`` (from its legacy ``compress_ratios``), ``compress_rates``,
+    ``sliding_window``, and the three fields the indexer's TileLang gate reads --
+    ``index_n_heads=64``, ``index_head_dim=128``, ``index_topk=512``. What is reduced
+    is width alone: hidden size, head dim, the two LoRA ranks, the expert count and
+    width, and the vocabulary.
+
+    Measured, not assumed. At the checkpoint's own widths this model is 27.4B
+    parameters, 54.8 GB in bf16 before gradients; ``test_the_indexer_objective...``
+    and its neighbours build several models per session, and one build alone leaves
+    no room for a backward on the 189 GB this device has. At the widths below the
+    model is 7.8M parameters and builds in 0.4 s, while every gate, kernel dispatch
+    and layer type under test is still the checkpoint's own.
+
+    Skips rather than fails when the checkpoint is absent: it lives on an HDFS FUSE
+    mount that a machine running these tests need not have.
+    """
+    from transformers import AutoConfig
+
+    if not (_CHECKPOINT_4L / "config.json").is_file():
+        pytest.skip(f"the reference 4-layer DeepSeek-V4 checkpoint is not present at {_CHECKPOINT_4L}")
+
+    config = AutoConfig.from_pretrained(str(_CHECKPOINT_4L))
+    config.hidden_size = 256
+    config.head_dim = 64
+    config.q_lora_rank = 64
+    config.o_lora_rank = 64
+    config.n_routed_experts = 8
+    config.num_experts_per_tok = 2
+    config.moe_intermediate_size = 128
+    config.vocab_size = 1024
+    # An MTP head is a second stack of layers with its own attention, and nothing in
+    # this file reads it; the toy config drops it the same way.
+    config.num_nextn_predict_layers = 0
+    # The checkpoint ships fp8 block-quantised experts. ``from_pretrained`` would act
+    # on this; building from the config alone must not, and the weights are random
+    # here in any case.
+    config.quantization_config = None
+    return config
+
+
+@contextlib.contextmanager
+def _veomni_loss_mapping_installed():
+    """Install VeOmni's loss wrappers into HuggingFace's ``LOSS_MAPPING``, and undo it.
+
+    ``DeepseekV4ForCausalLM.forward`` unpacks three values from
+    ``self.loss_function``, which is VeOmni's contract and not HuggingFace's -- with
+    HF's stock ``ForCausalLMLoss`` in the mapping the forward fails on the unpack
+    long before it reaches anything this file is about. ``build_foundation_model``
+    installs these through ``apply_ops_config``; a test that builds the model
+    directly has to do it itself.
+
+    Restored afterwards for the reason ``_ops_config_slots_bound`` gives: the mapping
+    is a module-level dict shared with the rest of the session.
+    """
+    from transformers.loss.loss_utils import LOSS_MAPPING
+
+    from veomni.ops.kernels.cross_entropy import install_loss_mapping
+
+    saved = dict(LOSS_MAPPING)
+    install_loss_mapping("eager")
+    try:
+        yield
+    finally:
+        LOSS_MAPPING.clear()
+        LOSS_MAPPING.update(saved)
+
+
+def _build_4layer_test_model(
+    device="cuda", seq_len=4096, indexer_loss=True, enable_reentrant=False, seed=0, labels=True
+):
+    """Returns ``(model, batch)`` for the 4-layer CSA checkpoint's configuration.
+
+    Builds the config above (skipping when the checkpoint is absent), binds
+    ``dsa_indexer_loss`` / ``dsa_indexer_implementation`` / ``dsa_attention_implementation``,
+    enables gradient checkpointing with the given ``enable_reentrant``, and seeds both
+    the model init and the batch from ``seed`` so two calls with the same seed are
+    comparable.
+
+    ``seq_len=4096`` is not incidental: at the CSA compression rate of 4 it gives
+    ``compressed_len == 1024 > index_topk == 512``, so the top-k actually ranks. At
+    2048 the indexer would select every causally visible slot and a student permuted
+    within the valid region would still look right.
+
+    The batch is the packed one production trains on -- one sample filling the row,
+    global ``position_ids``, and ``cu_seq_lens_q`` spanning it -- which is what puts
+    ``DeepseekV4Model.forward`` on the mask-free TileLang path. ``labels`` are the
+    inputs themselves: what is under test is which objectives the gradient reaches,
+    not what the model predicts.
+
+    ``enable_reentrant=True`` uses PyTorch's own reentrant ``CheckpointFunction``
+    rather than the copy at ``veomni/distributed/checkpoint.py`` that
+    ``build_parallelize_model`` installs. That copy reads ``run_function.__self__``,
+    while ``GradientCheckpointingLayer.__call__`` hands the checkpoint a
+    ``functools.partial``, so it raises ``AttributeError: 'functools.partial' object
+    has no attribute '__self__'`` here -- with the indexer loss *off* as well as on,
+    i.e. an existing incompatibility with this transformers version rather than
+    anything this file introduces. Both implementations run the first forward inside
+    ``torch.no_grad()``, which is the property these tests are about.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = _4layer_test_config()
+    _bind_indexer_loss(enabled=indexer_loss)
+
+    torch.manual_seed(seed)
+    with torch.device(device):
+        model = modeling.DeepseekV4ForCausalLM(config)
+    model = model.to(dtype=torch.bfloat16)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": enable_reentrant})
+    model.train()
+
+    torch.manual_seed(seed + 1)
+    input_ids = torch.randint(0, config.vocab_size, (1, seq_len), device=device)
+    cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    batch = {
+        "input_ids": input_ids,
+        "position_ids": torch.arange(seq_len, device=device).unsqueeze(0),
+        "cu_seq_lens_q": cu_seq_lens,
+        "cu_seq_lens_k": cu_seq_lens,
+        "use_cache": False,
+    }
+    if labels:
+        batch["labels"] = input_ids.clone()
+    return model, batch
+
+
+def _csa_layers(model):
+    """The layers carrying a Lightning Indexer, i.e. the ones that can build a KL."""
+    return [
+        layer
+        for layer in model.model.layers
+        if getattr(getattr(layer.self_attn, "compressor", None), "indexer", None) is not None
+    ]
+
+
+def _model_only_batch(batch):
+    """``batch`` without the fields only ``DeepseekV4ForCausalLM.forward`` takes."""
+    return {key: value for key, value in batch.items() if key != "labels"}
+
+
+class TestFourLayerModelIndexerKL:
+    """The KL leaving the attention layer and arriving in the total loss: the decoder
+    layer's arity, the model loop's accumulation, the reduction and the coefficient.
+
+    Every test here runs a whole ``DeepseekV4ForCausalLM`` forward on the reference
+    checkpoint's layer schedule, so three of its four layers exercise the pass-through
+    the gate has to leave alone and one exercises the KL itself.
+    """
+
+    # Every test here imports the generated modeling module; see the note on
+    # ``_HDFS_STDENV_DEPRECATION_FILTER`` for what that drags in.
+    pytestmark = _HDFS_STDENV_DEPRECATION_FILTER
+
+    # Supported but off, matching the classes above. The coefficient is here too:
+    # every test below reads it through the loss, and one of them binds it to 0, so a
+    # test that took it from the session rather than from here would be reading
+    # whatever ran before it.
+    _SLOT_PRE_STATE = {
+        "dsa_indexer_loss": False,
+        "dsa_indexer_implementation": "eager",
+        "dsa_attention_implementation": "eager",
+        "dsa_indexer_loss_coef": 1.0,
+    }
+
+    @pytest.fixture(autouse=True)
+    def _restore_ops_config_slots_and_loss_mapping(self):
+        with _ops_config_slots_bound(self._SLOT_PRE_STATE), _veomni_loss_mapping_installed():
+            yield
+
+    @pytest.mark.parametrize("enable_reentrant", [False, True])
+    def test_indexer_receives_gradient_under_checkpointing(self, enable_reentrant):
+        """The silent-failure guard, and this task's acceptance criterion: a flag-on
+        forward *and backward* completing on the reference schedule.
+
+        Asserts parameter gradients, not ``kl.grad_fn is not None``. Under reentrant
+        checkpointing the first forward runs inside ``torch.no_grad()``, so any tensor
+        smuggled out through a side channel rather than through the layer's return
+        value is graph-less -- and a ``grad_fn`` proxy would not notice. The KL would
+        still log a plausible decreasing number while the indexer learned nothing.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, enable_reentrant=enable_reentrant)
+        with _single_rank_parallel_state():
+            out = model(**batch)
+            out.loss.backward()
+
+        csa = _csa_layers(model)
+        assert csa, "test model must contain at least one CSA layer"
+        for layer in csa:
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+                param = getattr(layer.self_attn.compressor.indexer, name).weight
+                assert param.grad is not None, f"{name} received no gradient"
+                assert param.grad.abs().sum() > 0, f"{name} received an all-zero gradient"
+
+    def test_only_csa_layers_carry_an_indexer(self):
+        """The reference checkpoint has ``compress_ratios [0, 0, 4, 128]``: two sliding
+        layers, one CSA layer at rate 4, one HCA layer at rate 128. Only the CSA layer
+        has an indexer, so only it may contribute to the KL, and the total must be a
+        finite positive number rather than a silent zero."""
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
+
+        with_indexer = [
+            i
+            for i, layer in enumerate(model.model.layers)
+            if getattr(getattr(layer.self_attn, "compressor", None), "indexer", None) is not None
+        ]
+        assert with_indexer == [2], f"expected exactly the rate-4 layer to have an indexer, got {with_indexer}"
+
+        with _single_rank_parallel_state():
+            out = model(**batch)
+        kl = out.aux_metrics["indexer_kl"]
+        assert torch.isfinite(kl).all()
+        assert kl > 0, "a zero KL here means the teacher and the indexer already agree exactly, which is not credible"
+
+    def test_the_model_output_carries_the_kl_where_a_round_trip_can_find_it(self):
+        """The KL leaves ``DeepseekV4Model.forward`` in a declared field, not as an
+        attribute assigned onto the output object.
+
+        ``ModelOutput.__setattr__`` writes into the underlying dict only for keys that
+        already exist; a new name becomes a plain instance attribute, invisible to
+        ``keys()``, to ``to_tuple()`` and to pytree flattening, and dropped by any
+        round-trip. The immediate read in ``ForCausalLM.forward`` would still work, so
+        nothing about the loss value would look wrong -- and this repository has been
+        bitten by exactly that before, with FSDP2's pre-backward unshard hook, which
+        finds the tensors it must unshard for by walking that same flattened output
+        (see the note above ``MoeCausalLMOutputWithLogProbs``'s import in the patch
+        config).
+
+        A flat-out ``kl > 0`` assertion elsewhere does not cover this: the value is
+        right either way. What has to hold is that the tensor is *reachable* the way
+        every generic consumer reaches it.
+        """
+        _require_tilelang_cuda()
+        from torch.utils import _pytree as pytree
+
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+
+        assert outputs.indexer_kl_total is not None, "the model dropped the KL"
+        assert "indexer_kl_total" in outputs, "the KL is an ad-hoc attribute, not a field of the output"
+        assert outputs.indexer_query_tokens == batch["input_ids"].numel()
+
+        leaves, spec = pytree.tree_flatten(outputs)
+        assert any(leaf is outputs.indexer_kl_total for leaf in leaves), (
+            "the KL is invisible to pytree flattening, which is how FSDP2 finds the tensors "
+            "a backward will need unsharded"
+        )
+        rebuilt = pytree.tree_unflatten(leaves, spec)
+        assert rebuilt.indexer_kl_total is outputs.indexer_kl_total
+        assert rebuilt.indexer_query_tokens == outputs.indexer_query_tokens
+
+    def test_the_reported_kl_is_the_per_token_mean_of_the_layer_sum(self):
+        """What reaches the loss is a *mean* over local query rows, not the sum the
+        attention layer returns.
+
+        ``reduce_sequence_parallel_loss`` takes a local mean and the local token count
+        and re-weights by that count across the group; handing it a sum instead trains
+        perfectly well on one rank and converges to the wrong cross-rank weighting,
+        which no single-process test of the value alone would ever notice. The two
+        differ here by a factor of 4096, so the check is exact rather than statistical.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+            out = model(**batch)
+
+        tokens = batch["input_ids"].numel()
+        assert outputs.indexer_query_tokens == tokens
+        torch.testing.assert_close(out.aux_metrics["indexer_kl"], outputs.indexer_kl_total / tokens, atol=0, rtol=1e-6)
+        assert not out.aux_metrics["indexer_kl"].requires_grad, "the reported metric must be detached"
+
+    def test_the_coefficient_scales_what_the_loss_receives(self):
+        """The KL enters the loss weighted by ``dsa_indexer_loss_coef``, and by nothing
+        else.
+
+        Run at coefficient 0 the total loss must be *bitwise* what the flag-off run
+        produced -- ``x + 0.0 * kl`` is exactly ``x`` for any finite KL -- which pins
+        two things at once: that the coefficient is really applied, and that turning
+        the loss on perturbs no part of the language-model objective. Run at 1 the
+        difference from that baseline must be the reported KL itself.
+        """
+        _require_tilelang_cuda()
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        def loss_at(indexer_loss, coef):
+            model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=indexer_loss, seed=0)
+            modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
+            with _single_rank_parallel_state():
+                out = model(**batch)
+            return out
+
+        off = loss_at(indexer_loss=False, coef=1.0)
+        assert off.aux_metrics is None, "the flag-off forward reported an indexer metric"
+
+        zero_weighted = loss_at(indexer_loss=True, coef=0.0)
+        assert torch.equal(zero_weighted.loss, off.loss), (
+            "at coefficient 0 the total loss moved, so either the coefficient is ignored "
+            "or the language-model objective was perturbed"
+        )
+
+        weighted = loss_at(indexer_loss=True, coef=1.0)
+        difference = weighted.loss - off.loss
+        reported = weighted.aux_metrics["indexer_kl"].to(off.loss.dtype)
+        # Subtracting two losses of the same magnitude cancels, and what survives is
+        # the KL plus a few ULPs of the larger number. Bound the comparison by those
+        # ULPs rather than by a relative tolerance on the KL itself, and assert the KL
+        # clears the bound -- otherwise this comparison would pass on a KL of zero.
+        admitted = 8 * torch.finfo(off.loss.dtype).eps * off.loss.abs()
+        assert reported > 100 * admitted, (
+            f"the reported KL {float(reported):.3e} is within the {float(admitted):.3e} of "
+            "floating-point noise this subtraction carries, so it cannot be told from zero here"
+        )
+        torch.testing.assert_close(difference, reported, atol=admitted, rtol=0)
+
+    def test_the_indexer_objective_moves_only_the_indexer(self):
+        """Decoupling at model scope: the auxiliary objective may move indexer
+        parameters and nothing else.
+
+        The KL leaving ``DeepseekV4Model.forward`` in a declared field is what makes
+        this exact. Comparing two whole runs' gradients would not be: measured on this
+        model, two identical flag-off runs already disagree on 77 of their 102
+        gradients at the bf16 ULP level, because the backward's reductions are not
+        deterministic -- so an equality comparison there cannot separate a leak from
+        the noise floor. Backpropagating the KL alone has no noise floor at all: a
+        parameter outside the indexer either receives a gradient from it or does not.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+        outputs.indexer_kl_total.backward()
+
+        moved = [name for name, param in model.named_parameters() if param.grad is not None]
+        assert moved, "the model-level KL trained nothing at all"
+        assert all(".indexer." in name for name in moved), (
+            f"the indexer objective moved parameters outside the indexer: "
+            f"{[name for name in moved if '.indexer.' not in name]}"
+        )
+        for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+            grad = getattr(_csa_layers(model)[0].self_attn.compressor.indexer, name).weight.grad
+            assert grad is not None and grad.abs().sum() > 0, f"indexer.{name} received no usable gradient"
+
+    def test_the_flag_off_model_forward_is_untouched(self):
+        """The off side of every branch this task adds, at model scope.
+
+        With the flag off the decoder layer must still return a bare tensor, the model
+        output must carry no indexer fields, and the causal-LM output must report no
+        aux metrics. Inverting any of those gates would break every flag-off DeepSeek-V4
+        forward in the tree while leaving the enabled path green.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=False)
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+            out = model(**batch)
+
+        assert outputs.indexer_kl_total is None
+        assert outputs.indexer_query_tokens is None
+        assert list(outputs.keys()) == ["last_hidden_state"], (
+            f"the flag-off model output grew fields: {list(outputs.keys())}"
+        )
+        assert out.aux_metrics is None
+        assert torch.isfinite(out.loss)
+        for layer in _csa_layers(model):
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+                param = getattr(layer.self_attn.compressor.indexer, name).weight
+                assert param.grad is None
+
+        out.loss.backward()
+        for layer in _csa_layers(model):
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+                param = getattr(layer.self_attn.compressor.indexer, name).weight
+                assert param.grad is None, f"indexer.{name} received a gradient with the loss disabled"
+
+    def test_the_kl_is_reported_but_not_added_when_there_are_no_labels(self):
+        """Inference has no loss to add the KL to.
+
+        ``loss`` is ``None`` without labels, so a fold-in that did not check would
+        raise ``TypeError: unsupported operand type(s) for +: 'NoneType'``. The metric
+        is still reported, which is what makes this distinguishable from skipping the
+        KL entirely.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, labels=False)
+        with _single_rank_parallel_state():
+            out = model(**batch)
+
+        assert out.loss is None
+        assert out.aux_metrics is not None and out.aux_metrics["indexer_kl"] > 0
