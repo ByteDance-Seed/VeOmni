@@ -319,3 +319,26 @@ def test_target_kernel_emits_no_unexpected_warnings():
         if not any(known in str(w.message) for known in _TOLERATED_WARNING_SUBSTRINGS)
     ]
     assert not unexpected, "unexpected warning(s):\n" + "\n".join(unexpected)
+
+
+def test_sparse_attn_returns_non_differentiable_lse():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+
+    torch.manual_seed(3)
+    b, s, heads, d = 1, 8, 16, 64
+    q = torch.randn(b, s, heads, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(b, 128, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    sink = torch.randn(heads, device="cuda", dtype=torch.float32, requires_grad=True)
+    topk = torch.randint(0, 128, (b, s, 64), device="cuda", dtype=torch.int32)
+
+    out_only = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5)
+    out, lse = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5, return_lse=True)
+
+    torch.testing.assert_close(out_only, out)
+    assert lse.shape == (b, s, heads)
+    assert lse.dtype == torch.float32
+    assert not lse.requires_grad, "the LSE feeds a detached teacher and must not open a path back into attention"
+
+    out.sum().backward()
+    assert q.grad is not None and torch.isfinite(q.grad).all()
