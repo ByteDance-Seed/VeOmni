@@ -1,22 +1,36 @@
 # DeepSeek-V4-Flash SFT with the Lightning Indexer KL objective (DeepSeek-V3.2 eq. 4).
 #
-# Sibling of configs/text/deepseek_v4.yaml. Two differences carry the feature
-# (model.ops_implementation.dsa_indexer_loss, and max_seq_len); the rest scales the job down
-# to a smoke run on the 4-layer checkpoint.
+# Sibling of configs/text/deepseek_v4.yaml. One line turns the feature on
+# (model.ops_implementation.dsa_indexer_loss); max_seq_len and dyn_bsz are the two non-obvious
+# values and each has a section below; the rest scales the job down to a smoke run on the
+# 4-layer checkpoint.
 #
 # WHY max_seq_len IS 8192 AND NOT THE 2048 THE SIBLING CONFIG SHIPS
 # ----------------------------------------------------------------
-# The indexer objective is only meaningful when the top-k is actually selecting a subset. At
-# max_seq_len 2048 the rate-4 CSA layer compresses to exactly 2048/4 = 512 slots, which is exactly
-# index_topk, so the top-k selects *every visible slot* and there is nothing for the indexer to
-# learn to rank. That is the degenerate boundary, not a safety margin: measured on this branch,
-# at 2048 only 1 of 2048 query rows can even fill its 512-slot candidate list, against 2049 of
-# 4096 at 4096. 8192 puts every row comfortably past it (2048 compressed slots against a
-# 512-slot budget). Lowering this back to 2048 does not make the run cheaper in any useful sense
-# -- it makes the objective vacuous while still costing the KL's compute.
+# The indexer objective only exercises top-k *selection* when a query row has more visible
+# compressed slots than index_topk (512 here). At max_seq_len 2048 the rate-4 CSA layer compresses
+# to exactly 2048/4 = 512 slots, which is exactly index_topk, so the top-k selects every visible
+# slot: that is the degenerate boundary, not a safety margin. 8192 gives 2048 compressed slots
+# against a 512-slot budget. If you change index_topk or the compress rate, re-derive this from
+# `max_seq_len / compress_rate >> index_topk` rather than keeping 8192.
 #
-# The other length-sensitive quantity is index_topk itself (512 here); if you change it, re-derive
-# max_seq_len from `max_seq_len / compress_rate >> index_topk` rather than keeping 8192.
+# READ THIS BEFORE CONCLUDING THAT 8192 IS SUFFICIENT. The visible-slot count is per *sample*,
+# not per packed row: build_packed_compression_metadata restarts range_starts/range_ends at every
+# cu_seq_lens boundary, so a query row only ever sees its own conversation's compressed slots.
+# tulu-3-sft-mixture conversations are short -- measured with this checkpoint's tokenizer over
+# 4000 samples, the median is 296 tokens, p99 is 1293, and 0.2% exceed the 2048 tokens a row needs
+# before its 512-slot budget can bind. So on *this dataset* the top-k is non-binding whatever
+# max_seq_len says, and the objective reduces to a dense KL over each row's visible slots. What
+# 8192 buys here is a full 8192-token packed micro-batch (see dyn_bsz below), not an escape from
+# the boundary. A dataset with genuinely long documents is what escapes it.
+
+# WHY dyn_bsz IS true HERE AND false IN THE SIBLING CONFIG
+# -------------------------------------------------------
+# With dyn_bsz false each micro-batch is one unpadded conversation, so the sequence length changes
+# every micro-batch and TileLang re-JITs its shape-specialised kernels: measured 227 compilations
+# in the first 5 steps, against 4 for the whole run here. Packing to a fixed 8192 also makes
+# max_seq_len mean something (otherwise nothing on this dataset comes within 6000 tokens of it)
+# and makes step times comparable between runs.
 
 model:
   model_path: /mnt/hdfs/__MERLIN_USER_DIR__/veomni/models/DeepSeek/DeepSeek-V4-Flash-Base-4L
@@ -39,6 +53,9 @@ model:
     rotary_pos_emb_implementation: triton
 
 data:
+  # .../tulu-3-sft-mixture/data, not .../tulu-3-sft-mixture/. get_data_files lists a directory
+  # non-recursively and takes the extension of its first sorted entry; the parent's first entry
+  # is .cache, so it raises " files are not supported" before it ever sees a parquet.
   train_path: /mnt/hdfs/__MERLIN_USER_DIR__/veomni/datasets/tulu-3-sft-mixture/data
   data_type: conversation
   chat_template: chatml
@@ -48,7 +65,9 @@ data:
   dyn_bsz_buffer_size: 200
 
 train:
-  dyn_bsz: false
+  # Packed, padding-free batching at a fixed 8192 tokens per micro-batch. See the header.
+  dyn_bsz: true
+  pad_to_length: true
   accelerator:
     # ulysses_size must stay 1: the indexer loss refuses Ulysses, because each rank would hold a
     # head shard of the index scores and the teacher is built from the full head set.
