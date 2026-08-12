@@ -210,11 +210,18 @@ class CompressedCandidates(NamedTuple):
     Indexer-driven compressors select an explicit per-query set and already mark
     misses with ``-1``; the heavily-compressed path instead stays a contiguous
     ``[range_start, range_end)`` causal interval. At most one of the two is set.
+
+    ``indexer_scores`` rides alongside ``topk_indices`` rather than replacing it: the
+    indexer's score at each *selected* slot, which the indexer loss needs as the
+    student distribution and no index builder reads. It is ``None`` unless
+    ``dsa_indexer_loss`` is on, since the eager scorer has no scores to hand over and
+    the TileLang one would otherwise keep a tensor alive for nothing.
     """
 
     topk_indices: torch.Tensor | None = None
     range_starts: torch.Tensor | None = None
     range_ends: torch.Tensor | None = None
+    indexer_scores: torch.Tensor | None = None
 
 
 def _broadcast_query_ranges(bound: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:

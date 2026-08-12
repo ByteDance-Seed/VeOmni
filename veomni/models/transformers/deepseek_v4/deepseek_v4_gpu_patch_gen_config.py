@@ -257,6 +257,23 @@ def _indexer_loss_enabled(module) -> bool:
     return True
 
 
+@config.add_helper
+def _split_indexer_output(module, indexer_output):
+    """Unpack ``DeepseekV4Indexer.forward``'s return, whose arity follows the gate.
+
+    The indexer returns ``(top_k_indices, index_score)`` only when the loss is on, so
+    that a flag-off forward keeps exactly the arity every existing caller unpacks. The
+    two compressor call sites read it through here rather than through an
+    ``isinstance(..., tuple)`` test, so that the compressor and the indexer decide by
+    the same gate and a mismatch surfaces as an unpacking error at the call rather than
+    as a silently missing student distribution much later.
+    """
+    if not _indexer_loss_enabled(module):
+        return indexer_output, None
+    top_k_indices, index_score = indexer_output
+    return top_k_indices, index_score
+
+
 # ================================================================
 # Patch: DeepSeek V4 RMSNorm dispatch
 # ================================================================
@@ -544,7 +561,7 @@ def deepseek_v4_csa_compressor_forward_patched(
             apply_rope=apply_rotary_pos_emb,
         )
         compressed_kv = compressed.unsqueeze(1)
-        top_k_indices = self.indexer(
+        indexer_output = self.indexer(
             hidden_states,
             q_residual,
             position_ids,
@@ -553,7 +570,8 @@ def deepseek_v4_csa_compressor_forward_patched(
             packed_sequence_slices=packed_sequence_slices,
             packed_compression_metadata=packed_compression_metadata,
         )
-        candidates = CompressedCandidates(topk_indices=top_k_indices)
+        top_k_indices, indexer_scores = _split_indexer_output(self, indexer_output)
+        candidates = CompressedCandidates(topk_indices=top_k_indices, indexer_scores=indexer_scores)
         block_bias = (
             scatter_topk_block_bias(compressed_kv, top_k_indices, batch, seq_len) if build_block_bias else None
         )
@@ -599,8 +617,9 @@ def deepseek_v4_csa_compressor_forward_patched(
     if cache_layer is not None:
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     compressed_kv = compressed.unsqueeze(1)
-    top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
-    candidates = CompressedCandidates(topk_indices=top_k_indices)
+    indexer_output = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
+    top_k_indices, indexer_scores = _split_indexer_output(self, indexer_output)
+    candidates = CompressedCandidates(topk_indices=top_k_indices, indexer_scores=indexer_scores)
     block_bias = scatter_topk_block_bias(compressed_kv, top_k_indices, batch, seq_len) if build_block_bias else None
     return (compressed_kv, block_bias, candidates) if return_topk_indices else (compressed_kv, block_bias)
 
@@ -610,6 +629,10 @@ def deepseek_v4_csa_compressor_forward_patched(
 # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
 #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
 #    position layouts retain the upstream eager implementation.
+# 2. Under ``dsa_indexer_loss``, hand the per-slot index scores back next to the
+#    selection so the auxiliary KL has a student to train, and detach the inputs so
+#    that KL cannot reach the main model. The eager fallback is refused, because it
+#    discards those scores.
 # ================================================================
 @config.override_method("DeepseekV4Indexer.forward", description="Optional TileLang Lightning Indexer dispatch")
 def deepseek_v4_indexer_forward_patched(
@@ -621,9 +644,27 @@ def deepseek_v4_indexer_forward_patched(
     layer_idx: int,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-) -> torch.LongTensor:
+) -> torch.LongTensor | tuple[torch.LongTensor, torch.Tensor]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
+
+    # --- Patch.3 ---
+    # The indexer trains on its own KL alone (DeepSeek-V3.2 §2.1: "we detach the
+    # indexer input from the computational graph for separate optimization"). Until
+    # the scores started coming back out of here the graph was severed only by
+    # accident, because this forward returned integer indices, which carry no
+    # gradient; from here on this detach is the only thing keeping the auxiliary
+    # objective from reaching the language-modelling one.
+    #
+    # Read once, so the detach, the return arity and the eager refusal below cannot
+    # disagree inside a single call, and so the gate's own refusals land before this
+    # module does any work rather than after it.
+    indexer_loss_enabled = _indexer_loss_enabled(self)
+    if indexer_loss_enabled:
+        hidden_states = hidden_states.detach()
+        q_residual = q_residual.detach()
+    # --- Patch.3 ---
+
     batch, seq_len, _ = hidden_states.shape
     cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
     kv = self.kv_proj(hidden_states)
@@ -754,7 +795,7 @@ def deepseek_v4_indexer_forward_patched(
                 query_range_starts = query_range_starts[query_start:query_end]
                 query_range_ends = query_range_ends[query_start:query_end]
 
-        _, top_k_indices = v4_lighting_indexer(
+        index_score, top_k_indices = v4_lighting_indexer(
             query,
             compressed_kv.transpose(0, 1).contiguous(),
             query_weights,
@@ -769,8 +810,25 @@ def deepseek_v4_indexer_forward_patched(
                 gather_dim=1,
                 group=parallel_state.ulysses_group,
             )
+        # --- Patch.3 ---
+        # ``index_score`` needs no all-gather to match: the two branches are mutually
+        # exclusive, because ``_indexer_loss_enabled`` refuses ``ulysses_size > 1``
+        # outright (a head shard would make the teacher's head sum partial), so a
+        # partitioned score can never be the one being returned.
+        if indexer_loss_enabled:
+            return top_k_indices.to(torch.long), index_score
+        # --- Patch.3 ---
         return top_k_indices.to(torch.long)
     # --- Patch.1 ---
+
+    # --- Patch.3 ---
+    if indexer_loss_enabled:
+        raise RuntimeError(
+            "dsa_indexer_loss is enabled but the indexer fell back to the eager path, which "
+            "discards its scores. Check that hidden_states/compressed_kv are bf16 CUDA tensors "
+            "and that head count, head dim and compressed length satisfy the TileLang gate."
+        )
+    # --- Patch.3 ---
 
     scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
     scores = F.relu(scores) * self.softmax_scale

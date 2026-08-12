@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -21,6 +23,10 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_comp
 
 
 DEVICE = get_device_type()
+
+# The generated modeling module by import path, for ``mock.patch`` targets.
+_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
+
 
 # Warnings this module tolerates, matched as substrings of the warning message.
 # Everything else fails test_target_kernel_emits_no_unexpected_warnings, so a new
@@ -459,6 +465,46 @@ def test_indexer_loss_coef_accepts_finite_non_negative_weights(coef):
     assert config.dsa_indexer_loss_coef == coef
 
 
+@contextlib.contextmanager
+def _ops_config_slots_bound(pre_state):
+    """Put the generated module's ``OpsConfigSlot``s in a known state, and undo every
+    binding afterwards.
+
+    The slots are globals on a module shared with the rest of the session, so without
+    this a test leaks its configuration into whatever runs next — and a refusal test
+    that reads a value some earlier test happened to leave behind proves nothing about
+    the refusal it names. Binding ``pre_state`` closes the same hole from the other
+    side: a test that binds only some of the slots reads the rest from here, not from
+    the session. Both directions go through ``bind``, the same public path the tests
+    use.
+
+    The ``isinstance`` filter that collects the slots to restore would happily match
+    nothing at all — after a slot rename or a move out of the generated module —
+    leaving a teardown loop over an empty list and no failure anywhere, so the setup
+    asserts that every slot named in ``pre_state`` was found.
+    """
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+    from veomni.ops.dispatch import OpsConfigSlot
+
+    saved = [(slot, slot.value) for slot in vars(modeling).values() if isinstance(slot, OpsConfigSlot)]
+    collected = {slot.field_name: slot for slot, _ in saved}
+    missing = sorted(pre_state.keys() - collected.keys())
+    assert not missing, (
+        f"no OpsConfigSlot found on {modeling.__name__} for {missing}; this is the only "
+        "thing keeping the tests that bind slots independent of each other and of the "
+        "session, and it just restored nothing"
+    )
+    for field_name, value in pre_state.items():
+        collected[field_name].bind(SimpleNamespace(**{field_name: value}))
+    try:
+        yield
+    finally:
+        for slot, value in saved:
+            slot.bind(SimpleNamespace(**{slot.field_name: value}))
+
+
 class TestIndexerLossGate:
     """``_indexer_loss_enabled``: the three refusals, the flag-off path, and the one
     configuration that enables the loss.
@@ -500,39 +546,14 @@ class TestIndexerLossGate:
 
     @pytest.fixture(autouse=True)
     def _restore_ops_config_slots(self):
-        """Put the gate's slots in a known state, and undo every binding afterwards.
+        """Bind the pre-state above before each test and restore every slot after it.
 
-        The slots are globals on a module shared with the rest of the session, so
-        without this a test leaks its configuration into whatever runs next — and a
-        refusal test that reads a value some earlier test happened to leave behind
-        proves nothing about the refusal it names. Binding the pre-state closes the
-        same hole from the other side: a test that binds only some of the slots reads
-        the rest from here, not from the session. Both directions go through
-        ``bind``, the same public path the tests use.
-
-        The ``isinstance`` filter that collects the slots to restore would happily
-        match nothing at all — after a slot rename or a move out of the generated
-        module — leaving a teardown loop over an empty list and no failure anywhere,
-        so the setup asserts that the slots the gate actually reads were found.
+        See ``_ops_config_slots_bound`` for why both directions are load-bearing. It
+        lives at module scope because the tests below this class bind slots too and
+        need exactly the same protection.
         """
-        from types import SimpleNamespace
-
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
-        from veomni.ops.dispatch import OpsConfigSlot
-
-        saved = [(slot, slot.value) for slot in vars(modeling).values() if isinstance(slot, OpsConfigSlot)]
-        collected = {slot.field_name: slot for slot, _ in saved}
-        missing = sorted(self._GATE_SLOT_PRE_STATE.keys() - collected.keys())
-        assert not missing, (
-            f"no OpsConfigSlot found on {modeling.__name__} for {missing}; this fixture is the only "
-            "thing keeping the tests in this class independent of each other and of the session, "
-            "and it just restored nothing"
-        )
-        for field_name, value in self._GATE_SLOT_PRE_STATE.items():
-            collected[field_name].bind(SimpleNamespace(**{field_name: value}))
-        yield
-        for slot, value in saved:
-            slot.bind(SimpleNamespace(**{slot.field_name: value}))
+        with _ops_config_slots_bound(self._GATE_SLOT_PRE_STATE):
+            yield
 
     def test_indexer_loss_refuses_ulysses(self, monkeypatch):
         """Ulysses shards heads across ranks, so the head sum inside the teacher would
@@ -656,3 +677,352 @@ class TestIndexerLossGate:
             return_value=state,
         ):
             assert modeling._indexer_loss_enabled(object()) is True
+
+
+_TOY_CONFIG_DIR = Path(__file__).resolve().parents[1] / "toy_config" / "deepseek_v4_toy"
+
+
+def _dsv4_indexer_test_config():
+    """The toy DeepSeek-V4 config, re-geometried to the 4-layer checkpoint's indexer.
+
+    ``index_n_heads=64`` / ``index_head_dim=128`` / ``index_topk=512`` over the CSA
+    compression rate of 4 are the values ``DeepSeek-V4-Flash-Base-4L/config.json``
+    ships, and the indexer forward's TileLang gate reads every one of them: the head
+    count and the head dim decide whether the kernel is eligible at all, and
+    ``index_topk`` against the compressed length decides how wide the score the loss
+    trains on is. The toy config's own ``index_n_heads=8`` would take the head count
+    off production's boundary of 64.
+
+    ``hidden_size`` (256) and ``q_lora_rank`` (64) stay at the toy config's values
+    rather than the checkpoint's 4096 / 1024: nothing under test reads them beyond the
+    widths of the indexer's two input projections.
+    """
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(str(_TOY_CONFIG_DIR))
+    config.index_n_heads = 64
+    config.index_head_dim = 128
+    config.index_topk = 512
+    return config
+
+
+def _build_test_indexer(device="cuda", dtype=torch.bfloat16):
+    """A ``DeepseekV4Indexer`` on the geometry above, ready to call.
+
+    ``position_bias`` is a ``torch.empty`` parameter in the upstream constructor, so a
+    directly built indexer scores against uninitialised memory until it is zeroed.
+
+    Returns the config alongside the module because the caller needs both
+    ``hidden_size`` and ``q_lora_rank`` to build inputs, and they differ — the indexer
+    projects ``hidden_states`` for its keys, gates and per-head weights but
+    ``q_residual`` for its queries, so one ``randn_like`` cannot serve for both.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = _dsv4_indexer_test_config()
+    indexer = modeling.DeepseekV4Indexer(config).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        torch.nn.init.zeros_(indexer.position_bias)
+    return indexer, config
+
+
+def _build_test_csa_compressor(device="cuda", dtype=torch.bfloat16):
+    """A ``DeepseekV4CSACompressor`` around an indexer of the same geometry.
+
+    Both modules declare ``position_bias`` as ``torch.empty``, and the compressor's own
+    is the easy one to forget because it sits one level above the module under test.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = _dsv4_indexer_test_config()
+    compressor = modeling.DeepseekV4CSACompressor(config).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        torch.nn.init.zeros_(compressor.position_bias)
+        torch.nn.init.zeros_(compressor.indexer.position_bias)
+    return compressor, config
+
+
+def _run_indexer(indexer, hidden_states, q_residual, position_ids=None, **kwargs):
+    """Call the indexer exactly as ``DeepseekV4CSACompressor.forward`` calls it.
+
+    Positional, in the compressor's argument order, with the compressor's ``None``
+    cache and its layer index, so that a change to the real call site's shape breaks
+    these tests rather than leaving them agreeing with a signature nothing uses. The
+    compressor's own two call sites are exercised directly by
+    ``test_csa_compressor_carries_the_indexer_scores``.
+    """
+    if position_ids is None:
+        position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+    return indexer(hidden_states, q_residual, position_ids, None, 0, **kwargs)
+
+
+def _bind_indexer_loss(*, enabled):
+    """Bind every slot ``_indexer_loss_enabled`` reads, with the two implementation
+    slots on the one configuration the loss supports.
+
+    All three, always: a test that left one unbound would read it from whatever ran
+    before, and a deleted guard would then fall into a neighbouring refusal instead of
+    through to the behaviour under test.
+    """
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=enabled))
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+
+
+@contextlib.contextmanager
+def _single_rank_parallel_state():
+    """Pin the ambient parallel state to a real single-rank ``ParallelState``.
+
+    Both ``_indexer_loss_enabled`` and the indexer forward resolve
+    ``get_parallel_state()``, and an uninitialised process only returns a default
+    single-rank state *because* nothing has initialised one — which is a fact about the
+    session, not about the code under test. A real ``ParallelState`` rather than a
+    namespace, for the reason ``test_indexer_loss_refuses_ulysses`` gives: a duck-typed
+    stand-in survives a rename of a field the production path would raise on.
+    """
+    from unittest import mock
+
+    from veomni.distributed.parallel_state import ParallelState
+
+    state = ParallelState(dp_size=1, ulysses_size=1)
+    with mock.patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=state):
+        yield state
+
+
+@contextlib.contextmanager
+def _counting_tilelang_indexer():
+    """Count the calls that reach the TileLang Lightning Indexer kernel.
+
+    Without this, a test that means to exercise the kernel branch would still pass if
+    the forward quietly took the eager fallback — which returns a bare index tensor
+    too, so the arity assertions below would be satisfied by the path they are not
+    about.
+    """
+    from unittest import mock
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    calls = []
+    real_kernel = modeling.v4_lighting_indexer
+
+    def _counting(*args, **kwargs):
+        calls.append(None)
+        return real_kernel(*args, **kwargs)
+
+    with mock.patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counting):
+        yield calls
+
+
+class TestIndexerScoresAndDecoupling:
+    """The indexer returning its scores, and detaching its own inputs to pay for it.
+
+    Returning ``index_score`` is what gives the KL a student to train; the detach is
+    what stops that KL from reaching the language-modelling objective. They belong in
+    one group because they are one change: before it, the indexer's forward returned
+    integer indices and the graph was severed by accident.
+
+    Every test here binds all three of the gate's slots through ``_bind_indexer_loss``
+    and pins the parallel state, and the class-scoped fixture restores every slot
+    afterwards, so nothing leaks into the rest of the session.
+    """
+
+    # Every test here imports the generated modeling module; see the note on
+    # ``_HDFS_STDENV_DEPRECATION_FILTER`` for what that drags in.
+    pytestmark = _HDFS_STDENV_DEPRECATION_FILTER
+
+    # Supported but off, matching ``TestIndexerLossGate``: a test that failed to bind a
+    # slot reads it from here rather than from whatever the session left behind.
+    _SLOT_PRE_STATE = {
+        "dsa_indexer_loss": False,
+        "dsa_indexer_implementation": "eager",
+        "dsa_attention_implementation": "eager",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _restore_ops_config_slots(self):
+        with _ops_config_slots_bound(self._SLOT_PRE_STATE):
+            yield
+
+    def test_indexer_detaches_its_input(self):
+        """The indexer must not backpropagate into the main model.
+
+        DeepSeek-V3.2 §2.1: "we detach the indexer input from the computational graph
+        for separate optimization." Until this change the graph was severed only by
+        accident, because the forward returned integer indices, which carry no
+        gradient. Returning ``index_score`` ends that accident: without an explicit
+        detach the KL would flow back through the indexer's projections into
+        ``hidden_states`` and perturb the LM objective.
+
+        The parameter half of the assertions is not a formality either. A detach
+        placed one line too late — after the projections rather than before them —
+        would still leave ``hidden_states.grad`` unset while cutting the indexer off
+        from its own gradient, so the loss would train nothing. All three of
+        ``q_b_proj`` / ``kv_proj`` / ``weights_proj`` are checked because they are
+        exactly the three tensors ``v4_lighting_indexer`` differentiates: the query,
+        the compressed key and the per-head weight. ``grad.abs().sum() > 0`` rather
+        than a ``grad_fn`` check, because a graph that exists and carries zeros trains
+        nothing.
+        """
+        _require_tilelang_cuda()
+        _bind_indexer_loss(enabled=True)
+
+        seq_len = 2048
+        indexer, config = _build_test_indexer(device="cuda")
+        hidden = torch.randn(1, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        q_residual = torch.randn(
+            1, seq_len, config.q_lora_rank, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+
+        with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
+            top_k_indices, index_score = _run_indexer(indexer, hidden, q_residual)
+        assert len(kernel_calls) == 1, "the TileLang scorer is the only path that has scores to return"
+
+        # The contract Task 5 reads: one score per selected slot, in fp32.
+        assert index_score.shape == top_k_indices.shape
+        assert index_score.dtype == torch.float32
+        # ``-inf`` marks the invalid slots and ``nan_to_num``'s own backward zeroes the
+        # gradient there, so this reduction stays finite and touches only real slots.
+        index_score.float().nan_to_num(neginf=0.0).sum().backward()
+
+        assert hidden.grad is None, "indexer input must be detached"
+        assert q_residual.grad is None, "indexer q_residual must be detached"
+        for name in ("q_b_proj", "kv_proj", "weights_proj"):
+            grad = getattr(indexer, name).weight.grad
+            assert grad is not None, f"{name} received no gradient from the indexer score"
+            assert grad.abs().sum() > 0, f"{name} received an all-zero gradient"
+
+    def test_indexer_returns_indices_only_with_the_loss_off(self):
+        """Default off means the return *arity* is what it was, not just the values.
+
+        This is the only test that pins the off side of that branch. Invert it and the
+        two-tuple leaks into every flag-off forward: ``DeepseekV4CSACompressor`` would
+        keep working, because it unpacks by the same gate, and the break would surface
+        somewhere else entirely — the CP and Ulysses suites call the indexer directly.
+        """
+        _require_tilelang_cuda()
+        _bind_indexer_loss(enabled=False)
+
+        seq_len = 2048
+        indexer, config = _build_test_indexer(device="cuda")
+        hidden = torch.randn(1, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        q_residual = torch.randn(1, seq_len, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
+
+        with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
+            result = _run_indexer(indexer, hidden, q_residual)
+
+        assert len(kernel_calls) == 1, "the eager fallback returns a bare tensor too, so it pins nothing here"
+        assert isinstance(result, torch.Tensor), f"expected a bare index tensor, got {type(result).__name__}"
+        assert result.dtype == torch.long
+        assert result.shape == (1, seq_len, min(config.index_topk, seq_len // indexer.compress_rate))
+
+    def test_indexer_refuses_the_eager_fallback_under_the_loss(self):
+        """A configuration that passes every construction-time check can still miss the
+        kernel at runtime, and the eager path discards its scores.
+
+        ``use_tilelang`` is decided per call out of dtypes, devices and shapes, so this
+        refusal cannot live where Task 3's configuration refusals live. The miss staged
+        here is the device — CPU tensors — but an fp32 activation dtype or a head count
+        outside the kernel's range lands at the same line. Silence is the worst outcome
+        available: the loss would train on nothing at all while its curve looked
+        entirely reasonable.
+
+        The match is on ``fell back to the eager path``, which no other message in the
+        generated module contains. ``eager`` alone would also be satisfied by the
+        ``dsa_indexer_implementation`` refusal, and a match on TileLang by the
+        attention forward's own runtime refusal a few hundred lines down.
+        """
+        _bind_indexer_loss(enabled=True)
+
+        indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
+        hidden = torch.randn(1, 32, config.hidden_size)
+        q_residual = torch.randn(1, 32, config.q_lora_rank)
+
+        with _single_rank_parallel_state():
+            with pytest.raises(RuntimeError, match="fell back to the eager path"):
+                _run_indexer(indexer, hidden, q_residual)
+
+    def test_indexer_eager_fallback_still_runs_with_the_loss_off(self):
+        """The refusal above is conditional, and this is the only test that says so.
+
+        The eager scorer is the production path for cache/decode and for any layout the
+        kernel declines, so a refusal that fired regardless of the flag would break
+        inference for every DeepSeek-V4 model in the tree — while the suite stayed
+        green on the enabled path, because that path never reaches the eager scorer.
+        """
+        _bind_indexer_loss(enabled=False)
+
+        indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
+        hidden = torch.randn(1, 32, config.hidden_size)
+        q_residual = torch.randn(1, 32, config.q_lora_rank)
+
+        with _single_rank_parallel_state():
+            result = _run_indexer(indexer, hidden, q_residual)
+
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (1, 32, 32 // indexer.compress_rate)
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_csa_compressor_carries_the_indexer_scores(self, packed):
+        """``CompressedCandidates.indexer_scores`` is how the scores reach the loss.
+
+        Both of ``DeepseekV4CSACompressor.forward``'s indexer call sites are exercised
+        — the packed one and the contiguous one — because each builds its own
+        ``CompressedCandidates`` and a dropped field at one is invisible from the
+        other.
+
+        The flag-off half is not a bonus. It pins that the compressor unpacks by the
+        same gate the indexer returns by, and the index comparison pins that turning
+        the loss on leaves the selection the model attends over untouched: a detach
+        cannot change a forward value, so exact equality is the right bar and any
+        tolerance would hide a real perturbation of the LM path.
+        """
+        _require_tilelang_cuda()
+
+        seq_len = 2048
+        compressor, config = _build_test_csa_compressor(device="cuda")
+        hidden = torch.randn(1, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        q_residual = torch.randn(1, seq_len, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
+        if packed:
+            from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+
+            sequence_slices = ((0, 1024), (1024, seq_len))
+            position_ids = torch.cat(
+                [torch.arange(end - start, device="cuda") for start, end in sequence_slices]
+            ).unsqueeze(0)
+            packed_kwargs = {
+                "packed_sequence_slices": sequence_slices,
+                "packed_compression_metadata": build_packed_compression_metadata(
+                    hidden, position_ids, sequence_slices, (compressor.compress_rate,)
+                ),
+            }
+        else:
+            position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+            packed_kwargs = {}
+
+        def _candidates():
+            with _single_rank_parallel_state():
+                _, _, candidates = compressor(
+                    hidden, q_residual, position_ids, None, 0, return_topk_indices=True, **packed_kwargs
+                )
+            return candidates
+
+        _bind_indexer_loss(enabled=False)
+        without_loss = _candidates()
+        assert without_loss.indexer_scores is None, "the scores must not appear with the loss off"
+
+        _bind_indexer_loss(enabled=True)
+        with_loss = _candidates()
+        scores = with_loss.indexer_scores
+        assert scores is not None, "the compressor dropped the indexer scores on the floor"
+        assert scores.shape == with_loss.topk_indices.shape
+        assert scores.dtype == torch.float32
+        # The kernel marks a miss with ``-1`` and scores it ``-inf``. The loss reads the
+        # two together, so anything but an exact correspondence means they are
+        # describing different slots.
+        assert (with_loss.topk_indices < 0).any(), "no invalid slot here, so the -inf correspondence is untested"
+        assert torch.equal(torch.isneginf(scores), with_loss.topk_indices < 0)
+        assert torch.equal(with_loss.topk_indices, without_loss.topk_indices)
