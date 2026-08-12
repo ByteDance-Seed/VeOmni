@@ -1902,6 +1902,45 @@ def _build_4layer_test_model(
     return model, batch
 
 
+@contextlib.contextmanager
+def _checkpointed_layer_calls_recorded(model):
+    """Record the calls that actually go through each decoder layer's checkpointing.
+
+    ``GradientCheckpointingLayer.__call__`` runs the layer through
+    ``self._gradient_checkpointing_func`` only when ``self.gradient_checkpointing and
+    self.training`` (``transformers/modeling_layers.py:60,92``), and falls through to
+    an ordinary call otherwise. Wrapping that function observes the branch being
+    taken, rather than inferring it from the attributes that decide it: a model that
+    was never put in training mode, or whose layers never received the flag, records
+    nothing at all here.
+
+    The recorded ``use_reentrant`` is read off the ``functools.partial``
+    ``gradient_checkpointing_enable`` built, so it also pins that the parametrised
+    setting is the one the checkpoint call receives -- otherwise the two legs of that
+    parametrisation could be running the same thing.
+    """
+    recorded = []
+    originals = []
+    for layer in model.model.layers:
+        original = getattr(layer, "_gradient_checkpointing_func", None)
+        assert original is not None, (
+            f"decoder layer {layer.layer_idx} has no _gradient_checkpointing_func, so "
+            "gradient checkpointing was never enabled on it"
+        )
+
+        def _recording(*args, _layer=layer, _original=original, **kwargs):
+            recorded.append((_layer.layer_idx, _original.keywords.get("use_reentrant")))
+            return _original(*args, **kwargs)
+
+        layer._gradient_checkpointing_func = _recording
+        originals.append((layer, original))
+    try:
+        yield recorded
+    finally:
+        for layer, original in originals:
+            layer._gradient_checkpointing_func = original
+
+
 def _csa_layers(model):
     """The layers carrying a Lightning Indexer, i.e. the ones that can build a KL."""
     return [
@@ -1955,12 +1994,29 @@ class TestFourLayerModelIndexerKL:
         smuggled out through a side channel rather than through the layer's return
         value is graph-less -- and a ``grad_fn`` proxy would not notice. The KL would
         still log a plausible decreasing number while the indexer learned nothing.
+
+        Checkpointing is asserted engaged rather than trusted. Enabling it and
+        believing the call is not enough: with checkpointing silently off, every
+        assertion below still holds, so the whole acceptance criterion would be
+        vacuous and nothing would say so. The ``[True]`` leg has independent evidence
+        -- the side-channel mutation fails it and passes ``[False]`` -- but ``[False]``
+        is the setting production runs, and it had none.
         """
         _require_tilelang_cuda()
         model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, enable_reentrant=enable_reentrant)
-        with _single_rank_parallel_state():
+        with _single_rank_parallel_state(), _checkpointed_layer_calls_recorded(model) as checkpointed:
             out = model(**batch)
             out.loss.backward()
+
+        assert [layer_idx for layer_idx, _ in checkpointed] == list(range(len(model.model.layers))), (
+            f"gradient checkpointing ran on layers {[i for i, _ in checkpointed]}, not on every layer of "
+            f"the {len(model.model.layers)}-layer model: the forward this criterion is about was not the "
+            "checkpointed one"
+        )
+        assert {reentrant for _, reentrant in checkpointed} == {enable_reentrant}, (
+            f"the checkpoint calls ran with use_reentrant="
+            f"{ {reentrant for _, reentrant in checkpointed} }, not the parametrised {enable_reentrant}"
+        )
 
         csa = _csa_layers(model)
         assert csa, "test model must contain at least one CSA layer"
