@@ -1131,6 +1131,18 @@ class OpsImplementationConfig:
         default="eager",
         metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
     )
+    dsa_indexer_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) "
+            "sparse KL objective. Requires dsa_indexer_implementation='tilelang', "
+            "dsa_attention_implementation='tilelang', and ulysses_size == 1."
+        },
+    )
+    dsa_indexer_loss_coef: float = field(
+        default=1.0,
+        metadata={"help": "Weight on the indexer KL when folding it into the total loss."},
+    )
     mhc_implementation: Literal["eager", "tilelang"] = field(
         default="eager",
         metadata={

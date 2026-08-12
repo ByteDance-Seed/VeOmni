@@ -361,3 +361,49 @@ def test_sparse_attn_returns_non_differentiable_lse():
 
     out.sum().backward()
     assert q.grad is not None and torch.isfinite(q.grad).all()
+
+
+def test_indexer_loss_refuses_ulysses():
+    """Ulysses shards heads across ranks, so the head sum inside the teacher would
+    only cover this rank's shard. That is a *wrong* teacher rather than a missing
+    one, and it would still produce a decreasing loss curve, so the gate has to
+    refuse rather than warn."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+    with mock.patch(
+        "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
+        return_value=SimpleNamespace(ulysses_enabled=True, ulysses_size=2, cp_enabled=False, cp_size=1),
+    ):
+        with pytest.raises(ValueError, match="Ulysses"):
+            modeling._indexer_loss_enabled(object())
+
+
+def test_indexer_loss_refuses_eager_indexer():
+    """The eager indexer discards its scores, so there would be no student to
+    train against and the KL would have nothing to say."""
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+    with pytest.raises(ValueError, match="tilelang"):
+        modeling._indexer_loss_enabled(object())
+
+
+def test_indexer_loss_off_by_default():
+    """With the flag off, none of the refusals above fire: an eager indexer is a
+    perfectly ordinary configuration until someone asks for the loss."""
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=False))
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+    assert modeling._indexer_loss_enabled(object()) is False

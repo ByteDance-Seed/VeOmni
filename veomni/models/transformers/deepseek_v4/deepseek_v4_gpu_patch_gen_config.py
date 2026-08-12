@@ -137,6 +137,12 @@ veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
 veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+# ``OpsConfigSlot``'s own default is the string ``"eager"``: right for the
+# ``*_implementation`` slots above, but truthy, and not a number. Left at that
+# default, an unbound ``dsa_indexer_loss`` would read as *on* and an unbound
+# coefficient would be a string, so both defaults are given explicitly.
+veomni_dsa_indexer_loss = OpsConfigSlot("dsa_indexer_loss", default=False)
+veomni_dsa_indexer_loss_coef = OpsConfigSlot("dsa_indexer_loss_coef", default=1.0)
 
 # Names resolved at codegen time from generated imports.
 get_parallel_state = None
@@ -211,8 +217,39 @@ config.add_post_import_block(
     veomni_mhc_head = OpSlot("mhc", "head")
     veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
     veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+    veomni_dsa_indexer_loss = OpsConfigSlot("dsa_indexer_loss", default=False)
+    veomni_dsa_indexer_loss_coef = OpsConfigSlot("dsa_indexer_loss_coef", default=1.0)
     """
 )
+
+
+@config.add_helper
+def _indexer_loss_enabled(module) -> bool:
+    """Whether to build the indexer KL, refusing loudly on unsupported setups.
+
+    Silence is the failure mode worth designing against here: every unsupported
+    configuration below would otherwise train the indexer on a wrong signal, or
+    on none, while the loss curve looked entirely reasonable.
+    """
+    if not veomni_dsa_indexer_loss.value:
+        return False
+    if veomni_dsa_indexer_implementation.value != "tilelang":
+        raise ValueError(
+            "dsa_indexer_loss requires dsa_indexer_implementation='tilelang'; the eager "
+            "indexer discards its scores, so the loss would have nothing to train against"
+        )
+    if veomni_dsa_attention_implementation.value != "tilelang":
+        raise ValueError(
+            "dsa_indexer_loss requires dsa_attention_implementation='tilelang'; the teacher "
+            "distribution is derived from the TileLang attention LSE"
+        )
+    state = get_parallel_state()
+    if getattr(state, "ulysses_size", 1) > 1:
+        raise ValueError(
+            "dsa_indexer_loss does not support Ulysses: each rank holds a head shard, so the "
+            "head sum in the teacher would be partial. Use context parallelism instead."
+        )
+    return True
 
 
 # ================================================================
