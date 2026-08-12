@@ -652,6 +652,13 @@ class BaseTrainer(Stateful, ABC):
             callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None, **kwargs):
+        # Every trainer funnels its step here, including the four that keep their
+        # own copy of the accumulation loop, so this is the one place that sees
+        # the step's micro-batch count for all of them. ``postforward`` needs it
+        # to normalize aux metrics; setting it per-loop instead would let the
+        # next trainer forget and silently report those metrics N times too high.
+        if micro_batches is not None:
+            self.num_micro_batches = len(micro_batches)
         for callback in self._callbacks:
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
@@ -708,9 +715,8 @@ class BaseTrainer(Stateful, ABC):
             # metric such as ``indexer_kl`` that is the step's per-token mean when the
             # micro-batches carry equal token counts, and unlike a token-share
             # weighting it assumes nothing about which denominator a metric used.
-            # The value is rank-local; ``EnvironMeterCallback.on_step_end`` already
-            # averages it over the FSDP group, and a per-micro-batch collective is
-            # not worth it for a diagnostic.
+            # ``on_step_begin`` sets the count; the default covers callers that reach
+            # a single forward without a step, such as tests.
             num_micro_batches = getattr(self, "num_micro_batches", 1)
             loss_dict.update({key: value.detach() / num_micro_batches for key, value in aux_metrics.items()})
         return loss, loss_dict
@@ -803,8 +809,6 @@ class BaseTrainer(Stateful, ABC):
         self.micro_batches_token_len = count_loss_token(micro_batches)
         self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
-        # Read by postforward to average aux metrics over the step's micro batches.
-        self.num_micro_batches = num_micro_steps
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
             mark_compile_step_begin(getattr(self.model, "_veomni_compile_uses_cuda_graphs", False))

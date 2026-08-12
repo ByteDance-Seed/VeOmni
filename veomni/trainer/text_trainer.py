@@ -129,8 +129,6 @@ class TextTrainer:
         self.base.micro_batches_token_len = count_loss_token(micro_batches)
         self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
-        # Read by BaseTrainer.postforward to average aux metrics over the step.
-        self.base.num_micro_batches = num_micro_steps
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
             mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
