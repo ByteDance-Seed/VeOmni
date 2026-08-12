@@ -12,10 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 import pytest
 import torch
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+
+
+# Warnings this module tolerates, matched as substrings of the warning message.
+# Everything else fails test_target_kernel_emits_no_unexpected_warnings, so a new
+# warning cannot slip into a run unnoticed. Only add an entry for a warning that
+# provably originates outside this repository; a warning raised by our own code is
+# a bug to fix, not an entry here.
+_TOLERATED_WARNING_SUBSTRINGS = (
+    # tilelang deprecating one of its own pass-config keys. Raised from
+    # tilelang/transform/pass_config.py::normalize_pass_configs on every
+    # JITKernel construction, for the `TL_DISABLE_TMA_LOWER` config that every
+    # DeepSeek-V4 tilelang kernel in this tree sets -- including the attention
+    # forward these tests call to produce the LSE.
+    "`tl.disable_tma_lower` is deprecated",
+)
 
 
 def reference_compressed_target(q, kv, attn_sink, topk_idxs, compressed_start, sm_scale):
@@ -88,6 +105,31 @@ def test_reference_target_is_normalised():
     assert (target >= 0).all()
 
 
+def test_reference_target_all_invalid_compressed_row_is_zero():
+    """A query whose *compressed* slots are all misses is not a distribution.
+
+    ``test_reference_target_is_normalised`` only masks a slot in the window slice,
+    where the compressed mass is unaffected. When the whole compressed slice
+    misses, the mass being normalised is exactly zero and the ``clamp_min(1e-20)``
+    divides it by a floor instead of by itself, so the row comes out as zeros
+    rather than as a uniform distribution or a NaN. A later task takes a KL
+    against this row and has to tolerate it, so the contract is pinned here and
+    in ``test_target_kernel_all_invalid_compressed_row_is_zero`` for the kernel.
+    """
+    torch.manual_seed(3)
+    b, s, h, d, w, c = 1, 2, 2, 16, 4, 4
+    q = torch.randn(b, s, h, d)
+    kv = torch.randn(b, w + c, d)
+    topk = torch.arange(w + c).view(1, 1, -1).expand(b, s, -1).contiguous().to(torch.int32)
+    topk[0, 0, w:] = -1  # query 0 keeps a valid window and loses every compressed slot
+
+    target = reference_compressed_target(q, kv, torch.zeros(h), topk, w, d**-0.5)
+    assert (target[0, 0] == 0).all()
+    assert not torch.isnan(target).any()
+    # The zero row is local: the untouched query is still normalised.
+    assert torch.allclose(target[0, 1].sum(), torch.ones(()), atol=1e-5)
+
+
 def _require_tilelang_cuda():
     pytest.importorskip("tilelang")
     if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
@@ -97,30 +139,46 @@ def _require_tilelang_cuda():
 
 
 @pytest.mark.parametrize("heads", [8, 16, 64])
-def test_target_kernel_matches_reference(heads):
+@pytest.mark.parametrize("c", [64, 128, 100])
+def test_target_kernel_matches_reference(heads, c):
     """``heads=8`` pads to 16 inside the kernel; the padded heads must contribute
     nothing to the head sum. That is not automatic — a padded head has zero Q and
-    would contribute ``exp2(0 - lse_pad)`` unless its LSE is padded to +inf."""
+    would contribute ``exp2(0 - lse_pad)`` unless its LSE is padded to +inf.
+
+    The ``c`` axis is the number of ``block_I``-sized slot tiles the kernel's
+    ``T.Pipelined(NI)`` loop runs, which is the axis production actually stresses:
+    ``index_topk = 512`` at ``block_I = 64`` is ``NI = 8``, never the ``NI = 1``
+    that ``c = 64`` alone exercises. ``c = 128`` gives ``NI = 2``, so the loop body
+    runs more than once against a reused ``tgt`` fragment and a moving output
+    slice. ``c = 100`` gives ``NI = 2`` *and* is not a multiple of ``block_I``, so
+    it is the only case that runs the interface's ``-1``-sentinel padding and the
+    final ``[:, :, :topk]`` slice that has to hide it again.
+    """
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
     from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
 
     torch.manual_seed(0)
-    b, s, d, w, c = 2, 8, 64, 64, 64
+    b, s, d, w = 2, 8, 64, 64
     device = "cuda"
     q = torch.randn(b, s, heads, d, device=device, dtype=torch.bfloat16)
     kv = torch.randn(b, 256, d, device=device, dtype=torch.bfloat16)
     sink = torch.randn(heads, device=device, dtype=torch.float32)
     topk = torch.randint(0, 256, (b, s, w + c), device=device, dtype=torch.int32)
-    topk[0, 0, w] = -1  # a compressed miss
+    topk[0, 0, w] = -1  # a compressed miss in the first slot tile
+    topk[1, 0, w + c - 1] = -1  # and one in the last, which only NI > 1 reaches
     scale = d**-0.5
 
     _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
     actual = sparse_mqa_target_fwd_interface(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
+    # The sentinel padding a non-multiple ``c`` needs must not survive into the
+    # returned shape.
+    assert actual.shape == (b, s, c)
     actual = actual / actual.sum(-1, keepdim=True).clamp_min(1e-20)
 
     expected = reference_compressed_target(q, kv, sink, topk, w, scale)
-    # A normalised entry is ~1/C ~ 0.015 here, so a tolerance of the order of
+    # A normalised entry is ~1/C, i.e. 0.008 to 0.016 across this
+    # parametrisation, so a tolerance of the order of
     # 1e-2 would exceed the values being compared and accept anything. It is not
     # a hypothetical: summing the wrong axis of the score tile yields a
     # per-head row sum whose normalised form sits 1.5e-2 from the truth, i.e.
@@ -151,6 +209,39 @@ def test_target_kernel_zeroes_invalid_slots():
     assert (target[:, :, 3] == 0).all()
 
 
+def test_target_kernel_all_invalid_compressed_row_is_zero():
+    """The kernel's half of the contract pinned in
+    ``test_reference_target_all_invalid_compressed_row_is_zero``: an all-miss
+    compressed row comes back as exact zeros, and the caller's ``clamp_min``
+    normalisation leaves it as zeros rather than turning it into a NaN or a
+    uniform distribution."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+
+    torch.manual_seed(4)
+    b, s, heads, d, w, c = 1, 4, 16, 64, 64, 64
+    q = torch.randn(b, s, heads, d, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(b, 256, d, device="cuda", dtype=torch.bfloat16)
+    sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
+    topk = torch.randint(0, 256, (b, s, w + c), device="cuda", dtype=torch.int32)
+    topk[0, 0, w:] = -1  # query 0 keeps a valid window and loses every compressed slot
+    scale = d**-0.5
+
+    _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
+    raw = sparse_mqa_target_fwd_interface(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
+    assert (raw[0, 0] == 0).all()
+
+    normalised = raw / raw.sum(-1, keepdim=True).clamp_min(1e-20)
+    assert (normalised[0, 0] == 0).all()
+    assert not torch.isnan(normalised).any()
+    # Still local: the queries with valid compressed slots are unaffected.
+    assert (raw[0, 1:] > 0).any()
+    assert torch.allclose(normalised[0, 1:].sum(-1), torch.ones(s - 1, device="cuda"), atol=1e-5)
+    # And the reference agrees on the same input, so the contract is one contract.
+    assert (reference_compressed_target(q, kv, sink, topk, w, scale)[0, 0] == 0).all()
+
+
 def test_target_kernel_rejects_more_than_64_heads():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
@@ -159,5 +250,72 @@ def test_target_kernel_rejects_more_than_64_heads():
     kv = torch.randn(1, 128, 64, device="cuda", dtype=torch.bfloat16)
     topk = torch.zeros(1, 2, 64, device="cuda", dtype=torch.int32)
     lse = torch.zeros(1, 2, 128, device="cuda", dtype=torch.float32)
-    with pytest.raises(AssertionError, match="64"):
+    # Matching on "64" alone would also be satisfied by the head-multiple assert
+    # or by any message that happens to mention a shape of 64.
+    with pytest.raises(AssertionError, match="one block owns the head sum"):
         sparse_mqa_target_fwd_interface(q, kv, topk, lse)
+
+
+def test_target_kernel_rejects_head_counts_the_interface_cannot_emit():
+    """``heads % 16 == 0`` on its own admits 48, which no interface call can
+    produce -- padding is ``max(next_power_of_2(heads), 16)``, so one of
+    {16, 32, 64} -- and which ``T.GemmWarpPolicy.FullRow`` cannot partition: with
+    the guard removed, lowering dies on ``Check failed: (m_warp * n_warp ==
+    num_warps) is false: m_warp: 3, n_warp: 2, num_warps: 8``. Only a caller that
+    bypasses the interface can reach this, which is exactly what this test does.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target
+
+    with pytest.raises(AssertionError, match=r"padded to one of \(16, 32, 64\)"):
+        sparse_mqa_target(48, 64, 64)
+
+
+def test_target_kernel_rejects_non_bfloat16_inputs():
+    """The kernel hardcodes ``dtype = T.bfloat16``; the interface names that
+    constraint instead of letting an fp16 caller fall into tilelang's lowering."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+
+    q = torch.randn(1, 2, 16, 64, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(1, 128, 64, device="cuda", dtype=torch.bfloat16)
+    topk = torch.zeros(1, 2, 64, device="cuda", dtype=torch.int32)
+    lse = torch.zeros(1, 2, 16, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(AssertionError, match="bfloat16-only, got q"):
+        sparse_mqa_target_fwd_interface(q.to(torch.float16), kv, topk, lse)
+    with pytest.raises(AssertionError, match="bfloat16-only, got kv"):
+        sparse_mqa_target_fwd_interface(q, kv.to(torch.float16), topk, lse)
+
+
+def test_target_kernel_emits_no_unexpected_warnings():
+    """Pin the warning set, so a newly introduced warning is a failure rather than
+    an unexplained bump in pytest's summary count.
+
+    ``heads = 32`` is used by no other test in this module, so both kernels below
+    are constructed here rather than being served from tilelang's in-process
+    cache; that is what makes the construction-time warnings observable at all.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+
+    torch.manual_seed(5)
+    b, s, heads, d, w, c = 1, 2, 32, 64, 64, 64
+    q = torch.randn(b, s, heads, d, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(b, 256, d, device="cuda", dtype=torch.bfloat16)
+    sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
+    topk = torch.randint(0, 256, (b, s, w + c), device="cuda", dtype=torch.int32)
+    scale = d**-0.5
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _, lse = sparse_mqa_fwd_interface(q, kv, sink, topk, sm_scale=scale)
+        sparse_mqa_target_fwd_interface(q, kv, topk[:, :, w:].contiguous(), lse, sm_scale=scale)
+
+    unexpected = [
+        f"{w.category.__name__} at {w.filename}:{w.lineno}: {w.message}"
+        for w in caught
+        if not any(known in str(w.message) for known in _TOLERATED_WARNING_SUBSTRINGS)
+    ]
+    assert not unexpected, "unexpected warning(s):\n" + "\n".join(unexpected)
