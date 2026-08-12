@@ -2081,7 +2081,7 @@ class TestFourLayerModelIndexerKL:
         # the KL plus a few ULPs of the larger number. Bound the comparison by those
         # ULPs rather than by a relative tolerance on the KL itself, and assert the KL
         # clears the bound -- otherwise this comparison would pass on a KL of zero.
-        admitted = 8 * torch.finfo(off.loss.dtype).eps * off.loss.abs()
+        admitted = 8 * torch.finfo(off.loss.dtype).eps * off.loss.detach().abs().item()
         assert reported > 100 * admitted, (
             f"the reported KL {float(reported):.3e} is within the {float(admitted):.3e} of "
             "floating-point noise this subtraction carries, so it cannot be told from zero here"
