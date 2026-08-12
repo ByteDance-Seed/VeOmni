@@ -27,10 +27,13 @@
 # WHY dyn_bsz IS true HERE AND false IN THE SIBLING CONFIG
 # -------------------------------------------------------
 # With dyn_bsz false each micro-batch is one unpadded conversation, so the sequence length changes
-# every micro-batch and TileLang re-JITs its shape-specialised kernels: measured 227 compilations
-# in the first 5 steps, against 4 for the whole run here. Packing to a fixed 8192 also makes
-# max_seq_len mean something (otherwise nothing on this dataset comes within 6000 tokens of it)
-# and makes step times comparable between runs.
+# every micro-batch and TileLang JITs a fresh kernel for every unseen shape: 227 compilations in
+# the first 5 steps on a cold kernel cache, 5 steps in 5m21s. That cost is one-off per shape -- the
+# same 5 steps re-run against the warmed cache compile nothing -- but unpadded conversations have
+# an unbounded shape space, so it never finishes amortising, and it makes step times incomparable
+# between runs. Packed at a fixed 8192 the whole 50-step run compiles 4 kernels, and carries 14x
+# the tokens per step at 2.72s against 4.0s. Packing also makes max_seq_len mean something:
+# nothing on this dataset comes within 6000 tokens of it one conversation at a time.
 
 model:
   model_path: /mnt/hdfs/__MERLIN_USER_DIR__/veomni/models/DeepSeek/DeepSeek-V4-Flash-Base-4L
