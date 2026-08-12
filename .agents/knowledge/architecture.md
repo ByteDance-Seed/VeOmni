@@ -17,6 +17,7 @@ veomni/
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
+│   ├── context_parallel/  Packed Ring CP + lossless GDN ownership/state/halo transport
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
 ├── models/             Model loading and patching
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
@@ -142,7 +143,7 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on EP modules with `ep_fsdp` submesh (Shard(1) for hidden dim)
    - `fully_shard()` on each transformer block with `fsdp_mesh`
    - `fully_shard()` on root model
-4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
+4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention. Hybrid CP×Ulysses uses CP as the outer sequence dimension and Ulysses as the inner head dimension; packed text is physically mirrored for causal Ring attention, while GDN temporarily repartitions complete native chunks to monotonic owners and passes recurrent state/conv halo along the owner chain. The FSDP shard mesh fuses with SP mesh (`dp_shard_sp`).
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
 
 ## Config Structure

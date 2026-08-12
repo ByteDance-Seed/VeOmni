@@ -245,3 +245,125 @@ def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch)
     assert calls[0][4:] == (group, 2)
     torch.testing.assert_close(calls[2][-1]["s_aux"], auxiliary)
     assert output.shape == (1, 5, 4, 8)
+
+
+def test_ring_cp_rejects_skip_ulysses_before_any_collective(monkeypatch):
+    monkeypatch.setattr(
+        flash_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True, ulysses_enabled=False),
+    )
+    query = torch.randn(1, 4, 8, 4)
+    key = torch.randn(1, 2, 8, 4)
+    value = torch.randn(1, 2, 8, 4)
+
+    with pytest.raises(NotImplementedError, match="cannot be skipped"):
+        flash_backend.flash_attention_forward(
+            _FakeAttentionModule("veomni_flash_attention_2_with_sp"),
+            query,
+            key,
+            value,
+            attention_mask=None,
+            skip_ulysses=True,
+        )
+
+
+def test_ring_cp_rejects_unsupported_device_before_ulysses_collective(monkeypatch):
+    group = object()
+    state = SimpleNamespace(cp_enabled=True, ulysses_enabled=True, ulysses_group=group, ulysses_size=2)
+    collective_calls = []
+
+    def fake_prepare(*args, **kwargs):
+        collective_calls.append((args, kwargs))
+        raise AssertionError("Ulysses collective must not run on an unsupported CP device")
+
+    monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", fake_prepare)
+    query = torch.empty(1, 4, 8, 4, dtype=torch.float16, device="meta")
+    key = torch.empty(1, 2, 8, 4, dtype=torch.float16, device="meta")
+    value = torch.empty(1, 2, 8, 4, dtype=torch.float16, device="meta")
+
+    with pytest.raises(NotImplementedError, match="validated on Ascend NPU only"):
+        flash_backend.flash_attention_forward(
+            _FakeAttentionModule("veomni_flash_attention_2_with_sp"),
+            query,
+            key,
+            value,
+            attention_mask=None,
+            cu_seqlens_list_q=[0, 8],
+        )
+
+    assert collective_calls == []
+
+
+@pytest.mark.parametrize(
+    ("call_kwargs", "message"),
+    [
+        ({"is_causal": False, "cu_seqlens_list_q": [0, 8]}, "causal self-attention only"),
+        ({"sliding_window": 16, "cu_seqlens_list_q": [0, 8]}, "sliding-window attention or softcap"),
+        ({"softcap": 30.0, "cu_seqlens_list_q": [0, 8]}, "sliding-window attention or softcap"),
+        ({"dropout": 0.1, "cu_seqlens_list_q": [0, 8]}, "dropout to be zero"),
+        ({}, "requires rank-local cu_seqlens metadata"),
+    ],
+)
+def test_ring_cp_rejects_invalid_contract_before_ulysses_collective(monkeypatch, call_kwargs, message):
+    group = object()
+    state = SimpleNamespace(cp_enabled=True, ulysses_enabled=True, ulysses_group=group, ulysses_size=2)
+    collective_calls = []
+
+    def fake_prepare(*args, **kwargs):
+        collective_calls.append((args, kwargs))
+        raise AssertionError("Ulysses collective must not run for an invalid CP contract")
+
+    monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", fake_prepare)
+    query = torch.randn(1, 4, 8, 4)
+    key = torch.randn(1, 2, 8, 4)
+    value = torch.randn(1, 2, 8, 4)
+
+    error_type = RuntimeError if not call_kwargs else NotImplementedError
+    with pytest.raises(error_type, match=message):
+        flash_backend.flash_attention_forward(
+            _FakeAttentionModule("veomni_flash_attention_2_with_sp"),
+            query,
+            key,
+            value,
+            attention_mask=None,
+            **call_kwargs,
+        )
+
+    assert collective_calls == []
+
+
+def test_ring_cp_applies_target_dtype_before_backend(monkeypatch):
+    group = object()
+    monkeypatch.setattr(
+        flash_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True, cp_group=group, ulysses_enabled=False),
+    )
+    monkeypatch.setattr(flash_backend.dist, "get_process_group_ranks", lambda actual: [0, 1])
+    captured = {}
+
+    def fake_ring(query, key, value, *args, **kwargs):
+        captured["dtypes"] = (query.dtype, key.dtype, value.dtype)
+        return query
+
+    monkeypatch.setattr(flash_backend, "ringattn_context_parallel", fake_ring)
+    module = _FakeAttentionModule("veomni_flash_attention_2_with_sp").to(torch.bfloat16)
+    query = torch.randn(1, 4, 8, 4, dtype=torch.float32)
+    key = torch.randn(1, 2, 8, 4, dtype=torch.float32)
+    value = torch.randn(1, 2, 8, 4, dtype=torch.float32)
+
+    output, _ = flash_backend.flash_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        cu_seq_lens_q=torch.tensor([0, 8], dtype=torch.int32),
+        cu_seqlens_list_q=[0, 8],
+    )
+
+    assert captured["dtypes"] == (torch.bfloat16, torch.bfloat16, torch.bfloat16)
+    assert output.dtype == torch.bfloat16
