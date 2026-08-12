@@ -21,6 +21,26 @@ def _fake_ps(sp_size: int):
     )
 
 
+def _context_aware_native_dataloader_kwargs():
+    return {
+        "dataset": [{"input_ids": [1], "attention_mask": [1]}],
+        "micro_batch_size": 1,
+        "global_batch_size": 1,
+        "dataloader_batch_size": 1,
+        "max_seq_len": 1024 * 1024,
+        "train_steps": 1,
+        "dyn_bsz": True,
+        "dyn_bsz_buffer_size": 200,
+        "dyn_bsz_buffer_policy": "context_aware",
+        "dyn_bsz_runtime": "main",
+        "dyn_bsz_count_mode": "total",
+        "data_modality": "text",
+        "num_workers": 0,
+        "pin_memory": False,
+        "prefetch_factor": None,
+    }
+
+
 def test_omni_data_arguments_identify_multimodal_policy_scope():
     from tasks.omni.train_omni_model import MyDataArguments
 
@@ -196,6 +216,88 @@ def test_build_dataloader_resolves_context_aware_buffer_before_registry_dispatch
 
     assert captured_kwargs["dyn_bsz_buffer_size"] == 24
     assert captured_kwargs["dyn_bsz_buffer_policy"] == "context_aware"
+
+
+def test_build_dataloader_resolves_context_aware_native_buffer_once(monkeypatch):
+    import veomni.data.data_loader as m_dl
+
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: _fake_ps(sp_size=1))
+    resolve_calls = []
+    original_resolver = m_dl.resolve_dyn_bsz_buffer_size
+
+    def recording_resolver(**kwargs):
+        resolve_calls.append(kwargs)
+        return original_resolver(**kwargs)
+
+    monkeypatch.setattr(m_dl, "resolve_dyn_bsz_buffer_size", recording_resolver)
+    build_dataloader(dataloader_type="native", **_context_aware_native_dataloader_kwargs())
+
+    assert len(resolve_calls) == 1
+    assert resolve_calls[0]["buffer_size"] == 200
+
+
+def test_build_dataloader_native_alias_resolves_context_aware_buffer_once(monkeypatch):
+    import veomni.data.data_loader as m_dl
+
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: _fake_ps(sp_size=1))
+    resolve_calls = []
+    original_resolver = m_dl.resolve_dyn_bsz_buffer_size
+
+    def recording_resolver(**kwargs):
+        resolve_calls.append(kwargs)
+        return original_resolver(**kwargs)
+
+    monkeypatch.setattr(m_dl, "resolve_dyn_bsz_buffer_size", recording_resolver)
+    alias = "native_context_aware_alias_test"
+    DATALOADER_REGISTRY[alias] = m_dl.build_native_dataloader
+    try:
+        build_dataloader(dataloader_type=alias, **_context_aware_native_dataloader_kwargs())
+    finally:
+        del DATALOADER_REGISTRY[alias]
+
+    assert len(resolve_calls) == 1
+    assert resolve_calls[0]["buffer_size"] == 200
+
+
+def test_build_dataloader_native_override_resolves_before_external_dispatch():
+    captured_kwargs = {}
+
+    def external_builder(**kwargs):
+        captured_kwargs.update(kwargs)
+        return object()
+
+    DATALOADER_REGISTRY["native"] = external_builder
+    try:
+        build_dataloader(
+            dataloader_type="native",
+            dyn_bsz=True,
+            dyn_bsz_buffer_size=200,
+            dyn_bsz_buffer_policy="context_aware",
+            max_seq_len=1024 * 1024,
+            micro_batch_size=1,
+            dyn_bsz_runtime="main",
+            dyn_bsz_count_mode="total",
+            data_modality="text",
+        )
+    finally:
+        del DATALOADER_REGISTRY["native"]
+
+    assert captured_kwargs["dyn_bsz_buffer_size"] == 24
+
+
+@pytest.mark.parametrize("missing_argument", ["max_seq_len", "micro_batch_size"])
+def test_build_dataloader_context_aware_policy_reports_missing_arguments(missing_argument):
+    arguments = {
+        "dataloader_type": "native",
+        "dyn_bsz": True,
+        "dyn_bsz_buffer_policy": "context_aware",
+        "max_seq_len": 1024 * 1024,
+        "micro_batch_size": 1,
+    }
+    del arguments[missing_argument]
+
+    with pytest.raises(ValueError, match=rf"missing: {missing_argument}"):
+        build_dataloader(**arguments)
 
 
 @pytest.mark.parametrize("dp_size", [1, 2, 4, 8])

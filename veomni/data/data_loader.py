@@ -85,20 +85,31 @@ def resolve_dyn_bsz_buffer_size(
 
 
 def build_dataloader(dataloader_type: str, **kwargs):
-    # Resolve policy-driven settings before registry dispatch so external
-    # dataloaders receive the same concrete buffer size as the native loader.
-    # Keep the policy in kwargs for logging/audit by the selected builder.
+    builder = DATALOADER_REGISTRY[dataloader_type]
     if kwargs.get("dyn_bsz", False) and kwargs.get("dyn_bsz_buffer_policy", "fixed") == "context_aware":
-        kwargs["dyn_bsz_buffer_size"] = resolve_dyn_bsz_buffer_size(
-            buffer_size=kwargs.get("dyn_bsz_buffer_size", 200),
-            buffer_policy=kwargs.get("dyn_bsz_buffer_policy", "fixed"),
-            max_seq_len=kwargs["max_seq_len"],
-            micro_batch_size=kwargs["micro_batch_size"],
-            runtime=kwargs.get("dyn_bsz_runtime", "main"),
-            count_mode=kwargs.get("dyn_bsz_count_mode", "total"),
-            data_modality=kwargs.get("data_modality", "text"),
-        )
-    return DATALOADER_REGISTRY[dataloader_type](**kwargs)
+        required_arguments = ("max_seq_len", "micro_batch_size")
+        missing_arguments = [argument for argument in required_arguments if argument not in kwargs]
+        if missing_arguments:
+            missing = ", ".join(missing_arguments)
+            raise ValueError(
+                "dyn_bsz_buffer_policy='context_aware' requires explicit max_seq_len and micro_batch_size; "
+                f"missing: {missing}."
+            )
+
+        # The native builder owns validation and resolution because it can also
+        # be called directly. Resolve before dispatch only for external builders
+        # so every path performs the policy conversion exactly once.
+        if builder is not build_native_dataloader:
+            kwargs["dyn_bsz_buffer_size"] = resolve_dyn_bsz_buffer_size(
+                buffer_size=kwargs.get("dyn_bsz_buffer_size", 200),
+                buffer_policy=kwargs.get("dyn_bsz_buffer_policy", "fixed"),
+                max_seq_len=kwargs["max_seq_len"],
+                micro_batch_size=kwargs["micro_batch_size"],
+                runtime=kwargs.get("dyn_bsz_runtime", "main"),
+                count_mode=kwargs.get("dyn_bsz_count_mode", "total"),
+                data_modality=kwargs.get("data_modality", "text"),
+            )
+    return builder(**kwargs)
 
 
 class DistributedDataloader(StatefulDataLoader):
