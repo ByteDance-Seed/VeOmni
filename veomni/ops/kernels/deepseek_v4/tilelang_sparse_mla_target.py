@@ -47,10 +47,15 @@ def sparse_mqa_target(heads, dim, topk, sm_scale=None, block_I=64, threads=256):
     # across CTAs. The attention forward replicates over heads above 64; this
     # kernel refuses instead.
     assert heads <= 64, f"target kernel requires heads <= 64 so one block owns the head sum, got {heads}"
-    # T.gemm's warp partition needs M % 16 == 0; without this the failure is a
-    # bare TVM InternalError from deep inside lowering. The interface pads for
-    # callers, so only a direct caller can trip it.
-    assert heads % 16 == 0, f"heads must be a multiple of 16 for T.gemm, got {heads}"
+    # Admit exactly the set the interface can emit -- it pads to
+    # max(next_power_of_2(heads), 16), so {16, 32, 64} -- rather than the weaker
+    # `heads % 16 == 0`, which also admits 48. M = 48 is unsound under
+    # T.GemmWarpPolicy.FullRow: the partition it picks is 3 warp-rows x 2
+    # warp-cols, which does not cover the 8 warps of a 256-thread block, and
+    # lowering dies with `Check failed: (m_warp * n_warp == num_warps) is false:
+    # m_warp: 3, n_warp: 2, num_warps: 8`. Without this guard that bare TVM
+    # InternalError is what a direct caller bypassing the interface would see.
+    assert heads in (16, 32, 64), f"target kernel requires heads padded to one of (16, 32, 64), got {heads}"
     if sm_scale is None:
         sm_scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -140,6 +145,13 @@ def sparse_mqa_target(heads, dim, topk, sm_scale=None, block_I=64, threads=256):
                 # transposed form is rejected outright when H != BI and, far
                 # worse, is silently accepted when H == BI -- where it yields the
                 # per-head row sum instead of the head sum.
+                #
+                # `tgt` is reused across the NI iterations, so this relies on
+                # T.reduce_sum's default clear=True zeroing it first (the forward
+                # passes clear=False explicitly when it wants accumulation). Both
+                # that and the moving output slice are covered by the c=128 and
+                # c=100 parametrisations of test_target_kernel_matches_reference;
+                # at NI == 1 neither can fail.
                 T.reduce_sum(acc_s, tgt, dim=0)
                 T.copy(tgt, Target[b_i, s_i, i_i * BI : (i_i + 1) * BI])
 
@@ -162,6 +174,11 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None, block_
     """
     assert q.is_contiguous() and kv.is_contiguous() and topk_idxs.is_contiguous()
     assert lse.is_contiguous() and lse.dtype == torch.float32
+    # The kernel hardcodes `dtype = T.bfloat16` for both Q and KV, so an fp16 or
+    # fp32 caller would otherwise get a tilelang type error from inside lowering
+    # instead of a named constraint.
+    assert q.dtype == torch.bfloat16, f"target kernel is bfloat16-only, got q.dtype={q.dtype}"
+    assert kv.dtype == torch.bfloat16, f"target kernel is bfloat16-only, got kv.dtype={kv.dtype}"
     batch, seq_len, heads, dim = q.shape
     assert heads <= 64, f"target kernel requires heads <= 64 so one block owns the head sum, got {heads}"
     assert kv.shape[-1] == dim
