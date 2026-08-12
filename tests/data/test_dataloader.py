@@ -21,6 +21,53 @@ def _fake_ps(sp_size: int):
     )
 
 
+def test_omni_data_arguments_identify_multimodal_policy_scope():
+    from tasks.omni.train_omni_model import MyDataArguments
+
+    assert MyDataArguments.data_modality == "multimodal"
+
+
+def test_omni_dataloader_forwards_buffer_policy_scope(monkeypatch):
+    import tasks.omni.train_omni_model as omni_train
+
+    captured_kwargs = {}
+    monkeypatch.setattr(omni_train, "build_dataloader", lambda **kwargs: captured_kwargs.update(kwargs))
+    args = types.SimpleNamespace(
+        data=types.SimpleNamespace(
+            dataloader=types.SimpleNamespace(
+                type="native",
+                num_workers=0,
+                drop_last=True,
+                pin_memory=False,
+                prefetch_factor=None,
+            ),
+            max_seq_len=1024 * 1024,
+            dyn_bsz_buffer_size=200,
+            dyn_bsz_buffer_policy="context_aware",
+            data_modality="multimodal",
+        ),
+        train=types.SimpleNamespace(
+            micro_batch_size=1,
+            global_batch_size=1,
+            dataloader_batch_size=1,
+            dyn_bsz=True,
+            dyn_bsz_runtime="worker",
+            dyn_bsz_count_mode="total",
+            dyn_bsz_physical_overflow_ratio=1.5,
+            bsz_warmup_ratio=0.02,
+            bsz_warmup_init_mbtoken=200,
+            seed=0,
+        ),
+        train_steps=1,
+    )
+
+    omni_train._build_train_dataloader(args, object(), {})
+
+    assert captured_kwargs["dyn_bsz_buffer_policy"] == "context_aware"
+    assert captured_kwargs["dyn_bsz_runtime"] == "worker"
+    assert captured_kwargs["data_modality"] == "multimodal"
+
+
 @pytest.mark.parametrize(
     ("token_budget", "expected_buffer_size"),
     [
