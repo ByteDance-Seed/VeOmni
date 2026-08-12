@@ -2523,6 +2523,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
 
         # --- Patch.3 ---
         indexer_kl_total = None
+        indexer_kl_layers = 0
         # --- Patch.3 ---
         for layer in self.layers:
             # --- Patch.3 ---
@@ -2564,9 +2565,38 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             if builds_indexer_kl:
                 hidden_states, layer_kl = layer_output
                 indexer_kl_total = layer_kl if indexer_kl_total is None else indexer_kl_total + layer_kl
+                indexer_kl_layers += 1
             else:
                 hidden_states = layer_output
             # --- Patch.3 ---
+
+        # --- Patch.3 ---
+        # A model configured for the loss whose ``layer_types`` has no CSA entry would
+        # otherwise accept the flag and train nothing: with no layer carrying a
+        # Lightning Indexer there is no student, ``indexer_kl_total`` stays ``None``,
+        # and both the metric and the fold-in in ``ForCausalLM.forward`` are skipped in
+        # silence -- a plausible loss curve training nothing, which is the failure class
+        # this feature exists to prevent. It is the same class the refusals in
+        # ``_indexer_loss_enabled`` cover, and the analogous case one layer down -- a CSA
+        # compressor that produced no scores -- already raises.
+        #
+        # Here rather than beside the fold-in in ``ForCausalLM.forward``, so that it
+        # fires identically with and without ``labels``: the fold-in is the half that is
+        # conditional on labels, the refusal must not be. And on the first forward rather
+        # than at construction, because the only construction-time hook is a full-body
+        # ``override_method`` on ``DeepseekV4Model.__init__``: patchgen replaces methods
+        # whole, so that would fork the constructor from upstream and silently drop any
+        # field a future transformers adds to it. That is a worse instance of this very
+        # failure class than the one it would close, and every other refusal in this
+        # feature fires on the first forward too.
+        if indexer_kl_layers == 0 and _indexer_loss_enabled(self):
+            raise RuntimeError(
+                "dsa_indexer_loss is enabled but no layer of this model builds an indexer KL: "
+                f"layer_types={list(self.config.layer_types)} contains no 'compressed_sparse_attention' "
+                "entry, and only a CSA layer carries a Lightning Indexer to train. The flag would "
+                "otherwise be accepted and train nothing."
+            )
+        # --- Patch.3 ---
 
         hidden_states = self.norm(self.hc_head(hidden_states))
         # --- Patch.3 ---

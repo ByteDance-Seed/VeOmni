@@ -1837,7 +1837,7 @@ def _veomni_loss_mapping_installed():
 
 
 def _build_4layer_test_model(
-    device="cuda", seq_len=4096, indexer_loss=True, enable_reentrant=False, seed=0, labels=True
+    device="cuda", seq_len=4096, indexer_loss=True, enable_reentrant=False, seed=0, labels=True, layer_types=None
 ):
     """Returns ``(model, batch)`` for the 4-layer CSA checkpoint's configuration.
 
@@ -1867,10 +1867,17 @@ def _build_4layer_test_model(
     i.e. an existing incompatibility with this transformers version rather than
     anything this file introduces. Both implementations run the first forward inside
     ``torch.no_grad()``, which is the property these tests are about.
+
+    ``layer_types`` overrides the checkpoint's own schedule, for the one test that
+    needs a model with no CSA layer at all. Set after the config is constructed
+    rather than passed to it, because the constructor derives ``layer_types`` from
+    the checkpoint's legacy ``compress_ratios`` and would ignore the keyword.
     """
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
     config = _4layer_test_config()
+    if layer_types is not None:
+        config.layer_types = list(layer_types)
     _bind_indexer_loss(enabled=indexer_loss)
 
     torch.manual_seed(seed)
@@ -2008,6 +2015,61 @@ class TestFourLayerModelIndexerKL:
         with _single_rank_parallel_state():
             with pytest.raises(RuntimeError, match="disagree about the indexer-KL return arity"):
                 model(**batch)
+
+    # No CSA entry, so no layer of this model carries a Lightning Indexer. Otherwise
+    # a supported configuration: tilelang indexer, tilelang attention, one rank --
+    # every refusal in ``_indexer_loss_enabled`` passes it.
+    _NO_CSA_LAYER_TYPES = [
+        "sliding_attention",
+        "sliding_attention",
+        "heavily_compressed_attention",
+        "heavily_compressed_attention",
+    ]
+
+    @pytest.mark.parametrize("labels", [True, False])
+    def test_the_flag_is_refused_when_no_layer_can_build_a_kl(self, labels):
+        """A model with no CSA layer accepts ``dsa_indexer_loss=True`` and trains
+        nothing, unless it is refused here.
+
+        ``_indexer_loss_enabled`` refuses a non-tilelang indexer, a non-tilelang
+        attention and ``ulysses_size > 1``, but a tilelang, one-rank model whose
+        ``layer_types`` has no CSA entry passes all three. It then has no student to
+        train: ``indexer_kl_total`` stays ``None``, and both the metric and the
+        fold-in are skipped without a word. That is the same "plausible curve,
+        nothing trained" failure those three refusals exist for.
+
+        Parametrised on ``labels`` because the fold-in is the half that is
+        conditional on them -- the refusal must fire on the inference path exactly as
+        it does on the training one, which is what putting it in the model body
+        rather than beside the fold-in buys.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(
+            device="cuda", seq_len=4096, labels=labels, layer_types=self._NO_CSA_LAYER_TYPES
+        )
+        assert not _csa_layers(model), "the no-CSA config still built a layer with an indexer"
+
+        with _single_rank_parallel_state():
+            with pytest.raises(RuntimeError, match="no layer of this model builds an indexer KL"):
+                model(**batch)
+
+    def test_a_model_with_no_csa_layer_is_fine_with_the_flag_off(self):
+        """The other side of the refusal above: no CSA layer is a perfectly ordinary
+        model until someone asks for the indexer loss.
+
+        Without this, the refusal could be unconditional on the flag and the test
+        above would not notice -- it would break every non-CSA DeepSeek-V4 forward in
+        the tree while the enabled path stayed green.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(
+            device="cuda", seq_len=4096, indexer_loss=False, layer_types=self._NO_CSA_LAYER_TYPES
+        )
+        with _single_rank_parallel_state():
+            out = model(**batch)
+
+        assert out.aux_metrics is None
+        assert torch.isfinite(out.loss)
 
     def test_only_csa_layers_carry_an_indexer(self):
         """The reference checkpoint has ``compress_ratios [0, 0, 4, 128]``: two sliding
