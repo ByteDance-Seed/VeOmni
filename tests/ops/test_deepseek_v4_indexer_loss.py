@@ -2389,7 +2389,25 @@ class TestFourLayerModelIndexerKL:
 
         tokens = batch["input_ids"].numel()
         assert outputs.indexer_query_tokens == tokens
-        torch.testing.assert_close(out.aux_metrics["indexer_kl"], outputs.indexer_kl_total / tokens, atol=0, rtol=1e-6)
+        # The error this comparison hunts -- the layer sum reaching the metric where
+        # the per-token mean belongs -- is a factor of ``tokens``, a relative error of
+        # 4095, so the bound only has to sit far below 1 to be diagnostic. Measured
+        # over 12 repeated pairs of these two forwards the values agree *bitwise*, so
+        # today any bound whatsoever passes; what it has to survive is a future
+        # forward that reorders its reductions. Bound it at bf16 epsilon, the
+        # precision the forward runs in and so the granularity at which two runs of it
+        # could legitimately disagree -- this file already documents a backward that
+        # disagrees with itself at exactly that scale, on 77 of 102 gradients. That is
+        # still five orders of magnitude tighter than the error it is looking for.
+        # ``rtol=1e-6`` bought none of that margin back: the token count is pinned
+        # exactly on the line above, so this comparison does not also have to police
+        # it, and no arithmetic mistake here is small.
+        torch.testing.assert_close(
+            out.aux_metrics["indexer_kl"],
+            outputs.indexer_kl_total / tokens,
+            atol=0,
+            rtol=torch.finfo(torch.bfloat16).eps,
+        )
         assert not out.aux_metrics["indexer_kl"].requires_grad, "the reported metric must be detached"
 
     def test_a_zero_coefficient_costs_nothing_and_trains_nothing(self):
