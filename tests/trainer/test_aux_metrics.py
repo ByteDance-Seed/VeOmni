@@ -35,8 +35,12 @@ import torch
 
 import veomni.trainer.base as base_trainer_module
 import veomni.trainer.callbacks.trace_callback as trace_callback_module
+import veomni.trainer.text_trainer as text_trainer_module
+import veomni.trainer.vlm_trainer as vlm_trainer_module
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import TrainerState
+from veomni.trainer.text_trainer import TextTrainer
+from veomni.trainer.vlm_trainer import VLMTrainer
 
 
 class _Output:
@@ -132,18 +136,13 @@ def test_absent_aux_metrics_add_no_keys(identity_loss, aux_metrics):
     assert list(loss_dict) == ["foundation_loss"]
 
 
-def _accumulating_trainer(monkeypatch, outputs, recorded):
+def _accumulating_trainer(outputs, recorded):
     """A ``BaseTrainer`` reduced to the parts ``train_step`` touches.
 
     Everything stubbed here is off the reporting path — process groups, the
     optimizer, grad clipping, the model. The accumulation loop itself, and the
     ``postforward`` it calls, are the real ones.
     """
-    monkeypatch.setattr(base_trainer_module, "synchronize", lambda: None)
-    monkeypatch.setattr(base_trainer_module, "mark_compile_step_begin", lambda *args, **kwargs: None)
-    monkeypatch.setattr(base_trainer_module, "use_parallel_state", lambda name: nullcontext())
-    monkeypatch.setattr(base_trainer_module, "veomni_clip_grad_norm", lambda *args, **kwargs: 0.0)
-
     trainer = _bare_trainer()
     trainer.state = TrainerState(global_step=0)
     trainer.model = SimpleNamespace()
@@ -164,13 +163,45 @@ def _accumulating_trainer(monkeypatch, outputs, recorded):
     # Stands in for the forward + backward, so the real postforward runs on a
     # real per-micro-batch model output without a model or autograd.
     trainer.forward_backward_step = lambda micro_batch: BaseTrainer.postforward(trainer, next(remaining), micro_batch)
+    # ``TextTrainer`` / ``VLMTrainer`` route their ``on_step_end`` through the
+    # base trainer, so patching it here captures the step totals for all three.
     trainer.on_step_end = lambda loss=None, loss_dict=None, grad_norm=None: recorded.update(
         loss=loss, loss_dict=loss_dict
     )
     return trainer
 
 
-def test_reported_aux_metric_does_not_scale_with_gradient_accumulation(monkeypatch, identity_loss):
+# ``TextTrainer`` and ``VLMTrainer`` do not reuse ``BaseTrainer.train_step``; each
+# keeps its own copy of the accumulation loop, so each has to publish
+# ``num_micro_batches`` for the shared ``postforward`` to normalize against.
+_TRAIN_STEP_OWNERS = {
+    "base": (base_trainer_module, None),
+    "text": (text_trainer_module, TextTrainer),
+    "vlm": (vlm_trainer_module, VLMTrainer),
+}
+
+
+@pytest.fixture(params=sorted(_TRAIN_STEP_OWNERS))
+def run_train_step(request, monkeypatch):
+    """Runs one training step through whichever trainer owns the loop."""
+    module, wrapper_cls = _TRAIN_STEP_OWNERS[request.param]
+    monkeypatch.setattr(module, "synchronize", lambda: None)
+    monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext())
+    monkeypatch.setattr(module, "veomni_clip_grad_norm", lambda *args, **kwargs: 0.0)
+    # VLMTrainer's loop does not mark compile steps.
+    monkeypatch.setattr(module, "mark_compile_step_begin", lambda *args, **kwargs: None, raising=False)
+
+    def run(trainer, micro_batches):
+        driver = trainer
+        if wrapper_cls is not None:
+            driver = object.__new__(wrapper_cls)
+            driver.base = trainer
+        type(driver).train_step(driver, iter([micro_batches]))
+
+    return run
+
+
+def test_reported_aux_metric_does_not_scale_with_gradient_accumulation(run_train_step, identity_loss):
     """The reported metric is the mean over the step's micro batches, not their sum.
 
     ``train_step`` accumulates ``total_loss_dict[k] += v.item()`` over the micro
@@ -185,10 +216,10 @@ def test_reported_aux_metric_does_not_scale_with_gradient_accumulation(monkeypat
     lm_losses = [1.0, 2.0, 3.0]
     outputs = [_Output(torch.tensor(lm), {"indexer_kl": torch.tensor(aux)}) for lm, aux in zip(lm_losses, aux_values)]
     recorded = {}
-    trainer = _accumulating_trainer(monkeypatch, outputs, recorded)
+    trainer = _accumulating_trainer(outputs, recorded)
     micro_batches = [{"labels": torch.tensor([[1, 2, -100, 4]])} for _ in aux_values]
 
-    BaseTrainer.train_step(trainer, iter([micro_batches]))
+    run_train_step(trainer, micro_batches)
 
     # mean(6, 9, 12) == 9.0; the unnormalized sum would report 27.0.
     assert recorded["loss_dict"]["indexer_kl"] == pytest.approx(9.0)
@@ -198,13 +229,13 @@ def test_reported_aux_metric_does_not_scale_with_gradient_accumulation(monkeypat
     assert recorded["loss"] == pytest.approx(sum(lm_losses))
 
 
-def test_single_micro_batch_reports_the_metric_unscaled(monkeypatch, identity_loss):
+def test_single_micro_batch_reports_the_metric_unscaled(run_train_step, identity_loss):
     """The N == 1 case, which the averaging must leave alone."""
     recorded = {}
     outputs = [_Output(torch.tensor(1.0), {"indexer_kl": torch.tensor(6.0)})]
-    trainer = _accumulating_trainer(monkeypatch, outputs, recorded)
+    trainer = _accumulating_trainer(outputs, recorded)
 
-    BaseTrainer.train_step(trainer, iter([[{"labels": torch.tensor([[1, 2, -100, 4]])}]]))
+    run_train_step(trainer, [{"labels": torch.tensor([[1, 2, -100, 4]])}])
 
     assert recorded["loss_dict"]["indexer_kl"] == pytest.approx(6.0)
 
