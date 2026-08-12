@@ -36,6 +36,16 @@ _TOLERATED_WARNING_SUBSTRINGS = (
     "`tl.disable_tma_lower` is deprecated",
 )
 
+# Importing ``veomni.arguments`` or the generated modeling module (which pulls in
+# ``veomni.distributed``) imports ``bytedance.hdfs_stdenv``, and that package calls the
+# deprecated ``Logger.warn`` during its own env setup. Third-party and not fixable from
+# here, so it is filtered rather than left to accumulate in pytest's summary. The
+# filter is pinned to that package's module path, so the same warning raised from our
+# own code would still be reported.
+_HDFS_STDENV_DEPRECATION_FILTER = pytest.mark.filterwarnings(
+    r"ignore:The 'warn' method is deprecated:DeprecationWarning:bytedance\.hdfs_stdenv\..*"
+)
+
 
 def reference_compressed_target(q, kv, attn_sink, topk_idxs, compressed_start, sm_scale):
     """Paper-correct teacher for DeepSeek-V3.2 eq. (4), in fp32.
@@ -363,8 +373,95 @@ def test_sparse_attn_returns_non_differentiable_lse():
     assert q.grad is not None and torch.isfinite(q.grad).all()
 
 
+# Run in a fresh interpreter by
+# ``test_indexer_loss_slots_are_off_before_anything_binds_them``. It has to be a
+# subprocess: the slots are module globals, so the only place their *unbound* value
+# can be observed is a process where nothing has bound them yet, and in-process that
+# depends on what else the session ran.
+_UNBOUND_SLOT_PROBE = """
+from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+loss = modeling.veomni_dsa_indexer_loss
+coef = modeling.veomni_dsa_indexer_loss_coef
+assert loss.value is False, f"unbound {loss.field_name} reads {loss.value!r}, expected False"
+assert coef.value == 1.0, f"unbound {coef.field_name} reads {coef.value!r}, expected 1.0"
+assert isinstance(coef.value, float), f"unbound {coef.field_name} is a {type(coef.value).__name__}, expected float"
+assert modeling._indexer_loss_enabled(object()) is False, "the gate is enabled with nothing bound"
+print("UNBOUND_SLOTS_OK")
+"""
+
+
+def test_indexer_loss_slots_are_off_before_anything_binds_them():
+    """``OpsConfigSlot``'s own constructor default is the string ``"eager"``, so the
+    two slots added for the indexer loss pass an explicit ``default=``.
+
+    That deviation is load-bearing and silent: delete both ``default=`` arguments and
+    an unbound ``dsa_indexer_loss`` reads ``"eager"``, which is truthy, so the gate
+    turns *on* for a model whose config never asked for the loss — while the
+    coefficient becomes a string that would raise only once something multiplied by
+    it. Nothing else observes this, because every test that touches the gate binds
+    the slots first, which is exactly what erases the state under test.
+
+    Hence the subprocess: a process where nothing has bound anything is the only
+    honest way to read an unbound slot, and it does not depend on which tests ran
+    before this one. The expected values are written out here rather than read from
+    ``OpsImplementationConfig``'s field defaults — the point is that the two
+    declarations agree, so deriving one from the other would pin nothing.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-c", _UNBOUND_SLOT_PROBE],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0 and "UNBOUND_SLOTS_OK" in result.stdout, (
+        "the indexer-loss slots are not off before binding; "
+        f"probe exited {result.returncode}\n"
+        f"--- stdout (tail) ---\n{result.stdout[-500:]}\n"
+        f"--- stderr (tail) ---\n{result.stderr[-4000:]}"
+    )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+@pytest.mark.parametrize("coef", [-1.0, -1e-8, float("nan"), float("inf"), float("-inf")])
+def test_indexer_loss_coef_rejects_negative_and_non_finite(coef):
+    """The coefficient is multiplied into the indexer KL before it joins the total
+    loss, so a negative value trains the indexer *away* from the teacher and a
+    non-finite one wipes out every other term in the sum. Both would show up as a
+    loss curve rather than as an error, which is why the bound is checked where the
+    rest of ``OpsImplementationConfig`` validates itself — at config-parse time,
+    before any of it reaches a model.
+
+    ``load_balancing_loss_implementation`` is pinned to eager only so this test does
+    not depend on ``triton`` being installed; the field is unrelated to the bound
+    under test.
+    """
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    with pytest.raises(ValueError, match="dsa_indexer_loss_coef"):
+        OpsImplementationConfig(load_balancing_loss_implementation="eager", dsa_indexer_loss_coef=coef)
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+@pytest.mark.parametrize("coef", [0.0, 0.5, 1.0, 100.0])
+def test_indexer_loss_coef_accepts_finite_non_negative_weights(coef):
+    """The other half of the bound: zero is a legitimate way to switch the term off
+    without changing the flag, and the check must not reject the ordinary weights."""
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    config = OpsImplementationConfig(load_balancing_loss_implementation="eager", dsa_indexer_loss_coef=coef)
+    assert config.dsa_indexer_loss_coef == coef
+
+
 class TestIndexerLossGate:
-    """``_indexer_loss_enabled``: the three refusals, and the flag-off path.
+    """``_indexer_loss_enabled``: the three refusals, the flag-off path, and the one
+    configuration that enables the loss.
 
     Each refusal guards a configuration that would otherwise train the indexer on a
     wrong signal or on none while the loss curve looked entirely reasonable, so a
@@ -377,28 +474,46 @@ class TestIndexerLossGate:
     * every ``match=`` names the field its own refusal is about. ``tilelang`` alone
       does not: it appears in the indexer refusal and the attention refusal both.
 
+    The first of those is enforced by the fixture below rather than left to each
+    test: it binds all three slots to a known pre-state, so a test that binds two of
+    them reads the third from that pre-state instead of from whatever the session
+    left behind.
+
     The class exists to scope the autouse fixture below to this group.
     """
 
-    # Importing the generated modeling module pulls in ``veomni.distributed``, which
-    # imports ``bytedance.hdfs_stdenv``; that package calls the deprecated
-    # ``Logger.warn`` during its own env setup. Third-party and not fixable from
-    # here, so it is filtered rather than left to accumulate in pytest's summary.
-    # The filter is pinned to that package's module path, so the same warning raised
-    # from our own code would still be reported.
-    pytestmark = pytest.mark.filterwarnings(
-        r"ignore:The 'warn' method is deprecated:DeprecationWarning:bytedance\.hdfs_stdenv\..*"
-    )
+    # Every test here imports the generated modeling module; see the note on
+    # ``_HDFS_STDENV_DEPRECATION_FILTER`` for what that drags in and why it is
+    # filtered rather than left to accumulate in pytest's summary.
+    pytestmark = _HDFS_STDENV_DEPRECATION_FILTER
+
+    # The slots ``_indexer_loss_enabled`` reads, and the pre-state the fixture puts
+    # them in before every test: a configuration that is supported but off. Spelled
+    # out here rather than read back from the module, so a slot that is renamed or
+    # moved out of the generated module fails the fixture's setup assertion instead
+    # of quietly dropping out of the collected set.
+    _GATE_SLOT_PRE_STATE = {
+        "dsa_indexer_loss": False,
+        "dsa_indexer_implementation": "eager",
+        "dsa_attention_implementation": "eager",
+    }
 
     @pytest.fixture(autouse=True)
     def _restore_ops_config_slots(self):
-        """Undo every slot binding a test in this group makes.
+        """Put the gate's slots in a known state, and undo every binding afterwards.
 
         The slots are globals on a module shared with the rest of the session, so
         without this a test leaks its configuration into whatever runs next — and a
         refusal test that reads a value some earlier test happened to leave behind
-        proves nothing about the refusal it names. Restoring goes through ``bind``,
-        the same public path the tests use to set the values.
+        proves nothing about the refusal it names. Binding the pre-state closes the
+        same hole from the other side: a test that binds only some of the slots reads
+        the rest from here, not from the session. Both directions go through
+        ``bind``, the same public path the tests use.
+
+        The ``isinstance`` filter that collects the slots to restore would happily
+        match nothing at all — after a slot rename or a move out of the generated
+        module — leaving a teardown loop over an empty list and no failure anywhere,
+        so the setup asserts that the slots the gate actually reads were found.
         """
         from types import SimpleNamespace
 
@@ -406,11 +521,20 @@ class TestIndexerLossGate:
         from veomni.ops.dispatch import OpsConfigSlot
 
         saved = [(slot, slot.value) for slot in vars(modeling).values() if isinstance(slot, OpsConfigSlot)]
+        collected = {slot.field_name: slot for slot, _ in saved}
+        missing = sorted(self._GATE_SLOT_PRE_STATE.keys() - collected.keys())
+        assert not missing, (
+            f"no OpsConfigSlot found on {modeling.__name__} for {missing}; this fixture is the only "
+            "thing keeping the tests in this class independent of each other and of the session, "
+            "and it just restored nothing"
+        )
+        for field_name, value in self._GATE_SLOT_PRE_STATE.items():
+            collected[field_name].bind(SimpleNamespace(**{field_name: value}))
         yield
         for slot, value in saved:
             slot.bind(SimpleNamespace(**{slot.field_name: value}))
 
-    def test_indexer_loss_refuses_ulysses(self):
+    def test_indexer_loss_refuses_ulysses(self, monkeypatch):
         """Ulysses shards heads across ranks, so the head sum inside the teacher would
         only cover this rank's shard. That is a *wrong* teacher rather than a missing
         one, and it would still produce a decreasing loss curve, so the gate has to
@@ -418,18 +542,34 @@ class TestIndexerLossGate:
 
         The match pins the message's two actionable halves: the size observed, and the
         one size that is supported.
+
+        The state is a real ``ParallelState`` rather than a namespace carrying an
+        ``ulysses_size`` attribute: a duck-typed stand-in keeps this test green
+        through a rename of the field, while the gate's ``state.ulysses_size`` would
+        raise ``AttributeError`` in production. Two accommodations are needed to build
+        one in a single process, both with precedent in
+        ``tests/parallel/context_parallel/test_dsv4_cp_parallel_state.py``:
+        ``ParallelState.world_size`` reads ``torch.distributed`` directly, and a
+        sequence-parallel state requires a non-``None`` device mesh that nothing here
+        touches.
         """
         from types import SimpleNamespace
         from unittest import mock
+        from unittest.mock import MagicMock
 
+        from veomni.distributed.parallel_state import ParallelState
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        monkeypatch.setattr("veomni.distributed.parallel_state.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("veomni.distributed.parallel_state.dist.get_world_size", lambda: 2)
+        state = ParallelState(dp_size=1, ulysses_size=2, device_type="cpu", device_mesh=MagicMock())
 
         modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
         with mock.patch(
             "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
-            return_value=SimpleNamespace(ulysses_enabled=True, ulysses_size=2, cp_enabled=False, cp_size=1),
+            return_value=state,
         ):
             with pytest.raises(ValueError, match=r"requires ulysses_size=1, got ulysses_size=2"):
                 modeling._indexer_loss_enabled(object())
@@ -482,3 +622,37 @@ class TestIndexerLossGate:
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
         assert modeling._indexer_loss_enabled(object()) is False
+
+    def test_indexer_loss_enabled_on_the_supported_configuration(self):
+        """The one configuration this whole flag exists for, and the only test that
+        reaches the gate's ``return True``.
+
+        The three refusals raise before that line and the flag-off test returns from
+        the early guard, so without this test ``return True`` could read ``return
+        False`` and nothing would notice — the indexer loss would silently never be
+        built on precisely the setup it was written for. That is the same "plausible
+        curve, nothing trained" failure the refusals were written to prevent, so the
+        success path is pinned as tightly as they are: ``is True`` rather than a
+        truthiness check, since a gate returning a truthy non-``bool`` is not the
+        contract the call sites read.
+
+        ``ulysses_size=1`` is the default of a real ``ParallelState``, and at that
+        size the state needs no mesh and no world of more than one rank, so nothing
+        has to be accommodated to build it.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from veomni.distributed.parallel_state import ParallelState
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        state = ParallelState(dp_size=1, ulysses_size=1, device_type="cpu")
+        assert state.ulysses_size == 1  # the premise of this test, not an assumption about the default
+        with mock.patch(
+            "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
+            return_value=state,
+        ):
+            assert modeling._indexer_loss_enabled(object()) is True

@@ -1244,6 +1244,18 @@ class OpsImplementationConfig:
             if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
                 raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
 
+        # The indexer KL is scaled by this weight before it is added to the
+        # total loss, so a negative value trains the Lightning Indexer away
+        # from its teacher and a non-finite one destroys every other term in
+        # the sum. Both surface as a loss curve rather than as an error, so the
+        # bound is checked here, before the value reaches a model.
+        if not math.isfinite(self.dsa_indexer_loss_coef) or self.dsa_indexer_loss_coef < 0:
+            raise ValueError(
+                f"dsa_indexer_loss_coef={self.dsa_indexer_loss_coef!r} must be finite and non-negative: "
+                "a negative weight flips the sign of the indexer KL and a non-finite one destroys the "
+                "total loss. Use 0.0 to switch the term off."
+            )
+
         # The Triton load-balancing-loss kernel imports ``triton`` at module
         # top — surface a missing package here with an actionable message
         # instead of a noisy ImportError at apply_global_ops time.
