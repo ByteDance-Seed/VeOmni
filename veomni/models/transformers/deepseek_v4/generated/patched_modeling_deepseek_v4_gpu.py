@@ -98,7 +98,7 @@ from veomni.ops import fused_moe_forward
 
 # Additional import blocks for patches
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
-from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
+from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, sparse_mqa_target_fwd, v4_lighting_indexer
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
@@ -169,6 +169,39 @@ def _split_indexer_output(module, indexer_output):
         return indexer_output, None
     top_k_indices, index_score = indexer_output
     return top_k_indices, index_score
+
+
+def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per-query ``KL(target || softmax(index_score))`` for DeepSeek-V3.2 eq. (4).
+
+    Args:
+        index_score: [B, S, C] indexer scores at the selected slots, -inf at misses
+        target:      [B, S, C] fp32, L1-normalised, zero at misses
+
+    Returns:
+        [B, S] fp32
+    """
+    # A query whose compressed slots are *all* misses scores every one of them
+    # ``-inf``, and ``log_softmax`` of such a row is NaN. Masking that after the
+    # fact is not enough: the mask below hides the NaN from the returned value, but
+    # ``log_softmax``'s backward computes ``g - softmax * g.sum(-1)`` with
+    # ``softmax = exp(NaN)``, so even the zero gradient such a row receives comes
+    # back NaN -- and the indexer's own backward propagates it, because it forms
+    # ``grad * relu(logits)`` and ``NaN * 0`` is NaN. The row is therefore
+    # neutralised on the way *in*. It is the common case, not a corner one: the
+    # first ``compress_rate - 1`` positions of every packed sample have no complete
+    # compression window behind them.
+    all_missing = ~torch.isfinite(index_score).any(-1, keepdim=True)
+    scores = torch.where(all_missing, torch.zeros_like(index_score, dtype=torch.float32), index_score.float())
+    log_q = torch.log_softmax(scores, dim=-1)
+    # ``log_q`` is -inf exactly where ``target`` is 0, and 0 * -inf is NaN, so the
+    # zero-mass slots have to be masked rather than merely multiplied out.
+    contributions = torch.where(
+        target > 0,
+        target * (torch.log(target.clamp_min(torch.finfo(torch.float32).tiny)) - log_q),
+        torch.zeros_like(target),
+    )
+    return contributions.sum(-1)
 
 
 # ======================================================================
@@ -1313,6 +1346,17 @@ def eager_attention_forward(
         and dropout == 0
         and key.shape[1] == 1
     )
+    # --- Patch.3 ---
+    # The indexer loss's teacher is a TileLang kernel, so a declined dispatch cannot
+    # produce one. Refusing here turns that into a legible error rather than the
+    # caller's unpack of a two-value return.
+    if not use_tilelang and kwargs.get("indexer_target_width") is not None:
+        raise RuntimeError(
+            "dsa_indexer_loss needs the TileLang sparse attention dispatch to obtain the teacher's "
+            "log-sum-exp, but the dispatch was declined at runtime. Check that query/key/value are "
+            "bf16 CUDA tensors."
+        )
+    # --- Patch.3 ---
     if not use_tilelang and attention_mask is None and kwargs.get("sparse_topk_indices") is not None:
         raise RuntimeError(
             "DeepSeek-V4 built mask-free sparse indices but the TileLang dispatch was "
@@ -1342,6 +1386,44 @@ def eager_attention_forward(
         elif attention_mask is not None:
             topk_indices = mask_sparse_attention_indices(attention_mask, topk_indices)
         sinks = kwargs.get("s_aux", module.sinks)
+        # --- Patch.3 ---
+        # ``indexer_target_width`` is how ``DeepseekV4Attention.forward`` asks for the
+        # indexer loss's teacher distribution: the width of the compressed slice it
+        # wants scored, and the signal that this call returns three values instead of
+        # two. Only that forward sets it, and only when its own gate is on.
+        target_width = kwargs.get("indexer_target_width")
+        if target_width is not None:
+            query_rows = query.transpose(1, 2).contiguous()
+            kv_rows = key[:, 0].contiguous()
+            # One forward, and the teacher reads *its* LSE. That LSE is the true CSA
+            # denominator only because ``topk_indices`` spans the sliding window as
+            # well as the compressed entries and the kernel folds the sink into the
+            # same sumexp. A second forward over the compressed slice alone would
+            # produce a plausible, decreasing loss that trains the indexer toward the
+            # wrong distribution (NVIDIA/Megatron-LM#5776).
+            attn_output, lse = sparse_attn_tilelang(
+                query_rows,
+                kv_rows,
+                sinks.float().contiguous(),
+                topk_indices,
+                scaling,
+                return_lse=True,
+            )
+            # The compressed entries are the *trailing* range of the index tensor:
+            # both ``build_sparse_attention_indices`` and
+            # ``build_packed_sparse_attention_indices`` end at
+            # ``torch.cat((sliding_indices, compressed_indices), dim=-1)``, and the
+            # caller asserts that this width is the selection's own.
+            target = sparse_mqa_target_fwd(
+                query_rows,
+                kv_rows,
+                topk_indices[:, :, -target_width:].contiguous(),
+                lse,
+                scaling,
+            )
+            target = target / target.sum(-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+            return attn_output, None, target
+        # --- Patch.3 ---
         attn_output = sparse_attn_tilelang(
             query.transpose(1, 2).contiguous(),
             key[:, 0].contiguous(),
@@ -1589,7 +1671,35 @@ class DeepseekV4Attention(nn.Module):
                 query_offset=query_offset,
                 kv_full_len=kv_full_len,
             )
-        attn_output, attn_weights = attention_interface(
+        # --- Patch.3 ---
+        # ``_indexer_loss_enabled`` first, so that its refusals fire on every layer type
+        # rather than only on the ones carrying an indexer: a model configured for the
+        # loss but built without a single CSA layer would otherwise accept the flag and
+        # train nothing. The second test is what keeps HCA and sliding layers on their
+        # two-value return -- they have no indexer, so they have no student, and their
+        # compressors hand back a perfectly ordinary ``CompressedCandidates`` carrying
+        # causal ranges instead of scores.
+        build_indexer_loss = _indexer_loss_enabled(self) and getattr(self.compressor, "indexer", None) is not None
+        indexer_kl = None
+        if build_indexer_loss:
+            index_score = compressed_candidates.indexer_scores if compressed_candidates is not None else None
+            if index_score is None:
+                raise RuntimeError(
+                    "dsa_indexer_loss is enabled but the CSA compressor produced no indexer scores, so the "
+                    "KL would have no student distribution to train. Every path that can drop them raises "
+                    "before here, so this is a wiring regression rather than a configuration problem."
+                )
+            # The width of the compressed slice the teacher is asked for. Reading it off
+            # the *scores* and then checking it against the selection is the point: the
+            # teacher's slot ``j`` has to be the slot ``index_score[..., j]`` scored, and a
+            # width taken from the wrong tensor would slide the slice into the sliding
+            # window and train the indexer against window probabilities.
+            kwargs["indexer_target_width"] = index_score.shape[-1]
+            assert kwargs["indexer_target_width"] == compressed_candidates.topk_indices.shape[-1], (
+                "indexer scores and compressed indices must describe the same slots"
+            )
+        # --- Patch.3 ---
+        attention_outputs = attention_interface(
             self,
             q,
             kv,
@@ -1601,6 +1711,20 @@ class DeepseekV4Attention(nn.Module):
             s_aux=s_aux,
             **kwargs,
         )
+        # --- Patch.3 ---
+        # The three-value return is only reachable through the patched
+        # ``eager_attention_forward`` above: ``_indexer_loss_enabled`` requires
+        # ``dsa_attention_implementation == "tilelang"``, and DeepSeek-V4 declares no
+        # support for any registry interface (``_supports_flash_attn`` /
+        # ``_supports_sdpa`` / ``_supports_flex_attn`` are all False), so
+        # ``_attn_implementation`` is "eager" and ``get_interface`` falls back to the
+        # module-level function this file replaces.
+        if build_indexer_loss:
+            attn_output, attn_weights, target = attention_outputs
+            indexer_kl = indexer_kl_terms(index_score, target).sum()
+        else:
+            attn_output, attn_weights = attention_outputs
+        # --- Patch.3 ---
 
         if ulysses_enabled and not cp_enabled:
             # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
@@ -1613,6 +1737,13 @@ class DeepseekV4Attention(nn.Module):
         grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
         grouped = self.o_a_proj(grouped).flatten(2)
         output = self.o_b_proj(grouped)
+        # --- Patch.3 ---
+        # A 0-d sum rather than the [B, S] terms: the decoder layer above only has to
+        # add these together, and summing here keeps the reduction over *local* query
+        # rows, which is what makes the CP case a plain sum of per-rank contributions.
+        if build_indexer_loss:
+            return output, attn_weights, indexer_kl
+        # --- Patch.3 ---
         return output, attn_weights
 
 

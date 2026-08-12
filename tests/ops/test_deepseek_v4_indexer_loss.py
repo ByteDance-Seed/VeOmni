@@ -1026,3 +1026,533 @@ class TestIndexerScoresAndDecoupling:
         assert (with_loss.topk_indices < 0).any(), "no invalid slot here, so the -inf correspondence is untested"
         assert torch.equal(torch.isneginf(scores), with_loss.topk_indices < 0)
         assert torch.equal(with_loss.topk_indices, without_loss.topk_indices)
+
+
+def _build_test_attention(device="cuda", seq_len=4096, layer_type="compressed_sparse_attention", seed=0):
+    """One ``DeepseekV4Attention`` of the requested layer type, plus the kwargs its
+    real call site hands it.
+
+    The kwargs mirror ``DeepseekV4Model.forward``'s call into the decoder layer,
+    which forwards them verbatim to ``self_attn``: the ``position_embeddings`` dict
+    keyed by rope layer type, global ``position_ids``, ``attention_mask`` and
+    ``past_key_values``. Mirrored rather than invented so that a change to the real
+    call site's shape breaks these tests instead of leaving them agreeing with a
+    signature nothing uses.
+
+    ``attention_mask=None`` is the mask-free sparse path, which is the one bf16
+    TileLang training takes -- ``DeepseekV4Model.forward`` withholds the dense mask
+    exactly when the sparse index builder can validate candidates on its own. It also
+    keeps a ``[1, 1, 4096, 5120]`` mask off a device this test shares.
+
+    ``sinks`` and both ``position_bias`` parameters are ``torch.empty`` in the
+    upstream constructors, so a directly built layer attends against uninitialised
+    memory until they are written. The sinks are given per-head *different* values on
+    purpose: the teacher's per-head denominators are what make it more than a
+    compressed-only softmax, and equal sinks would weaken that difference.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = _dsv4_indexer_test_config()
+    layer_idx = config.layer_types.index(layer_type)
+    torch.manual_seed(seed)
+    attn = modeling.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        attn.sinks.normal_(0.0, 1.0)
+        for name, param in attn.named_parameters():
+            if name.endswith("position_bias"):
+                param.zero_()
+
+    hidden = torch.randn(1, seq_len, config.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True)
+    position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+    rotary = modeling.DeepseekV4RotaryEmbedding(config).to(device=device)
+    inputs = {
+        "hidden_states": hidden,
+        "position_embeddings": {
+            rope_type: rotary(hidden, position_ids=position_ids, layer_type=rope_type)
+            for rope_type in ("main", "compress")
+        },
+        "position_ids": position_ids,
+        "attention_mask": None,
+        "past_key_values": None,
+    }
+    return attn, inputs
+
+
+class _DsaKernelProbe:
+    """What the TileLang attention, indexer-teacher and Lightning Indexer kernels were
+    handed, and what they returned.
+
+    Reading the tensors at the kernel boundary is deliberate. Rebuilding ``q`` and
+    ``kv`` inside the test would mean copying the attention forward's projection,
+    per-head normalisation, RoPE and compressor concatenation out of the module under
+    test, and a copy like that agrees with the implementation by construction. What
+    the reference has to supply independently is the *teacher* -- one softmax over
+    ``[selected slots ‖ sink]`` -- and ``reference_compressed_target`` does.
+
+    ``index_score`` is captured from the indexer kernel rather than from the attention
+    forward's own use of it, so a forward that handed the KL a permuted or otherwise
+    mismatched student is compared against the selection the indexer really made.
+    """
+
+    def __init__(self):
+        self.attention = []
+        self.target = []
+        self.indexer = []
+
+    def one(self, name):
+        calls = getattr(self, name)
+        assert len(calls) == 1, f"expected exactly one {name} kernel call, got {len(calls)}"
+        return calls[0]
+
+
+@contextlib.contextmanager
+def _probe_dsa_kernels():
+    """Record every DSA kernel call the generated module makes, without changing one.
+
+    The wrappers bind their arguments by name, so a call site that renames or
+    reorders one fails here rather than being recorded under the wrong key.
+    """
+    from unittest import mock
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    probe = _DsaKernelProbe()
+    real_attention = modeling.sparse_attn_tilelang
+    real_target = modeling.sparse_mqa_target_fwd
+    real_indexer = modeling.v4_lighting_indexer
+
+    def _attention(q, kv, attn_sink, topk_idxs, sm_scale=None, return_lse=False):
+        result = real_attention(q, kv, attn_sink, topk_idxs, sm_scale, return_lse)
+        lse = result[1] if return_lse else None
+        probe.attention.append(
+            {"q": q, "kv": kv, "sink": attn_sink, "topk": topk_idxs, "sm_scale": sm_scale, "lse": lse}
+        )
+        return result
+
+    def _target(q, kv, topk_idxs, lse, sm_scale=None):
+        probe.target.append({"q": q, "kv": kv, "topk": topk_idxs, "lse": lse, "sm_scale": sm_scale})
+        return real_target(q, kv, topk_idxs, lse, sm_scale)
+
+    def _indexer(*args, **kwargs):
+        index_score, topk_indices = real_indexer(*args, **kwargs)
+        probe.indexer.append({"index_score": index_score, "topk_indices": topk_indices})
+        return index_score, topk_indices
+
+    with (
+        mock.patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _attention),
+        mock.patch(f"{_PATCHED_MODULE}.sparse_mqa_target_fwd", _target),
+        mock.patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _indexer),
+    ):
+        yield probe
+
+
+def _reference_target_by_query_chunk(q, kv, sink, topk_idxs, compressed_start, sm_scale, chunk=512):
+    """``reference_compressed_target`` over query chunks, concatenated.
+
+    The reference gathers ``[B, S, W + C, D]`` in one allocation, which at S=4096,
+    W + C = 544 and D = 64 is 285 MB in bf16 and another 570 MB once it upcasts --
+    on a device shared with whatever else is running. Query rows are independent, so
+    chunking moves the peak and nothing else.
+    """
+    return torch.cat(
+        [
+            reference_compressed_target(
+                q[:, start : start + chunk],
+                kv,
+                sink,
+                topk_idxs[:, start : start + chunk],
+                compressed_start,
+                sm_scale,
+            )
+            for start in range(0, q.shape[1], chunk)
+        ],
+        dim=1,
+    )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_indexer_kl_terms_matches_hand_computation():
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    target = torch.tensor([[[0.5, 0.5, 0.0]]])
+    index_score = torch.tensor([[[0.0, 0.0, float("-inf")]]])
+    # softmax over the two finite slots is [0.5, 0.5]; KL(t || q) == 0.
+    assert torch.allclose(modeling.indexer_kl_terms(index_score, target), torch.zeros(1, 1), atol=1e-6)
+
+    index_score = torch.tensor([[[1.0, 0.0, float("-inf")]]])
+    q0 = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)
+    expected = 0.5 * (torch.log(torch.tensor(0.5)) - torch.log(q0[0])) + 0.5 * (
+        torch.log(torch.tensor(0.5)) - torch.log(q0[1])
+    )
+    assert torch.allclose(modeling.indexer_kl_terms(index_score, target), expected.view(1, 1), atol=1e-6)
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_indexer_kl_terms_gradient_is_finite_when_a_query_sees_no_compressed_slot():
+    """A query row whose *every* compressed slot is a miss must not poison the
+    gradient, and the forward value cannot be trusted to reveal it.
+
+    Such rows are not a corner case: the first ``compress_rate - 1`` positions of
+    every packed sample have no complete compression window behind them, so the
+    indexer's causal range is empty, its top-k comes back all ``-1``, and its score
+    row is entirely ``-inf``. ``log_softmax`` of that row is NaN, and the NaN is
+    invisible in the forward — ``torch.where`` selects the zero branch, so the KL
+    for the row is exactly 0, which is the right answer. The backward is where it
+    bites: ``log_softmax``'s own backward computes ``g - softmax * g.sum(-1)`` with
+    ``softmax = exp(NaN)``, so a zero incoming gradient still comes out NaN. That
+    NaN survives the indexer's backward too, because its kernel forms
+    ``grad * relu(logits)`` and ``NaN * 0`` is NaN, so ``weights_proj`` ends up with
+    a NaN gradient while the loss curve stays finite.
+
+    Row 1 is here to keep the fix honest: the row-wise neutralisation must be
+    confined to the all-miss rows, so row 1's gradient has to match what it gets
+    when it is the only row present.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    neg_inf = float("-inf")
+    index_score = torch.tensor([[[neg_inf, neg_inf], [0.0, 1.0]]], requires_grad=True)
+    target = torch.tensor([[[0.0, 0.0], [0.4, 0.6]]])
+
+    kl = modeling.indexer_kl_terms(index_score, target)
+    assert torch.allclose(kl[0, 0], torch.zeros(())), "an all-miss row has no teacher mass and no KL"
+    kl.sum().backward()
+
+    assert torch.isfinite(index_score.grad).all(), f"non-finite gradient: {index_score.grad}"
+    assert (index_score.grad[0, 0] == 0).all(), "an all-miss row must not push the indexer anywhere"
+
+    alone = index_score.detach()[:, 1:].clone().requires_grad_(True)
+    modeling.indexer_kl_terms(alone, target[:, 1:]).sum().backward()
+    torch.testing.assert_close(index_score.grad[:, 1:], alone.grad)
+    assert alone.grad.abs().sum() > 0, "row 1 carries no gradient, so it pins nothing here"
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_indexer_kl_terms_ignores_zero_target_slots():
+    """A -inf score paired with zero target mass must contribute 0, not NaN."""
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    target = torch.tensor([[[1.0, 0.0]]])
+    index_score = torch.tensor([[[0.0, float("-inf")]]])
+    kl = modeling.indexer_kl_terms(index_score, target)
+    assert torch.isfinite(kl).all()
+    assert torch.allclose(kl, torch.zeros(1, 1), atol=1e-6)
+
+
+class TestAttentionForwardIndexerKL:
+    """The attention forward assembling the KL: the teacher it builds, the slice it
+    takes, the student it pairs with, and the arity it returns.
+
+    Every test binds all three of the gate's slots through ``_bind_indexer_loss`` and
+    pins the parallel state, and the fixture restores every slot afterwards.
+    """
+
+    # Every test here imports the generated modeling module; see the note on
+    # ``_HDFS_STDENV_DEPRECATION_FILTER`` for what that drags in.
+    pytestmark = _HDFS_STDENV_DEPRECATION_FILTER
+
+    # Supported but off, matching the two classes above.
+    _SLOT_PRE_STATE = {
+        "dsa_indexer_loss": False,
+        "dsa_indexer_implementation": "eager",
+        "dsa_attention_implementation": "eager",
+    }
+
+    # 4096 tokens at the CSA compression rate of 4 give 1024 compressed slots while
+    # the indexer selects ``index_topk = 512``, so the top-k genuinely ranks. At the
+    # 2048 the other tests in this file use, the two are equal and every causally
+    # visible slot is selected -- a teacher that never exercises selection, against
+    # which a student misaligned with its own selection would still look right.
+    _RANKING_SEQ_LEN = 4096
+    # Where ranking is beside the point, 2048 is used instead: it is half the work and
+    # it keeps ``sliding_window + top_k`` at 544, so it reuses the same compiled
+    # TileLang kernels rather than paying for a second set.
+    _CHEAP_SEQ_LEN = 2048
+
+    @pytest.fixture(autouse=True)
+    def _restore_ops_config_slots(self):
+        with _ops_config_slots_bound(self._SLOT_PRE_STATE):
+            yield
+
+    def test_kl_uses_the_paper_correct_teacher(self):
+        """The KL the forward returns must match one built from the independent
+        reference teacher -- a single softmax over ``[selected slots ‖ sink]``, which
+        carries the sliding window and the attention sink in its denominator.
+
+        This is the assertion that separates the paper's teacher from Megatron's
+        (NVIDIA/Megatron-LM#5776): a compressed-only denominator is a plausible,
+        decreasing loss that trains the indexer toward the wrong distribution. The
+        reference is deliberately LSE-free, so it cannot reproduce that mistake by
+        sharing it.
+        """
+        _require_tilelang_cuda()
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        _bind_indexer_loss(enabled=True)
+        seq_len = self._RANKING_SEQ_LEN
+        attn, inputs = _build_test_attention(device="cuda", seq_len=seq_len)
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            _, _, kl_sum = attn(**inputs)
+
+        assert kl_sum.shape == (), f"the KL must be a scalar, got {tuple(kl_sum.shape)}"
+        assert kl_sum.dtype == torch.float32
+
+        attention, target, indexer = probe.one("attention"), probe.one("target"), probe.one("indexer")
+        # The premise of the sequence length: the selection is a strict subset of what
+        # is causally visible for a large share of the query rows, so the KL is being
+        # asked about a ranking rather than about "everything visible".
+        visible = (inputs["position_ids"] + 1) // attn.compressor.compress_rate
+        selected = (indexer["topk_indices"] >= 0).sum(-1)
+        ranked_rows = int((visible > selected).sum())
+        assert ranked_rows > seq_len // 4, (
+            f"only {ranked_rows} of {seq_len} query rows had more visible compressed slots than the "
+            "indexer selected, so this test barely exercises the top-k"
+        )
+
+        expected_target = _reference_target_by_query_chunk(
+            attention["q"],
+            attention["kv"],
+            attention["sink"],
+            attention["topk"],
+            attention["topk"].shape[-1] - target["topk"].shape[-1],
+            attn.scaling,
+        )
+        expected = modeling.indexer_kl_terms(indexer["index_score"], expected_target).sum()
+        # Measured on GB200: the kernel teacher and this reference put the summed KL
+        # 6.1e-5 apart on a KL of 413.35, i.e. 1.5e-7 relative, both consuming the
+        # same bf16 inputs and accumulating in fp32. The bounds below admit 4.1e-2,
+        # which is ~700x the observed gap -- headroom for a different summation
+        # order -- while still being ~50x tighter than the 1.96 by which the
+        # compressed-only teacher misses.
+        torch.testing.assert_close(kl_sum, expected, atol=1e-2, rtol=1e-4)
+
+    def test_target_reads_the_full_window_lse_and_the_trailing_compressed_slice(self):
+        """The three structural contracts the numeric test above can only observe
+        through their consequences.
+
+        1. The LSE must come from a forward fed the *full* window+compressed index
+           tensor: that is the only reason the teacher's per-head denominator is the
+           true CSA denominator. A second forward over a compressed-only index list
+           would produce the Megatron variant.
+        2. The compressed entries are the *trailing* range of the index tensor, which
+           is what ``[:, :, -width:]`` relies on. Both index builders end at
+           ``torch.cat((sliding_indices, compressed_indices), dim=-1)``.
+        3. ``index_score[..., j]`` and the teacher's slot ``j`` must be the same slot,
+           or the KL trains the student's score for one slot toward another slot's
+           probability. The chain is checked link by link, against the selection the
+           indexer kernel really returned.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_loss(enabled=True)
+        seq_len = self._RANKING_SEQ_LEN
+        attn, inputs = _build_test_attention(device="cuda", seq_len=seq_len)
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            attn(**inputs)
+
+        attention, target, indexer = probe.one("attention"), probe.one("target"), probe.one("indexer")
+        width = target["topk"].shape[-1]
+
+        # (1) One attention call, over sink + sliding window + compressed entries, and
+        # the LSE the teacher consumed is that call's own -- not a second forward's.
+        assert attention["topk"].shape[-1] == attn.sliding_window + width, (
+            "the attention forward's index tensor no longer spans window + compressed slots, "
+            "so its LSE is not the full CSA denominator the teacher needs"
+        )
+        assert target["lse"] is attention["lse"], "the teacher must consume the attention forward's own LSE"
+        assert target["q"] is attention["q"] and target["kv"] is attention["kv"]
+        assert target["sm_scale"] == attention["sm_scale"] == attn.scaling
+
+        # (2) The teacher's slots are the trailing range of the attention forward's.
+        assert torch.equal(target["topk"], attention["topk"][:, :, -width:])
+        assert not torch.equal(target["topk"], attention["topk"][:, :, :width]), (
+            "the leading and trailing slices coincide here, so this test cannot tell them apart"
+        )
+
+        # (3) Those slots are exactly the indexer's selection, lifted past the
+        # full-resolution KV rows, in the indexer's own order -- so slot ``j`` of the
+        # teacher is the slot ``index_score[..., j]`` scored.
+        selection = indexer["topk_indices"].to(torch.int32)
+        assert width == selection.shape[-1] == indexer["index_score"].shape[-1]
+        expected_slice = torch.where(selection >= 0, selection + seq_len, torch.full_like(selection, -1))
+        assert torch.equal(target["topk"], expected_slice)
+        assert (selection < 0).any(), "no miss in this selection, so the -1 half of the mapping is untested"
+
+    def test_the_flag_off_forward_returns_two_values(self):
+        """Default off means the return *arity* is what it was.
+
+        This is the only test that pins the off side of the branch. Invert it and
+        every flag-off DeepSeek-V4 forward returns a 3-tuple into a decoder layer
+        that unpacks two, breaking inference for every model in the tree -- while the
+        enabled path stays green, because it never takes this branch.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_loss(enabled=False)
+        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN)
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            result = attn(**inputs)
+
+        assert len(result) == 2, f"expected (output, attn_weights), got {len(result)} values"
+        assert not probe.target, "the teacher kernel ran with the loss off"
+        assert probe.one("attention")["lse"] is None, "the LSE was computed with nothing to consume it"
+
+    def test_the_language_model_path_is_bit_identical_with_the_loss_on(self):
+        """Turning the loss on must not perturb the model it is attached to.
+
+        The two runs share their parameters and their input, and the enabled path
+        reaches the same attention kernel with the same arguments, so the outputs are
+        equal *bitwise*: a detach cannot change a forward value, and any tolerance
+        here would hide a real perturbation of the LM objective. This is the
+        forward-value half of the decoupling; the gradient half is
+        ``test_the_kl_gradient_reaches_the_indexer_and_stops_there``.
+        """
+        _require_tilelang_cuda()
+
+        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN)
+        with _single_rank_parallel_state():
+            _bind_indexer_loss(enabled=False)
+            output_off, weights_off = attn(**inputs)
+            _bind_indexer_loss(enabled=True)
+            output_on, weights_on, kl_sum = attn(**inputs)
+
+        assert torch.equal(output_off, output_on), "the indexer loss moved the attention output"
+        assert weights_off is None and weights_on is None
+        assert torch.isfinite(kl_sum) and kl_sum > 0, f"the KL is not a usable objective: {kl_sum}"
+
+    def test_a_layer_without_an_indexer_keeps_the_two_tuple(self):
+        """Only the layers that *have* a Lightning Indexer can build the KL.
+
+        An HCA layer's compressor returns a perfectly ordinary
+        ``CompressedCandidates`` -- carrying the causal ``range_starts`` /
+        ``range_ends`` its index builder needs -- with no ``indexer_scores``, because
+        it has no indexer to produce them. Gating on the candidates being present
+        would therefore make every HCA layer raise "the CSA compressor produced no
+        indexer scores" the moment the flag went on, which is most of the layers in
+        the 4-layer checkpoint.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_loss(enabled=True)
+        attn, inputs = _build_test_attention(
+            device="cuda", seq_len=self._CHEAP_SEQ_LEN, layer_type="heavily_compressed_attention"
+        )
+        assert getattr(attn.compressor, "indexer", None) is None, "this layer type is supposed to have no indexer"
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            result = attn(**inputs)
+
+        assert len(result) == 2, f"an HCA layer has no student to train; expected 2 values, got {len(result)}"
+        assert not probe.target, "the teacher kernel ran for a layer with no indexer"
+
+    def test_a_compressor_that_drops_the_scores_is_refused(self):
+        """The scores travelling from the indexer to the loss pass through a
+        ``CompressedCandidates`` field that no index builder reads, so losing them
+        would show up as a loss of exactly zero -- a plausible curve, nothing trained.
+
+        Staged by narrowing the compressor's own return rather than by editing the
+        module, because the field is what the contract is about.
+        """
+        _require_tilelang_cuda()
+        from unittest import mock
+
+        _bind_indexer_loss(enabled=True)
+        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN)
+        real_forward = attn.compressor.forward
+
+        def _without_scores(*args, **kwargs):
+            compressed_kv, block_bias, candidates = real_forward(*args, **kwargs)
+            return compressed_kv, block_bias, candidates._replace(indexer_scores=None)
+
+        with _single_rank_parallel_state(), mock.patch.object(attn.compressor, "forward", _without_scores):
+            with pytest.raises(RuntimeError, match="produced no indexer scores"):
+                attn(**inputs)
+
+    def test_scores_and_indices_of_different_widths_are_refused(self):
+        """``[:, :, -width:]`` takes the compressed slice on the strength of the
+        indexer's score width, so a width that disagrees with the selection would
+        silently slide the slice into the sliding-window entries and train the indexer
+        against window probabilities.
+
+        Staged as a one-slot-narrower score tensor, which is what any reordering or
+        re-widening of either tensor would look like from here.
+        """
+        _require_tilelang_cuda()
+        from unittest import mock
+
+        _bind_indexer_loss(enabled=True)
+        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN)
+        real_forward = attn.compressor.forward
+
+        def _narrower_scores(*args, **kwargs):
+            compressed_kv, block_bias, candidates = real_forward(*args, **kwargs)
+            return (
+                compressed_kv,
+                block_bias,
+                candidates._replace(indexer_scores=candidates.indexer_scores[..., :-1]),
+            )
+
+        with _single_rank_parallel_state(), mock.patch.object(attn.compressor, "forward", _narrower_scores):
+            with pytest.raises(AssertionError, match="describe the same slots"):
+                attn(**inputs)
+
+    def test_a_declined_tilelang_dispatch_under_the_loss_is_refused(self):
+        """The teacher's LSE comes out of the TileLang kernel, so a dispatch declined
+        at runtime leaves the loss with no teacher at all.
+
+        ``_indexer_loss_enabled`` can only check the *configured* implementation; the
+        dispatch additionally requires bf16 CUDA tensors and declines silently on
+        anything else. Without this refusal the caller would unpack three values from
+        a two-value eager return and report a bare "not enough values to unpack",
+        pointing at the loss's plumbing rather than at the dtype that caused it.
+        """
+        _require_tilelang_cuda()
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        _bind_indexer_loss(enabled=True)
+        # fp32 is the realistic way to lose the dispatch: the kernel is bf16-only, and
+        # the attention forward hands it whatever dtype the module was built in.
+        query = torch.randn(1, 4, 8, 64, device="cuda")
+        kv = torch.randn(1, 1, 24, 64, device="cuda")
+        with pytest.raises(RuntimeError, match="needs the TileLang sparse attention dispatch"):
+            modeling.eager_attention_forward(
+                None, query, kv, kv, None, 0.1, sparse_topk_indices=None, indexer_target_width=8
+            )
+
+    def test_the_kl_gradient_reaches_the_indexer_and_stops_there(self):
+        """The KL has to be a trainable objective for the indexer and *only* for the
+        indexer, and it has to be finite.
+
+        Three separate ways this can fail silently, all pinned here:
+
+        * a KL detached from the indexer's own graph would log a plausible decreasing
+          number while training nothing, so the assertion is on parameter gradients
+          rather than on ``grad_fn``, and on their magnitude rather than their
+          presence -- a graph carrying zeros trains nothing either;
+        * a teacher or an LSE that stayed attached to the attention query would make
+          the auxiliary objective a second gradient path into the language model,
+          which ``hidden_states.grad is None`` is what rules out; and
+        * the ``-inf`` score rows of the first positions of the sequence make the KL's
+          gradient NaN unless they are neutralised, and NaN parameter gradients here
+          would be blamed on anything but the auxiliary loss.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_loss(enabled=True)
+        attn, inputs = _build_test_attention(device="cuda", seq_len=self._RANKING_SEQ_LEN)
+        with _single_rank_parallel_state():
+            _, _, kl_sum = attn(**inputs)
+        kl_sum.backward()
+
+        assert inputs["hidden_states"].grad is None, "the indexer KL reached the language-model input"
+        for name in ("q_b_proj", "kv_proj", "weights_proj"):
+            grad = getattr(attn.compressor.indexer, name).weight.grad
+            assert grad is not None, f"indexer.{name} received no gradient from the KL"
+            assert torch.isfinite(grad).all(), f"indexer.{name} received a non-finite gradient from the KL"
+            assert grad.abs().sum() > 0, f"indexer.{name} received an all-zero gradient from the KL"
+        # Nothing outside the indexer may move on this objective. The compressor and
+        # the attention projections sit on the language-model path.
+        for module_name in ("compressor.kv_proj", "compressor.gate_proj", "q_b_proj", "kv_proj"):
+            module = attn
+            for part in module_name.split("."):
+                module = getattr(module, part)
+            assert module.weight.grad is None, f"{module_name} moved on the indexer objective"
