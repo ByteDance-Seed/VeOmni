@@ -550,8 +550,11 @@ class BaseTrainer(Stateful, ABC):
         # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
         # activations are handled by GC recomputation (via _checkpoint_hook).
         if args.train.accelerator.offload_config.enable_async_activation:
+            offload_config = args.train.accelerator.offload_config
             apply_async_activation_offload(
-                self.model, args.train.accelerator.offload_config.activation_offload_modules
+                self.model,
+                offload_config.activation_offload_modules,
+                host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
             )
 
         kwargs = {}

@@ -14,6 +14,7 @@
 
 import math
 import os
+import sys
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
@@ -23,6 +24,8 @@ from ..utils.env import get_env
 
 
 logger = logging.get_logger(__name__)
+
+_MAX_HOST_CACHE_LIMIT_GB = sys.maxsize // 1024**3
 
 
 def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
@@ -518,12 +521,33 @@ class OffloadConfig:
             )
         },
     )
+    activation_offload_host_cache_limit_gb: float = field(
+        default=4.0,
+        metadata={
+            "help": (
+                "Maximum GB of free host buffers retained by async activation offload between steps. "
+                "In-flight offloads may temporarily use more host memory. Set to 0 to disable reuse."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.enable_activation and self.enable_async_activation:
             raise ValueError(
                 "enable_activation and enable_async_activation are mutually exclusive; "
                 "select exactly one activation offload mode."
+            )
+        if not math.isfinite(self.activation_offload_host_cache_limit_gb) or (
+            self.activation_offload_host_cache_limit_gb < 0
+        ):
+            raise ValueError(
+                "activation_offload_host_cache_limit_gb must be a finite non-negative value, "
+                f"got {self.activation_offload_host_cache_limit_gb}."
+            )
+        if self.activation_offload_host_cache_limit_gb > _MAX_HOST_CACHE_LIMIT_GB:
+            raise ValueError(
+                "activation_offload_host_cache_limit_gb is too large to convert to bytes: "
+                f"got {self.activation_offload_host_cache_limit_gb}, maximum {_MAX_HOST_CACHE_LIMIT_GB}."
             )
 
 

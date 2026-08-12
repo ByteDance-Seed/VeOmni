@@ -14,9 +14,14 @@
 
 """Unit tests for MindSpeed-style async activation offload helpers."""
 
+from functools import partial
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+from transformers.modeling_layers import GradientCheckpointingLayer
 
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
@@ -27,7 +32,42 @@ from veomni.distributed.async_offload import (
     get_offload_modules,
     reset_async_activation_offload,
 )
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
+
+
+class _AsyncOffloadFSDPBlock(GradientCheckpointingLayer):
+    def __init__(self, device=None):
+        super().__init__()
+        self.proj = nn.Linear(16, 16, device=device)
+
+    def forward(self, hidden_states):
+        return torch.nn.functional.gelu(self.proj(hidden_states))
+
+
+class _AsyncOffloadFSDPModel(nn.Module):
+    _no_split_modules = ["_AsyncOffloadFSDPBlock"]
+
+    def __init__(self, device=None):
+        super().__init__()
+        self.layers = nn.ModuleList([_AsyncOffloadFSDPBlock(device=device) for _ in range(4)])
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        checkpoint_func = partial(checkpoint, **(gradient_checkpointing_kwargs or {}))
+        for layer in self.layers:
+            layer.gradient_checkpointing = True
+            layer._gradient_checkpointing_func = checkpoint_func
+
+    def init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, hidden_states):
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+        return hidden_states
 
 
 def test_offload_config_allows_no_modules_for_auto_discovery():
@@ -43,6 +83,12 @@ def test_offload_config_rejects_sync_and_async_activation_together():
             enable_async_activation=True,
             activation_offload_modules=["model.layers.{*}"],
         )
+
+
+@pytest.mark.parametrize("cache_limit", [-1.0, float("inf"), float("nan"), float.fromhex("0x1.fffffffffffffp+1023")])
+def test_offload_config_rejects_invalid_host_cache_limit(cache_limit):
+    with pytest.raises(ValueError, match="activation_offload_host_cache_limit_gb"):
+        OffloadConfig(activation_offload_host_cache_limit_gb=cache_limit)
 
 
 def test_get_offload_modules_glob_is_segment_aware():
@@ -207,6 +253,45 @@ def test_pinned_buffer_pool_reuses_matching_layout():
     assert pool.reuses == 1
 
 
+def test_pinned_buffer_pool_cache_is_bounded_across_dynamic_shapes():
+    pool = PinnedBufferPool(max_cached_bytes=64)
+
+    for width in (4, 8, 12):
+        source = torch.empty((width,), dtype=torch.float32)
+        buffer, key = pool.acquire(source)
+        pool.release(buffer, key)
+
+    assert pool.cached_bytes <= 64
+    assert pool.evictions > 0
+
+
+def test_pinned_buffer_pool_refreshes_layout_recency_on_reuse():
+    pool = PinnedBufferPool(max_cached_bytes=48)
+    layouts = [
+        torch.empty((4,), dtype=torch.float32),
+        torch.empty((2, 2), dtype=torch.float32),
+        torch.empty((1, 4), dtype=torch.float32),
+        torch.empty((4, 1), dtype=torch.float32),
+    ]
+
+    first_key_buffers = [pool.acquire(layouts[0]) for _ in range(2)]
+    for buffer, key in first_key_buffers:
+        pool.release(buffer, key)
+    second_buffer, second_key = pool.acquire(layouts[1])
+    pool.release(second_buffer, second_key)
+
+    reused_buffer, reused_key = pool.acquire(layouts[0])
+    pool.release(reused_buffer, reused_key)
+    for layout in layouts[2:]:
+        buffer, key = pool.acquire(layout)
+        pool.release(buffer, key)
+
+    allocations_before = pool.allocations
+    pool.acquire(layouts[1])
+
+    assert pool.allocations == allocations_before + 1
+
+
 def test_async_offload_manager_resets_at_step_boundary():
     model = nn.Sequential(nn.Linear(2, 2))
     apply_async_activation_offload(model, ["0"])
@@ -220,8 +305,11 @@ def test_async_offload_manager_resets_at_step_boundary():
     assert manager.getcnt._block_tensor_nums == {}
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA is required for async D2H/H2D validation")
-def test_async_offload_cuda_gradient_parity_and_peak_memory():
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
+    reason="CUDA or NPU is required for async D2H/H2D validation",
+)
+def test_async_offload_accelerator_gradient_parity_and_peak_memory():
     device_api = get_torch_device()
     device = torch.device(get_device_type())
 
@@ -291,3 +379,86 @@ def test_async_offload_cuda_gradient_parity_and_peak_memory():
     second_output.square().mean().backward()
     device_api.synchronize()
     assert manager.host_buffer_pool.reuses > 0
+
+
+def _run_async_offload_base_trainer_fsdp2_gc():
+    import torch.distributed as dist
+
+    from veomni.arguments import (
+        ChunkMBSConfig,
+        FSDPConfig,
+        GradientCheckpointingConfig,
+        MixedPrecisionConfig,
+        OptimizerConfig,
+        TorchCompileConfig,
+    )
+    from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
+    from veomni.trainer.base import BaseTrainer
+
+    world_size = dist.get_world_size()
+    init_parallel_state(
+        dp_size=world_size,
+        dp_shard_size=world_size,
+        dp_mode="fsdp2",
+        device_type=get_device_type(),
+        name="base",
+    )
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.model = _AsyncOffloadFSDPModel(device="meta")
+    trainer.args = SimpleNamespace(
+        model=SimpleNamespace(
+            lora_config=None,
+            fqn_to_index_mapping=None,
+            model_path=None,
+            basic_modules=[],
+        ),
+        train=SimpleNamespace(
+            accelerator=SimpleNamespace(
+                offload_config=OffloadConfig(
+                    enable_async_activation=True,
+                    activation_offload_host_cache_limit_gb=0.01,
+                ),
+                fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
+            ),
+            optimizer=OptimizerConfig(),
+            chunk_mbs_config=ChunkMBSConfig(enable=False),
+            checkpoint=SimpleNamespace(load_path=None),
+            init_device="meta",
+            gradient_checkpointing=GradientCheckpointingConfig(enable=True),
+            broadcast_model_weights_from_rank0=False,
+            ep_sharded_stream_load=False,
+            torch_compile=TorchCompileConfig(enable=False),
+        ),
+    )
+
+    torch.manual_seed(0)
+    with use_parallel_state("base"):
+        trainer._build_parallelized_model()
+
+    assert all(layer.gradient_checkpointing for layer in trainer.model.layers)
+    manager = trainer.model.layers[0]._veomni_offload_manager
+    hidden_states = torch.randn(2, 8, 16, device=get_device_type(), requires_grad=True)
+    with use_parallel_state("base"):
+        output = trainer.model(hidden_states)
+    with use_parallel_state("base"):
+        output.float().square().mean().backward()
+
+    assert torch.isfinite(output).all()
+    assert manager.host_buffer_pool.allocations > 0
+    assert not manager.items
+    for parameter in trainer.model.parameters():
+        if parameter.grad is not None:
+            local_grad = parameter.grad.to_local() if hasattr(parameter.grad, "to_local") else parameter.grad
+            assert torch.isfinite(local_grad).all()
+    dist.barrier()
+
+
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
+    reason="CUDA or NPU is required for FSDP2 async-offload integration",
+)
+def test_async_offload_base_trainer_fsdp2_gc_integration():
+    from ..tools.launch_utils import torchrun
+
+    torchrun(_run_async_offload_base_trainer_fsdp2_gc, world_size=2)

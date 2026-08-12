@@ -21,6 +21,8 @@
 #   - Supports wildcard pattern ``{*}`` for sequential module groups (e.g. model.layers.{*})
 
 import fnmatch
+from collections import OrderedDict, deque
+from threading import Lock
 from typing import List
 from weakref import WeakValueDictionary
 
@@ -68,12 +70,24 @@ def base_check_fn(tensor) -> bool:
 
 
 class PinnedBufferPool:
-    """Reuse host buffers so async offload does not allocate pinned memory per tensor."""
+    """Reuse host buffers with a bounded, layout-level LRU cache."""
 
-    def __init__(self):
-        self._free_buffers = {}
+    def __init__(self, max_cached_bytes: int = 4 * 1024**3):
+        if max_cached_bytes < 0:
+            raise ValueError(f"max_cached_bytes must be non-negative, got {max_cached_bytes}.")
+
+        self.max_cached_bytes = int(max_cached_bytes)
+        self._free_buffers = OrderedDict()
+        self._cached_bytes = 0
+        self._lock = Lock()
         self.allocations = 0
         self.reuses = 0
+        self.evictions = 0
+        self.drops = 0
+
+    @property
+    def cached_bytes(self):
+        return self._cached_bytes
 
     @staticmethod
     def _key(tensor):
@@ -84,10 +98,17 @@ class PinnedBufferPool:
 
     def acquire(self, tensor):
         key = self._key(tensor)
-        free_buffers = self._free_buffers.get(key)
-        if free_buffers:
-            self.reuses += 1
-            return free_buffers.pop(), key
+        with self._lock:
+            free_buffers = self._free_buffers.get(key)
+            if free_buffers:
+                buffer = free_buffers.pop()
+                self._cached_bytes -= buffer.numel() * buffer.element_size()
+                if free_buffers:
+                    self._free_buffers.move_to_end(key)
+                else:
+                    del self._free_buffers[key]
+                self.reuses += 1
+                return buffer, key
 
         pin_memory = _is_active_accelerator_tensor(tensor)
         try:
@@ -111,12 +132,32 @@ class PinnedBufferPool:
                 device="cpu",
                 pin_memory=False,
             )
-        self.allocations += 1
+        with self._lock:
+            self.allocations += 1
         return buffer, key
 
     def release(self, buffer, key):
-        if buffer is not None:
-            self._free_buffers.setdefault(key, []).append(buffer)
+        if buffer is None:
+            return
+
+        buffer_nbytes = buffer.numel() * buffer.element_size()
+        with self._lock:
+            if self.max_cached_bytes == 0 or buffer_nbytes > self.max_cached_bytes:
+                self.drops += 1
+                return
+
+            while self._cached_bytes + buffer_nbytes > self.max_cached_bytes:
+                oldest_key, oldest_buffers = next(iter(self._free_buffers.items()))
+                evicted = oldest_buffers.popleft()
+                self._cached_bytes -= evicted.numel() * evicted.element_size()
+                self.evictions += 1
+                if not oldest_buffers:
+                    del self._free_buffers[oldest_key]
+
+            free_buffers = self._free_buffers.setdefault(key, deque())
+            free_buffers.append(buffer)
+            self._free_buffers.move_to_end(key)
+            self._cached_bytes += buffer_nbytes
 
 
 class GetCnt:
@@ -241,14 +282,14 @@ class SwapTensor:
 
 
 class OffloadManager:
-    def __init__(self):
+    def __init__(self, host_cache_limit_bytes: int = 4 * 1024**3):
         # Autograd owns packed SwapTensor objects until backward. Weak references
         # let abandoned graphs release stale entries after a failed step.
         self.items = WeakValueDictionary()
         self.getcnt = GetCnt()
         self.swap_stream = create_stream()
 
-        self.host_buffer_pool = PinnedBufferPool()
+        self.host_buffer_pool = PinnedBufferPool(max_cached_bytes=host_cache_limit_bytes)
 
     def get_cnt(self, block_idx):
         return self.getcnt.get_cnt(block_idx)
@@ -440,7 +481,7 @@ def _get_no_split_offload_modules(model):
     return matched_submodules
 
 
-def async_offload_modules(modules, prefetch=True, hidden_states_idx=0):
+def async_offload_modules(modules, prefetch=True, hidden_states_idx=0, host_cache_limit_bytes: int = 4 * 1024**3):
     """Apply async activation offload via selected-instance ``__call__`` patching.
 
     For each module, per-instance attributes (``_veomni_offload_layer_idx``,
@@ -477,7 +518,7 @@ def async_offload_modules(modules, prefetch=True, hidden_states_idx=0):
     of resetting, so the second pass produces ``"0_1"``, ``"1_1"``, … rather
     than repeating ``"0_0"``, ``"1_0"``, ….
     """
-    manager = OffloadManager()
+    manager = OffloadManager(host_cache_limit_bytes=host_cache_limit_bytes)
     for name, module, layer_idx, depth in modules:
         logger.info_rank0(
             f"Applying activation offload to module: {name}, offload idx: {layer_idx}, offload_layers_num: {depth}"
@@ -555,7 +596,11 @@ def _patch_instance_call(module):
     module.__class__ = async_offload_cls
 
 
-def apply_async_activation_offload(model, activation_offload_modules: List[str]):
+def apply_async_activation_offload(
+    model,
+    activation_offload_modules: List[str],
+    host_cache_limit_bytes: int = 4 * 1024**3,
+):
     """Apply async activation offload to matched submodules.
 
     Uses a selected-instance ``__call__`` subclass so that
@@ -576,4 +621,4 @@ def apply_async_activation_offload(model, activation_offload_modules: List[str])
             )
     else:
         matched_modules = _get_no_split_offload_modules(model)
-    async_offload_modules(matched_modules)
+    async_offload_modules(matched_modules, host_cache_limit_bytes=host_cache_limit_bytes)
