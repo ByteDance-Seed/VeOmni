@@ -1963,6 +1963,52 @@ class TestFourLayerModelIndexerKL:
                 assert param.grad is not None, f"{name} received no gradient"
                 assert param.grad.abs().sum() > 0, f"{name} received an all-zero gradient"
 
+    @pytest.mark.parametrize(
+        "indexer_loss, layer_index, regression",
+        [
+            # The review's exact case: a decoder layer regressed to ``(output, None)``
+            # on the flag-off path. A loop branching on ``isinstance(layer_output,
+            # tuple)`` absorbs this one silently -- it reads the ``None`` as "this
+            # layer built a KL", sums nothing, and every test still passes.
+            (False, 0, "extra_none"),
+            (True, 0, "extra_none"),
+            # And the other direction: the CSA layer dropping the KL it promised.
+            (True, 2, "dropped_kl"),
+        ],
+    )
+    def test_a_layer_that_disagrees_with_the_shared_gate_is_refused(self, indexer_loss, layer_index, regression):
+        """The model loop reads ``_builds_indexer_kl`` and holds the layer to it.
+
+        This is what makes the "bare tensor when the layer builds no KL" contract
+        enforced rather than merely documented. Two things would otherwise be silent:
+
+        * a loop that *decided* on ``isinstance(layer_output, tuple)`` would accept
+          any arity a layer happened to return, which is what the three comments
+          claiming the loop reads the predicate were describing and the code was not
+          doing; and
+        * the unpacking alone is not self-checking. ``a, b = tensor`` succeeds for any
+          tensor whose leading dimension is 2, so on a two-sample batch a bare tensor
+          from a regressed layer would be split into hidden states and a "KL" without
+          error. The batch size would decide whether the bug was loud.
+
+        Patching one layer's ``forward`` is the closest a test can get to that
+        regression: patching ``_builds_indexer_kl`` itself would move the decoder
+        layer's read and the loop's read together, since both call the same
+        module-level function on the same object, and they would agree again.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=indexer_loss)
+        layer = model.model.layers[layer_index]
+        real_forward = layer.forward
+        if regression == "extra_none":
+            layer.forward = lambda *args, **kwargs: (real_forward(*args, **kwargs), None)
+        else:
+            layer.forward = lambda *args, **kwargs: real_forward(*args, **kwargs)[0]
+
+        with _single_rank_parallel_state():
+            with pytest.raises(RuntimeError, match="disagree about the indexer-KL return arity"):
+                model(**batch)
+
     def test_only_csa_layers_carry_an_indexer(self):
         """The reference checkpoint has ``compress_ratios [0, 0, 4, 128]``: two sliding
         layers, one CSA layer at rate 4, one HCA layer at rate 128. Only the CSA layer

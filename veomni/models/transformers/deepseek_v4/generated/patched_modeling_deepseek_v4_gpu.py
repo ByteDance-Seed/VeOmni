@@ -2525,6 +2525,16 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         indexer_kl_total = None
         # --- Patch.3 ---
         for layer in self.layers:
+            # --- Patch.3 ---
+            # The same predicate the decoder layer and the attention forward read, so
+            # the arity of ``layer_output`` is decided in one place rather than three.
+            # Branching on ``isinstance(layer_output, tuple)`` instead would *absorb* a
+            # regression rather than surface it: a decoder layer that returned
+            # ``(hidden_states, None)`` on the flag-off path would read here as "this
+            # layer built a KL", every test would still pass, and nothing would enforce
+            # the bare-tensor contract the layer's own comment spells out.
+            builds_indexer_kl = _builds_indexer_kl(layer.self_attn)
+            # --- Patch.3 ---
             layer_output = layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -2535,11 +2545,23 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 **kwargs,
             )
             # --- Patch.3 ---
+            # ``isinstance`` *verifies* the predicate here; it does not stand in for it.
+            # The unpacking below is not self-checking: ``a, b = tensor`` succeeds for
+            # any tensor whose leading dimension is 2, so on a two-sample batch a bare
+            # tensor from a regressed layer would be taken apart into hidden states and
+            # a "KL" without a word — the batch size deciding whether the bug is loud.
+            if builds_indexer_kl is not isinstance(layer_output, tuple):
+                raise RuntimeError(
+                    f"decoder layer {layer.layer_idx} returned "
+                    f"{'a tuple' if isinstance(layer_output, tuple) else type(layer_output).__name__} while "
+                    f"_builds_indexer_kl says builds_indexer_kl={builds_indexer_kl}: the layer and the model "
+                    "loop disagree about the indexer-KL return arity"
+                )
             # Only the CSA layers return a pair; the rest return the bare tensor they
             # always returned. Summed rather than averaged over the layers, which is
             # deliberate and matches the MoE router aux loss this sits beside: the
             # reported number scales with the number of CSA layers.
-            if isinstance(layer_output, tuple):
+            if builds_indexer_kl:
                 hidden_states, layer_kl = layer_output
                 indexer_kl_total = layer_kl if indexer_kl_total is None else indexer_kl_total + layer_kl
             else:
