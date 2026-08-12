@@ -30,6 +30,31 @@ from tilelang import language as T
 KV_BLOCK = 1024
 
 
+def cta_threads(block_H, block_size):
+    """Pick the backward CTA width for a ``(block_H, block_size)`` tile.
+
+    The accumulator fragments are spread over the CTA's threads, so this sets their
+    per-thread register footprint. ``acc_dq`` alone is ``block_H * D`` floats: at
+    block_H=64 that is 256 registers per thread on 4 warps, past the 255-register
+    limit, so ptxas spills ~1.8 KB per thread. Doubling to 8 warps halves every
+    fragment and drops the spill to 72 B. It costs nothing in occupancy -- the tile
+    shapes do not depend on the CTA width, and at ~200 KB of shared memory per CTA
+    only one CTA fits per SM either way, so the wider CTA just doubles the resident
+    warps. Measured on one GB200 at D=512, topk=640, B=1, S=4096, S_kv=5120, bf16:
+    14.97 -> 7.68 ms for block_H=64, and 8.08 -> 5.92 ms for block_H=32.
+
+    The ceiling is the GEMM tiling. ``FullCol`` splits the ``block_size`` columns
+    over at most ``block_size // 8`` warps (the MMA n-tile is 8) and the remaining
+    warps divide ``block_H`` rows, so each warp's row tile is
+    ``block_H * (block_size // 8) / num_warps`` and a warp needs a whole 16-row MMA
+    tile. That bounds the width at ``block_size * block_H // 4``; exceeding it is a
+    hard TileLang assertion ("warp_row_tiles must be greater than 16"), not a slow
+    kernel. Past 256 the extra warps are a net loss anyway (measured: 5.43 ms at 512
+    vs 4.32 ms at 256 for block_H=64 with a 1024-length KV).
+    """
+    return min(256, block_size * block_H // 4)
+
+
 @tilelang.jit(out_idx=[-1])
 def preprocess(
     B,
@@ -114,7 +139,7 @@ def bwd(
     sm_scale=None,
     block_size=32,
     num_stages=0,
-    threads=128,
+    threads=None,
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
@@ -141,6 +166,20 @@ def bwd(
     NH = padded_H // block_H
     BS = block_size
     NS = tilelang.cdiv(topk, block_size)
+
+    if threads is None:
+        threads = cta_threads(block_H, BS)
+    # Fail here rather than inside TileLang's MMA macro generator, which reports the
+    # violated warp tile with no hint of which kernel asked for it. The power-of-two
+    # requirement is separate from the bound: the row/column warp split must multiply
+    # back to the warp count, so e.g. 96 threads clears the bound and still fails.
+    assert threads % 32 == 0 and threads & (threads - 1) == 0, (
+        f"threads ({threads}) must be a power-of-two multiple of the 32-lane warp"
+    )
+    assert threads <= BS * block_H // 4, (
+        f"threads ({threads}) exceeds the GEMM warp-tile bound {BS * block_H // 4} "
+        f"for block_H={block_H}, block_size={BS}"
+    )
 
     split_store = 2
 
@@ -187,8 +226,18 @@ def bwd(
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
 
+                # Read the row index straight from global memory and clamp it, instead of
+                # going through the safe_indices fragment. A fragment index would tie this
+                # copy to the fragment's inferred layout, which collapses the whole tile
+                # onto the handful of threads that own the BS axis; reading Indices
+                # directly lets layout inference pick a coalesced whole-CTA copy instead.
+                # Clamping is equivalent to substituting row 0: out-of-range candidates
+                # have their scores pre-set to -inf above, which absorbs the finite QK
+                # product from whichever row is fetched here, so their softmax weight is
+                # exactly zero. The dKV scatter stays mask-guarded, so no gradient is ever
+                # written to the clamped row.
                 for bi_i, d_i in T.Parallel(BS, D):
-                    KV_shared[bi_i, d_i] = KV[by, safe_indices[bi_i], d_i]
+                    KV_shared[bi_i, d_i] = KV[by, T.max(T.min(Indices[by, s_i, i_i * BS + bi_i], S_kv - 1), 0), d_i]
 
                 T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
 
@@ -282,6 +331,8 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     assert topk_idxs.is_contiguous() and lse.is_contiguous()
     B, S, H, D = q.shape
     unpadded_S_kv = kv.shape[1]
+    # The gather clamps candidate rows into [0, S_kv - 1], which needs a row to exist.
+    assert unpadded_S_kv > 0, "kv must have at least one row"
     topk = topk_idxs.shape[-1]
 
     # Pad topk to next multiple of block_size (kernel requires divisibility)
