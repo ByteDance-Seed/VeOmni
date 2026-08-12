@@ -1317,6 +1317,10 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 #    converted to a compact fixed-width index list, preserving sliding-window,
 #    compressor, causal, and invalid-index semantics.
 # 2. Preserve the upstream eager implementation as the default fallback.
+# 3. Return the indexer loss's teacher distribution as a third value when the
+#    caller sets ``indexer_target_width``. The return annotation states that
+#    arity, so a caller reads the contract off the signature rather than off a
+#    comment; ``indexer_target_width`` is the only thing that selects it.
 # ================================================================
 def eager_attention_forward(
     module: nn.Module,
@@ -1327,7 +1331,7 @@ def eager_attention_forward(
     scaling: float,
     dropout: float | int = 0.0,
     **kwargs,
-):
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     # --- Patch.1 ---
     attention_implementation = veomni_dsa_attention_implementation.value
     if attention_implementation not in {"eager", "tilelang"}:
@@ -1526,6 +1530,9 @@ class DeepseekV4Attention(nn.Module):
     # 3. Context parallelism: shard the queries instead of the heads and
     #    replicate the MQA KV, so both Ulysses all-to-alls disappear and the
     #    sparse indices keep addressing global KV rows.
+    # 4. Under ``dsa_indexer_loss`` on a CSA layer, return the indexer KL as a
+    #    third value. The return annotation states that arity, so a caller reads
+    #    the contract off the signature rather than off a comment.
     # ================================================================
     def forward(
         self,
@@ -1535,7 +1542,7 @@ class DeepseekV4Attention(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings[self.rope_layer_type]
@@ -1675,12 +1682,19 @@ class DeepseekV4Attention(nn.Module):
         # ``_indexer_loss_enabled`` first, so that its refusals fire on every layer type
         # rather than only on the ones carrying an indexer: a model configured for the
         # loss but built without a single CSA layer would otherwise accept the flag and
-        # train nothing. The second test is what keeps HCA and sliding layers on their
-        # two-value return -- they have no indexer, so they have no student, and their
-        # compressors hand back a perfectly ordinary ``CompressedCandidates`` carrying
-        # causal ranges instead of scores.
-        build_indexer_loss = _indexer_loss_enabled(self) and getattr(self.compressor, "indexer", None) is not None
-        indexer_kl = None
+        # train nothing. The layer type is what keeps HCA and sliding layers on their
+        # two-value return -- only a CSA layer carries a Lightning Indexer, so only it
+        # has a student to train, and the others' compressors hand back a perfectly
+        # ordinary ``CompressedCandidates`` carrying causal ranges instead of scores.
+        #
+        # The test is on the layer type rather than on ``self.compressor.indexer``
+        # existing, because the two fail in opposite directions. ``layer_type`` comes
+        # from the checkpoint's ``layer_types``, so a rename of the compressor's
+        # attribute breaks the KL loudly at the attribute access below; keying the gate
+        # on that attribute's *name* would instead turn the whole auxiliary objective
+        # into a no-op, with no error and no change of arity -- a plausible loss curve
+        # training nothing, which is the failure class this task exists to prevent.
+        build_indexer_loss = _indexer_loss_enabled(self) and self.layer_type == "compressed_sparse_attention"
         if build_indexer_loss:
             index_score = compressed_candidates.indexer_scores if compressed_candidates is not None else None
             if index_score is None:
@@ -1689,14 +1703,21 @@ class DeepseekV4Attention(nn.Module):
                     "KL would have no student distribution to train. Every path that can drop them raises "
                     "before here, so this is a wiring regression rather than a configuration problem."
                 )
-            # The width of the compressed slice the teacher is asked for. Reading it off
-            # the *scores* and then checking it against the selection is the point: the
-            # teacher's slot ``j`` has to be the slot ``index_score[..., j]`` scored, and a
-            # width taken from the wrong tensor would slide the slice into the sliding
-            # window and train the indexer against window probabilities.
+            # The width of the compressed slice the teacher is asked for, read off the
+            # *scores* so that the KL pairs slot ``j`` of the teacher with the score
+            # ``index_score[..., j]``.
+            #
+            # The assertion below claims exactly one thing: that the two tensors the KL
+            # pairs are the same width. It compares two widths, so it cannot see a
+            # reordering of ``torch.cat((sliding_indices, compressed_indices))`` -- that
+            # leaves both widths unchanged while ``[:, :, -width:]`` starts reading window
+            # slots. The reordering guard is a test, not this line:
+            # ``test_target_reads_the_full_window_lse_and_the_trailing_compressed_slice``
+            # compares the teacher's slot tensor against the indexer's own selection
+            # lifted past the full-resolution KV rows.
             kwargs["indexer_target_width"] = index_score.shape[-1]
             assert kwargs["indexer_target_width"] == compressed_candidates.topk_indices.shape[-1], (
-                "indexer scores and compressed indices must describe the same slots"
+                "indexer scores and compressed indices must be the same width"
             )
         # --- Patch.3 ---
         attention_outputs = attention_interface(

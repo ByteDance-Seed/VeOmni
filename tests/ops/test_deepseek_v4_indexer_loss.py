@@ -1046,13 +1046,22 @@ def _build_test_attention(device="cuda", seq_len=4096, layer_type="compressed_sp
 
     ``sinks`` and both ``position_bias`` parameters are ``torch.empty`` in the
     upstream constructors, so a directly built layer attends against uninitialised
-    memory until they are written. The sinks are given per-head *different* values on
-    purpose: the teacher's per-head denominators are what make it more than a
-    compressed-only softmax, and equal sinks would weaken that difference.
+    memory until they are written. The sinks are drawn per-head rather than set to a
+    constant so that they cannot all cancel out of the teacher's denominators; note
+    though that they are *not* what separates the paper's teacher from a
+    compressed-only one. Measured on this configuration, forcing every sink to the
+    same value moves that separation from 1.9633 to 1.9620 — it is the per-head query
+    content that makes the summed compressed mass differ across heads, and
+    ``test_kl_uses_the_paper_correct_teacher`` asserts the separation itself rather
+    than trusting either.
     """
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
     config = _dsv4_indexer_test_config()
+    if layer_type not in config.layer_types:
+        # The 4-layer checkpoint this config mirrors has no sliding layer, and the
+        # gate has to keep one on its two-value return just as it does an HCA layer.
+        config.layer_types = [*config.layer_types[:-1], layer_type]
     layer_idx = config.layer_types.index(layer_type)
     torch.manual_seed(seed)
     attn = modeling.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device, dtype=torch.bfloat16)
@@ -1144,6 +1153,53 @@ def _probe_dsa_kernels():
         mock.patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _indexer),
     ):
         yield probe
+
+
+def _reference_compressed_only_target(q, kv, topk_idxs, compressed_start, sm_scale):
+    """The teacher this loss must **not** build: Megatron's compressed-only variant.
+
+    One softmax per head over the compressed slice alone, so the sliding window and
+    the attention sink are absent from the denominator (NVIDIA/Megatron-LM#5776).
+    Written here so that ``test_kl_uses_the_paper_correct_teacher`` can assert its own
+    premise -- that the two teachers are far enough apart for its tolerance to tell
+    them apart -- instead of taking that on trust.
+
+    All-miss compressed rows are neutralised on the way in, as
+    ``indexer_kl_terms`` does: without the sink in the denominator such a row is an
+    all-``-inf`` softmax, i.e. NaN, and a NaN teacher would make the separation below
+    unreadable rather than small.
+
+    Args / returns as ``reference_compressed_target``, minus the sink.
+    """
+    idx = topk_idxs[..., compressed_start:]
+    b = q.shape[0]
+    valid = idx >= 0
+    batch_index = torch.arange(b, device=kv.device).view(b, 1, 1)
+    gathered = kv[batch_index, idx.clamp_min(0).long()]
+    logits = torch.einsum("bshd,bskd->bshk", q.float(), gathered.float()) * sm_scale
+    logits = logits.masked_fill(~valid.unsqueeze(2), float("-inf"))
+    all_missing = ~torch.isfinite(logits).any(-1, keepdim=True)
+    probs = torch.softmax(torch.where(all_missing, torch.zeros_like(logits), logits), dim=-1)
+    compressed = torch.where(all_missing, torch.zeros_like(probs), probs).sum(dim=2)  # head sum -> [B, S, C]
+    return compressed / compressed.sum(-1, keepdim=True).clamp_min(1e-20)
+
+
+def _reference_compressed_only_target_by_query_chunk(q, kv, topk_idxs, compressed_start, sm_scale, chunk=512):
+    """``_reference_compressed_only_target`` over query chunks, for the reason
+    ``_reference_target_by_query_chunk`` gives."""
+    return torch.cat(
+        [
+            _reference_compressed_only_target(
+                q[:, start : start + chunk],
+                kv,
+                topk_idxs[:, start : start + chunk],
+                compressed_start,
+                sm_scale,
+            )
+            for start in range(0, q.shape[1], chunk)
+        ],
+        dim=1,
+    )
 
 
 def _reference_target_by_query_chunk(q, kv, sink, topk_idxs, compressed_start, sm_scale, chunk=512):
@@ -1309,22 +1365,43 @@ class TestAttentionForwardIndexerKL:
             "indexer selected, so this test barely exercises the top-k"
         )
 
+        compressed_start = attention["topk"].shape[-1] - target["topk"].shape[-1]
         expected_target = _reference_target_by_query_chunk(
             attention["q"],
             attention["kv"],
             attention["sink"],
             attention["topk"],
-            attention["topk"].shape[-1] - target["topk"].shape[-1],
+            compressed_start,
             attn.scaling,
         )
         expected = modeling.indexer_kl_terms(indexer["index_score"], expected_target).sum()
+
         # Measured on GB200: the kernel teacher and this reference put the summed KL
         # 6.1e-5 apart on a KL of 413.35, i.e. 1.5e-7 relative, both consuming the
-        # same bf16 inputs and accumulating in fp32. The bounds below admit 4.1e-2,
-        # which is ~700x the observed gap -- headroom for a different summation
-        # order -- while still being ~50x tighter than the 1.96 by which the
-        # compressed-only teacher misses.
-        torch.testing.assert_close(kl_sum, expected, atol=1e-2, rtol=1e-4)
+        # same bf16 inputs and accumulating in fp32. ``assert_close`` admits
+        # ``atol + rtol * |expected|``, so these bounds accept 5.1e-2 -- ~840x the
+        # observed gap, which is headroom for a different summation order.
+        atol, rtol = 1e-2, 1e-4
+        admitted = atol + rtol * expected.abs()
+
+        # The other half of that arithmetic, and the premise this whole test rests on:
+        # the wrong teacher has to sit *outside* what the bound accepts, or the
+        # comparison above would pass against the mistake it exists to catch. The
+        # separation is not free -- for a single head the LSE cancels under the L1
+        # renormalisation at the end of the forward, and the two teachers coincide
+        # exactly -- so it is asserted rather than assumed, the way the ranking premise
+        # above is. Measured here: 1.96, i.e. 38x the bound.
+        wrong_target = _reference_compressed_only_target_by_query_chunk(
+            attention["q"], attention["kv"], attention["topk"], compressed_start, attn.scaling
+        )
+        wrong = modeling.indexer_kl_terms(indexer["index_score"], wrong_target).sum()
+        separation = (expected - wrong).abs()
+        assert separation > 10 * admitted, (
+            f"the compressed-only teacher is only {separation:.3e} from the correct one while the "
+            f"tolerance below admits {admitted:.3e}, so this test can no longer tell them apart"
+        )
+
+        torch.testing.assert_close(kl_sum, expected, atol=atol, rtol=rtol)
 
     def test_target_reads_the_full_window_lse_and_the_trailing_compressed_slice(self):
         """The three structural contracts the numeric test above can only observe
@@ -1378,6 +1455,83 @@ class TestAttentionForwardIndexerKL:
         assert torch.equal(target["topk"], expected_slice)
         assert (selection < 0).any(), "no miss in this selection, so the -1 half of the mapping is untested"
 
+    def test_the_kl_survives_the_dense_mask_path(self):
+        """The other index-building path: a dense ``attention_mask``.
+
+        Every other test here passes ``attention_mask=None``, which is the mask-free
+        path bf16 TileLang training takes. When ``DeepseekV4Model.forward`` cannot
+        validate candidates from packed metadata alone it hands the layer the dense
+        sliding-window mask instead, and the layer then builds its candidates with
+        ``build_sparse_attention_indices`` and filters them through
+        ``mask_sparse_attention_indices``. This test is coverage of that path: the KL
+        has to come out finite, positive and trainable there too.
+
+        What the filtering step does *not* do is worth recording here, because the
+        obvious guess is wrong. Measured on this configuration it changes nothing at
+        all: the layer extends the dense mask with the compressor's own ``block_bias``
+        before handing it over, and the indexer's selection is already a subset of the
+        blocks that bias allows, so the call invalidates 0 of the 1048576 compressed
+        slots and returns a tensor bit-identical to its input. The ``-1`` slots the
+        premise below looks for are therefore the indexer's own misses carried through
+        the builder -- the same ones the mask-free path produces, scored ``-inf`` by
+        the indexer as well as zero-massed in the teacher -- and not a teacher/student
+        asymmetry this path creates.
+
+        The mask is built the way the model builds it, not by hand, so that a change to
+        the real mask's shape or dtype breaks this test rather than leaving it agreeing
+        with a mask nothing produces.
+        """
+        _require_tilelang_cuda()
+        from unittest import mock
+
+        from transformers.masking_utils import create_sliding_window_causal_mask
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        _bind_indexer_loss(enabled=True)
+        seq_len = self._CHEAP_SEQ_LEN
+        attn, inputs = _build_test_attention(device="cuda", seq_len=seq_len)
+        # The mask builder dispatches on the config's attention implementation, and a
+        # directly built layer leaves it unset; "eager" is what the model configures
+        # here and it is the interface this file's patched forward replaces.
+        attn.config._attn_implementation = "eager"
+        inputs["attention_mask"] = create_sliding_window_causal_mask(
+            config=attn.config,
+            inputs_embeds=inputs["hidden_states"],
+            attention_mask=torch.ones(1, seq_len, dtype=torch.long, device="cuda"),
+            past_key_values=None,
+            position_ids=inputs["position_ids"],
+        )
+        assert inputs["attention_mask"] is not None, "no dense mask here, so this test is the mask-free path again"
+
+        with (
+            _single_rank_parallel_state(),
+            _probe_dsa_kernels() as probe,
+            mock.patch(
+                f"{_PATCHED_MODULE}.mask_sparse_attention_indices",
+                wraps=modeling.mask_sparse_attention_indices,
+            ) as masking,
+        ):
+            _, _, kl_sum = attn(**inputs)
+
+        # The premise: the dense path really ran -- the mask-free path never reaches
+        # this call, so without it this test is that path again under another name.
+        assert masking.call_count == 1, f"the dense masking step ran {masking.call_count} times, expected once"
+        target_width = probe.one("target")["topk"].shape[-1]
+        compressed_slots = probe.one("attention")["topk"][:, :, -target_width:]
+        assert (compressed_slots < 0).any(), (
+            "no missing compressed slot, so the KL's zero-mass masking is not exercised here"
+        )
+
+        assert torch.isfinite(kl_sum), f"the dense-mask path made the KL {kl_sum}"
+        assert kl_sum > 0, "the KL collapsed to zero on the dense-mask path"
+        kl_sum.backward()
+        for name in ("q_b_proj", "kv_proj", "weights_proj"):
+            grad = getattr(attn.compressor.indexer, name).weight.grad
+            assert grad is not None, f"indexer.{name} received no gradient from the KL"
+            assert torch.isfinite(grad).all(), f"indexer.{name} received a non-finite gradient from the KL"
+            assert grad.abs().sum() > 0, f"indexer.{name} received an all-zero gradient from the KL"
+
     def test_the_flag_off_forward_returns_two_values(self):
         """Default off means the return *arity* is what it was.
 
@@ -1420,28 +1574,35 @@ class TestAttentionForwardIndexerKL:
         assert weights_off is None and weights_on is None
         assert torch.isfinite(kl_sum) and kl_sum > 0, f"the KL is not a usable objective: {kl_sum}"
 
-    def test_a_layer_without_an_indexer_keeps_the_two_tuple(self):
-        """Only the layers that *have* a Lightning Indexer can build the KL.
+    @pytest.mark.parametrize("layer_type", ["heavily_compressed_attention", "sliding_attention"])
+    def test_a_non_csa_layer_keeps_the_two_tuple(self, layer_type):
+        """Only a compressed-sparse-attention layer carries a Lightning Indexer, so
+        only it can build the KL -- and the other layer types must pass the flag-on
+        forward through unchanged rather than raise on it.
 
-        An HCA layer's compressor returns a perfectly ordinary
-        ``CompressedCandidates`` -- carrying the causal ``range_starts`` /
-        ``range_ends`` its index builder needs -- with no ``indexer_scores``, because
-        it has no indexer to produce them. Gating on the candidates being present
-        would therefore make every HCA layer raise "the CSA compressor produced no
-        indexer scores" the moment the flag went on, which is most of the layers in
-        the 4-layer checkpoint.
+        Both directions are easy to get wrong. An HCA layer's compressor returns a
+        perfectly ordinary ``CompressedCandidates`` -- carrying the causal
+        ``range_starts`` / ``range_ends`` its index builder needs -- with no
+        ``indexer_scores``, because it has no indexer to produce them; gating on the
+        candidates being present would make every HCA layer raise "the CSA compressor
+        produced no indexer scores" the moment the flag went on, which is three of the
+        four layers here. A sliding layer has no compressor at all, so it would reach
+        the same refusal through ``compressed_candidates is None``.
+
+        The gate keys on ``self.layer_type`` rather than on the compressor having an
+        attribute called ``indexer``, because a rename of that attribute has to break
+        loudly instead of turning the auxiliary objective into a silent no-op.
         """
         _require_tilelang_cuda()
 
         _bind_indexer_loss(enabled=True)
-        attn, inputs = _build_test_attention(
-            device="cuda", seq_len=self._CHEAP_SEQ_LEN, layer_type="heavily_compressed_attention"
-        )
+        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
+        assert attn.layer_type != "compressed_sparse_attention", "this test is about the layers the gate excludes"
         assert getattr(attn.compressor, "indexer", None) is None, "this layer type is supposed to have no indexer"
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
             result = attn(**inputs)
 
-        assert len(result) == 2, f"an HCA layer has no student to train; expected 2 values, got {len(result)}"
+        assert len(result) == 2, f"a {layer_type} layer has no student to train; expected 2 values, got {len(result)}"
         assert not probe.target, "the teacher kernel ran for a layer with no indexer"
 
     def test_a_compressor_that_drops_the_scores_is_refused(self):
@@ -1473,8 +1634,10 @@ class TestAttentionForwardIndexerKL:
         silently slide the slice into the sliding-window entries and train the indexer
         against window probabilities.
 
-        Staged as a one-slot-narrower score tensor, which is what any reordering or
-        re-widening of either tensor would look like from here.
+        Staged as a one-slot-narrower score tensor. This pins the width invariant
+        only, which is all the production assertion claims; a *reordering* of the
+        index tensor leaves both widths equal and is caught instead by
+        ``test_target_reads_the_full_window_lse_and_the_trailing_compressed_slice``.
         """
         _require_tilelang_cuda()
         from unittest import mock
@@ -1492,7 +1655,7 @@ class TestAttentionForwardIndexerKL:
             )
 
         with _single_rank_parallel_state(), mock.patch.object(attn.compressor, "forward", _narrower_scores):
-            with pytest.raises(AssertionError, match="describe the same slots"):
+            with pytest.raises(AssertionError, match="must be the same width"):
                 attn(**inputs)
 
     def test_a_declined_tilelang_dispatch_under_the_loss_is_refused(self):
