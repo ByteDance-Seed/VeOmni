@@ -2392,6 +2392,69 @@ class TestFourLayerModelIndexerKL:
         )
         torch.testing.assert_close(difference, reported, atol=admitted, rtol=0)
 
+    def test_the_pre_fold_language_model_loss_is_reported(self):
+        """The clean LM curve a flag-on run needs to be comparable to a flag-off one.
+
+        The KL is folded into ``loss`` -- deliberately, because that is what makes the
+        indexer's gradient scale right by construction -- so ``training/foundation_loss``
+        on a flag-on run is contaminated by it, which is Task 10's one unmet acceptance
+        criterion. The value from *before* the fold-in is reported alongside the KL so
+        that the criterion can be read directly.
+
+        Two things pin it, and the second is the one that matters:
+
+        * the difference between the reported total and this metric is the folded KL,
+          which fails if the metric is simply ``out.loss`` read after the fold-in -- the
+          obvious way to get this wrong -- and
+        * the metric tracks a flag-off run's loss to within the ULPs that separate two
+          runs of this forward, which is the criterion itself. Without that leg the
+          metric could be any pre-fold quantity at all.
+
+        The tolerance is the same one ``test_the_coefficient_scales_what_the_loss_receives``
+        derives: two forwards of this model that differ only in whether the attention
+        kernel also returned its LSE are not bitwise equal, and the bound has to admit
+        that while staying far below the KL it is separating.
+        """
+        _require_tilelang_cuda()
+
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=True, coef=1.0, seed=0)
+        with _single_rank_parallel_state():
+            out = model(**batch)
+
+        pre_fold = out.aux_metrics["lm_loss_before_indexer_kl"]
+        assert not pre_fold.requires_grad and pre_fold.grad_fn is None, "the pre-fold loss must be a metric only"
+
+        reported = out.aux_metrics["indexer_kl"].to(out.loss.dtype)
+        admitted = 8 * torch.finfo(out.loss.dtype).eps * out.loss.detach().abs().item()
+        assert reported > 100 * admitted, (
+            f"the reported KL {float(reported):.3e} cannot be told from zero at this precision, so "
+            "neither leg below separates anything"
+        )
+        torch.testing.assert_close(out.loss.detach() - pre_fold, reported, atol=admitted, rtol=0)
+
+        off, off_batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=False, seed=0)
+        with _single_rank_parallel_state():
+            off_out = off(**off_batch)
+        torch.testing.assert_close(pre_fold, off_out.loss.detach(), atol=admitted, rtol=0)
+
+    def test_the_pre_fold_loss_is_absent_when_there_is_nothing_to_fold_into(self):
+        """Without labels there is no loss, so there is no pre-fold value to report.
+
+        ``loss`` is ``None`` on that path and ``None.detach()`` would raise, so the
+        entry has to sit inside the ``labels is not None`` branch rather than beside
+        the KL. The KL itself is still reported, which is what distinguishes this from
+        skipping the block.
+        """
+        _require_tilelang_cuda()
+
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, labels=False)
+        with _single_rank_parallel_state():
+            out = model(**batch)
+
+        assert out.loss is None
+        assert "lm_loss_before_indexer_kl" not in out.aux_metrics
+        assert out.aux_metrics["indexer_kl"] > 0
+
     def test_the_indexer_objective_moves_only_the_indexer(self):
         """Decoupling at model scope: the auxiliary objective may move indexer
         parameters and nothing else.

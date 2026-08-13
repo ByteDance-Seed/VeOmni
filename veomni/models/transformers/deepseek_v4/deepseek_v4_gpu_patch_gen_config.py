@@ -1864,6 +1864,22 @@ def deepseek_v4_forcausallm_forward_patched(
         # re-checked, because two places deciding "is the objective on" is exactly the
         # staleness this feature's single-predicate discipline exists to prevent.
         if labels is not None:
+            # The language-model objective as it stood before the KL joined it, so a
+            # flag-on run still has a curve comparable to a flag-off baseline. The
+            # fold-in below stays exactly as it was -- it is what makes the indexer's
+            # gradient scale right by construction, riding
+            # ``reduce_sequence_parallel_loss`` and ``mean_global_loss`` on the same
+            # chain as the LM loss -- so this is an extra *metric*, not Megatron's
+            # ``DSAIndexerLossAutoScaler``, which leaves the forward value untouched at
+            # the price of reproducing that chain by hand.
+            #
+            # Subtracting the reported KL from ``training/foundation_loss`` is not the
+            # same number: ``mean_global_loss`` weights the total by the micro-batch's
+            # label-token share while an aux metric gets a plain ``1/N``, so the
+            # subtraction is exact only when the micro-batches carry equal label
+            # counts. This entry rides the aux-metric path, so it needs no such
+            # assumption.
+            aux_metrics["lm_loss_before_indexer_kl"] = loss.detach()
             loss = loss + veomni_dsa_indexer_loss_coef.value * indexer_kl.to(loss.device)
     # --- Patch.3 ---
 
