@@ -542,6 +542,7 @@ class TestIndexerLossGate:
         "dsa_indexer_loss": False,
         "dsa_indexer_implementation": "eager",
         "dsa_attention_implementation": "eager",
+        "dsa_indexer_loss_coef": 1.0,
     }
 
     @pytest.fixture(autouse=True)
@@ -678,6 +679,78 @@ class TestIndexerLossGate:
         ):
             assert modeling._indexer_loss_enabled(object()) is True
 
+    @pytest.mark.parametrize("coef", [0.0, -0.0, 0, -1.0])
+    def test_a_non_positive_coefficient_switches_the_objective_off(self, coef):
+        """``dsa_indexer_loss_coef <= 0`` is *off*, not "on and weighted by nothing".
+
+        A Python ``0.0`` multiplied into the fold-in still builds the graph, so the
+        backward propagates a zero tensor rather than none and every indexer
+        parameter ends the step with ``p.grad`` set. Muon skips only
+        ``p.grad is None`` (``muon.py:902``) and ``_apply_ortho`` then runs
+        ``p.mul_(1 - lr * weight_decay)`` unconditionally (``:1005-1006``), decaying
+        226M otherwise-frozen parameters -- while the run pays the teacher kernel's
+        full cost for a term that contributes nothing. The gate is what makes
+        ``arguments_types.py``'s "use 0.0 to switch the term off" true.
+
+        Checked on the predicate rather than on the fold-in because the fold-in is
+        one of four things the answer decides: the indexer's return arity, the
+        compressor's, the teacher recompute in the attention forward, and only then
+        the fold-in. Gating the fold-in alone would leave the teacher running.
+
+        The negative case cannot be reached through ``OpsImplementationConfig``,
+        which refuses it at parse time, but the slot is bindable directly and a
+        ``> 0`` gate should not read a sign flip as "on".
+        """
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
+        assert modeling._indexer_loss_enabled(object()) is False
+
+    def test_a_coefficient_of_zero_does_not_refuse_an_unsupported_configuration(self):
+        """Off is off, all the way: at ``coef=0`` the three refusals must not fire.
+
+        A user who switches the term off with the coefficient has not asked for a
+        TileLang indexer, and telling them to configure one is advice about a feature
+        they just disabled. This is also what makes the coefficient a usable escape
+        hatch on a run whose implementation flags are set for something else.
+        """
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+        modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=0.0))
+        assert modeling._indexer_loss_enabled(object()) is False
+
+    @pytest.mark.parametrize("coef", [1e-8, 0.5, 1.0])
+    def test_a_positive_coefficient_leaves_the_objective_on(self, coef):
+        """The other side of the gate above: ``> 0`` and not ``>= 0``, and not a gate
+        that reads any coefficient but 1.0 as off.
+
+        Without this leg the coefficient check could be inverted, or written as
+        ``!= 0``, and only the tests that already had to bind ``1.0`` would notice.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from veomni.distributed.parallel_state import ParallelState
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
+        state = ParallelState(dp_size=1, ulysses_size=1, device_type="cpu")
+        with mock.patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=state):
+            assert modeling._indexer_loss_enabled(object()) is True
+
 
 _TOY_CONFIG_DIR = Path(__file__).resolve().parents[1] / "toy_config" / "deepseek_v4_toy"
 
@@ -756,13 +829,15 @@ def _run_indexer(indexer, hidden_states, q_residual, position_ids=None, **kwargs
     return indexer(hidden_states, q_residual, position_ids, None, 0, **kwargs)
 
 
-def _bind_indexer_loss(*, enabled):
+def _bind_indexer_loss(*, enabled, coef=1.0):
     """Bind every slot ``_indexer_loss_enabled`` reads, with the two implementation
     slots on the one configuration the loss supports.
 
-    All three, always: a test that left one unbound would read it from whatever ran
+    All four, always: a test that left one unbound would read it from whatever ran
     before, and a deleted guard would then fall into a neighbouring refusal instead of
-    through to the behaviour under test.
+    through to the behaviour under test. The coefficient is one of the four because
+    the gate treats ``coef <= 0`` as off, so a test that left it to the session could
+    find the whole objective disabled by whatever ran before it.
     """
     from types import SimpleNamespace
 
@@ -771,6 +846,7 @@ def _bind_indexer_loss(*, enabled):
     modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=enabled))
     modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
     modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+    modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
 
 
 @contextlib.contextmanager
@@ -1837,15 +1913,22 @@ def _veomni_loss_mapping_installed():
 
 
 def _build_4layer_test_model(
-    device="cuda", seq_len=4096, indexer_loss=True, enable_reentrant=False, seed=0, labels=True, layer_types=None
+    device="cuda",
+    seq_len=4096,
+    indexer_loss=True,
+    enable_reentrant=False,
+    seed=0,
+    labels=True,
+    layer_types=None,
+    coef=1.0,
 ):
     """Returns ``(model, batch)`` for the 4-layer CSA checkpoint's configuration.
 
     Builds the config above (skipping when the checkpoint is absent), binds
-    ``dsa_indexer_loss`` / ``dsa_indexer_implementation`` / ``dsa_attention_implementation``,
-    enables gradient checkpointing with the given ``enable_reentrant``, and seeds both
-    the model init and the batch from ``seed`` so two calls with the same seed are
-    comparable.
+    ``dsa_indexer_loss`` / ``dsa_indexer_implementation`` / ``dsa_attention_implementation``
+    / ``dsa_indexer_loss_coef``, enables gradient checkpointing with the given
+    ``enable_reentrant``, and seeds both the model init and the batch from ``seed`` so
+    two calls with the same seed are comparable.
 
     ``seq_len=4096`` is not incidental: at the CSA compression rate of 4 it gives
     ``compressed_len == 1024 > index_topk == 512``, so the top-k actually ranks. At
@@ -1878,7 +1961,7 @@ def _build_4layer_test_model(
     config = _4layer_test_config()
     if layer_types is not None:
         config.layer_types = list(layer_types)
-    _bind_indexer_loss(enabled=indexer_loss)
+    _bind_indexer_loss(enabled=indexer_loss, coef=coef)
 
     torch.manual_seed(seed)
     with torch.device(device):
@@ -2207,15 +2290,72 @@ class TestFourLayerModelIndexerKL:
         torch.testing.assert_close(out.aux_metrics["indexer_kl"], outputs.indexer_kl_total / tokens, atol=0, rtol=1e-6)
         assert not out.aux_metrics["indexer_kl"].requires_grad, "the reported metric must be detached"
 
+    def test_a_zero_coefficient_costs_nothing_and_trains_nothing(self):
+        """``dsa_indexer_loss_coef: 0.0`` is the documented way to switch the term off,
+        and this is what "off" has to mean at model scope.
+
+        Three separate claims, and each fails on a different half-fix:
+
+        * **the teacher is never built.** ``sparse_mqa_target_fwd`` is the expensive
+          half of the objective, and a gate placed only at the fold-in would still run
+          it on every CSA layer of every step, for a term multiplied by zero. The
+          probe counts calls, so this cannot be satisfied by the value coming out
+          right.
+        * **no indexer parameter ends the step with a gradient.** ``loss + 0.0 * kl``
+          is exactly ``loss`` as a *value* while still building the graph, so the
+          backward writes a zero ``p.grad`` on all 226M of them. Muon skips only
+          ``p.grad is None`` (``muon.py:902``) and ``_apply_ortho`` decays whatever it
+          steps (``:1005-1006``), so a zero gradient is not the same as no gradient:
+          it is weight decay on an otherwise-frozen indexer.
+        * **the language-model objective is bitwise untouched**, which is the
+          branch's central guarantee and the reason ``x + 0.0 * kl`` was not simply
+          left alone.
+
+        ``aux_metrics is None`` is asserted rather than a zero metric: the term is
+        off, and reporting a KL for an objective that is not being trained is the
+        silent-no-op class this feature refuses everywhere else.
+        """
+        _require_tilelang_cuda()
+
+        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=True, coef=0.0, seed=0)
+        assert _csa_layers(model), "the test model has no indexer to leave untrained"
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            out = model(**batch)
+        assert probe.target == [], (
+            f"the teacher kernel ran {len(probe.target)} time(s) at coefficient 0, so the objective is "
+            "still paying for a term that contributes nothing"
+        )
+        assert out.aux_metrics is None, "a switched-off objective reported a metric"
+
+        out.loss.backward()
+        for layer in _csa_layers(model):
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+                param = getattr(layer.self_attn.compressor.indexer, name).weight
+                assert param.grad is None, (
+                    f"indexer.{name} ends the step with p.grad set at coefficient 0; Muon steps it and "
+                    "weight decay applies"
+                )
+
+        off, off_batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=False, seed=0)
+        with _single_rank_parallel_state():
+            off_out = off(**off_batch)
+        assert torch.equal(out.loss, off_out.loss), (
+            "the total loss at coefficient 0 differs from the flag-off run, so switching the term off "
+            "perturbs the language-model objective"
+        )
+
     def test_the_coefficient_scales_what_the_loss_receives(self):
         """The KL enters the loss weighted by ``dsa_indexer_loss_coef``, and by nothing
         else.
 
         Run at coefficient 0 the total loss must be *bitwise* what the flag-off run
-        produced -- ``x + 0.0 * kl`` is exactly ``x`` for any finite KL -- which pins
-        two things at once: that the coefficient is really applied, and that turning
-        the loss on perturbs no part of the language-model objective. Run at 1 the
-        difference from that baseline must be the reported KL itself.
+        produced. Since the gate reads the coefficient, that leg now says the term is
+        genuinely off rather than that a zero multiply cancelled -- what it still pins
+        here is that turning the loss on perturbs no part of the language-model
+        objective, with the cost and gradient halves of "off" covered by
+        ``test_a_zero_coefficient_costs_nothing_and_trains_nothing`` above. Run at 1
+        the difference from that baseline must be the reported KL itself, which is the
+        leg that pins the coefficient being applied at all.
         """
         _require_tilelang_cuda()
         from types import SimpleNamespace

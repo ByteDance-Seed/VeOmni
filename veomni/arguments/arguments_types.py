@@ -1136,12 +1136,20 @@ class OpsImplementationConfig:
         metadata={
             "help": "Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) "
             "sparse KL objective. Requires dsa_indexer_implementation='tilelang', "
-            "dsa_attention_implementation='tilelang', and ulysses_size == 1."
+            "dsa_attention_implementation='tilelang', and ulysses_size == 1. Only DeepSeek-V4 "
+            "implements it; any other model refuses the flag at model-build time rather than "
+            "ignoring it. Reports training/indexer_kl, training/indexer_kl_uniform, "
+            "training/indexer_kl_captured and training/lm_loss_before_indexer_kl."
         },
     )
     dsa_indexer_loss_coef: float = field(
         default=1.0,
-        metadata={"help": "Weight on the indexer KL when folding it into the total loss."},
+        metadata={
+            "help": "Weight on the indexer KL when folding it into the total loss. A value of 0.0 "
+            "switches the objective off entirely: the teacher distribution is not recomputed, no "
+            "gradient reaches the Lightning Indexer and no metric is reported, so it costs exactly "
+            "what dsa_indexer_loss=false costs."
+        },
     )
     mhc_implementation: Literal["eager", "tilelang"] = field(
         default="eager",
@@ -1254,6 +1262,19 @@ class OpsImplementationConfig:
                 f"dsa_indexer_loss_coef={self.dsa_indexer_loss_coef!r} must be finite and non-negative: "
                 "a negative weight flips the sign of the indexer KL and a non-finite one destroys the "
                 "total loss. Use 0.0 to switch the term off."
+            )
+
+        # The one configuration where both flags are set and nothing happens. It is a
+        # legitimate way to disable the objective without editing the flag, so it is
+        # not an error -- but a run whose config says ``dsa_indexer_loss: true`` and
+        # which reports no indexer metric at all is exactly the sort of thing someone
+        # spends an afternoon on, and this is the only place that can say so once
+        # rather than once per layer per forward.
+        if self.dsa_indexer_loss and self.dsa_indexer_loss_coef == 0:
+            logger.warning_rank0(
+                "dsa_indexer_loss is enabled but dsa_indexer_loss_coef is 0.0, so the indexer KL is "
+                "switched off entirely: no teacher is computed, the Lightning Indexer receives no "
+                "gradient, and no indexer metric is reported. Set a positive coefficient to train it."
             )
 
         # The Triton load-balancing-loss kernel imports ``triton`` at module

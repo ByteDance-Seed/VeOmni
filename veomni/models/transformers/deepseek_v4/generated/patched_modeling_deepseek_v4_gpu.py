@@ -136,8 +136,27 @@ def _indexer_loss_enabled(module) -> bool:
     Silence is the failure mode worth designing against here: every unsupported
     configuration below would otherwise train the indexer on a wrong signal, or
     on none, while the loss curve looked entirely reasonable.
+
+    A non-positive coefficient counts as off, matching Megatron's
+    ``coeff is not None and coeff > 0`` (``training/training.py:3317``). It is read
+    here rather than only at the fold-in because this predicate is what decides the
+    teacher recompute as well: ``loss + 0.0 * kl`` is the right *value* while still
+    building the graph, so the backward writes a zero ``p.grad`` onto every indexer
+    parameter -- and Muon skips only ``p.grad is None`` (``muon.py:902``) while
+    ``_apply_ortho`` decays whatever it steps (``:1005-1006``), which is weight decay
+    on 226M otherwise-frozen parameters, at the full cost of the teacher kernel.
+    Gating here makes ``dsa_indexer_loss_coef: 0.0`` cost exactly what
+    ``dsa_indexer_loss: false`` costs, which is what ``arguments_types.py`` has always
+    promised.
+
+    Before the three refusals, not after: a user who switched the term off with the
+    coefficient has not asked for a TileLang indexer, and refusing their run over the
+    configuration of a feature they just disabled would be advice about the wrong
+    thing.
     """
     if not veomni_dsa_indexer_loss.value:
+        return False
+    if veomni_dsa_indexer_loss_coef.value <= 0:
         return False
     if veomni_dsa_indexer_implementation.value != "tilelang":
         raise ValueError(
@@ -2846,6 +2865,12 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             # No labels means no loss to fold into -- ``loss`` is ``None`` and the
             # addition would raise. The metric is still reported: an inference forward
             # that computed the KL may as well say what it was.
+            #
+            # The coefficient is positive by the time control reaches here:
+            # ``_indexer_loss_enabled`` gates on it, so a non-positive one leaves
+            # ``indexer_kl_total`` ``None`` and this whole block unentered. It is not
+            # re-checked, because two places deciding "is the objective on" is exactly the
+            # staleness this feature's single-predicate discipline exists to prevent.
             if labels is not None:
                 loss = loss + veomni_dsa_indexer_loss_coef.value * indexer_kl.to(loss.device)
         # --- Patch.3 ---
