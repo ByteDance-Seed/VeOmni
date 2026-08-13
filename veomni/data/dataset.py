@@ -53,20 +53,45 @@ def build_dataset(dataset_name: str, **kwargs) -> "Dataset":
 
 
 class MappingDataset(Dataset):
-    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
+    """Map every global index to a reproducible sample.
+
+    The first pass keeps source order. Each later cycle uses ``seed + cycle``
+    without changing global RNG state, so the mapping is independent of access
+    order and worker-local dataset state.
+    """
+
+    def __init__(self, data: "Dataset", transform: Optional[Callable] = None, seed: int = 42):
         self._data = data
         self._transform = transform
+        self.seed = seed
         self.indices = list(range(len(self._data)))
         self.data_len = len(self.indices)
+        self._current_cycle = 0
+        self._cycle_indices = self.indices
 
     def __len__(self) -> int:
         return self.data_len
 
+    def _get_mapped_index(self, index: int) -> int:
+        if not self.indices:
+            raise IndexError("Cannot index an empty dataset")
+        if index < -len(self.indices):
+            raise IndexError(f"Index {index} out of range for dataset of length {len(self.indices)}")
+        if index < len(self.indices):
+            return self.indices[index]
+
+        cycle, index = divmod(index, len(self.indices))
+        if cycle == self._current_cycle:
+            cycle_indices = self._cycle_indices
+        else:
+            cycle_indices = self.indices.copy()
+            random.Random(self.seed + cycle).shuffle(cycle_indices)
+            self._current_cycle = cycle
+            self._cycle_indices = cycle_indices
+        return cycle_indices[index]
+
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        if index >= len(self.indices):
-            random.shuffle(self.indices)
-            index = index % len(self.indices)
-        mapped_idx = self.indices[index]
+        mapped_idx = self._get_mapped_index(index)
         if self._transform is not None:
             return self._transform(self._data[mapped_idx])
         else:
@@ -118,14 +143,11 @@ class InterleavedIterableDataset(IterativeDataset):
 
 
 class InterleavedMappingDataset(MappingDataset):
-    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
-        super().__init__(data, transform)
+    def __init__(self, data: "Dataset", transform: Optional[Callable] = None, seed: int = 42):
+        super().__init__(data, transform, seed)
 
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        if index >= len(self.indices):
-            random.shuffle(self.indices)
-            index = index % len(self.indices)
-        mapped_idx = self.indices[index]
+        mapped_idx = self._get_mapped_index(index)
         if self._transform is not None:
             sample = self._data[mapped_idx]
             ds_idx = sample["ds_idx"]
@@ -1430,6 +1452,7 @@ def build_mapping_dataset(
     train_path: str,
     transform: Optional[Callable] = None,
     namespace: Literal["train", "test"] = "train",
+    seed: int = 42,
     source_name: Optional[str] = None,
     **kwargs,
 ) -> "Dataset":
@@ -1439,6 +1462,7 @@ def build_mapping_dataset(
         train_path (str): data path
         transform (Optional[Callable]): transform function
         namespace (Literal["train", "test"]): dataset namespace
+        seed (int): random seed
         source_name (Optional[str]): source name
     Returns:
         Dataset: mapping dataset
@@ -1450,7 +1474,7 @@ def build_mapping_dataset(
 
     if transform:
         transform = partial(transform, source_name=source_name)
-    return MappingDataset(data=dataset, transform=transform)
+    return MappingDataset(data=dataset, transform=transform, seed=seed)
 
 
 @DATASET_REGISTRY.register("iterable")
@@ -1561,6 +1585,7 @@ def build_interleave_dataset(
         interleave_dataset = InterleavedMappingDataset(
             interleave_datasets(datasets=datasets, probabilities=weights, seed=seed),
             transform=transform,
+            seed=seed,
         )
     else:
         raise ValueError(f"Unsupported datasets_type: {datasets_type}")
