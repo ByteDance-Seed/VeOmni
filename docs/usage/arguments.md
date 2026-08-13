@@ -193,7 +193,7 @@ NPU validation runs at two times:
 | dsa_indexer_implementation | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
 | dsa_indexer_loss | `bool` | `False` | Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) sparse KL objective. Requires `dsa_indexer_implementation: tilelang`, `dsa_attention_implementation: tilelang` and `ulysses_size: 1`; each is refused rather than silently ignored. Only DeepSeek-V4 implements it — any other model type refuses the flag at model-build time. See the section below. |
-| dsa_indexer_loss_coef | `float` | `1.0` | Weight on the indexer KL when it is folded into the total loss. `0.0` switches the objective off entirely: no teacher is recomputed, no gradient reaches the indexer and no metric is reported, so it costs exactly what `dsa_indexer_loss: false` costs. Negative values are refused. |
+| dsa_indexer_loss_coef | `float` | `1.0` | Weight on the indexer KL when it is folded into the total loss. `0.0` switches the objective off entirely: no teacher is recomputed, no gradient reaches the indexer and no metric is reported, so it costs exactly what `dsa_indexer_loss: false` costs. Negative values are refused. It is not a learning-rate knob for the indexer — see the section below before tuning it. |
 | mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
 
 #### The Lightning Indexer KL objective (`dsa_indexer_loss`)
@@ -203,8 +203,11 @@ candidates the sparse attention selected, where `target` is a teacher
 distribution recomputed in the forward from that attention's own LSE. It is
 summed over CSA layers, normalised per query token, reduced across
 sequence-parallel ranks, scaled by `dsa_indexer_loss_coef` and added to the total
-loss. Gradients reach the Lightning Indexer only; the language-model path is
-bitwise unchanged with the flag on.
+loss. Gradients from the KL reach the Lightning Indexer only — no language-model
+parameter is on its backward path, which
+`test_the_indexer_objective_moves_only_the_indexer` pins. That is a narrower claim
+than "a flag-on run tracks a flag-off baseline step for step", which it does not;
+see `dsa_indexer_loss_coef` below.
 
 **The top-k has to actually bind, or this is not the paper's objective.** Eq. (4)
 is a KL over the *selected* candidates, which is only a selection when a query row
@@ -230,8 +233,47 @@ Four metrics are reported, all per micro-batch means:
 | --- | --- |
 | `training/indexer_kl` | The objective itself, as a **per-layer** mean so runs with different CSA layer counts are comparable. The loss keeps the layer sum; only the metric is divided. |
 | `training/indexer_kl_uniform` | `log(n_candidates) − H(target)`, the KL a student would pay knowing the candidate set and nothing about which slot matters. The scale `indexer_kl` has to be read against — it is not interpretable alone. |
-| `training/indexer_kl_captured` | `1 − indexer_kl / indexer_kl_uniform`. 1.0 reproduces the teacher, 0.0 is that zero-information student. A pretrained indexer on the reference checkpoint sits at ~0.96. |
+| `training/indexer_kl_captured` | `1 − indexer_kl / indexer_kl_uniform`. 1.0 reproduces the teacher, 0.0 is that zero-information student. A pretrained indexer sits at ~0.96 on the 4-layer reference checkpoint and ~0.99 on the 43-layer base one, from step 1 and flat: it arrives near-optimal, and the residual does not shrink because the teacher moves with the LM. This is the metric to watch — `indexer_kl`'s absolute scale also tracks how full the packing buffer is, so it ramps over the first few steps while this one does not. |
 | `training/lm_loss_before_indexer_kl` | The language-model loss from before the KL was folded in, so a flag-on run has a curve comparable to a flag-off baseline. `training/foundation_loss` includes the KL. |
+
+#### What `dsa_indexer_loss_coef` controls, and what it does not
+
+It scales the KL where the loss is assembled, so it moves two things: the value of
+`training/foundation_loss`, and the indexer's share of the global gradient norm —
+hence how often `train.optimizer.max_grad_norm` clips. The four metrics above are
+coefficient-free, so tuning it does not change how they read.
+
+It is **not** a learning-rate knob for the indexer. Muon orthogonalises its update
+and Adam divides by `sqrt(v)`, so both are invariant to a constant rescale of a
+parameter's gradient: quartering the coefficient does not quarter how fast the
+indexer moves. Only extreme values break that invariance, by pushing gradients under
+Adam's `eps` or degrading the Newton-Schulz conditioning. Read it as "how much the
+indexer objective may perturb the LM update", not "how hard the indexer trains".
+
+That perturbation is measurable. A 43-layer DeepSeek-V4-Flash SFT run at
+`dsa_indexer_loss_coef: 1.0` and `max_grad_norm: 1.0`, against three flag-off
+baselines on bitwise-identical batches, over its first 375 steps:
+
+| | flag off (3 runs) | flag on |
+| --- | --- | --- |
+| `grad_norm`, steps 60–100 | 0.245, over 1.0 on 0% of steps | 1.211, on 63% |
+| `grad_norm`, steps 150–375 | 0.192 | 0.33 |
+| MFU, steps 100–375 | 0.0373 / 0.0389 / 0.0394 | 0.0380 |
+| LM loss, paired per step | within ±0.02% of each other | +0.5% to +1.9% |
+
+The throughput cost sits inside the baselines' own ±2.9% spread, so the objective is
+free on step time. The LM-loss offset is not noise: the three baselines agree to
+0.02% on identical batches. Two channels produce it — the clip coefficient now
+depends on the indexer's gradient, and a moving indexer selects different candidates
+wherever the top-k binds — and neither is a gradient leak, which the test named above
+rules out. Lowering the coefficient is the in-semantics lever against the first
+channel only; the indexer's motion, and so the second channel, is coefficient-
+invariant for the reason above.
+
+Megatron-LM shares both channels and mitigates neither: `rg -in "indexer|dsa"` over
+its `core/optimizer/__init__.py` and `core/optimizer/clip_grads.py` is empty — no
+indexer param group, no clip exemption, no indexer learning rate. A per-indexer clip
+group or learning rate is therefore a recipe choice beyond the reference, not a fix.
 
 ### DataArguments
 
