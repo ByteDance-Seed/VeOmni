@@ -36,9 +36,20 @@ logger = logging.get_logger(__name__)
 
 
 class OpsConfigSlot:
-    """A module-level config value bound from ``OpsImplementationConfig``."""
+    """A module-level config value bound from ``OpsImplementationConfig``.
 
-    def __init__(self, field_name: str, default: str = "eager"):
+    The value is whatever the named field holds -- a ``str`` for the
+    implementation-selecting fields this class was written for, but also the
+    ``bool`` of ``dsa_indexer_loss`` and the ``float`` of
+    ``dsa_indexer_loss_coef``.
+
+    ``default`` is therefore worth passing explicitly for a non-string field.
+    Leaving it at ``"eager"`` for a boolean slot would make an unbound slot read
+    as ``True``, since ``"eager"`` is truthy -- the whole objective switched on by
+    a slot nobody bound.
+    """
+
+    def __init__(self, field_name: str, default: Any = "eager"):
         self.field_name = field_name
         self._value = default
 
@@ -46,7 +57,7 @@ class OpsConfigSlot:
         self._value = getattr(ops_config, self.field_name)
 
     @property
-    def value(self) -> str:
+    def value(self) -> Any:
         return self._value
 
     def __repr__(self) -> str:
