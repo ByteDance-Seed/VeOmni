@@ -252,7 +252,7 @@ def test_target_kernel_rejects_more_than_64_heads():
     lse = torch.zeros(1, 2, 128, device="cuda", dtype=torch.float32)
     # Matching on "64" alone would also be satisfied by the head-multiple assert
     # or by any message that happens to mention a shape of 64.
-    with pytest.raises(AssertionError, match="one block owns the head sum"):
+    with pytest.raises(RuntimeError, match="one block owns the head sum"):
         sparse_mqa_target_fwd_interface(q, kv, topk, lse)
 
 
@@ -267,7 +267,7 @@ def test_target_kernel_rejects_head_counts_the_interface_cannot_emit():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target
 
-    with pytest.raises(AssertionError, match=r"padded to one of \(16, 32, 64\)"):
+    with pytest.raises(RuntimeError, match=r"padded to one of \(16, 32, 64\)"):
         sparse_mqa_target(48, 64, 64)
 
 
@@ -282,9 +282,9 @@ def test_target_kernel_rejects_non_bfloat16_inputs():
     topk = torch.zeros(1, 2, 64, device="cuda", dtype=torch.int32)
     lse = torch.zeros(1, 2, 16, device="cuda", dtype=torch.float32)
 
-    with pytest.raises(AssertionError, match="bfloat16-only, got q"):
+    with pytest.raises(RuntimeError, match="bfloat16-only, got q"):
         sparse_mqa_target_fwd_interface(q.to(torch.float16), kv, topk, lse)
-    with pytest.raises(AssertionError, match="bfloat16-only, got kv"):
+    with pytest.raises(RuntimeError, match="bfloat16-only, got kv"):
         sparse_mqa_target_fwd_interface(q, kv.to(torch.float16), topk, lse)
 
 

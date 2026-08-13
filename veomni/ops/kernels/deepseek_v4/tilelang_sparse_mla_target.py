@@ -41,12 +41,15 @@ from ....utils.device import get_torch_device
     },
 )
 def sparse_mqa_target(heads, dim, topk, sm_scale=None, block_I=64, threads=256):
-    assert dim == tilelang.math.next_power_of_2(dim), f"dim must be power of 2, got {dim}"
-    assert topk % block_I == 0, f"topk ({topk}) must be divisible by block_I ({block_I})"
+    if dim != tilelang.math.next_power_of_2(dim):
+        raise RuntimeError(f"dim must be power of 2, got {dim}")
+    if topk % block_I != 0:
+        raise RuntimeError(f"topk ({topk}) must be divisible by block_I ({block_I})")
     # One CTA must own every head of a query, or the head sum would need atomics
     # across CTAs. The attention forward replicates over heads above 64; this
     # kernel refuses instead.
-    assert heads <= 64, f"target kernel requires heads <= 64 so one block owns the head sum, got {heads}"
+    if heads > 64:
+        raise RuntimeError(f"target kernel requires heads <= 64 so one block owns the head sum, got {heads}")
     # Admit exactly the set the interface can emit -- it pads to
     # max(next_power_of_2(heads), 16), so {16, 32, 64} -- rather than the weaker
     # `heads % 16 == 0`, which also admits 48. M = 48 is unsound under
@@ -55,7 +58,8 @@ def sparse_mqa_target(heads, dim, topk, sm_scale=None, block_I=64, threads=256):
     # lowering dies with `Check failed: (m_warp * n_warp == num_warps) is false:
     # m_warp: 3, n_warp: 2, num_warps: 8`. Without this guard that bare TVM
     # InternalError is what a direct caller bypassing the interface would see.
-    assert heads in (16, 32, 64), f"target kernel requires heads padded to one of (16, 32, 64), got {heads}"
+    if heads not in (16, 32, 64):
+        raise RuntimeError(f"target kernel requires heads padded to one of (16, 32, 64), got {heads}")
     if sm_scale is None:
         sm_scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -81,10 +85,11 @@ def sparse_mqa_target(heads, dim, topk, sm_scale=None, block_I=64, threads=256):
 
     smem_lower_bound = H_per_block * D * 2 + BI * D * 2
     smem_limit = get_torch_device().get_device_properties(None).shared_memory_per_block_optin
-    assert smem_lower_bound <= smem_limit, (
-        f"block_I={block_I}, dim={dim}, heads={heads} needs at least {smem_lower_bound} B "
-        f"of shared memory per block, above this device's {smem_limit} B"
-    )
+    if smem_lower_bound > smem_limit:
+        raise RuntimeError(
+            f"block_I={block_I}, dim={dim}, heads={heads} needs at least {smem_lower_bound} B "
+            f"of shared memory per block, above this device's {smem_limit} B"
+        )
 
     @T.prim_func
     def main(
@@ -172,17 +177,27 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None, block_
     Returns:
         [B, S, C] fp32. L1-normalise in the caller.
     """
-    assert q.is_contiguous() and kv.is_contiguous() and topk_idxs.is_contiguous()
-    assert lse.is_contiguous() and lse.dtype == torch.float32
+    # These guard the teacher's numerical contract, so they raise rather than
+    # assert: `python -O` strips asserts, and a stripped `heads <= 64` would not
+    # fail, it would return a head sum silently missing every head past 64.
+    if not (q.is_contiguous() and kv.is_contiguous() and topk_idxs.is_contiguous()):
+        raise RuntimeError("target kernel requires q, kv and topk_idxs to be contiguous")
+    if not (lse.is_contiguous() and lse.dtype == torch.float32):
+        raise RuntimeError(f"target kernel requires a contiguous fp32 lse, got dtype={lse.dtype}")
     # The kernel hardcodes `dtype = T.bfloat16` for both Q and KV, so an fp16 or
     # fp32 caller would otherwise get a tilelang type error from inside lowering
     # instead of a named constraint.
-    assert q.dtype == torch.bfloat16, f"target kernel is bfloat16-only, got q.dtype={q.dtype}"
-    assert kv.dtype == torch.bfloat16, f"target kernel is bfloat16-only, got kv.dtype={kv.dtype}"
+    if q.dtype != torch.bfloat16:
+        raise RuntimeError(f"target kernel is bfloat16-only, got q.dtype={q.dtype}")
+    if kv.dtype != torch.bfloat16:
+        raise RuntimeError(f"target kernel is bfloat16-only, got kv.dtype={kv.dtype}")
     batch, seq_len, heads, dim = q.shape
-    assert heads <= 64, f"target kernel requires heads <= 64 so one block owns the head sum, got {heads}"
-    assert kv.shape[-1] == dim
-    assert lse.shape == (batch, seq_len, heads), f"lse must be [B, S, H], got {tuple(lse.shape)}"
+    if heads > 64:
+        raise RuntimeError(f"target kernel requires heads <= 64 so one block owns the head sum, got {heads}")
+    if kv.shape[-1] != dim:
+        raise RuntimeError(f"kv head dim {kv.shape[-1]} does not match q head dim {dim}")
+    if lse.shape != (batch, seq_len, heads):
+        raise RuntimeError(f"lse must be [B, S, H], got {tuple(lse.shape)}")
     topk = topk_idxs.shape[-1]
 
     padded_topk = (topk + block_I - 1) // block_I * block_I
