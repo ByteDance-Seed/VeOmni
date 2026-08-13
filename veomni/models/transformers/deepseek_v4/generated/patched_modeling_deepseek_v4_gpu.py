@@ -250,12 +250,17 @@ def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> tuple[t
     # compression window behind them.
     scoreable = torch.isfinite(index_score)
     all_missing = ~scoreable.any(-1, keepdim=True)
-    scores = torch.where(all_missing, torch.zeros_like(index_score, dtype=torch.float32), index_score.float())
+    # Scalar zeros rather than ``torch.zeros_like``: the operand is only a zero, and
+    # a materialised one is a full [B, S, C] fp32 tensor -- 50 MB each at S=24576,
+    # C=512, about a third of the ~300 MB transient this function costs per CSA layer
+    # call. ``torch.where`` promotes a Python float as a weak scalar, so the result
+    # dtype is the fp32 of the other operand either way.
+    scores = torch.where(all_missing, 0.0, index_score.float())
     log_q = torch.log_softmax(scores, dim=-1)
     log_target = torch.log(target.clamp_min(torch.finfo(torch.float32).tiny))
     # ``log_q`` is -inf exactly where ``target`` is 0, and 0 * -inf is NaN, so the
     # zero-mass slots have to be masked rather than merely multiplied out.
-    contributions = torch.where(target > 0, target * (log_target - log_q), torch.zeros_like(target))
+    contributions = torch.where(target > 0, target * (log_target - log_q), 0.0)
     # The scale the KL has to be read against. ``log(n_candidates) - H(target)`` is
     # the KL a student would pay knowing the candidate set and nothing whatever about
     # which slot matters, so the KL alone says nothing until it is divided by this:
@@ -276,7 +281,7 @@ def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> tuple[t
     neg_entropy = (target * log_target).sum(-1)
     uniform_kl = torch.where(
         all_missing.squeeze(-1),
-        torch.zeros_like(neg_entropy),
+        0.0,
         torch.log(scoreable.sum(-1).clamp_min(1).to(torch.float32)) + neg_entropy,
     )
     return contributions.sum(-1), uniform_kl.detach()

@@ -1317,8 +1317,12 @@ def test_indexer_kl_terms_matches_hand_computation():
     expected = 0.5 * (torch.log(torch.tensor(0.5)) - torch.log(q0[0])) + 0.5 * (
         torch.log(torch.tensor(0.5)) - torch.log(q0[1])
     )
-    kl, _ = modeling.indexer_kl_terms(index_score, target)
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
     assert torch.allclose(kl, expected.view(1, 1), atol=1e-6)
+    # The masked branches use scalar zeros rather than materialising a 50 MB
+    # ``zeros_like``; a Python float is a weak scalar under type promotion, so the
+    # accumulation stays fp32 rather than following the scalar to fp64.
+    assert kl.dtype is torch.float32 and uniform.dtype is torch.float32
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
