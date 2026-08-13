@@ -1309,14 +1309,16 @@ def test_indexer_kl_terms_matches_hand_computation():
     target = torch.tensor([[[0.5, 0.5, 0.0]]])
     index_score = torch.tensor([[[0.0, 0.0, float("-inf")]]])
     # softmax over the two finite slots is [0.5, 0.5]; KL(t || q) == 0.
-    assert torch.allclose(modeling.indexer_kl_terms(index_score, target), torch.zeros(1, 1), atol=1e-6)
+    kl, _ = modeling.indexer_kl_terms(index_score, target)
+    assert torch.allclose(kl, torch.zeros(1, 1), atol=1e-6)
 
     index_score = torch.tensor([[[1.0, 0.0, float("-inf")]]])
     q0 = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)
     expected = 0.5 * (torch.log(torch.tensor(0.5)) - torch.log(q0[0])) + 0.5 * (
         torch.log(torch.tensor(0.5)) - torch.log(q0[1])
     )
-    assert torch.allclose(modeling.indexer_kl_terms(index_score, target), expected.view(1, 1), atol=1e-6)
+    kl, _ = modeling.indexer_kl_terms(index_score, target)
+    assert torch.allclose(kl, expected.view(1, 1), atol=1e-6)
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -1346,15 +1348,16 @@ def test_indexer_kl_terms_gradient_is_finite_when_a_query_sees_no_compressed_slo
     index_score = torch.tensor([[[neg_inf, neg_inf], [0.0, 1.0]]], requires_grad=True)
     target = torch.tensor([[[0.0, 0.0], [0.4, 0.6]]])
 
-    kl = modeling.indexer_kl_terms(index_score, target)
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
     assert torch.allclose(kl[0, 0], torch.zeros(())), "an all-miss row has no teacher mass and no KL"
+    assert torch.isfinite(uniform).all(), f"non-finite reference: {uniform}"
     kl.sum().backward()
 
     assert torch.isfinite(index_score.grad).all(), f"non-finite gradient: {index_score.grad}"
     assert (index_score.grad[0, 0] == 0).all(), "an all-miss row must not push the indexer anywhere"
 
     alone = index_score.detach()[:, 1:].clone().requires_grad_(True)
-    modeling.indexer_kl_terms(alone, target[:, 1:]).sum().backward()
+    modeling.indexer_kl_terms(alone, target[:, 1:])[0].sum().backward()
     torch.testing.assert_close(index_score.grad[:, 1:], alone.grad)
     assert alone.grad.abs().sum() > 0, "row 1 carries no gradient, so it pins nothing here"
 
@@ -1366,9 +1369,82 @@ def test_indexer_kl_terms_ignores_zero_target_slots():
 
     target = torch.tensor([[[1.0, 0.0]]])
     index_score = torch.tensor([[[0.0, float("-inf")]]])
-    kl = modeling.indexer_kl_terms(index_score, target)
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
     assert torch.isfinite(kl).all()
     assert torch.allclose(kl, torch.zeros(1, 1), atol=1e-6)
+    assert torch.isfinite(uniform).all()
+    assert torch.allclose(uniform, torch.zeros(1, 1), atol=1e-6), (
+        "one scoreable slot carrying all the mass is a row where nothing can be learned"
+    )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_uniform_reference_is_what_a_zero_information_student_pays():
+    """``log(n_candidates) - H(target)`` is a definition, so it is pinned against the
+    thing it is defined to be: the KL of a student that scores every candidate alike.
+
+    That equality is the whole content of the metric. ``indexer_kl_captured`` reads
+    1 - kl/reference, so a reference computed over a different support than the KL --
+    counting the zero-target slots the KL skips, say, or every slot rather than the
+    scoreable ones -- would still produce a plausible fraction in [0, 1] with no
+    number anywhere to contradict it.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    neg_inf = float("-inf")
+    # Row 0: three candidates, skewed teacher. Row 1: two candidates, one of the
+    # three slots unscoreable -- so a reference over `C` rather than over the
+    # scoreable count is a different number here.
+    target = torch.tensor([[[0.7, 0.2, 0.1], [0.25, 0.75, 0.0]]])
+    flat = torch.tensor([[[0.0, 0.0, 0.0], [0.0, 0.0, neg_inf]]])
+
+    kl_of_a_flat_student, uniform = modeling.indexer_kl_terms(flat, target)
+    torch.testing.assert_close(uniform, kl_of_a_flat_student, atol=1e-6, rtol=1e-6)
+
+    entropy = -(target * torch.log(target.clamp_min(torch.finfo(torch.float32).tiny))).sum(-1)
+    expected = torch.log(torch.tensor([[3.0, 2.0]])) - entropy
+    torch.testing.assert_close(uniform, expected, atol=1e-6, rtol=1e-6)
+
+    # And the fraction such a student captures is 0, which is the calibration the
+    # reported number is read against at the other end.
+    captured = 1.0 - kl_of_a_flat_student / uniform
+    torch.testing.assert_close(captured, torch.zeros_like(captured), atol=1e-6, rtol=0)
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_uniform_reference_carries_no_gradient_into_the_objective():
+    """The reference is a metric. It must not move a single weight.
+
+    Both halves are asserted, because either alone is weak: that the returned tensor
+    has no graph is a structural claim a future differentiable teacher could quietly
+    break, and that the KL's gradient is unchanged by the reference's presence is the
+    behavioural one. The second is exact -- same forward, same tensor -- so it is a
+    bitwise comparison rather than a tolerance, and it is checked against a
+    closed-form gradient that owes nothing to the implementation.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    target = torch.tensor([[[0.7, 0.2, 0.1]]])
+    index_score = torch.tensor([[[0.3, -0.4, 1.2]]], requires_grad=True)
+
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
+    assert uniform.grad_fn is None and not uniform.requires_grad, (
+        "the zero-information reference carries a graph, so a backward through the reported metric "
+        "would reach the indexer"
+    )
+
+    (kl.sum() + uniform.sum()).backward()
+    with_reference = index_score.grad.clone()
+
+    # d/ds KL(t || softmax(s)) = softmax(s) - t, independent of this file.
+    expected = torch.softmax(index_score.detach(), dim=-1) - target
+    torch.testing.assert_close(with_reference, expected, atol=1e-6, rtol=1e-6)
+
+    index_score.grad = None
+    modeling.indexer_kl_terms(index_score, target)[0].sum().backward()
+    assert torch.equal(with_reference, index_score.grad), (
+        "backward through KL + reference and backward through the KL alone gave different gradients"
+    )
 
 
 class TestAttentionForwardIndexerKL:
@@ -1424,7 +1500,7 @@ class TestAttentionForwardIndexerKL:
         seq_len = self._RANKING_SEQ_LEN
         attn, inputs = _build_test_attention(device="cuda", seq_len=seq_len)
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
-            _, _, kl_sum = attn(**inputs)
+            _, _, kl_sum, _ = attn(**inputs)
 
         assert kl_sum.shape == (), f"the KL must be a scalar, got {tuple(kl_sum.shape)}"
         assert kl_sum.dtype == torch.float32
@@ -1450,7 +1526,7 @@ class TestAttentionForwardIndexerKL:
             compressed_start,
             attn.scaling,
         )
-        expected = modeling.indexer_kl_terms(indexer["index_score"], expected_target).sum()
+        expected = modeling.indexer_kl_terms(indexer["index_score"], expected_target)[0].sum()
 
         # Measured on GB200: the kernel teacher and this reference put the summed KL
         # 6.1e-5 apart on a KL of 413.35, i.e. 1.5e-7 relative, both consuming the
@@ -1470,7 +1546,7 @@ class TestAttentionForwardIndexerKL:
         wrong_target = _reference_compressed_only_target_by_query_chunk(
             attention["q"], attention["kv"], attention["topk"], compressed_start, attn.scaling
         )
-        wrong = modeling.indexer_kl_terms(indexer["index_score"], wrong_target).sum()
+        wrong = modeling.indexer_kl_terms(indexer["index_score"], wrong_target)[0].sum()
         separation = (expected - wrong).abs()
         assert separation > 10 * admitted, (
             f"the compressed-only teacher is only {separation:.3e} from the correct one while the "
@@ -1588,7 +1664,7 @@ class TestAttentionForwardIndexerKL:
                 wraps=modeling.mask_sparse_attention_indices,
             ) as masking,
         ):
-            _, _, kl_sum = attn(**inputs)
+            _, _, kl_sum, _ = attn(**inputs)
 
         # The premise: the dense path really ran -- the mask-free path never reaches
         # this call, so without it this test is that path again under another name.
@@ -1612,7 +1688,7 @@ class TestAttentionForwardIndexerKL:
         """Default off means the return *arity* is what it was.
 
         This is the only test that pins the off side of the branch. Invert it and
-        every flag-off DeepSeek-V4 forward returns a 3-tuple into a decoder layer
+        every flag-off DeepSeek-V4 forward returns a 4-tuple into a decoder layer
         that unpacks two, breaking inference for every model in the tree -- while the
         enabled path stays green, because it never takes this branch.
         """
@@ -1644,7 +1720,7 @@ class TestAttentionForwardIndexerKL:
             _bind_indexer_loss(enabled=False)
             output_off, weights_off = attn(**inputs)
             _bind_indexer_loss(enabled=True)
-            output_on, weights_on, kl_sum = attn(**inputs)
+            output_on, weights_on, kl_sum, _ = attn(**inputs)
 
         assert torch.equal(output_off, output_on), "the indexer loss moved the attention output"
         assert weights_off is None and weights_on is None
@@ -1779,7 +1855,7 @@ class TestAttentionForwardIndexerKL:
         _bind_indexer_loss(enabled=True)
         attn, inputs = _build_test_attention(device="cuda", seq_len=self._RANKING_SEQ_LEN)
         with _single_rank_parallel_state():
-            _, _, kl_sum = attn(**inputs)
+            _, _, kl_sum, _ = attn(**inputs)
         kl_sum.backward()
 
         assert inputs["hidden_states"].grad is None, "the indexer KL reached the language-model input"
@@ -1805,12 +1881,12 @@ class TestAttentionForwardIndexerKL:
         every caller above reads it rather than re-deriving it.
 
         Three call sites act on this predicate -- the attention forward that returns
-        the third value, the decoder layer that unpacks it, and the model loop that
-        accumulates it -- and they are in three different functions. A copy of the
-        expression in any of them can go stale independently: the decoder layer gating
-        on ``_indexer_loss_enabled`` alone (the whole expression before Task 5's fix
-        round narrowed it) would three-unpack the two-tuple every sliding and HCA layer
-        returns, which is three of the four layers of the reference checkpoint.
+        the KL and its reference, the decoder layer that unpacks them, and the model
+        loop that accumulates them -- and they are in three different functions. A copy
+        of the expression in any of them can go stale independently: the decoder layer
+        gating on ``_indexer_loss_enabled`` alone (the whole expression before Task 5's
+        fix round narrowed it) would four-unpack the two-tuple every sliding and HCA
+        layer returns, which is three of the four layers of the reference checkpoint.
 
         Reading the predicate twice would prove nothing, so the assertion is against
         ``len(attn(...))``: what the attention forward actually returned.
@@ -1824,7 +1900,7 @@ class TestAttentionForwardIndexerKL:
             verdict = modeling._builds_indexer_kl(attn)
             result = attn(**inputs)
 
-        assert verdict is (len(result) == 3), (
+        assert verdict is (len(result) == 4), (
             f"the gate says {verdict} for a {layer_type} layer with the flag {enabled}, "
             f"while the forward returned {len(result)} values"
         )
@@ -2454,6 +2530,105 @@ class TestFourLayerModelIndexerKL:
             f"the layer-summed KL {float(layer_sum):.3e} is inside this subtraction's noise, so the "
             "leg below cannot tell a sum from a mean"
         )
+        torch.testing.assert_close(folded, layer_sum, atol=admitted, rtol=0)
+
+    def test_the_captured_fraction_is_a_ratio_of_means_and_touches_no_gradient(self):
+        """``indexer_kl`` says nothing on its own -- 0.021 means one thing against a
+        zero-information reference of 0.374 and another against 0.02 -- so the reference
+        and the fraction of it the student captures are reported beside it.
+
+        Three things are pinned, and the first is the one that is easy to get wrong in
+        a way nothing else would catch:
+
+        * it is a **ratio of means**, ``sum(kl) / sum(uniform)`` over every row and
+          layer, not the mean of the per-row ratios. The two are near enough to look
+          alike and far enough apart to matter, so both are computed here from the
+          per-row terms the reported forward actually formed, and their separation is
+          asserted to be well outside the tolerance the first leg admits -- otherwise
+          that leg would pass against the mistake it exists to catch.
+        * the fraction is **invariant to the layer divisor** of the test above: both
+          terms are summed over the same layers, so the divisor cancels. A reference
+          divided by a stale or absent layer count would be off by exactly 2 here.
+        * none of the three metrics carries a graph, and the loss is exactly what it
+          was before the reference existed -- the same fold-in identity the per-layer
+          test asserts, re-checked here because it is what "metric-only" means at the
+          model level.
+        """
+        _require_tilelang_cuda()
+
+        from unittest import mock
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        model, batch = _build_4layer_test_model(
+            device="cuda", seq_len=4096, layer_types=self._TWO_CSA_LAYER_TYPES, coef=1.0, seed=0
+        )
+
+        # The per-row terms as the *reported* forward formed them, so the expectation
+        # and the metric come out of one run: these kernels are not bit-reproducible
+        # across forwards, and a second run's totals would only support a tolerance
+        # wider than the two aggregations below are apart.
+        terms = []
+        real_terms = modeling.indexer_kl_terms
+
+        def _recording(index_score, target):
+            kl, uniform = real_terms(index_score, target)
+            terms.append((kl.detach().float(), uniform.detach().float()))
+            return kl, uniform
+
+        with _single_rank_parallel_state():
+            with mock.patch(f"{_PATCHED_MODULE}.indexer_kl_terms", _recording):
+                out = model(**batch)
+            outputs = model.model(**_model_only_batch(batch))
+
+        tokens = batch["input_ids"].numel()
+        layers = outputs.indexer_kl_layers
+        assert layers == 2 and len(terms) == layers
+
+        kl_rows = torch.cat([kl.flatten() for kl, _ in terms])
+        uniform_rows = torch.cat([uniform.flatten() for _, uniform in terms])
+        ratio_of_means = kl_rows.sum() / uniform_rows.sum()
+
+        # fp32 throughout and one forward, so the two sides differ only in the order
+        # they sum in.
+        rtol = 1e-4
+        torch.testing.assert_close(
+            out.aux_metrics["indexer_kl_uniform"], uniform_rows.sum() / tokens / layers, atol=0, rtol=rtol
+        )
+        torch.testing.assert_close(out.aux_metrics["indexer_kl_captured"], 1.0 - ratio_of_means, atol=0, rtol=rtol)
+        assert torch.isfinite(out.aux_metrics["indexer_kl_captured"]).all()
+
+        # ... and the alternative is measured rather than assumed to differ. Observed
+        # on this fixture: 1.0429 against 1.0382, ~450x the tolerance above.
+        scoreable = uniform_rows > 1e-6
+        mean_of_ratios = (kl_rows[scoreable] / uniform_rows[scoreable]).mean()
+        separation = float((mean_of_ratios - ratio_of_means).abs())
+        assert separation > 20 * rtol * float(ratio_of_means), (
+            f"the mean of the per-row ratios is {float(mean_of_ratios):.6f} against a ratio of means of "
+            f"{float(ratio_of_means):.6f}, only {separation:.2e} apart: this fixture can no longer tell the "
+            "two aggregations apart and the leg above is vacuous"
+        )
+
+        # The layer divisor cancels: the same fraction comes out of the undivided sums.
+        torch.testing.assert_close(
+            out.aux_metrics["indexer_kl_captured"],
+            1.0 - (kl_rows.sum() / tokens) / (uniform_rows.sum() / tokens),
+            atol=0,
+            rtol=rtol,
+        )
+
+        for name, value in out.aux_metrics.items():
+            assert value.grad_fn is None and not value.requires_grad, f"aux metric {name!r} carries a graph"
+        assert not outputs.indexer_uniform_total.requires_grad, (
+            "the reference reaches the model output with a graph attached, so a backward through anything "
+            "that touched it would reach the indexer"
+        )
+
+        # And the objective is untouched: the loss still differs from the pre-fold LM
+        # loss by the layer-summed KL alone.
+        folded = out.loss.detach() - out.aux_metrics["lm_loss_before_indexer_kl"]
+        layer_sum = (outputs.indexer_kl_total / tokens).to(out.loss.dtype)
+        admitted = 8 * torch.finfo(out.loss.dtype).eps * out.loss.detach().abs().item()
         torch.testing.assert_close(folded, layer_sum, atol=admitted, rtol=0)
 
     def test_the_pre_fold_language_model_loss_is_reported(self):

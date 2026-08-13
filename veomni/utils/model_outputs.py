@@ -180,7 +180,7 @@ class MoeModelOutputWithIndexerKL(MoeModelOutputWithPast):
     FSDP2's pre-backward unshard hook -- which walks that same flattened output to
     find the tensors a backward will need -- would never see it.
 
-    Both fields are ``None`` with the loss disabled, and ``ModelOutput.keys()``
+    Every field below is ``None`` with the loss disabled, and ``ModelOutput.keys()``
     skips ``None``, so a flag-off output is indistinguishable from the base class's.
 
     The entries below are in HuggingFace's ``name (type):`` form because
@@ -193,15 +193,23 @@ class MoeModelOutputWithIndexerKL(MoeModelOutputWithPast):
             0-d, summed over the CSA layers and over this rank's query rows. Not
             yet divided by the token count: that division and the cross-rank
             reduction belong together, in ``ForCausalLM.forward``.
+        indexer_uniform_total (`torch.Tensor`, *optional*):
+            0-d, ``log(n_candidates) - H(target)`` accumulated over exactly the rows
+            and layers ``indexer_kl_total`` covers: the KL a student would pay
+            knowing the candidate set and nothing else. Detached -- it is the scale
+            the KL is reported against and must never reach the objective. Summed
+            here rather than divided per row so the reported quantity can be a ratio
+            of means.
         indexer_query_tokens (`int`, *optional*):
-            Number of local query rows the sum above covers.
+            Number of local query rows the sums above cover.
         indexer_kl_layers (`int`, *optional*):
-            Number of CSA layers that contributed to the sum. The loss keeps the
+            Number of CSA layers that contributed to the sums. The loss keeps the
             sum; the reported metric divides by this, so runs with different CSA
             layer counts are comparable.
     """
 
     indexer_kl_total: Optional[torch.Tensor] = None
+    indexer_uniform_total: Optional[torch.Tensor] = None
     indexer_query_tokens: Optional[int] = None
     indexer_kl_layers: Optional[int] = None
 

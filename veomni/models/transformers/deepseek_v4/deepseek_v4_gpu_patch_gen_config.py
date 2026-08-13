@@ -337,15 +337,17 @@ def _split_indexer_output(module, indexer_output):
 
 
 @config.add_helper
-def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Per-query ``KL(target || softmax(index_score))`` for DeepSeek-V3.2 eq. (4).
+def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-query ``KL(target || softmax(index_score))`` for DeepSeek-V3.2 eq. (4), and
+    the zero-information reference to read it against.
 
     Args:
         index_score: [B, S, C] indexer scores at the selected slots, -inf at misses
         target:      [B, S, C] fp32, L1-normalised, zero at misses
 
     Returns:
-        [B, S] fp32
+        ``(kl, uniform_kl)``, both [B, S] fp32. ``uniform_kl`` is detached: it is a
+        metric only and must never reach the objective.
     """
     # A query whose compressed slots are *all* misses scores every one of them
     # ``-inf``, and ``log_softmax`` of such a row is NaN. Masking that after the
@@ -357,17 +359,38 @@ def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> torch.T
     # neutralised on the way *in*. It is the common case, not a corner one: the
     # first ``compress_rate - 1`` positions of every packed sample have no complete
     # compression window behind them.
-    all_missing = ~torch.isfinite(index_score).any(-1, keepdim=True)
+    scoreable = torch.isfinite(index_score)
+    all_missing = ~scoreable.any(-1, keepdim=True)
     scores = torch.where(all_missing, torch.zeros_like(index_score, dtype=torch.float32), index_score.float())
     log_q = torch.log_softmax(scores, dim=-1)
+    log_target = torch.log(target.clamp_min(torch.finfo(torch.float32).tiny))
     # ``log_q`` is -inf exactly where ``target`` is 0, and 0 * -inf is NaN, so the
     # zero-mass slots have to be masked rather than merely multiplied out.
-    contributions = torch.where(
-        target > 0,
-        target * (torch.log(target.clamp_min(torch.finfo(torch.float32).tiny)) - log_q),
-        torch.zeros_like(target),
+    contributions = torch.where(target > 0, target * (log_target - log_q), torch.zeros_like(target))
+    # The scale the KL has to be read against. ``log(n_candidates) - H(target)`` is
+    # the KL a student would pay knowing the candidate set and nothing whatever about
+    # which slot matters, so the KL alone says nothing until it is divided by this:
+    # a plateau of 0.021 means one thing against a reference of 0.374 and another
+    # against 0.02. ``n_candidates`` is the number of slots the student can score at
+    # all -- the finite entries of ``index_score`` -- so both quantities are over the
+    # same support and a row with one candidate correctly contributes 0.
+    #
+    # No mask on the entropy: ``clamp_min`` keeps ``log_target`` finite, so a
+    # zero-mass slot contributes ``0 * log(tiny) == 0`` rather than the ``0 * -inf``
+    # the KL above has to guard against.
+    #
+    # Detached, and nothing here could carry a graph in any case: ``target`` comes
+    # from a forward-only TileLang interface with no ``autograd.Function``, and the
+    # only tensor derived from ``index_score`` is an integer count. The ``detach``
+    # is the contract rather than the mechanism -- this must not perturb a gradient
+    # even if a future teacher becomes differentiable.
+    neg_entropy = (target * log_target).sum(-1)
+    uniform_kl = torch.where(
+        all_missing.squeeze(-1),
+        torch.zeros_like(neg_entropy),
+        torch.log(scoreable.sum(-1).clamp_min(1).to(torch.float32)) + neg_entropy,
     )
-    return contributions.sum(-1)
+    return contributions.sum(-1), uniform_kl.detach()
 
 
 # ================================================================
@@ -496,14 +519,15 @@ def deepseek_v4_decoder_layer_forward_patched(
     dtype = hidden_states.dtype
     post, comb, collapsed = self.attn_hc(hidden_states)
     # --- Patch.3 ---
-    # The attention returns its KL as a third value on exactly the layers
-    # ``_builds_indexer_kl`` selects, so this reads the same predicate rather than
-    # restating the condition or testing the length of what came back: a
-    # length test would read a stale two-tuple from a broken gate as "no KL here"
-    # and train nothing, whereas an arity mismatch against the predicate raises.
+    # The attention returns its KL and that KL's zero-information reference as third
+    # and fourth values on exactly the layers ``_builds_indexer_kl`` selects, so this
+    # reads the same predicate rather than restating the condition or testing the
+    # length of what came back: a length test would read a stale two-tuple from a
+    # broken gate as "no KL here" and train nothing, whereas an arity mismatch against
+    # the predicate raises.
     builds_indexer_kl = _builds_indexer_kl(self.self_attn)
     if builds_indexer_kl:
-        attn_output, _, indexer_kl = self.self_attn(self.input_layernorm(collapsed), **kwargs)
+        attn_output, _, indexer_kl, indexer_uniform = self.self_attn(self.input_layernorm(collapsed), **kwargs)
     else:
         attn_output, _ = self.self_attn(self.input_layernorm(collapsed), **kwargs)
     # --- Patch.3 ---
@@ -536,7 +560,7 @@ def deepseek_v4_decoder_layer_forward_patched(
     # flag-off path has to stay exactly what it was. It also keeps the checkpointed
     # return free of non-tensor leaves.
     if builds_indexer_kl:
-        return output, indexer_kl
+        return output, indexer_kl, indexer_uniform
     return output
     # --- Patch.3 ---
 
@@ -1157,7 +1181,14 @@ def deepseek_v4_attention_forward_patched(
     # module-level function this file replaces.
     if build_indexer_loss:
         attn_output, attn_weights, target = attention_outputs
-        indexer_kl = indexer_kl_terms(index_score, target).sum()
+        kl_terms, uniform_terms = indexer_kl_terms(index_score, target)
+        indexer_kl = kl_terms.sum()
+        # Summed over exactly the rows the KL is summed over, so the two travel the
+        # whole way to the metric through the same denominators and the ratio taken at
+        # the end is a ratio of means. A per-row ``kl / uniform`` averaged instead
+        # would be dominated by the rows with the smallest reference -- wrong, and
+        # wrong in a way that still lands in [0, 1] and looks entirely plausible.
+        indexer_uniform = uniform_terms.sum()
     else:
         attn_output, attn_weights = attention_outputs
     # --- Patch.3 ---
@@ -1173,11 +1204,11 @@ def deepseek_v4_attention_forward_patched(
     grouped = self.o_a_proj(grouped).flatten(2)
     output = self.o_b_proj(grouped)
     # --- Patch.3 ---
-    # A 0-d sum rather than the [B, S] terms: the decoder layer above only has to
+    # 0-d sums rather than the [B, S] terms: the decoder layer above only has to
     # add these together, and summing here keeps the reduction over *local* query
     # rows, which is what makes the CP case a plain sum of per-rank contributions.
     if build_indexer_loss:
-        return output, attn_weights, indexer_kl
+        return output, attn_weights, indexer_kl, indexer_uniform
     # --- Patch.3 ---
     return output, attn_weights
 
@@ -1477,6 +1508,7 @@ def deepseek_v4_model_forward_patched(
 
     # --- Patch.3 ---
     indexer_kl_total = None
+    indexer_uniform_total = None
     indexer_kl_layers = 0
     # --- Patch.3 ---
     for layer in self.layers:
@@ -1512,13 +1544,19 @@ def deepseek_v4_model_forward_patched(
                 f"_builds_indexer_kl says builds_indexer_kl={builds_indexer_kl}: the layer and the model "
                 "loop disagree about the indexer-KL return arity"
             )
-        # Only the CSA layers return a pair; the rest return the bare tensor they
-        # always returned. Summed rather than averaged over the layers, which is
-        # deliberate and matches the MoE router aux loss this sits beside: the
-        # reported number scales with the number of CSA layers.
+        # Only the CSA layers return a tuple; the rest return the bare tensor they
+        # always returned. The KL is summed rather than averaged over the layers,
+        # which is deliberate and matches the MoE router aux loss this sits beside;
+        # ``indexer_kl_layers`` carries the count so the *metric* can be a per-layer
+        # mean while the objective keeps the sum. The uniform reference is summed
+        # over the same layers by the same rule, which is what makes the ratio of the
+        # two independent of that divisor.
         if builds_indexer_kl:
-            hidden_states, layer_kl = layer_output
+            hidden_states, layer_kl, layer_uniform = layer_output
             indexer_kl_total = layer_kl if indexer_kl_total is None else indexer_kl_total + layer_kl
+            indexer_uniform_total = (
+                layer_uniform if indexer_uniform_total is None else indexer_uniform_total + layer_uniform
+            )
             indexer_kl_layers += 1
         else:
             hidden_states = layer_output
@@ -1554,7 +1592,7 @@ def deepseek_v4_model_forward_patched(
 
     hidden_states = self.norm(self.hc_head(hidden_states))
     # --- Patch.3 ---
-    # ``MoeModelOutputWithIndexerKL`` declares the three fields below; assigning them
+    # ``MoeModelOutputWithIndexerKL`` declares the four fields below; assigning them
     # onto a ``MoeModelOutputWithPast`` instead would make them invisible to
     # ``keys()`` and to pytree flattening, and any consumer that reconstructs the
     # output would drop them without a word. All are ``None`` with the loss off,
@@ -1568,6 +1606,7 @@ def deepseek_v4_model_forward_patched(
         last_hidden_state=hidden_states,
         past_key_values=return_cache,
         indexer_kl_total=indexer_kl_total,
+        indexer_uniform_total=indexer_uniform_total,
         indexer_query_tokens=hidden_states.shape[0] * hidden_states.shape[1] if indexer_kl_total is not None else None,
         indexer_kl_layers=indexer_kl_layers if indexer_kl_total is not None else None,
     )
@@ -1851,10 +1890,25 @@ def deepseek_v4_forcausallm_forward_patched(
         # converge to the wrong cross-rank weighting -- a discrepancy invisible to
         # any single-process test of the value.
         local_mean = outputs.indexer_kl_total / local_query_tokens.clamp_min(1)
+        # The zero-information reference the KL has to be read against, carried
+        # through byte-for-byte the same denominators: the same per-rank token count,
+        # the same SP reduction, the same layer sum. The ratio taken below is then a
+        # ratio of means over identical supports, which is the only form of it that
+        # is right -- averaging a per-row or per-rank ``kl / uniform`` instead gives a
+        # number that still lands in [0, 1] and is quietly wrong.
+        #
+        # ``.clone()`` on the token count for each call, not a shared tensor:
+        # ``ReduceLoss.forward`` all-reduces ``num_valid_tokens`` *in place*, so a
+        # second call handed the same tensor would divide by an SP-world-size-times
+        # inflated count -- correct on one rank, wrong on two, which is the class of
+        # bug this file's CP tests exist to catch.
+        local_uniform_mean = outputs.indexer_uniform_total / local_query_tokens.clamp_min(1)
         if get_parallel_state().sp_enabled:
-            indexer_kl = reduce_sequence_parallel_loss(local_mean, local_query_tokens)
+            indexer_kl = reduce_sequence_parallel_loss(local_mean, local_query_tokens.clone())
+            indexer_uniform = reduce_sequence_parallel_loss(local_uniform_mean, local_query_tokens.clone())
         else:
             indexer_kl = local_mean
+            indexer_uniform = local_uniform_mean
         # The *loss* keeps the layer sum -- a settled decision, and the reason the
         # fold-in below reads ``indexer_kl`` rather than the mean. The *metric* is a
         # per-layer mean, matching Megatron's
@@ -1869,7 +1923,29 @@ def deepseek_v4_forcausallm_forward_patched(
         # thing that becomes reachable later, and a division by zero here would be a
         # NaN in a metric rather than an error.
         indexer_kl_layers = max(outputs.indexer_kl_layers or 0, 1)
-        aux_metrics = {"indexer_kl": indexer_kl.detach() / indexer_kl_layers}
+        # ``indexer_kl`` alone says nothing: the reference run's plateau of 0.021
+        # means one thing against a zero-information reference of 0.374 and another
+        # against 0.02. ``indexer_kl_captured`` is the reading -- 1.0 is a student
+        # that reproduces the teacher, 0.0 is one that knows only the candidate set --
+        # and both terms go out beside it, because a reader given only the fraction
+        # can reconstruct neither.
+        #
+        # The layer divisor cancels in the ratio, both terms being summed over the
+        # same layers; it is applied to each anyway so the two reported numbers are
+        # per-layer means on the same scale as each other and as ``indexer_kl``.
+        #
+        # ``clamp_min`` on the denominator: the reference is zero exactly when every
+        # query row has at most one candidate, in which case the KL is zero too and
+        # nothing was there to capture. 1.0 -- "captured everything" -- is the honest
+        # reading of that, and a NaN in a metric would propagate into the logger.
+        indexer_kl_metric = indexer_kl.detach() / indexer_kl_layers
+        indexer_uniform_metric = indexer_uniform.detach() / indexer_kl_layers
+        aux_metrics = {
+            "indexer_kl": indexer_kl_metric,
+            "indexer_kl_uniform": indexer_uniform_metric,
+            "indexer_kl_captured": 1.0
+            - indexer_kl_metric / indexer_uniform_metric.clamp_min(torch.finfo(torch.float32).tiny),
+        }
         # No labels means no loss to fold into -- ``loss`` is ``None`` and the
         # addition would raise. The metric is still reported: an inference forward
         # that computed the KL may as well say what it was.
