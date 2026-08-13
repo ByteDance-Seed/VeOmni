@@ -49,6 +49,44 @@ logger = logging.get_logger(__name__)
 # being silently wrong.
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
 
+# Models whose forward implements the Lightning Indexer KL objective. An
+# allow-list for the same reason as above, and against the same failure: the flag
+# is on the model-agnostic ``OpsImplementationConfig``, but only DeepSeek-V4's
+# patch config declares the slot and only its forward builds the KL. GLM MoE DSA
+# has a Lightning Indexer of its own and declares the two neighbouring DSA slots,
+# so ``dsa_indexer_loss: true`` on a GLM run is an entirely reasonable thing for a
+# user to write -- and produces no error, no metric and no training. Every other
+# unsupported configuration of this objective is refused loudly; this one has to
+# be too, and it can only be refused from outside the model, because a GLM run
+# never reaches DeepSeek-V4's patched forward where the other two gates live.
+INDEXER_LOSS_MODEL_TYPES = frozenset({"deepseek_v4"})
+
+
+def check_indexer_loss_supported(config: PretrainedConfig) -> None:
+    """Raise unless this model type implements the Lightning Indexer KL objective.
+
+    A no-op when ``dsa_indexer_loss`` is off, which is the default and every other
+    configuration. Reads the installed ops singleton rather than taking the config
+    as an argument, so that every construction path is covered by the same call.
+    """
+    from ..ops.config.singleton import get_ops_config
+
+    ops_config = get_ops_config()
+    if ops_config is None or not getattr(ops_config, "dsa_indexer_loss", False):
+        return
+
+    model_type = getattr(config, "model_type", None)
+    if model_type in INDEXER_LOSS_MODEL_TYPES:
+        return
+
+    supported = ", ".join(sorted(INDEXER_LOSS_MODEL_TYPES))
+    raise NotImplementedError(
+        f"dsa_indexer_loss is not implemented for model type {model_type!r}; only {supported} "
+        "builds the indexer KL. Left to run it would train nothing, report nothing and cost "
+        "nothing -- a silent no-op rather than an error. Set dsa_indexer_loss=false, or train "
+        f"one of: {supported}."
+    )
+
 
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
     """Raise unless this model type implements context parallelism.
@@ -239,6 +277,7 @@ def build_foundation_model(
         config = build_config(config_path, **config_kwargs)
 
     check_context_parallel_supported(config)
+    check_indexer_loss_supported(config)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":

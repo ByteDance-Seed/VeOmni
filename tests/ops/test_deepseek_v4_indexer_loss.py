@@ -2777,3 +2777,124 @@ class TestFourLayerModelIndexerKL:
 
         assert out.loss is None
         assert out.aux_metrics is not None and out.aux_metrics["indexer_kl"] > 0
+
+
+class TestModelBuildRefusesModelsThatDoNotImplementIt:
+    """``dsa_indexer_loss`` lives on the model-agnostic ``OpsImplementationConfig``,
+    but only DeepSeek-V4 implements it.
+
+    GLM MoE DSA has a Lightning Indexer of its own and declares
+    ``dsa_indexer_implementation`` and ``dsa_attention_implementation``, so a GLM
+    user setting ``dsa_indexer_loss: true`` reads as an entirely reasonable thing to
+    do -- and gets no error, no metric and no training. That is the silent-no-op
+    class this feature refuses everywhere else, and it is refused here at model-build
+    time, before anything is constructed.
+
+    Neither of the two gates inside the model can do this: they are in DeepSeek-V4's
+    own patched forward, which a GLM run never reaches.
+    """
+
+    @staticmethod
+    def _build(config_path, indexer_loss, loader=None, omni=False):
+        """``build_foundation_model`` (or the omni branch) with nothing built.
+
+        Both construction paths are exercised, because there are two: the omni
+        encoder/decoder branch does not delegate to ``build_foundation_model``, and a
+        gate installed in only one of them would leave the other silent -- which is
+        exactly the shape of the bug this refusal exists to close.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from veomni.models.auto import build_config, build_foundation_model
+
+        parallel_state = SimpleNamespace(cp_enabled=False, sp_enabled=False, global_rank=0)
+        ops_config = SimpleNamespace(attn_implementation="eager", dsa_indexer_loss=indexer_loss)
+        with (
+            mock.patch("veomni.models.auto.get_parallel_state", return_value=parallel_state),
+            mock.patch("veomni.ops.config.singleton.get_ops_config", return_value=ops_config),
+        ):
+            if omni:
+                from veomni.models.seed_omni.auto import build_omni_model
+
+                model_cls = mock.MagicMock()
+                with (
+                    mock.patch("veomni.models.seed_omni.auto.SeedOmniModel", model_cls),
+                    mock.patch("veomni.models.seed_omni.auto.SeedOmniConfig", _StubOmniConfig),
+                ):
+                    build_omni_model(config_path=config_path, init_device="meta")
+                return model_cls._from_config.call_count
+            with mock.patch("veomni.models.auto.get_loader", return_value=loader):
+                build_foundation_model(config_path=build_config(config_path), init_device="meta")
+            return loader.calls
+
+    def test_a_model_with_its_own_lightning_indexer_is_still_refused(self):
+        """GLM MoE DSA: the case from the review, and the one most likely to be tried."""
+        loader = _StubLoader()
+        with pytest.raises(NotImplementedError, match="dsa_indexer_loss") as raised:
+            self._build("tests/toy_config/glm_moe_dsa_toy", indexer_loss=True, loader=loader)
+        message = str(raised.value)
+        assert "'glm_moe_dsa'" in message, message
+        # Naming the way out, as the context-parallel gate beside it does: a refusal
+        # that does not say what to set instead reads as a bug in the feature.
+        assert "dsa_indexer_loss=false" in message, message
+        assert loader.calls == 0, "the refusal must come before the model is constructed"
+
+    def test_deepseek_v4_is_not_refused(self):
+        """The one model that implements it builds as usual.
+
+        Without this leg a gate stuck at "refuse everything" would look correct.
+        """
+        loader = _StubLoader()
+        assert self._build("tests/toy_config/deepseek_v4_toy", indexer_loss=True, loader=loader) == 1
+
+    def test_the_flag_off_admits_every_model(self):
+        """The gate is keyed on the flag, not on the model: the default changes nothing.
+
+        This is the flag-off inertness guarantee at build time -- every model in the
+        tree goes through this line on every build.
+        """
+        loader = _StubLoader()
+        assert self._build("tests/toy_config/glm_moe_dsa_toy", indexer_loss=False, loader=loader) == 1
+
+    def test_the_omni_branch_refuses_it_too(self):
+        """The omni encoder/decoder path builds ``SeedOmniModel._from_config`` itself
+        rather than going through ``build_foundation_model``, so it needs the gate
+        installed separately -- the same reason the context-parallel gate is in both.
+        """
+        with pytest.raises(NotImplementedError, match="dsa_indexer_loss") as raised:
+            self._build("tests/toy_config/qwen3_toy", indexer_loss=True, omni=True)
+        assert "'qwen3'" in str(raised.value), str(raised.value)
+
+    def test_the_omni_branch_admits_it_with_the_flag_off(self):
+        assert self._build("tests/toy_config/qwen3_toy", indexer_loss=False, omni=True) == 1
+
+
+class _StubLoader:
+    """Stands in for the real loader, so the gate is the only thing under test.
+
+    Copied from ``tests/parallel/context_parallel/test_dsv4_cp_model_gate.py``, for
+    the same reason it exists there: the gate runs before construction, so building
+    a real model would make an assertion that *nothing happened* the most expensive
+    test in the file. Carrying no ``model_cls`` is deliberate --
+    ``build_foundation_model`` reads it with ``getattr(..., None)`` and skips the
+    OpSlot binding.
+    """
+
+    def __init__(self):
+        self.model = torch.nn.Identity()
+        self.calls = 0
+
+    def load_model(self, **kwargs):
+        self.calls += 1
+        return self.model
+
+
+class _StubOmniConfig:
+    """Stands in for ``SeedOmniConfig``: ``build_omni_model`` selects its branch with
+    ``isinstance(foundation_config, SeedOmniConfig)``, and a foundation config is not
+    an instance of this, which is the branch under test.
+    """
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
