@@ -1777,18 +1777,27 @@ class DeepseekV4Attention(nn.Module):
             # *scores* so that the KL pairs slot ``j`` of the teacher with the score
             # ``index_score[..., j]``.
             #
-            # The assertion below claims exactly one thing: that the two tensors the KL
-            # pairs are the same width. It compares two widths, so it cannot see a
-            # reordering of ``torch.cat((sliding_indices, compressed_indices))`` -- that
-            # leaves both widths unchanged while ``[:, :, -width:]`` starts reading window
-            # slots. The reordering guard is a test, not this line:
+            # The check below claims exactly one thing: that the two tensors the KL pairs
+            # are the same width. It compares two widths, so it cannot see a reordering of
+            # ``torch.cat((sliding_indices, compressed_indices))`` -- that leaves both
+            # widths unchanged while ``[:, :, -width:]`` starts reading window slots. The
+            # reordering guard is a test, not this line:
             # ``test_target_reads_the_full_window_lse_and_the_trailing_compressed_slice``
             # compares the teacher's slot tensor against the indexer's own selection
             # lifted past the full-resolution KV rows.
+            #
+            # ``raise`` rather than ``assert``, matching its siblings above and below:
+            # ``python -O`` strips an ``assert``, and this is the only thing standing
+            # between the teacher's ``[:, :, -width:]`` and the sliding-window slots. A
+            # width mismatch under -O would not crash -- it would silently train the
+            # indexer against the wrong distribution.
             kwargs["indexer_target_width"] = index_score.shape[-1]
-            assert kwargs["indexer_target_width"] == compressed_candidates.topk_indices.shape[-1], (
-                "indexer scores and compressed indices must be the same width"
-            )
+            if kwargs["indexer_target_width"] != compressed_candidates.topk_indices.shape[-1]:
+                raise RuntimeError(
+                    f"the indexer scored {kwargs['indexer_target_width']} slots while the compressor selected "
+                    f"{compressed_candidates.topk_indices.shape[-1]}: the KL pairs slot j of the teacher with "
+                    "index_score[..., j], so the two must be the same width"
+                )
         # --- Patch.3 ---
         attention_outputs = attention_interface(
             self,

@@ -1791,9 +1791,13 @@ class TestAttentionForwardIndexerKL:
         against window probabilities.
 
         Staged as a one-slot-narrower score tensor. This pins the width invariant
-        only, which is all the production assertion claims; a *reordering* of the
-        index tensor leaves both widths equal and is caught instead by
+        only, which is all the production check claims; a *reordering* of the index
+        tensor leaves both widths equal and is caught instead by
         ``test_target_reads_the_full_window_lse_and_the_trailing_compressed_slice``.
+
+        ``RuntimeError``, not ``AssertionError``: this guard has to survive
+        ``python -O``, which strips asserts. ``tests/ops/test_deepseek_v4_indexer_loss.py``
+        is run under ``-O`` to confirm the refusal is still there.
         """
         _require_tilelang_cuda()
         from unittest import mock
@@ -1811,7 +1815,7 @@ class TestAttentionForwardIndexerKL:
             )
 
         with _single_rank_parallel_state(), mock.patch.object(attn.compressor, "forward", _narrower_scores):
-            with pytest.raises(AssertionError, match="must be the same width"):
+            with pytest.raises(RuntimeError, match="must be the same width"):
                 attn(**inputs)
 
     def test_a_declined_tilelang_dispatch_under_the_loss_is_refused(self):
