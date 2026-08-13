@@ -1554,11 +1554,12 @@ def deepseek_v4_model_forward_patched(
 
     hidden_states = self.norm(self.hc_head(hidden_states))
     # --- Patch.3 ---
-    # ``MoeModelOutputWithIndexerKL`` declares the two fields below; assigning them
+    # ``MoeModelOutputWithIndexerKL`` declares the three fields below; assigning them
     # onto a ``MoeModelOutputWithPast`` instead would make them invisible to
     # ``keys()`` and to pytree flattening, and any consumer that reconstructs the
-    # output would drop them without a word. Both are ``None`` with the loss off,
-    # and ``keys()`` skips ``None``, so the flag-off output is unchanged.
+    # output would drop them without a word. All are ``None`` with the loss off,
+    # and ``keys()`` skips ``None``, so the flag-off output is unchanged -- which is
+    # why the layer count goes out as ``None`` rather than as the 0 it holds there.
     #
     # The token count is every local query row, padding included (~0.1% of a packed
     # row on the reference run). Excluding them would need packed-metadata plumbing
@@ -1568,6 +1569,7 @@ def deepseek_v4_model_forward_patched(
         past_key_values=return_cache,
         indexer_kl_total=indexer_kl_total,
         indexer_query_tokens=hidden_states.shape[0] * hidden_states.shape[1] if indexer_kl_total is not None else None,
+        indexer_kl_layers=indexer_kl_layers if indexer_kl_total is not None else None,
     )
     # --- Patch.3 ---
 
@@ -1853,7 +1855,21 @@ def deepseek_v4_forcausallm_forward_patched(
             indexer_kl = reduce_sequence_parallel_loss(local_mean, local_query_tokens)
         else:
             indexer_kl = local_mean
-        aux_metrics = {"indexer_kl": indexer_kl.detach()}
+        # The *loss* keeps the layer sum -- a settled decision, and the reason the
+        # fold-in below reads ``indexer_kl`` rather than the mean. The *metric* is a
+        # per-layer mean, matching Megatron's
+        # ``avg_indexer_loss = values.sum() / max(num_indexer_layers, 1)``
+        # (``dsa.py:427``): summed, ``training/indexer_kl`` is ~21x larger on
+        # DeepSeek-V4-Flash (21 CSA layers) than on the 1-CSA-layer smoke checkpoint
+        # at identical per-layer quality, so no two runs with different layer counts
+        # -- and no comparison against an upstream number -- mean anything.
+        #
+        # ``max(..., 1)`` guards nothing reachable: this block is entered only when at
+        # least one layer contributed. It is there because the divisor is the sort of
+        # thing that becomes reachable later, and a division by zero here would be a
+        # NaN in a metric rather than an error.
+        indexer_kl_layers = max(outputs.indexer_kl_layers or 0, 1)
+        aux_metrics = {"indexer_kl": indexer_kl.detach() / indexer_kl_layers}
         # No labels means no loss to fold into -- ``loss`` is ``None`` and the
         # addition would raise. The metric is still reported: an inference forward
         # that computed the KL may as well say what it was.

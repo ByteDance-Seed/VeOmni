@@ -195,10 +195,15 @@ class MoeModelOutputWithIndexerKL(MoeModelOutputWithPast):
             reduction belong together, in ``ForCausalLM.forward``.
         indexer_query_tokens (`int`, *optional*):
             Number of local query rows the sum above covers.
+        indexer_kl_layers (`int`, *optional*):
+            Number of CSA layers that contributed to the sum. The loss keeps the
+            sum; the reported metric divides by this, so runs with different CSA
+            layer counts are comparable.
     """
 
     indexer_kl_total: Optional[torch.Tensor] = None
     indexer_query_tokens: Optional[int] = None
+    indexer_kl_layers: Optional[int] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────

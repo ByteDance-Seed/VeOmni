@@ -2165,6 +2165,19 @@ class TestFourLayerModelIndexerKL:
         "heavily_compressed_attention",
     ]
 
+    # Two CSA layers where the checkpoint's own schedule has one. ``compress_rates``
+    # is keyed by layer *type*, not by index, so a second CSA entry gets the same
+    # rate-4 compressor and indexer the first one has. This is the only configuration
+    # in this file where the layer sum and the per-layer mean differ, and therefore
+    # the only one that can tell them apart -- at one CSA layer the divisor is 1 and
+    # every arrangement of the two agrees.
+    _TWO_CSA_LAYER_TYPES = [
+        "sliding_attention",
+        "compressed_sparse_attention",
+        "compressed_sparse_attention",
+        "heavily_compressed_attention",
+    ]
+
     @pytest.mark.parametrize("labels", [True, False])
     def test_the_flag_is_refused_when_no_layer_can_build_a_kl(self, labels):
         """A model with no CSA layer accepts ``dsa_indexer_loss=True`` and trains
@@ -2259,6 +2272,7 @@ class TestFourLayerModelIndexerKL:
         assert outputs.indexer_kl_total is not None, "the model dropped the KL"
         assert "indexer_kl_total" in outputs, "the KL is an ad-hoc attribute, not a field of the output"
         assert outputs.indexer_query_tokens == batch["input_ids"].numel()
+        assert outputs.indexer_kl_layers == len(_csa_layers(model))
 
         leaves, spec = pytree.tree_flatten(outputs)
         assert any(leaf is outputs.indexer_kl_total for leaf in leaves), (
@@ -2268,6 +2282,7 @@ class TestFourLayerModelIndexerKL:
         rebuilt = pytree.tree_unflatten(leaves, spec)
         assert rebuilt.indexer_kl_total is outputs.indexer_kl_total
         assert rebuilt.indexer_query_tokens == outputs.indexer_query_tokens
+        assert rebuilt.indexer_kl_layers == outputs.indexer_kl_layers
 
     def test_the_reported_kl_is_the_per_token_mean_of_the_layer_sum(self):
         """What reaches the loss is a *mean* over local query rows, not the sum the
@@ -2276,8 +2291,11 @@ class TestFourLayerModelIndexerKL:
         ``reduce_sequence_parallel_loss`` takes a local mean and the local token count
         and re-weights by that count across the group; handing it a sum instead trains
         perfectly well on one rank and converges to the wrong cross-rank weighting,
-        which no single-process test of the value alone would ever notice. The two
-        differ here by a factor of 4096, so the check is exact rather than statistical.
+        which no single-process test of the value alone would ever notice.
+
+        This model runs the checkpoint's own schedule, so it has one CSA layer and the
+        metric's per-layer divisor is 1; the divisor itself is pinned by
+        ``test_the_reported_kl_is_a_per_layer_mean_while_the_loss_keeps_the_sum``.
         """
         _require_tilelang_cuda()
         model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
@@ -2391,6 +2409,52 @@ class TestFourLayerModelIndexerKL:
             "floating-point noise this subtraction carries, so it cannot be told from zero here"
         )
         torch.testing.assert_close(difference, reported, atol=admitted, rtol=0)
+
+    def test_the_reported_kl_is_a_per_layer_mean_while_the_loss_keeps_the_sum(self):
+        """The two halves that have to disagree: the loss sums over CSA layers, the
+        metric averages over them.
+
+        Summed, ``training/indexer_kl`` is ~21x larger on DeepSeek-V4-Flash (21 CSA
+        layers) than on the 1-CSA-layer smoke checkpoint at identical per-layer
+        quality, so no two runs with different layer counts are comparable and neither
+        is any Megatron number (``dsa.py:427`` reports
+        ``values.sum() / max(num_indexer_layers, 1)``). The summed *loss* is a settled
+        decision and stays, which is why both legs are here: dividing the folded value
+        too would silently rescale the objective this branch has already tuned.
+
+        Every other test in this class runs the checkpoint's own one-CSA-layer
+        schedule, where the divisor is 1 and the two are indistinguishable.
+        """
+        _require_tilelang_cuda()
+
+        model, batch = _build_4layer_test_model(
+            device="cuda", seq_len=4096, layer_types=self._TWO_CSA_LAYER_TYPES, coef=1.0, seed=0
+        )
+        assert len(_csa_layers(model)) == 2, "the two-CSA schedule did not build two indexers"
+
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+            out = model(**batch)
+
+        assert outputs.indexer_kl_layers == 2, (
+            f"the model body counted {outputs.indexer_kl_layers} contributing layers, not 2"
+        )
+        tokens = batch["input_ids"].numel()
+        per_layer_mean = outputs.indexer_kl_total / tokens / 2
+        torch.testing.assert_close(
+            out.aux_metrics["indexer_kl"], per_layer_mean, atol=0, rtol=torch.finfo(torch.bfloat16).eps
+        )
+        # ... and the layer *sum* is what the loss received. Bounded by the ULPs of
+        # the subtraction, with the KL asserted clear of them, exactly as
+        # ``test_the_coefficient_scales_what_the_loss_receives`` does.
+        folded = out.loss.detach() - out.aux_metrics["lm_loss_before_indexer_kl"]
+        layer_sum = (outputs.indexer_kl_total / tokens).to(out.loss.dtype)
+        admitted = 8 * torch.finfo(out.loss.dtype).eps * out.loss.detach().abs().item()
+        assert layer_sum > 100 * admitted, (
+            f"the layer-summed KL {float(layer_sum):.3e} is inside this subtraction's noise, so the "
+            "leg below cannot tell a sum from a mean"
+        )
+        torch.testing.assert_close(folded, layer_sum, atol=admitted, rtol=0)
 
     def test_the_pre_fold_language_model_loss_is_reported(self):
         """The clean LM curve a flag-on run needs to be comparable to a flag-off one.
