@@ -192,7 +192,46 @@ NPU validation runs at two times:
 | chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (Hopper SM90), `npu` (requires `triton-ascend`). `eager` does not support varlen training. |
 | dsa_indexer_implementation | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
+| dsa_indexer_loss | `bool` | `False` | Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) sparse KL objective. Requires `dsa_indexer_implementation: tilelang`, `dsa_attention_implementation: tilelang` and `ulysses_size: 1`; each is refused rather than silently ignored. Only DeepSeek-V4 implements it — any other model type refuses the flag at model-build time. See the section below. |
+| dsa_indexer_loss_coef | `float` | `1.0` | Weight on the indexer KL when it is folded into the total loss. `0.0` switches the objective off entirely: no teacher is recomputed, no gradient reaches the indexer and no metric is reported, so it costs exactly what `dsa_indexer_loss: false` costs. Negative values are refused. |
 | mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
+
+#### The Lightning Indexer KL objective (`dsa_indexer_loss`)
+
+The objective minimises `KL(target ‖ softmax(index_score))` over the compressed
+candidates the sparse attention selected, where `target` is a teacher
+distribution recomputed in the forward from that attention's own LSE. It is
+summed over CSA layers, normalised per query token, reduced across
+sequence-parallel ranks, scaled by `dsa_indexer_loss_coef` and added to the total
+loss. Gradients reach the Lightning Indexer only; the language-model path is
+bitwise unchanged with the flag on.
+
+**The top-k has to actually bind, or this is not the paper's objective.** Eq. (4)
+is a KL over the *selected* candidates, which is only a selection when a query row
+has more causally visible compressed slots than `index_topk`. When it has fewer,
+every visible slot is selected and the objective degenerates to the dense eq. (3).
+Two things decide this and both are easy to get wrong:
+
+- `max_seq_len / compress_rate` must comfortably exceed `index_topk`. At
+  `max_seq_len: 2048` with a rate-4 CSA layer and `index_topk: 512` the two are
+  exactly equal — the degenerate boundary, not a margin.
+- The visible-slot count is per **sample**, not per packed row: compression
+  windows and causal ranges restart at every `cu_seq_lens` boundary, so a query
+  row only ever sees its own sample's slots. On a short-conversation SFT mixture
+  the top-k never binds however large `max_seq_len` is. Long documents are what
+  escape this, not a longer packed row.
+
+`configs/text/deepseek_v4_indexer_loss.yaml` derives both numbers for a concrete
+dataset and is the place to start from.
+
+Four metrics are reported, all per micro-batch means:
+
+| Metric | Meaning |
+| --- | --- |
+| `training/indexer_kl` | The objective itself, as a **per-layer** mean so runs with different CSA layer counts are comparable. The loss keeps the layer sum; only the metric is divided. |
+| `training/indexer_kl_uniform` | `log(n_candidates) − H(target)`, the KL a student would pay knowing the candidate set and nothing about which slot matters. The scale `indexer_kl` has to be read against — it is not interpretable alone. |
+| `training/indexer_kl_captured` | `1 − indexer_kl / indexer_kl_uniform`. 1.0 reproduces the teacher, 0.0 is that zero-information student. A pretrained indexer on the reference checkpoint sits at ~0.96. |
+| `training/lm_loss_before_indexer_kl` | The language-model loss from before the KL was folded in, so a flag-on run has a curve comparable to a flag-off baseline. `training/foundation_loss` includes the KL. |
 
 ### DataArguments
 
