@@ -29,6 +29,7 @@ with stock ``peft`` when it is installed (dev/test-only dependency).
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -38,6 +39,7 @@ from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import load_lora_weights
+from veomni.trainer.base import BaseTrainer
 
 
 torch.manual_seed(0)
@@ -137,6 +139,36 @@ def test_only_lora_trainable():
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]
     assert trainable, "expected some trainable params"
     assert all(".lora_A." in n or ".lora_B." in n for n in trainable)
+
+
+def test_base_trainer_rejects_lora_without_trainable_adapters():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.model = Toy()
+    trainer.args = SimpleNamespace(
+        model=SimpleNamespace(lora_config={"rank": 8, "alpha": 16, "lora_modules": ["missing"]})
+    )
+
+    with pytest.raises(ValueError, match="no trainable adapters"):
+        trainer._setup_lora()
+
+
+@pytest.mark.parametrize("is_trainable", [True, False])
+def test_base_trainer_validates_resumed_adapter(tmp_path, is_trainable):
+    VeOmniLoraModel(Toy(), _base_config()).save_pretrained(str(tmp_path))
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.model = Toy()
+    trainer.args = SimpleNamespace(
+        model=SimpleNamespace(
+            lora_config={"lora_adapter": str(tmp_path), "is_trainable": is_trainable},
+        )
+    )
+
+    if is_trainable:
+        trainer._setup_lora()
+        assert any(param.requires_grad for param in trainer.model.parameters())
+    else:
+        with pytest.raises(ValueError, match="no trainable adapters"):
+            trainer._setup_lora()
 
 
 def test_init_is_noop():

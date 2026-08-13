@@ -627,7 +627,7 @@ class TorchCompileConfig:
 
     enable: bool = field(
         default=False,
-        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
+        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
     )
     backend: Optional[str] = field(
         default="inductor",
@@ -737,6 +737,15 @@ class TrainingArguments:
     enable_batch_invariant_mode: bool = field(
         default=False,
         metadata={"help": "Enable batch invariant mode."},
+    )
+    sync_each_train_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Synchronize the accelerator before each training step's forward/backward work. "
+                "Disable to allow asynchronous dataloader and H2D work to overlap with the next step."
+            )
+        },
     )
     empty_cache_steps: int = field(
         default=500,
@@ -1384,6 +1393,14 @@ class DataloaderConfig:
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},
     )
+    persistent_workers: bool = field(
+        default=False,
+        metadata={"help": "Keep DataLoader worker processes alive between iterator recreations."},
+    )
+    in_order: bool = field(
+        default=True,
+        metadata={"help": "Return worker-loaded batches in first-in, first-out order."},
+    )
     drop_last: bool = field(
         default=True,
         metadata={"help": "Whether to drop the last incomplete batch."},
@@ -1525,12 +1542,12 @@ class VeOmniArguments:
                 )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text trainers only. "
-                    "Multimodal/DiT/Omni data pipelines do not implement pad_to_length for static packed shapes yet."
+                    "train.torch_compile.enable is not supported by this data pipeline. "
+                    "The pipeline must implement pad_to_length for static packed shapes."
                 )
             if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text data only; "
+                    "train.torch_compile.enable currently supports packed language-model data types only; "
                     f"got data.data_type={self.data.data_type!r}."
                 )
             if not self.train.dyn_bsz or not self.train.pad_to_length:

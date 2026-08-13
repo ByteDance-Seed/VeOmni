@@ -791,7 +791,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -793,47 +1147,95 @@
+@@ -793,47 +1147,105 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -855,8 +855,18 @@
 -                hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
 -            )
 +        compressed_topk_indices = None
++        # The device and dtype terms mirror what ``eager_attention_forward`` requires
++        # before it can dispatch to TileLang. Without them this reads the config string
++        # alone and claims the compact path on hosts where the kernel cannot run and the
++        # dispatch silently falls back to eager -- which then ignores the indices and
++        # uses the dense mask, so the compact work is wasted at best. On NPU it is worse
++        # than wasted: that sibling forked the compressors before ``return_topk_indices``
++        # existed, so asking for indices there is a TypeError.
 +        use_compact_sparse_indices = (
-+            veomni_dsa_attention_implementation.value == "tilelang" and past_key_values is None
++            veomni_dsa_attention_implementation.value == "tilelang"
++            and past_key_values is None
++            and q.is_cuda
++            and q.dtype == torch.bfloat16
 +        )
 +        if self.compressor is not None:
 +            compressor_output = self.compressor(
@@ -904,7 +914,7 @@
          attn_output, attn_weights = attention_interface(
              self,
              q,
-@@ -843,22 +1245,27 @@
+@@ -843,22 +1255,27 @@
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
              sliding_window=self.sliding_window,
@@ -940,7 +950,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -909,22 +1316,30 @@
+@@ -909,22 +1326,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -982,7 +992,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -933,11 +1348,14 @@
+@@ -933,11 +1358,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -1000,7 +1010,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -953,10 +1371,27 @@
+@@ -953,10 +1381,27 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1028,7 +1038,7 @@
 
 
  class DeepseekV4MLP(nn.Module):
-@@ -970,16 +1405,60 @@
+@@ -970,16 +1415,60 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
 
@@ -1096,7 +1106,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -990,30 +1469,63 @@
+@@ -990,30 +1479,63 @@
          self.limit = config.swiglu_limit
 
      def forward(
@@ -1173,7 +1183,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1027,14 +1539,26 @@
+@@ -1027,14 +1549,26 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
@@ -1203,7 +1213,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1057,10 +1581,14 @@
+@@ -1057,10 +1591,14 @@
          self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1220,7 +1230,7 @@
          scores = self.score_fn(logits)
          indices = self.tid2eid[input_ids.reshape(-1)].long()
          weights = scores.gather(1, indices)
-@@ -1088,6 +1616,12 @@
+@@ -1088,6 +1626,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1233,7 +1243,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1652,20 @@
+@@ -1118,22 +1662,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -1264,7 +1274,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1765,12 @@
+@@ -1233,6 +1775,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1277,7 +1287,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1790,16 @@
+@@ -1252,6 +1800,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1294,7 +1304,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +1815,76 @@
+@@ -1267,28 +1825,76 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1380,7 +1390,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +1988,12 @@
+@@ -1392,6 +1998,12 @@
      return overall_loss * num_experts
 
 
@@ -1393,7 +1403,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +2012,36 @@
+@@ -1410,49 +2022,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1463,7 +1473,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +2054,64 @@
+@@ -1465,26 +2064,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1542,7 +1552,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2119,17 @@
+@@ -1492,7 +2129,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

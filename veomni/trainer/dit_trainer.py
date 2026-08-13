@@ -396,6 +396,8 @@ class DiTTrainer:
                 drop_last=args.data.dataloader.drop_last,
                 pin_memory=args.data.dataloader.pin_memory,
                 prefetch_factor=args.data.dataloader.prefetch_factor,
+                persistent_workers=args.data.dataloader.persistent_workers,
+                in_order=args.data.dataloader.in_order,
                 seed=args.train.seed,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
@@ -510,7 +512,7 @@ class DiTTrainer:
 
         self.on_step_begin(micro_batches=micro_batches)
 
-        synchronize()
+        self.base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(float)
@@ -521,6 +523,7 @@ class DiTTrainer:
         for micro_step, micro_batch in enumerate(micro_batches):
             if self.training_task != "offline_embedding":
                 self.base.model_reshard(micro_step, num_micro_batches)
+                self.base._configure_hsdp_allreduce(micro_step, num_micro_batches)
 
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]

@@ -54,15 +54,30 @@ def test_environ_meter_passes_supported_lora_config(monkeypatch):
     meter.images_seqlens = [16]
     lora_config = VeOmniLoraConfig(r=8, target_modules=["q_proj"])
 
-    meter.step(delta_time=0.5, global_step=1, lora_config=lora_config)
+    meter.step(
+        delta_time=0.5,
+        global_step=1,
+        lora_config=lora_config,
+        freeze_vit=True,
+    )
 
-    assert calls == [([12, 5], 0.5, {"images_seqlens": [16], "lora_config": lora_config})]
+    assert calls == [
+        (
+            [12, 5],
+            0.5,
+            {
+                "images_seqlens": [16],
+                "lora_config": lora_config,
+                "freeze_vit": True,
+            },
+        )
+    ]
 
     calls.clear()
     meter.supports_lora_flops = False
     meter.batch_seqlens = [7]
     with patch("veomni.utils.helper.logger.warning_rank0") as warning:
-        metrics = meter.step(delta_time=0.25, global_step=2, lora_config=lora_config)
+        metrics = meter.step(delta_time=0.25, global_step=2, lora_config=lora_config, freeze_vit=True)
 
         meter.batch_seqlens = [8]
         meter.step(delta_time=0.25, global_step=3, lora_config=lora_config)
