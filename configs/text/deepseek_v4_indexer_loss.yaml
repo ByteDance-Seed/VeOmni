@@ -116,9 +116,12 @@ train:
   checkpoint:
     output_dir: deepseek_v4_4l_indexer_loss_smoke
     manager: dcp
-    # Nothing is written: a 50-step smoke run has no checkpoint worth 27B parameters of I/O.
+    # One checkpoint, at the last step. Without it the smoke run leaves nothing to
+    # read the indexer back out of, and the diagnostic's open question -- whether the
+    # KL plateau is the right tracking residual for a *trained* teacher -- cannot be
+    # asked at all. Equal to max_steps, so a run that stops there writes exactly once.
     # save_epochs defaults to 1, so it has to be turned off explicitly, not just left out.
-    save_steps: 0
+    save_steps: 50
     save_epochs: 0
     save_hf_weights: false
   wandb:
