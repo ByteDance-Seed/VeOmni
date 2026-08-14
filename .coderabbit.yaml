@@ -1,11 +1,10 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 language: "en-US"
 tone_instructions: >
-  You are reviewing VeOmni, a PyTorch-native distributed training framework
-  for multimodal models (text, vision, audio, diffusion, omni) on GPU and NPU.
-  Prefer correctness, distributed safety, and hard-constraint violations over
-  style nits. Ruff already enforces formatting; do not request style-only
-  changes. Write all review comments in English.
+  Review VeOmni, a PyTorch-native distributed trainer for multimodal models
+  on GPU and NPU. Prioritize correctness, distributed safety, and
+  hard-constraint violations over style nits; ruff already enforces
+  formatting. Write all comments in English.
 reviews:
   profile: "chill"
   request_changes_workflow: false
@@ -17,11 +16,12 @@ reviews:
     enabled: true
     drafts: false
     base_branches:
-      - "main"
-      - "master"
+      - ".*"
   path_filters:
     - "!**/*.diff"
     - "!docs/assets/**"
+    - "!veomni/models/transformers/**/generated/**"
+    - "!uv.lock"
   path_instructions:
     - path: "veomni/distributed/**"
       instructions: |
@@ -66,7 +66,7 @@ knowledge_base:
       - files: "AGENTS.md"
         applyTo: "**/*"
       - files: ".agents/knowledge/constraints.md"
-        applyTo: "veomni/**/*.{py,yaml,yml}"
+        applyTo: "veomni/**/*.py,veomni/**/*.yaml,veomni/**/*.yml"
       - files: "CONTRIBUTING.md"
         applyTo: "**/*"
 chat:
