@@ -344,22 +344,35 @@ class ProfileTraceCallback(Callback):
         finally:
             if synchronize_cleanup:
                 dist.barrier()
-        self._profile_active = False
-        self._profile_cleanup_barrier_required = False
-
         effective_mode = getattr(
             self.profiler,
             "_veomni_npu_analysis_mode",
             args.train.profile.npu_analysis_mode,
         )
+        self._profile_active = False
         logger.info_rank0(
             f"NPU_PROFILE_TRAIN_END mode={effective_mode} step={state.global_step} wall_time_seconds={time.time():.6f}"
         )
-        if self.profiler is not None:
-            helper.wait_npu_profile_sidecars(
-                self.profiler,
-                timeout_seconds=getattr(args.train.profile, "npu_sidecar_wait_timeout", 300.0),
-            )
+        try:
+            if self.profiler is not None:
+                try:
+                    helper.wait_npu_profile_sidecars(
+                        self.profiler,
+                        timeout_seconds=getattr(args.train.profile, "npu_sidecar_wait_timeout", 300.0),
+                    )
+                except Exception as exc:
+                    self._profiler_failed = True
+                    logger.warning(
+                        "NPU profile sidecar cleanup failed; training completion will continue after all ranks "
+                        f"leave the cleanup barrier. Error: {exc}"
+                    )
+        finally:
+            # Sidecar waits are rank-local, so synchronize again before returning
+            # to trainer teardown. Otherwise unprofiled ranks can reach a later
+            # collective while the profiled rank is still waiting.
+            if synchronize_cleanup:
+                dist.barrier()
+            self._profile_cleanup_barrier_required = False
         logger.info_rank0(
             f"NPU_PROFILE_TEARDOWN_DONE mode={effective_mode} step={state.global_step} "
             f"wall_time_seconds={time.time():.6f}"

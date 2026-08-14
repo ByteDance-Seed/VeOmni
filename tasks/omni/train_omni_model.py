@@ -597,11 +597,25 @@ def main():
         )
 
     dist.barrier()
-    if profiler is not None:
-        helper.wait_npu_profile_sidecars(
-            profiler,
-            timeout_seconds=getattr(args.train.profile, "npu_sidecar_wait_timeout", 300.0),
+    try:
+        if profiler is not None:
+            helper.wait_npu_profile_sidecars(
+                profiler,
+                timeout_seconds=getattr(args.train.profile, "npu_sidecar_wait_timeout", 300.0),
+            )
+    except Exception as exc:
+        if not helper.IS_NPU_AVAILABLE:
+            raise
+        profiler_failed = True
+        logger.warning(
+            "NPU profile sidecar cleanup failed; training completion will continue after all ranks leave the "
+            f"cleanup barrier. Error: {exc}"
         )
+    finally:
+        if synchronize_profile_cleanup:
+            # Keep every rank in the process group until the rank-local sidecar
+            # wait has completed; otherwise unprofiled ranks tear down early.
+            dist.barrier()
     dist.destroy_process_group()
 
 

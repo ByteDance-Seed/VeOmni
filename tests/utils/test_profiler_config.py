@@ -844,7 +844,9 @@ def test_npu_profile_finalize_error_still_releases_post_barrier(monkeypatch):
         stop=lambda: events.append("stop"),
     )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
+    monkeypatch.setattr(
+        trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait")
+    )
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
@@ -863,7 +865,7 @@ def test_npu_profile_finalize_error_still_releases_post_barrier(monkeypatch):
     callback.on_step_end(TrainerState(global_step=6))
     callback.on_train_end(TrainerState(global_step=30))
 
-    assert events == ["barrier", "step", "barrier", "barrier", "stop", "barrier", "wait"]
+    assert events == ["barrier", "step", "barrier", "barrier", "stop", "barrier", "wait", "barrier"]
     assert callback._profiler_stopped is True
 
 
@@ -892,7 +894,9 @@ def test_npu_profile_scheduled_stop_error_is_retried_at_train_end(monkeypatch):
         stop=stop_profiler,
     )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
+    monkeypatch.setattr(
+        trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait")
+    )
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
@@ -907,7 +911,7 @@ def test_npu_profile_scheduled_stop_error_is_retried_at_train_end(monkeypatch):
 
     callback.on_train_end(TrainerState(global_step=30))
 
-    assert events == ["step", "stop", "barrier", "stop", "barrier", "wait"]
+    assert events == ["step", "stop", "barrier", "stop", "barrier", "wait", "barrier"]
     assert stop_attempts == 2
     assert callback._profiler_stopped is True
     assert any("scheduled stop failed" in warning for warning in warnings)
@@ -1086,7 +1090,9 @@ def test_npu_profile_train_end_stops_early_window_and_waits_for_sidecar(monkeypa
         stop=lambda: events.append("stop"),
     )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
+    monkeypatch.setattr(
+        trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait")
+    )
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
@@ -1094,10 +1100,33 @@ def test_npu_profile_train_end_stops_early_window_and_waits_for_sidecar(monkeypa
 
     callback.on_train_end(TrainerState(global_step=10))
 
-    assert events == ["barrier", "stop", "barrier", "wait"]
+    assert events == ["barrier", "stop", "barrier", "wait", "barrier"]
     assert callback._profiler_stopped is True
     assert callback._profile_active is False
     assert any("NPU_PROFILE_TRAIN_END mode=offline step=10" in message for message in logs)
+
+
+def test_npu_profile_train_end_synchronizes_unprofiled_rank(monkeypatch):
+    events = []
+    profile_config = SimpleNamespace(enable=True, npu_analysis_mode="offline", end_step=20, this_rank=False)
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(profile=profile_config, global_rank=1))
+    )
+    callback._profile_active = True
+    callback._profile_cleanup_barrier_required = True
+    callback._profiler_stopped = True
+    callback.profiler = None
+
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(trace_callback.logger, "info_rank0", lambda message: None)
+
+    callback.on_train_end(TrainerState(global_step=10))
+
+    assert events == ["barrier", "barrier", "barrier"]
 
 
 def test_npu_profile_train_end_does_not_stop_twice(monkeypatch):
@@ -1114,12 +1143,73 @@ def test_npu_profile_train_end_does_not_stop_twice(monkeypatch):
         stop=lambda: pytest.fail("profiler already stopped"),
     )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
+    monkeypatch.setattr(
+        trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait")
+    )
     monkeypatch.setattr(trace_callback.logger, "info_rank0", lambda message: None)
 
     callback.on_train_end(TrainerState(global_step=30))
 
     assert events == ["wait"]
+
+
+def test_npu_profile_train_end_keeps_cleanup_barrier_after_profile_window(monkeypatch):
+    events = []
+    profile_config = SimpleNamespace(enable=True, npu_analysis_mode="offline", end_step=6, this_rank=True)
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(profile=profile_config, global_rank=0))
+    )
+    callback._profile_active = False
+    callback._profile_cleanup_barrier_required = True
+    callback._profiler_stopped = True
+    callback.profiler = SimpleNamespace(_veomni_npu_analysis_mode="offline")
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(
+        trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait")
+    )
+    monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(trace_callback.logger, "info_rank0", lambda message: None)
+
+    callback.on_train_end(TrainerState(global_step=30))
+
+    assert events == ["barrier", "barrier", "wait", "barrier"]
+    assert callback._profile_cleanup_barrier_required is False
+
+
+def test_npu_profile_train_end_sidecar_error_still_releases_barrier(monkeypatch):
+    events = []
+    warnings = []
+    profile_config = SimpleNamespace(enable=True, npu_analysis_mode="offline", end_step=20, this_rank=True)
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(profile=profile_config, global_rank=0))
+    )
+    callback._profile_active = True
+    callback._profile_cleanup_barrier_required = True
+    callback._profiler_stopped = True
+    callback.profiler = SimpleNamespace(_veomni_npu_analysis_mode="offline")
+
+    def fail_wait(*args, **kwargs):
+        events.append("wait")
+        raise RuntimeError("sidecar wait failed")
+
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", fail_wait)
+    monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(trace_callback.logger, "warning", warnings.append)
+    monkeypatch.setattr(trace_callback.logger, "info_rank0", lambda message: None)
+
+    callback.on_train_end(TrainerState(global_step=10))
+
+    assert events == ["barrier", "barrier", "wait", "barrier"]
+    assert callback._profile_cleanup_barrier_required is False
+    assert callback._profiler_failed is True
+    assert any("sidecar wait failed" in warning for warning in warnings)
 
 
 def test_npu_profile_train_end_stop_error_is_nonfatal_and_releases_barrier(monkeypatch):
@@ -1140,7 +1230,9 @@ def test_npu_profile_train_end_stop_error_is_nonfatal_and_releases_barrier(monke
 
     callback.profiler = SimpleNamespace(_veomni_npu_analysis_mode="offline", stop=fail_stop)
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait"))
+    monkeypatch.setattr(
+        trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler, **kwargs: events.append("wait")
+    )
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
@@ -1149,7 +1241,7 @@ def test_npu_profile_train_end_stop_error_is_nonfatal_and_releases_barrier(monke
 
     callback.on_train_end(TrainerState(global_step=10))
 
-    assert events == ["barrier", "stop", "barrier", "wait"]
+    assert events == ["barrier", "stop", "barrier", "wait", "barrier"]
     assert callback._profile_active is False
     assert callback._profiler_failed is True
     assert callback._profiler_stopped is True
