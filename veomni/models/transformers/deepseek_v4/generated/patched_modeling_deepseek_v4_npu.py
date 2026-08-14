@@ -1626,6 +1626,8 @@ class DeepseekV4HashRouter(nn.Module):
             logits = F.linear(flat.float(), self.weight.float())
         scores = self.score_fn(logits)
         indices = self.tid2eid[input_ids.reshape(-1)].long()
+        if get_active_replay() is not None:
+            indices = maybe_replay_indices(self, scores, indices)
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return logits, weights * self.routed_scaling_factor, indices

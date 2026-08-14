@@ -1216,7 +1216,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1057,10 +1594,14 @@
+@@ -1057,12 +1594,18 @@
          self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1232,8 +1232,12 @@
 +            logits = F.linear(flat.float(), self.weight.float())
          scores = self.score_fn(logits)
          indices = self.tid2eid[input_ids.reshape(-1)].long()
++        if get_active_replay() is not None:
++            indices = maybe_replay_indices(self, scores, indices)
          weights = scores.gather(1, indices)
-@@ -1088,6 +1629,12 @@
+         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+         return logits, weights * self.routed_scaling_factor, indices
+@@ -1088,6 +1631,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1246,7 +1250,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1665,20 @@
+@@ -1118,22 +1667,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -1277,7 +1281,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1778,12 @@
+@@ -1233,6 +1780,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1290,7 +1294,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1803,16 @@
+@@ -1252,6 +1805,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1307,7 +1311,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +1828,76 @@
+@@ -1267,28 +1830,76 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1393,7 +1397,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +2001,12 @@
+@@ -1392,6 +2003,12 @@
      return overall_loss * num_experts
 
 
@@ -1406,7 +1410,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +2025,36 @@
+@@ -1410,49 +2027,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1476,7 +1480,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +2067,64 @@
+@@ -1465,26 +2069,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1555,7 +1559,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2132,17 @@
+@@ -1492,7 +2134,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
