@@ -94,6 +94,7 @@ from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -1582,6 +1583,8 @@ class DeepseekV4TopKRouter(nn.Module):
         correction_bias = self.e_score_correction_bias.float()
         scores = self.score_fn(logits)
         indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+        if get_active_replay() is not None:
+            indices = maybe_replay_indices(self, scores, indices)
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return logits, weights * self.routed_scaling_factor, indices

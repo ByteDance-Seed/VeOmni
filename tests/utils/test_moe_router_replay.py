@@ -233,6 +233,8 @@ _GENERATED_FILES = [
     _REPO_ROOT / "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py",
     _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_gpu.py",
     _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
+    _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_gpu.py",
+    _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_npu.py",
 ]
 
 
