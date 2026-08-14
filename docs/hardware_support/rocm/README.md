@@ -20,6 +20,7 @@ The image is based on `rocm/primus:v26.4` and ships a ROCm 7.14 stack tuned for 
 | torchvision | `0.27.0+rocm7.14.0a20260608` |
 | triton | `3.7.0+gitb4e20bbe.rocm7.14.0a20260608` |
 | flash-attn | `2.8.3` |
+| aiter | `0.1.12.post2.dev214+gb5e03ed19` |
 | transformers | `5.12.1` |
 | diffusers | `0.37.0` |
 | python | `3.12` |
@@ -111,7 +112,12 @@ model:
     attn_implementation: aiter
 ```
 
-`aiter` ships in the pre-built image.
+`aiter` comes from the base image rather than being installed by the Dockerfile, so VeOmni does not
+pin it. The distribution is named `amd_aiter`, not `aiter`:
+
+```bash
+python -c "from importlib.metadata import version; print(version('amd_aiter'))"
+```
 
 ### Numerical parity
 
@@ -152,5 +158,7 @@ Exclude the first step when benchmarking: aiter pays a one-time CK/FMHA-v3 kerne
 Validated on 8×MI308X / ROCm 7.14. End-to-end training (FSDP2 sharding, Ulysses SP, expert parallel EP, VLM/Omni, DiT) works and aligns numerically. Known limitations:
 
 - **CUDA-only kernels** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on ROCm, or are skipped. For attention specifically, `attn_implementation: aiter` is the ROCm-native alternative (see above).
+- **Attention sinks are not supported by `aiter`** — DeepSeek-V4 and `gpt_oss` raise a `ValueError` rather than having the sinks silently dropped. `flash_attention_2` drops them silently instead, since flash-attn 2.8.3 has no sink argument either, so use `eager` if you need them. aiter's kernels do accept a `sink_ptr`, so real support is possible later.
+- **`aiter` rejects a logits softcap on the dense (unpacked) attention path**, because `aiter.flash_attn_func` has no softcap argument. The packed/varlen path VeOmni normally takes supports it via `logits_soft_cap`.
 - **GatedDeltaNet (qwen3_5 / qwen3_5_moe)**: the tilelang ROCm backend has a HIP wrapper/codegen defect; set `FLA_TILELANG=0` to use the Triton fallback (validated to train and align correctly).
 - **DCP → HF weight consolidation**: the version guard in `veomni/checkpoint/dcp_consolidation.py` only allows torch `2.9`/`2.11` and rejects the image's torch `2.12`. Relax the guard or use a 2.9/2.11 ROCm torch build; otherwise disable `save_hf_weights`.

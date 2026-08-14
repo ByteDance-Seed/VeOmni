@@ -29,14 +29,46 @@ import torch
 
 def aiter_window_size(window_size) -> tuple:
     """Translate a flash-attn 2-tuple ``(left, right)`` window into aiter's 3-tuple
-    ``(left, right, sink)`` (sink defaults to 0). ``None`` maps to the full-attention
-    window ``(-1, -1, 0)``."""
+    ``(left, right, sink_size)`` (sink size defaults to 0). ``None`` maps to the
+    full-attention window ``(-1, -1, 0)``.
+
+    Note the third slot is a *number of sink tokens*, not the per-head learnable sink
+    logits that ``s_aux`` carries; see ``_reject_attention_sinks``.
+    """
     if window_size is None:
         return (-1, -1, 0)
     ws = tuple(window_size)
     if len(ws) == 2:
         return (ws[0], ws[1], 0)
+    if len(ws) != 3:
+        raise ValueError(
+            f"attn_implementation='aiter' expects a 2- or 3-element window_size, got {window_size!r}. "
+            "The whole point of this translation is that flash-attn and aiter disagree on the tuple "
+            "width, so an unexpected width is a wiring bug rather than something to pass through."
+        )
     return ws
+
+
+def _reject_attention_sinks(s_aux, learnable_sink) -> None:
+    """Fail loudly when a model asks for attention sinks on this backend.
+
+    Transformers decides which optional kwargs to forward by introspecting the shim's
+    signature, and its sink forwarding is all-or-nothing: with neither ``s_aux`` nor
+    ``learnable_sink`` declared it drops them without raising, and attention is computed
+    without the sink logits. DeepSeek-V4 passes ``s_aux`` unconditionally, so declaring
+    them and rejecting here is what turns silently different maths into a clear error.
+
+    aiter's kernels do take a ``sink_ptr``, so this is a candidate for real support later;
+    it is rejected rather than wired through because the semantics have not been validated
+    against the eager reference on ROCm.
+    """
+    if s_aux is not None or learnable_sink is not None:
+        raise ValueError(
+            "attn_implementation='aiter' does not support attention sinks yet (the model passed "
+            "s_aux/learnable_sink). Sink logits would be silently ignored, changing the attention "
+            "maths. Use attn_implementation='flash_attention_2' or 'eager' for sink models such as "
+            "DeepSeek-V4 and gpt_oss."
+        )
 
 
 def build_aiter_flash_kernels() -> SimpleNamespace:
@@ -54,16 +86,33 @@ def build_aiter_flash_kernels() -> SimpleNamespace:
       ``out`` is bit-identical either way. Without the log-sum-exp aiter returns a
       bare tensor rather than an ``(out, lse, ...)`` tuple; Transformers guards
       every call site with ``isinstance(out, tuple)``, so both shapes are handled.
-    * ``window_size`` is a 3-tuple ``(left, right, sink)`` rather than a 2-tuple.
+    * ``window_size`` is a 3-tuple ``(left, right, sink_size)`` rather than a 2-tuple.
     * the varlen entry point names the softcap ``logits_soft_cap``; the dense entry
       point exposes no softcap argument at all, which this shim rejects explicitly
-      rather than silently ignoring.
+      rather than silently ignoring. Attention sinks are rejected for the same reason.
 
-    The parameter names declared on the varlen shim are what Transformers'
-    ``_lazy_define_process_function`` introspects to decide which optional kwargs
-    (dropout, window, deterministic, softcap, max_seqlen) it forwards.
+    Every kwarg Transformers can forward is declared explicitly and either passed on or
+    rejected: there is no catch-all, so a kwarg a future Transformers version starts
+    forwarding surfaces as a ``TypeError`` at this boundary instead of changing attention
+    behaviour silently. The parameter names declared on the *varlen* shim are the ones
+    ``_lazy_define_process_function`` introspects, and Transformers reuses that same
+    mapping for the dense path — which is why the dense shim must declare ``softcap``
+    in order to be able to reject it.
     """
     import aiter
+
+    # aiter gates its CK / HIP entry points on a usable ROCm runtime: without one it
+    # imports fine but exports only the Triton ops, so `aiter.flash_attn_func` is simply
+    # absent. Checking here turns that into an actionable message at model-build time
+    # instead of an `AttributeError` from inside the first attention forward.
+    missing = [name for name in ("flash_attn_func", "flash_attn_varlen_func") if not hasattr(aiter, name)]
+    if missing:
+        raise RuntimeError(
+            f"`aiter` is installed but does not expose {missing}. aiter disables its CK/HIP kernels "
+            "when it cannot query the GPU architecture, which happens on a non-ROCm host or when the "
+            "container is missing `--device /dev/kfd --device /dev/dri`. Fix the ROCm runtime, or pick "
+            "another attn_implementation."
+        )
 
     def flash_attn_func(
         q,
@@ -76,7 +125,8 @@ def build_aiter_flash_kernels() -> SimpleNamespace:
         softcap: float = 0.0,
         deterministic: bool = False,
         return_attn_probs: bool = False,
-        **ignored,
+        s_aux=None,
+        learnable_sink=None,
     ):
         if softcap:
             raise ValueError(
@@ -84,6 +134,7 @@ def build_aiter_flash_kernels() -> SimpleNamespace:
                 "attention path (aiter.flash_attn_func has no softcap argument). Use a model "
                 "without softcap, or the packed/varlen path which supports logits_soft_cap."
             )
+        _reject_attention_sinks(s_aux, learnable_sink)
         return aiter.flash_attn_func(
             q,
             k,
@@ -94,6 +145,7 @@ def build_aiter_flash_kernels() -> SimpleNamespace:
             window_size=aiter_window_size(window_size),
             deterministic=deterministic,
             return_lse=torch.is_grad_enabled(),
+            return_attn_probs=return_attn_probs,
         )
 
     def flash_attn_varlen_func(
@@ -111,8 +163,10 @@ def build_aiter_flash_kernels() -> SimpleNamespace:
         softcap: float = 0.0,
         deterministic: bool = False,
         return_attn_probs: bool = False,
-        **ignored,
+        s_aux=None,
+        learnable_sink=None,
     ):
+        _reject_attention_sinks(s_aux, learnable_sink)
         return aiter.flash_attn_varlen_func(
             q,
             k,
@@ -128,6 +182,7 @@ def build_aiter_flash_kernels() -> SimpleNamespace:
             window_size=aiter_window_size(window_size),
             deterministic=deterministic,
             return_lse=torch.is_grad_enabled(),
+            return_attn_probs=return_attn_probs,
         )
 
     return SimpleNamespace(

@@ -33,16 +33,26 @@ class _FakeAttentionModule(nn.Module):
 
 
 def _install_fake_aiter(monkeypatch):
-    """Register a fake ``aiter`` module and return the recorded call kwargs."""
+    """Register a fake ``aiter`` module and return the recorded call kwargs.
+
+    The fakes mirror the real return contract: a bare tensor unless ``return_lse``
+    (or ``return_attn_probs``) is requested, a tuple otherwise. That is what makes the
+    ``no_grad`` path exercise the same shape Transformers has to unwrap in production.
+    """
     calls = {}
+
+    def _result(q, kwargs):
+        if kwargs.get("return_lse") or kwargs.get("return_attn_probs"):
+            return (torch.zeros_like(q), None)
+        return torch.zeros_like(q)
 
     def flash_attn_func(q, k, v, **kwargs):
         calls["dense"] = kwargs
-        return (torch.zeros_like(q), None)
+        return _result(q, kwargs)
 
     def flash_attn_varlen_func(q, k, v, **kwargs):
         calls["varlen"] = kwargs
-        return (torch.zeros_like(q), None)
+        return _result(q, kwargs)
 
     monkeypatch.setitem(
         sys.modules,
@@ -82,6 +92,14 @@ def test_veomni_backend_rewrites_aiter_to_the_sp_implementation(monkeypatch):
 )
 def test_window_size_is_translated_to_aiter_three_tuple(window_size, expected):
     assert veomni_aiter.aiter_window_size(window_size) == expected
+
+
+@pytest.mark.parametrize("window_size", [(8,), (8, 0, 4, 1)])
+def test_unexpected_window_size_width_is_rejected(window_size):
+    """A width other than 2 or 3 is a wiring bug; passing it through would surface as a
+    confusing kernel-level failure instead."""
+    with pytest.raises(ValueError, match="window_size"):
+        veomni_aiter.aiter_window_size(window_size)
 
 
 def test_dense_path_requests_lse_and_translates_window(monkeypatch):
@@ -129,6 +147,46 @@ def test_dense_path_rejects_softcap_instead_of_ignoring_it(monkeypatch):
         kernels.flash_attn_func(q, q, q, softcap=30.0)
 
 
+@pytest.mark.parametrize("path", ["dense", "varlen"])
+@pytest.mark.parametrize("sink_kwarg", ["s_aux", "learnable_sink"])
+def test_attention_sinks_are_rejected_instead_of_dropped(monkeypatch, path, sink_kwarg):
+    """Transformers' sink forwarding is all-or-nothing: with neither name declared it
+    drops them silently. Declaring both and raising is what makes a sink model fail
+    loudly rather than train with different maths (DeepSeek-V4 always passes s_aux)."""
+    _install_fake_aiter(monkeypatch)
+    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+
+    q = torch.randn(6, 2, 4)
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    sinks = {sink_kwarg: torch.zeros(2)}
+
+    with pytest.raises(ValueError, match="attention sinks"):
+        if path == "dense":
+            kernels.flash_attn_func(q.unsqueeze(0), q.unsqueeze(0), q.unsqueeze(0), **sinks)
+        else:
+            kernels.flash_attn_varlen_func(
+                q, q, q, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=3, max_seqlen_k=3, **sinks
+            )
+
+
+def test_transformers_kwarg_selection_matches_the_shim_signature(monkeypatch):
+    """Transformers decides which optional kwargs to forward by introspecting the varlen
+    shim, so that mapping is the real contract this backend has to satisfy. Pinning it
+    means a signature change cannot quietly stop a kwarg from being forwarded."""
+    from transformers.modeling_flash_attention_utils import _lazy_define_process_function
+
+    _install_fake_aiter(monkeypatch)
+    kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+
+    supports_mapping = _lazy_define_process_function(kernels.flash_attn_varlen_func).keywords["supports_mapping"]
+
+    for kwarg in ("dropout_p", "window_size", "deterministic", "softcap", "max_seqlen_q", "max_seqlen_k"):
+        assert supports_mapping[kwarg], f"Transformers would stop forwarding {kwarg}"
+    # Declared so the sinks reach the shim and get rejected rather than dropped.
+    assert supports_mapping["s_aux"]
+    assert supports_mapping["learnable_sink"]
+
+
 def test_varlen_path_maps_softcap_to_logits_soft_cap(monkeypatch):
     calls = _install_fake_aiter(monkeypatch)
     kernels = veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
@@ -153,6 +211,34 @@ def test_varlen_path_maps_softcap_to_logits_soft_cap(monkeypatch):
     assert varlen["return_lse"] is True
     assert varlen["window_size"] == (8, 0, 0)
     assert varlen["max_seqlen_q"] == 3
+
+
+@pytest.mark.parametrize("grad_enabled", [True, False])
+def test_forward_unwraps_both_return_shapes_end_to_end(monkeypatch, grad_enabled):
+    """Drives the real Transformers unwrap with the fake kernels behind it.
+
+    Under autograd aiter returns ``(out, lse)``; under ``no_grad`` it returns a bare
+    tensor. Transformers guards each call site with ``isinstance(out, tuple)``, and this
+    pins that contract so a change there fails here instead of failing an eval run.
+    """
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(veomni_flash, "get_parallel_state", lambda: SimpleNamespace(ulysses_enabled=False))
+    veomni_flash.patch_transformers_hub_kernel_loader_for_veomni()
+
+    module = _FakeAttentionModule()
+    query = torch.randn(1, 2, 3, 4, dtype=torch.bfloat16)
+    key = torch.randn(1, 1, 3, 4, dtype=torch.bfloat16)
+    value = torch.randn(1, 1, 3, 4, dtype=torch.bfloat16)
+
+    with torch.set_grad_enabled(grad_enabled):
+        output, attn_weights = veomni_flash.flash_attention_forward(
+            module, query, key, value, attention_mask=None, scaling=0.5
+        )
+
+    # A tuple leaking through would make this a 2-element sequence, not a tensor.
+    assert isinstance(output, torch.Tensor)
+    assert output.shape == (1, 3, 2, 4)
+    assert attn_weights is None
 
 
 def test_attention_forward_dispatches_under_the_aiter_implementation(monkeypatch):
@@ -183,4 +269,14 @@ def test_attention_forward_dispatches_under_the_aiter_implementation(monkeypatch
 def test_missing_aiter_raises_actionable_import_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "aiter", None)
     with pytest.raises(ImportError, match="aiter"):
+        veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
+
+
+def test_aiter_without_ck_kernels_fails_at_load_not_at_forward(monkeypatch):
+    """aiter imports on a non-ROCm host but exports only its Triton ops, so the flash
+    entry points are simply absent. Verified against the published ROCm image run without
+    `--device /dev/kfd`. Catching it here beats an AttributeError mid-forward."""
+    monkeypatch.setitem(sys.modules, "aiter", SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="does not expose"):
         veomni_flash._load_veomni_local_flash_kernel(AITER_IMPL)
