@@ -85,10 +85,45 @@ config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import(
+    "veomni.ops.kernels.attention._replicated_dummy",
+    names=[
+        "_DUMMY_SP_TOKEN",
+        "_call_replicated_dummy_checkpointed_module",
+        "_replicated_dummy_sequence_parallel",
+        "is_replicated_dummy_sequence_parallel",
+        "reject_public_sequence_parallel_bypass",
+    ],
+)
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+)
+config.add_import(
+    "veomni.distributed.context_parallel.gdn_lossless",
+    names=[
+        "align_gdn_varlen_chunks",
+        "attach_state_dependency",
+        "compile_gdn_lossless_runtime_plan",
+        "exchange_conv_halo",
+        "make_state_participation",
+        "make_state_template",
+        "owned_to_physical",
+        "physical_to_owned",
+        "receive_initial_state",
+        "send_final_state",
+        "trim_conv_halo",
+        "unpad_gdn_varlen_output",
+    ],
+)
+config.add_import("veomni.distributed.context_parallel.gdn_runtime", names=["make_gdn_cp_runtime_observer"])
+config.add_import(
+    "veomni.distributed.context_parallel.packed_sharding",
+    names=[
+        "reorder_sample_major_to_ulysses_rank_major",
+        "reorder_ulysses_rank_major_to_sample_major",
+    ],
 )
 # gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
 # (re-exported by the package __init__), not in .ulysses.
@@ -134,7 +169,7 @@ config.add_post_import_block(
     # Bound at model-build time by _bind_veomni_ops() in auto.py. The three
     # linear-attention slots replace the previous import-time fla/torch
     # selection inside Qwen3_5MoeGatedDeltaNet.__init__ /forward.
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -142,6 +177,9 @@ config.add_post_import_block(
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_gdn_context_parallel_implementation = OpsConfigSlot(
+        "gdn_context_parallel_implementation", "disabled"
+    )
     """
 )
 
@@ -154,6 +192,7 @@ slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+veomni_gdn_context_parallel_implementation = None  # OpsConfigSlot, declared in post-import block above
 
 # Mirror the GPU sentinel from qwen3_5_gpu_patch_gen_config: this config
 # registers Qwen3_5MoeVisionAttention.forward as the consumer, so the
@@ -347,10 +386,11 @@ def qwen3_5_moe_model_forward_patched(
     # via all_gather to compute them locally.
     image_mask = kwargs.get("image_mask", None)
     video_mask = kwargs.get("video_mask", None)
+    has_multimodal_inputs = pixel_values is not None or pixel_values_videos is not None
 
     # if None, calculate mask
     if video_mask is None and image_mask is None:
-        if get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled and has_multimodal_inputs:
             input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
             dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
             input_ids = torch.cat(input_ids_list, dim=1)
@@ -359,7 +399,6 @@ def qwen3_5_moe_model_forward_patched(
 
     # --- Patch.4: Pop pre-computed Flash Attention kwargs to avoid ViT forward re-computation ---
     # The LM-level flash-attention kwargs (`cu_seq_lens_q`, `cu_seq_lens_k`, `max_length_q`, `max_length_k`) are injected for packed-sequence attention. They must not reach the ViT, which computes its own `cu_seqlens`
-    flash_attn_kwargs = {}
     flash_attn_kwargs = {}
     for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
         if key in kwargs:
@@ -388,7 +427,7 @@ def qwen3_5_moe_model_forward_patched(
     # --- Patch.6 ---
 
     # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and has_multimodal_inputs:
         # Transpose from (batch, local_seq, full_hidden) to (batch, full_seq, local_hidden).
         # This gives each rank visibility over the ENTIRE sequence length, which is
         # necessary to scatter vision features into their correct global positions
@@ -483,7 +522,7 @@ def qwen3_5_moe_model_forward_patched(
         # --- Patch.2 ---
 
     # --- Patch.1: Final transpose back to standard sequence-sharded layout ---
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and has_multimodal_inputs:
         # Restore the layout to (batch, local_seq, full_hidden) for subsequent
         # transformer layers, which expect standard Sequence Parallel sharding.
         inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
@@ -814,6 +853,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
         "and to remove the full Flash Attention CPU-GPU sync."
     )
     linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
+    linear_attn_cu_seqlens_list = kwargs.pop("linear_attn_cu_seqlens_list_q", None)
 
     # Token Mixer
     if self.layer_type == "linear_attention":
@@ -824,6 +864,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             cache_position=cache_position,
             attention_mask=attention_mask,
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
+            cu_seqlens_list=linear_attn_cu_seqlens_list,
         )
     elif self.layer_type == "full_attention":
         # Self Attention
@@ -898,6 +939,7 @@ def qwen3_5_moe_forcausallm_forward_patched(
     output_router_logits = (
         output_router_logits if output_router_logits is not None else self.config.output_router_logits
     )
+    router_attention_mask = kwargs.pop("router_attention_mask", attention_mask)
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs: MoeModelOutputWithPast = self.model(
@@ -952,21 +994,21 @@ def qwen3_5_moe_forcausallm_forward_patched(
         logits = self.lm_head(hidden_states)
 
     aux_loss = None
-    if kwargs.get("output_router_logits", False):
+    if output_router_logits:
         # Modification: OpSlot guard for load-balancing loss.
         if veomni_load_balancing_loss.use_non_eager_impl:
             aux_loss = veomni_load_balancing_loss(
                 outputs.router_logits,
                 self.config.num_experts,
                 self.config.num_experts_per_tok,
-                attention_mask,
+                router_attention_mask,
             )
         else:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
                 self.config.num_experts,
                 self.config.num_experts_per_tok,
-                attention_mask,
+                router_attention_mask,
             )
         if labels is not None:
             loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
@@ -1006,6 +1048,7 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
+    router_attention_mask = kwargs.pop("router_attention_mask", attention_mask)
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1067,14 +1110,14 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
-                attention_mask,
+                router_attention_mask,
             )
         else:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
-                attention_mask,
+                router_attention_mask,
             )
         if labels is not None:
             loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)

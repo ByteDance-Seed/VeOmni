@@ -14,6 +14,7 @@
 
 
 import math
+from functools import partial
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -42,6 +43,12 @@ from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 DATALOADER_REGISTRY = Registry("dataloader")
 logger = logging.get_logger(__name__)
+
+
+def _get_context_parallel_physical_length(sample: Dict[str, Any], *, multiple: int) -> int:
+    """Return the post-collation token count for one CP-packed sample."""
+    raw_length = get_length_by_attention_mask_fn(sample)
+    return ((raw_length + multiple - 1) // multiple) * multiple
 
 
 def build_dataloader(dataloader_type: str, **kwargs):
@@ -186,6 +193,16 @@ def build_native_dataloader(
         else:
             physical_token_cap = None
             dyn_bsz_physical_length_fn = None
+        cp_size = int(getattr(parallel_state, "cp_size", 1))
+        if cp_size > 1:
+            ulysses_size = int(getattr(parallel_state, "ulysses_size", parallel_state.sp_size))
+            cp_sample_multiple = 2 * cp_size * ulysses_size
+            if physical_token_cap is None:
+                physical_token_cap = batching_token_len
+            dyn_bsz_physical_length_fn = partial(
+                _get_context_parallel_physical_length,
+                multiple=cp_sample_multiple,
+            )
         if dyn_bsz_runtime == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=batching_token_len,

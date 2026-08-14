@@ -91,6 +91,7 @@ key_features/lora.md
 
 design/kernel_selection.md
 design/fused_moe_kernels.md
+design/gdn_lossless_context_parallel.md
 design/local_parallel_state.md
 design/patchgen.md
 design/unified_kernel_registry.md

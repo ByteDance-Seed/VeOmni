@@ -12,53 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-runnable contract tests for ``precompute_varlen_metadata`` introduced in the
-AscendC GDN precomputation path (PR #999).
-
-The module under test pulls in ``torch_npu``, ``fla_npu``, and vendored Triton
-kernels at the top level; those are mocked so the tests run on any host (CPU/GPU/Mac).
-"""
+"""CPU-runnable contracts for lightweight GDN varlen metadata precomputation."""
 
 from __future__ import annotations
 
+import ast
+import importlib.util
+import os
+import subprocess
 import sys
-from unittest.mock import MagicMock
+from pathlib import Path
 
 import pytest
+
+
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
 import torch
-
-
-# ---------------------------------------------------------------------------
-# Mock NPU dependencies so ``flash_gated_delta_rule`` can be imported on CPU.
-# ---------------------------------------------------------------------------
-
-
-def _install_npu_mocks() -> None:
-    """Pre-populate ``sys.modules`` with stubs for every NPU / Triton dep."""
-    _TL = MagicMock(__path__=[], __spec__=MagicMock())
-    _TRITON = MagicMock(language=_TL, __version__="3.2.0", __path__=[], __spec__=MagicMock())
-
-    _TRITON_SUBS = [
-        "triton.language.extra",
-        "triton.language.extra.libdevice",
-        "triton.language.extra.cann",
-        "triton.language.extra.cann.extension",
-        "triton.runtime",
-        "triton.runtime.driver",
-    ]
-
-    _MOCKS: dict[str, object] = {
-        "torch_npu": MagicMock(),
-        "fla_npu": MagicMock(),
-        "triton": _TRITON,
-        "triton.language": _TL,
-    }
-    for sub in _TRITON_SUBS:
-        _MOCKS[sub] = MagicMock(__path__=[], __spec__=MagicMock())
-
-    for name, mock in _MOCKS.items():
-        if name not in sys.modules:
-            sys.modules[name] = mock
 
 
 # ---------------------------------------------------------------------------
@@ -71,21 +41,76 @@ def _make_cu_seqlens(*lengths: int) -> torch.LongTensor:
     return torch.cumsum(torch.tensor((0,) + lengths, dtype=torch.long), dim=0)
 
 
+def _load_lightweight_module():
+    path = Path(__file__).parents[2] / "veomni/ops/kernels/gated_delta_rule/varlen_metadata.py"
+    spec = importlib.util.spec_from_file_location("_test_gdn_varlen_metadata", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _expected_pairs(lengths: list[int], chunk_size: int) -> list[list[int]]:
+    return [
+        [seq_idx, chunk_idx]
+        for seq_idx, length in enumerate(lengths)
+        for chunk_idx in range((length + chunk_size - 1) // chunk_size)
+    ]
+
+
+def test_lightweight_module_does_not_import_ascendc_dependencies() -> None:
+    code = """
+import importlib.machinery
+import sys
+from types import ModuleType, SimpleNamespace
+
+import torch
+
+torch_npu = ModuleType("torch_npu")
+torch_npu.__spec__ = importlib.machinery.ModuleSpec("torch_npu", loader=None)
+sys.modules["torch_npu"] = torch_npu
+torch.npu = SimpleNamespace(config=SimpleNamespace(allow_internal_format=False), is_available=lambda: False)
+
+from veomni.ops.kernels.gated_delta_rule.varlen_metadata import precompute_varlen_metadata
+
+metadata = precompute_varlen_metadata(torch.tensor([0, 64, 192]), num_heads=4)
+assert metadata[0] == [0, 64, 192]
+assert "fla_npu" not in sys.modules
+assert "veomni.ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule" not in sys.modules
+"""
+    env = os.environ.copy()
+    env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    subprocess.run([sys.executable, "-c", code], check=True, env=env)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "veomni/models/transformers/qwen3_5/generated/patched_modeling_qwen3_5_npu.py",
+        "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
+    ],
+)
+def test_generated_npu_models_import_lightweight_metadata(relative_path: str) -> None:
+    source = (Path(__file__).parents[2] / relative_path).read_text()
+    lightweight_import = "from veomni.ops.kernels.gated_delta_rule.varlen_metadata import precompute_varlen_metadata"
+    assert lightweight_import in source
+    assert (
+        "from veomni.ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule import precompute_varlen_metadata"
+        not in source
+    )
+
+
 # ---------------------------------------------------------------------------
 # precompute_varlen_metadata contract
 # ---------------------------------------------------------------------------
 
 
 class TestPrecomputeVarlenMetadataContract:
-    """Verify ``precompute_varlen_metadata`` produces the same metadata as the
-    per-layer ``_ensure_varlen_metadata`` fallback."""
+    """Verify the backend-neutral metadata contract independently."""
 
     @pytest.fixture(scope="class")
     def module(self):
-        _install_npu_mocks()
-        from veomni.ops.kernels.gated_delta_rule._ascend import flash_gated_delta_rule as m
-
-        return m
+        return _load_lightweight_module()
 
     @pytest.mark.parametrize(
         "lengths,chunk_size,num_heads",
@@ -101,8 +126,7 @@ class TestPrecomputeVarlenMetadataContract:
         chunk_size: int,
         num_heads: int,
     ) -> None:
-        """``precompute_varlen_metadata`` must produce the same keys/values as
-        ``_ensure_varlen_metadata`` when called with matching parameters."""
+        """Tensor and host-list metadata must encode identical chunk ordinals."""
         cu_seqlens = _make_cu_seqlens(*lengths)
         cu_seqlens_list, chunk_indices, chunk_indices_list = module.precompute_varlen_metadata(
             cu_seqlens=cu_seqlens,
@@ -110,44 +134,42 @@ class TestPrecomputeVarlenMetadataContract:
             chunk_size=chunk_size,
         )
 
-        # Compare against _ensure_varlen_metadata.
-        # _ensure_varlen_metadata needs a gate tensor to derive head count and
-        # device info.  Shape: [B, T, H]; h = num_heads so the cumsum-block
-        # computation inside both functions produces the same key set.
-        B, T = 2, sum(lengths)
-        g = torch.zeros(B, T, num_heads)
+        cumsum_block_size = 1 << (max(1, (1 << 17) // (num_heads * chunk_size)) - 1).bit_length()
+        expected_sizes = {16, 32, 64, 128, 608 * 2, chunk_size, cumsum_block_size}
 
-        _, ref_list, ref_tensor, ref_list_dict = module._ensure_varlen_metadata(
-            g=g,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_list=None,
-            chunk_indices=None,
-            chunk_indices_list=None,
-            chunk_size=chunk_size,
+        assert cu_seqlens_list == torch.cumsum(torch.tensor([0, *lengths]), dim=0).tolist()
+        assert set(chunk_indices) == {str(size) for size in expected_sizes}
+        assert set(chunk_indices_list) == {str(size) for size in expected_sizes}
+        for size in expected_sizes:
+            expected = _expected_pairs(lengths, size)
+            assert chunk_indices[str(size)].tolist() == expected
+            assert chunk_indices_list[str(size)] == [item for pair in expected for item in pair]
+
+
+def test_ascendc_module_compatibly_reexports_metadata_helpers() -> None:
+    source = (
+        Path(__file__).parents[2] / "veomni/ops/kernels/gated_delta_rule/_ascend/flash_gated_delta_rule.py"
+    ).read_text()
+    assert "from ..varlen_metadata import (" in source
+    for name in ("precompute_varlen_metadata", "prepare_chunk_indices", "prepare_chunk_indices_list"):
+        assert name in source
+
+
+def test_ascendc_fla_npu_import_is_compute_time_only() -> None:
+    path = Path(__file__).parents[2] / "veomni/ops/kernels/gated_delta_rule/_ascend/flash_gated_delta_rule.py"
+    tree = ast.parse(path.read_text())
+
+    top_level_imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert all(not any(alias.name == "fla_npu" for alias in node.names) for node in top_level_imports)
+
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    ensure = functions["_ensure_fla_npu"]
+    assert any(
+        isinstance(node, ast.Import) and any(alias.name == "fla_npu" for alias in node.names)
+        for node in ast.walk(ensure)
+    )
+    for name in ("flash_chunk_gated_delta_rule_fwd", "flash_chunk_gated_delta_rule_bwd", "flash_gated_delta_rule"):
+        assert any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_ensure_fla_npu"
+            for node in ast.walk(functions[name])
         )
-
-        # cu_seqlens_list
-        assert cu_seqlens_list == ref_list
-
-        # Both dicts must cover the same key set
-        assert set(chunk_indices.keys()) == set(ref_tensor.keys())
-        assert set(chunk_indices_list.keys()) == set(ref_list_dict.keys())
-
-        for key in chunk_indices:
-            pre_t = chunk_indices[key]
-            ref_t = ref_tensor[key]
-            if pre_t is None:
-                assert ref_t is None
-            else:
-                assert ref_t is not None
-                assert pre_t.shape == ref_t.shape
-                assert pre_t.tolist() == ref_t.tolist(), f"mismatch at key={key}"
-
-        for key in chunk_indices_list:
-            pre_l = chunk_indices_list[key]
-            ref_l = ref_list_dict[key]
-            if pre_l is None:
-                assert ref_l is None
-            else:
-                assert ref_l is not None
-                assert pre_l == ref_l, f"mismatch at key={key}"

@@ -15,7 +15,7 @@
 
 import types
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,6 +39,10 @@ from .utils import sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
+
+# Private marker consumed by ``_fully_shard_grouped_nested_fsdp_leaves``.
+# Modules set this class/instance attribute; this file must not import NPU kernels.
+GROUPED_NESTED_FSDP_LEAF_ATTR = "_veomni_grouped_nested_fsdp_leaf"
 
 
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
@@ -68,6 +72,47 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     for module, name, buffer in buffers:
         materialized_buffer = module._buffers[name]
         materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
+
+
+def _iter_grouped_nested_fsdp_leaves(model: nn.Module) -> List[nn.Module]:
+    """Return unmarked-by-FSDP modules that opted into the grouped nested leaf."""
+
+    leaves: List[nn.Module] = []
+    seen: Set[int] = set()
+    for module in model.modules():
+        if not getattr(module, GROUPED_NESTED_FSDP_LEAF_ATTR, False):
+            continue
+        if isinstance(module, FSDPModule):
+            continue
+        key = id(module)
+        if key in seen:
+            continue
+        seen.add(key)
+        leaves.append(module)
+    return leaves
+
+
+def _fully_shard_grouped_nested_fsdp_leaves(model: nn.Module, fsdp_kwargs: dict) -> List[nn.Module]:
+    """Wrap every marked gated-norm as one nested FSDP2 group.
+
+    Parent ``fully_shard(decoder_layer)`` then skips this group. The group uses
+    the same mesh and mixed-precision policy as the parent layers, but keeps
+    ``reshard_after_forward=False`` so ``npu_rms_norm`` sees a full local Tensor
+    for the whole forward-to-backward window. One small AG/RS covers all marked
+    128-d weights.
+    """
+
+    leaves = _iter_grouped_nested_fsdp_leaves(model)
+    if not leaves:
+        return []
+    grouped_kwargs = dict(fsdp_kwargs)
+    grouped_kwargs["reshard_after_forward"] = False
+    fully_shard(leaves, **grouped_kwargs)
+    logger.info_rank0(
+        "grouped nested FSDP leaf: "
+        f"modules={len(leaves)} reshard_after_forward=False mesh={grouped_kwargs.get('mesh')}"
+    )
+    return leaves
 
 
 def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
@@ -408,6 +453,10 @@ def parallelize_model_fsdp2(
     #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
+
+    # Bottom-up: wrap every marked gated-norm as one nested group before any
+    # decoder-layer ``fully_shard``. Parent layers then skip this group.
+    _fully_shard_grouped_nested_fsdp_leaves(model, fsdp_kwargs)
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration

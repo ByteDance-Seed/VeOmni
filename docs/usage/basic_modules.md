@@ -74,6 +74,14 @@ More details about torch device mesh, you can refer to the [Getting Started with
 
 - source code [veomni/distributed/parallel_state.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/distributed/parallel_state.py).
 
+Context parallelism is currently a fail-closed Qwen3.5 GatedDeltaNet feature,
+not a generic `cp_size` switch. Values greater than one must be powers of two
+and require packed dynamic-batch text training plus
+`model.ops_implementation.gdn_context_parallel_implementation` set to
+`state_passing_lossless` (GPU or NPU) or `kcp` (Ascend NPU only). Other model,
+data, attention, and dropout combinations are rejected during configuration or
+model binding.
+
 ```python
 from veomni.distributed.parallel_state import (
     get_parallel_state,
@@ -88,7 +96,7 @@ init_parallel_state(
     dp_shard_size=args.train.accelerator.dp_shard_size, # data parallel shard degree
     tp_size=args.train.accelerator.tp_size, # tensor parallel size
     pp_size=args.train.accelerator.pp_size, # pipeline parallel size, not support now
-    cp_size=args.train.accelerator.cp_size, # context parallel size, not support now
+    cp_size=args.train.accelerator.cp_size, # Qwen3.5 lossless GDN CP; see support boundary above
     ulysses_size=args.train.accelerator.ulysses_size, # ulysses parallel size
     extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
     extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,

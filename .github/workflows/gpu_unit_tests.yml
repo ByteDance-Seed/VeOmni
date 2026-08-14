@@ -129,6 +129,8 @@ jobs:
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -s -x tests/parallel/test_chunk_mbs.py
+          uv run --frozen pytest -s -x tests/parallel/context_parallel
+          uv run --frozen pytest -s -x tests/distributed/test_grouped_nested_fsdp_leaf.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
