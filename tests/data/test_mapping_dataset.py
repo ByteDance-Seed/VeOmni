@@ -16,7 +16,8 @@ import random
 
 import pytest
 
-from veomni.data.dataset import InterleavedMappingDataset, MappingDataset
+import veomni.data.dataset as dataset_module
+from veomni.data.dataset import InterleavedMappingDataset, MappingDataset, build_dataset
 
 
 def _read_cycle(dataset, cycle):
@@ -30,6 +31,7 @@ def test_mapping_dataset_overlength_indices_are_deterministic():
 
     expected = _read_cycle(first, 1)
     assert expected != list(range(8))
+    assert sorted(expected) == list(range(8))
     assert _read_cycle(second, 1) == expected
     assert [second[index] for index in (12, 8, 15, 9)] == [expected[index] for index in (4, 0, 7, 1)]
 
@@ -75,6 +77,16 @@ def test_mapping_dataset_seed_controls_overlength_order_without_global_rng_side_
     random.seed(123)
     first[len(first)]
     assert random.random() == expected
+
+
+def test_build_mapping_dataset_forwards_seed(monkeypatch):
+    monkeypatch.setattr(dataset_module, "get_data_files", lambda _: (["unused.jsonl"], "json"))
+    monkeypatch.setattr(dataset_module, "load_dataset", lambda *args, **kwargs: list(range(8)))
+
+    first = build_dataset(dataset_name="mapping", train_path="unused.jsonl", seed=3)
+    second = build_dataset(dataset_name="mapping", train_path="unused.jsonl", seed=4)
+
+    assert _read_cycle(first, 1) != _read_cycle(second, 1)
 
 
 def test_overlength_read_does_not_change_first_cycle_order():

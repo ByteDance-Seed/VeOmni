@@ -57,34 +57,36 @@ class MappingDataset(Dataset):
 
     The first pass keeps source order. Each later cycle uses ``seed + cycle``
     without changing global RNG state, so the mapping is independent of access
-    order and worker-local dataset state.
+    order and worker-local dataset state. Only the most recently used later
+    cycle is cached to bound per-worker memory; non-monotonic reads remain
+    correct but may rebuild a cycle permutation.
     """
 
     def __init__(self, data: "Dataset", transform: Optional[Callable] = None, seed: int = 42):
         self._data = data
         self._transform = transform
         self.seed = seed
-        self.indices = list(range(len(self._data)))
-        self.data_len = len(self.indices)
-        self._current_cycle = 0
-        self._cycle_indices = self.indices
+        self.data_len = len(self._data)
+        self._current_cycle: Optional[int] = None
+        self._cycle_indices: Optional[List[int]] = None
 
     def __len__(self) -> int:
         return self.data_len
 
     def _get_mapped_index(self, index: int) -> int:
-        if not self.indices:
+        if self.data_len == 0:
             raise IndexError("Cannot index an empty dataset")
-        if index < -len(self.indices):
-            raise IndexError(f"Index {index} out of range for dataset of length {len(self.indices)}")
-        if index < len(self.indices):
-            return self.indices[index]
+        if index < -self.data_len:
+            raise IndexError(f"Index {index} out of range for dataset of length {self.data_len}")
+        if index < 0:
+            return self.data_len + index
+        if index < self.data_len:
+            return index
 
-        cycle, index = divmod(index, len(self.indices))
-        if cycle == self._current_cycle:
-            cycle_indices = self._cycle_indices
-        else:
-            cycle_indices = self.indices.copy()
+        cycle, index = divmod(index, self.data_len)
+        cycle_indices = self._cycle_indices
+        if cycle != self._current_cycle or cycle_indices is None:
+            cycle_indices = list(range(self.data_len))
             random.Random(self.seed + cycle).shuffle(cycle_indices)
             self._current_cycle = cycle
             self._cycle_indices = cycle_indices
@@ -143,9 +145,6 @@ class InterleavedIterableDataset(IterativeDataset):
 
 
 class InterleavedMappingDataset(MappingDataset):
-    def __init__(self, data: "Dataset", transform: Optional[Callable] = None, seed: int = 42):
-        super().__init__(data, transform, seed)
-
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
         mapped_idx = self._get_mapped_index(index)
         if self._transform is not None:
