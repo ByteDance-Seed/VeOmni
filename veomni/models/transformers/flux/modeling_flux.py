@@ -235,7 +235,7 @@ class FluxJointAttention(torch.nn.Module):
         k = torch.concat([k_b, k_a], dim=2)
         v = torch.concat([v_b, v_a], dim=2)
         q, k = self.apply_rope(q, k, image_rotary_emb)
-        hidden_states = flash_attention(q, k, v, causal=True, attn_mask=attn_mask)
+        hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
 
         if get_parallel_state().ulysses_enabled:
             hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)
@@ -385,7 +385,7 @@ class FluxSingleTransformerBlock(torch.nn.Module):
 
         q, k = self.apply_rope(q, k, image_rotary_emb)
 
-        hidden_states = flash_attention(q, k, v, causal=True, attn_mask=attn_mask)
+        hidden_states = flash_attention(q, k, v, causal=False, attn_mask=attn_mask)
 
         if get_parallel_state().ulysses_enabled:
             hidden_states = gather_heads_scatter_seq(hidden_states, seq_dim=2, head_dim=1)
