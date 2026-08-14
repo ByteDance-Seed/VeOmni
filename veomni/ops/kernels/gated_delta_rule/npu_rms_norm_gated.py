@@ -24,6 +24,11 @@ import torch_npu
 
 
 class NPUFusedRMSNormGated(nn.Module):
+    # Private FSDP2 contract: torch_parallelize collects every marked module
+    # into one nested ``fully_shard([...])`` group. Do not replace this with
+    # ``ignored_params``, ``to_local()``, or ``full_tensor()``.
+    _veomni_grouped_nested_fsdp_leaf = True
+
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))

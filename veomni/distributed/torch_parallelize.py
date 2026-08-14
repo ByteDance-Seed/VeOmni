@@ -13,11 +13,14 @@
 # limitations under the License.
 
 
+import hashlib
+import json
 import types
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed._tensor import Shard
@@ -29,7 +32,7 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
-from ..utils.device import IS_NPU_AVAILABLE, get_device_type
+from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from .checkpoint import CheckpointFunction
 from .chunk_mbs import apply_chunk_mbs
 from .parallel_plan import get_runtime_parallel_plan
@@ -39,6 +42,10 @@ from .utils import sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
+
+# Private marker consumed by ``_fully_shard_grouped_nested_fsdp_leaves``.
+# Modules set this class/instance attribute; this file must not import NPU kernels.
+GROUPED_NESTED_FSDP_LEAF_ATTR = "_veomni_grouped_nested_fsdp_leaf"
 
 
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
@@ -68,6 +75,183 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     for module, name, buffer in buffers:
         materialized_buffer = module._buffers[name]
         materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
+
+
+def _iter_grouped_nested_fsdp_leaves(model: nn.Module) -> List[nn.Module]:
+    """Return unmarked-by-FSDP modules that opted into the grouped nested leaf."""
+
+    leaves: List[nn.Module] = []
+    seen: Set[int] = set()
+    for module in model.modules():
+        if not getattr(module, GROUPED_NESTED_FSDP_LEAF_ATTR, False):
+            continue
+        if isinstance(module, FSDPModule):
+            continue
+        key = id(module)
+        if key in seen:
+            continue
+        seen.add(key)
+        leaves.append(module)
+    return leaves
+
+
+def _fully_shard_grouped_nested_fsdp_leaves(model: nn.Module, fsdp_kwargs: dict) -> List[nn.Module]:
+    """Wrap every marked gated-norm as one nested FSDP2 group.
+
+    Parent ``fully_shard(decoder_layer)`` then skips this group. The group uses
+    the same mesh and mixed-precision policy as the parent layers, but keeps
+    ``reshard_after_forward=False`` so ``npu_rms_norm`` sees a full local Tensor
+    for the whole forward→backward window. One small AG/RS for all 128-d weights.
+    """
+
+    leaves = _iter_grouped_nested_fsdp_leaves(model)
+    if not leaves:
+        return []
+    grouped_kwargs = dict(fsdp_kwargs)
+    grouped_kwargs["reshard_after_forward"] = False
+    fully_shard(leaves, **grouped_kwargs)
+    logger.info_rank0(
+        "grouped nested FSDP leaf: "
+        f"modules={len(leaves)} reshard_after_forward=False mesh={grouped_kwargs.get('mesh')}"
+    )
+    return leaves
+
+
+def _mixed_precision_param_dtype(mixed_precision: MixedPrecisionConfig) -> torch.dtype:
+    name = getattr(mixed_precision, "param_dtype", None) or "bfloat16"
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise RuntimeError(f"unsupported mixed_precision.param_dtype {name!r}")
+    return dtype
+
+
+def _kcp_ttx_precompile_device() -> torch.device:
+    return torch.device("npu", int(get_device_id()))
+
+
+def _kcp_gdn_hkv_signatures(model: nn.Module, *, ulysses_size: int) -> List[Tuple[int, int, int]]:
+    """Collect unique post-Ulysses ``(H, K, V)`` signatures from KCP GDN modules.
+
+    Uses only integer module attributes. Meta weights are never read.
+    After Ulysses and optional V/K ``repeat_interleave``, live TTX sees
+    ``H = num_v_heads // ulysses_size``.
+    """
+
+    ulysses_size = max(int(ulysses_size or 1), 1)
+    seen: Set[Tuple[int, int, int]] = set()
+    ordered: List[Tuple[int, int, int]] = []
+    required = ("num_k_heads", "num_v_heads", "head_k_dim", "head_v_dim")
+    for module in model.modules():
+        if getattr(module, "gdn_context_parallel_implementation", None) != "kcp":
+            continue
+        missing = [name for name in required if not hasattr(module, name)]
+        if missing:
+            raise RuntimeError(f"KCP TTX precompile found {type(module).__name__} missing {missing}")
+        num_k = int(module.num_k_heads)
+        num_v = int(module.num_v_heads)
+        key_dim = int(module.head_k_dim)
+        value_dim = int(module.head_v_dim)
+        if min(num_k, num_v, key_dim, value_dim) <= 0:
+            raise RuntimeError(
+                f"KCP TTX precompile got non-positive GDN geometry "
+                f"num_k_heads={num_k} num_v_heads={num_v} "
+                f"head_k_dim={key_dim} head_v_dim={value_dim}"
+            )
+        if num_k % ulysses_size != 0 or num_v % ulysses_size != 0:
+            raise RuntimeError(
+                f"KCP TTX precompile requires Ulysses size {ulysses_size} to divide "
+                f"num_k_heads={num_k} and num_v_heads={num_v}"
+            )
+        signature = (num_v // ulysses_size, key_dim, value_dim)
+        if signature not in seen:
+            seen.add(signature)
+            ordered.append(signature)
+    return ordered
+
+
+def _canonical_kcp_ttx_hkv_payload(signatures: Sequence[Tuple[int, int, int]]) -> str:
+    return json.dumps([list(item) for item in signatures], separators=(",", ":"))
+
+
+def _assert_identical_kcp_ttx_signatures(payload: str, *, device: torch.device) -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("KCP TTX build-stage precompile requires an initialized process group")
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    local = torch.tensor(list(digest), device=device, dtype=torch.uint8)
+    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local)
+    if any(not torch.equal(local, other) for other in gathered):
+        raise RuntimeError(f"KCP TTX build-stage precompile signatures differ across ranks; local={payload}")
+
+
+def _coordinate_kcp_ttx_precompile_success(
+    local_error: Optional[BaseException],
+    *,
+    device: torch.device,
+    label: str,
+) -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("KCP TTX build-stage precompile requires an initialized process group")
+    flag = torch.tensor([0 if local_error is None else 1], device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if int(flag.item()) == 0:
+        return
+    if local_error is not None:
+        raise RuntimeError(f"KCP TTX build-stage precompile failed on this rank ({label})") from local_error
+    raise RuntimeError(f"KCP TTX build-stage precompile failed on another rank ({label})")
+
+
+def _warmup_kcp_ttx_build_signature(
+    key: torch.Tensor, value: torch.Tensor, g: torch.Tensor, beta: torch.Tensor
+) -> None:
+    # Lazy import: this file must not import NPU kernels at module level.
+    from veomni.ops.kernels.gdn_kcp_affine_ttx import warmup_ttx_bc8_m1_forward_backward
+
+    warmup_ttx_bc8_m1_forward_backward(key, value, g, beta, origin="build_pre_fsdp")
+
+
+def _precompile_kcp_ttx_before_fsdp(
+    model: nn.Module,
+    *,
+    mixed_precision: MixedPrecisionConfig,
+    parallel_state,
+) -> None:
+    """Compile unique TTX signatures on NPU before AC/TP/FSDP are installed."""
+
+    if not IS_NPU_AVAILABLE:
+        return
+    ulysses_size = int(getattr(parallel_state, "ulysses_size", 1) or 1)
+    if not bool(getattr(parallel_state, "ulysses_enabled", ulysses_size > 1)):
+        ulysses_size = 1
+    local_error: Optional[BaseException] = None
+    signatures: List[Tuple[int, int, int]] = []
+    try:
+        signatures = _kcp_gdn_hkv_signatures(model, ulysses_size=ulysses_size)
+    except Exception as exc:
+        local_error = exc
+    if local_error is None and not signatures:
+        return
+
+    device = _kcp_ttx_precompile_device()
+    _coordinate_kcp_ttx_precompile_success(local_error, device=device, label="collect_hkv")
+    payload = _canonical_kcp_ttx_hkv_payload(signatures)
+    _assert_identical_kcp_ttx_signatures(payload, device=device)
+    dtype = _mixed_precision_param_dtype(mixed_precision)
+    logger.info_rank0(
+        f"KCP TTX build-stage precompile: signatures={signatures} dtype={dtype} device={device} origin=build_pre_fsdp"
+    )
+    for heads, key_dim, value_dim in signatures:
+        label = f"H={heads},K={key_dim},V={value_dim}"
+        local_error = None
+        try:
+            proto_key = torch.zeros(1, 0, heads, key_dim, device=device, dtype=dtype)
+            proto_value = torch.zeros(1, 0, heads, value_dim, device=device, dtype=dtype)
+            proto_g = torch.zeros(1, 0, heads, device=device, dtype=torch.float32)
+            proto_beta = torch.zeros(1, 0, heads, device=device, dtype=dtype)
+            _warmup_kcp_ttx_build_signature(proto_key, proto_value, proto_g, proto_beta)
+        except Exception as exc:
+            local_error = exc
+        _coordinate_kcp_ttx_precompile_success(local_error, device=device, label=label)
 
 
 def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
@@ -396,6 +580,8 @@ def parallelize_model_fsdp2(
     # | -- experts layer (apply fully_shard separately in order to shard across EP groups on the same EP rank instead of sharding globally)
     # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
     #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
+    # | -- marked gated-norm leaves wrapped once as nested fully_shard([...])
+    #      (reshard_after_forward=False; parent layer FSDP skips the group)
     # NPU currently does not support the PreSumMul operation, so this operation is supported through the apply_hccl_premul_sum_patch.
     # TODO(https://github.com/ByteDance-Seed/VeOmni/issues/241):
     # NPU is missing PreSumMul ReduceOp. Need to remove this condition after the issue is resolved.
@@ -408,6 +594,10 @@ def parallelize_model_fsdp2(
     #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
+
+    # Bottom-up: wrap every marked gated-norm as one nested group before any
+    # decoder-layer ``fully_shard``. Parent layers then skip this group.
+    _fully_shard_grouped_nested_fsdp_leaves(model, fsdp_kwargs)
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
@@ -624,6 +814,12 @@ def build_parallelize_model(
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
+
+    _precompile_kcp_ttx_before_fsdp(
+        model,
+        mixed_precision=mixed_precision,
+        parallel_state=parallel_state,
+    )
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):

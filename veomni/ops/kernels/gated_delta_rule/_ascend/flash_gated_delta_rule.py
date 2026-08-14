@@ -19,16 +19,20 @@ from typing import Dict, Optional
 import torch
 import torch_npu
 
-# Load-bearing despite being unused: importing fla_npu registers the fused
-# torch.ops.npu.* GDN ops this file dispatches to. Do not prune.
-import fla_npu  # noqa: F401
-
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton.cumsum import chunk_local_cumsum
 from .triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
+from ..varlen_metadata import (
+    _DEFAULT_VARLEN_CHUNK_SIZES,
+    _next_power_of_2,
+    precompute_varlen_metadata,
+    prepare_chunk_indices,
+    prepare_chunk_indices_list,
+)
 from .triton.utils import is_arch35
+from .varlen_active_segments import build_active_varlen_segments, empty_varlen_result
 
 if is_arch35():
     from .triton_core.solve_tril import solve_tril
@@ -36,36 +40,23 @@ else:
     from .triton.solve_tril import solve_tril
 
 _disable_compile = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
-_DEFAULT_VARLEN_CHUNK_SIZES = (16, 32, 64, 128, 608 * 2)
+_FLA_NPU_LOADED = False
 
 
-def cdiv_torch(a, b):
-    return (a + b - 1) // b
-
-
-def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
-    return cu_seqlens[1:] - cu_seqlens[:-1]
-
-
-def prepare_chunk_indices(cu_seqlens: torch.LongTensor, chunk_size: int) -> torch.LongTensor:
-    indices = torch.cat(
-        [torch.arange(n) for n in cdiv_torch(prepare_lens(cu_seqlens), chunk_size).tolist()]
-    )
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
-
-
-def prepare_chunk_indices_list(cu_seqlens: list[int] | torch.LongTensor, chunk_size: int) -> list[int]:
-    if isinstance(cu_seqlens, torch.Tensor):
-        cu_seqlens = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
-
-    indices: list[int] = []
-    for seq_idx in range(len(cu_seqlens) - 1):
-        length = int(cu_seqlens[seq_idx + 1]) - int(cu_seqlens[seq_idx])
-        if length <= 0:
-            continue
-        for chunk_idx in range((length + chunk_size - 1) // chunk_size):
-            indices.extend([seq_idx, chunk_idx])
-    return indices
+def _ensure_fla_npu() -> None:
+    """Import ``fla_npu`` immediately before calling its registered ops."""
+    global _FLA_NPU_LOADED
+    if _FLA_NPU_LOADED:
+        return
+    try:
+        import fla_npu  # noqa: F401
+    except ImportError as error:
+        raise ImportError(
+            "AscendC chunk gated delta rule requires fla_npu to register "
+            "torch.ops.npu.* GDN kernels. Install fla_npu on this NPU image, "
+            "or select chunk_gated_delta_rule_implementation='npu'."
+        ) from error
+    _FLA_NPU_LOADED = True
 
 
 def _as_int_list(value: Optional[list[int] | torch.Tensor]) -> Optional[list[int]]:
@@ -96,11 +87,6 @@ def _as_chunk_list_dict(
     if isinstance(value, dict):
         return {str(k): _as_int_list(v) for k, v in value.items()}
     return {str(chunk_size): _as_int_list(value)}
-
-
-def _next_power_of_2(value: int) -> int:
-    value = max(1, int(value))
-    return 1 << (value - 1).bit_length()
 
 
 def _cumsum_block_t(g: torch.Tensor, chunk_size: int) -> int:
@@ -179,6 +165,7 @@ def flash_chunk_gated_delta_rule_fwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
+    _ensure_fla_npu()
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
@@ -281,6 +268,7 @@ def flash_chunk_gated_delta_rule_bwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
+    _ensure_fla_npu()
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
 
@@ -433,20 +421,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 64,
     ):
-        # The AscendC backward (npu_chunk_gated_delta_rule_bwd_dhu) hardcodes
-        # h0/dht=None and returns dh0=None, so it produces no gradient w.r.t.
-        # initial_state — this matches upstream MindSpeed-MM's AscendC path (its
-        # Triton `npu` backend does thread h0/dht, but this AscendC one does not).
-        # Forward-only use of initial_state (recurrent-state carry) is fine; guard
-        # only the grad-requiring case so it fails loud instead of silently
-        # returning a None/zero gradient.
-        if torch.is_grad_enabled() and initial_state is not None and initial_state.requires_grad:
-            raise NotImplementedError(
-                "npu_ascendc chunk_gated_delta_rule cannot differentiate initial_state "
-                "(the AscendC backward returns no dh0, same as MindSpeed-MM). Detach "
-                "initial_state, or use the 'npu' (Triton) backend if you need that gradient."
-            )
-
         if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
@@ -573,8 +547,7 @@ def flash_gated_delta_rule(
         raise ValueError(f"g and beta shapes must match, got {g.shape} and {beta.shape}.")
     if g.shape[0] != q.shape[0] or g.shape[1] != q.shape[2] or g.shape[2] != q.shape[1]:
         raise ValueError(
-            "Expected q/k/v in [B, H, T, D] and g/beta in [B, T, H]; "
-            f"got q={tuple(q.shape)}, g={tuple(g.shape)}."
+            f"Expected q/k/v in [B, H, T, D] and g/beta in [B, T, H]; got q={tuple(q.shape)}, g={tuple(g.shape)}."
         )
 
     if head_first:
@@ -585,7 +558,62 @@ def flash_gated_delta_rule(
     if chunk_size != 2 ** (chunk_size.bit_length() - 1):
         raise ValueError(f"chunk_size must be a power of 2, got {chunk_size}.")
 
+    active_plan = None
+    original_initial_state = initial_state
     if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.shape[0]} when using cu_seqlens. "
+                "Please flatten variable-length inputs before processing."
+            )
+        active_plan = build_active_varlen_segments(
+            cu_seqlens,
+            cu_seqlens_list=cu_seqlens_list,
+            token_count=int(q.shape[2]),
+            initial_state=initial_state,
+        )
+        if active_plan.all_empty:
+            dependencies = [q, k, v, g, beta]
+            if initial_state is not None:
+                dependencies.append(initial_state)
+            return empty_varlen_result(
+                v.transpose(1, 2).contiguous(),
+                dependencies=dependencies,
+                plan=active_plan,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                state_shape=(int(q.shape[1]), int(q.shape[3]), int(v.shape[3])),
+            )
+
+    # The mathematically empty recurrence above has no native backward and can
+    # preserve both state VJPs with ordinary PyTorch edges.  The following
+    # restrictions apply only to paths that actually launch AscendC kernels.
+    # Keep them outside the custom Function because its forward executes with
+    # autograd disabled.
+    if torch.is_grad_enabled():
+        if initial_state is not None and initial_state.requires_grad:
+            raise NotImplementedError(
+                "npu_ascendc chunk_gated_delta_rule cannot differentiate initial_state "
+                "(the AscendC backward returns no dh0). Detach initial_state, or use the "
+                "'npu' (Triton) backend if you need that gradient."
+            )
+        differentiable_input = any(tensor.requires_grad for tensor in (q, k, v, g, beta))
+        if output_final_state and differentiable_input:
+            raise NotImplementedError(
+                "npu_ascendc chunk_gated_delta_rule cannot differentiate final_state "
+                "(the AscendC backward ignores dht). Set output_final_state=False, or use "
+                "the 'npu' (Triton) backend if you need that gradient."
+            )
+
+    if active_plan is not None:
+        if active_plan.has_empty:
+            cu_seqlens = active_plan.compact_cu_seqlens
+            cu_seqlens_list = list(active_plan.compact_cu_seqlens_list)
+            initial_state = active_plan.compact_initial_state(initial_state)
+            # Caller metadata was compiled against full-N sequence ordinals.
+            # Reusing it after compaction would bind chunks to the wrong state.
+            chunk_indices = None
+            chunk_indices_list = None
         if cu_seqlens_list is not None and chunk_indices is not None and chunk_indices_list is not None:
             cu_seqlens = cu_seqlens.to(device=g.device, dtype=torch.int64)
         else:
@@ -597,20 +625,12 @@ def flash_gated_delta_rule(
                 chunk_indices_list=chunk_indices_list,
                 chunk_size=chunk_size,
             )
-        if q.shape[0] != 1:
-            raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using cu_seqlens. "
-                "Please flatten variable-length inputs before processing."
-            )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens_list) - 1:
-            raise ValueError(
-                "The number of initial states is expected to match the number of input sequences, "
-                f"got initial_state.shape[0]={initial_state.shape[0]} and sequences={len(cu_seqlens_list) - 1}."
-            )
     else:
         cu_seqlens_list = None
         chunk_indices = None
         chunk_indices_list = None
+
+    _ensure_fla_npu()
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -635,6 +655,8 @@ def flash_gated_delta_rule(
         False,
         chunk_size,
     )
+    if active_plan is not None:
+        final_state = active_plan.restore_final_state(final_state, original_initial_state)
     return o, final_state
 
 
@@ -649,49 +671,6 @@ def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     # Restore original dtype — ``torch.rsqrt`` promotes bf16 inputs to fp32.
     return (x * inv_norm).to(original_dtype)
-
-
-def precompute_varlen_metadata(
-    cu_seqlens: torch.LongTensor,
-    num_heads: int,
-    chunk_size: int = 64,
-    device: Optional[torch.device | str] = None,
-) -> tuple[list[int], Dict[str, Optional[torch.LongTensor]], Dict[str, Optional[list[int]]]]:
-    """Precompute variable-length metadata once for all GDN layers.
-
-    Hoists the per-layer ``cu_seqlens.tolist()`` / ``prepare_chunk_indices``
-    calls into a single host-side pass so that subsequent layers can reuse the
-    results via the fast-path bypass in :func:`flash_gated_delta_rule`.
-
-    Args:
-        cu_seqlens: Cumulative sequence lengths ``[N+1]`` in FlashAttention format.
-        num_heads: Number of value heads — should be the **local** head count
-            (i.e. ``num_v_heads // ulysses_size`` under Ulysses SP).
-        chunk_size: GDN chunk size (must be a power of 2).
-        device: If set, ``chunk_indices`` tensors are placed on this device.
-
-    Returns:
-        ``(cu_seqlens_list, chunk_indices, chunk_indices_list)`` suitable for
-        passing as the precomputed-metadata kwargs to :func:`flash_gated_delta_rule`.
-    """
-    if cu_seqlens.device.type != "cpu":
-        cu_seqlens = cu_seqlens.cpu()
-    cu_seqlens_list = cu_seqlens.tolist()
-    cumsum_block_size = _next_power_of_2((1 << 17) // max(1, num_heads * chunk_size))
-    required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES) | {chunk_size, cumsum_block_size}
-    chunk_indices: Dict[str, Optional[torch.LongTensor]] = {}
-    chunk_indices_list: Dict[str, Optional[list[int]]] = {}
-
-    for size in required_sizes:
-        key = str(size)
-        chunk_indices[key] = prepare_chunk_indices(cu_seqlens, size)
-        chunk_indices_list[key] = prepare_chunk_indices_list(cu_seqlens_list, size)
-    if device is not None:
-        chunk_indices = {
-            k: v.to(device=device) if v is not None else None
-            for k, v in chunk_indices.items()
-        }
-    return cu_seqlens_list, chunk_indices, chunk_indices_list
 
 
 __all__ = [

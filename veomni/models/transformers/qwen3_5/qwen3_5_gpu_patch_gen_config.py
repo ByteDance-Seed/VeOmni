@@ -49,6 +49,12 @@ from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
+from veomni.ops.kernels.attention._replicated_dummy import (
+    _DUMMY_SP_TOKEN,
+    _replicated_dummy_sequence_parallel,
+    is_replicated_dummy_sequence_parallel,
+    reject_public_sequence_parallel_bypass,
+)
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
@@ -72,10 +78,44 @@ config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import(
+    "veomni.ops.kernels.attention._replicated_dummy",
+    names=[
+        "_DUMMY_SP_TOKEN",
+        "_replicated_dummy_sequence_parallel",
+        "is_replicated_dummy_sequence_parallel",
+        "reject_public_sequence_parallel_bypass",
+    ],
+)
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+)
+config.add_import(
+    "veomni.distributed.context_parallel.gdn_lossless",
+    names=[
+        "align_gdn_varlen_chunks",
+        "attach_state_dependency",
+        "compile_gdn_lossless_runtime_plan",
+        "exchange_conv_halo",
+        "make_state_participation",
+        "make_state_template",
+        "owned_to_physical",
+        "physical_to_owned",
+        "receive_initial_state",
+        "send_final_state",
+        "trim_conv_halo",
+        "unpad_gdn_varlen_output",
+    ],
+)
+config.add_import("veomni.distributed.context_parallel.gdn_runtime", names=["make_gdn_cp_runtime_observer"])
+config.add_import(
+    "veomni.distributed.context_parallel.packed_sharding",
+    names=[
+        "reorder_sample_major_to_ulysses_rank_major",
+        "reorder_ulysses_rank_major_to_sample_major",
+    ],
 )
 # gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
 # (re-exported by the package __init__), not in .ulysses.
@@ -132,12 +172,15 @@ config.add_post_import_block(
     # `chunk_gated_delta_rule or torch_chunk_gated_delta_rule` selection so the
     # backend (eager / fla / flash_qla) is picked from
     # OpsImplementationConfig instead of "is the library importable".
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_gdn_context_parallel_implementation = OpsConfigSlot(
+        "gdn_context_parallel_implementation", "disabled"
+    )
     """
 )
 
@@ -167,6 +210,7 @@ veomni_rms_norm = None  # OpSlot, declared in post-import block above
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+veomni_gdn_context_parallel_implementation = None  # OpsConfigSlot, declared in post-import block above
 # Names referenced by the patched Qwen3_5VisionAttention.forward; resolved at
 # codegen time from the imports already present in the generated modeling file.
 ALL_ATTENTION_FUNCTIONS = None
@@ -269,6 +313,7 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
     self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
     self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
+    self.gdn_context_parallel_implementation = veomni_gdn_context_parallel_implementation.value
     self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
     if not is_fast_path_available:
@@ -317,11 +362,84 @@ def qwen3_5_gated_deltanet_forward_patched(
     attention_mask: torch.Tensor | None = None,
     # Modification: plumb varlen sequence metadata to FLA kernels.
     cu_seq_lens_q: torch.Tensor | None = None,
+    cu_seqlens_list: list[int] | None = None,
 ):
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     # Set up dimensions for reshapes later
     batch_size, seq_len, _ = hidden_states.shape
+
+    # Modification: lossless GDN context parallelism is selected explicitly
+    # through OpsImplementationConfig.  CP uses the packed physical layout for
+    # softmax attention and a native-64-token ownership layout for GDN.
+    parallel_state = get_parallel_state()
+    cp_enabled = parallel_state.cp_enabled
+    if cp_enabled and self.gdn_context_parallel_implementation == "kcp":
+        raise RuntimeError("KCP ttx_bc8_m1 is currently supported on Ascend NPU only.")
+    if cp_enabled and self.gdn_context_parallel_implementation != "state_passing_lossless":
+        raise RuntimeError(
+            "GDN context parallelism requires gdn_context_parallel_implementation='state_passing_lossless'."
+        )
+    if not cp_enabled and self.gdn_context_parallel_implementation != "disabled":
+        raise RuntimeError("The selected GDN CP implementation requires an initialized context-parallel group.")
+    gdn_lossless_plan = None
+    gdn_cp_observer = None
+    ulysses_local_cu = None
+    if cp_enabled:
+        if batch_size != 1 or cu_seq_lens_q is None:
+            raise RuntimeError("Lossless GDN CP requires a packed batch of size one and global valid cu_seqlens.")
+        if cache_params is not None:
+            raise NotImplementedError("Lossless GDN CP currently supports training forwards without KV cache only.")
+        if cu_seqlens_list is None:
+            raise RuntimeError(
+                "Lossless GDN CP requires host linear_attn_cu_seqlens_list_q; "
+                "the data collator must materialize it before device transfer."
+            )
+        valid_points = [int(point) for point in cu_seqlens_list]
+        valid_lengths = [end - start for start, end in zip(valid_points, valid_points[1:])]
+        plan_key = (tuple(valid_lengths), parallel_state.cp_size, parallel_state.ulysses_size)
+        cached_plan = getattr(self, "_gdn_lossless_plan_cache", None)
+        if cached_plan is None or cached_plan[0] != plan_key:
+            cached_plan = (
+                plan_key,
+                compile_gdn_lossless_runtime_plan(
+                    valid_lengths,
+                    cp_group=parallel_state.cp_group,
+                    ulysses_size=parallel_state.ulysses_size,
+                ),
+            )
+            self._gdn_lossless_plan_cache = cached_plan
+        gdn_lossless_plan = cached_plan[1]
+        observer = getattr(self, "gdn_cp_runtime_evidence", None)
+        expected_identity = (
+            self.gdn_context_parallel_implementation,
+            gdn_lossless_plan.plan_hash,
+            gdn_lossless_plan.cp_size,
+            gdn_lossless_plan.cp_rank,
+        )
+        live_identity = None
+        if observer is not None:
+            identity = observer.identity
+            live_identity = (
+                identity.implementation,
+                identity.ownership_plan_hash,
+                identity.cp_size,
+                identity.cp_rank,
+            )
+        if live_identity != expected_identity:
+            observer = make_gdn_cp_runtime_observer(
+                self.gdn_context_parallel_implementation,
+                plan=gdn_lossless_plan,
+            )
+            self.gdn_cp_runtime_evidence = observer
+        gdn_cp_observer = observer
+        local_physical_lengths = [
+            length // (parallel_state.cp_size * parallel_state.ulysses_size)
+            for length in gdn_lossless_plan.global_plan.ring_physical_lengths
+        ]
+        ulysses_local_cu = [0]
+        for length in local_physical_lengths:
+            ulysses_local_cu.append(ulysses_local_cu[-1] + length)
 
     use_precomputed_states = (
         cache_params is not None and cache_params.has_previous_state and seq_len == 1 and cache_position is not None
@@ -341,11 +459,11 @@ def qwen3_5_gated_deltanet_forward_patched(
     a = self.in_proj_a(hidden_states)
 
     # Modification: Ulysses SP all-to-all for linear attention heads.
-    ulysses_enabled = get_parallel_state().ulysses_enabled
+    ulysses_enabled = parallel_state.ulysses_enabled
     if ulysses_enabled:
-        ulysses_group = get_parallel_state().ulysses_group
-        ulysses_size = get_parallel_state().ulysses_size
-        ulysses_rank = get_parallel_state().ulysses_rank
+        ulysses_group = parallel_state.ulysses_group
+        ulysses_size = parallel_state.ulysses_size
+        ulysses_rank = parallel_state.ulysses_rank
         assert self.num_k_heads % ulysses_size == 0 and self.num_v_heads % ulysses_size == 0, (
             f"SP size ({ulysses_size}) must divide num_k_heads ({self.num_k_heads}) "
             f"and num_v_heads ({self.num_v_heads}) for gated deltanet LASP"
@@ -372,6 +490,23 @@ def qwen3_5_gated_deltanet_forward_patched(
         b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
         a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
 
+        if cp_enabled:
+            q_proj = reorder_ulysses_rank_major_to_sample_major(
+                q_proj, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
+            )
+            k_proj = reorder_ulysses_rank_major_to_sample_major(
+                k_proj, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
+            )
+            v_proj = reorder_ulysses_rank_major_to_sample_major(
+                v_proj, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
+            )
+            b = reorder_ulysses_rank_major_to_sample_major(
+                b, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
+            )
+            a = reorder_ulysses_rank_major_to_sample_major(
+                a, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
+            )
+
         # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
         q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
         k_proj = k_proj.reshape(k_proj.shape[0], k_proj.shape[1], -1)
@@ -382,6 +517,23 @@ def qwen3_5_gated_deltanet_forward_patched(
         local_num_v_heads = self.num_v_heads
         local_key_dim = self.key_dim
         local_value_dim = self.value_dim
+
+    gdn_core_cu = cu_seq_lens_q
+    if cp_enabled:
+        mixed_qkv = physical_to_owned(
+            mixed_qkv,
+            plan=gdn_lossless_plan,
+            cp_group=parallel_state.cp_group,
+            sequence_dim=1,
+            observer=gdn_cp_observer,
+        )
+        b = physical_to_owned(
+            b, plan=gdn_lossless_plan, cp_group=parallel_state.cp_group, sequence_dim=1, observer=gdn_cp_observer
+        )
+        a = physical_to_owned(
+            a, plan=gdn_lossless_plan, cp_group=parallel_state.cp_group, sequence_dim=1, observer=gdn_cp_observer
+        )
+        gdn_core_cu = mixed_qkv.new_tensor(gdn_lossless_plan.owned_cu_seqlens, dtype=torch.int32)
 
     if use_precomputed_states:
         # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
@@ -401,16 +553,38 @@ def qwen3_5_gated_deltanet_forward_patched(
                 )
             else:
                 conv_weight = self.conv1d.weight.squeeze(1)
-            # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
-            mixed_qkv = self.causal_conv1d_fn(
-                x=mixed_qkv,
-                weight=conv_weight,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=None,
-                backend="triton",
-                cu_seqlens=cu_seq_lens_q,
-            )[0]
+            if cp_enabled and gdn_lossless_plan.local.owned_token_count == 0:
+                # Empty owners still participate in the ownership collective;
+                # there is no local convolution work to launch.
+                pass
+            else:
+                conv_cu = gdn_core_cu
+                if cp_enabled:
+                    mixed_qkv, conv_cu = exchange_conv_halo(
+                        mixed_qkv,
+                        plan=gdn_lossless_plan,
+                        cp_group=parallel_state.cp_group,
+                        kernel_size=self.conv_kernel_size,
+                        sequence_dim=1,
+                        observer=gdn_cp_observer,
+                    )
+                # mixed_qkv is [B, S, D] — FLA causal_conv1d expects [B, S, D].
+                mixed_qkv = self.causal_conv1d_fn(
+                    x=mixed_qkv,
+                    weight=conv_weight,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=None,
+                    backend="triton",
+                    cu_seqlens=conv_cu,
+                )[0]
+                if cp_enabled:
+                    mixed_qkv = trim_conv_halo(
+                        mixed_qkv,
+                        plan=gdn_lossless_plan,
+                        kernel_size=self.conv_kernel_size,
+                        sequence_dim=1,
+                    )
         else:
             raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
 
@@ -469,6 +643,50 @@ def qwen3_5_gated_deltanet_forward_patched(
                 "Set chunk_gated_delta_rule_implementation='fla' (and install flash-linear-attention) "
                 "or 'flash_qla' (ships under the gpu extra, Hopper sm90 only) in OpsImplementationConfig."
             )
+        elif cp_enabled:
+            query_gdr, key_gdr, value_gdr, g_gdr, beta_gdr, aligned_cu, unpad_index = align_gdn_varlen_chunks(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                gdn_core_cu,
+                cu_seqlens_list=gdn_lossless_plan.owned_cu_seqlens,
+            )
+            state_template = make_state_template(query_gdr, value_gdr, aligned_cu)
+            participation = make_state_participation(query, key, value, g, beta)
+            initial_state = receive_initial_state(
+                plan=gdn_lossless_plan,
+                cp_group=parallel_state.cp_group,
+                state_template=state_template,
+                participation=participation,
+                observer=gdn_cp_observer,
+            )
+            if gdn_lossless_plan.local.owned_token_count == 0:
+                core_attn_out = value.new_empty(value.shape)
+                last_recurrent_state = initial_state
+            else:
+                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                    query_gdr,
+                    key_gdr,
+                    value_gdr,
+                    g=g_gdr,
+                    beta=beta_gdr,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=aligned_cu,
+                )
+                core_attn_out = unpad_gdn_varlen_output(core_attn_out, unpad_index)
+            if last_recurrent_state is None:
+                raise RuntimeError("Lossless GDN CP requires the kernel to return its final recurrent state.")
+            final_state = send_final_state(
+                last_recurrent_state,
+                plan=gdn_lossless_plan,
+                cp_group=parallel_state.cp_group,
+                observer=gdn_cp_observer,
+            )
+            core_attn_out = attach_state_dependency(core_attn_out, final_state)
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
@@ -498,10 +716,26 @@ def qwen3_5_gated_deltanet_forward_patched(
     if cache_params is not None:
         cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
 
+    if cp_enabled:
+        core_attn_out = owned_to_physical(
+            core_attn_out,
+            plan=gdn_lossless_plan,
+            cp_group=parallel_state.cp_group,
+            sequence_dim=1,
+            observer=gdn_cp_observer,
+        )
+        if ulysses_enabled:
+            core_attn_out = reorder_sample_major_to_ulysses_rank_major(
+                core_attn_out,
+                ulysses_local_cu,
+                ulysses_size=ulysses_size,
+                sequence_dim=1,
+            )
+
     # Modification: gather attention output back to sequence-sharded layout before gated norm.
     if ulysses_enabled:
         core_attn_out = gather_heads_scatter_seq(
-            core_attn_out, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
+            core_attn_out, head_dim=2, seq_dim=1, group=parallel_state.ulysses_group
         )
 
     # reshape input data into 2D tensor
@@ -575,6 +809,7 @@ def qwen3_5_decoder_layer_forward_patched(
         "and to remove the full Flash Attention CPU-GPU sync."
     )
     linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
+    linear_attn_cu_seqlens_list = kwargs.pop("linear_attn_cu_seqlens_list_q", None)
 
     # Token Mixer
     if self.layer_type == "linear_attention":
@@ -585,6 +820,7 @@ def qwen3_5_decoder_layer_forward_patched(
             cache_position=cache_position,
             attention_mask=attention_mask,
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
+            cu_seqlens_list=linear_attn_cu_seqlens_list,
         )
     elif self.layer_type == "full_attention":
         # Self Attention
@@ -812,7 +1048,9 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     # from `multimodal_metadata` and passes as the single `vit_metadata` kwarg.
     # All .get() below fall back to None for callers that bypass MainCollator.
     # See .agents/knowledge/multimodal_metadata.md.
+    reject_public_sequence_parallel_bypass(kwargs)
     vit_metadata = kwargs.pop("vit_metadata", None) or {}
+    sequence_parallel_enabled = get_parallel_state().sp_enabled and not is_replicated_dummy_sequence_parallel()
     precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
     precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
     precomputed_max_seqlen = vit_metadata.get("max_seqlen")
@@ -830,7 +1068,7 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
 
     # --- Patch.1: Sequence parallel padding and slicing for position embeddings ---
-    if get_parallel_state().sp_enabled:
+    if sequence_parallel_enabled:
         # Note: grid_thw records the original, unpadded visual shapes. However, the data collator
         # pads the visual sequence (hidden_states) to a multiple of (sp_size * pad_scale)
         # to support Sequence Parallelism and subsequent spatial merging.
@@ -890,7 +1128,7 @@ def qwen3_5_vision_model_forward(self, hidden_states: torch.Tensor, grid_thw: to
     position_embeddings = (emb.cos(), emb.sin())
 
     pad_seq_len = 0
-    if get_parallel_state().sp_enabled:
+    if sequence_parallel_enabled:
         # --- Patch.3: Sequence parallel padding and slicing for sin/cos rotary embeddings ---
         cos, sin = position_embeddings
         # Similar to Patch.1, we pad and slice the rotary embeddings to align with the
@@ -976,13 +1214,16 @@ def qwen3_5_vision_model_dummy_forward(self):
     # This prevents reduce-scatter hangs when some ranks have no real images/videos.
     """
     # 16 patch tokens, each flattened from 3 channels * 2 temporal * 16 * 16 spatial.
+    cp_dummy = bool(get_parallel_state().cp_enabled)
     pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and not cp_dummy:
         # grid_thw describes the *global* pre-sharded vision grid (H scaled by
         # sp_size): total patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
         t, h, w = 1, 4 * get_parallel_state().sp_size, 4
     else:
-        # Non-SP case: a minimal valid 4x4 patch grid (1 * 4 * 4 = 16 tokens).
+        # Non-SP and CP dummy cases: a minimal valid 4x4 patch grid
+        # (1 * 4 * 4 = 16 tokens). CP dummy stays replicated/local so it
+        # does not inherit the unified U×CP pad/slice size.
         t, h, w = 1, 4, 4
     grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
 
@@ -998,7 +1239,18 @@ def qwen3_5_vision_model_dummy_forward(self):
         "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
         "max_seqlen": h * w,
     }
-    return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
+    if cp_dummy:
+        with _replicated_dummy_sequence_parallel(_DUMMY_SP_TOKEN):
+            return self(
+                hidden_states=pixel_values,
+                grid_thw=grid_thw,
+                vit_metadata=vit_metadata,
+            )
+    return self(
+        hidden_states=pixel_values,
+        grid_thw=grid_thw,
+        vit_metadata=vit_metadata,
+    )
 
 
 @config.override_method(
@@ -1129,13 +1381,14 @@ def qwen3_5_model_forward(
     # via all_gather to compute them locally.
     image_mask = kwargs.get("image_mask", None)
     video_mask = kwargs.get("video_mask", None)
+    has_multimodal_inputs = pixel_values is not None or pixel_values_videos is not None
     # v5 multimodal RoPE input; consumed here so it is not forwarded to the
     # language model. Derived from input_ids below when not supplied.
     mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
 
     # if None, calculate mask
     if video_mask is None and image_mask is None:
-        if get_parallel_state().sp_enabled:
+        if get_parallel_state().sp_enabled and has_multimodal_inputs:
             input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
             dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
             input_ids = torch.cat(input_ids_list, dim=1)
@@ -1173,7 +1426,7 @@ def qwen3_5_model_forward(
     # --- Patch.6 ---
 
     # --- Patch.1: Support Ulysses SP by transposing layout for multimodal scattering ---
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and has_multimodal_inputs:
         # Transpose from (batch, local_seq, full_hidden) to (batch, full_seq, local_hidden).
         # This gives each rank visibility over the ENTIRE sequence length, which is
         # necessary to scatter vision features into their correct global positions
@@ -1265,7 +1518,7 @@ def qwen3_5_model_forward(
         # --- Patch.2 ---
 
     # --- Patch.1: Final transpose back to standard sequence-sharded layout ---
-    if get_parallel_state().sp_enabled:
+    if get_parallel_state().sp_enabled and has_multimodal_inputs:
         # Restore the layout to (batch, local_seq, full_hidden) for subsequent
         # transformer layers, which expect standard Sequence Parallel sharding.
         inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
@@ -1364,6 +1617,10 @@ def qwen3_5_forcausallm_forward_patched(
     >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
     "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
     ```"""
+    # The shared CP collator provides this MoE-only mask. Dense Qwen3.5 has no
+    # router loss, so consume it here rather than leaking an unknown kwarg into
+    # the decoder/attention stack.
+    kwargs.pop("router_attention_mask", None)
     outputs: BaseModelOutputWithPast = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -1600,6 +1857,7 @@ def qwen3_5_forconditional_generation_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
+    kwargs.pop("router_attention_mask", None)
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,

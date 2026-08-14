@@ -20,6 +20,7 @@ import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from . import flash, flex
+from ._replicated_dummy import reject_public_sequence_parallel_bypass
 from .flash import (
     flash_attention_forward,
     patch_transformers_hub_kernel_loader_for_veomni,
@@ -49,6 +50,7 @@ def fused_attention_forward(
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Dispatch the model's resolved fused-attention implementation to its backend adapter."""
+    reject_public_sequence_parallel_bypass(kwargs)
     implementation = module.config._attn_implementation
     try:
         attention_forward = _ATTENTION_FORWARD_DISPATCH[implementation]

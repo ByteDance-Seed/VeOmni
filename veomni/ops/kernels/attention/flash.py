@@ -18,11 +18,22 @@ from types import SimpleNamespace
 from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 from transformers.modeling_flash_attention_utils import _flash_attention_forward as hf_flash_attention_forward
 
+from ....distributed.context_parallel.attention_backend import has_npu_fusion_attention
+from ....distributed.context_parallel.packed_sharding import (
+    reorder_sample_major_to_ulysses_rank_major,
+    reorder_ulysses_rank_major_to_sample_major,
+)
+from ....distributed.context_parallel.ring_attention import ringattn_context_parallel
 from ....distributed.parallel_state import get_parallel_state
 from ....utils import logging
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
+from ._replicated_dummy import (
+    is_replicated_dummy_sequence_parallel,
+    reject_public_sequence_parallel_bypass,
+)
 from .ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -177,7 +188,10 @@ def flash_attention_forward(
     2. **Ulysses sequence-parallelism** — when Ulysses SP is active the full
        Q/K/V sequence is gathered across SP ranks before the kernel call and the
        output is scattered back afterwards.  Pass ``skip_ulysses=True`` for
-       sub-modules (e.g. ViT encoders) that should not participate in SP.
+       sub-modules (e.g. ViT encoders) that should not participate in Ulysses.
+       ``skip_ulysses`` is rejected when Ring CP is active. The FSDP
+       zero-valued ViT dummy may skip both Ulysses and CP only while the
+       private replicated-dummy scope is active.
 
     3. **FA backend selection** — the implementation name stored in
        ``module.config._attn_implementation`` is mapped to the token that
@@ -191,6 +205,7 @@ def flash_attention_forward(
          monkey-patch of ``load_and_register_attn_kernel``, which loads
          ``flash_attn.cute`` locally instead of fetching from the hub.
     """
+    reject_public_sequence_parallel_bypass(kwargs)
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
             "`flash_attention_2` does not support `output_attentions=True` or `head_mask`."
@@ -199,6 +214,7 @@ def flash_attention_forward(
 
     # This is before the transpose
     seq_len = query.shape[2]
+    host_cu_seqlens = kwargs.pop("cu_seqlens_list_q", None)
 
     if any(dim == 0 for dim in query.shape):
         raise ValueError(
@@ -232,10 +248,47 @@ def flash_attention_forward(
         is_causal = module.is_causal
 
     # Ulysses patch
-    ulysses_enabled = get_parallel_state().ulysses_enabled
+    parallel_state = get_parallel_state()
+    replicated_dummy = is_replicated_dummy_sequence_parallel()
+    ulysses_enabled = parallel_state.ulysses_enabled and not replicated_dummy
+    cp_enabled = bool(getattr(parallel_state, "cp_enabled", False)) and not replicated_dummy
+    cp_input_cu = None
+    cp_backend = None
+    if cp_enabled:
+        # Every fail-closed check must run before Ulysses performs its first
+        # all-to-all. Unsupported ranks must never enter only a prefix of the
+        # collective schedule.
+        if query.device.type not in {"cpu", "npu"}:
+            raise NotImplementedError(
+                "This lossless Ring context-parallel foundation is validated on Ascend NPU only; "
+                "the torch backend is a CPU correctness oracle, not a long-sequence CUDA kernel."
+            )
+        if skip_ulysses:
+            raise NotImplementedError(
+                "Ring context parallelism cannot be skipped for a subset of attention layers; "
+                "vision and cross-attention modules are not supported."
+            )
+        if not is_causal:
+            raise NotImplementedError("Ring context parallelism currently supports causal self-attention only.")
+        if sliding_window is not None or softcap is not None:
+            raise NotImplementedError("Ring context parallelism does not support sliding-window attention or softcap.")
+        if dropout not in (0, 0.0):
+            raise NotImplementedError("Ring context parallelism currently requires attention dropout to be zero.")
+        cp_input_cu = (
+            host_cu_seqlens if host_cu_seqlens is not None else kwargs.get("cu_seq_lens_q", kwargs.get("cu_seqlens_q"))
+        )
+        if cp_input_cu is None:
+            raise RuntimeError("Packed Ring CP requires rank-local cu_seqlens metadata.")
+        if query.device.type == "npu":
+            if not has_npu_fusion_attention():
+                raise RuntimeError("Ring context parallelism on NPU requires torch_npu fusion-attention forward/grad.")
+            cp_backend = "npu"
+        else:
+            cp_backend = "torch"
+    ulysses_local_cu = None
     if ulysses_enabled and not skip_ulysses:
-        ulysses_group = get_parallel_state().ulysses_group
-        ulysses_size = get_parallel_state().ulysses_size
+        ulysses_group = parallel_state.ulysses_group
+        ulysses_size = parallel_state.ulysses_size
         query, key, value, query_head_count = prepare_ulysses_qkv(
             query,
             key,
@@ -253,6 +306,61 @@ def flash_attention_forward(
                 local_query_head_count=query.shape[2],
                 group=ulysses_group,
             )
+
+        if cp_enabled:
+            ulysses_local_cu = cp_input_cu
+            query = reorder_ulysses_rank_major_to_sample_major(
+                query, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
+            )
+            key = reorder_ulysses_rank_major_to_sample_major(
+                key, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
+            )
+            value = reorder_ulysses_rank_major_to_sample_major(
+                value, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
+            )
+            if isinstance(ulysses_local_cu, torch.Tensor):
+                cp_local_cu = (ulysses_local_cu * ulysses_size).to(dtype=torch.int32)
+            else:
+                cp_local_cu = [int(point) * ulysses_size for point in ulysses_local_cu]
+        else:
+            cp_local_cu = None
+
+    elif cp_enabled:
+        cp_local_cu = cp_input_cu
+    else:
+        cp_local_cu = None
+
+    if cp_enabled:
+        if target_dtype is not None:
+            query = query.to(target_dtype)
+            key = key.to(target_dtype)
+            value = value.to(target_dtype)
+        cp_group = parallel_state.cp_group
+        cp_global_ranks = dist.get_process_group_ranks(cp_group)
+        attn_output = (
+            ringattn_context_parallel(
+                query.transpose(1, 2).contiguous(),
+                key.transpose(1, 2).contiguous(),
+                value.transpose(1, 2).contiguous(),
+                query.shape[2],
+                cp_group,
+                cp_global_ranks,
+                softmax_scale=scaling,
+                backend=cp_backend,
+                cu_seqlens=cp_local_cu,
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )
+        if ulysses_enabled and not skip_ulysses:
+            attn_output = reorder_sample_major_to_ulysses_rank_major(
+                attn_output,
+                ulysses_local_cu,
+                ulysses_size=ulysses_size,
+                sequence_dim=1,
+            )
+            attn_output = restore_ulysses_output(attn_output, group=ulysses_group)
+        return attn_output, None
 
     # Resolve the token that will be passed to Transformers' lazy_import_flash_attention.
     #
@@ -295,7 +403,6 @@ def flash_attention_forward(
 
     # Ulysses patch
     if ulysses_enabled and not skip_ulysses:
-        ulysses_group = get_parallel_state().ulysses_group
         attn_output = restore_ulysses_output(attn_output, group=ulysses_group)
 
     return attn_output, None
