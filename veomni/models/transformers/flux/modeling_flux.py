@@ -83,6 +83,14 @@ def rearrange_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rerange_typ
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, attn_mask=None):
     # bs, head_cont, seq, head_dim = q.shape
 
+    if attn_mask is not None:
+        # flash_attn_func (FA2/FA3) does not accept an arbitrary attention mask. The
+        # mask is a (b, 1, s, s) additive bias (0 / -inf) built by `construct_mask`, so
+        # fall back to scaled_dot_product_attention, which supports it and still
+        # dispatches to an efficient fused backend. The flash-attn path below is for the
+        # mask-less case only.
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+
     if FLASH_ATTN_3_AVAILABLE or FLASH_ATTN_2_AVAILABLE:
         rerange_type_seq_head = "b n s d -> b s n d"
         rerange_type_head_seq = "b s n d -> b n s d"
