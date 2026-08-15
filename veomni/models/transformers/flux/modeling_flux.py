@@ -89,6 +89,15 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: b
         # fall back to scaled_dot_product_attention, which supports it and still
         # dispatches to an efficient fused backend. The flash-attn path below is for the
         # mask-less case only.
+        if causal:
+            # scaled_dot_product_attention cannot take both `attn_mask` and `is_causal`,
+            # so merge a lower-triangular causal bias into the additive mask to preserve
+            # the caller's causal intent.
+            seq = q.shape[-2]
+            causal_bias = torch.triu(
+                torch.full((seq, seq), float("-inf"), dtype=q.dtype, device=q.device), diagonal=1
+            )
+            attn_mask = attn_mask + causal_bias
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
     if FLASH_ATTN_3_AVAILABLE or FLASH_ATTN_2_AVAILABLE:
