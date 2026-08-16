@@ -84,19 +84,19 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: b
     # bs, head_cont, seq, head_dim = q.shape
 
     if attn_mask is not None:
-        # flash_attn_func (FA2/FA3) does not accept an arbitrary attention mask. The
-        # mask is a (b, 1, s, s) additive bias (0 / -inf) built by `construct_mask`, so
-        # fall back to scaled_dot_product_attention, which supports it and still
-        # dispatches to an efficient fused backend. The flash-attn path below is for the
+        # flash_attn_func (FA2/FA3) does not accept an arbitrary attention mask, so fall
+        # back to scaled_dot_product_attention, which supports an additive mask. Note that
+        # supplying a mask rules out SDPA's flash backend, so this uses the memory-efficient
+        # kernel (or the math fallback) instead. The flash-attn path below is for the
         # mask-less case only.
         if causal:
-            # scaled_dot_product_attention cannot take both `attn_mask` and `is_causal`,
-            # so merge a lower-triangular causal bias into the additive mask to preserve
-            # the caller's causal intent.
-            seq = q.shape[-2]
-            causal_bias = torch.triu(
-                torch.full((seq, seq), float("-inf"), dtype=q.dtype, device=q.device), diagonal=1
-            )
+            # scaled_dot_product_attention cannot take both `attn_mask` and `is_causal`, so
+            # merge a lower-triangular causal bias into the additive mask to preserve the
+            # caller's causal intent. No in-tree caller passes a mask with causal=True; this
+            # is defensive for future callers.
+            if attn_mask.dtype == torch.bool:
+                attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype).masked_fill_(~attn_mask, float("-inf"))
+            causal_bias = torch.triu(torch.full_like(attn_mask, float("-inf")), diagonal=1)
             attn_mask = attn_mask + causal_bias
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
