@@ -131,7 +131,7 @@ Thanks to the following projects for their excellent work:
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ByteDance-Seed/VeOmni&type=date&legend=top-left)](https://www.star-history.com/#ByteDance-Seed/VeOmni&type=date&legend=top-left)
+[![Star History Chart](https://star-history.dera.page/svg?repos=ByteDance-Seed/VeOmni&type=date&legend=top-left)](https://star-history.dera.page/#ByteDance-Seed/VeOmni&type=date&legend=top-left)
 
 
 ## 🌱 About [ByteDance Seed Team](https://team.doubao.com/)
