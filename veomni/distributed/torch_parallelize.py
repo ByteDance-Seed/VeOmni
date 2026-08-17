@@ -619,7 +619,7 @@ def build_parallelize_model(
             raise ValueError("ChunkMBS requires non-reentrant gradient checkpointing.")
 
     if not parallel_state.fsdp_enabled:
-        if kwargs.get("init_device") not in ["cuda", "npu"]:
+        if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
             raise ValueError("Only FSDP training supports `init_device=meta`.")
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
