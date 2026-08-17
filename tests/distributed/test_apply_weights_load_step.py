@@ -162,6 +162,7 @@ def test_apply_load_step_none_calls_to_empty_and_init(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     assert to_empty_calls == [(model, "cpu")]
@@ -192,6 +193,7 @@ def test_apply_load_step_str_with_rank0_broadcast(monkeypatch):
         cpu_load_param_name=["embed.weight"],
         max_load_broadcast_size=15.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     rank0_mock.assert_called_once()
@@ -226,6 +228,7 @@ def test_apply_load_step_str_without_rank0_broadcast(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     load_model_weights_mock.assert_called_once()
@@ -266,6 +269,7 @@ def test_apply_load_step_mapping_calls_loader_per_child(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     # rank0_load called once per sub-module, in mapping iteration order.
@@ -279,6 +283,33 @@ def test_apply_load_step_mapping_calls_loader_per_child(monkeypatch):
     # Strict bijection: no random-init paths should fire.
     init_weights_mock.assert_not_called()
     to_empty_mock.assert_not_called()
+
+
+def test_apply_load_step_forwards_fqn_to_index_mapping(monkeypatch):
+    """The single-snapshot path forwards the caller's mapping to the loader; the
+    Mapping branch passes ``None`` per child, because a shard index belongs to
+    the one snapshot it was built from and cannot describe a sibling's."""
+    load_model_weights_mock = MagicMock()
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.load_model_weights", load_model_weights_mock)
+
+    mapping: Mapping[str, int] = {"linear.weight": 0}
+    common: dict[str, Any] = dict(
+        materialize_device="cpu",
+        broadcast_from_rank0=False,
+        is_peft_model=False,
+        adapter_path=None,
+        cpu_load_param_name=None,
+        max_load_broadcast_size=20.0,
+        distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=mapping,
+    )
+
+    _apply_weights_load_step(model=_Container(), weights_path="/snap/full", **common)
+    assert load_model_weights_mock.call_args.kwargs["fqn_to_index_mapping"] is mapping
+
+    load_model_weights_mock.reset_mock()
+    _apply_weights_load_step(model=_Container(), weights_path={"encoder": "/p/enc", "decoder": "/p/dec"}, **common)
+    assert [call.kwargs["fqn_to_index_mapping"] for call in load_model_weights_mock.call_args_list] == [None, None]
 
 
 def test_apply_load_step_mapping_unknown_key_raises(monkeypatch):
@@ -300,6 +331,7 @@ def test_apply_load_step_mapping_unknown_key_raises(monkeypatch):
             cpu_load_param_name=None,
             max_load_broadcast_size=20.0,
             distribute_tensor_fn=lambda *a, **k: None,
+            fqn_to_index_mapping=None,
         )
 
     load_model_weights_mock.assert_not_called()
@@ -327,6 +359,7 @@ def test_apply_load_step_mapping_missing_child_raises(monkeypatch):
             cpu_load_param_name=None,
             max_load_broadcast_size=20.0,
             distribute_tensor_fn=lambda *a, **k: None,
+            fqn_to_index_mapping=None,
         )
 
     load_model_weights_mock.assert_not_called()
@@ -355,6 +388,7 @@ def test_apply_load_step_mapping_rejects_peft(monkeypatch):
             cpu_load_param_name=None,
             max_load_broadcast_size=20.0,
             distribute_tensor_fn=lambda *a, **k: None,
+            fqn_to_index_mapping=None,
         )
 
     load_model_weights_mock.assert_not_called()
@@ -381,6 +415,7 @@ def test_load_one_routes_to_rank0_when_broadcast_enabled(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     rank0_mock.assert_called_once()
@@ -404,6 +439,7 @@ def test_load_one_routes_to_load_model_weights_otherwise(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     load_model_weights_mock.assert_called_once()
