@@ -453,6 +453,14 @@ class BaseTrainer(Stateful, ABC):
         customized = getattr(self.model, "customized_setup_lora", None)
         if callable(customized):
             self.model = customized(lora_config)
+            # Warn rather than raise as the native path does below: the check keys
+            # on VeOmni's ``lora_A`` / ``lora_B`` naming, which a custom hook is
+            # free not to follow, so a miss here is inconclusive.
+            if not _has_trainable_lora_parameters(self.model):
+                logger.warning_rank0(
+                    "customized_setup_lora produced no trainable parameters named lora_A/lora_B. "
+                    "If the hook uses VeOmni's naming, the LoRA config selected no targets."
+                )
             return
 
         from ..lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
