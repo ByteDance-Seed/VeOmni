@@ -78,6 +78,7 @@ from transformers import PretrainedConfig
 
 from ...arguments.arguments_types import VeOmniArguments
 from ...arguments.parser import _deep_update, _instantiate_recursive
+from ...utils.fs import is_non_local
 
 
 class OmniConfig(PretrainedConfig):
@@ -287,7 +288,12 @@ class OmniConfig(PretrainedConfig):
         model_path: Union[str, os.PathLike],
         modules_config: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Join relative ``model.model_path`` under ``model_path``."""
+        """Join relative ``model.model_path`` under ``model_path``.
+
+        A remote-scheme path counts as absolute: ``os.path.isabs("hdfs://ns/x")``
+        is ``False``, so without the extra check a fully-qualified remote path
+        would be silently joined under the root as ``/local/root/hdfs://ns/x``.
+        """
         if not modules_config:
             return {}
         checkpoint_root = str(model_path)
@@ -296,7 +302,7 @@ class OmniConfig(PretrainedConfig):
             resolved = model.get("model_path") or model.get("weights_path")
             if resolved is None:
                 continue
-            if not os.path.isabs(resolved):
+            if not os.path.isabs(resolved) and not is_non_local(resolved):
                 resolved = os.path.join(checkpoint_root, resolved)
             _deep_update(
                 model,
