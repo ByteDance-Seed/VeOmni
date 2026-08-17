@@ -785,6 +785,7 @@ def parallelize_model_fsdp2(
 def parallelize_model_ddp(
     model: "nn.Module",
     weights_path: Optional[Union[str, Mapping[str, str]]] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply DDP (replicated) data parallelism to the model.
@@ -812,6 +813,10 @@ def parallelize_model_ddp(
               owns its own HF folder.  Incompatible with
               ``is_peft_model=True`` — raises ``NotImplementedError``.
             loaded as full tensors (no DTensor sharding).
+        should_skip_hf_weight_load: On a distributed-checkpoint resume the HF
+            snapshot is about to be overwritten, so skip reading it and only
+            materialise the params. Must be honoured here too, or a DDP resume
+            re-reads the whole snapshot — and fails outright when it is gone.
     """
     parallel_state = get_parallel_state()
 
@@ -834,6 +839,7 @@ def parallelize_model_ddp(
             # with the FSDP2 path.
             distribute_tensor_fn=distribute_tensor,
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+            should_skip_hf_weight_load=should_skip_hf_weight_load,
         )
 
     # PyTorch DDP rejects modules with zero trainable params. Fully-frozen
@@ -955,7 +961,12 @@ def build_parallelize_model(
         else:
             if compile_config.enable:
                 raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
-            model = parallelize_model_ddp(model=model, weights_path=weights_path, **kwargs)
+            model = parallelize_model_ddp(
+                model=model,
+                weights_path=weights_path,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
+                **kwargs,
+            )
     elif compile_config.enable:
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
 

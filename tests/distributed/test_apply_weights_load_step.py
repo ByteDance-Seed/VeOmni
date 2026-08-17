@@ -25,12 +25,14 @@ from typing import Any, Mapping
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 import torch.nn as nn
 
 from veomni.distributed.torch_parallelize import (
     _apply_weights_load_step,
     _load_one,
     _resolve_weights_path_mapping,
+    parallelize_model_ddp,
 )
 from veomni.utils.device import get_device_type
 
@@ -444,3 +446,38 @@ def test_load_one_routes_to_load_model_weights_otherwise(monkeypatch):
 
     load_model_weights_mock.assert_called_once()
     rank0_mock.assert_not_called()
+
+
+# ── DDP path: should_skip_hf_weight_load must reach the load step ──────────
+
+
+def _frozen_meta_leaf() -> _Leaf:
+    """A fully-frozen meta-init leaf: ``parallelize_model_ddp`` materialises it
+    and then returns before the DDP wrap, so no process group is needed."""
+    with torch.device("meta"):
+        model = _Leaf("frozen")
+    model.requires_grad_(False)
+    return model
+
+
+@pytest.mark.parametrize("should_skip", [True, False])
+def test_ddp_honors_should_skip_hf_weight_load(monkeypatch, should_skip):
+    """A distributed-checkpoint resume must not re-read the HF snapshot under
+    DDP, but the params still have to leave the meta device."""
+    load_model_weights_mock = MagicMock()
+    rank0_mock = MagicMock()
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.load_model_weights", load_model_weights_mock)
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
+
+    model = parallelize_model_ddp(
+        model=_frozen_meta_leaf(),
+        weights_path="/snap/full",
+        should_skip_hf_weight_load=should_skip,
+        init_device="meta",
+    )
+
+    assert load_model_weights_mock.call_count == (0 if should_skip else 1)
+    if should_skip:
+        # Nothing else will materialise these params once the loader is skipped,
+        # so a meta param here would blow up on the first forward.
+        assert not any(param.is_meta for param in model.parameters())
