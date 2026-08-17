@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+tone_instructions: >
+  Review VeOmni, a PyTorch-native distributed trainer for multimodal models
+  on GPU and NPU. Prioritize correctness, distributed safety, and
+  hard-constraint violations over style nits; ruff already enforces
+  formatting. Write all comments in English.
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: true
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - ".*"
+  path_filters:
+    - "!**/*.diff"
+    - "!docs/assets/**"
+    - "!veomni/models/transformers/**/generated/**"
+    - "!uv.lock"
+  path_instructions:
+    - path: "veomni/distributed/**"
+      instructions: |
+        Focus on distributed correctness.
+        - VeOmni uses FSDP2 only. FSDP1 has been removed.
+        - Collectives and DCP checkpoint save/load must include every rank. Rank-0-only collective calls deadlock.
+        - Sequence parallel uses all-to-all head/sequence exchange, not all-gather.
+        - SP collation order is load-bearing: pad, slice batch tensors, compute FlashAttention kwargs on full position_ids, then slice position_ids last.
+        - Device-agnostic code must use veomni.utils.device helpers, not raw torch.cuda calls.
+        Flag tensor-shape mismatches, missing rank participation, and ambient ParallelState misuse.
+    - path: "veomni/data/**"
+      instructions: |
+        Focus on data-pipeline contracts.
+        - position_ids == 0 marks FlashAttention varlen segment boundaries and must exist before model forward.
+        - IGNORE_INDEX is -100 and must be preserved for loss masking, including packed-sample boundaries.
+        - Dynamic batching token counting must match dyn_bsz_count_mode.
+        - Multimodal placeholder IDs and masks must stay consistent with TYPE2INDEX.
+    - path: "veomni/models/**"
+      instructions: |
+        Focus on model loading and patchgen.
+        - Do not request edits under veomni/models/transformers/*/generated/. Change patch_spec.py or modeling_*_patch.py instead.
+        - Model registration must happen at import time.
+        - config model_type must match the registry key.
+        - New modeling must target transformers 5.9.0 and FSDP2.
+        - NPU-only imports must be guarded with is_torch_npu_available() or IS_NPU_AVAILABLE.
+    - path: "veomni/checkpoint/**"
+      instructions: |
+        Focus on DCP safety: all ranks must participate, checkpoint keys must match the model state dict, and integer or boolean buffers must not be treated as floating tensors during consolidation.
+    - path: "veomni/trainer/**"
+      instructions: |
+        Trainer callback or forward_backward_step changes must also cover composed trainers such as TextDPOTrainer and DiTTrainer. Do not assume every trainer inherits BaseTrainer.forward_backward_step.
+    - path: "tests/**"
+      instructions: |
+        Prefer tests that catch rank, shape, device, and packing bugs. Flag tests that mock away the behavior under test, or that only run on one hardware path when the change is device-sensitive.
+    - path: "docs/**"
+      instructions: |
+        Check that examples still match current APIs, config fields, and tasks/ script paths. Flag stale trainer or parallelism guidance.
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - files: "AGENTS.md"
+        applyTo: "**/*"
+      - files: ".agents/knowledge/constraints.md"
+        applyTo: "veomni/**/*.py,veomni/**/*.yaml,veomni/**/*.yml"
+      - files: "CONTRIBUTING.md"
+        applyTo: "**/*"
+chat:
+  auto_reply: true

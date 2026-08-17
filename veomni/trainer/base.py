@@ -74,7 +74,7 @@ from ..utils.device import (
     is_nccl_backend,
     synchronize,
 )
-from ..utils.loss_utils import count_loss_token, mean_global_loss
+from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     ChannelLossCallback,
@@ -92,6 +92,15 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+def _has_trainable_lora_parameters(module: torch.nn.Module | None) -> bool:
+    if module is None:
+        return False
+    return any(
+        param.requires_grad and ({"lora_A", "lora_B"} & set(name.split(".")))
+        for name, param in module.named_parameters()
+    )
 
 
 class BackgroundPrefetcher:
@@ -223,6 +232,9 @@ def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
         "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
         "ns_implementation": optimizer_cfg.muon_ns_implementation,
         "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
+        # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
+        "head_group_size": int(optimizer_cfg.muon_head_group_size),
+        "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
         # Surface for startup summary only; not a DistributedMuon ctor kwarg.
         "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
         "adamw_lr": float(optimizer_cfg.lr),
@@ -460,6 +472,11 @@ class BaseTrainer(Stateful, ABC):
             cfg = VeOmniLoraConfig.from_yaml(resolved_config)
             logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
             self.model = VeOmniLoraModel(self.model, cfg)
+
+        if not _has_trainable_lora_parameters(self.model):
+            raise ValueError(
+                "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
+            )
 
     def _freeze_model_module(self):
         self._setup_lora()
@@ -713,7 +730,10 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            outputs.loss,
+            self.micro_batch_token_len,
+            self.micro_batches_token_len,
+            getattr(self, "global_micro_batches_token_len", None),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
@@ -785,6 +805,10 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_requires_all_reduce(True)
 
+    def sync_before_train_step(self):
+        if self.args.train.sync_each_train_step:
+            synchronize()
+
     def train_step(
         self,
         data_iterator: Any,
@@ -797,13 +821,14 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
-        synchronize()
+        self.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
         # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)
+        self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

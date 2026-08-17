@@ -16,6 +16,7 @@ On session start, read the following:
 - `.agents/knowledge/constraints.md` — hard constraints to check before any code change
 - `.agents/knowledge/architecture.md` — module map, trainer hierarchy, data flow
 - `.agents/knowledge/uv.md` — dependency management architecture (uv, extras, lockfile)
+- `.agents/knowledge/cloud_env.md` — Cursor Cloud (CPU-only VM) setup; read when running on the Cursor Cloud VM
 
 ---
 
@@ -65,6 +66,7 @@ Title: `[{modules}] {type}: {description}`
 
 - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (the CI source of truth).
 - Breaking: prepend `[BREAKING]`
+- GitHub PRs are also reviewed by CodeRabbit (`.coderabbit.yaml`). On an existing PR, comment `@coderabbitai review` or `@coderabbitai full review`.
 
 ---
 
