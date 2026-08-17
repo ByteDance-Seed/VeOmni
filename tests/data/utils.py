@@ -29,6 +29,9 @@ def setup_test_distributed(args):
     """Initialize a minimal distributed runtime for data tests.
 
     Returns the device and the ``ParallelState``.
+
+    Registers under ``"base"`` because callers stand in for ``BaseTrainer._setup``,
+    and ``BaseTrainer`` scopes its build under ``use_parallel_state("base")``.
     """
     device_type = get_device_type()
     if device_type != "cpu":
@@ -58,6 +61,7 @@ def setup_test_distributed(args):
         extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
         extra_parallel_names=args.train.accelerator.extra_parallel_names,
         dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        name="base",
     )
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     return device, parallel_state
