@@ -289,7 +289,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 
 | Field | Available values | Notes |
 |-------|------------------|-------|
-| `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `native-sparse` | VeOmni rewrites FA2/3/4, Flex and aiter to SP-aware variants under `MODELING_BACKEND=veomni`. `aiter` is ROCm-only. |
+| `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | VeOmni rewrites FA2/3/4 to SP-aware variants under `MODELING_BACKEND=veomni` |
 | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
