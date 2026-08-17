@@ -53,6 +53,7 @@ from .arguments_types import (
     ModelArguments,
     TrainingArguments,
     VeOmniArguments,
+    _resolve_hdfs_path,
 )
 
 
@@ -335,6 +336,12 @@ class OmniArguments(VeOmniArguments):
         infer = self.infer
         # `infer.model_path` overrides the training base for inference (e.g. a
         # trained checkpoint root); falls back to `model.model_path`.
+        #
+        # An HDFS root is localized here rather than in ``__post_init__`` so a
+        # training run never downloads an inference-only checkpoint.
+        # ``model.model_path`` is already localized by ``ModelArguments``.
+        if infer.model_path:
+            infer.model_path = _resolve_hdfs_path(infer.model_path)
         model_path = infer.model_path or self.model.model_path
         if not model_path:
             raise ValueError(
