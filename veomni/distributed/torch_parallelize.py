@@ -278,6 +278,11 @@ def _load_one(
             )
             return
         except NotImplementedError as e:
+            # Deliberately degrades instead of failing early: the flag is global
+            # (``train.ep_sharded_stream_load``) but this helper runs once per
+            # OmniModule, and every sub-module without an ExtraParallel plan — the
+            # vision encoder, VAE, connector — raises here. Aborting would make the
+            # flag unusable for any heterogeneous model whose MoE backbone wants it.
             logger.warning_rank0(
                 f"ep_sharded_stream_load unsupported for this model/checkpoint ({e}); "
                 "falling back to load_model_weights."

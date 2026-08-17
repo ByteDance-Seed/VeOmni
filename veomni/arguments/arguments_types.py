@@ -746,7 +746,7 @@ class TrainingArguments:
     ep_sharded_stream_load: bool = field(
         default=False,
         metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations warn and fall back to the standard loader, so a heterogeneous OmniModel can enable it for its MoE sub-module alone."
         },
     )
     enable_full_determinism: bool = field(
