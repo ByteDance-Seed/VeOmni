@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn.functional import scaled_dot_product_attention
 from transformers import PreTrainedModel
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
@@ -39,6 +40,7 @@ class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitMetricMeterM
     main_input_name = "patchified_pixel_values"
     _no_split_modules = ["BagelSiglipEncoderLayer"]
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
 
     def __init__(self, config: BagelSiglipNavitConfig) -> None:
         super().__init__(config)
@@ -247,6 +249,20 @@ class BagelSiglipVisionEmbeddings(nn.Module):
         return patch_embeds + position_embeds.to(device=patch_embeds.device, dtype=patch_embeds.dtype)
 
 
+def _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=False):
+    num_seqs = cu_seqlens_q.shape[0] - 1
+    outputs = []
+    for i in range(num_seqs):
+        q_start, q_end = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
+        k_start, k_end = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
+        qi = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
+        ki = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        vi = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        oi = scaled_dot_product_attention(qi, ki, vi, is_causal=causal)
+        outputs.append(oi.squeeze(0).transpose(0, 1))
+    return torch.cat(outputs, dim=0)
+
+
 class BagelSiglipAttention(nn.Module):
     def __init__(self, config: BagelSiglipNavitConfig) -> None:
         super().__init__()
@@ -295,19 +311,31 @@ class BagelSiglipAttention(nn.Module):
                 causal=False,
             )
         else:
-            attn_output = torch_npu.npu_fusion_attention(
-                query_states.to(torch.bfloat16),
-                key_states.to(torch.bfloat16),
-                value_states.to(torch.bfloat16),
-                query_states.shape[1],
-                pse=None,
-                atten_mask=None,
-                scale=1.0 / math.sqrt(query_states.shape[-1]),
-                keep_prob=1,
-                input_layout="TND",
-                actual_seq_qlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
-                actual_seq_kvlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
-            )[0]
+            if self.config._attn_implementation in ("flash_attention_2", "veomni_flash_attention_2_with_sp"):
+                attn_output = torch_npu.npu_fusion_attention(
+                    query_states.to(torch.bfloat16),
+                    key_states.to(torch.bfloat16),
+                    value_states.to(torch.bfloat16),
+                    query_states.shape[1],
+                    pse=None,
+                    atten_mask=None,
+                    scale=1.0 / math.sqrt(query_states.shape[-1]),
+                    keep_prob=1,
+                    input_layout="TND",
+                    actual_seq_qlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
+                )[0]
+            else:
+                attn_output = _sdpa_varlen_attn(
+                    query_states.to(torch.bfloat16),
+                    key_states.to(torch.bfloat16),
+                    value_states.to(torch.bfloat16),
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    causal=False,
+                )
         return self.out_proj(attn_output.reshape(total_q_len, -1).to(hidden_states.dtype))
 
 

@@ -25,6 +25,7 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, BagelFlowConnectorMetric
     main_input_name = "hidden_states"
     _no_split_modules: list[str] = []
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
 
     def __init__(self, config: BagelFlowConnectorConfig) -> None:
         super().__init__(config)

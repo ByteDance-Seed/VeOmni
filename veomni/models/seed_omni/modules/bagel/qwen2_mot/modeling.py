@@ -60,6 +60,7 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, BagelQwen2MoTMetricMeterMixin, Pre
     _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
     supports_gradient_checkpointing = True
     _supports_flex_attn = True
+    _supports_sdpa = True
     _export_hf_checkpoint_with_weight_conversions = True
 
     def __init__(self, config: BagelQwen2MoTConfig):
