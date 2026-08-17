@@ -666,7 +666,7 @@ class OmniTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.on_step_begin(micro_batches=micro_batches)
-        synchronize()
+        base.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict: Dict[str, float] = defaultdict(float)
@@ -696,7 +696,7 @@ class OmniTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.on_step_begin(micro_batches=micro_batches)
-        synchronize()
+        base.sync_before_train_step()
 
         num_micro_steps = len(micro_batches)
         for micro_step, micro_batch in enumerate(micro_batches):
