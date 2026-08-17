@@ -7,14 +7,25 @@ Read this before editing `veomni/models/seed_omni/modules/**`.
 A SeedOmni V2 module is usually:
 
 - A `configuration.py` with a unique `model_type`.
-- A `modulemixin.py` with composable mixins:
+- A `modeling.py` — pure HuggingFace-native, loadable with plain
+  `from_pretrained` / `AutoModel`, no VeOmni import required:
+  - the concrete model class: weights + `forward` / `encode` / …
+  - if inference-capable, an in-file `InferenceMixin` — the omni analog of
+    HF's `GenerationMixin` — holding `generate()` and FSM inference state
+    (`reset_local_inference_state`, `reset_global_inference_state`,
+    `finalize`, sampling helpers). The model class lists it **first**:
+    `class Xxx(InferenceMixin, OmniPreTrainedModel)` (`OmniPreTrainedModel`
+    ships no-op defaults for those three methods; MRO resolves left-to-right,
+    so `InferenceMixin` must come first or those no-ops shadow it).
+- An `accelerated.py` with composable training-graph mixins:
   - `TrainingMixin(TrainingModuleMixin)` — `@pre_forward` / `@post_forward` hooks.
-  - `InferenceMixin(InferenceModuleMixin)` — `generate` / FSM hooks.
   - optional `MeterMixin(MetricMeterMixin)`.
-  - `VeOmniMixin(BaseMixin, …)` — family assembly + assets / preprocessor class.
-- A `modeling.py` concrete model class that multi-inherits:
-  - `VeOmniMixin` first,
-  - then the real HF/diffusers/torch model class.
+  - `VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin)` — family assembly +
+    assets / preprocessor class. **No `InferenceMixin` here** — `generate()` /
+    `reset_*` / `finalize` already reach the accelerated class unshadowed via
+    normal inheritance from the native `modeling.py` class.
+  - `XxxAccelerated(VeOmniMixin, Xxx)` — `VeOmniMixin` first, then the native
+    `modeling.py` class.
 - Optional `processing.py` for module-owned processors.
 - Optional `chat_template.py` for text encoders.
 
@@ -24,7 +35,7 @@ Use short filenames inside the module folder:
 modules/<family>/<submodule>/
 ├── configuration.py
 ├── modeling.py
-├── modulemixin.py
+├── accelerated.py
 └── processing.py
 ```
 
@@ -40,10 +51,11 @@ modules/<family>/<submodule>/
 - Tokenizers and processors are module-owned assets.
 - Do not add a top-level tokenizer path.
 
-## IDE type stubs (`modulemixin.py`)
+## IDE type stubs (`accelerated.py`)
 
-Hooks call modeling APIs through `self`, but implementation stays in
-`modeling.py`. Each mixin declares **only the names its hooks use**:
+`TrainingMixin` hooks call modeling APIs through `self`, but implementation
+stays in `modeling.py`. `TrainingMixin` declares **only the names its hooks
+use**:
 
 - class attributes: `config`, `device`, `dtype`, modeling-owned fields;
 - method bodies: `...` plus docstring:
@@ -52,8 +64,12 @@ Hooks call modeling APIs through `self`, but implementation stays in
   IDE stub — implemented on :class:`Xxx` in ``modeling.py``.
   ```
 
+`generate()` and its FSM helpers live entirely on the native class's
+`InferenceMixin` — `accelerated.py` needs no IDE stub for `generate` itself
+unless a training hook calls a `generate`-only helper.
+
 Full style guide: `references/modulemixin-ide-stubs.md`. Reference implementation:
-`modules/bagel/flow_connector/modulemixin.py` (IDE stubs + module-level helpers).
+`modules/bagel/flow_connector/accelerated.py` (IDE stubs + module-level helpers).
 
 ## Optional Per-Module Metric Meter
 

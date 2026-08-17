@@ -1,8 +1,8 @@
 """Janus LLaMA backbone (no wte / lm_head).
 
-``JanusLlama(JanusLlamaModuleMixin)`` — patched
+``JanusLlama(InferenceMixin, OmniPreTrainedModel)`` — patched
 ``LlamaModel`` with ``embed_tokens = Identity``; ``inputs_embeds`` come from
-the text-encoder node.  Packing / FSDP dummy anchors live in ``modulemixin.py``.
+the text-encoder node.  Packing / FSDP dummy anchors live in ``accelerated.py``.
 
 Multi-modal embedding packing
 -----------------------------
@@ -17,13 +17,13 @@ Sequence parallelism
 --------------------
 ``forward`` is SP-unaware — it computes on whatever (already-sliced) sequence
 it is handed. SP is driven OUTSIDE the model (classic single-pass Ulysses): when
-``sp_size > 1`` the mixin's ``forward_pre`` hook slices the (replicated) packed
-sample to this rank's ``1/sp_size`` shard (rebuilding the varlen ``cu_seqlens``),
-``forward`` runs once (its attention all-to-alls over the SP group internally),
-and the ``forward_post`` hook all-gathers the shards back to the full sequence on
-every rank (both in ``modulemixin.py``, each gated on ``sp_size > 1``). The rest
-of ``forward_post`` (the unpack / scatter) then runs SP-agnostically on the full
-data.
+``sp_size > 1`` the accelerated ``TrainingMixin``'s ``forward_pre`` hook slices
+the (replicated) packed sample to this rank's ``1/sp_size`` shard (rebuilding
+the varlen ``cu_seqlens``), ``forward`` runs once (its attention all-to-alls
+over the SP group internally), and the ``forward_post`` hook all-gathers the
+shards back to the full sequence on every rank (both in ``accelerated.py``,
+each gated on ``sp_size > 1``). The rest of ``forward_post`` (the unpack /
+scatter) then runs SP-agnostically on the full data.
 
 Connection outputs
 ------------------

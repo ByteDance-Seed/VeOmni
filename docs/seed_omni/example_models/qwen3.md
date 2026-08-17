@@ -263,7 +263,7 @@ default → plain text-only Qwen3):
 - `enable_image: true` — use the **Qwen3-VL image ChatML template** (image →
   `<|vision_start|>` · the vision-embed segment · `<|vision_end|>`) and handle
   image/video parts in decode. With it off, the original text-only template runs
-  verbatim (`if self._enable_image:` branches in `modulemixin.py`). It also makes
+  verbatim (`if self._enable_image:` branches in `accelerated.py`). It also makes
   `freeze_model()` keep the tied embedding's `requires_grad=True` but register a
   **per-row gradient mask** that zeroes every row except the vision special tokens
   (`<|vision_start|>`, `<|vision_end|>`, `<|image_pad|>`), so only those rows

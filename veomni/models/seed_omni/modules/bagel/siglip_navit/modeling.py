@@ -1,7 +1,7 @@
 """BAGEL SigLIP NaViT vision encoder.
 
 The training node is ``bagel_siglip_navit.forward``. It receives local
-patchified image tensors from ``modulemixin.py``, runs SigLIP/NaViT attention,
+patchified image tensors from ``accelerated.py``, runs SigLIP/NaViT attention,
 projects features to the Bagel MoT hidden size, adds visual position embeddings,
 and returns ``{"image_embeds": ..., "token_lens": ...}``. The post-hook writes
 those feature spans back to the image ``ConversationItem.value`` fields.

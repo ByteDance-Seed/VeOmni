@@ -4,7 +4,7 @@ Applies to backbones that consume pre-embedded ``conversation_list`` segments
 with flat 1-D ``position_ids`` and per-token ``attention_mask`` — e.g. Janus
 LLaMA and Qwen3 dense/MoE.  Vision-language backbones (Qwen3-VL M-RoPE) and
 packed MoT layouts (BAGEL Qwen2-MoT) keep family-specific packers in their own
-``modulemixin.py`` files.
+``modeling.py`` files.
 
 ``scatter_llm_hidden_states`` is the inverse scatter step shared by all of the
 above families (including Qwen3-VL) after ``forward_post`` unflattens backbone

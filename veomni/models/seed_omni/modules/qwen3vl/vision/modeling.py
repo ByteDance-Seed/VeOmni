@@ -1,7 +1,7 @@
 """Qwen3-VL vision tower (ViT + patch merger + deepstack mergers).
 
-``Qwen3VLVisionEncoder(Qwen3VLVisionEncoderModuleMixin)`` — HF
-vision stack in this file; graph hooks in ``modulemixin.py``.
+``Qwen3VLVisionEncoder(InferenceMixin, OmniPreTrainedModel)`` — HF
+vision stack in this file; graph hooks in ``accelerated.py``.
 
 The ``forward`` returns two payloads consumed by the backbone:
 

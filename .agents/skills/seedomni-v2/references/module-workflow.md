@@ -31,9 +31,13 @@ Answer these before editing:
 Follow the existing folder shape:
 
 - `configuration.py`: config fields, unique `model_type`.
-- `modeling.py`: weights and the actual model forward.
-- `modulemixin.py`: composable `TrainingMixin` / `InferenceMixin` / `VeOmniMixin`
-  hooks, CPU preprocessor, and **IDE type stubs** for modeling APIs (see
+- `modeling.py`: weights, `forward`, and — if inference-capable — an in-file
+  `InferenceMixin` (`generate()` + FSM state, listed before
+  `OmniPreTrainedModel` in the model class's bases; see §2.1 of
+  `docs/seed_omni/seed_omni_v2.md`).
+- `accelerated.py`: composable `TrainingMixin` / `VeOmniMixin` hooks (no
+  `InferenceMixin` — that lives on `modeling.py` now), CPU preprocessor, and
+  **IDE type stubs** for modeling APIs (see
   `references/modulemixin-ide-stubs.md`).
 - `processing.py`: processor wrapper only when needed.
 - `chat_template.py`: text encoder family-specific template only when needed.

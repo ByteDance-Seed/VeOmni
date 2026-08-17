@@ -7,10 +7,12 @@ Use this reference to decide which files to trust before editing SeedOmni V2.
 - `veomni/models/seed_omni/mixins/`
   - `base_mixin.py` — shared assets / hook registry.
   - `training_module_mixin.py` — `pre_forward`, `post_forward`, training dispatch.
-  - `inference_module_mixin.py` — `pre_generate`, `post_generate`, inference dispatch.
+  - `inference_module_mixin.py` — `pre_generate`, `post_generate`, inference dispatch (opt-in; not used by the standard `InferenceMixin` pattern).
   - `metric_meter_mixin.py` — optional per-module FLOPs meter.
-- `veomni/models/seed_omni/modules/**/modulemixin.py`
-  - composable mixins + IDE type stubs; see `references/modulemixin-ide-stubs.md`.
+- `veomni/models/seed_omni/modules/**/modeling.py`
+  - native HF class + in-file `InferenceMixin` (`generate()` + FSM state).
+- `veomni/models/seed_omni/modules/**/accelerated.py`
+  - composable `TrainingMixin` / `VeOmniMixin` + IDE type stubs; see `references/modulemixin-ide-stubs.md`.
 - `veomni/models/seed_omni/graphs/base.py`
   - endpoint parsing and common graph schema.
 - `veomni/models/seed_omni/graphs/training_graph.py`

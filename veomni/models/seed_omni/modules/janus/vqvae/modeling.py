@@ -1,7 +1,7 @@
 """Janus VQVAE codec + generation projection head.
 
-``JanusVqvae(JanusVqvaeModuleMixin)`` — codec weights here;
-encode/decode graph hooks in ``modulemixin.py``.
+``JanusVqvae(InferenceMixin, OmniPreTrainedModel)`` — codec weights here;
+encode/decode graph hooks in ``accelerated.py``.
 
 Call-site split
 ---------------

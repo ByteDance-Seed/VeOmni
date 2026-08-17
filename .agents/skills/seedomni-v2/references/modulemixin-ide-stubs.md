@@ -1,55 +1,77 @@
-# ModuleMixin IDE Type Stubs
+# Accelerated Mixin IDE Type Stubs
 
-Read this when editing `modulemixin.py` hooks that call into the sibling
-`modeling.py` class.
+Read this when editing `accelerated.py` `TrainingMixin` hooks that call into
+the sibling `modeling.py` class.
 
 ## Why
 
-Graph hooks live on `TrainingMixin` / `InferenceMixin`, but weights and
-`forward` / `encode` / … live on the concrete model in `modeling.py`:
+Training-graph hooks live on `TrainingMixin` (`accelerated.py`), but weights,
+`forward` / `encode` / … **and** `generate()` / FSM inference live on the
+native model class in `modeling.py`:
 
 ```python
-class BagelFlowConnector(VeOmniMixin, PreTrainedModel): ...
-```
-
-At edit time a hook only sees `self`, not the merged MRO of the final model
-class. **Class-level annotations and `...` method stubs** tell the IDE which
-attributes and modeling methods exist, without copying implementation into the
-mixin file.
-
-Live reference: `veomni/models/seed_omni/modules/bagel/flow_connector/modulemixin.py`.
-
-## Mixin file shape
-
-Each module folder splits capabilities progressively:
-
-```python
-class TrainingMixin(TrainingModuleMixin):
+# modeling.py
+class InferenceMixin:
+    """generate() + FSM inference state — analogous to HF's GenerationMixin."""
     ...
 
-class InferenceMixin(InferenceModuleMixin):
+class BagelFlowConnector(InferenceMixin, OmniPreTrainedModel):
+    ...
+
+# accelerated.py
+class BagelFlowConnectorAccelerated(VeOmniMixin, BagelFlowConnector): ...
+```
+
+At edit time a `TrainingMixin` hook only sees `self`, not the merged MRO of
+the final `Accelerated` model class. **Class-level annotations and `...`
+method stubs** tell the IDE which attributes and modeling methods exist,
+without copying implementation into the mixin file.
+
+Live reference: `veomni/models/seed_omni/modules/bagel/flow_connector/accelerated.py`.
+
+## File shape
+
+Each module folder splits capabilities across two files:
+
+```python
+# modeling.py — pure HF-native.
+class InferenceMixin:
+    """generate() + FSM state — omit if the module isn't inference-capable."""
+    def generate(self, conversation_list=None, **kwargs): ...
+
+class Xxx(InferenceMixin, OmniPreTrainedModel):
+    """InferenceMixin listed FIRST: OmniPreTrainedModel ships no-op
+    reset_local_inference_state / reset_global_inference_state / finalize
+    defaults, and MRO resolves left-to-right — second, those no-ops would
+    shadow the real implementations above."""
+    def forward(self, ...): ...
+
+# accelerated.py — VeOmni-only training-graph hooks. No InferenceMixin here:
+# generate() / reset_* / finalize already reach XxxAccelerated unshadowed via
+# normal inheritance from Xxx.
+class TrainingMixin(TrainingModuleMixin):
     ...
 
 class MeterMixin(MetricMeterMixin):
     ...
 
-class VeOmniMixin(BaseMixin, TrainingMixin, InferenceMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
+    ...
+
+class XxxAccelerated(VeOmniMixin, Xxx):
     ...
 ```
 
-`modeling.py` only declares:
+A handful of backbones (`qwen3/llm`, `qwen3_moe/llm`) share a family-wide
+`SimpleArGenerationMixin` (`modules/base/llm_packing.py`) instead of a
+per-module `InferenceMixin` — same rule: listed before `OmniPreTrainedModel`.
 
-```python
-class Xxx(VeOmniMixin, PreTrainedModel):
-    ...
-```
-
-Do **not** put modeling logic in the mixin stubs. Stubs are for static analysis
-and navigation only.
+Do **not** put modeling logic in the `TrainingMixin` stubs. Stubs are for
+static analysis and navigation only.
 
 ## What to declare
 
-On each mixin class, at the top of the body (before `__init__` or hooks):
+On `TrainingMixin`, at the top of the body (before `__init__` or hooks):
 
 | Kind | When | Example |
 |------|------|---------|
@@ -60,8 +82,11 @@ On each mixin class, at the top of the body (before `__init__` or hooks):
 | modeling-owned attrs | hook reads `self._tokenizer`, `self.model`, … | match `modeling.py` field names |
 | method stubs | hook calls `self.encode(...)`, `self.forward(...)`, … | signature copied from `modeling.py` |
 
-**Scope rule:** each mixin declares **only what its own hooks use**. Do not
-duplicate the full model surface on every mixin.
+**Scope rule:** `TrainingMixin` declares **only what its own hooks use**. Do
+not duplicate the full model surface. `generate()` and its FSM helpers live
+entirely on the native class's `InferenceMixin` now — `accelerated.py` needs
+no IDE stub for `generate` itself unless a training hook calls a
+`generate`-only helper.
 
 ## Method stub style
 
@@ -85,7 +110,7 @@ Conventions:
 - Replace `BagelFlowConnector` with the concrete class from that module's
   `modeling.py` (`TextEncoder`, `Qwen3Llm`, `BagelVAE`, …).
 - Signatures must match `modeling.py` exactly (args, types, return type).
-- Import config / processor types at the top of `modulemixin.py` when used in
+- Import config / processor types at the top of `accelerated.py` when used in
   annotations (`from __future__ import annotations` is fine).
 
 ## Property stubs
@@ -105,26 +130,27 @@ in this file, not in `modeling.py`.
 
 ## Checklist for a new / changed hook
 
-1. Grep the mixin for `self.<name>` calls not defined in the mixin file.
-2. If `<name>` is implemented in `modeling.py`, add or update a stub on the
-   mixin that owns the hook (`TrainingMixin` vs `InferenceMixin`).
+1. Grep `accelerated.py` for `self.<name>` calls not defined in the file.
+2. If `<name>` is implemented in `modeling.py`, add or update a stub on
+   `TrainingMixin`.
 3. If `<name>` is a class attribute on the model, add a typed class attribute
-   on the mixin.
+   on `TrainingMixin`.
 4. Copy the docstring template and verify jump-to-definition lands in
    `modeling.py`.
-5. Do **not** add stubs for helpers already defined in the same mixin file, for
+5. Do **not** add stubs for helpers already defined in the same file, for
    module-level carrier helpers, or for framework mixins (`metric_meter_set_seqlens`,
    `pre_forward`, …).
 
 ## Module-level carrier helpers
 
-Training and inference hooks often share carrier logic (select items, pack
-tensors, scatter outputs). When a helper does **not** need hook-local
-`self._*` state, define it as a plain function at the top of `modulemixin.py`
-and call it from both mixins — do not hang it on `TrainingMixin` and reach it
-via MRO from `InferenceMixin`.
+Training hooks and the native `InferenceMixin`'s `generate()` often share
+carrier logic (select items, pack tensors, scatter outputs). When a helper
+does **not** need hook-local `self._*` state, define it as a plain function at
+the top of `modeling.py` and call it from both `modeling.py` and
+`accelerated.py` — do not hang it on `TrainingMixin` and reach it via MRO from
+the native class.
 
-Reference: `modules/bagel/flow_connector/modulemixin.py`
+Reference: `modules/bagel/flow_connector/modeling.py`
 (`select_vae_context_latent_items`, `scatter_flow_latent_embeds`).
 
 Standard AR LLM backbones (1-D positions) reuse
@@ -135,12 +161,13 @@ All AR families (including Qwen3-VL) reuse
 in ``forward_post``.
 
 Pass `device`, `dtype`, and config fields explicitly inside these functions.
-Keep training-only SP bookkeeping (`self._sp_*`) in the mixin hook methods.
+Keep training-only SP bookkeeping (`self._sp_*`) in the `TrainingMixin` hook
+methods.
 
 ## Modules with full stub coverage
 
-All `modules/**/modulemixin.py` files follow this pattern. When adding a module,
-mirror an adjacent example:
+All `modules/**/accelerated.py` files follow this pattern. When adding a
+module, mirror an adjacent example:
 
 | Pattern | Example module |
 |---------|----------------|
