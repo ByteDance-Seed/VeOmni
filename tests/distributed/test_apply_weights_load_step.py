@@ -31,6 +31,7 @@ import torch.nn as nn
 from veomni.distributed.torch_parallelize import (
     _apply_weights_load_step,
     _load_one,
+    _non_persistent_buffer_names,
     _resolve_weights_path_mapping,
     parallelize_model_ddp,
 )
@@ -481,3 +482,61 @@ def test_ddp_honors_should_skip_hf_weight_load(monkeypatch, should_skip):
         # Nothing else will materialise these params once the loader is skipped,
         # so a meta param here would blow up on the first forward.
         assert not any(param.is_meta for param in model.parameters())
+
+
+# ── DDP path: which buffers DDP is allowed to broadcast ────────────────────
+
+
+class _BufferLeaf(nn.Module):
+    """Both buffer flavours, nested, so FQN construction is covered too."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm = nn.BatchNorm1d(4)  # persistent running stats
+        self.inner = nn.Module()
+        self.inner.register_buffer("inv_freq", torch.ones(2), persistent=False)
+        self.register_buffer("position_ids", torch.arange(3), persistent=False)
+        self.register_buffer("scale", torch.ones(1))  # persistent
+
+    def init_weights(self) -> None:  # pragma: no cover - not exercised here
+        pass
+
+
+def test_non_persistent_buffer_names_only_lists_non_persistent():
+    names = set(_non_persistent_buffer_names(_BufferLeaf()))
+
+    assert names == {"position_ids", "inner.inv_freq"}
+    # BatchNorm's running stats are real replicated state: they must stay
+    # broadcastable, or DDP ranks silently diverge and rank0's copy is what
+    # lands in the checkpoint.
+    assert not {"scale", "norm.running_mean", "norm.running_var", "norm.num_batches_tracked"} & names
+
+
+def test_ddp_broadcasts_persistent_buffers_but_ignores_derived_ones(monkeypatch):
+    """DDP must keep its default buffer broadcast (BatchNorm needs it) while
+    excluding config-derived buffers, whose in-place sync trips autograd when a
+    module owns more than one graph node."""
+    captured: dict[str, Any] = {}
+
+    def _fake_ddp(module, **kwargs):
+        captured["module"] = module
+        captured["kwargs"] = kwargs
+        return module
+
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.DDP", _fake_ddp)
+
+    model = parallelize_model_ddp(model=_BufferLeaf(), weights_path=None)
+
+    assert captured["kwargs"].get("broadcast_buffers", True) is True
+    assert model._ddp_params_and_buffers_to_ignore == ["inner.inv_freq", "position_ids"]
+
+
+def test_ddp_preserves_a_model_declared_ignore_list(monkeypatch):
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.DDP", lambda module, **kwargs: module)
+
+    model = _BufferLeaf()
+    model._ddp_params_and_buffers_to_ignore = ["norm.weight"]
+
+    parallelize_model_ddp(model=model, weights_path=None)
+
+    assert model._ddp_params_and_buffers_to_ignore == ["inner.inv_freq", "norm.weight", "position_ids"]
