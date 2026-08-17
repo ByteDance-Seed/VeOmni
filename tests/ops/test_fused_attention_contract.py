@@ -143,6 +143,8 @@ def test_register_veomni_magi_attention_mask_builder_uses_range_builder(monkeypa
 
 
 def test_registered_magi_mask_builder_rejects_implicit_packed_visibility(monkeypatch):
+    mask_mapping = ALL_MASK_ATTENTION_FUNCTIONS._global_mapping
+    monkeypatch.setitem(mask_mapping, _MAGI_IMPLEMENTATION, object())
     monkeypatch.setattr(
         magi_mask_backend,
         "get_parallel_state",

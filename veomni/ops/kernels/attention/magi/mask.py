@@ -263,7 +263,13 @@ def _validate_range_tensor(name: str, ranges: torch.Tensor) -> None:
 
 
 def _require_all(condition: torch.Tensor, message: str) -> None:
-    """Require every element to be true without synchronizing CUDA to Python."""
+    """Require every element to be true without synchronizing CUDA to Python.
+
+    ``torch._assert_async`` is private but supported by the pinned PyTorch 2.10
+    and 2.11 releases. On CUDA, a failed assertion surfaces at a later kernel
+    launch and invalidates the process's CUDA context instead of raising the
+    catchable ``ValueError`` used by the CPU branch.
+    """
     all_true = condition.all()
     if all_true.device.type == "cpu":
         if not bool(all_true):

@@ -46,9 +46,10 @@ The model-facing call path is:
 ```text
 ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
   -> fused_attention_forward(...)
-       -> flash_attention_forward(...)
-       -> flex_attention_forward(...)
-       -> magi_attention_forward(...)
+       -> one of:
+            flash_attention_forward(...)
+            flex_attention_forward(...)
+            magi_attention_forward(...)
 ```
 
 The facade resolves only VeOmni's private dispatch table; it does not look the

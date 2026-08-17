@@ -73,6 +73,15 @@ def _cp1_state(*, ulysses_enabled: bool = False):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_magi_fa4_caches(monkeypatch):
+    prepare_default_magi_kernel = magi_fa4_backend._prepare_default_magi_kernel
+    prepare_default_magi_kernel.cache_clear()
+    monkeypatch.setattr(magi_fa4_backend, "_fa4_cache_entry", None)
+    yield
+    prepare_default_magi_kernel.cache_clear()
+
+
 def _set_fake_cutlass_backend(monkeypatch, *, available: bool) -> dict[str, object] | None:
     fake_package = ModuleType("flash_attn_cute")
     fake_package.__path__ = []
@@ -514,7 +523,7 @@ def test_magi_fa4_explicit_arg_autograd(monkeypatch):
     ranges = torch.tensor([[0, 8]], dtype=torch.int32)
     fa4_attn_arg = object()
 
-    output, _ = magi_fa4_backend._MagiFA4Function.apply(
+    output, lse = magi_fa4_backend._MagiFA4Function.apply(
         query,
         key,
         value,
@@ -525,6 +534,8 @@ def test_magi_fa4_explicit_arg_autograd(monkeypatch):
         0.0,
         fa4_attn_arg,
     )
+    assert output.requires_grad
+    assert not lse.requires_grad
     output.sum().backward()
 
     assert captured == {"fwd_attn_arg": fa4_attn_arg, "bwd_attn_arg": fa4_attn_arg}
@@ -581,7 +592,6 @@ def test_magi_kernel_mode_follows_query_device(monkeypatch, compute_capability, 
 def test_magi_sm90_reports_cutlass_installer(monkeypatch):
     monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", lambda device: 90)
     _set_fake_cutlass_backend(monkeypatch, available=False)
-    magi_fa4_backend._prepare_default_magi_kernel.cache_clear()
 
     with pytest.raises(ImportError, match=r"install_magi_sm90\.sh"):
         magi_fa4_backend._prepare_default_magi_kernel(torch.device("cuda"))
@@ -597,7 +607,6 @@ def test_magi_sm100_plus_does_not_require_cutlass_backend(monkeypatch):
 
     monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", fake_compute_capability)
     _set_fake_cutlass_backend(monkeypatch, available=False)
-    magi_fa4_backend._prepare_default_magi_kernel.cache_clear()
 
     magi_fa4_backend._prepare_default_magi_kernel(torch.device("cuda"))
     magi_fa4_backend._prepare_default_magi_kernel(torch.device("cuda"))
@@ -610,7 +619,6 @@ def test_magi_sm90_prepares_cutlass_device_once(monkeypatch):
     prepared = []
     monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", lambda device: 90)
     _set_fake_cutlass_backend(monkeypatch, available=True)
-    magi_fa4_backend._prepare_default_magi_kernel.cache_clear()
     monkeypatch.setattr(
         magi_fa4_backend,
         "_install_magi_tile_size_compatibility",
@@ -668,7 +676,6 @@ def test_magi_sm90_rejects_incompatible_cutlass_build(monkeypatch, build_flag):
     config = sys.modules["flash_attn_cute.ffa_fa3.flash_attn_config"].CONFIG
     del config["build_flags"][build_flag]
     monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", lambda device: 90)
-    magi_fa4_backend._prepare_default_magi_kernel.cache_clear()
 
     with pytest.raises(RuntimeError, match=build_flag):
         magi_fa4_backend._prepare_default_magi_kernel(torch.device("cuda"))
@@ -746,7 +753,6 @@ def test_magi_unsupported_mode_fails_before_backend_call(
 ):
     monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", lambda device: compute_capability)
     _set_fake_cutlass_backend(monkeypatch, available=False)
-    magi_fa4_backend._prepare_default_magi_kernel.cache_clear()
     with pytest.raises(RuntimeError, match=rf"does not support {expected_hardware}"):
         magi_fa4_backend._prepare_default_magi_kernel(device)
 
@@ -1639,8 +1645,6 @@ def _profile_attention_backend(
         raise ValueError(f"Unsupported profiling backend: {backend}")
 
     qkv = (query, key, value)
-    if backend == "magi_attention":
-        magi_fa4_backend._fa4_cache_entry = None
 
     device_api.reset_peak_memory_stats()
     compile_init_ms, result = _measure_wall(lambda: _profile_full_iteration(forward, qkv, output_gradient))

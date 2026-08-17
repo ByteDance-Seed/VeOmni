@@ -315,6 +315,7 @@ class _MagiFA4Function(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.softcap = softcap
         ctx.attn_arg = attn_arg
+        ctx.mark_non_differentiable(lse)
         return output, lse
 
     @staticmethod
