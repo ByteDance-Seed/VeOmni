@@ -59,8 +59,11 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, BagelQwen2MoTMetricMeterMixin, Pre
     main_input_name = "inputs_embeds"
     _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
     supports_gradient_checkpointing = True
+    # No _supports_sdpa: both attention paths below require
+    # veomni_flex_attention_with_sp, so advertising sdpa would only let
+    # transformers select an implementation this model rejects at the first
+    # forward, after weight loading and FSDP wrapping.
     _supports_flex_attn = True
-    _supports_sdpa = True
     _export_hf_checkpoint_with_weight_conversions = True
 
     def __init__(self, config: BagelQwen2MoTConfig):
