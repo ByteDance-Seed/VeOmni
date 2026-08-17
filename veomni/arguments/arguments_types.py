@@ -1305,10 +1305,6 @@ class ModelArguments:
         self.model_path = _resolve_hdfs_path(self.model_path)
         self.config_path = _resolve_hdfs_path(self.config_path)
         self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
-        for sub_args in (*self.encoders.values(), *self.decoders.values()):
-            for key in ("model_path", "config_path", "tokenizer_path"):
-                if sub_args.get(key) is not None:
-                    sub_args[key] = _resolve_hdfs_path(sub_args[key])
 
         if self.config_path is None:
             self.config_path = self.model_path
