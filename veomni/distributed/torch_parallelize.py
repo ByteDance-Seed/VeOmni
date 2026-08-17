@@ -315,17 +315,6 @@ def _load_one(
         )
 
 
-def _non_persistent_buffer_names(model: nn.Module) -> List[str]:
-    """Return the fully-qualified names of every ``persistent=False`` buffer."""
-    names = []
-    for module_name, module in model.named_modules():
-        for buffer_name in module._non_persistent_buffers_set:
-            if module._buffers.get(buffer_name) is None:
-                continue
-            names.append(f"{module_name}.{buffer_name}" if module_name else buffer_name)
-    return names
-
-
 def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
     """``fully_shard(..., shard_placement_fn=...)`` hook: shard on a model-chosen
     dimension instead of the FSDP2 default ``Shard(0)``.
@@ -863,41 +852,30 @@ def parallelize_model_ddp(
         )
         return model
 
-    # Buffers get no gradients, so DDP's gradient allreduce never covers them and
-    # the buffer broadcast is their only sync mechanism. Split them by the
-    # ``persistent`` flag rather than disabling that broadcast wholesale.
+    # ``broadcast_buffers=False`` to match the FSDP2 path, which is the same
+    # replication story: ``ParallelState.fsdp_mesh`` treats DDP as HSDP with a
+    # single ``dp_replicate`` dim, and ``fully_shard`` syncs no buffers at all
+    # (torch's FSDP has no ``_sync_module_states`` equivalent), so a module's
+    # buffer behaviour must not depend on which ``dp_mode`` the config picked.
     #
-    # ``persistent=False`` buffers (SigLIP's ``position_ids``, rotary ``inv_freq``,
-    # ...) are derived state, not replicated state that needs aligning: a static
-    # rope table comes out identical on every rank anyway, and dynamic-rope
-    # ``inv_freq`` is deliberately recomputed from *this* rank's sequence length,
-    # so pushing rank0's copy onto the others would actively corrupt them. Either
-    # way there is nothing to gain by broadcasting — while the in-place ``copy_``
-    # DDP does at the start of each forward corrupts any of them a live autograd
-    # graph saved for backward (PyTorch #22095 / #66504). That
-    # fires whenever a module is entered twice before one backward, which happens
-    # for every module owning more than one graph node: ``call_graph_endpoint``
-    # routes ``encode``/``decode`` through the wrapper too, so DDP's pre-forward
-    # hooks run per node. Ignoring them keeps the broadcast for persistent
-    # buffers, i.e. genuinely divergent replicated state such as BatchNorm
-    # running stats.
-    #
-    # Asymmetry worth knowing: FSDP2 broadcasts nothing — ``fully_shard`` only
-    # places buffers on the device and torch has no buffer-sync path there at all
-    # — so plain ``nn.BatchNorm*`` running stats drift across ranks under FSDP2
-    # whatever we do here, and under DDP they still break a module holding two
-    # graph nodes (BatchNorm's backward saves them, so the second node's sync
-    # trips the version counter). ``SyncBatchNorm`` is the dp_mode-independent
-    # fix: it all-reduces the statistics inside forward, so it needs neither this
-    # broadcast nor a single wrapper entry per backward.
-    model._ddp_params_and_buffers_to_ignore = sorted(
-        set(getattr(model, "_ddp_params_and_buffers_to_ignore", ())) | set(_non_persistent_buffer_names(model))
-    )
+    # Nothing is lost by not broadcasting. Config-derived buffers are already
+    # per-rank correct: a static rope table is identical everywhere, and
+    # dynamic-rope ``inv_freq`` is recomputed from *this* rank's sequence length,
+    # so pushing rank0's copy would actively corrupt the others. Genuinely
+    # replicated mutable state — ``nn.BatchNorm*`` running stats — is NOT fixed by
+    # this broadcast either: it overwrites every rank with rank0's copy, i.e.
+    # discards the other ranks' statistics, and it would break any module owning
+    # more than one graph node, because ``call_graph_endpoint`` enters the wrapper
+    # once per node and the in-place pre-forward ``copy_`` then hits a buffer the
+    # first node's autograd graph saved for backward (PyTorch #22095 / #66504).
+    # ``SyncBatchNorm`` is the one real fix — it all-reduces the statistics inside
+    # forward — and it works identically under DDP, FSDP2 and HSDP.
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],
         process_group=parallel_state.dp_group,
         find_unused_parameters=True,
+        broadcast_buffers=False,
     )
 
 
