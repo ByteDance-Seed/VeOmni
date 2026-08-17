@@ -30,10 +30,6 @@ importlib.util.find_spec = _find_spec_without_torch_npu  # type: ignore[assignme
 try:
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
     from veomni.arguments.arguments_types import ChannelLossConfig, ChunkMBSConfig
-    from veomni.models.seed_omni.foundation.qwen3_moe_foundation.modeling_qwen3_moe_foundation import (
-        Qwen3MoeFoundationModel,
-    )
-    from veomni.models.seed_omni.modeling_seed_omni import SeedOmniModel
     from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
         Qwen2_5OmniForConditionalGeneration,
     )
@@ -297,6 +293,21 @@ def test_channel_loss_unwraps_native_lora_model_for_eager_loss():
         assert computer._result[0]["source_id"] == 0
     finally:
         computer.uninstall()
+
+
+class SeedOmniModel(torch.nn.Module):
+    """Stand-in for the V1 SeedOmni root model.
+
+    ``ChannelLossComputer`` identifies these models by class and module *name*
+    instead of importing them, so the stand-ins below reproduce the exact
+    conditions it matches. The V1 modules themselves no longer exist.
+    """
+
+
+class Qwen3MoeFoundationModel(torch.nn.Module):
+    """Stand-in for the V1 SeedOmni Qwen3-MoE foundation model."""
+
+    __module__ = "veomni.models.seed_omni.foundation.qwen3_moe_foundation.modeling_qwen3_moe_foundation"
 
 
 def test_channel_loss_unwraps_seed_omni_foundation_loss():
