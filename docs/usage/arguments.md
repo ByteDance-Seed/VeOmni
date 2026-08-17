@@ -361,10 +361,8 @@ not change the returned training loss or gradients. Fused-loss backends may
 recompute the LM-head projection on sampled steps, so the default interval is
 10 steps; set `interval=1` for per-step metrics. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
-a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
-because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
-is unsupported because it packs source alignment metadata after the common step
-lifecycle. In DPO training, only the policy-model forward is observed; the
+a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
+alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
 reference-model forward is excluded, and the chosen/rejected segments both use
 their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
