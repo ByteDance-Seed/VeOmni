@@ -4,6 +4,8 @@
 # different from the text-only `qwen3_moe_lora.yaml`. The wrapper auto-detects
 # the v5 fused layout (`gate_up_proj` / `down_proj`) and matches the same eager
 # per-expert dispatch used by `Qwen3_5MoeExperts`.
+# The vision tower Linear layers are adapted with LoRA in this example. The
+# Conv3d patch embedding is not supported by native LoRA.
 
 model:
   model_path: Qwen/Qwen3.5-35B-A3B
@@ -23,6 +25,10 @@ model:
       - k_proj
       - v_proj
       - o_proj
+      - qkv
+      - proj
+      - linear_fc1
+      - linear_fc2
     target_parameters:
       - model.language_model.layers.*.mlp.experts.gate_up_proj
       - model.language_model.layers.*.mlp.experts.down_proj
@@ -49,7 +55,6 @@ train:
       fsdp_mode: fsdp2
   gradient_checkpointing:
     enable_reentrant: false
-  freeze_vit: true
   optimizer:
     lr: 1.0e-4
     lr_decay_style: cosine
