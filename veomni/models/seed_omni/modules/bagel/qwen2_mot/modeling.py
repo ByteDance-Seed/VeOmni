@@ -15,13 +15,25 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 if IS_NPU_AVAILABLE:
     import torch_npu
 from transformers import PreTrainedModel
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as TransformersQwen2MLP
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm as TransformersQwen2RMSNorm
 from transformers.utils import ModelOutput
 
+from ......ops.dispatch import OpSlot
 from ......ops.kernels.attention import fused_attention_forward
+from .checkpoint_conversion import (
+    BagelQwen2MoTCheckpointTensorConverter,
+    combine_qkv_state_dict_pre_hook,
+    split_qkv_state_dict_post_hook,
+)
 from .configuration import BagelQwen2MoTConfig
 from .masking import build_mot_block_mask
 from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
+
+
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 
 
 @contextmanager
@@ -48,11 +60,22 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, BagelQwen2MoTMetricMeterMixin, Pre
     _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
     supports_gradient_checkpointing = True
     _supports_flex_attn = True
+    _export_hf_checkpoint_with_weight_conversions = True
 
     def __init__(self, config: BagelQwen2MoTConfig):
         super().__init__(config)
         self.model = BagelQwen2MoTBackbone(config)
         self.post_init()
+
+    # The runtime stores one merged QKV parameter per MoT branch, while existing
+    # HF checkpoints keep separate Q/K/V keys. VeOmni's streaming loader bypasses
+    # load_state_dict hooks, so it needs this dedicated checkpoint converter.
+    @staticmethod
+    def _create_checkpoint_tensor_converter(
+        model: PreTrainedModel,
+    ) -> BagelQwen2MoTCheckpointTensorConverter:
+        del model
+        return BagelQwen2MoTCheckpointTensorConverter()
 
     def forward(  # type: ignore[override]
         self,
@@ -144,6 +167,34 @@ def _apply_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.numel() != 0 and k.numel() != 0 and veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        if unsqueeze_dim != 1:
+            raise NotImplementedError("BAGEL packed fused RoPE requires unsqueeze_dim=1.")
+        if q.ndim != 3 or k.ndim != 3 or cos.ndim != 2 or sin.ndim != 2:
+            raise NotImplementedError(
+                "BAGEL fused RoPE requires packed q/k tensors shaped [tokens, heads, head_dim] "
+                "and cos/sin tensors shaped [tokens, head_dim]."
+            )
+        if not (q.shape[0] == k.shape[0] == cos.shape[0] == sin.shape[0]):
+            raise ValueError("BAGEL packed q/k/cos/sin tensors must share the token dimension.")
+        if not (q.shape[-1] == k.shape[-1] == cos.shape[-1] == sin.shape[-1]):
+            raise NotImplementedError("Liger full RoPE does not support partial rotary dimensions.")
+
+        # The shared full-RoPE kernels consume [batch, heads, sequence, head_dim].
+        # BAGEL stores packed Q/K as [tokens, heads, head_dim], so adapt through
+        # a synthetic batch dimension and restore the packed layout afterwards.
+        q_embed, k_embed = veomni_apply_rotary_pos_emb(
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            cos.unsqueeze(0),
+            sin.unsqueeze(0),
+            unsqueeze_dim=1,
+        )
+        return (
+            q_embed.squeeze(0).transpose(0, 1).contiguous(),
+            k_embed.squeeze(0).transpose(0, 1).contiguous(),
+        )
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (_rotate_half(q) * sin)
@@ -233,6 +284,42 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+class Qwen2MLP(TransformersQwen2MLP):
+    """Qwen2 SwiGLU MLP using the configured VeOmni ops backend."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Empty modality branches retain zero-gradient FSDP anchors. Liger's
+        # Triton kernel cannot launch the resulting zero-row grid.
+        if x.numel() == 0:
+            return super().forward(x)
+
+        if veomni_swiglu_mlp.use_non_eager_impl:
+            if self.config.hidden_act not in {"silu", "swish"}:
+                raise ValueError(
+                    f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}. "
+                    "Set model.ops_implementation.swiglu_mlp_implementation='eager' "
+                    "to use the Transformers reference implementation."
+                )
+            return veomni_swiglu_mlp(self, x)
+
+        return super().forward(x)
+
+
+class Qwen2RMSNorm(TransformersQwen2RMSNorm):
+    """Qwen2 RMSNorm using the configured VeOmni ops backend."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Empty modality branches retain zero-gradient FSDP anchors. Liger's
+        # Triton kernel cannot launch the resulting zero-row grid.
+        if hidden_states.numel() == 0:
+            return super().forward(hidden_states)
+
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
+        return super().forward(hidden_states)
+
+
 class BagelQwen2MoTAttention(nn.Module):
     def __init__(self, config: BagelQwen2MoTConfig, layer_idx: int):
         super().__init__()
@@ -242,18 +329,27 @@ class BagelQwen2MoTAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+
+        self.query_size = self.num_heads * self.head_dim
+        self.key_value_size = self.num_key_value_heads * self.head_dim
+        self.qkv_split_sizes = (self.query_size, self.key_value_size, self.key_value_size)
+        qkv_size = sum(self.qkv_split_sizes)
+
+        self.qkv_proj_und = nn.Linear(self.hidden_size, qkv_size, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.q_proj_moe_gen = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+
+        self.qkv_proj_gen = nn.Linear(self.hidden_size, qkv_size, bias=True)
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm_moe_gen = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm_moe_gen = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        # Keep the public checkpoint schema unchanged even though the runtime
+        # parameters are merged: direct PyTorch loads combine legacy Q/K/V keys,
+        # and ordinary state_dict exports split the combined parameters again.
+        self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
+        self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
 
     def _forward_packed_train(
         self,
@@ -264,40 +360,25 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_und_token_indexes: torch.Tensor,
         packed_gen_token_indexes: torch.Tensor,
     ) -> torch.Tensor:
-        packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
-        packed_key_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
-        packed_value_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
+        packed_qkv_states = packed_sequence.new_zeros((packed_sequence.shape[0], sum(self.qkv_split_sizes)))
 
         packed_sequence_und = packed_sequence[packed_und_token_indexes]
         packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
         has_und_tokens = int(packed_und_token_indexes.numel()) > 0
         has_gen_tokens = int(packed_gen_token_indexes.numel()) > 0
 
-        query_states_und = self.q_proj(packed_sequence_und)
-        query_states_gen = self.q_proj_moe_gen(packed_sequence_gen)
-        key_states_und = self.k_proj(packed_sequence_und)
-        key_states_gen = self.k_proj_moe_gen(packed_sequence_gen)
-        value_states_und = self.v_proj(packed_sequence_und)
-        value_states_gen = self.v_proj_moe_gen(packed_sequence_gen)
-        packed_query_states[packed_und_token_indexes] = query_states_und
-        packed_query_states[packed_gen_token_indexes] = query_states_gen
-        packed_key_states[packed_und_token_indexes] = key_states_und
-        packed_key_states[packed_gen_token_indexes] = key_states_gen
-        packed_value_states[packed_und_token_indexes] = value_states_und
-        packed_value_states[packed_gen_token_indexes] = value_states_gen
+        qkv_states_und = self.qkv_proj_und(packed_sequence_und)
+        qkv_states_gen = self.qkv_proj_gen(packed_sequence_gen)
+        packed_qkv_states[packed_und_token_indexes] = qkv_states_und
+        packed_qkv_states[packed_gen_token_indexes] = qkv_states_gen
         if not has_und_tokens:
-            packed_query_states = _fold_zero_anchors(packed_query_states, query_states_und)
-            packed_key_states = _fold_zero_anchors(packed_key_states, key_states_und)
-            packed_value_states = _fold_zero_anchors(packed_value_states, value_states_und)
+            packed_qkv_states = _fold_zero_anchors(packed_qkv_states, qkv_states_und)
         if not has_gen_tokens:
-            packed_query_states = _fold_zero_anchors(packed_query_states, query_states_gen)
-            packed_key_states = _fold_zero_anchors(packed_key_states, key_states_gen)
-            packed_value_states = _fold_zero_anchors(packed_value_states, value_states_gen)
+            packed_qkv_states = _fold_zero_anchors(packed_qkv_states, qkv_states_gen)
 
+        packed_query_states, packed_key_states, packed_value_states = packed_qkv_states.split(
+            self.qkv_split_sizes, dim=-1
+        )
         packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
         packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -365,33 +446,29 @@ class BagelQwen2MoTAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project packed inference tokens through the matching MoT attention expert."""
         if not is_gen:
-            packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
-            packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
-            packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+            packed_query_states, packed_key_states, packed_value_states = self.qkv_proj_und(
+                packed_query_sequence
+            ).split(self.qkv_split_sizes, dim=-1)
+            packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+            packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
             packed_query_states = self.q_norm(packed_query_states)
             packed_key_states = self.k_norm(packed_key_states)
             return packed_query_states, packed_key_states, packed_value_states
 
         packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
-        packed_query_states = packed_query_sequence.new_zeros(
-            (packed_query_sequence.shape[0], self.num_heads * self.head_dim)
-        )
-        packed_key_states = packed_query_sequence.new_zeros(
-            (packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
-        packed_value_states = packed_query_sequence.new_zeros(
-            (packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim)
+        packed_qkv_states = packed_query_sequence.new_zeros(
+            (packed_query_sequence.shape[0], sum(self.qkv_split_sizes))
         )
 
         packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
         packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-        packed_query_states[packed_text_indexes] = self.q_proj(packed_text_query_sequence)
-        packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence)
-        packed_key_states[packed_text_indexes] = self.k_proj(packed_text_query_sequence)
-        packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence)
-        packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
-        packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
+        packed_qkv_states[packed_text_indexes] = self.qkv_proj_und(packed_text_query_sequence)
+        packed_qkv_states[packed_vae_token_indexes] = self.qkv_proj_gen(packed_vae_query_sequence)
 
+        packed_query_states, packed_key_states, packed_value_states = packed_qkv_states.split(
+            self.qkv_split_sizes, dim=-1
+        )
         packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim).to(torch.float32)
         packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim).to(torch.float32)
         packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)

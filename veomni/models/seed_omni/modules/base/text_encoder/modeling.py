@@ -10,11 +10,11 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ......distributed.parallel_state import get_parallel_state
-from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
+from ......ops.kernels.cross_entropy import ForCausalLMLoss
+from ......ops.kernels.cross_entropy.eager import eager_cross_entropy
 from ....mixins.emb_parallel import EmbParallelMixin
 from .configuration import TextEncoderConfig
 from .modulemixin import TextEncoderMetricMeterMixin, TextEncoderModuleMixin
@@ -25,7 +25,7 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, EmbParall
 
     config_class = TextEncoderConfig
     base_model_prefix = ""
-    _no_split_modules: list = ["Embedding", "Linear"]
+    _no_split_modules: list = ["Embedding"]
     main_input_name = "input_ids"
     supports_gradient_checkpointing = True
 
@@ -101,43 +101,38 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, EmbParall
         shift_labels: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> dict:
-        logits = self._project(hidden_states)
+        del kwargs
         loss: torch.Tensor | None = None
+        has_labels = shift_labels is not None or labels is not None
 
-        if shift_labels is not None:
-            flat_labels = shift_labels.view(-1)
-            ce_sum = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                flat_labels,
-                ignore_index=-100,
-                reduction="sum",
-            )
-            # Token-weighted mean over the FULL data-parallel + SP mesh
-            # (``dp_sp`` == ``fsdp_group``): every valid token is weighted equally
-            # and the objective is IDENTICAL no matter how the global batch is
-            # split into DP vs SP — the invariant that makes per-module SP
-            # accuracy-transparent. ``reduce_sequence_parallel_loss`` all-reduces
-            # this rank's local CE sum / valid-token count over ``dp_sp`` and its
-            # backward scales grads by ``|dp_sp|``, exactly cancelling FSDP2's
-            # reduce-scatter (÷dp_shard_sp) + HSDP all-reduce (÷dp_replicate) so
-            # the gradient is the true global token-mean. (A plain per-rank
-            # ``ce_sum/n_valid`` would instead give a DP mean-of-means that
-            # over-weights ranks holding few valid tokens.)
+        if not has_labels:
+            # Inference path: materialize logits because no loss is requested.
+            logits = self._project(hidden_states)
+        elif self.lm_head is not None and self.lm_head.bias is None:
+            # Non-tied, bias-free training path: delegate to the selected ops loss.
             ps = get_parallel_state()
-            n_valid_local = (flat_labels != -100).sum()
-            local_mean = ce_sum / n_valid_local.clamp(min=1)
-            loss = reduce_sequence_parallel_loss(local_mean, n_valid_local.to(local_mean.dtype), group=ps.fsdp_group)
-        elif labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_targets = labels[..., 1:].contiguous()
-            ce_sum = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_targets.view(-1),
-                ignore_index=-100,
-                reduction="sum",
+            loss, logits, _ = self.loss_function(
+                logits=None,
+                labels=labels if labels is not None else shift_labels,
+                shift_labels=shift_labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                loss_reduction_group=ps.fsdp_group,
             )
-            n_valid = (shift_targets != -100).sum().clamp(min=1)
-            loss = ce_sum / n_valid
+        else:
+            # Tied embeddings and biased heads cannot use the weight-only fused
+            # linear contract, so retain their explicit projection + eager CE.
+            logits = self._project(hidden_states)
+            ps = get_parallel_state()
+            loss, _, _ = ForCausalLMLoss(
+                logits=logits,
+                labels=labels if labels is not None else shift_labels,
+                shift_labels=shift_labels,
+                vocab_size=self.config.vocab_size,
+                loss_reduction_group=ps.fsdp_group,
+                cross_entropy_fn=eager_cross_entropy,
+            )
 
         return {
             "loss": loss,

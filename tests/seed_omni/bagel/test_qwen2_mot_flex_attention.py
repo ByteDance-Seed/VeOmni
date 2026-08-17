@@ -394,8 +394,8 @@ def test_training_forward_gradient_checkpointing_reuses_one_block_mask(monkeypat
     assert build_count == 1
     assert text.grad is not None and torch.isfinite(text.grad).all()
     assert output.grad is not None and torch.isfinite(output.grad).all()
-    assert model.model.layers[0].self_attn.q_proj.weight.grad is not None
-    assert model.model.layers[0].self_attn.q_proj_moe_gen.weight.grad is not None
+    assert model.model.layers[0].self_attn.qkv_proj_und.weight.grad is not None
+    assert model.model.layers[0].self_attn.qkv_proj_gen.weight.grad is not None
 
 
 def test_native_gqa_rejects_invalid_global_head_ratio_at_config_init() -> None:
