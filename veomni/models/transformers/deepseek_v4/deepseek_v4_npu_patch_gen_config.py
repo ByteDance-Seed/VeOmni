@@ -157,6 +157,13 @@ config.add_import(
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
+# The reused TopKRouter.forward calls the router-replay hook, so the generated
+# NPU module needs the same names the GPU one imports.
+config.add_import(
+    "veomni.utils.moe_router_replay",
+    names=["get_active_replay", "maybe_replay_indices"],
+)
+
 config.add_post_import_block(
     """
     from veomni.ops.dispatch import OpSlot, OpsConfigSlot
