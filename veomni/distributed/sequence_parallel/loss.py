@@ -42,7 +42,6 @@ class ReduceLoss(torch.autograd.Function):
         dist.all_reduce(loss, group=group)
         dist.all_reduce(num_valid_tokens, group=group)
         ctx.save_for_backward(local_num_tokens, num_valid_tokens)
-        ctx.sp_world_size = dist.get_world_size(group) if group else 1
 
         # FIX: When ALL ranks in the SP group have zero valid tokens,
         # global num_valid_tokens = 0 after all_reduce, causing 0/0 = NaN.
@@ -59,7 +58,11 @@ class ReduceLoss(torch.autograd.Function):
 
         # FIX: Mirror the forward guard — zero grad when global tokens = 0,
         # preventing NaN grad_output from corrupting downstream parameters.
-        grad_output = ctx.sp_world_size * local_num_tokens * grad_output / global_num_tokens.clamp(min=1)
+        # The forward computes a token-weighted global mean
+        #   loss_out = (sum_j loss_j * n_j) / (sum_j n_j),
+        # whose gradient w.r.t. the local mean loss_j is n_j / sum_j n_j. There
+        # is no sequence-parallel world-size factor here.
+        grad_output = local_num_tokens * grad_output / global_num_tokens.clamp(min=1)
         return grad_output, None, None
 
 
