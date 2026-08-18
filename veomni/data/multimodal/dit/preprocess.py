@@ -1,5 +1,6 @@
 # dit preprocess should not be used for llm or mllms
 from ..preprocess import PREPROCESSOR_REGISTRY
+from . import minimax_h3_preprocess  # register minimax_h3 preprocessor  # noqa: F401
 
 
 @PREPROCESSOR_REGISTRY.register("Tom-and-Jerry-VideoGeneration-Dataset")

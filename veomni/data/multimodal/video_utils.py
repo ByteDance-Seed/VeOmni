@@ -17,14 +17,17 @@ import math
 import subprocess
 from typing import ByteString, Dict, List, Optional, Union
 
+import av
 import numpy as np
 import PIL
 import torch
+from PIL import Image
 from torchvision.transforms import InterpolationMode, functional
+from tqdm import tqdm
 
 from ...utils import logging
 from ...utils.import_utils import is_ffmpeg_available
-from .audio_utils import extract_audio_from_video
+from .audio_utils import _prepare_audio_stream, _write_audio, extract_audio_from_video
 
 
 logger = logging.get_logger(__name__)
@@ -873,3 +876,61 @@ def save_video_tensors_to_file(
         finally:
             if os.path.exists(tmp_audio_path):
                 os.remove(tmp_audio_path)
+
+
+def write_video_audio(
+    video: list[Image.Image],
+    audio: torch.Tensor | None,
+    output_path: str,
+    fps: int = 24,
+    audio_sample_rate: int | None = None,
+) -> None:
+    """
+    Writes a sequence of images and an audio tensor to a video file.
+
+    This function utilizes PyAV (or a similar multimedia library) to encode a list of PIL images into a video stream
+    and multiplex a PyTorch tensor as the audio stream into the output container.
+
+    Args:
+        video (list[Image.Image]): A list of PIL Image objects representing the video frames.
+            The length of this list determines the total duration of the video based on the FPS.
+        audio (torch.Tensor | None): The audio data as a PyTorch tensor.
+            The shape is typically (channels, samples). If no audio is required, pass None.
+            channels can be 1 or 2. 1 for mono, 2 for stereo.
+        output_path (str): The file path (including extension) where the output video will be saved.
+        fps (int, optional): The frame rate (frames per second) for the video. Defaults to 24.
+        audio_sample_rate (int | None, optional): The sample rate (e.g., 44100, 48000) for the audio.
+            If the audio tensor is provided and this is None, the function attempts to infer the rate
+            based on the audio tensor's length and the video duration.
+    Raises:
+        ValueError: If an audio tensor is provided but the sample rate cannot be determined.
+    """
+    duration = len(video) / fps
+    if audio_sample_rate is None:
+        audio_sample_rate = int(audio.shape[-1] / duration)
+
+    width, height = video[0].size
+    container = av.open(output_path, mode="w")
+    stream = container.add_stream("libx264", rate=int(fps))
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = "yuv420p"
+
+    if audio is not None:
+        if audio_sample_rate is None:
+            raise ValueError("audio_sample_rate is required when audio is provided")
+        audio_stream = _prepare_audio_stream(container, audio_sample_rate)
+
+    for frame in tqdm(video, total=len(video)):
+        frame = av.VideoFrame.from_image(frame)
+        for packet in stream.encode(frame):
+            container.mux(packet)
+
+    # Flush encoder
+    for packet in stream.encode():
+        container.mux(packet)
+
+    if audio is not None:
+        _write_audio(container, audio_stream, audio, audio_sample_rate)
+
+    container.close()

@@ -76,6 +76,7 @@ from ..utils.device import (
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
+from ..utils.registry import Registry
 from .callbacks import (
     ChannelLossCallback,
     CheckpointerCallback,
@@ -92,6 +93,11 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+# Trainer registry keyed by data.datasets_type. Task entry points look up the
+# trainer class here (falling back to the default), letting per-model packages
+# ship their own trainer subclasses (see models/diffusers/minimax_h3/trainer.py).
+TRAINER_REGISTRY = Registry("Trainer")
 
 
 def _has_trainable_lora_parameters(module: torch.nn.Module | None) -> bool:
@@ -605,6 +611,7 @@ class BaseTrainer(Stateful, ABC):
         self.optimizer = build_optimizer(
             self.model,
             lr=args.train.optimizer.lr,
+            betas=args.train.optimizer.betas,
             weight_decay=args.train.optimizer.weight_decay,
             fused=True,
             optimizer_type=args.train.optimizer.type,

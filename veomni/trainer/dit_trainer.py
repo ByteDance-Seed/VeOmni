@@ -145,6 +145,17 @@ class DiTDataArguments(DataArguments):
         default=True,
         metadata={"help": "Whether or not to shuffle the dataset."},
     )
+    data_transform: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Override the DATA_TRANSFORM_REGISTRY transform name. "
+            "When None, DiTTrainer picks dit_offline/dit_online by training_task."
+        },
+    )
+    log_sample: bool = field(
+        default=True,
+        metadata={"help": "Whether to print the first micro batch example to the log."},
+    )
 
 
 @dataclass
@@ -191,6 +202,7 @@ class DiTTrainer:
         # ``base._setup`` registers ParallelState; DiT then recomputes
         # dataloader_batch_size from ``dp_size``.
         self._setup()
+        self.base.LOG_SAMPLE = args.data.log_sample
 
         # All build steps read the current ParallelState via ``get_parallel_state()``
         # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
@@ -236,7 +248,9 @@ class DiTTrainer:
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
         args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
         if args.train.training_task == "offline_embedding":
-            assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
+            assert args.data.datasets_type in ("mapping", "minimax_h3_online"), (
+                "Datasets type must be mapping for offline embedding."
+            )
             if args.data.offline_embedding_save_dir is None:
                 self.offline_embedding_save_dir = f"{args.data.train_path}_offline"
             else:
@@ -322,7 +336,12 @@ class DiTTrainer:
 
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
-        if self.training_task == "offline_training":
+        if self.training_task == "offline_embedding":
+            self.base.data_transform = build_data_transform(
+                args.data.data_transform,
+                **args.data.mm_configs,
+            )
+        elif self.training_task == "offline_training":
             self.base.data_transform = build_data_transform("dit_offline")
         else:
             self.base.data_transform = build_data_transform(

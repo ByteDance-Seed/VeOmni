@@ -5,8 +5,8 @@ import math
 import torch
 import torch.nn as nn
 
-from ..core.attention import attention_forward
-from ..core.gradient import gradient_checkpoint_forward
+from .core import attention_forward, gradient_checkpoint_forward
+
 
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
 _PATCH_T, _PATCH_H, _PATCH_W = 1, 2, 2
@@ -85,7 +85,7 @@ class MiniMaxH3Rope(nn.Module):
     def __init__(self, inv_freq_len: int) -> None:
         super().__init__()
         self.inv_freq_len = inv_freq_len
-        self.inv_freq = nn.Parameter(self._build_inv_freq())
+        self.register_buffer("inv_freq", self._build_inv_freq(), persistent=False)
 
     def _build_inv_freq(self, device=None) -> torch.Tensor:
         steps = torch.arange(0, self.inv_freq_len, dtype=torch.float32, device=device)
@@ -111,9 +111,7 @@ class MiniMaxH3TimeEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
         half = self.frequency_embedding_size // 2
-        freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=t.device) / half
-        )
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
         args = t.to(torch.float32)[:, None] * freqs[None]
         t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         hidden = self.proj_in(t_freq.to(dtype))
@@ -198,10 +196,25 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
 
 
 class MiniMaxH3TokenRefiner(nn.Module):
-    def __init__(self, num_layers, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps, final_norm_eps):
+    def __init__(
+        self,
+        num_layers,
+        hidden_size,
+        num_attention_heads,
+        attention_head_dim,
+        ffn_hidden_size,
+        norm_eps,
+        qk_norm_eps,
+        final_norm_eps,
+    ):
         super().__init__()
         self.blocks = nn.ModuleList(
-            [MiniMaxH3TokenRefinerBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps) for _ in range(num_layers)]
+            [
+                MiniMaxH3TokenRefinerBlock(
+                    hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.final_norm = _norm(hidden_size, eps=final_norm_eps)
 
@@ -212,13 +225,25 @@ class MiniMaxH3TokenRefiner(nn.Module):
 
 
 class MiniMaxH3DiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, time_embed_dim, adaln_out_features, norm_eps, qk_norm_eps):
+    def __init__(
+        self,
+        hidden_size,
+        num_attention_heads,
+        attention_head_dim,
+        ffn_hidden_size,
+        time_embed_dim,
+        adaln_out_features,
+        norm_eps,
+        qk_norm_eps,
+    ):
         super().__init__()
         self.norm1 = _norm(hidden_size, eps=norm_eps)
         self.norm2 = _norm(hidden_size, eps=norm_eps)
         self.attn = MiniMaxH3Attention(hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps)
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
-        self.adaln_proj = MiniMaxH3AdalnProj(hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM)
+        self.adaln_proj = MiniMaxH3AdalnProj(
+            hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM
+        )
 
     def forward(self, x, *, t_emb, combined_indices, rope_freqs, cu_seqlens, max_seqlen):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
@@ -231,15 +256,27 @@ class MiniMaxH3DiTBlock(nn.Module):
         h = self.norm2(x)
         h = _modulate_scale_shift(h, shift_mlp, scale_mlp, combined_indices)
         h = self.mlp(h)
-        return _modulate_gate(residual, gate_mlp, h, combined_indices)
+        out = _modulate_gate(residual, gate_mlp, h, combined_indices)
+        return out
 
 
 class MiniMaxH3FinalLayer(nn.Module):
-    def __init__(self, hidden_size, time_embed_dim, final_adaln_out_features, latents_dim, audio_latents_dim, patch_size, final_norm_eps):
+    def __init__(
+        self,
+        hidden_size,
+        time_embed_dim,
+        final_adaln_out_features,
+        latents_dim,
+        audio_latents_dim,
+        patch_size,
+        final_norm_eps,
+    ):
         super().__init__()
         video_patch_dim = latents_dim * patch_size[0] * patch_size[1] * patch_size[2]
         self.norm = _norm(hidden_size, eps=final_norm_eps)
-        self.adaln_proj = MiniMaxH3AdalnProj(hidden_size, time_embed_dim, final_adaln_out_features, expand_ratio=2, modality_num=1)
+        self.adaln_proj = MiniMaxH3AdalnProj(
+            hidden_size, time_embed_dim, final_adaln_out_features, expand_ratio=2, modality_num=1
+        )
         self.video_out = nn.Linear(hidden_size, video_patch_dim, bias=True)
         self.audio_out = nn.Linear(hidden_size, audio_latents_dim, bias=True)
 
@@ -257,7 +294,7 @@ class MiniMaxH3DiT(nn.Module):
 
     def __init__(
         self,
-        num_layers: int = 50,
+        num_layers: int = 8,
         token_refiner_num_layers: int = 2,
         hidden_size: int = 5376,
         num_attention_heads: int = 56,
@@ -279,6 +316,7 @@ class MiniMaxH3DiT(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        self._block_offload_enabled = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_channels_latents = latents_dim
@@ -290,15 +328,78 @@ class MiniMaxH3DiT(nn.Module):
         self.time_embedder = MiniMaxH3TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim)
         self.rope = MiniMaxH3Rope(rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
-            token_refiner_num_layers, hidden_size, num_attention_heads, attention_head_dim,
-            ffn_hidden_size, norm_eps, qk_norm_eps, final_norm_eps,
+            token_refiner_num_layers,
+            hidden_size,
+            num_attention_heads,
+            attention_head_dim,
+            ffn_hidden_size,
+            norm_eps,
+            qk_norm_eps,
+            final_norm_eps,
         )
         self.blocks = nn.ModuleList(
-            [MiniMaxH3DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size, time_embed_dim, adaln_out_features, norm_eps, qk_norm_eps) for _ in range(num_layers)]
+            [
+                MiniMaxH3DiTBlock(
+                    hidden_size,
+                    num_attention_heads,
+                    attention_head_dim,
+                    ffn_hidden_size,
+                    time_embed_dim,
+                    adaln_out_features,
+                    norm_eps,
+                    qk_norm_eps,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        self.final_layer = MiniMaxH3FinalLayer(hidden_size, time_embed_dim, final_adaln_out_features, latents_dim, audio_latents_dim, patch_size, final_norm_eps)
+        self.final_layer = MiniMaxH3FinalLayer(
+            hidden_size,
+            time_embed_dim,
+            final_adaln_out_features,
+            latents_dim,
+            audio_latents_dim,
+            patch_size,
+            final_norm_eps,
+        )
 
-    def _embed(self, *, x, audio_x, text_embeddings_selected, unique_timesteps, img_pos, audio_pos, text_pos, refiner_cu_seqlens, refiner_max_seqlen, seq_len, device):
+    def enable_block_offload(self, split: int = None):
+        """Inference-only VRAM management: run the main blocks in two
+        device-resident halves (block-level offloading). The first
+        half stays on the compute device between steps; the second half is
+        staged in per step and moved back to CPU afterwards."""
+        self._block_offload_enabled = True
+        self._block_swap = (len(self.blocks) // 2) if split is None else split
+
+    def _stage_side_modules(self, device):
+        # Small fixed modules outside the main block loop (patch projs,
+        # token refiner, final layer, ~4.5GB total): keep them on the
+        # compute device for the whole forward.
+        for module in (
+            self.video_patch_proj,
+            self.audio_patch_proj,
+            self.condition_proj,
+            self.time_embedder,
+            self.rope,
+            self.token_refiner,
+            self.final_layer,
+        ):
+            module.to(device)
+
+    def _embed(
+        self,
+        *,
+        x,
+        audio_x,
+        text_embeddings_selected,
+        unique_timesteps,
+        img_pos,
+        audio_pos,
+        text_pos,
+        refiner_cu_seqlens,
+        refiner_max_seqlen,
+        seq_len,
+        device,
+    ):
         dtype = text_embeddings_selected.dtype
         x_rows = x.view(-1, x.shape[-1]).index_select(0, img_pos).to(dtype)
         video_embed = self.video_patch_proj(x_rows)
@@ -356,14 +457,23 @@ class MiniMaxH3DiT(nn.Module):
         seq_len = int(x.shape[1])
         device = x.device
 
+        if self._block_offload_enabled:
+            self._stage_side_modules(device)
+
         rope_freqs = self.rope(img_position_ids).to(device)
 
         decoder_input, t_emb = self._embed(
-            x=x, audio_x=audio_x, text_embeddings_selected=text_selected,
+            x=x,
+            audio_x=audio_x,
+            text_embeddings_selected=text_selected,
             unique_timesteps=unique_timesteps.view(-1).to(device),
-            img_pos=img_pos.to(device), audio_pos=audio_pos.to(device), text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device), refiner_max_seqlen=refiner_max,
-            seq_len=seq_len, device=device,
+            img_pos=img_pos.to(device),
+            audio_pos=audio_pos.to(device),
+            text_pos=text_pos.to(device),
+            refiner_cu_seqlens=refiner_cu.to(device),
+            refiner_max_seqlen=refiner_max,
+            seq_len=seq_len,
+            device=device,
         )
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
@@ -371,7 +481,17 @@ class MiniMaxH3DiT(nn.Module):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
-        for block in self.blocks:
+        block_swap = self._block_swap if self._block_offload_enabled else 0
+        for i, block in enumerate(self.blocks):
+            if self._block_offload_enabled:
+                if i == 0:
+                    for b in self.blocks[:block_swap]:
+                        b.to(device)
+                elif i == block_swap:
+                    for b in self.blocks[:block_swap]:
+                        b.to("cpu")
+                    for b in self.blocks[block_swap:]:
+                        b.to(device)
             hidden = gradient_checkpoint_forward(
                 block,
                 use_gradient_checkpointing,
@@ -383,6 +503,10 @@ class MiniMaxH3DiT(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
+
+        if self._block_offload_enabled:
+            for b in self.blocks[block_swap:]:
+                b.to("cpu")
 
         video_logits, audio_logits = self.final_layer(hidden, t_emb=t_emb, inverse_indices=inverse_indices)
 

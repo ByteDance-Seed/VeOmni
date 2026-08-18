@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
-from ..core.attention import attention_forward
+
+from .core import attention_forward
 
 
 class WarpedTensor(torch.nn.Module):
@@ -23,7 +24,26 @@ class WarpedTensor(torch.nn.Module):
 
 
 class WeightNormedConv1d(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride = 1, padding = 0, dilation = 1, groups = 1, bias = True, padding_mode = "zeros", device=None, dtype=None):
+    """Weight-normalized Conv1d with float32 norm computation.
+
+    Computes weight = (weight_g.float() * weight_v.float() / ||weight_v.float||).to(dtype)
+    in float32 for numerical precision, then calls F.conv1d.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=True,
+        padding_mode="zeros",
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.weight_g = torch.nn.Parameter(torch.empty((out_channels, 1, 1)))
         self.weight_v = torch.nn.Parameter(torch.empty((out_channels, in_channels, kernel_size)))
@@ -38,14 +58,32 @@ class WeightNormedConv1d(torch.nn.Module):
 
     def forward(self, input):
         dtype = self.weight_g.dtype
-        weight = (self.weight_g.float() * self.weight_v.float() / torch.norm(self.weight_v.float(), dim=(1, 2), keepdim=True)).to(dtype)
+        weight = (
+            self.weight_g.float() * self.weight_v.float() / torch.norm(self.weight_v.float(), dim=(1, 2), keepdim=True)
+        ).to(dtype)
         return torch.nn.functional.conv1d(
             input, weight, self.bias, self.stride, self.padding, self.dilation, self.groups
         )
 
 
 class WeightNormedConvTranspose1d(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride = 1, padding = 0, output_padding = 0, dilation = 1, groups = 1, bias = True, padding_mode = "zeros", device=None, dtype=None):
+    """Weight-normalized ConvTranspose1d with float32 norm computation."""
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        output_padding=0,
+        dilation=1,
+        groups=1,
+        bias=True,
+        padding_mode="zeros",
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.weight_g = torch.nn.Parameter(torch.empty((in_channels, 1, 1)))
         self.weight_v = torch.nn.Parameter(torch.empty((in_channels, out_channels, kernel_size)))
@@ -89,8 +127,7 @@ class WeightNormedConvTranspose1d(torch.nn.Module):
                 dim_size = (
                     (input.size(d + num_non_spatial_dims) - 1) * stride[d]
                     - 2 * padding[d]
-                    + (dilation[d] if dilation is not None else 1)
-                    * (kernel_size[d] - 1)
+                    + (dilation[d] if dilation is not None else 1) * (kernel_size[d] - 1)
                     + 1
                 )
                 min_sizes.append(dim_size)
@@ -115,7 +152,9 @@ class WeightNormedConvTranspose1d(torch.nn.Module):
 
     def forward(self, input, output_size=None):
         dtype = self.weight_g.dtype
-        weight = (self.weight_g.float() * self.weight_v.float() / torch.norm(self.weight_v.float(), dim=(1, 2), keepdim=True)).to(dtype)
+        weight = (
+            self.weight_g.float() * self.weight_v.float() / torch.norm(self.weight_v.float(), dim=(1, 2), keepdim=True)
+        ).to(dtype)
         assert isinstance(self.padding, tuple)
         num_spatial_dims = 1
         output_padding = self._output_padding(
@@ -151,9 +190,11 @@ class Snake(nn.Module):
 
     def forward(self, x):
         alpha = self.alpha
-        if len(alpha.shape) == 1: alpha = alpha.unsqueeze(0).unsqueeze(-1).exp()
+        if len(alpha.shape) == 1:
+            alpha = alpha.unsqueeze(0).unsqueeze(-1).exp()
         beta = self.alpha if self.beta is None else self.beta
-        if len(beta.shape) == 1: beta = beta.unsqueeze(0).unsqueeze(-1).exp()
+        if len(beta.shape) == 1:
+            beta = beta.unsqueeze(0).unsqueeze(-1).exp()
         x = x + (beta + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
         return x
 
@@ -210,7 +251,9 @@ class UpSample1d(nn.Module):
     def forward(self, x):
         _, C, _ = x.shape
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        x = self.ratio * F.conv_transpose1d(x, self.filter.expand(C, -1, -1).to(dtype=x.dtype, device=x.device), stride=self.stride, groups=C)
+        x = self.ratio * F.conv_transpose1d(
+            x, self.filter.expand(C, -1, -1).to(dtype=x.dtype, device=x.device), stride=self.stride, groups=C
+        )
         x = x[..., self.pad_left : -self.pad_right]
         return x
 
@@ -220,7 +263,9 @@ class DownSample1d(nn.Module):
         super().__init__()
         self.ratio = ratio
         self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-        self.lowpass = LowPassFilter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, stride=ratio, kernel_size=self.kernel_size)
+        self.lowpass = LowPassFilter1d(
+            cutoff=0.5 / ratio, half_width=0.6 / ratio, stride=ratio, kernel_size=self.kernel_size
+        )
 
     def forward(self, x):
         return self.lowpass(x)
@@ -264,6 +309,8 @@ class GeGluMlp(nn.Module):
 
 
 class CausalAttention(nn.Module):
+    """Causal multi-head attention with backend dispatch via attention_forward."""
+
     def __init__(self, in_dim, out_dim, num_heads):
         super().__init__()
         self.qkv = nn.Linear(in_dim, in_dim * 3, bias=False)
@@ -277,7 +324,17 @@ class CausalAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = q + self.q_bias(), k + self.zero_k_bias(), v + self.v_bias()
-        x = attention_forward(q, k, v, q_pattern="b s (n d)", k_pattern="b s (n d)", v_pattern="b s (n d)", out_pattern="b n s d", dims={"n": self.num_heads}, is_causal=True)
+        x = attention_forward(
+            q,
+            k,
+            v,
+            q_pattern="b s (n d)",
+            k_pattern="b s (n d)",
+            v_pattern="b s (n d)",
+            out_pattern="b n s d",
+            dims={"n": self.num_heads},
+            is_causal=True,
+        )
         x = torch.mean(x, dim=1)
         x = F.adaptive_avg_pool1d(x, self.out_dim)
         x = self.proj(x)
@@ -341,7 +398,9 @@ class EncoderBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, d_model: int = 64, strides: list = [2, 4, 8, 8], d_latent: int = 64):
+    def __init__(self, d_model: int = 64, strides: list = None, d_latent: int = 64):
+        if strides is None:
+            strides = [2, 4, 8, 8]
         super().__init__()
         self.block = [WeightNormedConv1d(1, d_model, kernel_size=7, padding=3)]
         for stride in strides:
@@ -360,9 +419,25 @@ class Encoder(nn.Module):
 class AMPBlock1(torch.nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
         super().__init__()
-        self.convs1 = nn.ModuleList([WeightNormedConv1d(channels, channels, kernel_size, stride=1, dilation=d, padding=int((kernel_size * d - d) / 2)) for d in dilation])
-        self.convs2 = nn.ModuleList([WeightNormedConv1d(channels, channels, kernel_size, stride=1, dilation=1, padding=int((kernel_size - 1) / 2)) for _ in range(len(dilation))])
-        self.activations = nn.ModuleList([Activation1d(activation=Snake(channels, beta=True)) for _ in range(2 * len(dilation))])
+        self.convs1 = nn.ModuleList(
+            [
+                WeightNormedConv1d(
+                    channels, channels, kernel_size, stride=1, dilation=d, padding=int((kernel_size * d - d) / 2)
+                )
+                for d in dilation
+            ]
+        )
+        self.convs2 = nn.ModuleList(
+            [
+                WeightNormedConv1d(
+                    channels, channels, kernel_size, stride=1, dilation=1, padding=int((kernel_size - 1) / 2)
+                )
+                for _ in range(len(dilation))
+            ]
+        )
+        self.activations = nn.ModuleList(
+            [Activation1d(activation=Snake(channels, beta=True)) for _ in range(2 * len(dilation))]
+        )
 
     def forward(self, x):
         acts1, acts2 = self.activations[::2], self.activations[1::2]
@@ -379,10 +454,14 @@ class BigVGAN(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.conv_pre = WeightNormedConv1d(2048, 1024, 7, 1, padding=3)
-        self.ups = nn.ModuleList([
-            nn.ModuleList([WeightNormedConvTranspose1d(1024 // (2**i), 1024 // (2**(i+1)), k, u, padding=(k-u)//2)])
-            for i, (u, k) in enumerate(zip([5, 5, 2, 2, 2, 2, 2], [9, 9, 4, 4, 4, 4, 4]))
-        ])
+        self.ups = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [WeightNormedConvTranspose1d(1024 // (2**i), 1024 // (2 ** (i + 1)), k, u, padding=(k - u) // 2)]
+                )
+                for i, (u, k) in enumerate(zip([5, 5, 2, 2, 2, 2, 2], [9, 9, 4, 4, 4, 4, 4]))
+            ]
+        )
         self.resblocks = nn.ModuleList()
         for i in range(7):
             ch = 1024 // (2 ** (i + 1))
@@ -405,23 +484,92 @@ class BigVGAN(torch.nn.Module):
         return x
 
 
-_AUDIO_LATENTS_MEAN = [-0.020211687488382354, 0.3876466479950502, -0.04398279799186767, -0.28591514936373, 0.08179686214561671, -0.35782641352446604, 0.040623809960919084, -0.01552534501956604, -0.223362481667332, 0.1821006842509091, 0.2941778783780663, -0.07901167601970885, -0.056815072777201, -0.3699028221860095, -0.31616315591624855, 0.5905951377425391, -0.052139568068853864, 0.013673160263486295, -0.03691647864630577, 0.09732660653298163, -0.3394662328788498, -0.30685677538541667, -0.24504598907458763, -0.034698524462007344, 0.02868032184767538, -0.21217779266454084, -0.1678263169941987, 0.3221287889040614, -0.1223055851554907, 0.4356604928128464, -0.0502599202236253, 0.3979258376211797]
-_AUDIO_LATENTS_STD = [1.6895524230479284, 2.76263727217653, 1.7945344281264435, 1.6801681847309828, 1.6390226546605453, 2.7788298348882177, 1.7659090095747236, 1.6199757612137327, 2.6336525640336896, 1.8539356672817833, 2.5056497896915633, 1.811019237886178, 1.9579657790720237, 1.6685498243529284, 1.4922469314453364, 3.298670198067373, 1.9491804496832168, 1.8720003270431442, 1.8334080103291832, 1.6488070416529093, 1.6176957696319716, 1.9131449234774398, 1.5695245398428617, 1.6943659940415912, 1.8318420762504692, 1.5540637421583379, 1.9344930328968526, 1.599198216109855, 1.718045989838149, 1.6307219190837705, 1.8661226051202384, 1.5613768203168363]
+_AUDIO_LATENTS_MEAN = [
+    -0.020211687488382354,
+    0.3876466479950502,
+    -0.04398279799186767,
+    -0.28591514936373,
+    0.08179686214561671,
+    -0.35782641352446604,
+    0.040623809960919084,
+    -0.01552534501956604,
+    -0.223362481667332,
+    0.1821006842509091,
+    0.2941778783780663,
+    -0.07901167601970885,
+    -0.056815072777201,
+    -0.3699028221860095,
+    -0.31616315591624855,
+    0.5905951377425391,
+    -0.052139568068853864,
+    0.013673160263486295,
+    -0.03691647864630577,
+    0.09732660653298163,
+    -0.3394662328788498,
+    -0.30685677538541667,
+    -0.24504598907458763,
+    -0.034698524462007344,
+    0.02868032184767538,
+    -0.21217779266454084,
+    -0.1678263169941987,
+    0.3221287889040614,
+    -0.1223055851554907,
+    0.4356604928128464,
+    -0.0502599202236253,
+    0.3979258376211797,
+]
+_AUDIO_LATENTS_STD = [
+    1.6895524230479284,
+    2.76263727217653,
+    1.7945344281264435,
+    1.6801681847309828,
+    1.6390226546605453,
+    2.7788298348882177,
+    1.7659090095747236,
+    1.6199757612137327,
+    2.6336525640336896,
+    1.8539356672817833,
+    2.5056497896915633,
+    1.811019237886178,
+    1.9579657790720237,
+    1.6685498243529284,
+    1.4922469314453364,
+    3.298670198067373,
+    1.9491804496832168,
+    1.8720003270431442,
+    1.8334080103291832,
+    1.6488070416529093,
+    1.6176957696319716,
+    1.9131449234774398,
+    1.5695245398428617,
+    1.6943659940415912,
+    1.8318420762504692,
+    1.5540637421583379,
+    1.9344930328968526,
+    1.599198216109855,
+    1.718045989838149,
+    1.6307219190837705,
+    1.8661226051202384,
+    1.5613768203168363,
+]
 
 
 class MiniMaxH3AudioVAE(nn.Module):
-
     def __init__(
         self,
         encoder_dim: int = 64,
-        encoder_rates: List[int] = [2, 4, 4, 5, 5],
+        encoder_rates: List[int] = None,
         decoder_dim: int = 1024,
-        decoder_rates: List[int] = [5, 5, 2, 2, 2, 2, 2],
+        decoder_rates: List[int] = None,
         sample_rate: int = 32000,
         vae_latent_channels: int = 32,
         attn_proj: bool = True,
         decoder_type: str = "bigvgan",
     ):
+        if decoder_rates is None:
+            decoder_rates = [5, 5, 2, 2, 2, 2, 2]
+        if encoder_rates is None:
+            encoder_rates = [2, 4, 4, 5, 5]
         super().__init__()
         self.sample_rate = sample_rate
         self.attn_proj = attn_proj
@@ -464,9 +612,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         latent = self.encode(self.preprocess(audio_data))
         latent_channels = len(_AUDIO_LATENTS_MEAN)
         if latent.dim() != 3 or latent.shape[1] != latent_channels:
-            raise ValueError(
-                f"expected audio latent [C, {latent_channels}, T], got {list(latent.shape)}"
-            )
+            raise ValueError(f"expected audio latent [C, {latent_channels}, T], got {list(latent.shape)}")
         mean, std = self._latent_stats(latent.device)
         return ((latent.to(torch.float32) - mean) / std).to(out_dtype)
 

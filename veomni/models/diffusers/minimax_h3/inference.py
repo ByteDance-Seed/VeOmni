@@ -1,30 +1,350 @@
+"""MiniMax H3 audio/video inference pipeline.
+
+Ported from the minimax_h3_audio_video pipeline (MiniMaxH3Pipeline) and the
+base pipeline machinery (BasePipeline / PipelineUnit / PipelineUnitRunner).
+Framework-specific dependencies are replaced by VeOmni equivalents:
+
+- model loading (ModelPool / ModelConfig): VeOmni registries
+  (MODEL_CONFIG_REGISTRY / MODELING_REGISTRY) for the condition model
+  (text encoder + VAEs + schedulers) and build_foundation_model for the DiT.
+- get_device_type: veomni.utils.device.get_device_type
+- audio utils (convert_to_stereo / resample_waveform): ported below.
+- attention / gradient checkpointing: veomni minimax_h3_core (not used here).
+- load_models_to_device: VeOmni models have no VRAM-management hooks, so the
+  pipeline stages models by name explicitly (listed models move to
+  self.device, all other children move to CPU).
+
+Known deviations:
+- self.dit is the HF wrapper MiniMaxH3DiTModel; model_fn calls its
+  forward and takes predictions (same raw DiT forward + cond-row slicing +
+  unpatchify + negation). ref2va audio references are NOT supported by the
+  wrapper (raises NotImplementedError); t2va and fl2va paths are numerically
+  equivalent.
+- FlowMatchScheduler.set_timesteps ignores the shift kwarg (VeOmni scheduler
+  pins shift at construction; default shifts are 12.0 video / 3.0 audio).
+"""
+
+from __future__ import annotations
+
 import numpy as np
 import torch
+from einops import reduce, repeat
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoProcessor
 
-from ..core import ModelConfig
-from ..core.device.npu_compatible_device import get_device_type
-from ..diffusion import FlowMatchScheduler
-from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
-from ..models.minimax_h3_dit import MiniMaxH3DiT, patchify_video, unpatchify_video, pack_audio, unpack_audio
-from ..models.minimax_h3_text_encoder import (
-    MiniMaxH3TextEncoder, presentation_t2va, presentation_fl2va, presentation_ref2va,
-    sample_qwen_video_frames, image_token_counts, video_token_counts,
+from veomni.models import build_foundation_model
+from veomni.models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from veomni.utils.device import get_device_type
+
+from .minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
+from .minimax_h3_core.minimax_h3_audio_vae import MiniMaxH3AudioVAE
+from .minimax_h3_core.minimax_h3_dit import pack_audio, patchify_video
+from .minimax_h3_core.minimax_h3_text_encoder import (
+    MiniMaxH3TextEncoder,
+    image_token_counts,
+    presentation_fl2va,
+    presentation_ref2va,
+    presentation_t2va,
+    sample_qwen_video_frames,
+    video_token_counts,
 )
-from ..models.minimax_h3_video_vae import MiniMaxH3VideoVAE
-from ..models.minimax_h3_audio_vae import MiniMaxH3AudioVAE
-from ..utils.data.audio import convert_to_stereo, resample_waveform
+from .minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
+from .minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
+
+
+# ── Audio utils ──────────────────────────────────────────────────────
+
+
+def convert_to_stereo(audio_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Convert audio to stereo.
+    Supports [C, T] or [B, C, T]. Duplicate mono, keep stereo.
+    """
+    if audio_tensor.size(-2) == 1:
+        return audio_tensor.repeat(1, 2, 1) if audio_tensor.dim() == 3 else audio_tensor.repeat(2, 1)
+    return audio_tensor
+
+
+def resample_waveform(waveform: torch.Tensor, source_rate: int, target_rate: int) -> torch.Tensor:
+    """Resample waveform to target sample rate if needed."""
+    if source_rate == target_rate:
+        return waveform
+    import torchaudio
+
+    resampled = torchaudio.functional.resample(waveform, source_rate, target_rate)
+    return resampled.to(dtype=waveform.dtype)
+
+
+# ── Base pipeline machinery ──────────────────────────────────────────
+
+
+class PipelineUnit:
+    def __init__(
+        self,
+        seperate_cfg: bool = False,
+        take_over: bool = False,
+        input_params: tuple[str] = None,
+        output_params: tuple[str] = None,
+        input_params_posi: dict[str, str] = None,
+        input_params_nega: dict[str, str] = None,
+        onload_model_names: tuple[str] = None,
+    ):
+        self.seperate_cfg = seperate_cfg
+        self.take_over = take_over
+        self.input_params = input_params
+        self.output_params = output_params
+        self.input_params_posi = input_params_posi
+        self.input_params_nega = input_params_nega
+        self.onload_model_names = onload_model_names
+
+    def fetch_input_params(self):
+        params = []
+        if self.input_params is not None:
+            for param in self.input_params:
+                params.append(param)
+        if self.input_params_posi is not None:
+            for _, param in self.input_params_posi.items():
+                params.append(param)
+        if self.input_params_nega is not None:
+            for _, param in self.input_params_nega.items():
+                params.append(param)
+        params = sorted(set(params))
+        return params
+
+    def fetch_output_params(self):
+        params = []
+        if self.output_params is not None:
+            for param in self.output_params:
+                params.append(param)
+        return params
+
+    def process(self, pipe, **kwargs) -> dict:
+        return {}
+
+    def post_process(self, pipe, **kwargs) -> dict:
+        return {}
+
+
+class PipelineUnitRunner:
+    def __init__(self):
+        pass
+
+    def __call__(
+        self, unit: PipelineUnit, pipe: BasePipeline, inputs_shared: dict, inputs_posi: dict, inputs_nega: dict
+    ) -> tuple[dict, dict]:
+        if unit.take_over:
+            # Let the pipeline unit take over this function.
+            inputs_shared, inputs_posi, inputs_nega = unit.process(
+                pipe, inputs_shared=inputs_shared, inputs_posi=inputs_posi, inputs_nega=inputs_nega
+            )
+        elif unit.seperate_cfg:
+            # Positive side
+            processor_inputs = {name: inputs_posi.get(name_) for name, name_ in unit.input_params_posi.items()}
+            if unit.input_params is not None:
+                for name in unit.input_params:
+                    processor_inputs[name] = inputs_shared.get(name)
+            processor_outputs = unit.process(pipe, **processor_inputs)
+            inputs_posi.update(processor_outputs)
+            # Negative side
+            if inputs_shared["cfg_scale"] != 1:
+                processor_inputs = {name: inputs_nega.get(name_) for name, name_ in unit.input_params_nega.items()}
+                if unit.input_params is not None:
+                    for name in unit.input_params:
+                        processor_inputs[name] = inputs_shared.get(name)
+                processor_outputs = unit.process(pipe, **processor_inputs)
+                inputs_nega.update(processor_outputs)
+            else:
+                inputs_nega.update(processor_outputs)
+        else:
+            processor_inputs = {name: inputs_shared.get(name) for name in unit.input_params}
+            processor_outputs = unit.process(pipe, **processor_inputs)
+            inputs_shared.update(processor_outputs)
+        return inputs_shared, inputs_posi, inputs_nega
+
+
+class BasePipeline(torch.nn.Module):
+    def __init__(
+        self,
+        device=None,
+        torch_dtype=torch.bfloat16,
+        height_division_factor=32,
+        width_division_factor=32,
+        time_division_factor=17,
+        time_division_remainder=5,
+    ):
+        super().__init__()
+        # The device and torch_dtype is used for the storage of intermediate variables, not models.
+        self.device = device if device is not None else get_device_type()
+        self.torch_dtype = torch_dtype
+        # The following parameters are used for shape check.
+        self.height_division_factor = height_division_factor
+        self.width_division_factor = width_division_factor
+        self.time_division_factor = time_division_factor
+        self.time_division_remainder = time_division_remainder
+        # VRAM management (VeOmni models have no onload/offload hooks,
+        # load_models_to_device stages children explicitly instead).
+        self.vram_management_enabled = False
+        # Pipeline Unit Runner
+        self.unit_runner = PipelineUnitRunner()
+
+    def to(self, *args, **kwargs):
+        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
+        if device is not None:
+            self.device = device
+        if dtype is not None:
+            self.torch_dtype = dtype
+        super().to(*args, **kwargs)
+        return self
+
+    def check_resize_height_width(self, height, width, num_frames=None, verbose=1):
+        # Shape check
+        if height % self.height_division_factor != 0:
+            height = (
+                (height + self.height_division_factor - 1) // self.height_division_factor * self.height_division_factor
+            )
+            if verbose > 0:
+                print(f"height % {self.height_division_factor} != 0. We round it up to {height}.")
+        if width % self.width_division_factor != 0:
+            width = (width + self.width_division_factor - 1) // self.width_division_factor * self.width_division_factor
+            if verbose > 0:
+                print(f"width % {self.width_division_factor} != 0. We round it up to {width}.")
+        if num_frames is None:
+            return height, width
+        else:
+            if num_frames % self.time_division_factor != self.time_division_remainder:
+                num_frames = (
+                    num_frames - self.time_division_remainder + self.time_division_factor - 1
+                ) // self.time_division_factor * self.time_division_factor + self.time_division_remainder
+                if verbose > 0:
+                    print(
+                        f"num_frames % {self.time_division_factor} != {self.time_division_remainder}. We round it up to {num_frames}."
+                    )
+            return height, width, num_frames
+
+    def preprocess_image(self, image, torch_dtype=None, device=None, pattern="B C H W", min_value=-1, max_value=1):
+        # Transform a PIL.Image to torch.Tensor
+        image = torch.Tensor(np.array(image, dtype=np.float32))
+        image = image.to(dtype=torch_dtype or self.torch_dtype, device=device or self.device)
+        image = image * ((max_value - min_value) / 255) + min_value
+        image = repeat(image, f"H W C -> {pattern}", **({"B": 1} if "B" in pattern else {}))
+        return image
+
+    def preprocess_video(self, video, torch_dtype=None, device=None, pattern="B C T H W", min_value=-1, max_value=1):
+        # Transform a list of PIL.Image to torch.Tensor
+        video = [
+            self.preprocess_image(
+                image, torch_dtype=torch_dtype, device=device, min_value=min_value, max_value=max_value
+            )
+            for image in video
+        ]
+        video = torch.stack(video, dim=pattern.index("T") // 2)
+        return video
+
+    def vae_output_to_image(self, vae_output, pattern="B C H W", min_value=-1, max_value=1):
+        # Transform a torch.Tensor to PIL.Image
+        if pattern != "H W C":
+            vae_output = reduce(vae_output, f"{pattern} -> H W C", reduction="mean")
+        image = ((vae_output - min_value) * (255 / (max_value - min_value))).clip(0, 255)
+        image = image.to(device="cpu", dtype=torch.uint8)
+        image = Image.fromarray(image.numpy())
+        return image
+
+    def vae_output_to_video(self, vae_output, pattern="B C T H W", min_value=-1, max_value=1):
+        # Transform a torch.Tensor to list of PIL.Image
+        if pattern != "T H W C":
+            vae_output = reduce(vae_output, f"{pattern} -> T H W C", reduction="mean")
+        video = [
+            self.vae_output_to_image(image, pattern="H W C", min_value=min_value, max_value=max_value)
+            for image in vae_output
+        ]
+        return video
+
+    def output_audio_format_check(self, audio_output):
+        # output standard foramt: [C, T], output dtype: float()
+        # remove batch dim
+        if audio_output.ndim == 3:
+            audio_output = audio_output.squeeze(0)
+        return audio_output.float().cpu()
+
+    def load_models_to_device(self, model_names):
+        # VeOmni models have no onload/offload VRAM-management hooks; stage
+        # children by name instead: listed models go to self.device,
+        # everything else to CPU. "condition_model" is only a handle to the
+        # encoder container and is skipped (it holds the same text encoder /
+        # VAE modules as their named children). A self-managed DiT (block
+        # offload) stages its own weights.
+        for name, model in self.named_children():
+            if name == "condition_model":
+                continue
+            if model is not None and getattr(model, "_self_managed", False):
+                continue
+            if model is not None:
+                model.to(self.device if name in model_names else "cpu")
+
+    def generate_noise(
+        self, shape, seed=None, rand_device="cpu", rand_torch_dtype=torch.float32, device=None, torch_dtype=None
+    ):
+        # Initialize Gaussian noise
+        generator = None if seed is None else torch.Generator(rand_device).manual_seed(seed)
+        noise = torch.randn(shape, generator=generator, device=rand_device, dtype=rand_torch_dtype)
+        noise = noise.to(dtype=torch_dtype or self.torch_dtype, device=device or self.device)
+        return noise
+
+    def step(self, scheduler, latents, progress_id, noise_pred, input_latents=None, inpaint_mask=None, **kwargs):
+        timestep = scheduler.timesteps[progress_id]
+        if inpaint_mask is not None:
+            noise_pred_expected = scheduler.return_to_timestep(
+                scheduler.timesteps[progress_id], latents, input_latents
+            )
+            noise_pred = self.blend_with_mask(noise_pred_expected, noise_pred, inpaint_mask)
+        latents_next = scheduler.step(noise_pred, timestep, latents)
+        return latents_next
+
+    def blend_with_mask(self, base, addition, mask):
+        return base * (1 - mask) + addition * mask
+
+    def check_vram_management_state(self):
+        vram_management_enabled = False
+        for module in self.children():
+            if hasattr(module, "vram_management_enabled") and module.vram_management_enabled:
+                vram_management_enabled = True
+        return vram_management_enabled
+
+    def cfg_guided_model_fn(self, model_fn, cfg_scale, inputs_shared, inputs_posi, inputs_nega, **inputs_others):
+        # Positive side forward
+        noise_pred_posi = model_fn(**inputs_posi, **inputs_shared, **inputs_others)
+        if cfg_scale != 1.0:
+            # Negative side forward
+            noise_pred_nega = model_fn(**inputs_nega, **inputs_shared, **inputs_others)
+            if isinstance(noise_pred_posi, tuple):
+                # Separately handling different output types of latents, eg. video and audio latents.
+                noise_pred = tuple(
+                    n_nega + cfg_scale * (n_posi - n_nega) for n_posi, n_nega in zip(noise_pred_posi, noise_pred_nega)
+                )
+            else:
+                noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+        else:
+            noise_pred = noise_pred_posi
+        return noise_pred
+
+
+# ── Pipeline ─────────────────────────────────────────────────────────
+
 
 class MiniMaxH3Pipeline(BasePipeline):
-
-    def __init__(self, device=get_device_type(), torch_dtype=torch.bfloat16):
-        super().__init__(device=device, torch_dtype=torch_dtype, height_division_factor=32, width_division_factor=32, time_division_factor=17, time_division_remainder=5)
-        self.scheduler = FlowMatchScheduler("MiniMax-H3")
-        self.scheduler_audio = FlowMatchScheduler("MiniMax-H3")
+    def __init__(self, device=None, torch_dtype=torch.bfloat16):
+        super().__init__(
+            device=device,
+            torch_dtype=torch_dtype,
+            height_division_factor=32,
+            width_division_factor=32,
+            time_division_factor=17,
+            time_division_remainder=5,
+        )
+        self.scheduler = FlowMatchScheduler(shift=12.0)
+        self.scheduler_audio = FlowMatchScheduler(shift=3.0)
         self.text_encoder: MiniMaxH3TextEncoder = None
-        self.dit: MiniMaxH3DiT = None
+        self.dit: MiniMaxH3DiTModel = None
         self.video_vae: MiniMaxH3VideoVAE = None
         self.audio_vae: MiniMaxH3AudioVAE = None
         self.tokenizer = None
@@ -49,20 +369,81 @@ class MiniMaxH3Pipeline(BasePipeline):
     def from_pretrained(
         torch_dtype: torch.dtype = torch.bfloat16,
         device: str = get_device_type(),
-        model_configs: list[ModelConfig] = [],
-        processor_config: ModelConfig = ModelConfig(model_id="MiniMax/MiniMax-H3", origin_file_pattern="FL2VA/processor/"),
-        vram_limit: float = None,
+        condition_model_path: str = None,
+        condition_model_cfg: dict = None,
+        transformer_config_path: str = None,
+        transformer_weights_path: str = None,
+        transformer_config_kwargs: dict = None,
+        ops_implementation=None,
     ):
+        """Load the pipeline through VeOmni model loading paths.
+
+        - condition model (text encoder + video/audio VAE + schedulers +
+          tokenizer/processor) via MODEL_CONFIG_REGISTRY / MODELING_REGISTRY,
+          same as DiTTrainer._build_condition_model.
+        - DiT via build_foundation_model. init_device=<device>: single-process
+          parallel state reports global_rank=-1, so "cpu" would trigger
+          empty_init and leave the weights on meta.
+        """
         pipe = MiniMaxH3Pipeline(device=device, torch_dtype=torch_dtype)
-        model_pool = pipe.download_and_load_models(model_configs, vram_limit)
-        pipe.text_encoder = model_pool.fetch_model("minimax_h3_text_encoder")
-        pipe.dit = model_pool.fetch_model("minimax_h3_dit")
-        pipe.video_vae = model_pool.fetch_model("minimax_h3_video_vae")
-        pipe.audio_vae = model_pool.fetch_model("minimax_h3_audio_vae")
-        if processor_config is not None:
-            processor_config.download_if_necessary()
-            pipe.processor = AutoProcessor.from_pretrained(processor_config.path)
-            pipe.tokenizer = pipe.processor.tokenizer
+
+        # Condition model: encoders are always needed at inference time, so
+        # force load even when the config was written for offline training.
+        condition_model_cfg = dict(condition_model_cfg or {})
+        condition_model_cfg.setdefault("skip_encoder_load", False)
+        # Video VAE weights live in video_vae/source (checkpoint layout); the
+        # config default subfolder "video_vae" has no safetensors directly.
+        condition_model_cfg.setdefault("video_vae_subfolder", "video_vae/source")
+        config_class = MODEL_CONFIG_REGISTRY["MiniMaxH3ConditionModel"]()
+        condition_cfg = config_class.from_pretrained(condition_model_path, **condition_model_cfg)
+        model_class = MODELING_REGISTRY["MiniMaxH3ConditionModel"]()
+        condition_model = model_class._from_config(condition_cfg)
+        condition_model.eval()
+
+        # Keep a handle to the condition model, but do NOT register it as an
+        # nn.Module child: load_models_to_device() stages children by name and
+        # the condition model contains all encoders (moving it would undo the
+        # per-encoder staging).
+        pipe.__dict__["condition_model"] = condition_model
+        pipe.text_encoder = condition_model._text_encoder
+        pipe.video_vae = condition_model._video_vae
+        pipe.audio_vae = condition_model._audio_vae
+        pipe.tokenizer = condition_model._tokenizer
+        pipe.processor = condition_model._processor
+        pipe.scheduler = condition_model._scheduler_video
+        pipe.scheduler_audio = condition_model._scheduler_audio
+        pipe.imgvid_cond_noise_aug = condition_cfg.imgvid_cond_noise_aug
+        pipe.audio_cond_noise_aug = condition_cfg.audio_cond_noise_aug
+
+        # The 50-layer DiT (~60GB bf16) alone nearly fills the NPU. Encoders
+        # must not sit on it while the DiT allocates; the pipeline units
+        # re-stage each model per use during __call__.
+        pipe.load_models_to_device([])
+        # Release the allocator pool so the DiT allocation starts from a
+        # clean state instead of a pool reserved for the offloaded encoders.
+        if hasattr(torch, "npu"):
+            torch.npu.empty_cache()
+
+        # DiT (HF wrapper MiniMaxH3DiTModel). The 61.7GB of
+        # weights do not fit on the NPU (~61.3GB total), so they live on
+        # CPU and the DiT stages its blocks in two halves per forward.
+        # With init_device="meta", build_foundation_model forces
+        # empty_init and skips its internal weight load; the explicit call
+        # below materializes the weights on CPU instead.
+        pipe.dit = build_foundation_model(
+            config_path=transformer_config_path,
+            weights_path=None,
+            torch_dtype="bfloat16",
+            init_device="meta",
+            ops_implementation=ops_implementation,
+            config_kwargs=transformer_config_kwargs,
+        )
+        from veomni.models.module_utils import load_model_weights
+
+        load_model_weights(pipe.dit, transformer_weights_path, init_device="cpu")
+        pipe.dit.dit.enable_block_offload()
+        pipe.dit._self_managed = True
+        pipe.dit.eval()
         pipe.vram_management_enabled = pipe.check_vram_management_state()
         return pipe
 
@@ -121,18 +502,28 @@ class MiniMaxH3Pipeline(BasePipeline):
         inputs_nega = {"negative_prompt": negative_prompt}
         inputs_shared = {
             "cfg_scale": cfg_scale,
-            "height": height, "width": width, "num_frames": num_frames,
-            "seed": seed, "rand_device": rand_device,
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "seed": seed,
+            "rand_device": rand_device,
             "use_gradient_checkpointing": use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
-            "keyframes": keyframes, "keyframe_indices": keyframe_indices,
-            "references": references, "ref_image_short_edge": ref_image_short_edge, "ref_video_short_edge": ref_video_short_edge, "ref_video_max_pixels": ref_video_max_pixels,
-            "imgvid_cond_noise_aug": self.imgvid_cond_noise_aug, "audio_cond_noise_aug": self.audio_cond_noise_aug,
+            "keyframes": keyframes,
+            "keyframe_indices": keyframe_indices,
+            "references": references,
+            "ref_image_short_edge": ref_image_short_edge,
+            "ref_video_short_edge": ref_video_short_edge,
+            "ref_video_max_pixels": ref_video_max_pixels,
+            "imgvid_cond_noise_aug": self.imgvid_cond_noise_aug,
+            "audio_cond_noise_aug": self.audio_cond_noise_aug,
         }
 
         # 3. Unit chain
         for unit in self.units:
-            inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+            inputs_shared, inputs_posi, inputs_nega = self.unit_runner(
+                unit, self, inputs_shared, inputs_posi, inputs_nega
+            )
 
         # 4. Denoise loop
         self.load_models_to_device(self.in_iteration_models)
@@ -141,15 +532,32 @@ class MiniMaxH3Pipeline(BasePipeline):
             t_video = float(1.0 - self.scheduler.sigmas[progress_id])
             t_audio = float(1.0 - self.scheduler_audio.sigmas[progress_id])
             noise_pred_video, noise_pred_audio = self.cfg_guided_model_fn(
-                self.model_fn, cfg_scale, inputs_shared, inputs_posi, inputs_nega,
-                **models, t_video=t_video, t_audio=t_audio, device=self.device,
+                self.model_fn,
+                cfg_scale,
+                inputs_shared,
+                inputs_posi,
+                inputs_nega,
+                **models,
+                t_video=t_video,
+                t_audio=t_audio,
+                device=self.device,
             )
-            inputs_shared["video_latents"] = self.step(self.scheduler, inputs_shared["video_latents"], progress_id, noise_pred=noise_pred_video)
-            inputs_shared["audio_latents"] = self.step(self.scheduler_audio, inputs_shared["audio_latents"], progress_id, noise_pred=noise_pred_audio)
+            inputs_shared["video_latents"] = self.step(
+                self.scheduler, inputs_shared["video_latents"], progress_id, noise_pred=noise_pred_video
+            )
+            inputs_shared["audio_latents"] = self.step(
+                self.scheduler_audio, inputs_shared["audio_latents"], progress_id, noise_pred=noise_pred_audio
+            )
 
         # 5. Decode
         self.load_models_to_device(["video_vae"])
-        frames = self.video_vae.decode_video(inputs_shared["video_latents"], dtype=self.torch_dtype, tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap)
+        frames = self.video_vae.decode_video(
+            inputs_shared["video_latents"],
+            dtype=self.torch_dtype,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+        )
         video = self.vae_output_to_video(frames, min_value=0, max_value=1)
 
         self.load_models_to_device(["audio_vae"])
@@ -179,9 +587,16 @@ class MiniMaxH3Unit_NoiseInitializer(PipelineUnit):
 
     def process(self, pipe: MiniMaxH3Pipeline, seed, num_frames, height, width, rand_device):
         video_latent_t, latent_h, latent_w = ((num_frames - 5) // 17) * 5 + 2, height // 16, width // 16
-        video_latents = pipe.generate_noise((1, 24, video_latent_t, latent_h, latent_w), seed=seed, rand_device=rand_device, rand_torch_dtype=pipe.torch_dtype)
+        video_latents = pipe.generate_noise(
+            (1, 24, video_latent_t, latent_h, latent_w),
+            seed=seed,
+            rand_device=rand_device,
+            rand_torch_dtype=pipe.torch_dtype,
+        )
         audio_latent_t = round(num_frames / 24.0 * 40.0)
-        audio_latents = pipe.generate_noise((2, 32, audio_latent_t), seed=seed, rand_device=rand_device, rand_torch_dtype=pipe.torch_dtype)
+        audio_latents = pipe.generate_noise(
+            (2, 32, audio_latent_t), seed=seed, rand_device=rand_device, rand_torch_dtype=pipe.torch_dtype
+        )
         return {"video_latents": video_latents, "audio_latents": audio_latents}
 
 
@@ -225,15 +640,21 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
         if len(images) > 0:
             pixel_values, image_grid_thw, image_counts = image_token_counts(pipe.processor, images)
         if len(videos) > 0:
-            pixel_values_videos, video_grid_thw, video_counts, video_timestamps = video_token_counts(pipe.processor, videos, timestamps_per_video)
-        input_ids, text_token_tags = presentation_ref2va(pipe.tokenizer, prompt, condition_labels, image_counts, video_counts, video_timestamps)
+            pixel_values_videos, video_grid_thw, video_counts, video_timestamps = video_token_counts(
+                pipe.processor, videos, timestamps_per_video
+            )
+        input_ids, text_token_tags = presentation_ref2va(
+            pipe.tokenizer, prompt, condition_labels, image_counts, video_counts, video_timestamps
+        )
         return input_ids, text_token_tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
 
     def process(self, pipe: MiniMaxH3Pipeline, prompt, keyframes=None, ref_blocks=None, height=None, width=None):
         pipe.load_models_to_device(self.onload_model_names)
         pixel_values = image_grid_thw = pixel_values_videos = video_grid_thw = None
         if ref_blocks:
-            input_ids, text_token_tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw = self.preprocess_ref_blocks(pipe, prompt, ref_blocks)
+            input_ids, text_token_tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw = (
+                self.preprocess_ref_blocks(pipe, prompt, ref_blocks)
+            )
         elif keyframes:
             keyframes = [img.convert("RGB").resize((width, height), Image.LANCZOS) for img in keyframes]
             pixel_values, image_grid_thw, image_counts = image_token_counts(pipe.processor, keyframes)
@@ -251,7 +672,10 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
             kwargs["video_grid_thw"] = video_grid_thw.to(pipe.device, torch.long)
         hidden = pipe.text_encoder(**kwargs)
 
-        return {"prompt_embeds": hidden.to(pipe.device, pipe.torch_dtype), "text_token_tags": text_token_tags.view(-1).to(pipe.device, torch.long)}
+        return {
+            "prompt_embeds": hidden.to(pipe.device, pipe.torch_dtype),
+            "text_token_tags": text_token_tags.view(-1).to(pipe.device, torch.long),
+        }
 
 
 class MiniMaxH3Unit_InputVideoEmbedder(PipelineUnit):
@@ -259,7 +683,7 @@ class MiniMaxH3Unit_InputVideoEmbedder(PipelineUnit):
         super().__init__(
             input_params=("input_video",),
             output_params=("video_latents", "input_latents"),
-            onload_model_names=("video_vae",)
+            onload_model_names=("video_vae",),
         )
 
     def process(self, pipe: MiniMaxH3Pipeline, input_video):
@@ -276,7 +700,7 @@ class MiniMaxH3Unit_InputAudioEmbedder(PipelineUnit):
         super().__init__(
             input_params=("input_audio",),
             output_params=("audio_latents", "audio_input_latents"),
-            onload_model_names=("audio_vae",)
+            onload_model_names=("audio_vae",),
         )
 
     def process(self, pipe: MiniMaxH3Pipeline, input_audio):
@@ -286,8 +710,12 @@ class MiniMaxH3Unit_InputAudioEmbedder(PipelineUnit):
         waveform, sample_rate = input_audio
         waveform = waveform.squeeze(0) if waveform.dim() == 3 else waveform
         assert waveform.dim() == 2, "waveform must be in shape (C, T)"
-        waveform = resample_waveform(convert_to_stereo(waveform).float(), sample_rate, pipe.audio_vae.sample_rate) # [C, T]
-        latents = pipe.audio_vae.encode_audio(waveform[:2].to(pipe.device), dtype=pipe.torch_dtype).to(pipe.torch_dtype)  # [C, 32, T]
+        waveform = resample_waveform(
+            convert_to_stereo(waveform).float(), sample_rate, pipe.audio_vae.sample_rate
+        )  # [C, T]
+        latents = pipe.audio_vae.encode_audio(waveform[:2].to(pipe.device), dtype=pipe.torch_dtype).to(
+            pipe.torch_dtype
+        )  # [C, 32, T]
         return {"audio_latents": latents, "audio_input_latents": latents}
 
 
@@ -296,20 +724,30 @@ class MiniMaxH3Unit_KeyframeEncoder(PipelineUnit):
         super().__init__(
             input_params=("keyframes", "keyframe_indices", "video_latents", "rand_device", "seed", "height", "width"),
             output_params=("keyframe_cond_anchor",),
-            onload_model_names=("video_vae",)
+            onload_model_names=("video_vae",),
         )
 
-    def process(self, pipe: MiniMaxH3Pipeline, keyframes, keyframe_indices, video_latents, rand_device, seed, height, width):
+    def process(
+        self, pipe: MiniMaxH3Pipeline, keyframes, keyframe_indices, video_latents, rand_device, seed, height, width
+    ):
         if keyframes is None:
             return {}
-        assert keyframe_indices is not None and len(keyframes) == len(keyframe_indices), "keyframe_indices must be provided when keyframes is not None"
-        assert all(idx in (0, -1) for idx in keyframe_indices), "keyframe_indices must be within the range of keyframes (0 or -1)"
+        assert keyframe_indices is not None and len(keyframes) == len(keyframe_indices), (
+            "keyframe_indices must be provided when keyframes is not None"
+        )
+        assert all(idx in (0, -1) for idx in keyframe_indices), (
+            "keyframe_indices must be within the range of keyframes (0 or -1)"
+        )
         pipe.load_models_to_device(self.onload_model_names)
         # Encode keyframes
         all_cond_rows = []
         for img in keyframes:
-            img_tensor = pipe.preprocess_image(img.convert("RGB").resize((width, height), Image.LANCZOS), torch_dtype=torch.float32, min_value=0)
-            z_norm = pipe.video_vae.encode_video(img_tensor, dtype=pipe.torch_dtype, process_image=True)  # [1,24,1,H',W']
+            img_tensor = pipe.preprocess_image(
+                img.convert("RGB").resize((width, height), Image.LANCZOS), torch_dtype=torch.float32, min_value=0
+            )
+            z_norm = pipe.video_vae.encode_video(
+                img_tensor, dtype=pipe.torch_dtype, process_image=True
+            )  # [1,24,1,H',W']
             rows = patchify_video(z_norm)
             all_cond_rows.append(rows)
         clean_cond_rows = torch.cat(all_cond_rows, dim=0).to(device=pipe.device, dtype=pipe.torch_dtype)
@@ -318,11 +756,13 @@ class MiniMaxH3Unit_KeyframeEncoder(PipelineUnit):
         else:
             video_latent_t, latent_h, latent_w = (int(x) for x in video_latents.shape[2:])
             ts = torch.tensor(pipe.imgvid_cond_noise_aug, dtype=pipe.torch_dtype, device=pipe.device)
-            noise = pipe.generate_noise((1, 24, video_latent_t + len(keyframes), latent_h, latent_w), seed, rand_device, pipe.torch_dtype)[:,:,:1]
+            noise = pipe.generate_noise(
+                (1, 24, video_latent_t + len(keyframes), latent_h, latent_w), seed, rand_device, pipe.torch_dtype
+            )[:, :, :1]
             noise_rows = patchify_video(noise).to(device=pipe.device, dtype=pipe.torch_dtype)
             frame_rows = (latent_h // 2) * (latent_w // 2)
             parts = [
-                ts * clean_cond_rows[i * frame_rows:(i + 1) * frame_rows] + (1.0 - ts) * noise_rows
+                ts * clean_cond_rows[i * frame_rows : (i + 1) * frame_rows] + (1.0 - ts) * noise_rows
                 for i in range(len(keyframes))
             ]
             keyframe_cond_anchor = torch.cat(parts, dim=0)
@@ -332,9 +772,17 @@ class MiniMaxH3Unit_KeyframeEncoder(PipelineUnit):
 class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("references", "seed", "video_latents", "num_frames", "ref_image_short_edge", "ref_video_short_edge", "ref_video_max_pixels"),
+            input_params=(
+                "references",
+                "seed",
+                "video_latents",
+                "num_frames",
+                "ref_image_short_edge",
+                "ref_video_short_edge",
+                "ref_video_max_pixels",
+            ),
             output_params=("ref_blocks", "ref_visual_anchor", "ref_audio_anchor"),
-            onload_model_names=("video_vae", "audio_vae")
+            onload_model_names=("video_vae", "audio_vae"),
         )
 
     @staticmethod
@@ -343,25 +791,38 @@ class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
 
     def _resolve_reference_image_shape(self, pipe: MiniMaxH3Pipeline, width: int, height: int, short_edge: int):
         scale = short_edge * 1.0 / min(width, height)
-        return self._nearest_multiple(width * scale, pipe.width_division_factor), self._nearest_multiple(height * scale, pipe.height_division_factor)
+        return self._nearest_multiple(width * scale, pipe.width_division_factor), self._nearest_multiple(
+            height * scale, pipe.height_division_factor
+        )
 
-    def _resolve_reference_video_shape(self, pipe: MiniMaxH3Pipeline, width: int, height: int, short_edge: int, max_pixels: int):
+    def _resolve_reference_video_shape(
+        self, pipe: MiniMaxH3Pipeline, width: int, height: int, short_edge: int, max_pixels: int
+    ):
         scale = min(short_edge * 1.0 / min(width, height), float(np.sqrt(max_pixels / (width * height))))
-        return self._nearest_multiple(width * scale, pipe.width_division_factor), self._nearest_multiple(height * scale, pipe.height_division_factor)
+        return self._nearest_multiple(width * scale, pipe.width_division_factor), self._nearest_multiple(
+            height * scale, pipe.height_division_factor
+        )
 
     def _trim_reference_video_length(self, pipe: MiniMaxH3Pipeline, frame_count: int) -> int:
         frame_count = int(frame_count)
         factor, remainder = pipe.time_division_factor, pipe.time_division_remainder
         chunks = max(1, (frame_count - remainder) // factor)
         used = chunks * factor + remainder
-        assert used <= frame_count, f"cannot trim {frame_count} reference video frames down to a valid " f"length: at least {used} frames are required"
+        assert used <= frame_count, (
+            f"cannot trim {frame_count} reference video frames down to a valid "
+            f"length: at least {used} frames are required"
+        )
         return used
 
     def _encode_image_ref(self, pipe, img: Image.Image, short_edge: int):
         target_w, target_h = self._resolve_reference_image_shape(pipe, *img.size, short_edge)
         img = img.convert("RGB").resize((target_w, target_h), Image.LANCZOS)
         img_tensor = pipe.preprocess_image(img, torch_dtype=torch.float32, min_value=0)
-        z = pipe.video_vae.encode_video(img_tensor.to(pipe.device), dtype=pipe.torch_dtype, process_image=True,)  # [1,24,1,H',W']
+        z = pipe.video_vae.encode_video(
+            img_tensor.to(pipe.device),
+            dtype=pipe.torch_dtype,
+            process_image=True,
+        )  # [1,24,1,H',W']
         return patchify_video(z), z.shape[-2], z.shape[-1], img
 
     def _encode_video_ref(self, pipe, frames, target_frame_count: int, short_edge: int, max_pixels: int):
@@ -369,13 +830,19 @@ class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
         frames = [f.resize((target_w, target_h), Image.LANCZOS).convert("RGB") for f in frames]
         frames = frames[: self._trim_reference_video_length(pipe, min(len(frames), target_frame_count))]
         frames_tensor = pipe.preprocess_video(frames, torch_dtype=torch.float32, min_value=0, device=pipe.device)
-        z = pipe.video_vae.encode_video(frames_tensor, dtype=pipe.torch_dtype, process_image=False,)  # [1,24,T',H',W']
+        z = pipe.video_vae.encode_video(
+            frames_tensor,
+            dtype=pipe.torch_dtype,
+            process_image=False,
+        )  # [1,24,T',H',W']
         return patchify_video(z), int(z.shape[2]), int(z.shape[3]), int(z.shape[4]), frames
 
     def _encode_audio_ref(self, pipe, waveform, sample_rate: int):
         waveform = waveform.squeeze(0) if waveform.dim() == 3 else waveform
         assert waveform.dim() == 2, "waveform must be in shape (C, T)"
-        waveform = resample_waveform(convert_to_stereo(waveform).float(), sample_rate, pipe.audio_vae.sample_rate) # [C, T]
+        waveform = resample_waveform(
+            convert_to_stereo(waveform).float(), sample_rate, pipe.audio_vae.sample_rate
+        )  # [C, T]
         latent = pipe.audio_vae.encode_audio(waveform[:2].to(pipe.device), dtype=pipe.torch_dtype)  # [C, 32, T]
         return pack_audio(latent), latent.shape[-1]
 
@@ -385,11 +852,23 @@ class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
         assert value is not None, f"reference type {kind!r} requires field {key!r}"
         return value
 
-    def _build_block(self, pipe, ref, target_frame_count, ref_image_short_edge, ref_video_short_edge, ref_video_max_pixels):
+    def _build_block(
+        self, pipe, ref, target_frame_count, ref_image_short_edge, ref_video_short_edge, ref_video_max_pixels
+    ):
         kind = ref["type"]
         if kind == "image":
-            rows, lh, lw, prepared = self._encode_image_ref(pipe, self._require(ref, "image", kind), ref_image_short_edge)
-            return {"kind": kind, "visual_clean": rows, "latent_t": 1, "latent_h": lh, "latent_w": lw, "prepared_image": prepared, "ref_audio_t": 0}
+            rows, lh, lw, prepared = self._encode_image_ref(
+                pipe, self._require(ref, "image", kind), ref_image_short_edge
+            )
+            return {
+                "kind": kind,
+                "visual_clean": rows,
+                "latent_t": 1,
+                "latent_h": lh,
+                "latent_w": lw,
+                "prepared_image": prepared,
+                "ref_audio_t": 0,
+            }
         if kind in ("video", "video_audio"):
             if kind == "video" and ref.get("audio") is not None:
                 raise ValueError("reference type 'video' is silent; use 'video_audio' to pass a soundtrack")
@@ -397,24 +876,49 @@ class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
             if kind == "video_audio":
                 audio_waveform = self._require(ref, "audio", kind)
                 audio_sample_rate = int(self._require(ref, "sample_rate", kind))
-            rows, lt, lh, lw, prepared = self._encode_video_ref(pipe, frames, target_frame_count, ref_video_short_edge, ref_video_max_pixels)
-            block = {"kind": kind, "visual_clean": rows, "latent_t": lt, "latent_h": lh, "latent_w": lw, "prepared_frames": prepared, "ref_audio_t": 0}
+            rows, lt, lh, lw, prepared = self._encode_video_ref(
+                pipe, frames, target_frame_count, ref_video_short_edge, ref_video_max_pixels
+            )
+            block = {
+                "kind": kind,
+                "visual_clean": rows,
+                "latent_t": lt,
+                "latent_h": lh,
+                "latent_w": lw,
+                "prepared_frames": prepared,
+                "ref_audio_t": 0,
+            }
             if kind == "video_audio":
                 audio_rows, ref_audio_t = self._encode_audio_ref(pipe, audio_waveform, audio_sample_rate)
                 block["audio_clean"], block["ref_audio_t"] = audio_rows, ref_audio_t
             return block
         if kind == "audio":
-            rows, ref_audio_t = self._encode_audio_ref(pipe, self._require(ref, "audio", kind), int(self._require(ref, "sample_rate", kind)))
+            rows, ref_audio_t = self._encode_audio_ref(
+                pipe, self._require(ref, "audio", kind), int(self._require(ref, "sample_rate", kind))
+            )
             return {"kind": kind, "audio_clean": rows, "ref_audio_t": ref_audio_t}
 
-    def process(self, pipe: MiniMaxH3Pipeline, references, seed, video_latents, num_frames, ref_image_short_edge, ref_video_short_edge, ref_video_max_pixels):
+    def process(
+        self,
+        pipe: MiniMaxH3Pipeline,
+        references,
+        seed,
+        video_latents,
+        num_frames,
+        ref_image_short_edge,
+        ref_video_short_edge,
+        ref_video_max_pixels,
+    ):
         if not references:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         seed = int(seed) if seed is not None else 42
         device = pipe.device
 
-        ref_blocks_out = [self._build_block(pipe, ref, num_frames, ref_image_short_edge, ref_video_short_edge, ref_video_max_pixels) for ref in references]
+        ref_blocks_out = [
+            self._build_block(pipe, ref, num_frames, ref_image_short_edge, ref_video_short_edge, ref_video_max_pixels)
+            for ref in references
+        ]
         visual_blocks = [b for b in ref_blocks_out if "visual_clean" in b]
         imgvid_cond_num_frames = len(visual_blocks)
         visual_parts = []
@@ -425,8 +929,17 @@ class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
             else:
                 full_t = video_latents.shape[2] + imgvid_cond_num_frames
                 noise_shape = (1, 24, full_t, int(block["latent_h"]), int(block["latent_w"]))
-                noise = pipe.generate_noise(noise_shape, seed=seed, rand_device="cpu", rand_torch_dtype=pipe.torch_dtype, device="cpu", torch_dtype=pipe.torch_dtype)
-                noise_rows = patchify_video(noise[:, :, : int(block["latent_t"])]).to(device=device, dtype=pipe.torch_dtype)
+                noise = pipe.generate_noise(
+                    noise_shape,
+                    seed=seed,
+                    rand_device="cpu",
+                    rand_torch_dtype=pipe.torch_dtype,
+                    device="cpu",
+                    torch_dtype=pipe.torch_dtype,
+                )
+                noise_rows = patchify_video(noise[:, :, : int(block["latent_t"])]).to(
+                    device=device, dtype=pipe.torch_dtype
+                )
                 ts = torch.tensor(pipe.imgvid_cond_noise_aug, dtype=pipe.torch_dtype, device=device)
                 anchor = ts * clean + (1.0 - ts) * noise_rows
             visual_parts.append(anchor)
@@ -440,7 +953,14 @@ class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
             if pipe.audio_cond_noise_aug == 1.0:
                 anchor = clean
             else:
-                noise = pipe.generate_noise(clean.shape, seed=seed + 1, rand_device="cpu", rand_torch_dtype=pipe.torch_dtype, device=device, torch_dtype=pipe.torch_dtype)
+                noise = pipe.generate_noise(
+                    clean.shape,
+                    seed=seed + 1,
+                    rand_device="cpu",
+                    rand_torch_dtype=pipe.torch_dtype,
+                    device=device,
+                    torch_dtype=pipe.torch_dtype,
+                )
                 ts = torch.tensor(pipe.audio_cond_noise_aug, dtype=pipe.torch_dtype, device=device)
                 anchor = ts * clean + (1.0 - ts) * noise
             audio_parts.append(anchor)
@@ -465,7 +985,7 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
             input_params_posi={"prompt_embeds": "prompt_embeds", "text_token_tags": "text_token_tags"},
             input_params_nega={"prompt_embeds": "prompt_embeds", "text_token_tags": "text_token_tags"},
             input_params=("video_latents", "audio_latents", "keyframe_cond_anchor", "keyframe_indices", "ref_blocks"),
-            output_params=("packed",)
+            output_params=("packed",),
         )
 
     @staticmethod
@@ -483,13 +1003,15 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         return torch.from_numpy(grid).to(torch.float64)
 
     def _video_t_grid(self, n: int, origin: float) -> torch.Tensor:
-        spans = torch.tensor([self._FRAME_RESCALE * self._FRAME_PER_TOKEN[k % self._T_GROUP] for k in range(n)], dtype=torch.float64)
+        spans = torch.tensor(
+            [self._FRAME_RESCALE * self._FRAME_PER_TOKEN[k % self._T_GROUP] for k in range(n)], dtype=torch.float64
+        )
         return origin + torch.cat([torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)])
 
     def _temporal_position_span(self, temporal_length: int) -> float:
         spans = np.ones(int(temporal_length), dtype=np.float64) * self._FRAME_RESCALE
         for token_index in range(self._T_GROUP):
-            spans[token_index::self._T_GROUP] *= self._FRAME_PER_TOKEN[token_index]
+            spans[token_index :: self._T_GROUP] *= self._FRAME_PER_TOKEN[token_index]
         return float(spans.sum())
 
     def _video_t_span(self, n: int) -> float:
@@ -508,8 +1030,12 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         return video_g.reshape(-1, 3)
 
     def _audio_w_axis(self, w_grid: torch.Tensor, audio_t: int, audio_rows: int) -> torch.Tensor:
-        return torch.cat([torch.full((audio_t,), float(w_grid[0]), dtype=torch.float64),
-                          torch.full((audio_rows - audio_t,), float(w_grid[-1]), dtype=torch.float64)])
+        return torch.cat(
+            [
+                torch.full((audio_t,), float(w_grid[0]), dtype=torch.float64),
+                torch.full((audio_rows - audio_t,), float(w_grid[-1]), dtype=torch.float64),
+            ]
+        )
 
     def _build_packed_fl2va(self, text_len, latent_t, latent_h, latent_w, audio_t, keyframe_indices, audio_channel=2):
         """fl2va layout: [text | cond | audio | video | pad]."""
@@ -547,7 +1073,7 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
             cond_g = torch.empty(frame_rows, 3, dtype=torch.float64)
             cond_g[:, 0] = cond_t
             cond_g[:, 1:] = frame
-            g[cond_sl.start + sl.start: cond_sl.start + sl.stop] = cond_g
+            g[cond_sl.start + sl.start : cond_sl.start + sl.stop] = cond_g
 
         g[video_sl] = self._video_grid(latent_t, frame, float(text_len))
         g[audio_sl, 0] = (float(text_len) + torch.arange(audio_t, dtype=torch.float64)).repeat(audio_channel)
@@ -559,9 +1085,13 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         token_tags[img_pos] = 0  # both cond and video rows are tagged as video (0)
 
         return {
-            "img_pos": img_pos, "audio_pos": audio_pos, "text_pos": torch.arange(0, text_len),
-            "img_position_ids": g[None], "token_tags": token_tags,
-            "cu_seqlens": torch.tensor([0, used, seq_len], dtype=torch.int32), "seq_len": seq_len,
+            "img_pos": img_pos,
+            "audio_pos": audio_pos,
+            "text_pos": torch.arange(0, text_len),
+            "img_position_ids": g[None],
+            "token_tags": token_tags,
+            "cu_seqlens": torch.tensor([0, used, seq_len], dtype=torch.int32),
+            "seq_len": seq_len,
         }
 
     def _build_packed_ref2va(self, text_len, latent_t, latent_h, latent_w, audio_t, ref_blocks, audio_channel=2):
@@ -686,19 +1216,42 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
 
         return {
-            "img_pos": img_pos, "audio_pos": audio_pos, "text_pos": text_pos,
-            "img_position_ids": g[None], "token_tags": token_tags, "cu_seqlens": cu,
+            "img_pos": img_pos,
+            "audio_pos": audio_pos,
+            "text_pos": text_pos,
+            "img_position_ids": g[None],
+            "token_tags": token_tags,
+            "cu_seqlens": cu,
             "seq_len": seq_len,
         }
 
-    def process(self, pipe: MiniMaxH3Pipeline, prompt_embeds, video_latents, audio_latents, text_token_tags=None, keyframe_cond_anchor=None, keyframe_indices=None, ref_blocks=None):
+    def process(
+        self,
+        pipe: MiniMaxH3Pipeline,
+        prompt_embeds,
+        video_latents,
+        audio_latents,
+        text_token_tags=None,
+        keyframe_cond_anchor=None,
+        keyframe_indices=None,
+        ref_blocks=None,
+    ):
         text_len = prompt_embeds.shape[0]
         video_latent_t, latent_h, latent_w = video_latents.shape[2:]
         audio_latent_t = audio_latents.shape[-1]
         if ref_blocks is not None:
-            packed = self._build_packed_ref2va(text_len, video_latent_t, latent_h, latent_w, audio_latent_t, ref_blocks)
+            packed = self._build_packed_ref2va(
+                text_len, video_latent_t, latent_h, latent_w, audio_latent_t, ref_blocks
+            )
         else:
-            packed = self._build_packed_fl2va(text_len, video_latent_t, latent_h, latent_w, audio_latent_t, keyframe_indices if keyframe_cond_anchor is not None else [])
+            packed = self._build_packed_fl2va(
+                text_len,
+                video_latent_t,
+                latent_h,
+                latent_w,
+                audio_latent_t,
+                keyframe_indices if keyframe_cond_anchor is not None else [],
+            )
 
         packed["token_tags"][packed["text_pos"]] = text_token_tags.cpu()
         if pipe.device == "mps":
@@ -756,7 +1309,18 @@ def model_fn_minimax_h3(
     unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
 
     refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device)
-    v_video_rows, v_audio_rows = dit(
+
+    # VeOmni DiT is the HF wrapper MiniMaxH3DiTModel: it runs the
+    # same raw DiT forward (skip_mask_out_condition=True, update_mask=None),
+    # slices cond rows, unpatchifies and negates, returning the same
+    # (video_pred, audio_pred) pair. The wrapper
+    # does NOT slice ref-audio rows, so ref2va audio references are
+    # unsupported (t2va / fl2va are unaffected).
+    if ref_audio_anchor is not None:
+        raise NotImplementedError(
+            "ref2va audio references are not supported by the VeOmni wrapper (MiniMaxH3DiTModel)."
+        )
+    outputs = dit(
         x=x,
         audio_x=audio_x,
         img_position_ids=packed["img_position_ids"],
@@ -770,15 +1334,12 @@ def model_fn_minimax_h3(
         img_pos_for_infer_output_info={"position_ids": img_pos},
         packed_seq_params={"cu_seqlens_q": cu, "max_seqlen_q": int(cu[1])},
         refiner_packed_seq_params={"cu_seqlens_q": refiner_cu, "max_seqlen_q": text_len},
-        update_mask=None,
         skip_mask_out_condition=True,
+        cond_rows=cond_rows_count,
+        video_latent_shape=(f, h // 2, w // 2),
+        audio_latent_shape=(audio_channel, audio_t),
         use_gradient_checkpointing=use_gradient_checkpointing,
-        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
     )
 
-    v_video_rows = v_video_rows[cond_rows_count:]
-    v_audio_rows = v_audio_rows[ref_audio_rows_count:]
-
-    v_video = unpatchify_video(v_video_rows, f, h, w)
-    v_audio = unpack_audio(v_audio_rows, audio_channel, audio_t)
-    return -v_video, -v_audio
+    video_pred, audio_pred = outputs.predictions
+    return video_pred, audio_pred
