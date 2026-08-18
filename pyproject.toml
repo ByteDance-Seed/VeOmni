@@ -88,6 +88,13 @@ gpu = [
   "peft==0.18.1",
   "megatron-energon>=7.2.1",
   "hf_transfer",
+  # MagiAttention 1.1.1 imports debugpy unconditionally from
+  # magi_attention.utils.debug but omits it from package metadata.
+  "debugpy",
+  "create-block-mask-cuda==0.1; sys_platform == 'linux'",
+  "flash-attn-cute==0.0.2; sys_platform == 'linux'",
+  "magi-to-hstu-cuda==0.1; sys_platform == 'linux'",
+  "magi-attention==1.1.1; sys_platform == 'linux'",
 ]
 
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
@@ -198,6 +205,14 @@ conflicts = [
 
 [tool.uv.sources]
 patchgen = { path = "patchgen-pkg", editable = true }
+magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
+# MagiAttention upstream designates this contributor-maintained support branch
+# for its arbitrary-mask FA4 packages and SM90 ffa-fa3 overlay. Dao-AILab does
+# not publish equivalent packages.
+# Keep the immutable shared revision until an organization-owned source exists.
+create-block-mask-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/create_block_mask" }
+flash-attn-cute = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "flash_attn" }
+magi-to-hstu-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/magi_to_hstu" }
 # Direct wheel URLs for gpu — pytorch index sometimes resolves cu128_full wheels
 # that drop nvidia-* deps and confuse uv into uninstalling them. Update both
 # Python versions and architectures when bumping torch.
@@ -280,10 +295,50 @@ name = "flash-qla"
 version = "0.1.0"
 requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
 
+# The Magi packages below intentionally use empty static runtime metadata.
+# Their companion extensions declare no runtime requirements upstream, while
+# MagiAttention omits project dependencies and keeps a separate requirements
+# file that targets CUDA 12 NVSHMEM and an older Quack release. VeOmni skips
+# the communication extension and supplies the CUDA 13-compatible runtime
+# closure explicitly through the complete gpu extra: torch, CUTLASS DSL,
+# Quack, the three companion packages, and the otherwise undeclared debugpy.
+# Re-audit those direct dependencies whenever the pinned revisions change.
+[[tool.uv.dependency-metadata]]
+name = "magi-attention"
+version = "1.1.1"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "create-block-mask-cuda"
+version = "0.1"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn-cute"
+version = "0.0.2"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "magi-to-hstu-cuda"
+version = "0.1"
+requires-dist = []
+
 # Seeds the build env (uv-created venvs are not seeded by default).
 [tool.uv.extra-build-dependencies]
+create-block-mask-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
 flash-attn-4 = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+flash-attn-cute = ["setuptools", "wheel"]
 flash-qla = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+magi-attention = ["setuptools>=78.1.1", "wheel", "packaging>=24.2", "ninja", "torch", "versioningit"]
+magi-to-hstu-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+# SM90 uses the separately installed CUTLASS FFA overlay, while SM100+ uses
+# CUTE DSL/JIT. Build their shared extensions for both architectures; CP
+# communication remains outside the CP1 scope.
+magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
+create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100" }
+magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}
