@@ -13,7 +13,7 @@ from torch.distributed.tensor import DTensor
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
-from veomni.models.seed_omni.modules.bagel.qwen2_mot import modeling as qwen2_mot_modeling
+from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated as qwen2_mot_accelerated
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 from veomni.utils.device import get_device_type, get_torch_device
@@ -178,9 +178,9 @@ def _qwen2_mot_sp_worker() -> None:
     world_size = dist.get_world_size()
     assert world_size == 4
     device = torch.device(f"{get_device_type()}:{rank}")
-    qwen2_mot_modeling.veomni_rms_norm.bind("liger_kernel")
-    qwen2_mot_modeling.veomni_apply_rotary_pos_emb.bind("liger_kernel")
-    qwen2_mot_modeling.veomni_swiglu_mlp.bind("liger_kernel")
+    qwen2_mot_accelerated.veomni_rms_norm.bind("liger_kernel")
+    qwen2_mot_accelerated.veomni_apply_rotary_pos_emb.bind("liger_kernel")
+    qwen2_mot_accelerated.veomni_swiglu_mlp.bind("liger_kernel")
 
     non_sp_state = init_parallel_state(
         dp_size=world_size,

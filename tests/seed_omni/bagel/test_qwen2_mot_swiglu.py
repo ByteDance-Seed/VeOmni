@@ -9,7 +9,7 @@ import pytest
 import torch
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as TransformersQwen2MLP
 
-import veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling as modeling
+import veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated as accelerated
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -29,9 +29,9 @@ def test_qwen2_mot_swiglu_dispatches_configured_kernel(monkeypatch):
             captured["hidden_states"] = hidden_states
             return hidden_states.clone()
 
-    monkeypatch.setattr(modeling, "veomni_swiglu_mlp", RecordingSlot())
+    monkeypatch.setattr(accelerated, "veomni_swiglu_mlp", RecordingSlot())
 
-    mlp = modeling.Qwen2MLP(_config())
+    mlp = accelerated.Qwen2MLPAccelerated(_config())
     hidden_states = torch.randn(2, 3, 128)
     output = mlp(hidden_states)
 
@@ -47,9 +47,9 @@ def test_qwen2_mot_swiglu_rejects_unsupported_fused_activation(monkeypatch):
         def __call__(self, *args, **kwargs):
             raise AssertionError("unsupported activation must fail before kernel dispatch")
 
-    monkeypatch.setattr(modeling, "veomni_swiglu_mlp", UnexpectedSlot())
+    monkeypatch.setattr(accelerated, "veomni_swiglu_mlp", UnexpectedSlot())
 
-    mlp = modeling.Qwen2MLP(_config(hidden_act="gelu"))
+    mlp = accelerated.Qwen2MLPAccelerated(_config(hidden_act="gelu"))
     with pytest.raises(
         ValueError,
         match="Set model.ops_implementation.swiglu_mlp_implementation='eager'",
@@ -64,9 +64,9 @@ def test_qwen2_mot_swiglu_empty_input_skips_fused_kernel(monkeypatch):
         def __call__(self, *args, **kwargs):
             raise AssertionError("fused SwiGLU must not receive an empty input")
 
-    monkeypatch.setattr(modeling, "veomni_swiglu_mlp", FailingSlot())
+    monkeypatch.setattr(accelerated, "veomni_swiglu_mlp", FailingSlot())
 
-    mlp = modeling.Qwen2MLP(_config())
+    mlp = accelerated.Qwen2MLPAccelerated(_config())
     hidden_states = torch.empty(0, 128, requires_grad=True)
     output = mlp(hidden_states)
     output.sum().backward()
@@ -80,7 +80,7 @@ def test_qwen2_mot_swiglu_empty_input_skips_fused_kernel(monkeypatch):
 
 def test_qwen2_mot_swiglu_preserves_state_dict_contract():
     source = TransformersQwen2MLP(_config())
-    target = modeling.Qwen2MLP(_config())
+    target = TransformersQwen2MLP(_config())
     for parameter in source.parameters():
         parameter.data.normal_()
 
@@ -111,18 +111,18 @@ def test_qwen2_mot_liger_swiglu_matches_eager(monkeypatch):
     torch.manual_seed(2026)
     device = get_device_type()
 
-    eager_mlp = modeling.Qwen2MLP(_config()).to(device=device, dtype=torch.bfloat16)
-    liger_mlp = copy.deepcopy(eager_mlp)
+    eager_mlp = TransformersQwen2MLP(_config()).to(device=device, dtype=torch.bfloat16)
+    liger_mlp = accelerated.Qwen2MLPAccelerated(_config()).to(device=device, dtype=torch.bfloat16)
+    liger_mlp.load_state_dict(copy.deepcopy(eager_mlp.state_dict()))
     eager_input = torch.randn(7, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
     liger_input = eager_input.detach().clone().requires_grad_()
     grad_output = torch.randn_like(eager_input)
 
-    monkeypatch.setattr(modeling, "veomni_swiglu_mlp", OpSlot("swiglu_mlp", "standard"))
     eager_output, eager_input_grad, eager_parameter_grads = _run_forward_backward(eager_mlp, eager_input, grad_output)
 
     liger_slot = OpSlot("swiglu_mlp", "standard")
     liger_slot.bind("liger_kernel")
-    monkeypatch.setattr(modeling, "veomni_swiglu_mlp", liger_slot)
+    monkeypatch.setattr(accelerated, "veomni_swiglu_mlp", liger_slot)
     liger_output, liger_input_grad, liger_parameter_grads = _run_forward_backward(liger_mlp, liger_input, grad_output)
 
     torch.testing.assert_close(liger_output, eager_output, atol=2e-2, rtol=2e-2)

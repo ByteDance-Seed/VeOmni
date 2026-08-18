@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated as accelerated
 import veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling as modeling
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
@@ -33,12 +34,12 @@ def test_qwen2_mot_rope_dispatches_packed_inputs(monkeypatch):
             captured.update(q=q, k=k, cos=cos, sin=sin, kwargs=kwargs)
             return q + 1, k + 2
 
-    monkeypatch.setattr(modeling, "veomni_apply_rotary_pos_emb", RecordingSlot())
+    monkeypatch.setattr(accelerated, "veomni_apply_rotary_pos_emb", RecordingSlot())
 
     q = torch.randn(7, 28, 128)
     k = torch.randn(7, 4, 128)
     cos, sin = _cos_sin(7, 128)
-    q_output, k_output = modeling._apply_rotary_pos_emb(q, k, cos, sin)
+    q_output, k_output = accelerated._apply_rotary_pos_emb(q, k, cos, sin)
 
     assert captured["q"].shape == (1, 28, 7, 128)
     assert captured["k"].shape == (1, 4, 7, 128)
@@ -58,13 +59,13 @@ def test_qwen2_mot_rope_empty_input_skips_fused_kernel(monkeypatch):
         def __call__(self, *args, **kwargs):
             raise AssertionError("fused RoPE must not receive an empty input")
 
-    monkeypatch.setattr(modeling, "veomni_apply_rotary_pos_emb", FailingSlot())
+    monkeypatch.setattr(accelerated, "veomni_apply_rotary_pos_emb", FailingSlot())
 
     q = torch.empty(0, 28, 128, requires_grad=True)
     k = torch.empty(0, 4, 128, requires_grad=True)
     cos = torch.empty(0, 128)
     sin = torch.empty(0, 128)
-    q_output, k_output = modeling._apply_rotary_pos_emb(q, k, cos, sin)
+    q_output, k_output = accelerated._apply_rotary_pos_emb(q, k, cos, sin)
     torch.autograd.backward((q_output.sum(), k_output.sum()))
 
     assert q_output.shape == q.shape
@@ -80,13 +81,13 @@ def test_qwen2_mot_rope_rejects_partial_fused_dimensions(monkeypatch):
         def __call__(self, *args, **kwargs):
             raise AssertionError("partial RoPE must fail before kernel dispatch")
 
-    monkeypatch.setattr(modeling, "veomni_apply_rotary_pos_emb", UnexpectedSlot())
+    monkeypatch.setattr(accelerated, "veomni_apply_rotary_pos_emb", UnexpectedSlot())
 
     q = torch.randn(7, 28, 128)
     k = torch.randn(7, 4, 128)
     cos, sin = _cos_sin(7, 64)
     with pytest.raises(NotImplementedError, match="does not support partial rotary dimensions"):
-        modeling._apply_rotary_pos_emb(q, k, cos, sin)
+        accelerated._apply_rotary_pos_emb(q, k, cos, sin)
 
 
 def test_qwen2_mot_rope_rejects_unsupported_unsqueeze_dimension(monkeypatch):
@@ -96,13 +97,13 @@ def test_qwen2_mot_rope_rejects_unsupported_unsqueeze_dimension(monkeypatch):
         def __call__(self, *args, **kwargs):
             raise AssertionError("unsupported layout must fail before kernel dispatch")
 
-    monkeypatch.setattr(modeling, "veomni_apply_rotary_pos_emb", UnexpectedSlot())
+    monkeypatch.setattr(accelerated, "veomni_apply_rotary_pos_emb", UnexpectedSlot())
 
     q = torch.randn(7, 28, 128)
     k = torch.randn(7, 4, 128)
     cos, sin = _cos_sin(7, 128)
     with pytest.raises(NotImplementedError, match="requires unsqueeze_dim=1"):
-        modeling._apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
+        accelerated._apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Liger RoPE requires CUDA")
@@ -120,7 +121,6 @@ def test_qwen2_mot_liger_rope_matches_eager_forward_backward(monkeypatch):
     q_grad_output = torch.randn_like(eager_q_leaf)
     k_grad_output = torch.randn_like(eager_k_leaf)
 
-    monkeypatch.setattr(modeling, "veomni_apply_rotary_pos_emb", OpSlot("rotary_pos_emb", "full"))
     eager_q_output, eager_k_output = modeling._apply_rotary_pos_emb(
         eager_q_leaf * 1,
         eager_k_leaf * 1,
@@ -131,8 +131,8 @@ def test_qwen2_mot_liger_rope_matches_eager_forward_backward(monkeypatch):
 
     liger_slot = OpSlot("rotary_pos_emb", "full")
     liger_slot.bind("liger_kernel")
-    monkeypatch.setattr(modeling, "veomni_apply_rotary_pos_emb", liger_slot)
-    liger_q_output, liger_k_output = modeling._apply_rotary_pos_emb(
+    monkeypatch.setattr(accelerated, "veomni_apply_rotary_pos_emb", liger_slot)
+    liger_q_output, liger_k_output = accelerated._apply_rotary_pos_emb(
         liger_q_leaf * 1,
         liger_k_leaf * 1,
         cos,

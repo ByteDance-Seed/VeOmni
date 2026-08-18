@@ -8,7 +8,7 @@ import pytest
 import torch
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm as TransformersQwen2RMSNorm
 
-import veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling as modeling
+import veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated as accelerated
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -25,9 +25,9 @@ def test_qwen2_mot_rms_norm_dispatches_configured_kernel(monkeypatch):
             captured["eps"] = eps
             return hidden_states.clone()
 
-    monkeypatch.setattr(modeling, "veomni_rms_norm", RecordingSlot())
+    monkeypatch.setattr(accelerated, "veomni_rms_norm", RecordingSlot())
 
-    norm = modeling.Qwen2RMSNorm(8, eps=1e-5)
+    norm = accelerated.Qwen2RMSNormAccelerated(8, eps=1e-5)
     hidden_states = torch.randn(2, 3, 8)
     output = norm(hidden_states)
 
@@ -44,9 +44,9 @@ def test_qwen2_mot_rms_norm_empty_input_skips_fused_kernel(monkeypatch):
         def __call__(self, *args, **kwargs):
             raise AssertionError("fused RMSNorm must not receive an empty input")
 
-    monkeypatch.setattr(modeling, "veomni_rms_norm", FailingSlot())
+    monkeypatch.setattr(accelerated, "veomni_rms_norm", FailingSlot())
 
-    norm = modeling.Qwen2RMSNorm(128)
+    norm = accelerated.Qwen2RMSNormAccelerated(128)
     hidden_states = torch.empty(0, 28, 128, requires_grad=True)
     output = norm(hidden_states)
     output.sum().backward()
@@ -59,7 +59,7 @@ def test_qwen2_mot_rms_norm_empty_input_skips_fused_kernel(monkeypatch):
 
 def test_qwen2_mot_rms_norm_preserves_state_dict_contract():
     source = TransformersQwen2RMSNorm(128)
-    target = modeling.Qwen2RMSNorm(128)
+    target = TransformersQwen2RMSNorm(128)
     source.weight.data.normal_()
 
     assert source.state_dict().keys() == target.state_dict().keys()
@@ -93,18 +93,18 @@ def test_qwen2_mot_liger_rms_norm_matches_eager(monkeypatch, shape):
     torch.manual_seed(2025)
     device = get_device_type()
 
-    eager_norm = modeling.Qwen2RMSNorm(shape[-1]).to(device=device, dtype=torch.bfloat16)
-    liger_norm = copy.deepcopy(eager_norm)
+    eager_norm = TransformersQwen2RMSNorm(shape[-1]).to(device=device, dtype=torch.bfloat16)
+    liger_norm = accelerated.Qwen2RMSNormAccelerated(shape[-1]).to(device=device, dtype=torch.bfloat16)
+    liger_norm.load_state_dict(copy.deepcopy(eager_norm.state_dict()))
     eager_input = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
     liger_input = eager_input.detach().clone().requires_grad_()
     grad_output = torch.randn_like(eager_input)
 
-    monkeypatch.setattr(modeling, "veomni_rms_norm", OpSlot("rms_norm", "standard"))
     eager_result = _run_forward_backward(eager_norm, eager_input, grad_output)
 
     liger_slot = OpSlot("rms_norm", "standard")
     liger_slot.bind("liger_kernel")
-    monkeypatch.setattr(modeling, "veomni_rms_norm", liger_slot)
+    monkeypatch.setattr(accelerated, "veomni_rms_norm", liger_slot)
     liger_result = _run_forward_backward(liger_norm, liger_input, grad_output)
 
     for eager_value, liger_value in zip(eager_result, liger_result, strict=True):

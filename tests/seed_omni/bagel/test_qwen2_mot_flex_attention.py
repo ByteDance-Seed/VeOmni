@@ -12,7 +12,7 @@ from torch.nn.attention.flex_attention import create_mask
 from torch.nn.functional import scaled_dot_product_attention
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
-from veomni.models.seed_omni.modules.bagel.qwen2_mot import modeling
+from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated, modeling
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     build_mot_attention_metadata,
     build_mot_block_mask,
@@ -20,6 +20,7 @@ from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoTAttention
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.ops.kernels.attention import fused_attention_forward
 
 
 def _flex_config(**overrides):
@@ -260,14 +261,14 @@ def test_sp_padding_metadata_is_isolated_and_has_visible_rows() -> None:
 
 def test_training_attention_dispatches_unified_flex_once(monkeypatch: pytest.MonkeyPatch) -> None:
     config = _flex_config()
-    attention = BagelQwen2MoTAttention(config, layer_idx=0)
+    attention = accelerated.BagelQwen2MoTAttentionAccelerated(config, layer_idx=0)
     calls = []
 
     def fake_attention(module, query, key, value, attention_mask, **kwargs):
         calls.append((module, query.shape, key.shape, value.shape, attention_mask, kwargs))
         return query.transpose(1, 2).contiguous(), None
 
-    monkeypatch.setattr(modeling, "fused_attention_forward", fake_attention)
+    monkeypatch.setattr(accelerated, "fused_attention_forward", fake_attention)
     sequence_length = 6
     packed_sequence = torch.randn(sequence_length, config.hidden_size)
     metadata = build_mot_attention_metadata(
@@ -295,14 +296,46 @@ def test_training_attention_dispatches_unified_flex_once(monkeypatch: pytest.Mon
     assert calls[0][5]["scaling"] == attention.head_dim**-0.5
 
 
-def test_training_attention_rejects_non_flex_backend() -> None:
+def test_eager_training_attention_uses_sdpa() -> None:
     config_type = config_cls("bagel_qwen2_mot")
     config = config_type(**tiny_bagel_qwen2_cfg(), attn_implementation="sdpa")
     attention = BagelQwen2MoTAttention(config, layer_idx=0)
     sequence_length = 2
     metadata = build_mot_attention_metadata([[2]], [["causal"]], device=torch.device("cpu"))
 
-    with pytest.raises(ValueError, match="requires attn_implementation='veomni_flex_attention_with_sp'"):
+    output = attention._forward_packed_train(
+        packed_sequence=torch.randn(sequence_length, config.hidden_size),
+        attention_mask=build_mot_block_mask(metadata),
+        packed_position_cos=torch.ones(sequence_length, attention.head_dim),
+        packed_position_sin=torch.zeros(sequence_length, attention.head_dim),
+        packed_und_token_indexes=torch.arange(sequence_length),
+        packed_gen_token_indexes=torch.empty(0, dtype=torch.long),
+    )
+
+    assert output.shape == (sequence_length, config.hidden_size)
+    assert torch.isfinite(output).all()
+
+
+def test_eager_model_advertises_sdpa_only() -> None:
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoT
+
+    assert BagelQwen2MoT._supports_sdpa is True
+    assert BagelQwen2MoT._supports_flex_attn is False
+
+
+def test_accelerated_model_advertises_flex_attention() -> None:
+    assert accelerated.BagelQwen2MoTAccelerated._supports_flex_attn is True
+    assert accelerated.BagelQwen2MoTAccelerated._supports_sdpa is True
+
+
+def test_accelerated_training_attention_rejects_non_flex_backend() -> None:
+    config_type = config_cls("bagel_qwen2_mot")
+    config = config_type(**tiny_bagel_qwen2_cfg(), attn_implementation="sdpa")
+    attention = accelerated.BagelQwen2MoTAttentionAccelerated(config, layer_idx=0)
+    sequence_length = 2
+    metadata = build_mot_attention_metadata([[2]], [["causal"]], device=torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="requires packed fused attention"):
         attention._forward_packed_train(
             packed_sequence=torch.randn(sequence_length, config.hidden_size),
             attention_mask=build_mot_block_mask(metadata),
@@ -342,7 +375,7 @@ def test_flex_attention_matches_dense_sdpa_forward_and_qkv_gradients() -> None:
     flex_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in base_inputs]
     dense_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in base_inputs]
 
-    flex_output, _ = modeling.fused_attention_forward(attention, *flex_inputs, block_mask)
+    flex_output, _ = fused_attention_forward(attention, *flex_inputs, block_mask)
     dense_output = scaled_dot_product_attention(
         *dense_inputs,
         attn_mask=dense_mask,
