@@ -19,11 +19,15 @@ from typing import Collection, Optional
 import torch
 import torch.nn as nn
 
-from ..utils import logging
-from ..utils.device import IS_CUDA_AVAILABLE
+from ..utils import device, logging
 
 
 logger = logging.get_logger(__name__)
+
+
+_SUPPORTED_MULTIMODAL_DECODER_BLOCKS = {
+    "qwen3_vl": "Qwen3VLTextDecoderLayer",
+}
 
 
 @dataclass
@@ -47,6 +51,64 @@ def _decoder_block_class_names(model: nn.Module) -> set[str]:
     if no_split_modules is None:
         return set()
     return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+
+
+def _is_multimodal_model(model: nn.Module) -> bool:
+    config = getattr(model, "config", None)
+    if config is not None and any(
+        getattr(config, config_name, None) is not None for config_name in ("vision_config", "audio_config")
+    ):
+        return True
+
+    input_modalities = getattr(model, "input_modalities", None) or getattr(type(model), "input_modalities", ())
+    if isinstance(input_modalities, str):
+        input_modalities = (input_modalities,)
+    return any(modality != "text" for modality in input_modalities)
+
+
+def validate_compile_model(
+    model: nn.Module,
+    compile_config: CompileConfig,
+    sequence_parallel_enabled: bool = False,
+    async_enabled: bool = False,
+) -> None:
+    """Validate model-specific contracts for per-block compilation.
+
+    Text models keep the generic decoder-layer path. Multimodal models are
+    fail-closed because their towers and cross-modal injection points have
+    different shape and lifecycle contracts.
+    """
+
+    if not _is_multimodal_model(model):
+        return
+
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    expected_decoder_block = _SUPPORTED_MULTIMODAL_DECODER_BLOCKS.get(model_type)
+    if expected_decoder_block is None:
+        raise RuntimeError(
+            "train.torch_compile.enable currently supports multimodal training only for dense Qwen3-VL "
+            f"(model_type='qwen3_vl'); got model_type={model_type!r}."
+        )
+    if compile_config.dynamic:
+        raise RuntimeError("train.torch_compile.enable for Qwen3-VL requires train.torch_compile.dynamic=False.")
+    if compile_config.uses_cuda_graphs():
+        raise RuntimeError(
+            "train.torch_compile.enable for Qwen3-VL does not support CUDA Graph replay yet because packed "
+            "FlashAttention metadata can vary between micro-batches; use backend='inductor' and mode=None."
+        )
+    if sequence_parallel_enabled or async_enabled:
+        raise RuntimeError(
+            "train.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism, "
+            "Ring Attention context parallelism, or async Ulysses yet; set train.accelerator.ulysses_size=1, "
+            "train.accelerator.cp_size=1, and train.accelerator.enable_async=False."
+        )
+
+    decoder_block_class_names = _decoder_block_class_names(model)
+    if expected_decoder_block not in decoder_block_class_names:
+        raise RuntimeError(
+            f"train.torch_compile.enable for Qwen3-VL requires {expected_decoder_block!r} in model._no_split_modules."
+        )
 
 
 def _is_decoder_block(module: nn.Module, decoder_block_class_names: Optional[Collection[str]] = None) -> bool:
@@ -74,7 +136,39 @@ def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_resh
         )
 
 
-def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> int:
+def validate_compile_runtime(
+    compile_config: CompileConfig,
+    *,
+    device_type: str,
+    fsdp_enabled: bool,
+    fsdp_mode: str,
+    any_extra_parallel_enabled: bool,
+    enable_reshard_after_forward: bool,
+) -> None:
+    """Validate runtime contracts before compile-specific setup begins."""
+
+    if not compile_config.enable:
+        return
+    if not device.IS_CUDA_AVAILABLE or device_type != device.get_device_type():
+        raise RuntimeError("train.torch_compile.enable is CUDA-only for now.")
+    if not fsdp_enabled:
+        raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
+    if fsdp_mode != "fsdp2":
+        raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
+    if any_extra_parallel_enabled:
+        raise RuntimeError(
+            "train.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
+            "communication may be captured inside compiled blocks."
+        )
+    validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
+
+
+def compile_decoder_blocks(
+    model: nn.Module,
+    compile_config: CompileConfig,
+    sequence_parallel_enabled: bool = False,
+    async_enabled: bool = False,
+) -> int:
     """Compile forward of every decoder block inside ``model`` in place.
 
     Compiling the forward method (rather than wrapping the whole module)
@@ -86,6 +180,8 @@ def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> i
         raise RuntimeError(
             "train.torch_compile.enable requires torch.compile, but this PyTorch build has no torch.compile."
         )
+
+    validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,
@@ -129,7 +225,7 @@ def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> i
 def mark_compile_step_begin(enable_compile: bool) -> None:
     """Mark a new training step for CUDA Graph Trees managed by torch.compile."""
 
-    if not enable_compile or not IS_CUDA_AVAILABLE:
+    if not enable_compile or not device.IS_CUDA_AVAILABLE:
         return
     mark_step_begin = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
     if mark_step_begin is not None:

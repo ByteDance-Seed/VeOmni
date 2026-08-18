@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
@@ -146,6 +147,7 @@ def main(
         compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
+    return res
 
 
 _DEFAULT_RTOL = 1e-1
@@ -206,15 +208,13 @@ deepseek_v4_text_smoke_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        # DeepSeek-V4 attention is eager-only (no FA / SDPA / FlexAttention)
-        # and the 4D ``[B, S, hc_mult, D]`` HyperConnection residual stack
-        # is not SP-aware yet. Force ``max_sp_size=1`` until a V4-specific
-        # eager-SP path lands.
-        1,
+        # DeepSeek-V4 uses an eager/TileLang SP path (Q Ulysses + MQA sequence
+        # gather around compressors). Exercise SP=1 vs SP=2 alignment.
+        2,
         # The GPU fused-MoE path now preserves DeepSeek-V4's ``swiglu_limit``
         # clamp, so keep the smoke test on the default fused_triton MoE path.
         # EP remains disabled here because the surrounding V4 e2e coverage is
-        # a single-mode smoke test, not an EP alignment test.
+        # an SP alignment smoke test, not an EP alignment test.
         1,
     ),
     pytest.param(
@@ -508,7 +508,7 @@ def test_deepseek_v4_tilelang_dyn_bsz_smoke(
         rtol=_DEFAULT_RTOL,
         atol=_DEFAULT_ATOL,
         train_path=request.getfixturevalue(dataset_fixture),
-        max_sp_size=1,
+        max_sp_size=2,
         max_ep_size=1,
         compare_alignment=False,
         extra_args=[*_DEEPSEEK_V4_TILELANG_TRAINING_ARGS, *case_args],
@@ -549,6 +549,44 @@ def test_qwen3vl_parallel_align(
         atol=atol,
         max_sp_size=max_sp_size,
         train_path=dummy_qwen3vl_dataset,
+    )
+
+
+def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
+    lora_config_path = tmp_path / "qwen3vl_lora_smoke.yaml"
+    lora_config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "lora_config": {
+                        "rank": 4,
+                        "alpha": 8,
+                        "lora_modules": ["q_proj", "qkv"],
+                    }
+                }
+            }
+        )
+    )
+    results = main(
+        task_name="train_vlm_test",
+        model_name="qwen3vl",
+        config_path="./tests/toy_config/qwen3vl_toy",
+        is_moe=False,
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        train_path=dummy_qwen3vl_dataset,
+        max_sp_size=1,
+        compare_alignment=False,
+        extra_args=[
+            str(lora_config_path),
+            "--train.freeze_vit=True",
+        ],
+    )
+    assert results and all(results.values())
+    assert all(
+        values and torch.isfinite(torch.tensor(values)).all()
+        for result in results.values()
+        for values in result.values()
     )
 
 

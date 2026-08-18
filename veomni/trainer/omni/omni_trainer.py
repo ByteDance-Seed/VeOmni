@@ -50,7 +50,6 @@ Division of labour
 """
 
 import json
-import math
 import os
 from collections import defaultdict
 from dataclasses import asdict
@@ -65,6 +64,7 @@ from ...arguments.parser import save_args
 from ...data import SeedOmniCollator, build_dataloader, build_dataset
 from ...data.data_transform import build_data_transform
 from ...distributed.chunk_mbs import build_chunk_mbs_ranges
+from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.offloading import build_activation_offloading_context
 from ...distributed.parallel_state import init_parallel_state
 from ...models.seed_omni.accelerator import OmniModelRuntime
@@ -590,17 +590,22 @@ class OmniTrainer:
     # ── Grad-norm helpers ─────────────────────────────────────────────────────
 
     def _clip_grad_norm(self) -> float:
-        """Clip each module-trainer's grads and combine into the global L2 grad norm.
+        """Clip grads across OmniModules according to ``grad_clip_scope``.
 
-        Each :class:`ModuleRuntime` clips the params of its own FSDP unit and
-        returns that module's grad norm; the whole-model norm is their L2
-        combination (sqrt of sum of squares). Empty (no module-trainers) → 0.0.
+        * ``per_module`` (default): each :class:`ModuleRuntime` clips the params of
+          its own FSDP unit against **its own** ``optimizer.max_grad_norm`` (every
+          OmniModule carries its own optimizer config); the whole-model norm is
+          their L2 combination. Empty (no module runtimes) → 0.0.
+        * ``global``: measure unclipped, ``total=sqrt(sum n_i^2)``, then one scale
+          coeff for all modules (seedream ``gradient_clip_val`` semantics), against
+          the model-level ``max_grad_norm`` the modules inherit from.
         """
-        module_grad_norms = [
-            module_runtime._clip_grad_norm(module_runtime.args.optimizer.max_grad_norm)
-            for module_runtime in self.model.module_runtimes.values()
-        ]
-        return math.sqrt(sum(g * g for g in module_grad_norms)) if module_grad_norms else 0.0
+        opt_cfg = self.args.model.optimizer
+        return omni_clip_grad_norm(
+            self.model.module_runtimes,
+            opt_cfg.max_grad_norm,
+            grad_clip_scope=opt_cfg.grad_clip_scope,
+        )
 
     def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         def _to_device(v: Any) -> Any:
@@ -650,7 +655,8 @@ class OmniTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self._callbacks(stage="step_begin", micro_batches=micro_batches)
-        synchronize()
+        if self.args.train.sync_each_train_step:
+            synchronize()
 
         total_loss = 0.0
         total_loss_dict: Dict[str, float] = defaultdict(float)
@@ -679,7 +685,8 @@ class OmniTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self._callbacks(stage="step_begin", micro_batches=micro_batches)
-        synchronize()
+        if self.args.train.sync_each_train_step:
+            synchronize()
 
         num_micro_steps = len(micro_batches)
         for micro_step, micro_batch in enumerate(micro_batches):

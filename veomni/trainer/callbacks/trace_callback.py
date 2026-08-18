@@ -188,6 +188,8 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
 
         args: "VeOmniArguments" = self.trainer.args
+        self.lora_config = trainer.model.get_lora_config() if hasattr(trainer.model, "get_lora_config") else None
+        self.freeze_vit = getattr(args.train, "freeze_vit", None) if self.lora_config is None else None
         self.trainer.environ_meter = helper.EnvironMeter(
             config=trainer.model_config,
             global_batch_size=args.train.global_batch_size,
@@ -208,7 +210,12 @@ class EnvironMeterCallback(Callback):
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
         delta_time = time.time() - self.start_time
-        step_env_metrics = self.trainer.environ_meter.step(delta_time, global_step=state.global_step)
+        step_env_metrics = self.trainer.environ_meter.step(
+            delta_time,
+            global_step=state.global_step,
+            lora_config=self.lora_config,
+            freeze_vit=self.freeze_vit,
+        )
 
         step_train_metrics = {
             "total_loss": loss,

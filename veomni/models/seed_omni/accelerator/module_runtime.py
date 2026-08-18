@@ -42,6 +42,7 @@ from ....models import build_foundation_model
 from ....optim import build_lr_scheduler, build_optimizer
 from ....trainer.base import _collect_muon_kwargs
 from ....utils import helper, logging
+from ....utils.checkpoint_utils import should_skip_hf_weight_load
 from ....utils.device import get_device_type
 from ....utils.model_utils import pretty_print_trainable_parameters
 from ..mixins.metric_meter_mixin import MetricMeterMixin, MetricMeterResult
@@ -291,6 +292,7 @@ class ModuleRuntime:
             model,
             init_device=args.accelerator.init_device,
             weights_path=args.model_path,
+            should_skip_hf_weight_load=self.skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.accelerator.gradient_checkpointing.enable,
@@ -408,6 +410,35 @@ class ModuleRuntime:
         if self._has_trainable_parameters is None:
             self._has_trainable_parameters = any(param.requires_grad for param in self.model.parameters())
         return self._has_trainable_parameters
+
+    @property
+    def skip_hf_weight_load(self) -> bool:
+        """Whether this module's initial HF weight materialization can be skipped.
+
+        A full non-LoRA resume already carries model weights, so materializing the
+        HF checkpoint first only to overwrite it costs a second memory peak that
+        can OOM large MoE modules. Skipping is safe **only** if a DCP checkpoint
+        will actually restore this module — and for a fully-frozen module
+        :meth:`_init_checkpoint` installs no checkpoint manager at all, so nothing
+        would ever write its weights and it must load the released HF ones.
+        """
+        load_path = self.train.checkpoint.load_path if self.train is not None else None
+        if not should_skip_hf_weight_load(load_path, self.args.lora_config):
+            return False
+
+        # A parameterless module has no persistent state for HF or DCP to restore
+        # (e.g. a process-only stage), so there is nothing to materialize.
+        if not self.model.state_dict():
+            return True
+
+        if not self.has_trainable_parameters:
+            logger.info_rank0(
+                f"ModuleRuntime[{self.module_name}]: fully frozen module has persistent model state; "
+                "loading HF weights because no module DCP checkpoint will restore it."
+            )
+            return False
+
+        return True
 
     def _build_optimizer(self):
         """Build this module's optimizer over its still-trainable params.

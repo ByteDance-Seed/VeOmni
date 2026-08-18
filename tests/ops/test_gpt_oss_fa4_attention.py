@@ -5,6 +5,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssAttention
 
 from veomni.ops.kernels import attention as veomni_attention
+from veomni.ops.kernels.attention import flash as flash_backend
 
 
 class _FakeAttentionModule(nn.Module):
@@ -23,7 +24,7 @@ def test_gpt_oss_fa4_attention_forwards_sliding_window_and_sinks(monkeypatch):
         captured.update(kwargs)
         return torch.zeros_like(query)
 
-    monkeypatch.setattr(veomni_attention, "_flash_attention_forward", fake_flash_attention_forward)
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash_attention_forward)
 
     module = _FakeAttentionModule()
     query = torch.randn(1, 2, 3, 4)

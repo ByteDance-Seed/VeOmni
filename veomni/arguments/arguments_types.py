@@ -25,6 +25,21 @@ from ..utils.env import get_env
 logger = logging.get_logger(__name__)
 
 
+def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
+    """Copy an ``hdfs://`` path to a local cache and return the local path.
+
+    Non-HDFS paths (local filesystem, HF hub ids, hdfs-fuse mounts) are returned
+    unchanged. Concurrent processes on the same node are serialized by the file
+    lock inside ``copy_to_local``, so the download happens only once per node.
+    """
+    from ..utils.fs import copy_to_local, is_non_local
+
+    if path is None or not is_non_local(path):
+        return path
+
+    return copy_to_local(path.rstrip("/"), verbose=True)
+
+
 # ================================ Training Arguments ======================================
 #
 # Hierarchy:
@@ -97,13 +112,27 @@ class OptimizerConfig:
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
     )
+    grad_clip_scope: Literal["per_module", "global"] = field(
+        default="per_module",
+        metadata={
+            "help": (
+                "How OmniTrainer applies max_grad_norm across OmniModules. "
+                "'per_module' (default): clip each module to max_grad_norm independently, "
+                "then report sqrt(sum n_i^2). "
+                "'global': measure each module unclipped, total=sqrt(sum n_i^2), then scale "
+                "all modules by one coefficient (single-model / seedream gradient_clip_val semantics)."
+            ),
+        },
+    )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
-    muon_lr: float = field(
-        default=2e-2,
+    muon_lr: Optional[float] = field(
+        default=None,
         metadata={
             "help": (
                 "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
-                "Per Moonlight, ~25x the AdamW lr is a common starting point."
+                "If unset: inherits train.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
+                "(default); uses 25x train.optimizer.lr when muon_adjust_lr_fn=original "
+                "(Moonlight-style starting point)."
             )
         },
     )
@@ -141,6 +170,28 @@ class OptimizerConfig:
             )
         },
     )
+    muon_head_group_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Attention heads per Newton-Schulz block for head-split Muon. "
+                "0 (default) orthogonalizes each projection as a single matrix; 1 is fully per-head; "
+                "g > 1 puts g heads in each block. Any value >= 1 also requires "
+                "muon_head_split_modules."
+            )
+        },
+    )
+    muon_head_split_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Leaf module names to head-split, matched exactly against the children of an "
+                "attention module, e.g. ['q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
+                "['q_proj', 'k_proj', 'v_proj'] for GQA. Required whenever "
+                "muon_head_group_size >= 1; see docs/usage/basic_modules.md."
+            )
+        },
+    )
     muon_expert_zero_comm: bool = field(
         default=False,
         metadata={
@@ -148,6 +199,28 @@ class OptimizerConfig:
                 "Use whole-expert Shard(0) for Muon under FSDP+ExtraParallel when "
                 "(num_experts/ep_size) %% ep_fsdp_size == 0; otherwise fall back "
                 "to the default hidden-dim sharding path."
+            )
+        },
+    )
+    muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
+        default="gram_quack",
+        metadata={
+            "help": (
+                "Newton-Schulz implementation used by Muon. "
+                "'std': torch.optim.Muon-compatible Newton-Schulz; "
+                "'gram': pure-PyTorch Dao-AILab Gram Newton-Schulz; "
+                "'gram_quack' (default): Dao-AILab Gram-NS with quack CuTeDSL GEMM kernels "
+                "(Hopper/Blackwell). If quack/package is missing, falls back to gram."
+            )
+        },
+    )
+    muon_gram_ns_reset_iterations: List[int] = field(
+        default_factory=lambda: [2],
+        metadata={
+            "help": (
+                "Restart indices for Gram Newton-Schulz (applied immediately before "
+                "those iteration indices). Default [2] matches Dao-AILab guidance "
+                "for 5-step schedules."
             )
         },
     )
@@ -455,7 +528,7 @@ class TorchCompileConfig:
 
     enable: bool = field(
         default=False,
-        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
+        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
     )
     backend: Optional[str] = field(
         default="inductor",
@@ -748,7 +821,7 @@ class TrainingArguments:
     ep_sharded_stream_load: bool = field(
         default=False,
         metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations warn and fall back to the standard loader, so a heterogeneous OmniModel can enable it for its MoE sub-module alone."
         },
     )
     enable_full_determinism: bool = field(
@@ -758,6 +831,15 @@ class TrainingArguments:
     enable_batch_invariant_mode: bool = field(
         default=False,
         metadata={"help": "Enable batch invariant mode."},
+    )
+    sync_each_train_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Synchronize the accelerator before each training step's forward/backward work. "
+                "Disable to allow asynchronous dataloader and H2D work to overlap with the next step."
+            )
+        },
     )
     empty_cache_steps: int = field(
         default=500,
@@ -1014,6 +1096,7 @@ class OpsImplementationConfig:
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
             "native-sparse",
         ]
     ] = field(
@@ -1102,6 +1185,8 @@ class OpsImplementationConfig:
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
+            "delegates heavy GDN compute to torch.ops.npu.*). "
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
@@ -1127,6 +1212,7 @@ class OpsImplementationConfig:
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
+                "flex_attention": "veomni_flex_attention_with_sp",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
@@ -1262,6 +1348,12 @@ class ModelArguments:
         if self.config_path is None and self.model_path is None:
             raise ValueError("`config_path` must be specified when `model_path` is None.")
 
+        # Download HDFS-hosted paths to a local cache before resolving defaults so
+        # that all downstream loaders (config/tokenizer/safetensors) see local paths.
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.config_path = _resolve_hdfs_path(self.config_path)
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
+
         if self.config_path is None:
             self.config_path = self.model_path
 
@@ -1313,6 +1405,14 @@ class DataloaderConfig:
     prefetch_factor: int = field(
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},
+    )
+    persistent_workers: bool = field(
+        default=False,
+        metadata={"help": "Keep DataLoader worker processes alive between iterator recreations."},
+    )
+    in_order: bool = field(
+        default=True,
+        metadata={"help": "Return worker-loaded batches in first-in, first-out order."},
     )
     drop_last: bool = field(
         default=True,
@@ -1465,12 +1565,12 @@ class VeOmniArguments:
                 )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text trainers only. "
-                    "Multimodal/DiT/Omni data pipelines do not implement pad_to_length for static packed shapes yet."
+                    "train.torch_compile.enable is not supported by this data pipeline. "
+                    "The pipeline must implement pad_to_length for static packed shapes."
                 )
             if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text data only; "
+                    "train.torch_compile.enable currently supports packed language-model data types only; "
                     f"got data.data_type={self.data.data_type!r}."
                 )
             if not self.train.dyn_bsz or not self.train.pad_to_length:
@@ -1541,5 +1641,7 @@ class InferArguments:
     )
 
     def __post_init__(self):
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path

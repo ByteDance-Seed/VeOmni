@@ -1,7 +1,9 @@
 import copy
 import os
 import shutil
+import signal
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -20,8 +22,12 @@ try:
     )
 except Exception as _:
     from checkpoint_verification_utils import verify_dcp_to_hf_conversion
+
+from tests.tools.launch_utils import find_free_port
 from veomni.arguments import parse_args
 from veomni.data import build_dummy_dataset
+from veomni.models.seed_omni.modules.qwen3.llm.configuration import Qwen3LlmConfig
+from veomni.models.seed_omni.modules.qwen3.llm.modeling import Qwen3Llm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, HuggingfaceCkptCallback
@@ -35,6 +41,23 @@ os.environ["NCCL_DEBUG"] = "OFF"
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 logger = helper.create_logger(__name__)
+
+
+def _run_bounded_process_group(command: list[str], timeout: float = 180.0) -> None:
+    process = subprocess.Popen(command, start_new_session=True)
+    try:
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        raise
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
 
 
 def flatten_dict(d, parent_key="", sep="_"):
@@ -280,11 +303,32 @@ def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
 
 
 # MoE save/load coverage.
-TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
+# deepseek_v4 is included for hash-MoE tid2eid + fused experts + mHC DCP resume.
+# CI L20-8 keeps the default nproc=8; local machines can override with
+# VEOMNI_CHECKPOINT_TEST_NPROC (ep sizes larger than nproc are skipped).
+TEST_MODELS = ["qwen3_moe", "deepseek_v3", "deepseek_v4"]
 TEST_EP_SIZES = [1, 4, 8]
 
 
-@pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
+def _saveload_cases():
+    try:
+        from .utils import get_checkpoint_test_nproc
+    except Exception:
+        from utils import get_checkpoint_test_nproc
+
+    nproc = get_checkpoint_test_nproc()
+    cases = []
+    for model in TEST_MODELS:
+        # DeepSeek-V4 EP token dispatch is not yet covered by saveload (e2e also
+        # keeps max_ep_size=1). Exercise DCP resume + HF export at ep=1 only.
+        ep_sizes = [1] if model == "deepseek_v4" else TEST_EP_SIZES
+        for ep in ep_sizes:
+            if ep <= nproc:
+                cases.append((model, ep))
+    return cases
+
+
+@pytest.mark.parametrize("model_name,ep_size", _saveload_cases())
 def test_trainer_saveload(model_name: str, ep_size: int):
     _run_trainer_saveload_and_verify(model_name, ep_size)
 
@@ -304,3 +348,81 @@ def test_trainer_saveload_hsdp(ep_size: int):
 def test_trainer_save_hf_safetensor(ep_size: int):
     # only test save hf safetensor on qwen3_moe to save resources
     _run_trainer_save_hf_safetensor("qwen3_moe", ep_size)
+
+
+def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
+    snapshot_dir = tmp_path / "frozen_llm"
+    output_dir = tmp_path / "output"
+    resume_root = output_dir / "checkpoints" / "global_step_1"
+    resume_root.mkdir(parents=True)
+
+    config = Qwen3LlmConfig(
+        text_config={
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "max_position_embeddings": 128,
+            "tie_word_embeddings": False,
+            "use_cache": False,
+        },
+        freeze=True,
+    )
+    model = Qwen3Llm(config)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(0.125)
+    model.save_pretrained(snapshot_dir)
+
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes=1",
+        "--nproc_per_node=2",
+        f"--master-port={find_free_port()}",
+        "tests/checkpoints/omni_frozen_resume_runner.py",
+        # `model.model_path` is the split-checkpoint ROOT; the runner resolves
+        # `frozen_llm` (the module name) as this module's subfolder under it.
+        "--model.model_path",
+        str(tmp_path),
+        "--model.ops_implementation.attn_implementation",
+        "eager",
+        "--model.ops_implementation.cross_entropy_loss_implementation",
+        "eager",
+        "--model.ops_implementation.rms_norm_implementation",
+        "eager",
+        "--model.ops_implementation.swiglu_mlp_implementation",
+        "eager",
+        "--model.ops_implementation.rotary_pos_emb_implementation",
+        "eager",
+        "--model.ops_implementation.load_balancing_loss_implementation",
+        "eager",
+        # SeedOmni V2 keeps the parallel plan on `model.accelerator`, not `train.*`.
+        "--model.accelerator.fsdp_config.fsdp_mode",
+        "fsdp2",
+        "--model.accelerator.fsdp_config.forward_prefetch",
+        "False",
+        "--model.accelerator.broadcast_model_weights_from_rank0",
+        "False",
+        "--model.accelerator.init_device",
+        "meta",
+        "--model.accelerator.gradient_checkpointing.enable",
+        "False",
+        "--data.train_path",
+        "dummy",
+        "--train.checkpoint.load_path",
+        str(resume_root),
+        "--train.checkpoint.output_dir",
+        str(output_dir),
+        "--train.checkpoint.manager",
+        "dcp",
+        "--train.global_batch_size",
+        "2",
+        "--train.micro_batch_size",
+        "1",
+    ]
+    _run_bounded_process_group(command)

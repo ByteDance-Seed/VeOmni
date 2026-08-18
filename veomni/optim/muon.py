@@ -18,15 +18,25 @@
 weights and adds batched Newton-Schulz for 3D MoE expert stacks. Sharded
 params are gathered only when the NS iteration needs the full trailing
 ``[M, K]`` matrix.
+
+The per-group ``head_blocks`` option orthogonalizes a head-stacked attention
+projection in row blocks (one block per head group) instead of as one matrix.
 """
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.optim.optimizer import Optimizer
+
+from ..utils import logging
+from ..utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+
+
+logger = logging.get_logger(__name__)
 
 
 try:
@@ -56,7 +66,11 @@ __all__ = [
     "DEFAULT_NS_COEFFICIENTS",
     "DEFAULT_NS_STEPS",
     "DistributedMuon",
+    "batched_gram_newton_schulz",
+    "NS_IMPLEMENTATIONS",
     "batched_newton_schulz",
+    "infer_head_block_counts",
+    "run_newton_schulz",
     "split_muon_adamw_params",
 ]
 
@@ -71,6 +85,66 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "output_layer",
 )
 
+# Attribute names carrying a head count and a per-head row stride. MLA modules
+# keep the true stride as ``qk_head_dim``; ``head_dim`` is only the rope part.
+_HEAD_COUNT_ATTRS: Tuple[str, ...] = ("num_heads", "n_heads", "num_attention_heads", "num_key_value_heads")
+_HEAD_STRIDE_ATTRS: Tuple[str, ...] = ("head_dim", "qk_head_dim")
+
+
+def _as_coeff_schedule(
+    ns_coefficients: Sequence[Any],
+    ns_steps: int,
+) -> Tuple[Tuple[float, float, float], ...]:
+    """Expand a single (a,b,c) or validate a per-step coefficient schedule."""
+    if ns_steps >= 100:
+        raise ValueError("Number of steps must be less than 100 for computational efficiency")
+    if len(ns_coefficients) == 0:
+        raise ValueError("ns_coefficients must not be empty")
+
+    # Single triple: (a, b, c) reused for every step (torch.optim.Muon style).
+    first = ns_coefficients[0]
+    if len(ns_coefficients) == 3 and not isinstance(first, (list, tuple)):
+        a, b, c = (float(ns_coefficients[0]), float(ns_coefficients[1]), float(ns_coefficients[2]))
+        return tuple((a, b, c) for _ in range(ns_steps))
+
+    # Flat sequences that are not a single (a,b,c) are invalid.
+    if all(not isinstance(x, (list, tuple)) for x in ns_coefficients):
+        raise ValueError(
+            "Coefficients must be a tuple of exactly 3 values (a, b, c), or a "
+            f"sequence of (a, b, c) triples; got length-{len(ns_coefficients)} flat sequence"
+        )
+
+    schedule: List[Tuple[float, float, float]] = []
+    for row in ns_coefficients:
+        if not isinstance(row, (list, tuple)) or len(row) != 3:
+            raise ValueError(f"Per-step ns_coefficients must be a sequence of (a, b, c) triples; got {row!r}")
+        schedule.append((float(row[0]), float(row[1]), float(row[2])))
+    if not schedule:
+        raise ValueError("ns_coefficients schedule is empty")
+    return tuple(schedule)
+
+
+def _flatten_matrix_batch(grad: Tensor) -> Tuple[Tensor, torch.Size]:
+    """Reshape ``[..., M, K]`` into ``[B, M, K]`` while remembering the original shape."""
+    if grad.ndim < 2:
+        raise ValueError(f"Input must have ndim >= 2, got shape {tuple(grad.shape)}")
+    original_shape = grad.shape
+    if grad.ndim == 2:
+        return grad.unsqueeze(0), original_shape
+    if grad.ndim == 3:
+        return grad, original_shape
+    return grad.reshape(-1, grad.shape[-2], grad.shape[-1]), original_shape
+
+
+def _split_row_blocks(update: Tensor, blocks: int) -> Tensor:
+    """View a 2D ``[M, K]`` update as ``[blocks, M // blocks, K]`` row blocks."""
+    if update.ndim != 2:
+        raise ValueError(f"Head-group splitting expects a 2D update, got shape {tuple(update.shape)}")
+    rows = int(update.shape[0])
+    if blocks < 1 or rows % blocks != 0:
+        raise ValueError(f"Cannot split {rows} rows into {blocks} equal head blocks")
+    return update.reshape(blocks, rows // blocks, update.shape[1])
+
 
 @torch.no_grad()
 def batched_newton_schulz(
@@ -81,14 +155,10 @@ def batched_newton_schulz(
     compute_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
     """Run quintic Newton-Schulz on each trailing ``[M, K]`` matrix."""
-    if ns_steps >= 100:
-        raise ValueError("Number of steps must be less than 100 for computational efficiency")
+    schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
     if grad.ndim < 2:
         raise ValueError(f"Input must have ndim >= 2, got shape {tuple(grad.shape)}")
-    if len(ns_coefficients) != 3:
-        raise ValueError("Coefficients must be a tuple of exactly 3 values")
 
-    a, b, c = ns_coefficients
     original_dtype = grad.dtype
     ortho = grad.to(compute_dtype)
 
@@ -101,7 +171,7 @@ def batched_newton_schulz(
     ortho = ortho / norm
 
     # Keep the 2D path byte-compatible with upstream; use the batched form for 3D.
-    for _ in range(ns_steps):
+    for a, b, c in schedule:
         A = ortho @ ortho.mT
         if A.ndim == 2:
             gram_update = torch.addmm(A, A, A, beta=b, alpha=c)
@@ -122,6 +192,200 @@ def batched_newton_schulz(
         ortho = ortho.mT
 
     return ortho.to(original_dtype)
+
+
+@torch.no_grad()
+def batched_gram_newton_schulz(
+    grad: Tensor,
+    ns_coefficients: Sequence[Any] = DEFAULT_NS_COEFFICIENTS,
+    ns_steps: int = DEFAULT_NS_STEPS,
+    eps: float = EPS,
+    compute_dtype: torch.dtype = torch.float16,
+    reset_iterations: Sequence[int] = (2,),
+) -> Tensor:
+    """Pure-PyTorch Gram Newton-Schulz (Dao-AILab algorithm, no custom kernels).
+
+    Algebraically rearranges quintic NS so the iterative work stays on the small
+    square Gram matrix, with optional intermediate restarts for stability.
+    Square matrices fall back to standard Newton-Schulz.
+    """
+    schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
+    reset_set = {int(i) for i in reset_iterations}
+    original_dtype = grad.dtype
+    X, original_shape = _flatten_matrix_batch(grad)
+
+    # Strictly rectangular only — same policy as Dao-AILab/gram-newton-schulz.
+    if X.size(-2) == X.size(-1):
+        out = batched_newton_schulz(
+            X,
+            ns_coefficients=schedule,
+            ns_steps=len(schedule),
+            eps=eps,
+            compute_dtype=torch.bfloat16 if compute_dtype == torch.float16 else compute_dtype,
+        )
+        return out.to(original_dtype).reshape(original_shape)
+
+    tall_skinny = X.size(-2) > X.size(-1)
+    # Match upstream package numerics: normalize in fp32, iterate in half.
+    X = X.to(torch.float32)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+    X = X.to(compute_dtype)
+
+    if tall_skinny:
+        R = torch.bmm(X.transpose(1, 2), X)
+    else:
+        R = torch.bmm(X, X.transpose(1, 2))
+
+    batch = R.size(0)
+    eye = torch.eye(R.size(-1), device=X.device, dtype=X.dtype).unsqueeze(0).expand(batch, -1, -1).contiguous()
+    Q: Optional[Tensor] = None
+
+    for i, (a, b, c) in enumerate(schedule):
+        if i in reset_set and i != 0:
+            if Q is None:
+                raise RuntimeError("Gram-NS restart requested before Q was initialized")
+            if tall_skinny:
+                X = torch.bmm(X, Q)
+                R = torch.bmm(X.transpose(1, 2), X)
+            else:
+                X = torch.bmm(Q, X)
+                R = torch.bmm(X, X.transpose(1, 2))
+            Q = None
+
+        # Z = b R + c R @ R
+        Z = torch.baddbmm(R, R, R, beta=b, alpha=c)
+        if i == 0 or i in reset_set:
+            Q = Z + a * eye
+        else:
+            assert Q is not None
+            # Q = a Q + Q @ Z
+            Q = torch.baddbmm(Q, Q, Z, beta=a, alpha=1.0)
+
+        # Skip Gram update before a restart or after the final step.
+        if i < len(schedule) - 1 and (i + 1) not in reset_set:
+            assert Q is not None
+            # RZ = a R + R @ Z ; R = a RZ + Z @ RZ
+            RZ = torch.baddbmm(R, R, Z, beta=a, alpha=1.0)
+            R = torch.baddbmm(RZ, Z, RZ, beta=a, alpha=1.0)
+
+    assert Q is not None
+    if tall_skinny:
+        X = torch.bmm(X, Q)
+    else:
+        X = torch.bmm(Q, X)
+    return X.to(original_dtype).reshape(original_shape)
+
+
+_PACKAGE_GRAM_NS_CACHE: Dict[Tuple[Any, ...], Any] = {}
+
+
+def _package_gram_newton_schulz(
+    grad: Tensor,
+    schedule: Tuple[Tuple[float, float, float], ...],
+    eps: float,
+    reset_iterations: Sequence[int],
+    use_kernels: bool,
+) -> Tensor:
+    """Call Dao-AILab ``GramNewtonSchulz`` (optional quack/CuTeDSL kernels)."""
+    try:
+        from gram_newton_schulz import GramNewtonSchulz
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "muon_ns_implementation='gram_quack' requires the gram-newton-schulz "
+            "package. Install with: "
+            "`pip install gram-newton-schulz --no-build-isolation` "
+            "(needs Hopper/Blackwell + quack-kernels)."
+        ) from exc
+
+    key = (schedule, float(eps), tuple(int(i) for i in reset_iterations), bool(use_kernels))
+    ortho = _PACKAGE_GRAM_NS_CACHE.get(key)
+    if ortho is None:
+        ortho = GramNewtonSchulz(
+            ns_epsilon=float(eps),
+            ns_use_kernels=bool(use_kernels),
+            ns_coefficients=[list(t) for t in schedule],
+            gram_newton_schulz_reset_iterations=[int(i) for i in reset_iterations],
+            # torch.compile is brittle across torch/CUDA combos; keep eager.
+            compile_kwargs=None,
+        )
+        _PACKAGE_GRAM_NS_CACHE[key] = ortho
+    return ortho(grad)
+
+
+# Newton-Schulz backend selectors for DistributedMuon / run_newton_schulz.
+NS_IMPLEMENTATIONS = ("std", "gram", "gram_quack")
+_GRAM_QUACK_FALLBACK_WARNED = False
+
+
+def _gram_quack_unavailable_reason(grad: Tensor) -> Optional[str]:
+    if not IS_CUDA_AVAILABLE or grad.device.type != get_device_type():
+        return f"{grad.device.type} tensors are unsupported; quack kernels require CUDA SM90 or newer"
+    compute_capability = get_gpu_compute_capability(grad.device)
+    if compute_capability < 90:
+        major, minor = divmod(compute_capability, 10)
+        return f"CUDA compute capability {major}.{minor} is unsupported; quack kernels require 9.0 or newer"
+    return None
+
+
+@torch.no_grad()
+def run_newton_schulz(
+    grad: Tensor,
+    ns_coefficients: Sequence[Any] = DEFAULT_NS_COEFFICIENTS,
+    ns_steps: int = DEFAULT_NS_STEPS,
+    eps: float = EPS,
+    ns_implementation: str = "gram_quack",
+    gram_ns_reset_iterations: Sequence[int] = (2,),
+    compute_dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    """Dispatch Newton-Schulz / Gram Newton-Schulz for a ``[..., M, K]`` update.
+
+    ``ns_implementation``:
+      - ``std``: torch Muon-compatible Newton-Schulz
+      - ``gram``: pure-PyTorch Gram Newton-Schulz
+      - ``gram_quack`` (default): quack CuTeDSL GEMM kernels (falls back to ``gram`` if unavailable)
+    """
+    if ns_implementation not in NS_IMPLEMENTATIONS:
+        raise ValueError(f"Unknown ns_implementation={ns_implementation!r}; expected one of {NS_IMPLEMENTATIONS}")
+
+    if ns_implementation == "std":
+        schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
+        return batched_newton_schulz(
+            grad,
+            ns_coefficients=schedule,
+            ns_steps=len(schedule),
+            eps=eps,
+            compute_dtype=torch.bfloat16 if compute_dtype is None else compute_dtype,
+        )
+
+    schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
+    if ns_implementation == "gram_quack":
+        fallback_reason = _gram_quack_unavailable_reason(grad)
+        if fallback_reason is None:
+            try:
+                return _package_gram_newton_schulz(
+                    grad,
+                    schedule=schedule,
+                    eps=eps,
+                    reset_iterations=gram_ns_reset_iterations,
+                    use_kernels=True,
+                )
+            except ImportError as exc:
+                fallback_reason = f"{type(exc).__name__}: {exc}"
+        global _GRAM_QUACK_FALLBACK_WARNED
+        if not _GRAM_QUACK_FALLBACK_WARNED:
+            _GRAM_QUACK_FALLBACK_WARNED = True
+            logger.warning_rank0(
+                "[Muon] ns_implementation=gram_quack requested but gram-newton-schulz/quack "
+                f"is unavailable ({fallback_reason}). Falling back to pure-PyTorch gram path."
+            )
+    return batched_gram_newton_schulz(
+        grad,
+        ns_coefficients=schedule,
+        ns_steps=len(schedule),
+        eps=eps,
+        compute_dtype=torch.float16 if compute_dtype is None else compute_dtype,
+        reset_iterations=gram_ns_reset_iterations,
+    )
 
 
 def _is_adamw_by_name(name: str, extra_patterns: Sequence[str]) -> bool:
@@ -187,6 +451,132 @@ def split_muon_adamw_params(
     return muon_params, adamw_params, muon_names, adamw_names
 
 
+def _positive_int(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _declared_ints(source: Any, attrs: Sequence[str]) -> List[int]:
+    """Collect distinct positive ints for ``attrs`` from ``source``."""
+    values: List[int] = []
+    for attr in attrs:
+        value = _positive_int(getattr(source, attr, None))
+        if value is not None and value not in values:
+            values.append(value)
+    return values
+
+
+def _head_layout_tiers(module: "nn.Module") -> List[Tuple[List[int], List[int]]]:
+    """``(head counts, per-head dims)`` to try, module attrs before config attrs.
+
+    A sub-module can disagree with the shared config -- a DSA indexer declares a
+    smaller ``n_heads``/``head_dim`` pair than the attention it sits in -- so its
+    own attributes are tried alone before the merged module+config tier, where
+    two different head counts can fit the same row total.
+    """
+    counts = _declared_ints(module, _HEAD_COUNT_ATTRS)
+    strides = _declared_ints(module, _HEAD_STRIDE_ATTRS)
+    tiers = [(counts, strides)]
+    config = getattr(module, "config", None)
+    if config is not None:
+        tiers.append(
+            (
+                counts + [v for v in _declared_ints(config, _HEAD_COUNT_ATTRS) if v not in counts],
+                strides + [v for v in _declared_ints(config, _HEAD_STRIDE_ATTRS) if v not in strides],
+            )
+        )
+    return tiers
+
+
+def _stacked_head_counts(rows: int, tiers: Sequence[Tuple[Sequence[int], Sequence[int]]]) -> List[int]:
+    """Head counts consistent with ``rows == heads * per_head_dim``.
+
+    Both factors must be *declared*, since ``rows // head_dim`` would split at
+    arbitrary offsets whenever ``head_dim`` is not the row stride (DeepSeek V3
+    reports the rope part only). Returns every match of the last tier tried, so
+    the caller can refuse to guess when a layout stays ambiguous.
+    """
+    matches: List[int] = []
+    for counts, strides in tiers:
+        matches = sorted({heads for heads in counts for stride in strides if rows == heads * stride})
+        if len(matches) == 1:
+            break
+    return matches
+
+
+def infer_head_block_counts(
+    model: "nn.Module",
+    head_group_size: int,
+    module_names: Sequence[str],
+) -> Dict[str, int]:
+    """Map parameter FQN to the number of row blocks for head-split Muon.
+
+    A weight is eligible when it lives in a direct child module named in
+    ``module_names`` of an attention module that declares both a head count and
+    a per-head dim. ``head_group_size`` is the number of heads per block.
+
+    Returns only params that end up with >1 block; anything whose head layout
+    cannot be pinned down, or whose head count is not divisible by
+    ``head_group_size``, is skipped with a warning and stays on full-matrix Muon.
+    """
+    if head_group_size < 1:
+        return {}
+    if not module_names:
+        raise ValueError(
+            "Head-split Muon needs an explicit list of attention projection module names "
+            "(head_group_size >= 1 with an empty module_names)."
+        )
+
+    allowed = set(module_names)
+    blocks: Dict[str, int] = {}
+    warned: set = set()
+
+    def _warn_once(key: Tuple[Any, ...], message: str) -> None:
+        if key not in warned:
+            warned.add(key)
+            logger.warning_rank0(f"[Muon] {message}")
+
+    for module_name, module in model.named_modules():
+        tiers = _head_layout_tiers(module)
+        head_counts, strides = tiers[-1]
+        for child_name, child in module.named_children():
+            if child_name not in allowed:
+                continue
+            for param_name, param in child.named_parameters(recurse=False):
+                if param.ndim != 2 or not param.requires_grad:
+                    continue
+                fqn = ".".join(part for part in (module_name, child_name, param_name) if part)
+                if not head_counts or not strides:
+                    _warn_once(
+                        (module.__class__.__name__, child_name, "undeclared"),
+                        f"head split skipped for {fqn}: {module.__class__.__name__} declares no head "
+                        "count / per-head dim, so row blocks cannot be validated against head boundaries.",
+                    )
+                    continue
+                rows = int(param.shape[0])
+                matches = _stacked_head_counts(rows, tiers)
+                if len(matches) != 1:
+                    _warn_once(
+                        (child_name, rows, tuple(head_counts), tuple(strides)),
+                        f"head split skipped for {fqn}: {rows} rows do not match exactly one "
+                        f"(head count x per-head dim) product, with head counts {head_counts} and "
+                        f"per-head dims {strides}.",
+                    )
+                    continue
+                num_heads = matches[0]
+                if num_heads % head_group_size != 0:
+                    _warn_once(
+                        (child_name, num_heads, head_group_size, "group"),
+                        f"head split skipped for {fqn}: {num_heads} heads are not divisible by "
+                        f"head_group_size={head_group_size}.",
+                    )
+                    continue
+                num_blocks = num_heads // head_group_size
+                if num_blocks > 1:
+                    blocks[fqn] = num_blocks
+
+    return blocks
+
+
 _KIND_LOCAL = "local"
 _KIND_FSDP_GATHER_2D = "fsdp_gather_2d"
 _KIND_MOE_LOCAL_3D = "moe_local_3d"
@@ -243,6 +633,44 @@ def _wrap_full_as_dtensor_like(full: Tensor, ref: Tensor) -> Tensor:
     return replicated.redistribute(device_mesh=mesh, placements=ref.placements)
 
 
+def _fsdp_all2all_fast_path_eligible(p: DTensor) -> bool:
+    """True when ``p`` is a 2D ``Shard(0)`` DTensor on a 1D mesh.
+
+    The owner-based all-to-all path supports empty tail-rank shards when the
+    first dimension is smaller than the mesh. Anything else (HSDP multi-dim
+    meshes, ``Shard(d>0)``, ragged shards) falls back to the generic
+    ``full_tensor()`` path.
+    """
+    if p.device_mesh.ndim != 1:
+        return False
+    placements = p.placements
+    if len(placements) != 1 or not isinstance(placements[0], Shard):
+        return False
+    if placements[0].dim != 0:
+        return False
+    world = p.device_mesh.size(0)
+    if world <= 1:
+        return False
+    return True
+
+
+def _fsdp_all2all_bucket_key(update: DTensor) -> Tuple[Any, torch.dtype]:
+    """Group all-to-all updates by mesh and local communication dtype."""
+    return update.device_mesh, update.to_local().dtype
+
+
+def _shard_row_sizes(full_rows: int, world: int) -> List[int]:
+    """Per-rank row counts matching DTensor's ``Shard(0)`` even split."""
+    shard_rows = -(-full_rows // world)
+    sizes = []
+    remaining = full_rows
+    for _ in range(world):
+        take = min(shard_rows, max(remaining, 0))
+        sizes.append(take)
+        remaining -= take
+    return sizes
+
+
 class DistributedMuon(Optimizer):
     """Muon optimizer that handles dense and 3D-MoE FSDP2-sharded DTensors.
 
@@ -262,6 +690,9 @@ class DistributedMuon(Optimizer):
         eps: float = EPS,
         ns_steps: int = DEFAULT_NS_STEPS,
         adjust_lr_fn: Optional[str] = None,
+        ns_implementation: str = "gram_quack",
+        gram_ns_reset_iterations: Sequence[int] = (2,),
+        head_blocks: int = 1,
     ) -> None:
         if not _MUON_AVAILABLE:
             raise RuntimeError(
@@ -277,6 +708,10 @@ class DistributedMuon(Optimizer):
             raise ValueError(f"weight decay should be >= 0 but is: {weight_decay}")
         if adjust_lr_fn is not None and adjust_lr_fn not in ("original", "match_rms_adamw"):
             raise ValueError(f"Adjust learning rate function {adjust_lr_fn} is not supported")
+        if ns_implementation not in NS_IMPLEMENTATIONS:
+            raise ValueError(f"ns_implementation must be one of {NS_IMPLEMENTATIONS}, got {ns_implementation!r}")
+        if int(head_blocks) < 1:
+            raise ValueError(f"head_blocks must be >= 1 but is: {head_blocks}")
 
         defaults: Dict[str, Any] = {
             "lr": lr,
@@ -287,18 +722,74 @@ class DistributedMuon(Optimizer):
             "eps": eps,
             "ns_steps": ns_steps,
             "adjust_lr_fn": adjust_lr_fn,
+            "ns_implementation": ns_implementation,
+            "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
+        # Only carried when splitting is on: as a default it would add a
+        # ``param_groups.<fqn>.head_blocks`` entry to every flattened optimizer
+        # state dict, which checkpoints written before this option lack.
+        if int(head_blocks) != 1:
+            defaults["head_blocks"] = int(head_blocks)
         super().__init__(params, defaults)
 
         for group in self.param_groups:
-            for p in group["params"]:
-                if not _is_muon_eligible_ndim(p):
+            self._validate_group(group)
+
+    @staticmethod
+    def _validate_group(group: Dict[str, Any]) -> None:
+        """Reject param layouts Muon cannot orthogonalize, at build time."""
+        head_blocks = int(group.get("head_blocks", 1))
+        if head_blocks < 1:
+            raise ValueError(f"head_blocks must be >= 1 but is: {head_blocks}")
+        for p in group["params"]:
+            if not _is_muon_eligible_ndim(p):
+                raise ValueError(
+                    "DistributedMuon supports only 2D and 3D parameters; "
+                    f"got param with shape {tuple(p.size())}. Route 1D/4D+ "
+                    "params (biases, norms, conv weights) to AdamW via "
+                    "split_muon_adamw_params."
+                )
+            if head_blocks > 1:
+                if p.ndim != 2:
                     raise ValueError(
-                        "DistributedMuon supports only 2D and 3D parameters; "
-                        f"got param with shape {tuple(p.size())}. Route 1D/4D+ "
-                        "params (biases, norms, conv weights) to AdamW via "
-                        "split_muon_adamw_params."
+                        "head_blocks > 1 only applies to 2D head-stacked attention "
+                        f"projections; got a {p.ndim}D param with shape {tuple(p.size())}."
                     )
+                if p.shape[0] % head_blocks != 0:
+                    raise ValueError(
+                        f"head_blocks={head_blocks} does not evenly divide the "
+                        f"{p.shape[0]} rows of a param with shape {tuple(p.size())}."
+                    )
+
+    def add_param_group(self, param_group: Dict[str, Any]) -> None:  # type: ignore[override]
+        super().add_param_group(param_group)
+        self._validate_group(self.param_groups[-1])
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:  # type: ignore[override]
+        """Restore optimizer state while keeping this run's head-split scope.
+
+        ``head_blocks`` describes how a matrix is sliced for orthogonalization,
+        not resumable state. Torch restores every param-group option from the
+        checkpoint, so without this a DCP resume (which rebuilds groups from the
+        live optimizer and then delegates here) would silently drop back to
+        full-matrix updates.
+        """
+        # ``None`` where the group carries no ``head_blocks`` at all, so an unsplit
+        # run does not gain the key (and its state dict keys) on resume.
+        configured = [group.get("head_blocks") for group in self.param_groups]
+        super().load_state_dict(state_dict)
+        restored = [group.get("head_blocks") for group in self.param_groups]
+        for group, blocks in zip(self.param_groups, configured):
+            if blocks is None:
+                group.pop("head_blocks", None)
+            else:
+                group["head_blocks"] = blocks
+        if restored != configured:
+            logger.warning_rank0(
+                f"[Muon] checkpoint head_blocks={[1 if b is None else b for b in restored]} disagrees "
+                f"with the configured {[1 if b is None else b for b in configured]}; "
+                "keeping the configured value."
+            )
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
@@ -316,6 +807,24 @@ class DistributedMuon(Optimizer):
             ns_steps = int(group["ns_steps"])
             eps = float(group["eps"])
             adjust_lr_fn = group["adjust_lr_fn"]
+            ns_implementation = str(group.get("ns_implementation", "gram_quack"))
+            gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
+            head_blocks = int(group.get("head_blocks", 1))
+            # Scope settings travel inside ns_kwargs so the all-to-all owner path
+            # reads them from one dict.
+            ns_kwargs = {
+                "ns_coefficients": ns_coefficients,
+                "ns_steps": ns_steps,
+                "eps": eps,
+                "ns_implementation": ns_implementation,
+                "gram_ns_reset_iterations": gram_ns_reset_iterations,
+                "head_blocks": head_blocks,
+            }
+
+            # Keep at most one owner-assignment chunk live per mesh/dtype. This
+            # bounds temporary updates and orthogonalized shards by world size
+            # instead of retaining the entire optimizer group.
+            a2a_buckets: Dict[Tuple[Any, torch.dtype], List[Tuple[Tensor, Tensor]]] = {}
 
             for p in group["params"]:
                 if p.grad is None:
@@ -335,26 +844,212 @@ class DistributedMuon(Optimizer):
                 update = grad.lerp(buf, momentum) if nesterov else buf
 
                 kind = _classify_param(p)
-                ortho = self._compute_ortho(update, kind, ns_coefficients, ns_steps, eps)
-
-                lr_shape = p.shape[-2:] if p.ndim >= 2 else p.shape
-                adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
-
-                if weight_decay != 0.0:
-                    p.mul_(1 - lr * weight_decay)
-
-                if isinstance(p, DTensor):
-                    target_dtype = p.to_local().dtype
-                    if isinstance(ortho, DTensor):
-                        update_dt = ortho.to(dtype=target_dtype)
-                    else:
-                        update_dt = _wrap_full_as_dtensor_like(ortho.to(dtype=target_dtype), p)
+                if (
+                    kind == _KIND_FSDP_GATHER_2D
+                    and isinstance(update, DTensor)
+                    and _fsdp_all2all_fast_path_eligible(update)
+                ):
+                    key = _fsdp_all2all_bucket_key(update)
+                    entries = a2a_buckets.setdefault(key, [])
+                    entries.append((p, update))
+                    if len(entries) == update.device_mesh.size(0):
+                        self._flush_fsdp_all2all_chunk(
+                            entries,
+                            update.device_mesh,
+                            ns_kwargs,
+                            lr=lr,
+                            weight_decay=weight_decay,
+                            adjust_lr_fn=adjust_lr_fn,
+                        )
                 else:
-                    update_dt = ortho.to(dtype=p.dtype)
+                    ortho = self._compute_ortho(update, kind, **ns_kwargs)
+                    self._apply_ortho(
+                        p,
+                        ortho,
+                        is_local_shard=False,
+                        lr=lr,
+                        weight_decay=weight_decay,
+                        adjust_lr_fn=adjust_lr_fn,
+                        head_blocks=head_blocks,
+                    )
 
-                p.add_(update_dt, alpha=-adjusted_lr)
+            for (mesh, _local_dtype), entries in a2a_buckets.items():
+                self._flush_fsdp_all2all_chunk(
+                    entries,
+                    mesh,
+                    ns_kwargs,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    adjust_lr_fn=adjust_lr_fn,
+                )
 
         return loss
+
+    def _flush_fsdp_all2all_chunk(
+        self,
+        entries: List[Tuple[Tensor, Tensor]],
+        mesh: Any,
+        ns_kwargs: Dict[str, Any],
+        *,
+        lr: float,
+        weight_decay: float,
+        adjust_lr_fn: Optional[str],
+    ) -> None:
+        if not entries:
+            return
+
+        updates = [update for _p, update in entries]
+        local_orthos = self._ortho_fsdp_group_all2all(updates, mesh, ns_kwargs)
+        for (p, _update), local_ortho in zip(entries, local_orthos):
+            self._apply_ortho(
+                p,
+                local_ortho,
+                is_local_shard=True,
+                lr=lr,
+                weight_decay=weight_decay,
+                adjust_lr_fn=adjust_lr_fn,
+                head_blocks=int(ns_kwargs.get("head_blocks", 1)),
+            )
+        entries.clear()
+
+    @staticmethod
+    def _apply_ortho(
+        p: Tensor,
+        ortho: Tensor,
+        *,
+        is_local_shard: bool,
+        lr: float,
+        weight_decay: float,
+        adjust_lr_fn: Optional[str],
+        head_blocks: int = 1,
+    ) -> None:
+        lr_shape = p.shape[-2:] if p.ndim >= 2 else p.shape
+        if head_blocks > 1:
+            # Scale by the block shape NS actually saw, not the full matrix.
+            lr_shape = (lr_shape[0] // head_blocks, lr_shape[1])
+        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
+
+        if weight_decay != 0.0:
+            p.mul_(1 - lr * weight_decay)
+
+        if isinstance(p, DTensor):
+            target_dtype = p.to_local().dtype
+            if is_local_shard:
+                update_dt = DTensor.from_local(
+                    ortho.to(dtype=target_dtype),
+                    device_mesh=p.device_mesh,
+                    placements=p.placements,
+                    shape=p.shape,
+                    stride=p.stride(),
+                    run_check=False,
+                )
+            elif isinstance(ortho, DTensor):
+                update_dt = ortho.to(dtype=target_dtype)
+            else:
+                update_dt = _wrap_full_as_dtensor_like(ortho.to(dtype=target_dtype), p)
+        else:
+            update_dt = ortho.to(dtype=p.dtype)
+
+        p.add_(update_dt, alpha=-adjusted_lr)
+
+    def _ortho_fsdp_group_all2all(
+        self,
+        updates: List["DTensor"],
+        mesh: Any,
+        ns_kwargs: Dict[str, Any],
+    ) -> List[Tensor]:
+        """Orthogonalize evenly-sharded 2D ``Shard(0)`` updates via all-to-all.
+
+        Instead of all-gathering every parameter to every rank and running
+        Newton-Schulz redundantly on all of them, params are processed in
+        chunks of ``world`` and each rank becomes the sole *owner* of one param
+        in the chunk. A single balanced ``all_to_all`` reassembles the owner's
+        full ``[M, K]`` matrix (each rank contributes its row shard); the owner
+        runs NS once; a reverse ``all_to_all`` scatters the row shards back.
+        This keeps the same math while cutting redundant compute by ``world``
+        and removing the redistribute round-trip.
+
+        Invariant: every rank must call this with the same ``updates`` list
+        length and ordering (guaranteed by the shared ``param_groups`` order and
+        the requirement that each Muon param has a gradient on all ranks). The
+        all-to-all pairing is position-based, so a rank-divergent bucket would
+        deadlock — the same constraint the previous all-gather path relied on.
+
+        The caller must pass at most ``world`` updates with one common dtype.
+        Trailing shapes may differ.
+
+        Returns one local-shard (``[m_local, K]``) tensor per input update, in
+        input order.
+        """
+        world = mesh.size(0)
+        if len(updates) > world:
+            raise ValueError(f"Expected at most {world} all-to-all updates, got {len(updates)}")
+
+        my_idx = int(mesh.get_coordinate()[0])
+        group = mesh.get_group(0)
+        device = updates[0].to_local().device
+        pad_dtype = updates[0].to_local().dtype  # stable across ranks for empty padding slots
+
+        results: List[Optional[Tensor]] = [None] * len(updates)
+
+        for base in range(0, len(updates), world):
+            owned_pos = base + my_idx  # global index of the param this rank owns
+            owned_update = updates[owned_pos] if owned_pos < len(updates) else None
+
+            # Forward all_to_all: rank ``r`` sends its row shard of param
+            # ``base + j`` to owner rank ``j``; owner ``j`` gathers all ``world``
+            # row shards of its owned param ``base + j``.
+            send_list: List[Tensor] = []
+            recv_list: List[Tensor] = []
+            if owned_update is not None:
+                owned_k = int(owned_update.shape[1])
+                owned_dtype = owned_update.to_local().dtype
+                owned_rows = _shard_row_sizes(int(owned_update.shape[0]), world)
+            else:
+                owned_k = 0
+                owned_dtype = pad_dtype
+                owned_rows = [0] * world
+
+            for j in range(world):
+                pos = base + j
+                if pos < len(updates):
+                    send_list.append(updates[pos].to_local().contiguous())
+                else:
+                    send_list.append(torch.empty(0, 0, device=device, dtype=pad_dtype))
+                recv_list.append(torch.empty(owned_rows[j], owned_k, device=device, dtype=owned_dtype))
+
+            dist.all_to_all(recv_list, send_list, group=group)
+
+            if owned_update is not None:
+                full_grad = torch.cat(recv_list, dim=0)
+                full_ortho = self._compute_ortho(full_grad, _KIND_LOCAL, **ns_kwargs)
+                scatter_send = [c.contiguous() for c in torch.split(full_ortho, owned_rows, dim=0)]
+            else:
+                scatter_send = [torch.empty(0, 0, device=device, dtype=pad_dtype) for _ in range(world)]
+
+            # Reverse all_to_all: owner ``j`` returns each rank ``i`` its row
+            # shard of param ``base + j``.
+            back_recv: List[Tensor] = []
+            for j in range(world):
+                pos = base + j
+                if pos < len(updates):
+                    param = updates[pos]
+                    rows = _shard_row_sizes(int(param.shape[0]), world)[my_idx]
+                    back_recv.append(
+                        torch.empty(rows, int(param.shape[1]), device=device, dtype=param.to_local().dtype)
+                    )
+                else:
+                    back_recv.append(torch.empty(0, 0, device=device, dtype=pad_dtype))
+
+            dist.all_to_all(back_recv, scatter_send, group=group)
+
+            for j in range(world):
+                pos = base + j
+                if pos < len(updates):
+                    results[pos] = back_recv[j]
+
+        assert all(r is not None for r in results)
+        return results  # type: ignore[return-value]
 
     @staticmethod
     def _compute_ortho(
@@ -363,19 +1058,34 @@ class DistributedMuon(Optimizer):
         ns_coefficients: Tuple[float, float, float],
         ns_steps: int,
         eps: float,
+        ns_implementation: str = "gram_quack",
+        gram_ns_reset_iterations: Sequence[int] = (2,),
+        head_blocks: int = 1,
     ) -> Tensor:
         """Run Newton-Schulz on ``update`` according to its layout kind."""
+
+        def _ns(x: Tensor) -> Tensor:
+            batched = _split_row_blocks(x, head_blocks) if head_blocks > 1 else x
+            ortho = run_newton_schulz(
+                batched,
+                ns_coefficients=ns_coefficients,
+                ns_steps=ns_steps,
+                eps=eps,
+                ns_implementation=ns_implementation,
+                gram_ns_reset_iterations=gram_ns_reset_iterations,
+            )
+            return ortho.reshape(x.shape) if head_blocks > 1 else ortho
+
         if kind == _KIND_LOCAL:
-            return batched_newton_schulz(update, ns_coefficients, ns_steps, eps)
+            return _ns(update)
 
         if kind == _KIND_FSDP_GATHER_2D:
-            full = _full_grad(update)
-            return batched_newton_schulz(full, ns_coefficients, ns_steps, eps)
+            return _ns(_full_grad(update))
 
         if kind == _KIND_MOE_LOCAL_3D:
             assert isinstance(update, DTensor)
             local = update._local_tensor
-            local_ortho = batched_newton_schulz(local, ns_coefficients, ns_steps, eps)
+            local_ortho = _ns(local)
             return DTensor.from_local(
                 local_ortho,
                 device_mesh=update.device_mesh,
@@ -384,7 +1094,6 @@ class DistributedMuon(Optimizer):
             )
 
         if kind == _KIND_MOE_GATHER_3D:
-            full = _full_grad(update)
-            return batched_newton_schulz(full, ns_coefficients, ns_steps, eps)
+            return _ns(_full_grad(update))
 
         raise ValueError(f"Unknown DistributedMuon kind: {kind!r}")

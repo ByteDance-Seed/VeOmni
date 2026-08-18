@@ -25,12 +25,14 @@ from typing import Any, Mapping
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 import torch.nn as nn
 
 from veomni.distributed.torch_parallelize import (
     _apply_weights_load_step,
     _load_one,
     _resolve_weights_path_mapping,
+    parallelize_model_ddp,
 )
 from veomni.utils.device import get_device_type
 
@@ -162,6 +164,7 @@ def test_apply_load_step_none_calls_to_empty_and_init(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     assert to_empty_calls == [(model, "cpu")]
@@ -192,6 +195,7 @@ def test_apply_load_step_str_with_rank0_broadcast(monkeypatch):
         cpu_load_param_name=["embed.weight"],
         max_load_broadcast_size=15.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     rank0_mock.assert_called_once()
@@ -226,6 +230,7 @@ def test_apply_load_step_str_without_rank0_broadcast(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     load_model_weights_mock.assert_called_once()
@@ -266,6 +271,7 @@ def test_apply_load_step_mapping_calls_loader_per_child(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     # rank0_load called once per sub-module, in mapping iteration order.
@@ -279,6 +285,33 @@ def test_apply_load_step_mapping_calls_loader_per_child(monkeypatch):
     # Strict bijection: no random-init paths should fire.
     init_weights_mock.assert_not_called()
     to_empty_mock.assert_not_called()
+
+
+def test_apply_load_step_forwards_fqn_to_index_mapping(monkeypatch):
+    """The single-snapshot path forwards the caller's mapping to the loader; the
+    Mapping branch passes ``None`` per child, because a shard index belongs to
+    the one snapshot it was built from and cannot describe a sibling's."""
+    load_model_weights_mock = MagicMock()
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.load_model_weights", load_model_weights_mock)
+
+    mapping: Mapping[str, int] = {"linear.weight": 0}
+    common: dict[str, Any] = dict(
+        materialize_device="cpu",
+        broadcast_from_rank0=False,
+        is_peft_model=False,
+        adapter_path=None,
+        cpu_load_param_name=None,
+        max_load_broadcast_size=20.0,
+        distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=mapping,
+    )
+
+    _apply_weights_load_step(model=_Container(), weights_path="/snap/full", **common)
+    assert load_model_weights_mock.call_args.kwargs["fqn_to_index_mapping"] is mapping
+
+    load_model_weights_mock.reset_mock()
+    _apply_weights_load_step(model=_Container(), weights_path={"encoder": "/p/enc", "decoder": "/p/dec"}, **common)
+    assert [call.kwargs["fqn_to_index_mapping"] for call in load_model_weights_mock.call_args_list] == [None, None]
 
 
 def test_apply_load_step_mapping_unknown_key_raises(monkeypatch):
@@ -300,6 +333,7 @@ def test_apply_load_step_mapping_unknown_key_raises(monkeypatch):
             cpu_load_param_name=None,
             max_load_broadcast_size=20.0,
             distribute_tensor_fn=lambda *a, **k: None,
+            fqn_to_index_mapping=None,
         )
 
     load_model_weights_mock.assert_not_called()
@@ -327,6 +361,7 @@ def test_apply_load_step_mapping_missing_child_raises(monkeypatch):
             cpu_load_param_name=None,
             max_load_broadcast_size=20.0,
             distribute_tensor_fn=lambda *a, **k: None,
+            fqn_to_index_mapping=None,
         )
 
     load_model_weights_mock.assert_not_called()
@@ -355,6 +390,7 @@ def test_apply_load_step_mapping_rejects_peft(monkeypatch):
             cpu_load_param_name=None,
             max_load_broadcast_size=20.0,
             distribute_tensor_fn=lambda *a, **k: None,
+            fqn_to_index_mapping=None,
         )
 
     load_model_weights_mock.assert_not_called()
@@ -381,6 +417,7 @@ def test_load_one_routes_to_rank0_when_broadcast_enabled(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     rank0_mock.assert_called_once()
@@ -404,7 +441,81 @@ def test_load_one_routes_to_load_model_weights_otherwise(monkeypatch):
         cpu_load_param_name=None,
         max_load_broadcast_size=20.0,
         distribute_tensor_fn=lambda *a, **k: None,
+        fqn_to_index_mapping=None,
     )
 
     load_model_weights_mock.assert_called_once()
     rank0_mock.assert_not_called()
+
+
+# ── DDP path: should_skip_hf_weight_load must reach the load step ──────────
+
+
+def _frozen_meta_leaf() -> _Leaf:
+    """A fully-frozen meta-init leaf: ``parallelize_model_ddp`` materialises it
+    and then returns before the DDP wrap, so no process group is needed."""
+    with torch.device("meta"):
+        model = _Leaf("frozen")
+    model.requires_grad_(False)
+    return model
+
+
+@pytest.mark.parametrize("should_skip", [True, False])
+def test_ddp_honors_should_skip_hf_weight_load(monkeypatch, should_skip):
+    """A distributed-checkpoint resume must not re-read the HF snapshot under
+    DDP, but the params still have to leave the meta device."""
+    load_model_weights_mock = MagicMock()
+    rank0_mock = MagicMock()
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.load_model_weights", load_model_weights_mock)
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
+
+    model = parallelize_model_ddp(
+        model=_frozen_meta_leaf(),
+        weights_path="/snap/full",
+        should_skip_hf_weight_load=should_skip,
+        init_device="meta",
+    )
+
+    assert load_model_weights_mock.call_count == (0 if should_skip else 1)
+    if should_skip:
+        # Nothing else will materialise these params once the loader is skipped,
+        # so a meta param here would blow up on the first forward.
+        assert not any(param.is_meta for param in model.parameters())
+
+
+# ── DDP path: buffers are never broadcast (FSDP2 / HSDP parity) ────────────
+
+
+class _BufferLeaf(nn.Module):
+    """Both buffer flavours, including BatchNorm's mutable running stats."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm = nn.BatchNorm1d(4)  # persistent running stats
+        self.inner = nn.Module()
+        self.inner.register_buffer("inv_freq", torch.ones(2), persistent=False)
+        self.register_buffer("position_ids", torch.arange(3), persistent=False)
+
+    def init_weights(self) -> None:  # pragma: no cover - not exercised here
+        pass
+
+
+def test_ddp_never_broadcasts_buffers(monkeypatch):
+    """DDP must not sync buffers, so a module behaves the same whichever
+    ``dp_mode`` the config picks: ``fully_shard`` syncs none either, and DDP's
+    in-place pre-forward ``copy_`` would corrupt a buffer saved for backward by
+    a module owning more than one graph node. Even BatchNorm's running stats stay
+    out — the rank0 broadcast discards the other ranks' statistics rather than
+    aggregating them, so ``SyncBatchNorm`` is the fix, not this flag.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_ddp(module, **kwargs):
+        captured["kwargs"] = kwargs
+        return module
+
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.DDP", _fake_ddp)
+
+    parallelize_model_ddp(model=_BufferLeaf(), weights_path=None)
+
+    assert captured["kwargs"]["broadcast_buffers"] is False

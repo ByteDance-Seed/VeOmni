@@ -57,9 +57,11 @@ from ..arguments.arguments_types import (
     OptimizerConfig,
     ProfileConfig,
     WandbConfig,
+    _resolve_hdfs_path,
 )
 from ..arguments.parser import _deep_update, _instantiate_recursive
 from ..utils import logging
+from ..utils.fs import is_non_local
 
 
 logger = logging.get_logger(__name__)
@@ -271,6 +273,13 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
     model_runtime = args.model
     if not model_runtime.model_path:
         raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel V2.")
+
+    # ``OmniArguments`` is standalone rather than a ``VeOmniArguments`` subclass, so
+    # it inherits none of ``ModelArguments.__post_init__``'s HDFS localization. Do it
+    # here, the single funnel for both training and inference, and write the local
+    # root back so per-module subfolders join against a path that exists locally --
+    # ``_try_load_omni_checkpoint_config`` below already needs to open ``config.json``.
+    model_runtime.model_path = _resolve_hdfs_path(model_runtime.model_path)
 
     model_path = model_runtime.model_path
     omni_cfg = _try_load_omni_checkpoint_config(model_path)
@@ -532,6 +541,12 @@ def _resolve_model_path(
     model_path: str | os.PathLike,
     modules_config: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    """Join a relative per-module ``model_path`` under the checkpoint root.
+
+    A remote-scheme path counts as absolute: ``os.path.isabs("hdfs://ns/x")`` is
+    ``False``, so without the extra check a fully-qualified remote path would be
+    silently joined under the root as ``/local/root/hdfs://ns/x``.
+    """
     if not modules_config:
         return {}
     checkpoint_root = str(model_path)
@@ -541,7 +556,7 @@ def _resolve_model_path(
         resolved = mod_cfg.get("model_path") or mod_cfg.get("weights_path")
         if resolved is None:
             continue
-        if not os.path.isabs(resolved):
+        if not os.path.isabs(resolved) and not is_non_local(resolved):
             resolved = os.path.join(checkpoint_root, resolved)
         mod_cfg["model_path"] = resolved
     return modules_config
@@ -762,6 +777,15 @@ class OmniTrainingArguments:
     enable_batch_invariant_mode: bool = field(
         default=False,
         metadata={"help": "Enable batch invariant mode."},
+    )
+    sync_each_train_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Synchronize the accelerator before each training step's forward/backward work. "
+                "Disable to allow asynchronous dataloader and H2D work to overlap with the next step."
+            )
+        },
     )
     empty_cache_steps: int = field(
         default=500,

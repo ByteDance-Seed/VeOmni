@@ -48,7 +48,8 @@ Patches:
    ``DeepseekV4HyperConnections.head`` — optional TileKernels mHC dispatch
    selected by ``mhc_implementation=tilelang``.
 9. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
-   normalization before RoPE.
+   normalization before RoPE, and adds Ulysses SP (Q head all-to-all + MQA
+   sequence all-gather around compressors / sparse attention).
 10. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
    always perform the official FP32 router projection.
 11. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
@@ -63,23 +64,15 @@ Intentionally NOT patched:
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
   that ``liger_rotary_pos_emb`` does not implement. SKILL.md flags this
   exact case (partial_rotary -> liger NaN).
-- ``DeepseekV4Attention.forward`` — V4 attention is eager-only
+- ``DeepseekV4Attention.forward`` remains eager/TileLang-only
   (``_supports_flash_attn = False`` / ``_supports_sdpa = False`` /
   ``_supports_flex_attn = False``: ``head_dim=512`` exceeds FlashAttention's
   256 cap, SDPA lacks the per-head learnable sink, and FlexAttention can't
   resize BlockMask after the in-block compressor concatenation). MoE does not
   share this limitation: the experts patch above binds VeOmni fused MoE by
-  default on GPU. The module-level eager attention interface is patched for
-  optional TileLang sparse dispatch without changing the class forward
-  contract. Sequence parallel for V4 attention is out of scope for this
-  patchgen pass and needs a dedicated eager-SP path before the model can train
-  under SP.
-- ``DeepseekV4Model.forward`` — top-level ``hidden_states`` is *4D*
-  (``[B, S, hc_mult, D]`` for the manifold-constrained Hyper-Connection
-  residual stack); existing VeOmni SP collators assume 3D
-  ``[B, S, D]`` at the embed boundary. Leaving the upstream forward
-  untouched keeps single-rank training / inference correct while a 4D-aware
-  SP path is designed.
+  default on GPU. Ulysses SP is handled inside the patched attention forward
+  (head all-to-all on Q + sequence all-gather on MQA KV / compressor inputs)
+  rather than via FA's ``veomni_flash_attention_*_with_sp`` path.
 """
 
 from typing import Optional
@@ -103,8 +96,10 @@ from transformers.utils import TransformersKwargs
 
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_compression_metadata,
+    build_sparse_attention_indices,
     compress_packed_windows,
     isolate_packed_causal_mask_,
+    mask_sparse_attention_indices,
     packed_compressed_block_bias,
     packed_compressed_causal_ranges,
 )
@@ -113,6 +108,7 @@ from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
 # OpSlot declarations — mirrored into the generated module via
@@ -132,6 +128,12 @@ veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
 veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
 
+# Names resolved at codegen time from generated imports.
+get_parallel_state = None
+gather_seq_scatter_heads = None
+gather_heads_scatter_seq = None
+gather_outputs = None
+
 
 config = PatchConfig(
     source_module="transformers.models.deepseek_v4.modeling_deepseek_v4",
@@ -145,11 +147,21 @@ config.add_import(
     names=["sparse_attn_tilelang", "v4_lighting_indexer"],
 )
 config.add_import(
+    "veomni.distributed.parallel_state",
+    names=["get_parallel_state"],
+)
+config.add_import(
+    "veomni.distributed.sequence_parallel",
+    names=["gather_heads_scatter_seq", "gather_outputs", "gather_seq_scatter_heads"],
+)
+config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
     names=[
+        "build_sparse_attention_indices",
         "build_packed_compression_metadata",
         "compress_packed_windows",
         "isolate_packed_causal_mask_",
+        "mask_sparse_attention_indices",
         "packed_compressed_block_bias",
         "packed_compressed_causal_ranges",
     ],
@@ -166,6 +178,11 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
+
+config.add_import(
+    "veomni.utils.moe_router_replay",
+    names=["get_active_replay", "maybe_replay_indices"],
+)
 
 config.add_post_import_block(
     """
@@ -345,7 +362,8 @@ def deepseek_v4_hca_compressor_forward_patched(
     layer_idx: int,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_topk_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
     batch, _, _ = hidden_states.shape
@@ -369,7 +387,8 @@ def deepseek_v4_hca_compressor_forward_patched(
             overlap=False,
         )
         block_bias = packed_compressed_block_bias(rate_metadata)
-        return compressed.unsqueeze(1), block_bias
+        result = (compressed.unsqueeze(1), block_bias)
+        return (*result, None) if return_topk_indices else result
 
     if cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -383,8 +402,13 @@ def deepseek_v4_hca_compressor_forward_patched(
         chunk_gate = chunk_gate.view(batch, n_windows, self.compress_rate, -1) + self.position_bias.to(
             chunk_gate.dtype
         )
+        # `sum` follows autocast's fp32_set_opt_dtype policy: an implicit `dtype`
+        # returns fp32 under autocast and leaks through `kv_norm` into the
+        # bf16-only TileLang kernels. Accumulate in fp32 explicitly, cast back.
         compressed = self.kv_norm(
-            (chunk_kv * chunk_gate.softmax(dim=2, dtype=torch.float32).to(chunk_kv.dtype)).sum(dim=2)
+            (chunk_kv * chunk_gate.softmax(dim=2, dtype=torch.float32).to(chunk_kv.dtype))
+            .sum(dim=2, dtype=torch.float32)
+            .to(chunk_kv.dtype)
         )
         positions = torch.arange(n_windows, device=compressed.device)
         positions = (positions * self.compress_rate + first_window_position).unsqueeze(0).expand(batch, -1)
@@ -400,7 +424,8 @@ def deepseek_v4_hca_compressor_forward_patched(
     compressed_len = compressed_kv.shape[2]
     seq_len = position_ids.shape[1]
     if seq_len == 1 or compressed_len == 0:
-        return compressed_kv, None
+        result = (compressed_kv, None)
+        return (*result, None) if return_topk_indices else result
 
     entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
     causal_threshold = (position_ids + 1) // self.compress_rate
@@ -409,7 +434,8 @@ def deepseek_v4_hca_compressor_forward_patched(
         entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
         float("-inf"),
     )
-    return compressed_kv, block_bias
+    result = (compressed_kv, block_bias)
+    return (*result, None) if return_topk_indices else result
 
 
 @config.override_method(
@@ -425,7 +451,8 @@ def deepseek_v4_csa_compressor_forward_patched(
     layer_idx: int,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_topk_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
     batch, seq_len, _ = hidden_states.shape
@@ -463,7 +490,8 @@ def deepseek_v4_csa_compressor_forward_patched(
         safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
         block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
         block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-        return compressed_kv, block_bias[..., :compressed_len]
+        result = (compressed_kv, block_bias[..., :compressed_len])
+        return (*result, top_k_indices) if return_topk_indices else result
 
     if cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -488,7 +516,12 @@ def deepseek_v4_csa_compressor_forward_patched(
             if prior_kv is not None:
                 new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
                 new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
-        compressed = self.kv_norm((new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2))
+        # See the HCA compressor above: `sum` needs an explicit `dtype` under autocast.
+        compressed = self.kv_norm(
+            (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype))
+            .sum(dim=2, dtype=torch.float32)
+            .to(new_kv.dtype)
+        )
         positions = torch.arange(n_windows, device=compressed.device)
         positions = positions * self.compress_rate + first_window_position
         positions = positions.unsqueeze(0).expand(batch, -1)
@@ -506,7 +539,8 @@ def deepseek_v4_csa_compressor_forward_patched(
     safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
     block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
     block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-    return compressed_kv, block_bias[..., :compressed_len]
+    result = (compressed_kv, block_bias[..., :compressed_len])
+    return (*result, top_k_indices) if return_topk_indices else result
 
 
 # ================================================================
@@ -577,7 +611,12 @@ def deepseek_v4_indexer_forward_patched(
                 new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
                 new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
 
-        compressed = self.kv_norm((new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2))
+        # See the HCA compressor above: `sum` needs an explicit `dtype` under autocast.
+        compressed = self.kv_norm(
+            (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype))
+            .sum(dim=2, dtype=torch.float32)
+            .to(new_kv.dtype)
+        )
         positions = torch.arange(n_windows, device=compressed.device)
         positions = positions * self.compress_rate + first_window_position
         positions = positions.unsqueeze(0).expand(batch, -1)
@@ -606,11 +645,12 @@ def deepseek_v4_indexer_forward_patched(
     packed_ranges = None
     if packed_compression_metadata is not None and cache_layer is None:
         packed_ranges = packed_compressed_causal_ranges(packed_compression_metadata[self.compress_rate])
+    # Operand dtypes are the kernel's contract and are enforced by
+    # ``v4_lighting_indexer`` itself, which reports the offending dtype. Only
+    # structural conditions belong here.
     use_tilelang = (
         indexer_implementation == "tilelang"
         and hidden_states.is_cuda
-        and q.dtype == torch.bfloat16
-        and compressed_kv.dtype == torch.bfloat16
         and self.num_heads <= 64
         and self.num_heads % 8 == 0
         and self.head_dim >= 32
@@ -619,16 +659,53 @@ def deepseek_v4_indexer_forward_patched(
         and compressed_len > 0
         and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
     )
+    if indexer_implementation == "tilelang" and not use_tilelang:
+        raise ValueError(
+            "dsa_indexer_implementation='tilelang' was requested but the TileLang indexer does not "
+            f"support this call: is_cuda={hidden_states.is_cuda}, num_heads={self.num_heads}, "
+            f"head_dim={self.head_dim}, decode={cache_layer is not None}, "
+            f"compressed_len={compressed_len}, packed={packed_ranges is not None}"
+        )
     if use_tilelang:
+        query = q.transpose(0, 1).contiguous()
+        query_weights = weights.transpose(0, 1).contiguous()
+        query_range_starts = None if packed_ranges is None else packed_ranges[0]
+        query_range_ends = None if packed_ranges is None else packed_ranges[1]
+        parallel_state = get_parallel_state()
+        if parallel_state.ulysses_enabled:
+            if query_range_starts is None and query_range_ends is None:
+                query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+                query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32)
+                query_range_ends = (query_positions + 1) // self.compress_rate
+            if seq_len % parallel_state.ulysses_size != 0:
+                raise ValueError(
+                    f"DeepSeek-V4 indexer sequence length ({seq_len}) must be divisible by "
+                    f"Ulysses size ({parallel_state.ulysses_size})"
+                )
+            local_seq_len = seq_len // parallel_state.ulysses_size
+            query_start = parallel_state.ulysses_rank * local_seq_len
+            query_end = query_start + local_seq_len
+            query = query[query_start:query_end]
+            query_weights = query_weights[query_start:query_end]
+            if query_range_starts is not None and query_range_ends is not None:
+                query_range_starts = query_range_starts[query_start:query_end]
+                query_range_ends = query_range_ends[query_start:query_end]
+
         _, top_k_indices = v4_lighting_indexer(
-            q.transpose(0, 1).contiguous(),
+            query,
             compressed_kv.transpose(0, 1).contiguous(),
-            weights.transpose(0, 1).contiguous(),
+            query_weights,
             self.compress_rate,
             top_k,
-            cu_seqlen_ks=None if packed_ranges is None else packed_ranges[0],
-            cu_seqlen_ke=None if packed_ranges is None else packed_ranges[1],
+            cu_seqlen_ks=query_range_starts,
+            cu_seqlen_ke=query_range_ends,
         )
+        if parallel_state.ulysses_enabled:
+            top_k_indices = gather_outputs(
+                top_k_indices,
+                gather_dim=1,
+                group=parallel_state.ulysses_group,
+            )
         return top_k_indices.to(torch.long)
     # --- Patch.1 ---
 
@@ -656,10 +733,13 @@ def deepseek_v4_indexer_forward_patched(
 # ================================================================
 # Patch: DeepseekV4Attention.forward
 # 1. Pass the collator-provided packed sequence slices into compressors.
+# 2. Ulysses SP: all-to-all Q heads, sequence all-gather for MQA KV and
+#    compressor inputs (windows/indexers need the full sequence), then
+#    scatter attention outputs back to the local sequence shard.
 # ================================================================
 @config.override_method(
     "DeepseekV4Attention.forward",
-    description="Forward packed sequence boundaries to HCA and CSA compressors",
+    description="Packed compressor path + Ulysses SP for DeepSeek-V4 eager/TileLang attention",
 )
 def deepseek_v4_attention_forward_patched(
     self,
@@ -675,8 +755,7 @@ def deepseek_v4_attention_forward_patched(
     cos, sin = position_embeddings[self.rope_layer_type]
 
     q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-    q = self.q_b_proj(q_residual).view(*hidden_shape)
-    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_b_norm.eps)
+    q = self.q_b_norm(self.q_b_proj(q_residual).view(*hidden_shape))
     q = q.transpose(1, 2)
     q = apply_rotary_pos_emb(q, cos, sin)
 
@@ -686,17 +765,67 @@ def deepseek_v4_attention_forward_patched(
     if past_key_values is not None:
         kv = past_key_values.update(kv, kv, self.layer_idx)[0]
 
+    ulysses_enabled = get_parallel_state().ulysses_enabled
+    compressor_hidden = hidden_states
+    compressor_q_residual = q_residual
+    compressor_position_ids = position_ids
+    s_aux = self.sinks
+    if ulysses_enabled:
+        if past_key_values is not None:
+            raise RuntimeError("DeepSeek-V4 Ulysses SP does not support KV-cache decode")
+        ulysses_group = get_parallel_state().ulysses_group
+        ulysses_size = get_parallel_state().ulysses_size
+        ulysses_rank = get_parallel_state().ulysses_rank
+        if self.num_heads % ulysses_size != 0:
+            raise ValueError(
+                f"DeepSeek-V4 Ulysses SP requires num_attention_heads ({self.num_heads}) "
+                f"divisible by ulysses_size ({ulysses_size})"
+            )
+        local_num_heads = self.num_heads // ulysses_size
+        # Compressors / Lightning Indexer window across the full sequence, so
+        # gather the local shard before running them. Q uses true Ulysses
+        # head/sequence exchange; MQA KV stays single-head and is all-gathered.
+        compressor_hidden = gather_outputs(hidden_states, gather_dim=1, group=ulysses_group)
+        compressor_q_residual = gather_outputs(q_residual, gather_dim=1, group=ulysses_group)
+        compressor_position_ids = gather_outputs(position_ids, gather_dim=-1, group=ulysses_group)
+        # Use the same [B, S, H, D] Ulysses layout as FA (seq_dim=1, head_dim=2).
+        q = q.transpose(1, 2).contiguous()
+        q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2, group=ulysses_group)
+        q = q.transpose(1, 2).contiguous()
+        kv = gather_outputs(kv, gather_dim=2, group=ulysses_group)
+        head_start = ulysses_rank * local_num_heads
+        s_aux = self.sinks.narrow(0, head_start, local_num_heads).contiguous()
+
     block_bias = None
+    compressed_topk_indices = None
+    # The device and dtype terms mirror what ``eager_attention_forward`` requires
+    # before it can dispatch to TileLang. Without them this reads the config string
+    # alone and claims the compact path on hosts where the kernel cannot run and the
+    # dispatch silently falls back to eager -- which then ignores the indices and
+    # uses the dense mask, so the compact work is wasted at best. On NPU it is worse
+    # than wasted: that sibling forked the compressors before ``return_topk_indices``
+    # existed, so asking for indices there is a TypeError.
+    use_compact_sparse_indices = (
+        veomni_dsa_attention_implementation.value == "tilelang"
+        and past_key_values is None
+        and q.is_cuda
+        and q.dtype == torch.bfloat16
+    )
     if self.compressor is not None:
-        compressed_kv, block_bias = self.compressor(
-            hidden_states,
-            q_residual,
-            position_ids,
+        compressor_output = self.compressor(
+            compressor_hidden,
+            compressor_q_residual,
+            compressor_position_ids,
             past_key_values,
             self.layer_idx,
             packed_sequence_slices=kwargs.get("packed_sequence_slices"),
             packed_compression_metadata=kwargs.get("packed_compression_metadata"),
+            return_topk_indices=use_compact_sparse_indices,
         )
+        if use_compact_sparse_indices:
+            compressed_kv, block_bias, compressed_topk_indices = compressor_output
+        else:
+            compressed_kv, block_bias = compressor_output
         kv = torch.cat([kv, compressed_kv], dim=2)
 
     if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
@@ -708,6 +837,16 @@ def deepseek_v4_attention_forward_patched(
     attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, eager_attention_forward
     )
+    kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
+    if use_compact_sparse_indices:
+        kwargs["sparse_topk_indices"] = build_sparse_attention_indices(
+            batch_size=q.shape[0],
+            seq_len=q.shape[-2],
+            sliding_window=self.sliding_window,
+            compressed_len=kv.shape[-2] - q.shape[-2],
+            compressed_indices=compressed_topk_indices,
+            device=q.device,
+        )
     attn_output, attn_weights = attention_interface(
         self,
         q,
@@ -717,9 +856,15 @@ def deepseek_v4_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,
-        s_aux=self.sinks,
+        s_aux=s_aux,
         **kwargs,
     )
+
+    if ulysses_enabled:
+        # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
+        attn_output = gather_heads_scatter_seq(
+            attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
+        )
 
     attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
     grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
@@ -754,38 +899,49 @@ def deepseek_v4_eager_attention_forward_patched(
             "DeepSeek-V4 does not support "
             f"dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'tilelang'"
         )
+    # Operand dtypes are the kernel's contract and are enforced by
+    # ``sparse_attn_tilelang`` itself, which reports the offending dtype. Only
+    # structural conditions belong here.
     use_tilelang = (
         attention_implementation == "tilelang"
         and query.is_cuda
-        and query.dtype == torch.bfloat16
-        and key.dtype == torch.bfloat16
-        and value.dtype == torch.bfloat16
         and query.shape[-1] == 1 << (query.shape[-1] - 1).bit_length()
         and isinstance(attention_mask, torch.Tensor)
         and dropout == 0
         and key.shape[1] == 1
     )
+    if attention_implementation == "tilelang" and not use_tilelang:
+        raise ValueError(
+            "dsa_attention_implementation='tilelang' was requested but the TileLang sparse attention "
+            f"does not support this call: is_cuda={query.is_cuda}, head_dim={query.shape[-1]}, "
+            f"mask={type(attention_mask).__name__}, dropout={dropout}, kv_heads={key.shape[1]}"
+        )
     if use_tilelang:
-        batch, _, seq_len, _ = query.shape
-        kv_len = key.shape[-2]
-        compressed_len = max(0, kv_len - seq_len)
-        compressed_budget = compressed_len
-        indexer = getattr(getattr(module, "compressor", None), "indexer", None)
-        if indexer is not None:
-            compressed_budget = min(compressed_len, indexer.index_topk)
-        selected_width = min(kv_len, module.sliding_window + compressed_budget)
+        topk_indices = kwargs.get("sparse_topk_indices")
+        if topk_indices is None:
+            batch, _, seq_len, _ = query.shape
+            kv_len = key.shape[-2]
+            compressed_len = max(0, kv_len - seq_len)
+            compressed_budget = compressed_len
+            indexer = getattr(getattr(module, "compressor", None), "indexer", None)
+            if indexer is not None:
+                compressed_budget = min(compressed_len, indexer.index_topk)
+            selected_width = min(kv_len, module.sliding_window + compressed_budget)
 
-        mask = attention_mask
-        if mask.shape[0] == 1 and batch > 1:
-            mask = mask.expand(batch, -1, -1, -1)
-        allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
-        _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
-        selected_valid = allowed.gather(-1, topk_indices)
-        topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
+            mask = attention_mask
+            if mask.shape[0] == 1 and batch > 1:
+                mask = mask.expand(batch, -1, -1, -1)
+            allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
+            _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
+            selected_valid = allowed.gather(-1, topk_indices)
+            topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
+        else:
+            topk_indices = mask_sparse_attention_indices(attention_mask, topk_indices)
+        sinks = kwargs.get("s_aux", module.sinks)
         attn_output = sparse_attn_tilelang(
             query.transpose(1, 2).contiguous(),
             key[:, 0].contiguous(),
-            module.sinks.float().contiguous(),
+            sinks.float().contiguous(),
             topk_indices,
             scaling,
         )
@@ -793,13 +949,18 @@ def deepseek_v4_eager_attention_forward_patched(
     # --- Patch.1 ---
 
     # --- Patch.2 ---
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
+    # Under Ulysses SP, ``query`` only holds a head shard while the module still
+    # reports the full ``num_key_value_groups``. Expand KV to the *local* query
+    # head count so matmul shapes stay consistent.
+    n_rep = query.shape[1] // key.shape[1]
+    key_states = repeat_kv(key, n_rep)
+    value_states = repeat_kv(value, n_rep)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
-    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    sinks = kwargs.get("s_aux", module.sinks)
+    sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
     combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
     probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
@@ -815,10 +976,15 @@ def deepseek_v4_eager_attention_forward_patched(
 # Patch: DeepseekV4Model.forward
 # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
 # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
+# 3. Under Ulysses SP the collator keeps full ``attention_mask`` /
+#    ``cu_seq_lens_*`` while slicing ``input_ids`` / local ``position_ids``.
+#    Build the sliding-window mask and packed compression metadata on the full
+#    sequence length so attention matches non-SP semantics after the all-gather
+#    inside ``DeepseekV4Attention``.
 # ================================================================
 @config.override_method(
     "DeepseekV4Model.forward",
-    description="Propagate packed boundaries and preserve stateless indexer dispatch",
+    description="Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch",
 )
 def deepseek_v4_model_forward_patched(
     self,
@@ -846,21 +1012,34 @@ def deepseek_v4_model_forward_patched(
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
         position_ids = position_ids.unsqueeze(0)
 
+    ulysses_enabled = get_parallel_state().ulysses_enabled
+    ulysses_group = get_parallel_state().ulysses_group if ulysses_enabled else None
+    ulysses_size = get_parallel_state().ulysses_size if ulysses_enabled else 1
+    local_seq_len = inputs_embeds.shape[1]
+    full_seq_len = local_seq_len * ulysses_size if ulysses_enabled else local_seq_len
+    full_position_ids = (
+        gather_outputs(position_ids, gather_dim=-1, group=ulysses_group) if ulysses_enabled else position_ids
+    )
+
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
     if isinstance(cu_seq_lens_q, torch.Tensor) and inputs_embeds.shape[0] == 1:
         boundaries = cu_seq_lens_q.detach().cpu().tolist()
-        if boundaries[0] != 0 or boundaries[-1] != inputs_embeds.shape[1]:
+        if boundaries[0] != 0 or boundaries[-1] != full_seq_len:
             raise ValueError(
                 "DeepSeek V4 packed cu_seq_lens_q must span the full sequence; "
-                f"got {boundaries} for length {inputs_embeds.shape[1]}"
+                f"got {boundaries} for length {full_seq_len}"
             )
         packed_sequence_slices = tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
         kwargs["packed_sequence_slices"] = packed_sequence_slices
         compress_rates = tuple(self.config.compress_rates.values())
         hca_rate = self.config.compress_rates["heavily_compressed_attention"]
+        # Metadata is indexed by global positions / cu-seqlens; under SP the
+        # collator already provides full-sequence cu-seqlens while local embeds
+        # are only one shard, so materialize a full-length reference tensor.
+        metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
         kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
-            inputs_embeds,
-            position_ids,
+            metadata_reference,
+            full_position_ids,
             packed_sequence_slices,
             compress_rates,
             block_bias_rates=(hca_rate,),
@@ -873,12 +1052,19 @@ def deepseek_v4_model_forward_patched(
     if isinstance(attention_mask, dict):
         causal_mask = next(iter(attention_mask.values()))
     else:
+        mask_embeds = inputs_embeds
+        mask_position_ids = position_ids
+        if ulysses_enabled:
+            # SP collator keeps the full 2D attention_mask while slicing
+            # input_ids; build the 4D sliding-window mask on the full length.
+            mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
+            mask_position_ids = full_position_ids
         causal_mask = create_sliding_window_causal_mask(
             config=self.config,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=mask_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            position_ids=position_ids,
+            position_ids=mask_position_ids,
         )
     if "packed_sequence_slices" in kwargs:
         causal_mask = isolate_packed_causal_mask_(causal_mask, kwargs["packed_sequence_slices"])
@@ -1037,6 +1223,8 @@ def deepseek_v4_topk_router_forward_patched(
     correction_bias = self.e_score_correction_bias.float()
     scores = self.score_fn(logits)
     indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+    if get_active_replay() is not None:
+        indices = maybe_replay_indices(self, scores, indices)
     weights = scores.gather(1, indices)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
     return logits, weights * self.routed_scaling_factor, indices
@@ -1057,6 +1245,8 @@ def deepseek_v4_hash_router_forward_patched(
         logits = F.linear(flat.float(), self.weight.float())
     scores = self.score_fn(logits)
     indices = self.tid2eid[input_ids.reshape(-1)].long()
+    if get_active_replay() is not None:
+        indices = maybe_replay_indices(self, scores, indices)
     weights = scores.gather(1, indices)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
     return logits, weights * self.routed_scaling_factor, indices

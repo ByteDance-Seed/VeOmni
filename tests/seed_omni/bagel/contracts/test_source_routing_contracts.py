@@ -215,16 +215,23 @@ def test_bagel_qwen2_mot_generate_does_not_validate_denoise_cfg() -> None:
     assert out["conversation_list"] is conversation
 
 
-def test_bagel_qwen2_mot_prefill_builds_cfg_img_context_only_when_requested() -> None:
+def test_bagel_qwen2_mot_prefill_packs_cfg_contexts_into_one_flex_forward() -> None:
     model = _tiny_qwen2_mot()
     hidden_size = int(model.config.hidden_size)
     calls: list[dict[str, object]] = []
 
     def fake_forward_inference(**kwargs: object) -> dict[str, object]:
         calls.append(kwargs)
+        query = kwargs["packed_query_sequence"]
+        cache = kwargs.get("past_key_values") or model._new_empty_cache()
+        assert torch.is_tensor(query)
+        rows = torch.arange(query.shape[0], dtype=torch.float32).reshape(-1, 1, 1)
+        for layer_idx in cache.key_cache:
+            cache.key_cache[layer_idx] = rows
+            cache.value_cache[layer_idx] = rows + 100
         return {
-            "past_key_values": object(),
-            "hidden_states": torch.zeros(1, hidden_size),
+            "past_key_values": cache,
+            "hidden_states": torch.zeros_like(query),
         }
 
     model.forward_inference = fake_forward_inference  # type: ignore[method-assign]
@@ -237,29 +244,173 @@ def test_bagel_qwen2_mot_prefill_builds_cfg_img_context_only_when_requested() ->
 
     assert len(calls) == 1
     assert model._generation_state.cfg_img.cache is None
+    assert model._generation_state.main.cache_len() == 1
+    assert model._generation_state.cfg_text.cache_len() == 0
+    assert "packed_attention_metadata" in calls[0]
+    assert "attention_implementation" not in calls[0]
 
     model = _tiny_qwen2_mot()
     calls = []
     model.forward_inference = fake_forward_inference  # type: ignore[method-assign]
-    model.generate(
-        conversation_list=[
-            ConversationItem(type="text", value=torch.zeros(1, hidden_size), role="user"),
+    hidden_states = model._prefill_prompt(
+        [
+            ConversationItem(
+                type="image",
+                value=torch.zeros(2, hidden_size),
+                role="assistant",
+                source=BAGEL_VAE_CONTEXT,
+            ),
+            ConversationItem(type="text", value=torch.zeros(3, hidden_size), role="user"),
         ],
         generation_kwargs={"infer_type": "infer_gen", "cfg_text_scale": 4.0, "cfg_img_scale": 1.5},
     )
 
-    assert len(calls) == 2
-    assert model._generation_state.cfg_img.cache is not None
+    assert hidden_states.shape == (5, hidden_size)
+    assert len(calls) == 1
+    call = calls[0]
+    assert torch.equal(call["query_lens"], torch.tensor([5, 3], dtype=torch.int32))
+    assert torch.equal(call["packed_query_indexes"], torch.arange(8))
+    assert torch.equal(call["packed_vae_token_indexes"], torch.tensor([0, 1]))
+    assert torch.equal(call["packed_text_indexes"], torch.arange(2, 8))
+    assert call["mode"] == "gen"
+    assert "attention_implementation" not in call
+
+    metadata = call["packed_attention_metadata"]
+    assert torch.is_tensor(metadata)
+    assert metadata[0].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+
+    state = model._generation_state
+    assert state.main.cache_len() == 5
+    assert state.cfg_text.cache_len() == 2
+    assert state.cfg_img.cache_len() == 3
+    assert state.main.next_position_ids.tolist() == [4]
+    assert state.cfg_text.next_position_ids.tolist() == [1]
+    assert state.cfg_img.next_position_ids.tolist() == [3]
+    assert state.main.cache.key_cache[0][:, 0, 0].tolist() == [0, 1, 2, 3, 4]
+    assert state.cfg_text.cache.key_cache[0][:, 0, 0].tolist() == [0, 1]
+    assert state.cfg_img.cache.key_cache[0][:, 0, 0].tolist() == [5, 6, 7]
+
+
+def test_bagel_qwen2_mot_prefill_keeps_latest_cfg_text_prefix_for_interleaved_prompt() -> None:
+    model = _tiny_qwen2_mot()
+    hidden_size = int(model.config.hidden_size)
+    calls: list[dict[str, object]] = []
+
+    def fake_forward_inference(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        query = kwargs["packed_query_sequence"]
+        cache = kwargs.get("past_key_values") or model._new_empty_cache()
+        assert torch.is_tensor(query)
+        for layer_idx in cache.key_cache:
+            cache.key_cache[layer_idx] = torch.zeros(query.shape[0], 1, 1)
+            cache.value_cache[layer_idx] = torch.zeros(query.shape[0], 1, 1)
+        return {"past_key_values": cache, "hidden_states": torch.zeros_like(query)}
+
+    model.forward_inference = fake_forward_inference  # type: ignore[method-assign]
+    conversation = [
+        ConversationItem(
+            type="image",
+            value=torch.zeros(1, hidden_size),
+            role="assistant",
+            source=BAGEL_VAE_CONTEXT,
+        ),
+        ConversationItem(type="text", value=torch.zeros(2, hidden_size), role="user"),
+        ConversationItem(
+            type="image",
+            value=torch.zeros(1, hidden_size),
+            role="assistant",
+            source=BAGEL_VAE_CONTEXT,
+        ),
+        ConversationItem(type="text", value=torch.zeros(3, hidden_size), role="user"),
+    ]
+
+    model._prefill_prompt(
+        conversation,
+        {"infer_type": "infer_gen", "cfg_text_scale": 4.0, "cfg_img_scale": 1.5},
+    )
+
+    assert len(calls) == 1
+    assert torch.equal(calls[0]["query_lens"], torch.tensor([7, 5], dtype=torch.int32))
+    assert model._generation_state.main.cache_len() == 7
+    assert model._generation_state.cfg_text.cache_len() == 4
+    assert model._generation_state.cfg_text.next_position_ids.tolist() == [4]
+    assert model._generation_state.cfg_img.cache_len() == 5
+
+
+def test_bagel_qwen2_mot_denoise_forces_flash_attention() -> None:
+    model = _tiny_qwen2_mot()
+    hidden_size = int(model.config.hidden_size)
+    model._generation_state.main.install_cache(
+        cache=model._new_empty_cache(),
+        cache_len=0,
+        next_position_id=torch.tensor(0),
+        device=model.device,
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_forward_inference(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        query = kwargs["packed_query_sequence"]
+        assert torch.is_tensor(query)
+        return {
+            "past_key_values": kwargs["past_key_values"],
+            "hidden_states": torch.zeros_like(query),
+        }
+
+    model.forward_inference = fake_forward_inference  # type: ignore[method-assign]
+    query = ConversationItem(
+        type="output",
+        value=torch.zeros(3, hidden_size),
+        role="assistant",
+        source=BAGEL_FLOW_QUERY,
+    )
+
+    model.denoise_branch(conversation_list=[query], generation_kwargs={})
+
+    assert len(calls) == 1
+    assert calls[0]["attention_implementation"] == "veomni_flash_attention_2_with_sp"
+
+
+def test_bagel_qwen2_mot_ar_decode_forces_flash_attention() -> None:
+    model = _tiny_qwen2_mot()
+    hidden_size = int(model.config.hidden_size)
+    main_context = model._generation_state.main
+    main_context.install_cache(
+        cache=model._new_empty_cache(),
+        cache_len=0,
+        next_position_id=torch.tensor(0),
+        device=model.device,
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_forward_inference(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        query = kwargs["packed_query_sequence"]
+        assert torch.is_tensor(query)
+        return {
+            "past_key_values": kwargs["past_key_values"],
+            "hidden_states": torch.zeros_like(query),
+        }
+
+    model.forward_inference = fake_forward_inference  # type: ignore[method-assign]
+    output = ConversationItem(
+        type="output",
+        value=torch.zeros(1, hidden_size),
+        role="assistant",
+    )
+
+    model._decode_next_token([output])
+
+    assert len(calls) == 1
+    assert calls[0]["attention_implementation"] == "veomni_flash_attention_2_with_sp"
 
 
 def test_bagel_qwen2_mot_keeps_denoise_shape_validation_after_source_selection() -> None:
     model = _tiny_qwen2_mot()
-    model._generation_state.main.snapshot(
+    model._generation_state.main.install_cache(
         cache=object(),
-        key_values_lens=torch.zeros(1, dtype=torch.int32),
-        packed_key_value_indexes=torch.empty(0, dtype=torch.long),
+        cache_len=0,
         next_position_id=torch.zeros(1, dtype=torch.long),
-        empty_cache_factory=model._new_empty_cache,
         device=model.device,
     )
     wrong_hidden = ConversationItem(

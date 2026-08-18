@@ -19,3 +19,5 @@ bagel_flow_connector:
       enable: false
 bagel_qwen2_mot:
   model_path: bagel_qwen2_mot
+  ops_implementation:
+    attn_implementation: flex_attention

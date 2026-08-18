@@ -75,6 +75,7 @@ class BagelTextEncoder(TextEncoder):
 
     config_class = BagelTextEncoderConfig
     preprocessor_class = BagelTextEncoderPreprocessor
+    _supports_sdpa = True
 
     def generate(
         self,

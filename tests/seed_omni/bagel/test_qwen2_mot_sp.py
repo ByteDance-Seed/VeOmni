@@ -13,9 +13,11 @@ from torch.distributed.tensor import DTensor
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
+from veomni.models.seed_omni.modules.bagel.qwen2_mot import modeling as qwen2_mot_modeling
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 from veomni.utils.device import get_device_type, get_torch_device
+from veomni.utils.save_safetensor_utils import get_model_save_state
 
 
 def _sample_items(
@@ -151,7 +153,7 @@ def _forward_carrier(
             input_shapes.append(
                 (
                     tuple(inputs["packed_sequence"].shape),
-                    tuple(inputs["attention_mask"].shape),
+                    tuple(inputs["packed_attention_metadata"].shape),
                 )
             )
         outputs = model(**inputs)
@@ -176,6 +178,9 @@ def _qwen2_mot_sp_worker() -> None:
     world_size = dist.get_world_size()
     assert world_size == 4
     device = torch.device(f"{get_device_type()}:{rank}")
+    qwen2_mot_modeling.veomni_rms_norm.bind("liger_kernel")
+    qwen2_mot_modeling.veomni_apply_rotary_pos_emb.bind("liger_kernel")
+    qwen2_mot_modeling.veomni_swiglu_mlp.bind("liger_kernel")
 
     non_sp_state = init_parallel_state(
         dp_size=world_size,
@@ -191,11 +196,12 @@ def _qwen2_mot_sp_worker() -> None:
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     config_kwargs = {
         **tiny_bagel_qwen2_cfg(),
-        "hidden_size": 112,
-        "intermediate_size": 224,
+        # FlexAttention's Triton kernel requires head_dim >= 16.
+        "hidden_size": 448,
+        "intermediate_size": 896,
         "num_attention_heads": 28,
         "num_key_value_heads": 4,
-        "attn_implementation": "veomni_flash_attention_2_with_sp",
+        "attn_implementation": "veomni_flex_attention_with_sp",
     }
     torch.manual_seed(9102)
     reference = (
@@ -223,6 +229,21 @@ def _qwen2_mot_sp_worker() -> None:
     fully_shard(sequence_parallel, mesh=sp_state.fsdp_mesh, mp_policy=mp_policy)
     _enable_scoped_gradient_checkpointing(sequence_parallel, sp_state)
 
+    qkv_checkpoint_keys = {
+        f"model.layers.0.self_attn.{projection}.{kind}"
+        for projection in ("q_proj", "k_proj", "v_proj", "q_proj_moe_gen", "k_proj_moe_gen", "v_proj_moe_gen")
+        for kind in ("weight", "bias")
+    }
+    exported_qkv = get_model_save_state(
+        sequence_parallel,
+        fqn_to_index_mapping=dict.fromkeys(qkv_checkpoint_keys, 0),
+        parallel_state=sp_state,
+    )
+    assert set(exported_qkv) == qkv_checkpoint_keys
+    assert tuple(exported_qkv["model.layers.0.self_attn.q_proj.weight"].shape) == (448, 448)
+    assert tuple(exported_qkv["model.layers.0.self_attn.k_proj.weight"].shape) == (64, 448)
+    assert tuple(exported_qkv["model.layers.0.self_attn.v_proj.weight"].shape) == (64, 448)
+
     hidden_size = int(reference.config.hidden_size)
     reference_conversation, reference_inputs = _replicated_batch(device, hidden_size)
     sp_conversation, sp_inputs = _replicated_batch(device, hidden_size)
@@ -231,7 +252,7 @@ def _qwen2_mot_sp_worker() -> None:
 
     reference_hidden = _forward_carrier(reference, reference_conversation, non_sp_state)
     sp_hidden = _forward_carrier(sequence_parallel, sp_conversation, sp_state, input_shapes)
-    assert input_shapes == [((7, hidden_size), (1, 1, 26, 26))]
+    assert input_shapes == [((7, hidden_size), (3, 28))]
     assert sequence_parallel._metric_full_seqlens["forward"] == expected_sample_lengths
     assert torch.isfinite(reference_hidden).all()
     assert torch.isfinite(sp_hidden).all()

@@ -45,41 +45,6 @@ dev = [
   "pytest>=6.0.0,<8.0",
   "expecttest>=0.3.0,<0.4"
 ]
-audio = [
-  "torchcodec",
-  "av>=14.3.0,<15.0; python_version == '3.11'",
-  "av>=14.0.0,<14.3; python_version == '3.12'",
-  "librosa>=0.11.0,<0.12",
-  # librosa pulls numba loosely (>=0.51); pin >=0.64 so the resolved numba
-  # supports numpy 2.4 (numba <0.64 caps numpy<2.4 and fails at import).
-  "numba>=0.64,<0.66",
-  "soundfile>=0.13.1,<0.14"
-]
-# Alias for audio extra - includes both video and audio processing dependencies
-video = [
-  "torchcodec",
-  "av>=14.3.0,<15.0; python_version == '3.11'",
-  "av>=14.0.0,<14.3; python_version == '3.12'",
-  "librosa>=0.11.0,<0.12",
-  # See note in the ``audio`` extra: keep numba>=0.64 for numpy 2.4 support.
-  "numba>=0.64,<0.66",
-  "soundfile>=0.13.1,<0.14"
-]
-dit = [
-  "diffusers==0.37.0",
-  "torchcodec",
-  "av>=14.3.0,<15.0; python_version == '3.11'",
-  "av>=14.0.0,<14.3; python_version == '3.12'",
-  "librosa>=0.11.0,<0.12",
-  # See note in the ``audio`` extra: keep numba>=0.64 for numpy 2.4 support.
-  "numba>=0.64,<0.66",
-  "soundfile>=0.13.1,<0.14",
-  "diffusers==0.37.0",
-  "ftfy",
-  "peft==0.18.1",
-  "megatron-energon>=7.2.1",
-  "hf_transfer",
-]
 
 gpu = [
   "torch==2.11.0+cu130",
@@ -105,6 +70,9 @@ gpu = [
   "liger-kernel",
   "flash-linear-attention",
   "quack-kernels[cu13]==0.5.0",
+  # Dao-AILab Gram Newton-Schulz (default muon_ns_implementation=gram_quack).
+  # Pure-torch `gram` path does not need this; package ImportError falls back to gram.
+  "gram-newton-schulz==0.1.6",
   "torch-c-dlpack-ext",
   "apache-tvm-ffi==0.1.9",
   # Training-capable DeepSeek V4 mHC kernels. TileKernels 1.0.0 requires
@@ -115,8 +83,6 @@ gpu = [
   "av>=14.2.0,<14.3; python_version == '3.11' and platform_machine == 'aarch64'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
-  # See note in the ``audio`` extra: keep numba>=0.64 for numpy 2.4 support.
-  "numba>=0.64,<0.66",
   "soundfile>=0.13.1,<0.14",
   "diffusers==0.37.0",
   "ftfy",
@@ -199,7 +165,7 @@ transformers-stable = [
 # is preserved because docker/CI install a concrete pin and use --locked /
 # --frozen. Concrete pins (docker/, .github/workflows/check_patchgen.yml)
 # must stay inside this range.
-required-version = ">=0.9.8,<0.12"
+required-version = ">=0.9.8,<0.13"
 
 default-groups = ["transformers-stable"]
 

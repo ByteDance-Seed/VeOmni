@@ -14,10 +14,11 @@ import torch.nn.functional as F
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_outputs,
-    reduce_sequence_parallel_loss,
     slice_input_tensor,
     sp_pad,
 )
+from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
+from veomni.ops.kernels.cross_entropy.eager import eager_cross_entropy
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.base_mixin import BaseMixin
@@ -191,40 +192,61 @@ class TrainingMixin(TrainingModuleMixin):
     ) -> dict:
         """FSDP2/SP-safe counterpart of :meth:`~.modeling.TextEncoder.decode`.
 
-        Same loss math, but (a) projects via :meth:`_project` above instead of
-        the native tied-weight shortcut, and (b) token-weights the loss mean
-        across the whole ``dp_sp`` (``fsdp_group``) mesh via
-        :func:`~veomni.distributed.sequence_parallel.reduce_sequence_parallel_loss`
-        — required once SP is enabled, since each rank only scores its own
-        (unsliced, per :meth:`decode_pre`) span.
-        """
-        logits = self._project(hidden_states)
-        loss: torch.Tensor | None = None
+        Two departures from the native version, both runtime concerns the pure-HF
+        layer deliberately stays out of:
 
-        if shift_labels is not None:
-            flat_labels = shift_labels.view(-1)
-            ce_sum = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                flat_labels,
-                ignore_index=-100,
-                reduction="sum",
+        (a) The loss goes through the ops-selected cross-entropy backend rather
+        than a bare ``F.cross_entropy``, so an untied bias-free head gets the
+        fused linear+CE kernel (Liger / chunk_loss) and never materializes the
+        ``[T, V]`` logits. Passing ``logits=None`` + ``hidden_states`` + ``weights``
+        is what opts into that contract; a tied or biased head cannot (the fused
+        kernels take a weight tensor only, no bias, and the tied weight needs the
+        gather in :meth:`_project`), so it keeps an explicit projection and eager CE.
+
+        (b) ``loss_reduction_group=fsdp_group`` token-weights the loss mean across
+        the whole ``dp_sp`` mesh — required once SP is enabled, since each rank only
+        scores its own (unsliced, per :meth:`decode_pre`) span.
+        ``ForCausalLMLoss`` applies exactly the
+        :func:`~veomni.distributed.sequence_parallel.reduce_sequence_parallel_loss`
+        this method used to call inline.
+
+        (c) A span with no supervised token scores 0.0, matching the native
+        clamped denominator required by constraint 7b. Every fused backend
+        normalizes by its own supervised-token count with no way to clamp it
+        (Liger divides by ``n_non_ignore``, chunk_loss recounts the labels), so
+        such a span is routed to the eager branch and given an explicit
+        denominator instead of dividing 0 by 0.
+        """
+        loss: torch.Tensor | None = None
+        logits: torch.Tensor | None = None
+        target_labels = labels if labels is not None else shift_labels
+        fsdp_group = get_parallel_state().fsdp_group
+        num_supervised_tokens = None if target_labels is None else (target_labels != -100).sum()
+
+        if target_labels is None:
+            # Inference path: materialize logits because no loss is requested.
+            logits = self._project(hidden_states)
+        elif self.lm_head is not None and self.lm_head.bias is None and num_supervised_tokens > 0:
+            loss, logits, _ = self.loss_function(
+                logits=None,
+                labels=target_labels,
+                shift_labels=shift_labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                loss_reduction_group=fsdp_group,
             )
-            n_valid_local = (flat_labels != -100).sum()
-            local_mean = ce_sum / n_valid_local.clamp(min=1)
-            loss = reduce_sequence_parallel_loss(
-                local_mean, n_valid_local.to(local_mean.dtype), group=get_parallel_state().fsdp_group
+        else:
+            logits = self._project(hidden_states)
+            loss, _, _ = ForCausalLMLoss(
+                logits=logits,
+                labels=target_labels,
+                shift_labels=shift_labels,
+                vocab_size=self.config.vocab_size,
+                num_items_in_batch=num_supervised_tokens.clamp(min=1),
+                loss_reduction_group=fsdp_group,
+                cross_entropy_fn=eager_cross_entropy,
             )
-        elif labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_targets = labels[..., 1:].contiguous()
-            ce_sum = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_targets.view(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
-            n_valid = (shift_targets != -100).sum().clamp(min=1)
-            loss = ce_sum / n_valid
 
         return {
             "loss": loss,

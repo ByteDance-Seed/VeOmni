@@ -251,37 +251,34 @@ def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
     assert "timestep" not in request["conversation_list"][-1].meta
 
 
-def test_bagel_qwen2_mot_cfg_text_context_snapshot_is_internal():
+def test_bagel_qwen2_mot_cfg_text_context_install_is_internal():
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
 
-    model._generation_state.cfg_text.snapshot(
-        cache=None,
-        key_values_lens=None,
-        packed_key_value_indexes=None,
+    empty_cache = model._new_empty_cache()
+    model._generation_state.cfg_text.install_cache(
+        cache=empty_cache,
+        cache_len=0,
         next_position_id=torch.tensor(7),
-        empty_cache_factory=model._new_empty_cache,
         device=model.device,
     )
     cfg_text_context = model._generation_state.cfg_text
-    assert cfg_text_context.cache is not None
+    assert cfg_text_context.cache is empty_cache
     assert cfg_text_context.cache_len() == 0
     assert cfg_text_context.repeated_position_ids(3, device=model.device).tolist() == [7, 7, 7]
     assert cfg_text_context.key_values_lens.tolist() == [0]
     assert cfg_text_context.packed_key_value_indexes.numel() == 0
 
     cache = model._new_empty_cache()
-    model._generation_state.cfg_text.snapshot(
+    model._generation_state.cfg_text.install_cache(
         cache=cache,
-        key_values_lens=torch.tensor([5], dtype=torch.int32),
-        packed_key_value_indexes=torch.arange(5),
+        cache_len=5,
         next_position_id=torch.tensor(11),
-        empty_cache_factory=model._new_empty_cache,
         device=model.device,
     )
 
-    assert cfg_text_context.cache is not cache
+    assert cfg_text_context.cache is cache
     assert cfg_text_context.cache_len() == 5
     assert cfg_text_context.repeated_position_ids(2, device=model.device).tolist() == [11, 11]
     assert cfg_text_context.packed_key_value_indexes.tolist() == [0, 1, 2, 3, 4]
@@ -292,9 +289,15 @@ def test_bagel_qwen2_mot_cfg_img_context_accessors_are_internal():
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
 
-    model._generation_state.cfg_img.ensure_empty(empty_cache_factory=model._new_empty_cache, device=model.device)
+    empty_cache = model._new_empty_cache()
+    model._generation_state.cfg_img.install_cache(
+        cache=empty_cache,
+        cache_len=0,
+        next_position_id=torch.tensor(0),
+        device=model.device,
+    )
     cfg_img_context = model._generation_state.cfg_img
-    assert cfg_img_context.cache is not None
+    assert cfg_img_context.cache is empty_cache
     assert cfg_img_context.cache_len() == 0
     assert cfg_img_context.repeated_position_ids(3, device=model.device).tolist() == [0, 0, 0]
     assert cfg_img_context.key_values_lens.tolist() == [0]
@@ -311,28 +314,22 @@ def test_bagel_qwen2_mot_branch_batch_indexes_use_per_branch_attention_offsets()
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
     state = model._generation_state
-    state.main.snapshot(
+    state.main.install_cache(
         cache=_fake_cache(model, torch.tensor([10.0, 11.0])),
-        key_values_lens=torch.tensor([2], dtype=torch.int32),
-        packed_key_value_indexes=torch.arange(2),
+        cache_len=2,
         next_position_id=torch.tensor(3),
-        empty_cache_factory=model._new_empty_cache,
         device=model.device,
     )
-    state.cfg_text.snapshot(
-        cache=None,
-        key_values_lens=None,
-        packed_key_value_indexes=None,
+    state.cfg_text.install_cache(
+        cache=model._new_empty_cache(),
+        cache_len=0,
         next_position_id=torch.tensor(7),
-        empty_cache_factory=model._new_empty_cache,
         device=model.device,
     )
-    state.cfg_img.snapshot(
+    state.cfg_img.install_cache(
         cache=_fake_cache(model, torch.tensor([20.0, 21.0, 22.0])),
-        key_values_lens=torch.tensor([3], dtype=torch.int32),
-        packed_key_value_indexes=torch.arange(3),
+        cache_len=3,
         next_position_id=torch.tensor(11),
-        empty_cache_factory=model._new_empty_cache,
         device=model.device,
     )
 
@@ -400,11 +397,26 @@ def test_bagel_qwen2_mot_collects_stacked_cfg_velocity_like_serial_oracle(
         )
     ]
     state = model._generation_state
-    state.main.ensure_empty(empty_cache_factory=model._new_empty_cache, device=model.device)
+    state.main.install_cache(
+        cache=model._new_empty_cache(),
+        cache_len=0,
+        next_position_id=torch.tensor(0),
+        device=model.device,
+    )
     if "cfg_text" in branches:
-        state.cfg_text.ensure_empty(empty_cache_factory=model._new_empty_cache, device=model.device)
+        state.cfg_text.install_cache(
+            cache=model._new_empty_cache(),
+            cache_len=0,
+            next_position_id=torch.tensor(0),
+            device=model.device,
+        )
     if "cfg_img" in branches:
-        state.cfg_img.ensure_empty(empty_cache_factory=model._new_empty_cache, device=model.device)
+        state.cfg_img.install_cache(
+            cache=model._new_empty_cache(),
+            cache_len=0,
+            next_position_id=torch.tensor(0),
+            device=model.device,
+        )
     state.preprocess_parallel_denoise_inputs(
         torch.zeros(4, int(model.config.hidden_size)),
         generation_kwargs,

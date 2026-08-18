@@ -179,7 +179,7 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
 
     config_class = TextEncoderConfig
     base_model_prefix = ""
-    _no_split_modules: list = ["Embedding", "Linear"]
+    _no_split_modules: list = ["Embedding"]
     main_input_name = "input_ids"
 
     def __init__(self, config: TextEncoderConfig):
@@ -247,9 +247,13 @@ class TextEncoder(InferenceMixin, OmniPreTrainedModel):
         shift_labels: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> dict:
+        del kwargs
         logits = self._project(hidden_states)
         loss: torch.Tensor | None = None
 
+        # Local, parallel-state-free CE: kernel selection and the DP+SP token
+        # weighting are the runtime's business, so ``accelerated.py`` overrides
+        # this with the fused ops dispatch (see ``TrainingMixin.decode``).
         if shift_labels is not None:
             flat_labels = shift_labels.view(-1)
             ce_sum = F.cross_entropy(

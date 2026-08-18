@@ -34,7 +34,7 @@ from .checkpoint import CheckpointFunction
 from .chunk_mbs import apply_chunk_mbs
 from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
-from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_config_for_fsdp2
+from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
 from .utils import sort_fqn_by_submodule_first
 
 
@@ -46,6 +46,28 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         module._is_hf_initialized = False
     for child in module.children():
         _reset_hf_initialized_flag(child)
+
+
+def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
+    """Materialize parameters without discarding config-derived buffers.
+
+    Distributed checkpoints restore ``state_dict()``, which excludes buffers
+    registered with ``persistent=False``. Snapshot those buffers before
+    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
+    materialization path without duplicating persistent buffers that DCP loads.
+    """
+    buffers = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:
+            buffer = module._buffers.get(name)
+            if buffer is not None:
+                buffers.append((module, name, buffer.detach().clone()))
+
+    model.to_empty(device=device)
+
+    for module, name, buffer in buffers:
+        materialized_buffer = module._buffers[name]
+        materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
 
 
 def _resolve_weights_path_mapping(
@@ -101,6 +123,7 @@ def _apply_weights_load_step(
     distribute_tensor_fn: Callable[..., Any],
     fqn_to_index_mapping: Optional[Mapping[str, int]],
     ep_sharded_stream_load: bool = False,
+    should_skip_hf_weight_load: bool = False,
 ) -> None:
     """Materialise meta-initialised parameters and (optionally) load weights.
 
@@ -144,6 +167,21 @@ def _apply_weights_load_step(
       composition is exercised end-to-end by D2.3's smoke tests (which
       run real FSDP) — the unit tests here only cover dispatch.
     """
+    if should_skip_hf_weight_load and is_peft_model:
+        raise ValueError(
+            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
+            "trainable-only and the frozen base must still be loaded from weights_path."
+        )
+
+    if should_skip_hf_weight_load:
+        logger.info_rank0(
+            "Skipping pretrained weight load for checkpoint resume; "
+            "parameters will be restored from the distributed checkpoint."
+        )
+        _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        _reset_hf_initialized_flag(model)
+        return
+
     if weights_path is None:
         model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
@@ -240,6 +278,11 @@ def _load_one(
             )
             return
         except NotImplementedError as e:
+            # Deliberately degrades instead of failing early: the flag is global
+            # (``train.ep_sharded_stream_load``) but this helper runs once per
+            # OmniModule, and every sub-module without an ExtraParallel plan — the
+            # vision encoder, VAE, connector — raises here. Aborting would make the
+            # flag unusable for any heterogeneous model whose MoE backbone wants it.
             logger.warning_rank0(
                 f"ep_sharded_stream_load unsupported for this model/checkpoint ({e}); "
                 "falling back to load_model_weights."
@@ -270,6 +313,38 @@ def _load_one(
             adapter_path=adapter_path,
             fqn_to_index_mapping=fqn_to_index_mapping,
         )
+
+
+def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
+    """``fully_shard(..., shard_placement_fn=...)`` hook: shard on a model-chosen
+    dimension instead of the FSDP2 default ``Shard(0)``.
+
+    A model opts a specific parameter in by tagging it with a
+    ``_veomni_fsdp_shard_dim`` attribute in its own ``__init__`` (e.g. DeepSeek-V4's
+    compressor/indexer ``position_bias`` -- shape ``(compress_rate, head_dim*k)``
+    where ``compress_rate`` can be as small as 4, but the trailing dim is a large,
+    reliably-divisible power of 2). Sharding such a param on dim-0 across a large
+    FSDP world leaves most ranks with a genuinely empty local shard; redirecting it
+    to a dimension that divides evenly avoids that at no memory cost. Returning
+    ``None`` for untagged params keeps the FSDP2 default (``Shard(0)``).
+    """
+    dim = getattr(param, "_veomni_fsdp_shard_dim", None)
+    return Shard(dim) if dim is not None else None
+
+
+def _move_buffers_to_device(model: nn.Module, device: str) -> None:
+    """Place every buffer on ``device``.
+
+    ``CPUOffloadPolicy`` only offloads parameters, gradients and optimizer states:
+    ``fully_shard`` puts buffers on the FSDP device once at wrap time and never stages
+    them again. Meta init defers that move, so a CPU materialization leaves buffers such
+    as the DeepSeek-V4 hash-router ``tid2eid`` table or rotary ``inv_freq`` on CPU while
+    the activations are on the accelerator.
+    """
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if buffer is not None and buffer.device.type != device:
+                module._buffers[name] = buffer.to(device)
 
 
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
@@ -308,6 +383,7 @@ def parallelize_model_fsdp2(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -349,6 +425,8 @@ def parallelize_model_fsdp2(
               owns its own HF folder.  Incompatible with
               ``is_peft_model=True`` — raises ``NotImplementedError``.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
 
@@ -455,23 +533,32 @@ def parallelize_model_fsdp2(
     logger.info_rank0(f"extra_parallel layer pairs: {layer_pairs}")
 
     if compile_config.enable:
-        if get_device_type() != "cuda":
-            raise RuntimeError("train.torch_compile.enable is CUDA-only for now.")
-        if parallel_state.any_extra_parallel_enabled:
-            raise RuntimeError(
-                "train.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
-                "communication may be captured inside compiled blocks."
-            )
-        validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
+        validate_compile_runtime(
+            compile_config,
+            device_type=get_device_type(),
+            fsdp_enabled=parallel_state.fsdp_enabled,
+            fsdp_mode=parallel_state.dp_mode,
+            any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
+            enable_reshard_after_forward=enable_reshard_after_forward,
+        )
 
-        compiled_count = compile_decoder_blocks(model, compile_config)
+        compiled_count = compile_decoder_blocks(
+            model,
+            compile_config,
+            sequence_parallel_enabled=parallel_state.sp_enabled,
+            async_enabled=parallel_state.async_enabled,
+        )
         if compiled_count == 0:
             raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True
         model._veomni_compile_uses_cuda_graphs = compile_config.uses_cuda_graphs()
 
     # Step 2: Update fsdp2 kwargs
-    fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
+    fsdp_kwargs = {
+        "mesh": parallel_state.fsdp_mesh,
+        "reshard_after_forward": enable_reshard_after_forward,
+        "shard_placement_fn": _veomni_shard_placement_fn,
+    }
     # prepare mp_policy kwargs
     if mixed_precision.enable:
         mp_policy = MixedPrecisionPolicy(
@@ -681,7 +768,11 @@ def parallelize_model_fsdp2(
         distribute_tensor_fn=distribute_tensor,
         fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load", False)),
+        should_skip_hf_weight_load=should_skip_hf_weight_load,
     )
+
+    if materialize_device == "cpu":
+        _move_buffers_to_device(model, get_device_type())
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
@@ -694,6 +785,7 @@ def parallelize_model_fsdp2(
 def parallelize_model_ddp(
     model: "nn.Module",
     weights_path: Optional[Union[str, Mapping[str, str]]] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply DDP (replicated) data parallelism to the model.
@@ -721,6 +813,10 @@ def parallelize_model_ddp(
               owns its own HF folder.  Incompatible with
               ``is_peft_model=True`` — raises ``NotImplementedError``.
             loaded as full tensors (no DTensor sharding).
+        should_skip_hf_weight_load: On a distributed-checkpoint resume the HF
+            snapshot is about to be overwritten, so skip reading it and only
+            materialise the params. Must be honoured here too, or a DDP resume
+            re-reads the whole snapshot — and fails outright when it is gone.
     """
     parallel_state = get_parallel_state()
 
@@ -743,6 +839,7 @@ def parallelize_model_ddp(
             # with the FSDP2 path.
             distribute_tensor_fn=distribute_tensor,
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+            should_skip_hf_weight_load=should_skip_hf_weight_load,
         )
 
     # PyTorch DDP rejects modules with zero trainable params. Fully-frozen
@@ -755,19 +852,30 @@ def parallelize_model_ddp(
         )
         return model
 
-    # DDP's default ``broadcast_buffers=True`` does an in-place ``copy_`` on every
-    # buffer at the start of each forward — including constant index buffers such as
-    # Janus SigLIP's ``position_ids`` that ``nn.Embedding`` saves for backward —
-    # which can fail autograd version checks (PyTorch #22095 / #66504). Disable
-    # buffer broadcast under SP; module weights still sync via the gradient
-    # allreduce. Non-SP DDP keeps the default (needed for BatchNorm running stats
-    # when those modules use DDP).
+    # ``broadcast_buffers=False`` to match the FSDP2 path, which is the same
+    # replication story: ``ParallelState.fsdp_mesh`` treats DDP as HSDP with a
+    # single ``dp_replicate`` dim, and ``fully_shard`` syncs no buffers at all
+    # (torch's FSDP has no ``_sync_module_states`` equivalent), so a module's
+    # buffer behaviour must not depend on which ``dp_mode`` the config picked.
+    #
+    # Nothing is lost by not broadcasting. Config-derived buffers are already
+    # per-rank correct: a static rope table is identical everywhere, and
+    # dynamic-rope ``inv_freq`` is recomputed from *this* rank's sequence length,
+    # so pushing rank0's copy would actively corrupt the others. Genuinely
+    # replicated mutable state — ``nn.BatchNorm*`` running stats — is NOT fixed by
+    # this broadcast either: it overwrites every rank with rank0's copy, i.e.
+    # discards the other ranks' statistics, and it would break any module owning
+    # more than one graph node, because ``call_graph_endpoint`` enters the wrapper
+    # once per node and the in-place pre-forward ``copy_`` then hits a buffer the
+    # first node's autograd graph saved for backward (PyTorch #22095 / #66504).
+    # ``SyncBatchNorm`` is the one real fix — it all-reduces the statistics inside
+    # forward — and it works identically under DDP, FSDP2 and HSDP.
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],
         process_group=parallel_state.dp_group,
         find_unused_parameters=True,
-        broadcast_buffers=parallel_state.sp_size <= 1,
+        broadcast_buffers=False,
     )
 
 
@@ -780,6 +888,7 @@ def build_parallelize_model(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -798,6 +907,8 @@ def build_parallelize_model(
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
@@ -855,12 +966,18 @@ def build_parallelize_model(
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 compile_config=compile_config,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
             )
         else:
             if compile_config.enable:
                 raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
-            model = parallelize_model_ddp(model=model, weights_path=weights_path, **kwargs)
+            model = parallelize_model_ddp(
+                model=model,
+                weights_path=weights_path,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
+                **kwargs,
+            )
     elif compile_config.enable:
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
 

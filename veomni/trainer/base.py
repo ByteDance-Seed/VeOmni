@@ -66,6 +66,7 @@ from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
+from ..utils.checkpoint_utils import should_skip_hf_weight_load
 from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -73,7 +74,7 @@ from ..utils.device import (
     is_nccl_backend,
     synchronize,
 )
-from ..utils.loss_utils import count_loss_token, mean_global_loss
+from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     ChannelLossCallback,
@@ -91,6 +92,15 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+def _has_trainable_lora_parameters(module: torch.nn.Module | None) -> bool:
+    if module is None:
+        return False
+    return any(
+        param.requires_grad and ({"lora_A", "lora_B"} & set(name.split(".")))
+        for name, param in module.named_parameters()
+    )
 
 
 class BackgroundPrefetcher:
@@ -198,10 +208,21 @@ class VeOmniIter:
         return {}
 
 
+def _resolve_muon_lr(optimizer_cfg) -> float:
+    """Resolve Muon LR, inheriting AdamW lr under match_rms_adamw when unset."""
+    if optimizer_cfg.muon_lr is not None:
+        return float(optimizer_cfg.muon_lr)
+    adamw_lr = float(optimizer_cfg.lr)
+    if optimizer_cfg.muon_adjust_lr_fn == "match_rms_adamw":
+        return adamw_lr
+    # original: Moonlight-style ~25x AdamW lr starting point
+    return 25.0 * adamw_lr
+
+
 def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
     """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
     return {
-        "lr": optimizer_cfg.muon_lr,
+        "lr": _resolve_muon_lr(optimizer_cfg),
         "momentum": optimizer_cfg.muon_momentum,
         "nesterov": optimizer_cfg.muon_nesterov,
         "weight_decay": optimizer_cfg.muon_weight_decay,
@@ -209,6 +230,15 @@ def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
         "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
         "eps": optimizer_cfg.muon_eps,
         "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
+        "ns_implementation": optimizer_cfg.muon_ns_implementation,
+        "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
+        # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
+        "head_group_size": int(optimizer_cfg.muon_head_group_size),
+        "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
+        # Surface for startup summary only; not a DistributedMuon ctor kwarg.
+        "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
+        "adamw_lr": float(optimizer_cfg.lr),
+        "muon_lr_explicit": optimizer_cfg.muon_lr is not None,
     }
 
 
@@ -423,6 +453,14 @@ class BaseTrainer(Stateful, ABC):
         customized = getattr(self.model, "customized_setup_lora", None)
         if callable(customized):
             self.model = customized(lora_config)
+            # Warn rather than raise as the native path does below: the check keys
+            # on VeOmni's ``lora_A`` / ``lora_B`` naming, which a custom hook is
+            # free not to follow, so a miss here is inconclusive.
+            if not _has_trainable_lora_parameters(self.model):
+                logger.warning_rank0(
+                    "customized_setup_lora produced no trainable parameters named lora_A/lora_B. "
+                    "If the hook uses VeOmni's naming, the LoRA config selected no targets."
+                )
             return
 
         from ..lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
@@ -442,6 +480,11 @@ class BaseTrainer(Stateful, ABC):
             cfg = VeOmniLoraConfig.from_yaml(resolved_config)
             logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
             self.model = VeOmniLoraModel(self.model, cfg)
+
+        if not _has_trainable_lora_parameters(self.model):
+            raise ValueError(
+                "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
+            )
 
     def _freeze_model_module(self):
         self._setup_lora()
@@ -510,7 +553,7 @@ class BaseTrainer(Stateful, ABC):
             **dataloader_kwargs,
         )
 
-    def _build_parallelized_model(self):
+    def _build_parallelized_model(self, *, skip_hf_weight_load: bool = True):
         args: VeOmniArguments = self.args
         kwargs = {}
         cpu_load_param_name = None
@@ -529,11 +572,25 @@ class BaseTrainer(Stateful, ABC):
         if args.train.chunk_mbs_config.enable:
             kwargs["chunk_mbs_config"] = args.train.chunk_mbs_config
 
+        # A full non-LoRA resume already contains model weights. Skip the HF
+        # materialization pass to avoid a second peak (HF load then checkpoint
+        # overwrite) that can OOM large MoE jobs. LoRA resumes still need the HF base.
+        skip_hf_weight_load = skip_hf_weight_load and should_skip_hf_weight_load(
+            args.train.checkpoint.load_path,
+            args.model.lora_config,
+        )
+        if skip_hf_weight_load:
+            logger.info_rank0(
+                f"Checkpoint resume enabled (load_path={args.train.checkpoint.load_path}); "
+                "skipping HF weight materialization before checkpoint restore."
+            )
+
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
+            should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
@@ -681,7 +738,10 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            outputs.loss,
+            self.micro_batch_token_len,
+            self.micro_batches_token_len,
+            getattr(self, "global_micro_batches_token_len", None),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
@@ -753,6 +813,10 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_requires_all_reduce(True)
 
+    def sync_before_train_step(self):
+        if self.args.train.sync_each_train_step:
+            synchronize()
+
     def train_step(
         self,
         data_iterator: Any,
@@ -765,13 +829,14 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
-        synchronize()
+        self.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
         # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)
+        self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

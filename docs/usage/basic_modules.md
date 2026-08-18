@@ -402,7 +402,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `muon_lr` | `2e-2` | Learning rate for the Muon group. Per Moonlight, ~25× the AdamW lr is a common starting point. |
+| `muon_lr` | `None` | Learning rate for the Muon group. Unset: inherits `optimizer.lr` when `muon_adjust_lr_fn=match_rms_adamw` (default); uses `25×optimizer.lr` when `original` (Moonlight-style). |
 | `muon_momentum` | `0.95` | Momentum factor (Nesterov when `muon_nesterov=True`). |
 | `muon_nesterov` | `true` | Use Nesterov momentum. |
 | `muon_weight_decay` | `0.0` | Decoupled weight decay for the Muon group. |
@@ -410,7 +410,74 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_ns_coefficients` | `[3.4445, -4.7750, 2.0315]` | Quintic NS polynomial coefficients (a, b, c). |
 | `muon_eps` | `1e-7` | Numerical-stability epsilon for the spectral-norm normalization. |
 | `muon_adjust_lr_fn` | `match_rms_adamw` | Per-matrix LR adjustment. `original` follows Keller Jordan; `match_rms_adamw` matches the RMS of an AdamW update so AdamW-tuned hyperparams transfer. |
-| `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and silently falls back to the dim-1 + all-to-all-gather path. |
+| `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and falls back to the dim-1 + all-to-all-gather path. |
+| `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
+| `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
+| `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
+| `muon_head_split_modules` | `[]` | Leaf module names to head-split, matched exactly against the children of an attention module. **Required** when `muon_head_group_size >= 1`; there is no default list. |
+
+On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `expert_zero_comm`). Whether zero-comm sharding actually activated is logged separately as `[muon_expert_zero_comm]` during parallelize.
+
+### Head-split Muon (`muon_head_group_size`)
+
+Attention computes scores per head, but Muon's natural unit is the whole matrix.
+Setting `muon_head_group_size` splits a head-stacked projection into row blocks
+and gives each block its own polar factor — GLM-5's "Muon Split".
+
+Both knobs are needed to turn it on; there is no built-in module list, because a
+default would quietly change the update math for every model whose attention uses
+the same names:
+
+```yaml
+train:
+  optimizer:
+    type: muon
+    muon_head_group_size: 1            # heads per block
+    muon_head_split_modules: [q_b_proj]  # which projections to split
+```
+
+Whether this helps depends on the shape of the stacked matrix:
+
+- **Wide or square** (`num_heads * head_dim <= in_features`, e.g. classic MHA
+  `q_proj`, GQA `k_proj`/`v_proj`): full-matrix orthogonalization already makes
+  every head block a partial isometry, so splitting only drops the cross-head
+  orthogonality constraint. Expect a wash; Tri Dao's Gram-NS report measured
+  *higher* loss when splitting near-square Llama attention weights by head.
+- **Much taller than wide** (`num_heads * head_dim >> in_features`, e.g. MLA /
+  low-rank up-projections such as DeepSeek V4's `q_b_proj` at `[32768, 1024]`):
+  the full matrix's polar factor is capped at `rank <= in_features`, so all heads
+  share one small update budget and weak-gradient heads are starved. Splitting
+  restores a full-scale whitened update per head. This is the case where GLM-5
+  reported MLA catching up to GQA-8, with stable attention logits and no QK-Clip.
+
+Intermediate group sizes often beat both extremes (the current modded-nanoGPT
+record orthogonalizes Q/K in head *pairs*), so `g` is a tunable, not a switch.
+
+Mechanics worth knowing when running an A/B:
+
+- The LR adjustment (`muon_adjust_lr_fn`) is computed from the **block** shape,
+  not the full matrix. Without that, a split `[32768, 1024]` param would take a
+  `sqrt(32)`-times-larger step and the experiment would really be measuring a
+  learning-rate change.
+- Splitting is applied by name, so pick the list deliberately. Reasonable
+  starting points: `[q_b_proj]` for DeepSeek V3/V4 MLA up-projections,
+  `[q_proj, k_proj, v_proj]` for GQA attention, `[wq_b]` for a GLM MoE DSA
+  indexer. Nothing stops you from listing `o_proj` (head-structured along
+  *columns*) or MLA `kv_b_proj` (interleaves K and V inside each head), but row
+  blocks would not line up with heads there.
+- The head count is never guessed from the shape alone: a projection is split
+  only when its row count equals a *declared* head count times a *declared*
+  per-head dim (`num_heads`/`n_heads`/config equivalents against
+  `head_dim`/`qk_head_dim`, module attributes before config). MLA sets
+  `config.head_dim` to the rope part only, so `rows // head_dim` would cut each
+  head into pieces. Anything that cannot be resolved is skipped with a warning.
+- Params are grouped by block count into separate Muon param groups. With the
+  option off, the optimizer state dict is unchanged, so existing checkpoints
+  resume as before. Turning it on adds one `head_blocks` entry per split param;
+  VeOmni's DCP loader tolerates its absence in an older checkpoint, and the
+  configured value always wins over a stored one.
+- Blocks are smaller matrices, so Newton–Schulz gets cheaper — the aspect ratio
+  seen by Gram-NS drops by roughly the number of blocks.
 
 For MoE training under FSDP2+EP, the Muon flow auto-classifies each parameter into one of four code paths in `DistributedMuon`:
 

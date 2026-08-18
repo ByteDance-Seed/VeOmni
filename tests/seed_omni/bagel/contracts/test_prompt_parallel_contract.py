@@ -168,7 +168,10 @@ def test_downstream_prompt_consumers_see_sequentially_equivalent_carrier() -> No
     assert torch.equal(packed.packed_sequence[:1], _marker_embeds().squeeze(0)[:1])
     assert torch.equal(packed.packed_sequence[1:3], _flow_context_embeds())
     assert torch.equal(packed.packed_sequence[3:4], _marker_embeds().squeeze(0)[1:])
-    assert torch.equal(packed.packed_token_type_ids, torch.zeros(11, dtype=torch.long))
+    assert torch.equal(
+        packed.packed_token_type_ids,
+        torch.tensor([0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+    )
 
 
 def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> None:

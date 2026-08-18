@@ -7,7 +7,12 @@ import pytest
 import torch
 from PIL import Image
 
-from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
+from tests.seed_omni.bagel.contracts.helpers import (
+    config_cls,
+    model_cls,
+    native_model_cls,
+    tiny_bagel_qwen2_cfg,
+)
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
@@ -91,7 +96,7 @@ def test_bagel_mot_packing_rejects_missing_conversation_list(conversation_list):
         )
 
 
-def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
+def test_bagel_mot_packing_routes_tagged_edit_vae_through_generation_expert():
     from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 
     edit_context = ConversationItem(
@@ -124,12 +129,11 @@ def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
     )
 
     assert packed is not None
-    assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0, 1, 1, 0]))
+    assert torch.equal(packed.packed_token_type_ids, torch.tensor([1, 1, 1, 1, 0]))
     assert packed.sample_splits == [[2, 2, 1]]
-    assert packed.sample_attn_modes == [["full", "noise", "full"]]
 
 
-def test_bagel_mot_packing_treats_untagged_vae_as_inference_context():
+def test_bagel_mot_packing_routes_untagged_vae_through_generation_expert():
     from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 
     context = ConversationItem(
@@ -143,9 +147,8 @@ def test_bagel_mot_packing_treats_untagged_vae_as_inference_context():
     packed = preprocess_mot_inputs([[context]], device=torch.device("cpu"), dtype=torch.float32, hidden_size=4)
 
     assert packed is not None
-    assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0]))
+    assert torch.equal(packed.packed_token_type_ids, torch.tensor([1, 1]))
     assert packed.sample_splits == [[2]]
-    assert packed.sample_attn_modes == [["full"]]
 
 
 def test_bagel_mot_packing_exposes_sp_metadata_without_rewriting_spans():
@@ -167,7 +170,6 @@ def test_bagel_mot_packing_exposes_sp_metadata_without_rewriting_spans():
     assert packed is not None
     assert [span.start for span in packed.spans] == [0, 2]
     assert packed.sample_splits == [[2, 3]]
-    assert packed.sample_attn_modes == [["causal", "noise"]]
     assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0, 1, 1, 1]))
 
 
@@ -187,7 +189,9 @@ def test_bagel_mot_forward_pre_returns_sample_local_tensor_contract():
 
     inputs = model.forward_pre(conversation_list=[[text, gen_target]])
 
-    forward_parameters = signature(model.forward).parameters
+    # The accelerated class inherits the graph's generic ``forward(**kwargs)``
+    # trampoline, so the explicit packed-tensor contract lives on the native one.
+    forward_parameters = signature(native_model_cls("bagel_qwen2_mot").forward).parameters
     assert "packed_token_type_ids" in forward_parameters
     assert "packed_und_token_indexes" not in forward_parameters
     assert "packed_gen_token_indexes" not in forward_parameters
@@ -196,23 +200,23 @@ def test_bagel_mot_forward_pre_returns_sample_local_tensor_contract():
         "packed_sequence",
         "packed_position_ids",
         "packed_token_type_ids",
-        "attention_mask",
+        "packed_attention_metadata",
     }
     assert torch.equal(inputs["packed_token_type_ids"], torch.tensor([0, 0, 1, 1, 1]))
-    assert inputs["attention_mask"].shape == (1, 1, 5, 5)
-    assert inputs["attention_mask"].dtype == torch.bool
-    assert inputs["attention_mask"].is_contiguous()
+    assert inputs["packed_attention_metadata"].shape == (3, 5)
+    assert inputs["packed_attention_metadata"].dtype == torch.int32
+    assert inputs["packed_attention_metadata"].is_contiguous()
 
 
 @pytest.mark.parametrize(
-    ("attention_mask", "error"),
+    ("attention_metadata", "error"),
     [
-        (torch.ones(3, 3, dtype=torch.bool), "must match the full packed sample"),
-        (torch.ones(1, 1, 2, 2, dtype=torch.bool), "must match the full packed sample"),
+        (torch.ones(2, 3, dtype=torch.int32), "must match the full packed sample"),
+        (torch.ones(3, 2, dtype=torch.int32), "must match the full packed sample"),
     ],
 )
-def test_bagel_mot_training_attention_mask_contract_is_checked_once_at_the_module_boundary(
-    attention_mask: torch.Tensor,
+def test_bagel_mot_training_attention_metadata_contract_is_checked_once_at_the_module_boundary(
+    attention_metadata: torch.Tensor,
     error: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -223,7 +227,14 @@ def test_bagel_mot_training_attention_mask_contract_is_checked_once_at_the_modul
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
     hidden_size = int(model.config.hidden_size)
     conversation = [[ConversationItem(type="text", value=torch.ones(3, hidden_size), role="user")]]
-    monkeypatch.setattr(accelerated, "build_mot_attention_mask", lambda *args, **kwargs: attention_mask)
+    original_preprocess = accelerated.preprocess_mot_inputs
+
+    def invalid_preprocess(*args, **kwargs):
+        packed = original_preprocess(*args, **kwargs)
+        packed.packed_attention_metadata = attention_metadata
+        return packed
+
+    monkeypatch.setattr(accelerated, "preprocess_mot_inputs", invalid_preprocess)
 
     with pytest.raises(ValueError, match=error):
         model.forward_pre(conversation_list=conversation)
@@ -254,7 +265,7 @@ def test_bagel_mot_forward_pre_normalizes_sample_broadcast_dtype():
     assert inputs["packed_sequence"].dtype == model.dtype
 
 
-def test_bagel_mot_forward_pre_keeps_dense_mask_full_and_marks_sequence_padding(monkeypatch):
+def test_bagel_mot_forward_pre_keeps_metadata_full_and_marks_sequence_padding(monkeypatch):
     from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
@@ -286,55 +297,18 @@ def test_bagel_mot_forward_pre_keeps_dense_mask_full_and_marks_sequence_padding(
 
     inputs = model.forward_pre(conversation_list=[[text, image]])
 
-    assert inputs["attention_mask"].shape == (1, 1, 5, 5)
+    assert inputs["packed_attention_metadata"].shape == (3, 8)
     assert inputs["packed_sequence"].shape[0] == 8
     assert set(inputs) == {
         "packed_sequence",
         "packed_position_ids",
         "packed_token_type_ids",
-        "attention_mask",
+        "packed_attention_metadata",
     }
     assert torch.equal(inputs["packed_token_type_ids"], torch.tensor([0, 0, 1, 1, 1, -1, -1, -1]))
-
-
-def test_bagel_mot_attention_mask_preserves_causal_full_and_noise_semantics():
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import build_mot_attention_mask
-
-    mask = build_mot_attention_mask(
-        [[2, 2, 2, 1]],
-        [["causal", "full", "noise", "causal"]],
-        device=torch.device("cpu"),
-    )[0, 0]
-
-    expected = torch.tensor(
-        [
-            [1, 0, 0, 0, 0, 0, 0],
-            [1, 1, 0, 0, 0, 0, 0],
-            [1, 1, 1, 1, 0, 0, 0],
-            [1, 1, 1, 1, 0, 0, 0],
-            [1, 1, 1, 1, 1, 1, 0],
-            [1, 1, 1, 1, 1, 1, 0],
-            [1, 1, 1, 1, 0, 0, 1],
-        ],
-        dtype=torch.bool,
-    )
-    assert torch.equal(mask, expected)
-
-
-def test_bagel_mot_attention_mask_isolates_packed_samples():
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import build_mot_attention_mask
-
-    mask = build_mot_attention_mask(
-        [[2], [1, 2]],
-        [["full"], ["causal", "noise"]],
-        device=torch.device("cpu"),
-    )
-
-    assert mask.shape == (1, 1, 5, 5)
-    assert mask.dtype == torch.bool
-    assert mask.is_contiguous()
-    assert not mask[0, 0, :2, 2:].any()
-    assert not mask[0, 0, 2:, :2].any()
+    assert torch.equal(inputs["packed_attention_metadata"][0, 5:], torch.tensor([5, 5, 5], dtype=torch.int32))
+    assert torch.equal(inputs["packed_attention_metadata"][1, 5:], torch.tensor([5, 5, 5], dtype=torch.int32))
+    assert torch.equal(inputs["packed_attention_metadata"][2, 5:], torch.tensor([-1, -1, -1], dtype=torch.int32))
 
 
 def test_bagel_mot_packing_rejects_incompatible_vae_img_tag():

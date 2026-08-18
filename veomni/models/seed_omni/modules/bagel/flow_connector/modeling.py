@@ -274,6 +274,7 @@ class BagelFlowConnector(InferenceMixin, OmniPreTrainedModel):
     base_model_prefix = "bagel_flow_connector"
     main_input_name = "hidden_states"
     _no_split_modules: list[str] = []
+    _supports_sdpa = True
 
     def __init__(self, config: BagelFlowConnectorConfig) -> None:
         super().__init__(config)

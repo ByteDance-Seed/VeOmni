@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from datasets import Dataset as HuggingFaceDataset
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.trainer.callbacks import CheckpointerCallback, TrainerState
@@ -29,6 +29,9 @@ def setup_test_distributed(args):
     """Initialize a minimal distributed runtime for data tests.
 
     Returns the device and the ``ParallelState``.
+
+    Registers under ``"base"`` because callers stand in for ``BaseTrainer._setup``,
+    and ``BaseTrainer`` scopes its build under ``use_parallel_state("base")``.
     """
     device_type = get_device_type()
     if device_type != "cpu":
@@ -58,6 +61,7 @@ def setup_test_distributed(args):
         extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
         extra_parallel_names=args.train.accelerator.extra_parallel_names,
         dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        name="base",
     )
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     return device, parallel_state
@@ -168,8 +172,9 @@ class ShardedIterableDataset(IterableDataset):
 
     Designed to tested with ``DynamicBatchingSizeDataset`` and ``StatefulDataLoader`` checkpointing:
 
-    * **Deterministic sample generation** – sample at 0-based index ``i`` contains
-      **i + 1** tokens, each with value ``i + 1``.
+    * **Deterministic sample generation** – sample ``i`` uses token value ``i + 1``.
+      Its length defaults to ``i + 1``, or cycles through ``sample_length_range``
+      when configured.
     * **Sharding** – samples are distributed across distributed ranks *and* DataLoader
       workers using a round-robin interleave strategy (rank-major, then worker-minor),
       so each dataloader worker on each rank sees a disjoint, deterministic subset of the data.
@@ -192,6 +197,7 @@ class ShardedIterableDataset(IterableDataset):
         shuffle: bool = False,
         seed: int = 42,
         transform: Optional[Callable[[Dict[str, torch.Tensor]], Any]] = None,
+        sample_length_range: Optional[tuple[int, int]] = None,
     ):
         """
         Args:
@@ -202,11 +208,14 @@ class ShardedIterableDataset(IterableDataset):
             seed: Random seed used to generate the permutation when ``shuffle=True``.
             transform: Optional transform applied in ``__getitem__`` / ``get_item``.
                 It may return either one sample dict or ``list[dict]``.
+            sample_length_range: If set, sample lengths cycle through this inclusive
+                range instead of growing with the sample index.
         """
         self.size = size
         self.shuffle = shuffle
         self.seed = seed
         self.transform = transform
+        self.sample_length_range = sample_length_range
         self.output_index_for_resume = False  # Will be set by DynamicBatchingSizeDataset if needed
         self._current_idx = -1  # Track current position in iteration
         self._just_resumed = False
@@ -228,7 +237,12 @@ class ShardedIterableDataset(IterableDataset):
             raise IndexError(f"Index {idx} out of range [0, {self.size})")
 
         index = idx + 1
-        input_ids = torch.tensor([index] * index, dtype=torch.long)
+        if self.sample_length_range is None:
+            sample_length = index
+        else:
+            min_length, max_length = self.sample_length_range
+            sample_length = min_length + idx % (max_length - min_length + 1)
+        input_ids = torch.tensor([index] * sample_length, dtype=torch.long)
         sample = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids), "labels": input_ids.clone()}
         return self.transform(sample) if self.transform is not None else sample
 
@@ -306,6 +320,28 @@ class ShardedIterableDataset(IterableDataset):
         """Restore the iteration state."""
         self._current_idx = state_dict["current_idx"]
         self._just_resumed = True
+
+
+class ShardedMappingDataset(Dataset):
+    """Map-style sibling of :class:`ShardedIterableDataset`.
+
+    Reuses :class:`ShardedIterableDataset`'s deterministic per-index sample
+    generation but is a plain map-style ``Dataset`` consumed purely by ``__len__`` /
+    ``__getitem__`` -- the form ``_MapStyleSamplerWrapper`` expects.
+    """
+
+    def __init__(
+        self,
+        size: int = 100,
+        transform: Optional[Callable[[Dict[str, torch.Tensor]], Any]] = None,
+        sample_length_range: Optional[tuple[int, int]] = None,
+    ):
+        self.size = size
+        self.transform = transform
+        self.sample_length_range = sample_length_range
+
+    __len__ = ShardedIterableDataset.__len__
+    __getitem__ = ShardedIterableDataset.__getitem__
 
 
 class DummyDataset:

@@ -29,6 +29,7 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     assert "bagel_text_encoder.decode" in endpoints
     assert "bagel_flow_connector.decode_velocity" in endpoints
     assert "end" in endpoints
+    assert cfg.module_ops_implementation("bagel_qwen2_mot")["attn_implementation"] == "veomni_flex_attention_with_sp"
 
 
 def test_bagel_train_graph_fan_in_execution_order():
@@ -87,6 +88,7 @@ def test_bagel_train_with_cache_yaml_loads_process_only_vae():
     endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
     assert "bagel_vae.online_process" in endpoints
     assert "bagel_vae.encode" not in endpoints
+    assert cfg.module_ops_implementation("bagel_qwen2_mot")["attn_implementation"] == "veomni_flex_attention_with_sp"
 
 
 def test_bagel_offline_cache_full_entry_yamls_point_to_cache_graphs():
@@ -124,6 +126,7 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
         "bagel_vae",
     }
     assert cfg.generation_graph is not None
+    assert cfg.module_ops_implementation("bagel_qwen2_mot")["attn_implementation"] == "veomni_flex_attention_with_sp"
     assert cfg.generation_graph["initial"] == "prompt_encode"
     assert "done" not in cfg.generation_graph["states"]
     assert any(

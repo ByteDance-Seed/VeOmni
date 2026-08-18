@@ -149,6 +149,7 @@ class BagelVAE(InferenceMixin, OmniPreTrainedModel):
     main_input_name = "pixel_values"
     _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
     supports_gradient_checkpointing = False
+    _supports_sdpa = True
 
     def __init__(self, config: BagelVAEConfig, **kwargs: Any) -> None:
         super().__init__(config, **kwargs)

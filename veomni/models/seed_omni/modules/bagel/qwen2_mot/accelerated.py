@@ -24,8 +24,9 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from .configuration import BagelQwen2MoTConfig
+from .masking import pad_mot_attention_metadata
 from .modeling import BagelQwen2MoT
-from .processing import PackedConversation, build_mot_attention_mask, preprocess_mot_inputs
+from .processing import PackedConversation, preprocess_mot_inputs
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -69,17 +70,13 @@ class TrainingMixin(TrainingModuleMixin):
         )
 
         packed_sequence = self._fold_dummy_anchors(self._packed_training.packed_sequence, conversation_list)
-        attention_mask = build_mot_attention_mask(
-            self._packed_training.sample_splits,
-            self._packed_training.sample_attn_modes,
-            device=self.device,
-        )
         sequence_length = int(packed_sequence.shape[0])
-        expected_mask_shape = (1, 1, sequence_length, sequence_length)
-        if tuple(attention_mask.shape) != expected_mask_shape:
+        attention_metadata = self._packed_training.packed_attention_metadata
+        expected_metadata_shape = (3, sequence_length)
+        if tuple(attention_metadata.shape) != expected_metadata_shape:
             raise ValueError(
-                "BAGEL Qwen2-MoT attention mask must match the full packed sample: "
-                f"expected {expected_mask_shape}, got {tuple(attention_mask.shape)}."
+                "BAGEL Qwen2-MoT attention metadata must match the full packed sample: "
+                f"expected {expected_metadata_shape}, got {tuple(attention_metadata.shape)}."
             )
 
         ps = get_parallel_state()
@@ -89,7 +86,7 @@ class TrainingMixin(TrainingModuleMixin):
                 "packed_sequence": packed_sequence,
                 "packed_position_ids": self._packed_training.packed_position_ids,
                 "packed_token_type_ids": self._packed_training.packed_token_type_ids,
-                "attention_mask": attention_mask,
+                "packed_attention_metadata": attention_metadata,
             }
 
         if ps.cp_size != 1:
@@ -112,10 +109,17 @@ class TrainingMixin(TrainingModuleMixin):
                 )
             self._validated_ulysses_size = ps.ulysses_size
 
+        # Tensor inputs are padded then sliced for Ulysses. Attention metadata
+        # stays full because the Flex adapter reconstructs the full sequence
+        # before building/using its BlockMask.
         self._sp_full_sequence_length = sequence_length
         packed_sequence = sp_pad(packed_sequence, dim=0, pad_value=0)
         packed_position_ids = sp_pad(self._packed_training.packed_position_ids, dim=0, pad_value=0)
         packed_token_type_ids = sp_pad(self._packed_training.packed_token_type_ids, dim=0, pad_value=-1)
+        attention_metadata = pad_mot_attention_metadata(
+            attention_metadata,
+            padded_length=int(packed_sequence.shape[0]),
+        )
         packed_sequence = slice_input_tensor(packed_sequence, dim=0, padding=False, group=ps.sp_group)
         packed_position_ids = slice_input_tensor(
             packed_position_ids,
@@ -134,7 +138,9 @@ class TrainingMixin(TrainingModuleMixin):
             "packed_sequence": packed_sequence,
             "packed_position_ids": packed_position_ids,
             "packed_token_type_ids": packed_token_type_ids,
-            "attention_mask": attention_mask,
+            # FlexAttention's generic Ulysses adapter reconstructs the complete
+            # padded sequence, so every rank keeps the same full metadata.
+            "packed_attention_metadata": attention_metadata,
         }
 
     @post_forward("forward")
