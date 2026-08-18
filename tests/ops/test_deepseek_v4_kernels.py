@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import inspect
 import sys
 import types
 from types import SimpleNamespace
@@ -74,6 +75,8 @@ def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="SM90 or later"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp8_weight_quant(torch.empty(0))
 
 
 def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
@@ -90,6 +93,8 @@ def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp8_weight_quant(torch.empty(0))
 
 
 def _require_tilelang_cuda():
@@ -222,6 +227,90 @@ def _sparse_attention_reference(q, kv, sinks, indices, scale):
     return numerator / denominator.unsqueeze(-1)
 
 
+def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing_output():
+    """Pipelining the forward's sparse gather must stay legal, real, and exact.
+
+    Legality is load-bearing on the gather reading its row index straight from global
+    memory. Indexing a register fragment there instead puts the gather in pipeline
+    stage 0 while the fragment's producer lands in a later stage, which is a hard
+    TileLang failure -- so a future change of that shape breaks compilation here rather
+    than silently losing the overlap. The async-copy check is what distinguishes "still
+    pipelined" from "compiles but the pipelining was dropped".
+
+    Pipelining is off by default because it is a loss at the production shape, so this
+    only pins that it remains available and exact when asked for.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+
+    torch.manual_seed(4)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 64, 8, 512, 128, 640
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16)
+    sinks = torch.randn(heads, device=DEVICE)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    # topk=640 is 10 gather tiles, so the loop has a real steady state; plant sentinels
+    # in every tile so a one-tile skew between the mask and the gather cannot hide.
+    indices[..., ::64] = -1
+    indices[..., 63::64] = kv_len
+    scale = dim**-0.5
+
+    pipelined = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=1)
+    serial = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=0)
+    assert "cp_async_gs" in pipelined.get_kernel_source()
+    assert "cp_async_gs" not in serial.get_kernel_source()
+
+    expected_out, expected_lse = serial(q, kv, sinks, indices)
+    for out, lse in (
+        pipelined(q, kv, sinks, indices),
+        sparse_mqa_fwd_interface(q, kv, sinks, indices, scale, num_stages=1),
+    ):
+        assert torch.equal(out, expected_out)
+        assert torch.equal(lse, expected_lse)
+
+    # The depth is bounded by shared memory, so it is derived from the device rather than
+    # left to surface as an opaque launch failure. Walk the depth up until the guard
+    # refuses, then show the deepest depth it did allow really launches: that measures the
+    # bound against the device instead of against a copy of its own formula, and it holds
+    # on any opt-in shared-memory limit rather than assuming Hopper's 227 KB.
+    wide_heads = 64
+    wide_q = torch.randn(batch, seqlen, wide_heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    wide_sinks = torch.randn(wide_heads, device=DEVICE)
+    deepest = None
+    for depth in range(1, 9):
+        try:
+            candidate = sparse_mqa_fwd(wide_heads, dim, topk, scale, num_stages=depth)
+        except AssertionError as exc:
+            assert "shared memory per block" in str(exc)
+            break
+        deepest = candidate
+    else:
+        pytest.fail("the shared-memory guard never rejected a gather depth")
+
+    assert deepest is not None, "the guard rejected even a single-stage gather"
+    deep_out, _ = deepest(wide_q, kv, wide_sinks, indices)
+    # Reading the result into a Python bool is the synchronization point: a launch that
+    # could not get its shared memory surfaces here rather than staying pending.
+    assert torch.isfinite(deep_out).all().item()
+
+
+def test_tilelang_sparse_attention_forward_defaults_to_no_pipelining():
+    """The shipped gather depth is a performance choice that no output can reveal.
+
+    Both depths are bitwise identical, so the numerics test above cannot catch a flipped
+    default -- and the depth it would flip to cost 5% of a production step. This lives
+    outside that test because it needs no GPU, while the test it would otherwise sit in
+    skips below SM90 and therefore never runs on CI's L20 runners.
+    """
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+
+    for entry in (sparse_mqa_fwd, sparse_mqa_fwd_interface):
+        # tilelang.jit re-exports the kernel as (*args, **kwargs), hiding its defaults.
+        params = inspect.signature(getattr(entry, "func", entry)).parameters
+        assert params["num_stages"].default == 0
+
+
 def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
@@ -248,6 +337,123 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
         assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+    # dAttnSink is accumulated by an atomic under a replicated T.Parallel loop, so a
+    # lost replication guard would scale it by the warp count -- which cosine, being
+    # scale-invariant, cannot see.
+    torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "block_H, block_size, expected",
+    [
+        (16, 32, 128),
+        (32, 32, 256),
+        (64, 32, 256),
+        # block_size is a bwd parameter, so the bound has to follow it: at 16 the
+        # column split halves and block_H=32 no longer affords 8 warps.
+        (32, 16, 128),
+        (64, 16, 256),
+        # The one tile where the derived width drops below the historical 128, which
+        # was in fact illegal there -- two warps is all this tile can partition.
+        (16, 16, 64),
+    ],
+)
+def test_tilelang_bwd_cta_threads_respects_warp_tile_bound(block_H, block_size, expected):
+    """``cta_threads`` must stay inside the GEMM warp tile it derives its bound from.
+
+    A width above ``block_size * block_H // 4`` is a TileLang compile-time assertion
+    rather than a slow kernel, so this pins both the chosen values and the warp split
+    they come from. The production tile is (64, 32); (16, 32) is what every other
+    TileLang test in this file exercises, which is why it must stay at 128.
+    """
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.deepseek_v4 import tilelang_sparse_mla_bwd
+
+    threads = tilelang_sparse_mla_bwd.cta_threads(block_H, block_size)
+
+    assert threads == expected
+    assert threads % 32 == 0 and threads & (threads - 1) == 0
+    # Restate TileLang's own partition rather than the closed form above: it splits the
+    # columns over at most block_size // 8 warps and gives the rest to the rows, and an
+    # MMA row tile below 16 is a hard compile error.
+    num_warps = threads // 32
+    column_warps = min(num_warps, block_size // 8)
+    assert block_H // (num_warps // column_warps) >= 16
+
+
+def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile():
+    """Cover the head tile that gets the widened CTA; the rest of this file does not.
+
+    ``bwd`` derives its CTA width from ``block_H = min(64, max(next_power_of_2(H), 16))``,
+    and every other TileLang test here uses 8 heads, i.e. block_H=16, which keeps the
+    historical 128 threads. 32 heads is the smallest tile that actually widens to 256,
+    so without this case the wide path is never run.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+
+    torch.manual_seed(6)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 16, 32, 512, 64, 64
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    indices[..., -1] = -1
+    scale = dim**-0.5
+
+    actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+    expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+    grad = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+    actual.backward(grad)
+    for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+        assert actual_grad is not None and torch.isfinite(actual_grad).all()
+        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+    # The CTA width sets the replicate extent of the T.Parallel loop that atomically
+    # accumulates dAttnSink, so a lost replication guard would scale it by the warp
+    # count while leaving every cosine above intact.
+    torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
+
+
+def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monkeypatch):
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+    from veomni.ops.kernels.deepseek_v4 import tilelang_sparse_mla_bwd as sparse_mla_bwd
+
+    kv_block = sparse_mla_bwd.KV_BLOCK
+    requested_kv_lengths = []
+    original_bwd = sparse_mla_bwd.bwd
+
+    def tracking_bwd(B, S, S_kv, *args, **kwargs):
+        requested_kv_lengths.append(S_kv)
+        return original_bwd(B, S, S_kv, *args, **kwargs)
+
+    monkeypatch.setattr(sparse_mla_bwd, "bwd", tracking_bwd)
+
+    batch, seqlen, heads, dim, topk = 1, 32, 8, 512, 64
+    scale = dim**-0.5
+    # All three round up to one KV block, so one compiled kernel must serve them all;
+    # the last one needs no padding at all.
+    for kv_len in (48, 129, kv_block):
+        torch.manual_seed(4)
+        q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+        indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+        # Out of range for the real KV but inside the padded KV: must stay masked out.
+        indices[..., -2:] = kv_len
+
+        actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+        expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+        grad = torch.randn_like(actual)
+        expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+        actual.backward(grad)
+        assert kv.grad.shape == kv.shape
+        for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+            assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+    # One specialization key for all three lengths, so TileLang compiles once.
+    assert set(requested_kv_lengths) == {kv_block}
 
 
 def test_deepseek_v4_generated_attention_dispatch_matches_eager():
@@ -626,3 +832,187 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
     expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
+
+
+def _fp8_weight_quant_reference(x, block_size=128, round_scale=False):
+    """Bit-exact torch model of the TileLang block-wise FP8 weight quantizer.
+
+    Both compute the scale in FP32 from the tile amax, so the divide, the
+    clamp and the round-to-nearest-even FP8 cast all match exactly.
+    """
+    rows, cols = x.shape
+    tiles = x.float().contiguous().view(rows // block_size, block_size, cols // block_size, block_size)
+    amax = tiles.abs().amax(dim=(1, 3)).clamp_min(1e-4)
+    scales = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0))) if round_scale else amax / 448.0
+    quantized = (tiles / scales[:, None, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return quantized.view(rows, cols), scales
+
+
+def _weight_quant_test_input():
+    """A 2x3 grid of 128x128 tiles, each exercising a different scale regime."""
+    torch.manual_seed(6)
+    tiles = [
+        torch.randn(128, 128),
+        torch.zeros(128, 128),  # amax clamp: must not divide by zero
+        torch.full((128, 128), 1e-8),  # below the clamp floor
+        torch.randn(128, 128) * 1e4,  # large magnitudes
+        torch.randn(128, 128) * 1e-3,  # small magnitudes
+        torch.randn(128, 128),
+    ]
+    tiles[4][7, 11] = 500.0  # lone outlier: the tile scale must absorb it
+    rows = [torch.cat(tiles[:3], dim=1), torch.cat(tiles[3:], dim=1)]
+    return torch.cat(rows, dim=0).to(device=DEVICE, dtype=torch.bfloat16)
+
+
+def _tiles_above_amax_floor():
+    """Mask of the _weight_quant_test_input tiles whose amax clears the 1e-4 floor.
+
+    The other two tiles keep the floor scale, so they neither saturate nor
+    stretch to the FP8 range and have to be excluded from range assertions.
+    """
+    return torch.tensor([[True, False, False], [True, True, True]], device=DEVICE)
+
+
+def test_tilelang_fp8_weight_quant_matches_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128)
+    reference_quantized, reference_scales = _fp8_weight_quant_reference(x)
+
+    assert quantized.shape == x.shape
+    assert quantized.dtype == torch.float8_e4m3fn
+    # A non-square tile grid catches a swapped block index or transposed scales.
+    assert scales.shape == (2, 3)
+    assert scales.dtype == torch.float32
+    assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
+    assert torch.equal(scales, reference_scales)
+    assert not quantized.float().isnan().any()
+
+    # The scale is derived per tile, so each tile stretches to the FP8 max on
+    # its own. The two tiles whose amax falls under the 1e-4 clamp keep the
+    # floor scale instead and therefore stay far below saturation.
+    tile_amax = quantized.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    assert torch.equal(tile_amax == 448.0, _tiles_above_amax_floor())
+    assert tile_amax[0, 1] == 0.0
+    assert 0.0 < tile_amax[0, 2] < 1.0
+    assert scales[0, 1] == 1e-4 / 448.0
+    assert scales[0, 2] == 1e-4 / 448.0
+
+
+def test_tilelang_fp8_weight_quant_round_trip_and_non_contiguous_input():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128)
+
+    dequantized = quantized.float().view(2, 128, 3, 128) * scales[:, None, :, None]
+    dequantized = dequantized.view(x.shape)
+    # E4M3 keeps 3 mantissa bits, so a correctly scaled tile round-trips to
+    # within one ulp (~2^-4) relative to that tile's amax.
+    tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    tolerance = (tile_amax / 16.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
+    assert ((dequantized - x.float()).abs() <= tolerance).all()
+
+    transposed = x.t().contiguous().t()
+    assert not transposed.is_contiguous()
+    transposed_quantized, transposed_scales = fp8_weight_quant(transposed, block_size=128)
+    assert torch.equal(transposed_quantized.view(torch.uint8), quantized.view(torch.uint8))
+    assert torch.equal(transposed_scales, scales)
+
+
+def test_tilelang_fp8_weight_quant_ue8m0_matches_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+    reference_quantized, reference_scales = _fp8_weight_quant_reference(x, round_scale=True)
+
+    assert quantized.shape == x.shape
+    assert quantized.dtype == torch.float8_e4m3fn
+    assert scales.shape == (2, 3)
+    assert scales.dtype == torch.float8_e8m0fnu
+    # E8M0 stores the exponent alone, so a power-of-two scale survives the cast
+    # bit for bit and matches the FP32 value the kernel divided by.
+    assert torch.equal(scales.float().log2(), scales.float().log2().round())
+    assert torch.equal(scales.float(), reference_scales)
+    assert torch.equal(quantized.view(torch.uint8), reference_quantized.view(torch.uint8))
+    assert not quantized.float().isnan().any()
+
+    # Rounding the scale up costs at most one binade of range, so unlike the
+    # FP32 mode no tile saturates, yet every tile above the amax floor still
+    # reaches at least half of the FP8 max.
+    tile_amax = quantized.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    assert (tile_amax <= 448.0).all()
+    assert (tile_amax[_tiles_above_amax_floor()] >= 224.0).all()
+
+
+def test_tilelang_fp8_weight_quant_scale_fmt_and_scale_dtype_are_orthogonal():
+    """scale_fmt decides how the scale is computed, scale_dtype only how it is stored."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    _, exact_scales = fp8_weight_quant(x, block_size=128)
+    rounded_quantized, rounded_scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0")
+    e8m0_quantized, e8m0_scales = fp8_weight_quant(
+        x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu
+    )
+
+    assert rounded_scales.dtype == torch.float32
+    assert torch.equal(rounded_scales, e8m0_scales.float())
+    assert torch.equal(rounded_quantized.view(torch.uint8), e8m0_quantized.view(torch.uint8))
+    # Rounding goes upward and never overshoots by a full binade.
+    assert (rounded_scales >= exact_scales).all()
+    assert (rounded_scales < 2.0 * exact_scales).all()
+
+
+def test_tilelang_fp8_weight_quant_ue8m0_keeps_exact_power_of_two_scale():
+    """An amax that already divides to a power of two must not gain a binade."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = torch.zeros(128, 128, device=DEVICE, dtype=torch.bfloat16)
+    x[3, 5] = 56.0  # 448 * 2**-3, exact in BF16, so ceil(log2(amax / 448)) == -3
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+
+    assert scales.shape == (1, 1)
+    assert scales.float().item() == 0.125
+    assert quantized.float()[3, 5] == 448.0
+
+
+def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+
+    dequantized = quantized.float().view(2, 128, 3, 128) * scales.float()[:, None, :, None]
+    dequantized = dequantized.view(x.shape)
+    # Rounding the scale up spends up to one of E4M3's 3 mantissa bits, so the
+    # round-trip budget is twice the ~2^-4 of the exact-scale mode.
+    tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
+    tolerance = (tile_amax / 8.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
+    assert ((dequantized - x.float()).abs() <= tolerance).all()
+
+
+def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    with pytest.raises(AssertionError, match="2D weight"):
+        fp8_weight_quant(torch.empty(2, 128, 128, device=DEVICE, dtype=torch.bfloat16))
+    with pytest.raises(AssertionError, match="bfloat16 weight"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.float32))
+    with pytest.raises(AssertionError, match="divisible by block_size"):
+        fp8_weight_quant(torch.empty(128, 200, device=DEVICE, dtype=torch.bfloat16))
+    with pytest.raises(AssertionError, match="float32 and float8_e8m0fnu"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float16)
+    # An E8M0 scale cannot represent the unrounded FP32 scale the kernel would
+    # divide by, so the pairing has to be rejected instead of drifting.
+    with pytest.raises(AssertionError, match="powers of two"):
+        fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)

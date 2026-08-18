@@ -187,3 +187,8 @@ Core files:
     - The model is only `to_empty()`-materialized; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
     - LoRA/PEFT must not set `skip_weights_load` (and the FSDP2 path raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
     - After DCP load, `empty_cache()` is called to reduce first-step NCCL OOM risk from allocator fragmentation on near-OOM MoE jobs.
+
+## Environment Reproducibility
+
+27. **Exact uv synchronization removes separately installed overlays**
+    - The MagiAttention SM90 CUTLASS overlay is installed by `scripts/kernel/install_magi_sm90.sh` after the locked GPU environment. Reinstall it after a later exact `uv sync` before running MagiAttention on SM90.
