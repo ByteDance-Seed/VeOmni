@@ -1,0 +1,19 @@
+# Example: Training with validation
+# Add these fields to your existing training config to enable validation.
+
+data:
+  eval_path: /path/to/validation/data
+  train_path: /path/to/training/data
+  data_type: conversation
+  max_seq_len: 4096
+
+train:
+  eval_steps: 100          # Evaluate every 100 optimizer steps
+  eval_epochs: 0           # Set to 0 to disable epoch-based eval
+  validation_metrics:
+    - loss
+    - perplexity
+    - accuracy
+  micro_batch_size: 1
+  global_batch_size: 32
+  num_train_epochs: 3

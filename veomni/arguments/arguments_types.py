@@ -550,6 +550,16 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Number of epochs between two evaluations. 0 to disable."},
     )
+    validation_metrics: List[str] = field(
+        default_factory=lambda: ["loss"],
+        metadata={
+            "help": (
+                "List of metric names to compute during validation. "
+                "Available: 'loss', 'perplexity', 'accuracy', 'token_accuracy'. "
+                "Default: ['loss']."
+            ),
+        },
+    )
     seed: int = field(
         default=42,
         metadata={"help": "Random seed."},

@@ -22,7 +22,18 @@ from .data_loader import DistributedDataloader, build_dataloader
 from .data_transform import DATA_TRANSFORM_REGISTRY, build_data_transform
 from .dataset import build_dataset
 from .dummy_dataset import build_dummy_dataset
+from .evaluator import (
+    EVALUATOR_REGISTRY,
+    Evaluator,
+    AccuracyEvaluator,
+    LossEvaluator,
+    PerplexityEvaluator,
+    TokenAccuracyEvaluator,
+    build_evaluator,
+    compute_metrics,
+)
 from .multimodal.multimodal_chat_template import build_multimodal_chat_template
+from .validation_loader import build_validation_dataloader
 
 
 __all__ = [
@@ -37,4 +48,13 @@ __all__ = [
     "UnpackDataCollator",
     "build_dataset",
     "DistributedDataloader",
+    "EVALUATOR_REGISTRY",
+    "Evaluator",
+    "AccuracyEvaluator",
+    "LossEvaluator",
+    "PerplexityEvaluator",
+    "TokenAccuracyEvaluator",
+    "build_evaluator",
+    "compute_metrics",
+    "build_validation_dataloader",
 ]
