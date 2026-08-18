@@ -220,3 +220,8 @@ Core files:
     - A parameterless Omni module with an empty `state_dict()` has no persistent model state to restore and may allow the BaseTrainer resume fallback to skip HF loading.
     - LoRA/PEFT must not set the effective skip value (and the FSDP2 path raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
     - After DCP load, `empty_cache()` is called to reduce first-step NCCL OOM risk from allocator fragmentation on near-OOM MoE jobs.
+
+## Environment Reproducibility
+
+27. **Exact uv synchronization removes separately installed overlays**
+    - The MagiAttention SM90 CUTLASS overlay is installed by `scripts/kernel/install_magi_sm90.sh` after the locked GPU environment. Reinstall it after a later exact `uv sync` before running MagiAttention on SM90.

@@ -3,6 +3,7 @@ name: Check Patchgen Drift
 on:
   pull_request:
     paths:
+      - ".github/workflows/check_patchgen.yml"
       - "patchgen-pkg/**"
       - "veomni/patchgen/**"
       - "veomni/models/transformers/**"
@@ -12,6 +13,7 @@ on:
     branches:
       - main
     paths:
+      - ".github/workflows/check_patchgen.yml"
       - "patchgen-pkg/**"
       - "veomni/patchgen/**"
       - "veomni/models/transformers/**"
@@ -41,5 +43,15 @@ jobs:
           # the range ceiling. Keep this in sync with the docker/ uv pin.
           version: "0.11.16"
 
+      - name: Sync patchgen environment
+        run: |
+          # Patchgen is CPU-only. These MagiAttention packages build CUDA
+          # extensions during sync but are not needed for drift checks.
+          uv sync --extra gpu --dev \
+            --no-install-package magi-attention \
+            --no-install-package create-block-mask-cuda \
+            --no-install-package flash-attn-cute \
+            --no-install-package magi-to-hstu-cuda
+
       - name: Check patchgen drift
-        run: uv run --extra gpu --dev patchgen --check
+        run: uv run --no-sync patchgen --check
