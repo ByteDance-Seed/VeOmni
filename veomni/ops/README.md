@@ -139,8 +139,8 @@ post, and head kernels behind registry `OpSlot`s.
 The package does not import TileLang eagerly, so CPU and NPU installations can
 still import VeOmni. Callers that use a TileLang entry point must have the GPU
 extra installed. The GPU extra pins `tilelang==0.1.9` and
-`tile-kernels==1.0.0`; the uv override resolves FlashQLA's older 0.1.8 metadata
-pin against the shared, validated TileLang version.
+`tile-kernels==1.0.0`; FlashQLA 0.1.2 pins the same TileLang version, so all
+three TileLang consumers share one validated build.
 
 DeepSeek-V4 selects these kernels with `dsa_indexer_implementation: tilelang` and
 `dsa_attention_implementation: tilelang`. Both default to `eager`; unsupported
