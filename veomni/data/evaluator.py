@@ -22,11 +22,11 @@ add custom metrics without modifying trainer code::
         def compute(self, logits, labels, **kwargs):
             ...
 
-All evaluators are distrubuted-aware: per-rank partial sums are aggregated
+All evaluators are distributed-aware: per-rank partial sums are aggregated
 via ``all_reduce`` so the final metric reflects the global validation set.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist

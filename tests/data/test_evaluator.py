@@ -34,11 +34,11 @@ class TestPerplexityEvaluator:
 
     def test_perfect_prediction(self):
         """When logits perfectly predict labels, perplexity should be ~1.0."""
-        # Create logits where the correct next token gets overwhelming probability.
+        # Fixed labels for deterministic testing.
         # The evaluator applies a causal LM shift (logits[:-1] vs labels[1:]),
         # so position s in logits should predict labels[s+1].
         batch, seq, vocab = 2, 4, 10
-        labels = torch.randint(0, vocab, (batch, seq))
+        labels = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
         logits = torch.full((batch, seq, vocab), -10.0)
         for b in range(batch):
             for s in range(seq - 1):
@@ -49,7 +49,7 @@ class TestPerplexityEvaluator:
         result = evaluator.aggregate(partial)
 
         assert "perplexity" in result
-        assert result["perplexity"] < 2.0  # Should be very close to 1.0
+        assert result["perplexity"] == pytest.approx(1.0, rel=1e-2)
 
     def test_random_prediction(self):
         """Zero logits give uniform distribution, perplexity = vocab_size."""
@@ -102,7 +102,7 @@ class TestAccuracyEvaluator:
     def test_perfect_accuracy(self):
         """When argmax matches labels, accuracy should be 1.0."""
         batch, seq, vocab = 2, 8, 10
-        labels = torch.randint(0, vocab, (batch, seq))
+        labels = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8]])
         logits = torch.full((batch, seq, vocab), -10.0)
         # Position s predicts labels[s+1] due to causal LM shift
         for b in range(batch):
