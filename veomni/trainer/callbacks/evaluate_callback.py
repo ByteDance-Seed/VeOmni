@@ -95,78 +95,84 @@ class EvaluateCallback(Callback):
         was_training = model.training
         model.eval()
 
-        # Set epoch on the sampler for deterministic sharding
-        if hasattr(self._val_dataloader, "set_epoch"):
-            self._val_dataloader.set_epoch(state.epoch)
+        try:
+            # Set epoch on the sampler for deterministic sharding
+            if hasattr(self._val_dataloader, "set_epoch"):
+                self._val_dataloader.set_epoch(state.epoch)
 
-        logger.info_rank0(
-            f"Starting validation at step {state.global_step}, epoch {state.epoch}."
-        )
+            logger.info_rank0(
+                f"Starting validation at step {state.global_step}, epoch {state.epoch}."
+            )
 
-        # Accumulate partial sums per evaluator (each gets its own dict)
-        accumulated: List[Dict[str, torch.Tensor]] = [{} for _ in self._evaluators]
+            # Initialize accumulated partials with zero tensors for each evaluator's
+            # metric schema. This ensures every rank has the same keys in accumulated,
+            # so all_reduce calls are aligned even if a rank's iterable shard is empty.
+            accumulated: List[Dict[str, torch.Tensor]] = []
+            for evaluator in self._evaluators:
+                dummy_logits = torch.zeros(1, 2, 2, device=self.trainer.device)
+                dummy_labels = torch.zeros(1, 2, dtype=torch.long, device=self.trainer.device)
+                dummy_partial = evaluator.compute(dummy_logits, dummy_labels)
+                accumulated.append({k: torch.zeros_like(v) for k, v in dummy_partial.items()})
 
-        with torch.no_grad():
-            for batch_idx, micro_batches in enumerate(self._val_dataloader):
-                # The dataloader yields a list of micro-batches (same format as training).
-                # For validation we process each micro-batch and accumulate.
-                if not isinstance(micro_batches, list):
-                    micro_batches = [micro_batches]
+            with torch.no_grad():
+                for batch_idx, micro_batches in enumerate(self._val_dataloader):
+                    # The dataloader yields a list of micro-batches (same format as training).
+                    # For validation we process each micro-batch and accumulate.
+                    if not isinstance(micro_batches, list):
+                        micro_batches = [micro_batches]
 
-                for micro_batch in micro_batches:
-                    # Move tensors to device
-                    moved = {}
-                    for k, v in micro_batch.items():
-                        if isinstance(v, torch.Tensor):
-                            moved[k] = v.to(self.trainer.device, non_blocking=True)
-                        else:
-                            moved[k] = v
-
-                    # Forward pass
-                    forward_kwargs = dict(moved)
-                    if supports_use_cache:
-                        forward_kwargs["use_cache"] = False
-                    outputs = model(**forward_kwargs)
-
-                    logits = getattr(outputs, "logits", None)
-                    labels = moved.get("labels")
-                    if logits is None or labels is None:
-                        continue
-
-                    # Compute partial metrics for this batch, per evaluator
-                    for i, evaluator in enumerate(self._evaluators):
-                        partial = evaluator.compute(
-                            logits, labels, loss=getattr(outputs, "loss", None),
-                        )
-                        for k, v in partial.items():
-                            if k in accumulated[i]:
-                                accumulated[i][k] += v.detach()
+                    for micro_batch in micro_batches:
+                        # Move tensors to device
+                        moved = {}
+                        for k, v in micro_batch.items():
+                            if isinstance(v, torch.Tensor):
+                                moved[k] = v.to(self.trainer.device, non_blocking=True)
                             else:
-                                accumulated[i][k] = v.detach()
+                                moved[k] = v
 
-        # Aggregate using each evaluator's own aggregate() method
-        results: Dict[str, float] = {}
-        for i, evaluator in enumerate(self._evaluators):
-            results.update(evaluator.aggregate(accumulated[i]))
+                        # Forward pass
+                        forward_kwargs = dict(moved)
+                        if supports_use_cache:
+                            forward_kwargs["use_cache"] = False
+                        outputs = model(**forward_kwargs)
 
-        # Log results
-        metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in results.items())
-        logger.info_rank0(
-            f"Validation results at step {state.global_step}: {metrics_str}"
-        )
+                        logits = getattr(outputs, "logits", None)
+                        labels = moved.get("labels")
+                        if logits is None or labels is None:
+                            continue
 
-        # Log to wandb if enabled (rank 0 only)
-        if args.train.wandb.enable and getattr(args.train, "global_rank", 0) == 0:
-            try:
-                import wandb
+                        # Compute partial metrics for this batch, per evaluator
+                        for i, evaluator in enumerate(self._evaluators):
+                            partial = evaluator.compute(
+                                logits, labels, loss=getattr(outputs, "loss", None),
+                            )
+                            for k, v in partial.items():
+                                accumulated[i][k] += v.detach()
 
-                wandb.log(
-                    {f"val/{k}": v for k, v in results.items()},
-                    step=state.global_step,
-                )
-            except Exception:
-                logger.warning_rank0("Failed to log validation metrics to wandb.")
+            # Aggregate using each evaluator's own aggregate() method
+            results: Dict[str, float] = {}
+            for i, evaluator in enumerate(self._evaluators):
+                results.update(evaluator.aggregate(accumulated[i]))
 
-        # Restore training mode
-        if was_training:
-            model.train()
+            # Log results
+            metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in results.items())
+            logger.info_rank0(
+                f"Validation results at step {state.global_step}: {metrics_str}"
+            )
+
+            # Log to wandb if enabled (rank 0 only)
+            if args.train.wandb.enable and getattr(args.train, "global_rank", 0) == 0:
+                try:
+                    import wandb
+
+                    wandb.log(
+                        {f"val/{k}": v for k, v in results.items()},
+                        step=state.global_step,
+                    )
+                except Exception:
+                    logger.warning_rank0("Failed to log validation metrics to wandb.")
+
+        finally:
+            # Restore training mode on every exit path (including exceptions)
+            if was_training:
+                model.train()
