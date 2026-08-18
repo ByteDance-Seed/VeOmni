@@ -83,6 +83,23 @@ def rearrange_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rerange_typ
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, attn_mask=None):
     # bs, head_cont, seq, head_dim = q.shape
 
+    if attn_mask is not None:
+        # flash_attn_func (FA2/FA3) does not accept an arbitrary attention mask, so fall
+        # back to scaled_dot_product_attention, which supports an additive mask. Note that
+        # supplying a mask rules out SDPA's flash backend, so this uses the memory-efficient
+        # kernel (or the math fallback) instead. The flash-attn path below is for the
+        # mask-less case only.
+        if causal:
+            # scaled_dot_product_attention cannot take both `attn_mask` and `is_causal`, so
+            # merge a lower-triangular causal bias into the additive mask to preserve the
+            # caller's causal intent. No in-tree caller passes a mask with causal=True; this
+            # is defensive for future callers.
+            if attn_mask.dtype == torch.bool:
+                attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype).masked_fill_(~attn_mask, float("-inf"))
+            causal_bias = torch.triu(torch.full_like(attn_mask, float("-inf")), diagonal=1)
+            attn_mask = attn_mask + causal_bias
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+
     if FLASH_ATTN_3_AVAILABLE or FLASH_ATTN_2_AVAILABLE:
         rerange_type_seq_head = "b n s d -> b s n d"
         rerange_type_head_seq = "b s n d -> b n s d"
