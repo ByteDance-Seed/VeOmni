@@ -26,7 +26,8 @@ All evaluators are distributed-aware: per-rank partial sums are aggregated
 via ``all_reduce`` so the final metric reflects the global validation set.
 """
 
-from typing import Dict, List, Optional
+import math
+from typing import Dict, List
 
 import torch
 import torch.distributed as dist
@@ -133,9 +134,10 @@ class PerplexityEvaluator(Evaluator):
 
     def aggregate(self, partial: Dict[str, torch.Tensor]) -> Dict[str, float]:
         result = super().aggregate(partial)
-        # Convert NLL to perplexity
-        if "perplexity" in result and not (result["perplexity"] != result["perplexity"]):  # not NaN
-            result["perplexity"] = torch.exp(torch.tensor(result["perplexity"])).item()
+        # Convert average NLL to perplexity
+        val = result.get("perplexity")
+        if val is not None and not math.isnan(val):
+            result["perplexity"] = math.exp(val)
         return result
 
 

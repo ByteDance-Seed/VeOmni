@@ -70,6 +70,7 @@ Evaluators use the `Registry` pattern. To add a custom metric:
 from veomni.data.evaluator import EVALUATOR_REGISTRY, Evaluator
 from typing import Dict
 import torch
+import torch.distributed as dist
 
 @EVALUATOR_REGISTRY.register("f1_score")
 class F1Evaluator(Evaluator):
@@ -79,13 +80,20 @@ class F1Evaluator(Evaluator):
         tp = ((predictions == 1) & (labels == 1)).sum()
         fp = ((predictions == 1) & (labels == 0)).sum()
         fn = ((predictions == 0) & (labels == 1)).sum()
-        return {"f1_tp": tp.float(), "f1_tp_count": tp.float(),
-                "f1_fp": fp.float(), "f1_fp_count": fp.float(),
-                "f1_fn": fn.float(), "f1_fn_count": fn.float()}
+        return {"f1_tp": tp.float(), "f1_fp": fp.float(), "f1_fn": fn.float()}
 
-    def aggregate(self, partial):
-        # all_reduce and compute final F1
-        ...
+    def aggregate(self, partial: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        # F1 needs global sums (not averages), so override aggregate
+        # to all_reduce raw totals without dividing by a count.
+        result: Dict[str, float] = {}
+        for name in ("f1_tp", "f1_fp", "f1_fn"):
+            total = partial[name].detach().clone()
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(total, op=dist.ReduceOp.SUM)
+            result[name] = total.item()
+        tp, fp, fn = result["f1_tp"], result["f1_fp"], result["f1_fn"]
+        denom = 2 * tp + fp + fn
+        return {"f1_score": 2 * tp / denom if denom > 0 else float("nan")}
 ```
 
 Then use it in your config:

@@ -14,6 +14,8 @@
 
 """Unit tests for veomni.data.evaluator."""
 
+import math
+
 import pytest
 import torch
 
@@ -194,7 +196,6 @@ class TestLossEvaluator:
 
         # Zero logits → uniform distribution → CE loss = log(vocab) per token
         # After shift: 3 valid positions per sample, 6 total
-        import math
         expected_loss = math.log(vocab)
         assert partial["val_loss_count"].item() == 6
         assert result["val_loss"] == pytest.approx(expected_loss, rel=1e-4)
