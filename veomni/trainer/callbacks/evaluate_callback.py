@@ -14,6 +14,8 @@
 
 from typing import Dict, List
 
+import inspect
+
 import torch
 
 from veomni.data import build_evaluator, build_validation_dataloader
@@ -83,15 +85,11 @@ class EvaluateCallback(Callback):
         args = self.trainer.args
         model = self.trainer.model
 
-        # Guard: skip evaluation for models that don't produce logits
-        # (e.g. DiT diffusion models use a different forward signature)
-        if not hasattr(model, "use_cache"):
-            logger.info_rank0(
-                "Skipping validation: model does not support use_cache "
-                "(likely a non-causal-LM model). Evaluation is only supported "
-                "for text generation models."
-            )
-            return
+        # Check if the model's forward accepts use_cache (causal LM models do,
+        # but DiT and other non-text models do not).
+        unwrapped = model.module if hasattr(model, "module") else model
+        forward_params = inspect.signature(unwrapped.forward).parameters
+        supports_use_cache = "use_cache" in forward_params
 
         # Switch to eval mode
         was_training = model.training
@@ -125,7 +123,10 @@ class EvaluateCallback(Callback):
                             moved[k] = v
 
                     # Forward pass
-                    outputs = model(**moved, use_cache=False)
+                    forward_kwargs = dict(moved)
+                    if supports_use_cache:
+                        forward_kwargs["use_cache"] = False
+                    outputs = model(**forward_kwargs)
 
                     logits = getattr(outputs, "logits", None)
                     labels = moved.get("labels")

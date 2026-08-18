@@ -52,46 +52,48 @@ class TestPerplexityEvaluator:
         assert result["perplexity"] < 2.0  # Should be very close to 1.0
 
     def test_random_prediction(self):
-        """Random logits should give perplexity close to vocab_size."""
+        """Zero logits give uniform distribution, perplexity = vocab_size."""
         vocab = 100
         batch, seq = 4, 16
-        labels = torch.randint(0, vocab, (batch, seq))
-        logits = torch.randn(batch, seq, vocab)
+        labels = torch.arange(batch * seq).reshape(batch, seq) % vocab
+        logits = torch.zeros(batch, seq, vocab)
 
         evaluator = PerplexityEvaluator()
         partial = evaluator.compute(logits, labels)
         result = evaluator.aggregate(partial)
 
-        # Random prediction perplexity ≈ vocab_size
-        assert 20 < result["perplexity"] < 200
+        assert result["perplexity"] == pytest.approx(float(vocab))
 
     def test_ignore_index(self):
         """Positions with label -100 should be excluded."""
         batch, seq, vocab = 1, 6, 10
         labels = torch.tensor([[1, 2, -100, -100, 5, 6]])
-        logits = torch.randn(batch, seq, vocab)
-
-        evaluator = PerplexityEvaluator()
-        partial = evaluator.compute(logits, labels)
-
-        # After causal LM shift: shift_labels = [2, -100, -100, 5, 6] (5 positions)
-        # 2 positions are -100, so 3 valid tokens remain.
-        # Count is summed across all batches; with batch=1 it equals 3.
-        assert partial["perplexity_count"].item() > 0
-        assert partial["perplexity_count"].item() <= batch * (seq - 1)
-
-    def test_2d_logits(self):
-        """Should handle 2D logits (batch, vocab) for classification."""
-        batch, vocab = 4, 10
-        labels = torch.randint(0, vocab, (batch,))
-        logits = torch.randn(batch, vocab)
+        logits = torch.zeros(batch, seq, vocab)
 
         evaluator = PerplexityEvaluator()
         partial = evaluator.compute(logits, labels)
         result = evaluator.aggregate(partial)
 
-        assert "perplexity" in result
-        assert result["perplexity"] > 0
+        # After causal LM shift: shift_labels = [2, -100, -100, 5, 6] (5 positions)
+        # 2 positions are -100, so 3 valid tokens remain.
+        assert partial["perplexity_count"].item() == 3
+        # Zero logits → uniform distribution → NLL = log(vocab) per token
+        # Perplexity = exp(log(vocab)) = vocab
+        assert result["perplexity"] == pytest.approx(float(vocab))
+
+    def test_2d_logits(self):
+        """Should handle 2D logits (batch, vocab) for classification."""
+        batch, vocab = 4, 10
+        labels = torch.tensor([1, 2, 3, 4])
+        logits = torch.zeros(batch, vocab)
+
+        evaluator = PerplexityEvaluator()
+        partial = evaluator.compute(logits, labels)
+        result = evaluator.aggregate(partial)
+
+        # Zero logits → uniform → perplexity = vocab
+        assert partial["perplexity_count"].item() == batch
+        assert result["perplexity"] == pytest.approx(float(vocab))
 
 
 class TestAccuracyEvaluator:
@@ -130,13 +132,17 @@ class TestAccuracyEvaluator:
     def test_ignore_index(self):
         """Ignored positions should not affect accuracy."""
         labels = torch.tensor([[1, 2, -100, -100, 5, 6]])
-        logits = torch.randn(1, 6, 10)
+        logits = torch.zeros(1, 6, 10)
 
         evaluator = AccuracyEvaluator()
         partial = evaluator.compute(logits, labels)
 
-        # Count should exclude -100 positions
-        assert partial["accuracy_count"].item() > 0
+        # After shift: shift_labels = [2, -100, -100, 5, 6]
+        # 3 valid positions; zero logits → argmax=0, none match labels
+        assert partial["accuracy_count"].item() == 3
+
+        result = evaluator.aggregate(partial)
+        assert result["accuracy"] == 0.0
 
 
 class TestTokenAccuracyEvaluator:
@@ -144,14 +150,17 @@ class TestTokenAccuracyEvaluator:
 
     def test_basic(self):
         batch, seq, vocab = 2, 4, 10
-        labels = torch.randint(0, vocab, (batch, seq))
-        logits = torch.randn(batch, seq, vocab)
+        labels = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        logits = torch.zeros(batch, seq, vocab)
 
         evaluator = TokenAccuracyEvaluator()
         partial = evaluator.compute(logits, labels)
         result = evaluator.aggregate(partial)
 
-        assert 0.0 <= result["token_accuracy"] <= 1.0
+        # Zero logits → argmax=0, none match labels (all > 0)
+        # After shift: 3 valid positions per sample, 6 total
+        assert partial["token_accuracy_count"].item() == 6
+        assert result["token_accuracy"] == 0.0
 
 
 class TestLossEvaluator:
@@ -160,29 +169,35 @@ class TestLossEvaluator:
     def test_with_model_loss(self):
         """Should use model's native loss when provided."""
         batch, seq, vocab = 2, 4, 10
-        labels = torch.randint(0, vocab, (batch, seq))
-        logits = torch.randn(batch, seq, vocab)
+        labels = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        logits = torch.zeros(batch, seq, vocab)
         loss = torch.tensor(2.5)
 
         evaluator = LossEvaluator()
         partial = evaluator.compute(logits, labels, loss=loss)
         result = evaluator.aggregate(partial)
 
-        assert "val_loss" in result
-        assert abs(result["val_loss"] - 2.5) < 0.1
+        # After shift: 3 valid positions per sample, 6 total
+        # LossEvaluator multiplies loss by token_count, aggregate divides by count
+        assert partial["val_loss_count"].item() == 6
+        assert result["val_loss"] == pytest.approx(2.5, rel=1e-4)
 
     def test_without_model_loss(self):
         """Should compute CE loss from logits when loss is None."""
         batch, seq, vocab = 2, 4, 10
-        labels = torch.randint(0, vocab, (batch, seq))
-        logits = torch.randn(batch, seq, vocab)
+        labels = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        logits = torch.zeros(batch, seq, vocab)
 
         evaluator = LossEvaluator()
         partial = evaluator.compute(logits, labels, loss=None)
         result = evaluator.aggregate(partial)
 
-        assert "val_loss" in result
-        assert result["val_loss"] > 0
+        # Zero logits → uniform distribution → CE loss = log(vocab) per token
+        # After shift: 3 valid positions per sample, 6 total
+        import math
+        expected_loss = math.log(vocab)
+        assert partial["val_loss_count"].item() == 6
+        assert result["val_loss"] == pytest.approx(expected_loss, rel=1e-4)
 
 
 class TestRegistry:
@@ -221,8 +236,8 @@ class TestComputeMetrics:
 
     def test_multiple_evaluators(self):
         batch, seq, vocab = 2, 8, 10
-        labels = torch.randint(0, vocab, (batch, seq))
-        logits = torch.randn(batch, seq, vocab)
+        labels = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8]])
+        logits = torch.zeros(batch, seq, vocab)
 
         evaluators = [
             PerplexityEvaluator(),
@@ -234,10 +249,13 @@ class TestComputeMetrics:
         assert "perplexity" in results
         assert "accuracy" in results
         assert "val_loss" in results
+        # Zero logits → perplexity = vocab, accuracy = 0
+        assert results["perplexity"] == pytest.approx(float(vocab))
+        assert results["accuracy"] == 0.0
 
     def test_empty_list(self):
         """Empty evaluator list returns empty dict."""
-        results = compute_metrics([], torch.randn(2, 4, 10), torch.randint(0, 10, (2, 4)))
+        results = compute_metrics([], torch.zeros(2, 4, 10), torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]))
         assert results == {}
 
 
@@ -245,41 +263,48 @@ class TestPackedBatch:
     """Tests for packed-sample boundaries with IGNORE_INDEX=-100."""
 
     def test_packed_boundaries_excluded_from_perplexity(self):
-        """Packed samples separated by -100 padding should not contribute to perplexity."""
-        # Simulate a packed batch: two short sequences concatenated with -100 padding
-        # Sequence 1: [1, 2, 3] followed by -100 padding
-        # Sequence 2: [4, 5] followed by -100 padding
-        # After causal LM shift, -100 positions must be excluded from NLL.
-        labels = torch.tensor([[1, 2, 3, -100, -100, 4, 5, -100, -100, -100]])
+        """Packed samples separated by -100 padding should not contribute to perplexity.
+
+        In a packed batch, the first target after each boundary is also masked
+        because the model's context at that position includes padding tokens.
+        """
+        # Two packed samples: [1, 2, 3] and [4, 5]
+        # The first token of each new sample (4) is masked with -100 because
+        # the model cannot predict it from the preceding padding context.
+        labels = torch.tensor([[1, 2, 3, -100, -100, -100, 5, -100, -100, -100]])
         vocab = 10
         batch, seq = labels.shape
-        logits = torch.randn(batch, seq, vocab)
+        logits = torch.zeros(batch, seq, vocab)
 
         evaluator = PerplexityEvaluator()
         partial = evaluator.compute(logits, labels)
 
-        # After shift: shift_labels = [2, 3, -100, -100, 4, 5, -100, -100, -100]
-        # Valid positions: 2, 3, 4, 5 = 4 tokens (ignoring the -100s)
-        assert partial["perplexity_count"].item() == 4
+        # After shift: shift_labels = [2, 3, -100, -100, -100, 5, -100, -100, -100]
+        # Valid positions: 2, 3, 5 = 3 tokens
+        assert partial["perplexity_count"].item() == 3
 
     def test_packed_boundaries_excluded_from_accuracy(self):
-        """Packed sample boundaries with -100 should not affect accuracy."""
-        labels = torch.tensor([[1, 2, -100, -100, 5, 6, -100, -100]])
+        """Packed sample boundaries with -100 should not affect accuracy.
+
+        The first token after each boundary is masked because the model's
+        context includes padding, making the prediction meaningless.
+        """
+        labels = torch.tensor([[1, 2, -100, -100, -100, 6, -100, -100]])
         vocab = 10
         batch, seq = labels.shape
-        logits = torch.randn(batch, seq, vocab)
+        logits = torch.zeros(batch, seq, vocab)
 
         evaluator = AccuracyEvaluator()
         partial = evaluator.compute(logits, labels)
 
-        # After shift: shift_labels = [2, -100, -100, 5, 6, -100, -100]
-        # Valid positions: 2, 5, 6 = 3 tokens
-        assert partial["accuracy_count"].item() == 3
+        # After shift: shift_labels = [2, -100, -100, -100, 6, -100, -100]
+        # Valid positions: 2, 6 = 2 tokens
+        assert partial["accuracy_count"].item() == 2
 
     def test_all_ignored_returns_nan(self):
         """When all positions are -100, metrics should be NaN."""
         labels = torch.tensor([[-100, -100, -100, -100]])
-        logits = torch.randn(1, 4, 10)
+        logits = torch.zeros(1, 4, 10)
 
         evaluator = PerplexityEvaluator()
         partial = evaluator.compute(logits, labels)
@@ -287,3 +312,105 @@ class TestPackedBatch:
 
         assert partial["perplexity_count"].item() == 0
         assert result["perplexity"] != result["perplexity"]  # NaN check
+
+
+class TestDistributedAggregation:
+    """Integration tests for multi-rank metric aggregation.
+
+    These tests initialize a real process group with the gloo backend and
+    invoke the actual ``dist.all_reduce`` — no mocks.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self):
+        yield
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+    @pytest.mark.skipif(
+        not torch.distributed.is_available(),
+        reason="torch.distributed not available",
+    )
+    def test_two_rank_perplexity_aggregation(self, tmp_path):
+        """Verify token-weighted perplexity across two ranks via real all_reduce.
+
+        Uses subprocess spawning with the gloo CPU backend so it runs anywhere
+        without GPU dependencies.
+        """
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        script = tmp_path / "_two_rank_test.py"
+        script.write_text(textwrap.dedent("""\
+            import math
+            import os
+            import torch
+            import torch.distributed as dist
+            from veomni.data.evaluator import PerplexityEvaluator
+
+            def main():
+                rank = int(os.environ["RANK"])
+                world_size = int(os.environ["WORLD_SIZE"])
+                dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+                vocab = 10
+                # Rank 0: labels [1, 2, 3], rank 1: labels [4, 5]
+                # Zero logits → uniform → NLL = log(vocab) per token
+                if rank == 0:
+                    labels = torch.tensor([[1, 2, 3]])
+                else:
+                    labels = torch.tensor([[4, 5]])
+                logits = torch.zeros(1, labels.size(1), vocab)
+
+                evaluator = PerplexityEvaluator()
+                partial = evaluator.compute(logits, labels)
+                result = evaluator.aggregate(partial)
+
+                # Rank 0 shift: [2, 3] → 2 tokens
+                # Rank 1 shift: [5] → 1 token
+                # Total: 3 tokens, NLL = 3 * log(10)
+                # Perplexity = exp(log(10)) = 10
+                expected = float(vocab)
+                actual = result["perplexity"]
+                assert abs(actual - expected) < 0.01, \\
+                    f"Rank {rank}: expected {expected}, got {actual}"
+                if rank == 0:
+                    print("DISTRIBUTED_TEST_PASSED")
+
+                dist.destroy_process_group()
+
+            if __name__ == "__main__":
+                main()
+        """))
+
+        env = os.environ.copy()
+        env["RANK"] = "0"
+        env["WORLD_SIZE"] = "2"
+        env["MASTER_ADDR"] = "127.0.0.1"
+        env["MASTER_PORT"] = "29512"
+        # Include current sys.path so the subprocess can import veomni
+        env["PYTHONPATH"] = os.pathsep.join(sys.path)
+
+        # Run two processes
+        procs = []
+        for r in range(2):
+            env_rank = env.copy()
+            env_rank["RANK"] = str(r)
+            p = subprocess.Popen(
+                [sys.executable, str(script)],
+                env=env_rank,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            procs.append(p)
+
+        outputs = []
+        for p in procs:
+            out, err = p.communicate(timeout=30)
+            outputs.append(out.decode())
+            if p.returncode != 0:
+                pytest.fail(f"Rank process failed: {err.decode()}")
+
+        assert "DISTRIBUTED_TEST_PASSED" in outputs[0], f"Rank 0 did not pass: {outputs[0]}"
