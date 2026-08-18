@@ -10,14 +10,12 @@ from flash_attn import flash_attn_varlen_func
 from torch.nn.attention.flex_attention import BlockMask
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, tiny_bagel_qwen2_cfg
-from veomni.models.seed_omni.modules.bagel.qwen2_mot import modeling
+from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     build_mot_attention_metadata,
     build_mot_block_mask,
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import (
-    BagelQwen2MoT,
-    BagelQwen2MoTAttention,
     BaseNavitOutputWithPast,
     NaiveCache,
 )
@@ -48,7 +46,7 @@ def test_forward_inference_temporarily_overrides_and_restores_attention_config(
             "attn_implementation": "veomni_flex_attention_with_sp",
         }
     )
-    model = BagelQwen2MoT(config).eval()
+    model = accelerated.BagelQwen2MoTAccelerated(config).eval()
     packed_query = torch.randn(2, config.hidden_size)
     observed_implementations: list[str] = []
 
@@ -100,7 +98,7 @@ def test_inference_attention_facade_dispatches_flex_for_packed_prefill(
             "attn_implementation": "veomni_flex_attention_with_sp",
         }
     )
-    attention = BagelQwen2MoTAttention(config, layer_idx=0).to(dtype=torch.bfloat16).eval()
+    attention = accelerated.BagelQwen2MoTAttentionAccelerated(config, layer_idx=0).to(dtype=torch.bfloat16).eval()
     query_lens = torch.tensor([2, 3], dtype=torch.int32)
     packed_query = torch.randn(5, config.hidden_size, dtype=torch.bfloat16)
     attention_metadata = build_mot_attention_metadata(
@@ -126,7 +124,7 @@ def test_inference_attention_facade_dispatches_flex_for_packed_prefill(
         calls.append(kwargs)
         return query.transpose(1, 2), None
 
-    monkeypatch.setattr(modeling, "fused_attention_forward", fake_flex_facade)
+    monkeypatch.setattr(accelerated, "fused_attention_forward", fake_flex_facade)
     cache = NaiveCache(num_layers=1)
     output, output_cache = attention._forward_packed_inference(
         packed_query_sequence=packed_query,
@@ -164,7 +162,7 @@ def test_flex_prefill_matches_spanwise_flash_attention() -> None:
             "attn_implementation": "veomni_flex_attention_with_sp",
         }
     )
-    model = BagelQwen2MoT(config).to(device=device, dtype=torch.bfloat16).eval()
+    model = accelerated.BagelQwen2MoTAccelerated(config).to(device=device, dtype=torch.bfloat16).eval()
     generator = torch.Generator(device=device).manual_seed(1234)
     image = torch.randn(2, config.hidden_size, generator=generator, device=device, dtype=torch.bfloat16)
     text = torch.randn(3, config.hidden_size, generator=generator, device=device, dtype=torch.bfloat16)
@@ -259,8 +257,12 @@ def test_inference_attention_facade_dispatches_flash_with_cache(monkeypatch: pyt
             "attn_implementation": "veomni_flash_attention_2_with_sp",
         }
     )
-    attention = BagelQwen2MoTAttention(config, layer_idx=0).to(device=device, dtype=torch.bfloat16).eval()
-    original_facade = modeling.fused_attention_forward
+    attention = (
+        accelerated.BagelQwen2MoTAttentionAccelerated(config, layer_idx=0)
+        .to(device=device, dtype=torch.bfloat16)
+        .eval()
+    )
+    original_facade = accelerated.fused_attention_forward
     calls: list[dict[str, Any]] = []
 
     def checking_facade(
@@ -295,7 +297,7 @@ def test_inference_attention_facade_dispatches_flash_with_cache(monkeypatch: pyt
         calls.append(kwargs)
         return wrapped_output, None
 
-    monkeypatch.setattr(modeling, "fused_attention_forward", checking_facade)
+    monkeypatch.setattr(accelerated, "fused_attention_forward", checking_facade)
     generator = torch.Generator(device=device).manual_seed(8123)
     head_dim = config.hidden_size // config.num_attention_heads
     cache = NaiveCache(num_layers=1)

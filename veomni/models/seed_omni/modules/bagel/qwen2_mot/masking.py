@@ -1,9 +1,15 @@
-"""Attention visibility metadata and FlexAttention masks for BAGEL Qwen2-MoT."""
+"""Attention visibility metadata and mask materializers for BAGEL Qwen2-MoT.
+
+`packed_attention_metadata` is the source of truth. `build_mot_block_mask`
+materializes a Flex `BlockMask` for accelerated training. `build_mot_sdpa_mask`
+materializes a dense mask for eager SDPA. Vectorizing the dense path later can
+keep the same signatures.
+"""
 
 from __future__ import annotations
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import BlockMask, create_mask
 
 
 _MOT_BLOCK_SIZE = 128
@@ -22,8 +28,8 @@ def build_mot_attention_metadata(
     ``noise``). Row 2 identifies noise spans so their keys remain invisible
     outside that same noise span. ``-1`` means that a row does not apply.
 
-    The model turns this compact representation into a native FlexAttention
-    ``BlockMask`` without materializing an O(sequence²) token mask.
+    Callers materialize this compact representation either as a Flex
+    ``BlockMask`` or as a dense SDPA mask, without changing the metadata.
     """
     total_length = sum(sum(split_lens) for split_lens in sample_splits)
     metadata = torch.full((3, total_length), -1, device=device, dtype=torch.int32)
@@ -202,8 +208,23 @@ def build_mot_block_mask(packed_attention_metadata: torch.Tensor) -> BlockMask:
     )
 
 
+def build_mot_sdpa_mask(packed_attention_metadata: torch.Tensor) -> torch.Tensor:
+    """Materialize a dense ``[1, 1, S, S]`` SDPA mask from packed MoT metadata."""
+    block_mask = build_mot_block_mask(packed_attention_metadata)
+    sequence_length = int(packed_attention_metadata.shape[1])
+    return create_mask(
+        block_mask.mask_mod,
+        1,
+        1,
+        sequence_length,
+        sequence_length,
+        device=packed_attention_metadata.device,
+    )
+
+
 __all__ = [
     "build_mot_attention_metadata",
     "build_mot_block_mask",
+    "build_mot_sdpa_mask",
     "pad_mot_attention_metadata",
 ]

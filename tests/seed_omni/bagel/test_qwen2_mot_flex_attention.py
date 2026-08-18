@@ -12,10 +12,11 @@ from torch.nn.attention.flex_attention import create_mask
 from torch.nn.functional import scaled_dot_product_attention
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
-from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated, modeling
+from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     build_mot_attention_metadata,
     build_mot_block_mask,
+    build_mot_sdpa_mask,
     pad_mot_attention_metadata,
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoTAttention
@@ -158,6 +159,7 @@ def test_block_mask_metadata_matches_dense_attention_oracle(
     assert metadata.numel() == 3 * sequence_length
     assert materialized.any(dim=-1).all()
     assert torch.equal(materialized, dense_oracle)
+    assert torch.equal(build_mot_sdpa_mask(metadata), materialized)
 
 
 def test_randomized_block_mask_metadata_matches_dense_attention_oracle() -> None:
@@ -305,7 +307,7 @@ def test_eager_training_attention_uses_sdpa() -> None:
 
     output = attention._forward_packed_train(
         packed_sequence=torch.randn(sequence_length, config.hidden_size),
-        attention_mask=build_mot_block_mask(metadata),
+        attention_mask=build_mot_sdpa_mask(metadata),
         packed_position_cos=torch.ones(sequence_length, attention.head_dim),
         packed_position_sin=torch.zeros(sequence_length, attention.head_dim),
         packed_und_token_indexes=torch.arange(sequence_length),
@@ -400,7 +402,7 @@ def test_training_forward_gradient_checkpointing_reuses_one_block_mask(monkeypat
     model_type = model_cls("bagel_qwen2_mot")
     model = model_type(_flex_config()).to(device="cuda", dtype=torch.bfloat16).train()
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    original_builder = modeling.build_mot_block_mask
+    original_builder = accelerated.BagelQwen2MoTAttentionAccelerated.build_attention_mask
     build_count = 0
 
     def counted_builder(metadata):
@@ -408,7 +410,7 @@ def test_training_forward_gradient_checkpointing_reuses_one_block_mask(monkeypat
         build_count += 1
         return original_builder(metadata)
 
-    monkeypatch.setattr(modeling, "build_mot_block_mask", counted_builder)
+    monkeypatch.setattr(accelerated.BagelQwen2MoTAttentionAccelerated, "build_attention_mask", counted_builder)
     hidden_size = int(model.config.hidden_size)
     text = torch.randn(2, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     output = torch.randn(3, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)

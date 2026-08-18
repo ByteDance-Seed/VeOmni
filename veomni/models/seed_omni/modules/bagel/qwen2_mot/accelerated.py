@@ -30,7 +30,7 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from .configuration import BagelQwen2MoTConfig
-from .masking import pad_mot_attention_metadata
+from .masking import build_mot_block_mask, pad_mot_attention_metadata
 from .modeling import (
     BagelQwen2MoT,
     BagelQwen2MoTAttention,
@@ -407,6 +407,10 @@ _PACKED_FUSED_ATTN_IMPLEMENTATIONS = (
 
 class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
     """MoT attention with fused RoPE and ``fused_attention_forward``."""
+
+    @staticmethod
+    def build_attention_mask(packed_attention_metadata: torch.Tensor) -> BlockMask:
+        return build_mot_block_mask(packed_attention_metadata)
 
     def apply_rotary_pos_emb(
         self,

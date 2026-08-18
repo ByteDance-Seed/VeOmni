@@ -6,7 +6,6 @@ from typing import Any, Dict, Iterator, Optional
 
 import torch
 import torch.nn as nn
-from torch.nn.attention.flex_attention import BlockMask, create_mask
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
@@ -21,7 +20,7 @@ from .checkpoint_conversion import (
 )
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
-from .masking import build_mot_block_mask
+from .masking import build_mot_sdpa_mask
 from .processing import PackedConversation, preprocess_mot_inputs
 
 
@@ -341,7 +340,7 @@ class InferenceMixin:
 
     def _decode_next_token(self, conversation_list: list[ConversationItem]) -> torch.Tensor:
         # AR has one query token and an existing contiguous cache, so the
-        # dedicated FlashAttention path is preferable to rebuilding a BlockMask.
+        # dedicated FlashAttention path is preferable to rebuilding a packed mask.
         main_context = self._generation_state.main
         main_context.require_ready()
         tail = conversation_list[-1]
@@ -435,7 +434,6 @@ class BagelQwen2MoT(InferenceMixin, OmniPreTrainedModel):
         super().__init__(config)
         self.model = BagelQwen2MoTBackbone(
             config,
-            decoder_layer_cls=type(self).decoder_layer_cls,
             attention_cls=type(self).attention_cls,
             mlp_cls=type(self).mlp_cls,
             rms_norm_cls=type(self).rms_norm_cls,
@@ -507,26 +505,15 @@ def _apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
-def _sdpa_attn_mask(
-    attention_mask: BlockMask | torch.Tensor,
-    query_length: int,
-    key_length: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if isinstance(attention_mask, BlockMask):
-        return create_mask(attention_mask.mask_mod, 1, 1, query_length, key_length, device=device)
-    return attention_mask
-
-
 def _sdpa_packed_attention(
     packed_query_states: torch.Tensor,
     packed_key_states: torch.Tensor,
     packed_value_states: torch.Tensor,
     *,
-    attention_mask: BlockMask | torch.Tensor | None = None,
+    attention_mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
-    cu_seq_lens_q: torch.Tensor | None = None,
-    cu_seq_lens_k: torch.Tensor | None = None,
+    cu_seq_lens_q: Optional[torch.Tensor] = None,
+    cu_seq_lens_k: Optional[torch.Tensor] = None,
     scale: float,
     enable_gqa: bool,
 ) -> torch.Tensor:
@@ -538,17 +525,11 @@ def _sdpa_packed_attention(
         query = packed_query_states.transpose(0, 1).unsqueeze(0)
         key = packed_key_states.transpose(0, 1).unsqueeze(0)
         value = packed_value_states.transpose(0, 1).unsqueeze(0)
-        attn_mask = _sdpa_attn_mask(
-            attention_mask,
-            packed_query_states.shape[0],
-            packed_key_states.shape[0],
-            packed_query_states.device,
-        )
         output = scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=attn_mask,
+            attn_mask=attention_mask,
             dropout_p=0.0,
             is_causal=False,
             scale=scale,
@@ -724,6 +705,10 @@ class BagelQwen2MoTAttention(nn.Module):
         self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
         self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
 
+    @staticmethod
+    def build_attention_mask(packed_attention_metadata: torch.Tensor) -> torch.Tensor:
+        return build_mot_sdpa_mask(packed_attention_metadata)
+
     def apply_rotary_pos_emb(
         self,
         q: torch.Tensor,
@@ -784,7 +769,7 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_query_states: torch.Tensor,
         packed_key_states: torch.Tensor,
         packed_value_states: torch.Tensor,
-        attention_mask: BlockMask,
+        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         packed_attn_output = _sdpa_packed_attention(
             packed_query_states,
@@ -813,7 +798,7 @@ class BagelQwen2MoTAttention(nn.Module):
     def _forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
-        attention_mask: BlockMask,
+        attention_mask: torch.Tensor,
         packed_position_cos: torch.Tensor,
         packed_position_sin: torch.Tensor,
         packed_und_token_indexes: torch.Tensor,
@@ -919,7 +904,7 @@ class BagelQwen2MoTAttention(nn.Module):
         merged_key_states: torch.Tensor,
         merged_value_states: torch.Tensor,
         *,
-        attention_mask: Optional[BlockMask],
+        attention_mask: Optional[torch.Tensor],
         is_causal: bool,
         cu_seq_lens_q: torch.Tensor,
         cu_seq_lens_k: torch.Tensor,
@@ -970,7 +955,7 @@ class BagelQwen2MoTAttention(nn.Module):
         update_past_key_values: bool = True,
         is_causal: bool = True,
         mode: str = "und",
-        attention_mask: Optional[BlockMask] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
         *,
@@ -1080,7 +1065,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
     def _forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
-        attention_mask: BlockMask,
+        attention_mask: torch.Tensor,
         packed_position_cos: torch.Tensor,
         packed_position_sin: torch.Tensor,
         packed_und_token_indexes: torch.Tensor,
@@ -1172,7 +1157,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         update_past_key_values: bool = True,
         is_causal: bool = True,
         mode: str = "und",
-        attention_mask: Optional[BlockMask] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
         *,
@@ -1234,7 +1219,6 @@ class BagelQwen2MoTBackbone(nn.Module):
         self,
         config: BagelQwen2MoTConfig,
         *,
-        decoder_layer_cls: type[BagelQwen2MoTDecoderLayer] = BagelQwen2MoTDecoderLayer,
         attention_cls: type[BagelQwen2MoTAttention] = BagelQwen2MoTAttention,
         mlp_cls: type[Qwen2MLP] = Qwen2MLP,
         rms_norm_cls: type[Qwen2RMSNorm] = Qwen2RMSNorm,
@@ -1243,7 +1227,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         self.gradient_checkpointing = False
         self.layers = nn.ModuleList(
             [
-                decoder_layer_cls(
+                BagelQwen2MoTDecoderLayer(
                     config,
                     layer_idx,
                     attention_cls=attention_cls,
@@ -1257,6 +1241,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         self.norm_moe_gen = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = BagelQwen2RotaryEmbedding(config=config)
         self.use_moe = "Mo" in config.layer_module
+        self.attention_cls = attention_cls
 
     def _build_inference_attention_mask(
         self,
@@ -1264,20 +1249,22 @@ class BagelQwen2MoTBackbone(nn.Module):
         packed_attention_metadata: Optional[torch.Tensor],
         *,
         cache_has_values: bool,
-    ) -> Optional[BlockMask]:
-        """Validate packed-prefill invariants and build its FlexAttention mask."""
+    ) -> Any:
+        """Validate packed-prefill invariants and materialize its attention mask."""
         if packed_attention_metadata is None:
             return None
         if cache_has_values:
-            raise ValueError("BAGEL FlexAttention prefill requires an empty KV cache.")
+            raise ValueError("BAGEL packed prefill requires an empty KV cache.")
 
         expected_metadata_shape = (3, int(packed_query_sequence.shape[0]))
         if tuple(packed_attention_metadata.shape) != expected_metadata_shape:
             raise ValueError(
-                "BAGEL FlexAttention prefill metadata must match the packed query sequence: "
+                "BAGEL packed prefill metadata must match the packed query sequence: "
                 f"expected {expected_metadata_shape}, got {tuple(packed_attention_metadata.shape)}."
             )
-        return build_mot_block_mask(packed_attention_metadata.to(device=packed_query_sequence.device))
+        return self.attention_cls.build_attention_mask(
+            packed_attention_metadata.to(device=packed_query_sequence.device)
+        )
 
     def _apply_inference_final_norm(
         self,
@@ -1304,7 +1291,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         packed_und_token_indexes: Optional[torch.Tensor] = None,
         packed_gen_token_indexes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        attention_mask = build_mot_block_mask(packed_attention_metadata)
+        attention_mask = self.attention_cls.build_attention_mask(packed_attention_metadata)
         cos, sin = self.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
         packed_position_cos = cos.squeeze(0)
         packed_position_sin = sin.squeeze(0)
@@ -1437,7 +1424,6 @@ class BagelQwen2MoTBackbone(nn.Module):
 
 
 BagelQwen2MoT.attention_cls = BagelQwen2MoTAttention
-BagelQwen2MoT.decoder_layer_cls = BagelQwen2MoTDecoderLayer
 BagelQwen2MoT.mlp_cls = Qwen2MLP
 BagelQwen2MoT.rms_norm_cls = Qwen2RMSNorm
 
