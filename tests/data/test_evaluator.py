@@ -328,19 +328,28 @@ class TestDistributedAggregation:
             torch.distributed.destroy_process_group()
 
     @pytest.mark.skipif(
-        not torch.distributed.is_available(),
-        reason="torch.distributed not available",
+        not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+        reason="torch.distributed gloo backend not available",
     )
     def test_two_rank_perplexity_aggregation(self, tmp_path):
         """Verify token-weighted perplexity across two ranks via real all_reduce.
 
         Uses subprocess spawning with the gloo CPU backend so it runs anywhere
-        without GPU dependencies.
+        without GPU dependencies. Rank 0 has perfectly predicted tokens (NLL≈0)
+        while rank 1 has uniform logits (NLL=log(vocab)), so the aggregated
+        perplexity = exp((0*2 + log(10)*1) / 3) = 10^(1/3).
         """
         import os
+        import socket
         import subprocess
         import sys
         import textwrap
+
+        # Find a free port for the rendezvous
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        master_port = str(sock.getsockname()[1])
+        sock.close()
 
         script = tmp_path / "_two_rank_test.py"
         script.write_text(textwrap.dedent("""\
@@ -356,23 +365,26 @@ class TestDistributedAggregation:
                 dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
                 vocab = 10
-                # Rank 0: labels [1, 2, 3], rank 1: labels [4, 5]
-                # Zero logits → uniform → NLL = log(vocab) per token
                 if rank == 0:
+                    # Perfect prediction: NLL ≈ 0 for 2 shifted tokens
                     labels = torch.tensor([[1, 2, 3]])
+                    logits = torch.full((1, 3, vocab), -10.0)
+                    logits[0, 0, 2] = 10.0  # predicts labels[1]=2
+                    logits[0, 1, 3] = 10.0  # predicts labels[2]=3
                 else:
+                    # Uniform prediction: NLL = log(vocab) for 1 shifted token
                     labels = torch.tensor([[4, 5]])
-                logits = torch.zeros(1, labels.size(1), vocab)
+                    logits = torch.zeros(1, 2, vocab)
 
                 evaluator = PerplexityEvaluator()
                 partial = evaluator.compute(logits, labels)
                 result = evaluator.aggregate(partial)
 
-                # Rank 0 shift: [2, 3] → 2 tokens
-                # Rank 1 shift: [5] → 1 token
-                # Total: 3 tokens, NLL = 3 * log(10)
-                # Perplexity = exp(log(10)) = 10
-                expected = float(vocab)
+                # Rank 0: 2 tokens, NLL ≈ 0
+                # Rank 1: 1 token, NLL = log(10)
+                # Total: 3 tokens, NLL = log(10)
+                # Perplexity = exp(log(10) / 3) = 10^(1/3) ≈ 2.154
+                expected = 10.0 ** (1.0 / 3.0)
                 actual = result["perplexity"]
                 assert abs(actual - expected) < 0.01, \\
                     f"Rank {rank}: expected {expected}, got {actual}"
@@ -386,11 +398,9 @@ class TestDistributedAggregation:
         """))
 
         env = os.environ.copy()
-        env["RANK"] = "0"
         env["WORLD_SIZE"] = "2"
         env["MASTER_ADDR"] = "127.0.0.1"
-        env["MASTER_PORT"] = "29512"
-        # Include current sys.path so the subprocess can import veomni
+        env["MASTER_PORT"] = master_port
         env["PYTHONPATH"] = os.pathsep.join(sys.path)
 
         # Run two processes

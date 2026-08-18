@@ -136,7 +136,7 @@ class EvaluateCallback(Callback):
                     # Compute partial metrics for this batch, per evaluator
                     for i, evaluator in enumerate(self._evaluators):
                         partial = evaluator.compute(
-                            logits, labels, loss=outputs.loss,
+                            logits, labels, loss=getattr(outputs, "loss", None),
                         )
                         for k, v in partial.items():
                             if k in accumulated[i]:
@@ -155,8 +155,8 @@ class EvaluateCallback(Callback):
             f"Validation results at step {state.global_step}: {metrics_str}"
         )
 
-        # Log to wandb if enabled
-        if args.train.wandb.enable:
+        # Log to wandb if enabled (rank 0 only)
+        if args.train.wandb.enable and getattr(args.train, "global_rank", 0) == 0:
             try:
                 import wandb
 
