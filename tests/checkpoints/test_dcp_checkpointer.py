@@ -24,6 +24,7 @@ from veomni.distributed.torch_parallelize import (
 from veomni.models.module_utils import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
+from veomni.utils.device import get_device_type
 
 
 # ---------------------------------------------------------------------------
@@ -397,11 +398,11 @@ class TestDdpMetaInit:
             lambda: SimpleNamespace(local_rank=0, dp_group=None, any_extra_parallel_enabled=True),
         )
         with pytest.raises(RuntimeError, match="requires fsdp_mode='fsdp2'"):
-            parallelize_model_ddp(nn.Linear(2, 2), init_device="cuda")
+            parallelize_model_ddp(nn.Linear(2, 2), init_device=get_device_type())
 
     def test_rejects_ep_sharded_stream_load(self, wrap_ddp):
         with pytest.raises(RuntimeError, match="ep_sharded_stream_load"):
-            wrap_ddp(nn.Linear(2, 2), init_device="cuda", ep_sharded_stream_load=True)
+            wrap_ddp(nn.Linear(2, 2), init_device=get_device_type(), ep_sharded_stream_load=True)
 
     def test_reports_parameters_still_on_meta(self, wrap_ddp):
         # init_device="cpu" leaves every rank but 0 on meta (models/loader.py).
@@ -416,7 +417,7 @@ class TestDdpMetaInit:
         monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
         model = _MetaInitModel()
 
-        wrapped = wrap_ddp(model, weights_path="hf-path", init_device="cuda")
+        wrapped = wrap_ddp(model, weights_path="hf-path", init_device=get_device_type())
 
         # A non-meta init device means build_model already loaded the weights.
         loader.assert_not_called()
