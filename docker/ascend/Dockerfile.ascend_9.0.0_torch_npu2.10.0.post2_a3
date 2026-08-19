@@ -77,13 +77,11 @@ RUN pip install torch-npu==2.10.0.post2 pybind11
 # verifies the patch stuck.
 # aarch64 triton-ascend 3.2.1 requires triton==3.5.0 (x86's is 3.2.0) — an arch-specific
 # dep, confirmed via `pip install triton-ascend==3.2.1 --dry-run` on an aarch64 host.
-# pip tolerates the osinfra index behavior here; x86 uses uv with the Huawei Cloud mirror
-# because uv rejects wrong-name metadata returned by osinfra for transitive lookups.
+# Use Huawei Cloud's Ascend package index so TLS verification remains enabled.
 RUN (pip uninstall -y triton triton-ascend || true) && \
     pip install triton==3.5.0 && \
     pip install triton-ascend==3.2.1 \
-        --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple \
-        --trusted-host triton-ascend.osinfra.cn && \
+        --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
     echo "Verifying triton-ascend patched libtriton.so ..." && \
     python -c "from triton._C.libtriton import ascend"
 

@@ -87,7 +87,7 @@ ENV UV_CACHE_DIR=/home/tiger/.cache/uv
 # uv sync
 WORKDIR /app
 COPY --chown=tiger:tiger . ./
-RUN uv sync --python 3.11 --locked --extra npu --allow-insecure-host github.com --allow-insecure-host objects.githubusercontent.com --allow-insecure-host download-r2.pytorch.org
+RUN uv sync --system-certs --python 3.11 --locked --extra npu
 
 # fla_npu needs a torch_npu post matched to torch: its scripts/check_npu_env.py maps
 # torch 2.10.0 -> torch_npu 2.10.0.post2. VeOmni's npu extra pins plain torch-npu
