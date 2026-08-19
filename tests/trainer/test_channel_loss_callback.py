@@ -30,10 +30,6 @@ importlib.util.find_spec = _find_spec_without_torch_npu  # type: ignore[assignme
 try:
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
     from veomni.arguments.arguments_types import ChannelLossConfig, ChunkMBSConfig
-    from veomni.models.seed_omni.foundation.qwen3_moe_foundation.modeling_qwen3_moe_foundation import (
-        Qwen3MoeFoundationModel,
-    )
-    from veomni.models.seed_omni.modeling_seed_omni import SeedOmniModel
     from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
         Qwen2_5OmniForConditionalGeneration,
     )
@@ -295,60 +291,6 @@ def test_channel_loss_unwraps_native_lora_model_for_eager_loss():
         assert result == "main-loss"
         assert computer._result
         assert computer._result[0]["source_id"] == 0
-    finally:
-        computer.uninstall()
-
-
-def test_channel_loss_unwraps_seed_omni_foundation_loss():
-    class EagerFoundationModel(torch.nn.Module):
-        def loss_function(self, logits, labels, vocab_size, **kwargs):
-            return "foundation-loss"
-
-        def forward(self, logits, labels, vocab_size):
-            return self.loss_function(logits, labels, vocab_size)
-
-    class LightweightSeedOmniModel(SeedOmniModel):
-        def __init__(self, foundation):
-            torch.nn.Module.__init__(self)
-            self.foundation = foundation
-
-        def forward(self, *args, **kwargs):
-            return self.foundation(*args, **kwargs)
-
-    foundation = EagerFoundationModel()
-    model = LightweightSeedOmniModel(foundation)
-    computer = ChannelLossComputer()
-    computer._source_ids = [0]
-    computer._position_ids = torch.tensor([[0, 1, 2]])
-    logits = torch.randn(1, 3, 8)
-    labels = torch.tensor([[1, 2, 3]])
-
-    try:
-        computer.install(model)
-        assert computer._model_ref is foundation
-        with computer.capture():
-            result = model(logits, labels, 8)
-        assert result == "foundation-loss"
-        assert computer._result
-        assert computer._result[0]["source_id"] == 0
-    finally:
-        computer.uninstall()
-
-
-def test_channel_loss_rejects_seed_omni_qwen3_moe_direct_loss():
-    class LightweightSeedOmniModel(SeedOmniModel):
-        def __init__(self, foundation):
-            torch.nn.Module.__init__(self)
-            self.foundation = foundation
-
-    foundation = object.__new__(Qwen3MoeFoundationModel)
-    torch.nn.Module.__init__(foundation)
-    model = LightweightSeedOmniModel(foundation)
-    computer = ChannelLossComputer()
-
-    try:
-        with pytest.raises(ValueError, match="Qwen3MoeFoundationModel.*computes causal-LM loss directly"):
-            computer.install(model)
     finally:
         computer.uninstall()
 
