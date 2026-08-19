@@ -12,12 +12,12 @@ from veomni.distributed.context_parallel.packed_sharding import (
 
 
 def test_per_sample_padding_and_cp2_physical_layout():
-    values = torch.arange(65)
+    values = torch.arange(1, 66)
     padded, cu = pad_packed_samples(values, torch.tensor([0, 1, 65], dtype=torch.int32), multiple=4)
 
     assert cu.tolist() == [0, 4, 68]
-    assert padded.tolist()[:4] == [0, 0, 0, 0]
-    assert padded.tolist()[4:] == list(range(1, 65))
+    assert padded.tolist()[:4] == [1, 0, 0, 0]
+    assert padded.tolist()[4:] == list(range(2, 66))
 
     rank0 = build_packed_context_parallel_partition(cu, cp_size=2, cp_rank=0)
     rank1 = build_packed_context_parallel_partition(cu, cp_size=2, cp_rank=1)

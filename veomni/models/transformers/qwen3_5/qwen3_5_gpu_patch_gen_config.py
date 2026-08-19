@@ -1399,9 +1399,9 @@ def qwen3_5_model_forward(
     image_mask = kwargs.get("image_mask", None)
     video_mask = kwargs.get("video_mask", None)
     has_multimodal_inputs = pixel_values is not None or pixel_values_videos is not None
-    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
-    # language model. Derived from input_ids below when not supplied.
-    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+    # Preserve processor-supplied multimodal token types. Python has already
+    # bound this explicit parameter, so it is not present in ``kwargs``.
+    # Derive it from ``input_ids`` below only when the caller omitted it.
 
     # if None, calculate mask
     if video_mask is None and image_mask is None:

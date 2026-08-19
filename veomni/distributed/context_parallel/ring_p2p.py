@@ -42,6 +42,7 @@ class RingP2P:
 
         self.send_recv_ops: list[dist.Work] = []
         self._packed_recv = None
+        self._single_recv = None
 
     def async_send_recv(self, send_tensor: TensorOrList, recv_tensor: TensorOrList) -> None:
         """Launch even/odd isend/irecv.
@@ -52,6 +53,7 @@ class RingP2P:
         retaining every remote K/V shard.
         """
         self._packed_recv = None
+        self._single_recv = None
         packed = isinstance(send_tensor, list)
         if packed:
             if not isinstance(recv_tensor, list) or not send_tensor or len(send_tensor) != len(recv_tensor):
@@ -70,7 +72,11 @@ class RingP2P:
             recv_payload = torch.empty_like(send_payload)
         else:
             send_payload = send_tensor.contiguous()
-            recv_payload = recv_tensor
+            if recv_tensor.is_contiguous():
+                recv_payload = recv_tensor
+            else:
+                recv_payload = torch.empty(recv_tensor.shape, dtype=recv_tensor.dtype, device=recv_tensor.device)
+                self._single_recv = (recv_tensor, recv_payload)
             numels = shapes = None
 
         if self.ring_rank % 2 == 0:
@@ -92,11 +98,15 @@ class RingP2P:
         for op in self.send_recv_ops:
             op.wait()
         self.send_recv_ops = []
+        if self._single_recv is not None:
+            recv_tensor, recv_payload = self._single_recv
+            recv_tensor.copy_(recv_payload)
+            self._single_recv = None
         if self._packed_recv is not None:
             recv_tensor, recv_payload, numels, shapes = self._packed_recv
             offset = 0
-            for index, (numel, shape) in enumerate(zip(numels, shapes)):
-                recv_tensor[index] = recv_payload[offset : offset + numel].view(shape)
+            for recv_item, numel, shape in zip(recv_tensor, numels, shapes):
+                recv_item.copy_(recv_payload[offset : offset + numel].view(shape))
                 offset += numel
             self._packed_recv = None
         return 1

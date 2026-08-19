@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,10 +23,13 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def _function_block(source: str, function_name: str) -> str:
-    marker = f"def {function_name}("
-    start = source.index(marker)
-    next_decorator = source.find("\n@", start)
-    return source[start:] if next_decorator < 0 else source[start:next_decorator]
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
+            if node.end_lineno is None:
+                raise AssertionError(f"could not determine source span for {function_name}")
+            return "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
+    raise AssertionError(f"function {function_name} not found")
 
 
 @pytest.mark.parametrize(
@@ -469,6 +473,19 @@ def test_qwen35_moe_aux_loss_consumes_rank_local_router_mask(relative_path: str)
     source = (ROOT / relative_path).read_text()
     assert source.count('router_attention_mask = kwargs.pop("router_attention_mask", attention_mask)') == 2
     assert source.count("                router_attention_mask,\n") == 4
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py",
+        "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_npu.py",
+    ],
+)
+def test_qwen3_moe_aux_loss_consumes_rank_local_router_mask(relative_path: str):
+    source = (ROOT / relative_path).read_text()
+    assert source.count('router_attention_mask = kwargs.pop("router_attention_mask", attention_mask)') == 1
+    assert source.count("                router_attention_mask,\n") == 2
 
 
 @pytest.mark.parametrize(

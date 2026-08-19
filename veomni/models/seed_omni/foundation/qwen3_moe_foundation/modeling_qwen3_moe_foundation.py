@@ -114,11 +114,17 @@ class Qwen3MoeDecoderLayer(OriginalQwen3MoeDecoderLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        indices_q, cu_seq_lens, max_seq_lens = prepare_fa2_from_position_ids(
-            position_ids[0]
-        )  # remove multimodal channel dimension
-        cu_seq_lens_q, cu_seq_lens_k = cu_seq_lens
-        max_length_q, max_length_k = max_seq_lens
+        supplied_fa_metadata = tuple(
+            kwargs.get(key) for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+        )
+        if all(value is not None for value in supplied_fa_metadata):
+            cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k = supplied_fa_metadata
+        else:
+            _, cu_seq_lens, max_seq_lens = prepare_fa2_from_position_ids(
+                position_ids[0]
+            )  # remove multimodal channel dimension
+            cu_seq_lens_q, cu_seq_lens_k = cu_seq_lens
+            max_length_q, max_length_k = max_seq_lens
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -249,7 +255,7 @@ class MultimodalQwen3MoeModel(Qwen3MoeModel):
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
+                    partial(decoder_layer.__call__, **flash_attn_kwargs),
                     hidden_states,
                     causal_mask,
                     position_ids,

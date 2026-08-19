@@ -92,26 +92,45 @@ def _iter_grouped_nested_fsdp_leaves(model: nn.Module) -> List[nn.Module]:
     return leaves
 
 
-def _fully_shard_grouped_nested_fsdp_leaves(model: nn.Module, fsdp_kwargs: dict) -> List[nn.Module]:
-    """Wrap every marked gated-norm as one nested FSDP2 group.
+def _fully_shard_grouped_nested_fsdp_leaves(
+    model: nn.Module,
+    fsdp_kwargs: dict,
+    fsdp_kwargs_without_mp: dict,
+    mp_ignored_classes: Optional[Tuple[type, ...]],
+) -> List[nn.Module]:
+    """Wrap marked gated norms into grouped nested FSDP2 leaves by MP policy.
 
     Parent ``fully_shard(decoder_layer)`` then skips this group. The group uses
-    the same mesh and mixed-precision policy as the parent layers, but keeps
-    ``reshard_after_forward=False`` so ``npu_rms_norm`` sees a full local Tensor
-    for the whole forward-to-backward window. One small AG/RS covers all marked
-    128-d weights.
+    the same mesh as the parent layers and the appropriate mixed-precision
+    policy, while keeping ``reshard_after_forward=False`` so ``npu_rms_norm``
+    sees a full local Tensor for the whole forward-to-backward window.
     """
 
     leaves = _iter_grouped_nested_fsdp_leaves(model)
     if not leaves:
         return []
-    grouped_kwargs = dict(fsdp_kwargs)
-    grouped_kwargs["reshard_after_forward"] = False
-    fully_shard(leaves, **grouped_kwargs)
-    logger.info_rank0(
-        "grouped nested FSDP leaf: "
-        f"modules={len(leaves)} reshard_after_forward=False mesh={grouped_kwargs.get('mesh')}"
+
+    regular_leaves: List[nn.Module] = []
+    mp_ignored_leaves: List[nn.Module] = []
+    for leaf in leaves:
+        target = mp_ignored_leaves if mp_ignored_classes and isinstance(leaf, mp_ignored_classes) else regular_leaves
+        target.append(leaf)
+
+    groups = (
+        ("default", regular_leaves, fsdp_kwargs),
+        ("mixed_precision_ignored", mp_ignored_leaves, fsdp_kwargs_without_mp),
     )
+    for policy_name, grouped_leaves, base_kwargs in groups:
+        if not grouped_leaves:
+            continue
+        grouped_kwargs = dict(base_kwargs)
+        grouped_kwargs["reshard_after_forward"] = False
+        fully_shard(grouped_leaves, **grouped_kwargs)
+        logger.info_rank0(
+            "grouped nested FSDP leaf: "
+            f"modules={len(grouped_leaves)} policy={policy_name} "
+            f"reshard_after_forward=False mesh={grouped_kwargs.get('mesh')}"
+        )
     return leaves
 
 
@@ -456,11 +475,19 @@ def parallelize_model_fsdp2(
 
     # Bottom-up: wrap every marked gated-norm as one nested group before any
     # decoder-layer ``fully_shard``. Parent layers then skip this group.
-    _fully_shard_grouped_nested_fsdp_leaves(model, fsdp_kwargs)
+    grouped_nested_fsdp_leaves = _fully_shard_grouped_nested_fsdp_leaves(
+        model,
+        fsdp_kwargs,
+        fsdp_kwargs_without_mp,
+        mp_ignored_classes,
+    )
+    grouped_nested_fsdp_leaf_ids = {id(module) for module in grouped_nested_fsdp_leaves}
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
-        layer_mod._fsdp_modules = []
+        layer_mod._fsdp_modules = [
+            sub_mod for sub_mod in layer_mod.modules() if id(sub_mod) in grouped_nested_fsdp_leaf_ids
+        ]
 
         for para in parallel_state.extra_parallel_names:
             # para (e.g. ep, emb) enabled and this layer contains the para module(s)
@@ -490,6 +517,8 @@ def parallelize_model_fsdp2(
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
+                if isinstance(sub_mod, FSDPModule):
+                    continue
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     layer_mod._fsdp_modules.append(sub_mod)

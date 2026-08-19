@@ -17,7 +17,7 @@ def as_balanced_halves(tensor: Tensor) -> Tensor:
     """View local CP shard [B, H, 2S, ...] as [B, H, 2, S, ...]."""
     if tensor.size(2) % 2 != 0:
         raise ValueError(f"Sequence dim must be even for balanced CP, got {tensor.size(2)}.")
-    return tensor.view(tensor.size(0), tensor.size(1), 2, tensor.size(2) // 2, *tensor.shape[3:])
+    return tensor.reshape(tensor.size(0), tensor.size(1), 2, tensor.size(2) // 2, *tensor.shape[3:])
 
 
 def flatten_balanced_halves(tensor: Tensor) -> Tensor:

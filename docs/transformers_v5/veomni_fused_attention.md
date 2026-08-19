@@ -230,7 +230,8 @@ active Ulysses group. Ring CP rejects `skip_ulysses` because a partial Ulysses
 bypass would desynchronize the unified U×CP layout. The FSDP zero-valued ViT
 dummy may skip both Ulysses and CP only while a private scoped sentinel is
 active; that sentinel is entered by `dummy_forward` and restores on exit.
-Public `skip_sequence_parallel` arguments and vision `**kwargs` are rejected.
+Public `skip_sequence_parallel` arguments and the `skip_sequence_parallel`
+vision `**kwargs` flag are rejected.
 FlexAttention fail-closes inside the private scope because a global BlockMask
 is layout-unsafe after skipping Ulysses. Real multimodal or non-causal vision
 CP remains fail-closed.

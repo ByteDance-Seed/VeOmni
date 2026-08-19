@@ -66,10 +66,17 @@ def test_u4_cp2_init_sequence_parallel_groups():
         processes = [
             ctx.Process(target=_worker, args=(rank, world_size, file_name, errors)) for rank in range(world_size)
         ]
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=180)
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
         for process in processes:
-            process.start()
-        for process in processes:
-            process.join(timeout=180)
             assert process.exitcode == 0, f"worker exited with {process.exitcode}"
         for _ in range(world_size):
             err = errors.get(timeout=5)

@@ -10,13 +10,13 @@ from veomni.distributed.context_parallel.ring_attention import (
     ringattn_context_parallel,
 )
 from veomni.distributed.context_parallel.ring_p2p import RingP2P
-from veomni.distributed.context_parallel.sharding import balanced_cp_restore, balanced_cp_slice
+from veomni.distributed.context_parallel.sharding import balanced_cp_slice
 
 
 def _init_gloo(rank: int, world_size: int, file_name: str):
     store = dist.FileStore(file_name, world_size)
     dist.init_process_group("gloo", store=store, rank=rank, world_size=world_size)
-    return dist.distributed_c10d._get_default_group()
+    return dist.group.WORLD
 
 
 def _ring_p2p_worker(rank: int, world_size: int, file_name: str, errors: mp.Queue):
@@ -30,6 +30,27 @@ def _ring_p2p_worker(rank: int, world_size: int, file_name: str, errors: mp.Queu
         ring.wait()
         expected = float((rank - 1 + world_size) % world_size + 1)
         torch.testing.assert_close(recv, torch.full_like(recv, expected))
+
+        # A strided destination must retain its identity and receive through a
+        # temporary contiguous payload.
+        noncontiguous_storage = torch.zeros(4, 2)
+        noncontiguous_recv = noncontiguous_storage[:, 0]
+        assert not noncontiguous_recv.is_contiguous()
+        ring.async_send_recv(send + 10, noncontiguous_recv)
+        ring.wait()
+        torch.testing.assert_close(noncontiguous_recv, torch.full_like(noncontiguous_recv, expected + 10))
+
+        # Packed receive must copy into the caller's original buffers rather
+        # than replacing list entries with views into an internal payload.
+        packed_send = [send[:2] + 20, send.reshape(2, 2) + 30]
+        packed_recv = [torch.zeros_like(packed_send[0]), torch.zeros_like(packed_send[1])]
+        original_recv = tuple(packed_recv)
+        ring.async_send_recv(packed_send, packed_recv)
+        ring.wait()
+        assert all(actual is original for actual, original in zip(packed_recv, original_recv))
+        torch.testing.assert_close(packed_recv[0], torch.full_like(packed_recv[0], expected + 20))
+        torch.testing.assert_close(packed_recv[1], torch.full_like(packed_recv[1], expected + 30))
+
         dist.destroy_process_group()
         errors.put(None)
     except Exception as exc:  # noqa: BLE001 - surface worker failures to parent
@@ -56,9 +77,9 @@ def _attention_worker(rank: int, world_size: int, file_name: str, errors: mp.Que
         dist.broadcast(key, src=0)
         dist.broadcast(value, src=0)
 
-        local_q = balanced_cp_slice(query, cp_size=2, cp_rank=rank, dim=2).detach().requires_grad_(True)
-        local_k = balanced_cp_slice(key, cp_size=2, cp_rank=rank, dim=2).detach().requires_grad_(True)
-        local_v = balanced_cp_slice(value, cp_size=2, cp_rank=rank, dim=2).detach().requires_grad_(True)
+        local_q = balanced_cp_slice(query, cp_size=world_size, cp_rank=rank, dim=2).detach().requires_grad_(True)
+        local_k = balanced_cp_slice(key, cp_size=world_size, cp_rank=rank, dim=2).detach().requires_grad_(True)
+        local_v = balanced_cp_slice(value, cp_size=world_size, cp_rank=rank, dim=2).detach().requires_grad_(True)
 
         local_out = ringattn_context_parallel(
             local_q,
@@ -73,39 +94,32 @@ def _attention_worker(rank: int, world_size: int, file_name: str, errors: mp.Que
         loss = local_out.sum()
         loss.backward()
 
-        gathered = [torch.empty_like(local_out) for _ in range(world_size)]
-        dist.all_gather(gathered, local_out.detach())
-        if rank == 0:
-            ring_full = balanced_cp_restore(torch.cat(gathered, dim=2), cp_size=2, dim=2)
-            dense = dense_causal_attention(query, key, value, softmax_scale=scale)
-            torch.testing.assert_close(ring_full, dense, atol=2e-4, rtol=2e-4)
-
-            # Gradient parity on local shards vs dense sliced grads.
-            query_r = query.detach().requires_grad_(True)
-            key_r = key.detach().requires_grad_(True)
-            value_r = value.detach().requires_grad_(True)
-            dense_out = dense_causal_attention(query_r, key_r, value_r, softmax_scale=scale)
-            dense_out.sum().backward()
+        # Every rank validates its own shard. A rank-local assertion failure
+        # therefore cannot strand a peer in a trailing barrier, and rank-specific
+        # gradient regressions are covered directly.
+        query_r = query.detach().requires_grad_(True)
+        key_r = key.detach().requires_grad_(True)
+        value_r = value.detach().requires_grad_(True)
+        dense_out = dense_causal_attention(query_r, key_r, value_r, softmax_scale=scale)
+        dense_out.sum().backward()
+        torch.testing.assert_close(
+            local_out,
+            balanced_cp_slice(dense_out, cp_size=world_size, cp_rank=rank, dim=2),
+            atol=2e-4,
+            rtol=2e-4,
+        )
+        for local_grad, dense_grad in (
+            (local_q.grad, query_r.grad),
+            (local_k.grad, key_r.grad),
+            (local_v.grad, value_r.grad),
+        ):
             torch.testing.assert_close(
-                local_q.grad,
-                balanced_cp_slice(query_r.grad, cp_size=2, cp_rank=0, dim=2),
-                atol=2e-4,
-                rtol=2e-4,
-            )
-            torch.testing.assert_close(
-                local_k.grad,
-                balanced_cp_slice(key_r.grad, cp_size=2, cp_rank=0, dim=2),
-                atol=2e-4,
-                rtol=2e-4,
-            )
-            torch.testing.assert_close(
-                local_v.grad,
-                balanced_cp_slice(value_r.grad, cp_size=2, cp_rank=0, dim=2),
+                local_grad,
+                balanced_cp_slice(dense_grad, cp_size=world_size, cp_rank=rank, dim=2),
                 atol=2e-4,
                 rtol=2e-4,
             )
 
-        dist.barrier()
         dist.destroy_process_group()
         errors.put(None)
     except Exception as exc:  # noqa: BLE001
@@ -120,10 +134,17 @@ def _run_mp(worker, world_size: int = 2):
         processes = [
             ctx.Process(target=worker, args=(rank, world_size, file_name, errors)) for rank in range(world_size)
         ]
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=120)
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
         for process in processes:
-            process.start()
-        for process in processes:
-            process.join(timeout=120)
             assert process.exitcode == 0, f"worker exited with {process.exitcode}"
         for _ in range(world_size):
             err = errors.get(timeout=5)

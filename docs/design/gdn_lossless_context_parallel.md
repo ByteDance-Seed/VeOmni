@@ -25,17 +25,18 @@ BC8/M1 backend (forward column tile 32, backward time tile 128, replay column
 tile 8); there are no environment-variable backend overrides or silent torch
 fallbacks. GPU model paths reject `kcp` explicitly.
 
-The implementation targets packed text training on Ascend NPU with a
-power-of-two CP size. `state_passing_lossless` and `kcp` are currently supported on Ascend NPU;
-GPU CP remains outside this lossless gate. Planner/CPU distributed-oracle coverage includes
-CP2/4/8/16. Full attention uses causal Ring CP; GDN uses lossless chunk
-ownership plus state passing or KCP. The following GDN inputs fail closed:
-selector without CP, non-packed batches, attention dropout,
-sliding-window/softcap, non-causal or multimodal/cross-attention, `kcp` on GPU,
-a missing hardware-specific fused-attention backend, and `cp_size > 1` without
-an explicit lossless GDN selector for Qwen3.5. The backwards-compatible
-`disabled` selector is the generic Ring/Hybrid CP path for non-GDN causal
-models; Qwen3.5 never silently falls back to it.
+The current CP release targets packed text training on Ascend NPU with a
+power-of-two CP size. CPU execution is reserved for correctness oracles, and
+CUDA CP is unsupported, including the generic Ring/Hybrid path. Planner and CPU
+distributed-oracle coverage includes CP2/4/8/16. Full attention uses causal Ring
+CP; GDN uses lossless chunk ownership plus state passing or KCP. Unsupported GDN
+inputs include selector without CP, non-packed batches, attention dropout,
+sliding-window/softcap, non-causal or multimodal/cross-attention, a missing
+hardware-specific fused-attention backend, and `cp_size > 1` without an explicit
+lossless GDN selector for Qwen3.5. The backwards-compatible `disabled` selector
+disables only the GDN-specific state-passing/KCP algorithm. With `cp_size > 1`,
+it selects generic Ring/Hybrid CP for non-GDN causal models and does not disable
+CP itself; Qwen3.5 never silently falls back to it.
 
 ## Layout contract
 
@@ -80,7 +81,7 @@ communication instead of risking a collective hang.
   `patchgen --check` and must never be edited directly.
 
 The CPU reference attention backend exists only for unit tests. Long-sequence
-training requires a hardware-specific fused-attention backend: VeOmni
-FlashAttention SP on GPU or fusion attention on Ascend NPU. The Ring scheduling
-helpers are adapted from MindSpeed under BSD-3-Clause; source files preserve
-Huawei attribution and identify ByteDance modifications.
+production training in this release requires Ascend fusion attention; CUDA
+FlashAttention CP is not supported. The Ring scheduling helpers are adapted
+from MindSpeed under BSD-3-Clause; source files preserve Huawei attribution and
+identify ByteDance modifications.

@@ -51,7 +51,7 @@ def test_state_receive_preserves_zero_participation_gradient_for_bos_owner():
         plan=plan,
         cp_group=dist.group.WORLD,
         state_template=torch.zeros(1, 1, 1, 1, dtype=torch.float64),
-        participation=physical_input.sum(),
+        participation=physical_input,
     )
     initial_state.sum().backward()
 

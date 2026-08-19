@@ -48,8 +48,8 @@ _PARALLEL_STATE_REGISTRY: Dict[str, "ParallelState"] = {}
 def _validate_context_parallel_device(*, cp_size: int, device_type: str) -> None:
     if cp_size > 1 and device_type not in {"cpu", "npu"}:
         raise NotImplementedError(
-            "Lossless GDN context parallelism is supported on Ascend NPU only; "
-            "CPU is reserved for correctness oracles."
+            "Context parallelism is currently supported on Ascend NPU only; "
+            "CPU is reserved for correctness oracles, and CUDA is not supported."
         )
 
 

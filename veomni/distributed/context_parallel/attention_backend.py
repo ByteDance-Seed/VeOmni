@@ -96,7 +96,7 @@ def torch_attention_forward(
         if q_len != key_exp.size(2):
             raise ValueError(f"Causal torch attention requires equal Q/K lengths, got {q_len} and {key_exp.size(2)}.")
         causal_mask = torch.ones(q_len, q_len, dtype=torch.bool, device=query.device).triu(diagonal=1)
-        scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
+        scores = scores.masked_fill(causal_mask, -torch.inf)
 
     block_max = scores.amax(dim=-1, keepdim=True)
     exp_scores = torch.exp(scores - block_max)
@@ -110,8 +110,8 @@ def torch_attention_forward(
         block_max = torch.where(fully_masked, torch.full_like(block_max, -torch.inf), block_max)
         block_sum = torch.where(fully_masked, torch.zeros_like(block_sum), block_sum)
 
-    softmax_max = _expand_softmax_stats(block_max.to(query.dtype))
-    softmax_sum = _expand_softmax_stats(block_sum.to(query.dtype))
+    softmax_max = _expand_softmax_stats(block_max)
+    softmax_sum = _expand_softmax_stats(block_sum)
     return output, softmax_max, softmax_sum
 
 

@@ -94,7 +94,8 @@ def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     assert out["max_length_k"] == exp_max_length
 
 
-def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, features_two_samples):
+@pytest.mark.parametrize("implementation", ["disabled", "state_passing_lossless", "kcp"])
+def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, features_two_samples, implementation):
     import veomni.data.data_collator as m
 
     monkeypatch.setattr(
@@ -108,7 +109,7 @@ def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, fea
             cp_rank=1,
             ulysses_size=2,
             ulysses_rank=0,
-            gdn_context_parallel_implementation="state_passing_lossless",
+            gdn_context_parallel_implementation=implementation,
         ),
     )
     token_labels = [
@@ -128,18 +129,6 @@ def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, fea
     assert torch.equal(out["linear_attn_cu_seq_lens_q"], torch.tensor([0, 3, 5], dtype=torch.int32))
     assert out["attention_mask"].shape[-1] == 16
     assert torch.equal(out["router_attention_mask"], torch.tensor([[1, 0, 0, 0]], dtype=torch.long))
-
-
-def test_text_collator_refuses_unselected_context_parallel_sharding(monkeypatch):
-    import veomni.data.data_collator as m
-
-    monkeypatch.setattr(
-        m,
-        "get_parallel_state",
-        lambda: _fake_ps(sp_enabled=True, sp_size=2, cp_size=2, cp_rank=0),
-    )
-    with pytest.raises(RuntimeError, match="Refusing to context-shard tokens"):
-        m.MainCollator()
 
 
 def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_samples):

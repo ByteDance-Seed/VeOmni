@@ -66,6 +66,33 @@ def test_portable_affine_reference_matches_batched_reference():
     assert batched.dtype is torch.float32
 
 
+def test_portable_affine_cu_contract_preserves_empty_segments_as_identity():
+    tensors = _inputs(tokens=4)
+    cu_seqlens = torch.tensor([0, 0, 4], dtype=torch.int32)
+
+    summary = local_affine_summary_fused_torch(*tensors, cu_seqlens=cu_seqlens)
+    he, matrix = gdn_kcp_module.unpack_affine_hm(summary, v_dim=3)
+
+    assert summary.shape[0] == 2
+    torch.testing.assert_close(he[0], torch.zeros_like(he[0]), rtol=0, atol=0)
+    expected_identity = torch.eye(4, dtype=torch.float32).expand(2, 4, 4)
+    torch.testing.assert_close(matrix[0], expected_identity, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("cu_seqlens", "message"),
+    [
+        (torch.tensor([0], dtype=torch.int32), "at least two boundaries"),
+        (torch.tensor([0, 3, 2, 4], dtype=torch.int32), "nondecreasing"),
+        (torch.tensor([0, 3], dtype=torch.int32), "end at T=4"),
+        (torch.tensor([0.0, 4.0]), "integer tensor"),
+    ],
+)
+def test_portable_affine_cu_contract_rejects_malformed_metadata(cu_seqlens, message):
+    with pytest.raises(ValueError, match=message):
+        local_affine_summary_fused_torch(*_inputs(tokens=4), cu_seqlens=cu_seqlens)
+
+
 def test_affine_dispatch_is_explicit_and_fail_closed():
     assert resolve_local_affine_impl() == "ttx"
     assert resolve_local_affine_impl("ttx_bc8_m1") == "ttx"
@@ -76,11 +103,13 @@ def test_affine_dispatch_is_explicit_and_fail_closed():
     assert reference.dtype is torch.float32
 
 
-def test_ttx_contract_is_typed_and_does_not_mutate_environment(monkeypatch):
-    names = [name for name in os.environ if name.startswith("VEOMNI_GDN_AFFINE")]
-    before = {name: os.environ[name] for name in names}
+def test_ttx_contract_is_typed_and_does_not_mutate_environment():
+    def _affine_env() -> dict[str, str]:
+        return {name: value for name, value in os.environ.items() if name.startswith("VEOMNI_GDN_AFFINE")}
+
+    before = _affine_env()
     contract = validate_ttx_bc8_m1_contract()
-    after = {name: os.environ[name] for name in names}
+    after = _affine_env()
     assert contract is TTX_BC8_M1_CONFIG
     assert contract.forward_column_tile == 32
     assert contract.backward_time_tile == 128

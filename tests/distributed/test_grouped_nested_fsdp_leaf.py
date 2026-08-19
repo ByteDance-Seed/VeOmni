@@ -86,6 +86,11 @@ class _ToyModel(nn.Module):
             parameter.data.fill_(0.25)
 
 
+class _ToyMixedPrecisionIgnoredModel(_ToyModel):
+    def get_ignore_modules_in_mixed_precision(self) -> tuple[type[nn.Module], ...]:
+        return (_MarkedGatedNorm,)
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -98,12 +103,14 @@ def _full_tensor(value: torch.Tensor) -> torch.Tensor:
     return value.detach().cpu()
 
 
-def _wrap(model: _ToyModel) -> nn.Module:
+def _wrap(model: _ToyModel, mixed_precision: MixedPrecisionConfig | None = None) -> nn.Module:
+    if mixed_precision is None:
+        mixed_precision = MixedPrecisionConfig(enable=False)
     return build_parallelize_model(
         model,
         init_device="meta",
         weights_path=None,
-        mixed_precision=MixedPrecisionConfig(enable=False),
+        mixed_precision=mixed_precision,
         enable_gradient_checkpointing=False,
         basic_modules=[],
         enable_forward_prefetch=False,
@@ -125,7 +132,12 @@ def test_collector_preserves_cp_off_and_state_passing_layout() -> None:
     assert _iter_grouped_nested_fsdp_leaves(_ToyModel(marked=True, implementation="state_passing_lossless")) == []
 
 
-def _run_grouped_matches_parent_fsdp(rank: int, world_size: int, port: int) -> None:
+def _run_grouped_matches_parent_fsdp(
+    rank: int,
+    world_size: int,
+    port: int,
+    ignore_marked_in_mixed_precision: bool,
+) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
@@ -140,13 +152,28 @@ def _run_grouped_matches_parent_fsdp(rank: int, world_size: int, port: int) -> N
             name="grouped_nested_fsdp_leaf",
         )
         torch.manual_seed(17)
-        reference = _wrap(_ToyModel(marked=False))
-        candidate = _wrap(_ToyModel(marked=True, implementation="kcp"))
+        if ignore_marked_in_mixed_precision:
+            model_cls = _ToyMixedPrecisionIgnoredModel
+            mixed_precision = MixedPrecisionConfig(
+                enable=True,
+                param_dtype=None,
+                reduce_dtype=None,
+                output_dtype=None,
+                cast_forward_inputs=False,
+            )
+            reference_model = model_cls(marked=True, implementation="disabled")
+        else:
+            model_cls = _ToyModel
+            mixed_precision = MixedPrecisionConfig(enable=False)
+            reference_model = model_cls(marked=False)
+        reference = _wrap(reference_model, mixed_precision)
+        candidate = _wrap(model_cls(marked=True, implementation="kcp"), mixed_precision)
 
         marked = [module for module in candidate.modules() if getattr(module, GROUPED_NESTED_FSDP_LEAF_ATTR, False)]
         assert len(marked) == 2
         assert all(isinstance(module, FSDPModule) for module in marked)
         assert all(isinstance(layer, FSDPModule) for layer in candidate.layers)
+        assert all(layer.norm in layer._fsdp_modules for layer in candidate.layers)
 
         seen_types: list[str] = []
 
@@ -203,7 +230,17 @@ def test_grouped_nested_leaf_matches_parent_fsdp_cpu2() -> None:
     world_size = 2
     mp.spawn(
         _run_grouped_matches_parent_fsdp,
-        args=(world_size, _free_port()),
+        args=(world_size, _free_port(), False),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def test_grouped_nested_leaf_respects_mixed_precision_ignore_cpu2() -> None:
+    world_size = 2
+    mp.spawn(
+        _run_grouped_matches_parent_fsdp,
+        args=(world_size, _free_port(), True),
         nprocs=world_size,
         join=True,
     )

@@ -172,3 +172,4 @@ def test_chunk_alignment_preserves_state_inputs_and_unpads_outputs():
     participation = make_state_participation(q_pad, k_pad, v_pad, g_pad, beta_pad)
     participation.backward()
     assert query.grad is not None
+    torch.testing.assert_close(query.grad, torch.zeros_like(query), rtol=0, atol=0)

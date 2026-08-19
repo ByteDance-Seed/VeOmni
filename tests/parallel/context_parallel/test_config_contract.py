@@ -106,11 +106,12 @@ def test_combined_cp_ulysses_malformed_sp_mesh_fails_closed():
         _ = state.sp_rank
 
 
-def test_gdn_context_parallel_rejects_cuda_topology_before_mesh_initialization():
+@pytest.mark.parametrize("implementation", ["disabled", "state_passing_lossless", "kcp"])
+def test_context_parallel_rejects_cuda_topology_before_mesh_initialization(implementation):
     with pytest.raises(NotImplementedError, match="supported on Ascend NPU only"):
         ParallelState(
             cp_size=2,
-            gdn_context_parallel_implementation="state_passing_lossless",
+            gdn_context_parallel_implementation=implementation,
             device_type="cuda",
         )
 

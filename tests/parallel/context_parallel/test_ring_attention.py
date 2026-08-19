@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+from veomni.distributed.context_parallel.attention_backend import torch_attention_forward
+from veomni.distributed.context_parallel.causal_schedule import as_balanced_halves
 from veomni.distributed.context_parallel.ring_attention import (
     _resolve_backend,
     _validate_packed_cu_seqlens,
@@ -72,6 +74,32 @@ def test_balanced_local_shards_cover_full_sequence_without_overlap():
     # Rank0 = c0||c3, Rank1 = c1||c2
     torch.testing.assert_close(shards[0][0, 0, :, 0], torch.cat((torch.arange(0, 16), torch.arange(48, 64))))
     torch.testing.assert_close(shards[1][0, 0, :, 0], torch.cat((torch.arange(16, 32), torch.arange(32, 48))))
+
+
+def test_balanced_halves_accepts_noncontiguous_input():
+    tensor = torch.arange(1 * 2 * 8 * 6).reshape(1, 2, 8, 6)[..., ::2]
+    assert not tensor.is_contiguous()
+    torch.testing.assert_close(as_balanced_halves(tensor), as_balanced_halves(tensor.contiguous()))
+
+
+def test_torch_attention_keeps_online_softmax_statistics_in_fp32():
+    torch.manual_seed(2)
+    query = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+    key = torch.randn(1, 1, 4, 8, dtype=torch.bfloat16)
+    value = torch.randn(1, 1, 4, 8, dtype=torch.bfloat16)
+
+    output, softmax_max, softmax_sum = torch_attention_forward(
+        query,
+        key,
+        value,
+        softmax_scale=8**-0.5,
+        causal=True,
+    )
+
+    assert output.dtype is torch.bfloat16
+    assert softmax_max.dtype is torch.float32
+    assert softmax_sum.dtype is torch.float32
+    assert torch.isfinite(output).all()
 
 
 def test_ring_backend_selection_fails_closed():

@@ -317,6 +317,7 @@ class _StateReceive(torch.autograd.Function):
         ctx.group = group
         ctx.observer = observer
         ctx.participation_dtype = participation.dtype
+        ctx.participation_shape = participation.shape
         if predecessor is None:
             ctx.received = False
             output = torch.zeros_like(template)
@@ -333,7 +334,7 @@ class _StateReceive(torch.autograd.Function):
                 raise
             if observer is not None:
                 observer.exit(GdnCpOperation.STATE_P2P_RECV, GdnCpPhase.FORWARD, peer_rank=predecessor)
-        return output + participation.to(dtype=output.dtype) * 0
+        return output + participation.sum().to(dtype=output.dtype) * 0
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[None, Tensor, None, None, None]:
@@ -352,7 +353,7 @@ class _StateReceive(torch.autograd.Function):
                 raise
             if ctx.observer is not None:
                 ctx.observer.exit(GdnCpOperation.STATE_P2P_RECV, GdnCpPhase.BACKWARD, peer_rank=ctx.predecessor)
-        participation_grad = grad_output.new_zeros((), dtype=ctx.participation_dtype)
+        participation_grad = grad_output.new_zeros(ctx.participation_shape, dtype=ctx.participation_dtype)
         return None, participation_grad, None, None, None
 
 
@@ -627,7 +628,7 @@ class _HaloReceive(torch.autograd.Function):
                 observer.exit(GdnCpOperation.HALO_P2P_RECV, GdnCpPhase.FORWARD, peer_rank=source)
         else:
             output = torch.zeros_like(template)
-        return output + participation.to(dtype=output.dtype) * 0
+        return output + participation.sum().to(dtype=output.dtype) * 0
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[None, None, None, None, None]:
@@ -734,7 +735,8 @@ def exchange_conv_halo(
         [torch.cat((halo, sample), dim=sequence_dim) for halo, sample in zip(received_parts, sample_tensors)],
         dim=sequence_dim,
     ).contiguous()
-    with_halo = with_halo + sent[(0,) * sent.ndim].to(dtype=with_halo.dtype) * 0
+    if sent.numel():
+        with_halo = with_halo + sent[(0,) * sent.ndim].to(dtype=with_halo.dtype) * 0
     halo_lengths = [length + halo_width for length in lengths]
     cu_with_halo = owned.new_tensor([0] + halo_lengths, dtype=torch.int32).cumsum(0)
     return with_halo, cu_with_halo

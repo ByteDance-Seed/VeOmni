@@ -100,9 +100,18 @@ def _prepare_affine_inputs(
     else:
         if bsz != 1:
             raise ValueError("varlen affine summary expects batch=1 packed layout")
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+            raise ValueError("affine summary cu_seqlens must be 1D with at least two boundaries")
+        if cu_seqlens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("affine summary cu_seqlens must be an integer tensor")
         pts = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
-        if not pts or pts[0] != 0:
+        if pts[0] != 0:
             raise ValueError(f"cu_seqlens must start at 0, got {pts[:3]}")
+        if any(right < left for left, right in zip(pts, pts[1:])):
+            raise ValueError(f"affine summary cu_seqlens must be nondecreasing, got {pts}")
+        token_count = int(k.shape[1])
+        if pts[-1] != token_count:
+            raise ValueError(f"affine summary cu_seqlens must end at T={token_count}, got {pts[-3:]}")
         ranges = [(0, pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
     return k, v, gg, bb, ranges
 
