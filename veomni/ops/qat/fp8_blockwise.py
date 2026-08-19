@@ -75,13 +75,7 @@ def _check_operand(tensor: torch.Tensor, scale_fmt: str | None, what: str) -> No
 class _Fp8FakeQuantAct(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, block_size: int, scale_fmt: str | None) -> torch.Tensor:
-        # `act_quant(inplace=True)` writes its dequantized result back into the
-        # tensor it is handed, so it must never see a tensor the autograd graph
-        # still refers to. `.contiguous()` is not a substitute: it is a no-op on
-        # an already-contiguous input and would hand over that very tensor.
-        # Asking clone for contiguous memory also saves the copy `act_quant`
-        # would otherwise make of a transposed or sliced input.
-        return act_quant(x.detach().clone(memory_format=torch.contiguous_format), block_size, scale_fmt, inplace=True)
+        return act_quant(x.detach(), block_size, scale_fmt, dequant=True)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
@@ -91,12 +85,7 @@ class _Fp8FakeQuantAct(torch.autograd.Function):
 class _Fp8FakeQuantWeight(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight: torch.Tensor, block_size: int, scale_fmt: str | None) -> torch.Tensor:
-        quantized, scales = fp8_weight_quant(weight.detach(), block_size, scale_fmt)
-        rows, cols = weight.shape
-        # The product is taken in FP32, as the inference dequantization does:
-        # accumulating an FP8 value against a BF16 scale would round twice.
-        tiles = quantized.float().view(rows // block_size, block_size, cols // block_size, block_size)
-        return (tiles * scales[:, None, :, None]).view(rows, cols).to(weight.dtype)
+        return fp8_weight_quant(weight.detach(), block_size, scale_fmt, dequant=True)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
@@ -212,11 +201,6 @@ def qat_linear(
     plain ``F.linear`` -- DeepSeek-V4's grouped output projection runs a
     ``bmm`` over reshaped weights -- keep their arithmetic.
 
-    The fake-quantized weight is a fresh tensor that the GEMM saves for
-    backward, so unlike the real parameter it is not something FSDP2 can
-    reshard after forward. Enable activation checkpointing on the enclosing
-    block, or peak memory grows by one weight copy per wrapped linear.
-
     Args:
         linear: Any module exposing a ``weight`` parameter, typically an
             ``nn.Linear`` or a subclass of one.
@@ -230,11 +214,6 @@ def qat_linear(
     """
     if not enabled:
         return linear(x)
-    # `functional_call` substitutes by name and ignores names it does not find,
-    # so a module that exposes `weight` as anything other than its own
-    # parameter -- a LoRA or quantization wrapper delegating to a child, a
-    # property -- would quantize a tensor and then run the GEMM unquantized
-    # anyway. Silent no-op QAT is worse than no QAT, so refuse.
     if "weight" not in linear._parameters:
         raise TypeError(f"{type(linear).__name__} does not own a 'weight' parameter, so it cannot be fake-quantized")
     if quantize_activation:

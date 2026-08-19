@@ -52,7 +52,7 @@ def _reference_scale(amax, scale_fmt):
     is insensitive to that, but the unrounded path is not, so the stand-in has
     to multiply rather than divide.
 
-    `fast_round_scale` (act_quant.py:75) reads the exponent straight off the
+    `fast_round_scale` (quant.py:75) reads the exponent straight off the
     FP32 bit pattern instead of calling `log2`/`ceil`, so do the same here
     rather than rely on the library's rounding agreeing.
     """
@@ -65,12 +65,12 @@ def _reference_scale(amax, scale_fmt):
     return ((log2_ceil + 127) << 23).view(torch.float32)
 
 
-def _reference_act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, inplace=False):
+def _reference_act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, dequant=False):
     """Torch stand-in for `veomni.ops.kernels.deepseek_v4.act_quant`.
 
-    Reproduces the contract, not just the numbers: `inplace=True` overwrites the
-    caller's tensor and hands the very same object back, which is the behaviour
-    `fp8_blockwise` has to defend the autograd graph against.
+    Reproduces the contract, not just the numbers: `dequant=True` fuses the
+    dequantizing FP32 product and returns a fresh tensor, reading its operand
+    without writing to it.
     """
     features = x.shape[-1]
     assert features % block_size == 0
@@ -78,23 +78,29 @@ def _reference_act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.fl
     amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4)
     scales = _reference_scale(amax, scale_fmt)
     quantized = (blocks / scales).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    if inplace:
-        x.copy_((quantized.float() * scales).reshape(x.shape).to(x.dtype))
-        return x
+    if dequant:
+        return (quantized.float() * scales).reshape(x.shape).to(x.dtype)
     return (
         quantized.reshape(x.shape),
         scales.reshape(*x.shape[:-1], features // block_size).to(scale_dtype),
     )
 
 
-def _reference_fp8_weight_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32):
-    """Torch stand-in for `veomni.ops.kernels.deepseek_v4.fp8_weight_quant`."""
+def _reference_fp8_weight_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, dequant=False):
+    """Torch stand-in for `veomni.ops.kernels.deepseek_v4.fp8_weight_quant`.
+
+    Reproduces the contract, not just the numbers: ``dequant=True`` fuses the
+    dequantizing FP32 product and returns a fresh BF16 tensor, reading its
+    operand without writing to it.
+    """
     assert x.dim() == 2 and x.dtype == torch.bfloat16
     rows, cols = x.shape
     tiles = x.float().contiguous().view(rows // block_size, block_size, cols // block_size, block_size)
     amax = tiles.abs().amax(dim=(1, 3)).clamp_min(1e-4)
     scales = _reference_scale(amax, scale_fmt)
     quantized = (tiles / scales[:, None, :, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    if dequant:
+        return (quantized.float() * scales[:, None, :, None]).view(rows, cols).to(x.dtype)
     return quantized.view(rows, cols), scales.to(scale_dtype)
 
 
@@ -114,8 +120,7 @@ def reference_quantizers(monkeypatch):
 
 
 def _act_qdq(x, block_size=128, round_scale=True):
-    quantized = _reference_act_quant(x.clone(), block_size, "ue8m0" if round_scale else None, inplace=True)
-    return quantized
+    return _reference_act_quant(x, block_size, "ue8m0" if round_scale else None, dequant=True)
 
 
 def _weight_qdq(weight, block_size=128, round_scale=True):
@@ -231,9 +236,9 @@ def test_fake_quant_act_dequantizes_in_place_of_its_input(reference_quantizers):
 
 
 def test_fake_quant_act_leaves_its_input_untouched(reference_quantizers):
-    # `act_quant(inplace=True)` overwrites the tensor it is handed. Feeding it
-    # the graph's own activation would corrupt every other consumer of that
-    # tensor, so the wrapper has to hand it a copy.
+    # The wrapper asks for `dequant=True` precisely because the in-place mode
+    # would overwrite the tensor it is handed, and that tensor is the graph's own
+    # activation -- every other consumer of it would read quantized values.
     torch.manual_seed(4)
     x = torch.randn(4, 256, dtype=torch.bfloat16, requires_grad=True)
     original = x.detach().clone()
@@ -308,6 +313,32 @@ def test_fake_quant_weight_dequantizes_each_tile_with_its_own_scale(reference_qu
     assert actual.shape == weight.shape
     assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, _weight_qdq(weight), rtol=0, atol=0)
+
+
+def test_fake_quant_weight_leaves_its_input_untouched(reference_quantizers):
+    # The tensor reaching this wrapper is a live parameter, so the fused
+    # quantizer must read it and write elsewhere. Getting this wrong would
+    # rewrite the master weight mid-step rather than fail.
+    torch.manual_seed(10)
+    weight = torch.randn(128, 256, dtype=torch.bfloat16, requires_grad=True)
+    original = weight.detach().clone()
+
+    quantized = fp8_fake_quant_weight(weight)
+
+    assert torch.equal(weight.detach(), original)
+    assert quantized.data_ptr() != weight.data_ptr()
+    assert not torch.equal(quantized.detach(), original)
+
+
+def test_fake_quant_weight_accepts_a_non_contiguous_weight(reference_quantizers):
+    # A transposed weight reaches the quantizer from layers that store their
+    # projection the other way round; the clone has to normalize the layout
+    # rather than let the kernel reinterpret the strides.
+    torch.manual_seed(10)
+    weight = torch.randn(256, 128, dtype=torch.bfloat16).t()
+    assert not weight.is_contiguous()
+
+    torch.testing.assert_close(fp8_fake_quant_weight(weight), _weight_qdq(weight), rtol=0, atol=0)
 
 
 def test_fake_quant_weight_passes_the_gradient_straight_through(reference_quantizers):
@@ -486,8 +517,8 @@ def test_reference_quantizers_match_the_tilelang_kernels():
 
     for block_size in (64, 128):
         for scale_fmt in (None, "ue8m0"):
-            actual = act_quant(x.clone(), block_size, scale_fmt, inplace=True)
-            expected = _reference_act_quant(x.clone(), block_size, scale_fmt, inplace=True)
+            actual = act_quant(x, block_size, scale_fmt, dequant=True)
+            expected = _reference_act_quant(x, block_size, scale_fmt, dequant=True)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
             quantized, scales = act_quant(x, block_size, scale_fmt)
