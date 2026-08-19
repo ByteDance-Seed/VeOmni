@@ -382,6 +382,8 @@ class DeepseekV4CheckpointTensorConverter:
         config = model.config
         fqn_to_index_mapping = model._veomni_fqn_to_index_mapping
         expert_dtype = config.expert_dtype
+        scale_fmt = "ue8m0"
+        scale_dtype = torch.float8_e8m0fnu if expert_dtype == "fp4" else torch.float32
         export_weight_names = set()
         for name, param in export_weights(model):
             # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
@@ -408,9 +410,6 @@ class DeepseekV4CheckpointTensorConverter:
 
             # 4. quantize the weight
             fp4_quantize = "ffn.experts." in origin and expert_dtype == "fp4"
-            scale_fmt, scale_dtype = (
-                ("ue8m0", torch.float8_e8m0fnu) if expert_dtype == "fp4" else (None, torch.float32)
-            )
             param = param.to(torch.bfloat16)
             if fp4_quantize:
                 weight, scale = fp4_act_quant(param, block_size=32, inplace=False)
