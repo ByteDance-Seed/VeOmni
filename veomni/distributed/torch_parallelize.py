@@ -70,6 +70,108 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
         materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
 
 
+def _materialize_and_load_weights(
+    model: nn.Module,
+    weights_path: Optional[str],
+    materialize_device: str,
+    *,
+    should_skip_hf_weight_load: bool,
+    is_peft_model: bool,
+    adapter_path: Optional[str],
+    broadcast_from_rank0: bool,
+    cpu_load_param_name: Optional[List[str]] = None,
+    max_load_broadcast_size: float = 20.0,
+    fqn_to_index_mapping: Optional[dict] = None,
+    ep_sharded_stream_load: bool = False,
+) -> None:
+    """Move meta-initialized parameters onto a real device and fill them in.
+
+    Shared by the FSDP2 and DDP paths: both build the model on ``meta`` and are
+    the only place that materializes it, so the choice between random init, an
+    HF snapshot and a checkpoint resume has to be made identically for each.
+    """
+    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
+    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
+    # and still need the HF base weights.
+    if should_skip_hf_weight_load and is_peft_model:
+        raise ValueError(
+            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
+            "trainable-only and the frozen base must still be loaded from weights_path."
+        )
+
+    if weights_path is None or should_skip_hf_weight_load:
+        if should_skip_hf_weight_load:
+            logger.info_rank0(
+                "Skipping pretrained weight load for checkpoint resume; "
+                "parameters will be restored from the distributed checkpoint."
+            )
+        if should_skip_hf_weight_load:
+            _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        else:
+            model.to_empty(device=materialize_device)
+        _reset_hf_initialized_flag(model)
+        # Random init is unnecessary when the checkpoint will overwrite every parameter.
+        if not should_skip_hf_weight_load:
+            model.init_weights()
+        return
+
+    from torch.distributed.tensor import distribute_tensor
+
+    logger.info_rank0(f"starting to load model weights from {weights_path}...")
+    if is_peft_model:
+        if adapter_path is not None:
+            logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
+        else:
+            logger.info_rank0("also init peft model lora weights...")
+
+    if broadcast_from_rank0:
+        logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
+        rank0_load_and_broadcast_weights(
+            model,
+            weights_path,
+            materialize_device,
+            dtensor_factory=distribute_tensor,
+            cpu_load_param_name=cpu_load_param_name,
+            max_load_broadcast_size=max_load_broadcast_size,
+            is_peft_model=is_peft_model,
+            adapter_path=adapter_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
+        )
+    else:
+        _dt_local_split = partial(distribute_tensor, src_data_rank=None)
+        if ep_sharded_stream_load:
+            # Opt-in fast/low-memory path for large MoE checkpoints: each rank
+            # reads only its ExtraParallel dim-0 slice of the expert tensors
+            # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
+            # Only valid on the every-rank-reads (non-broadcast) path. An
+            # unsupported model/checkpoint raises ``NotImplementedError``, which we
+            # surface directly rather than silently falling back -- an opt-in flag
+            # that quietly degrades is hard to reason about, so fail early instead.
+            logger.info_rank0(
+                "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
+            )
+            load_model_weights_ep_sharded(
+                model,
+                weights_path,
+                materialize_device,
+                dtensor_factory=_dt_local_split,
+                is_peft_model=is_peft_model,
+                adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+            )
+        else:
+            logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
+            load_model_weights(
+                model,
+                weights_path,
+                materialize_device,
+                dtensor_factory=_dt_local_split,
+                is_peft_model=is_peft_model,
+                adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+            )
+
+
 def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
     """``fully_shard(..., shard_placement_fn=...)`` hook: shard on a model-chosen
     dimension instead of the FSDP2 default ``Shard(0)``.
@@ -493,88 +595,19 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
-    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
-    # and still need the HF base weights.
-    is_peft_model = kwargs.pop("is_peft_model", False)
-    adapter_path = kwargs.pop("adapter_path", None)
-    if should_skip_hf_weight_load and is_peft_model:
-        raise ValueError(
-            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
-            "trainable-only and the frozen base must still be loaded from weights_path."
-        )
-
-    if weights_path is None or should_skip_hf_weight_load:
-        if should_skip_hf_weight_load:
-            logger.info_rank0(
-                "Skipping pretrained weight load for checkpoint resume; "
-                "parameters will be restored from the distributed checkpoint."
-            )
-        if should_skip_hf_weight_load:
-            _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
-        else:
-            model.to_empty(device=materialize_device)
-        _reset_hf_initialized_flag(model)
-        # Random init is unnecessary when the checkpoint will overwrite every parameter.
-        if not should_skip_hf_weight_load:
-            model.init_weights()
-    else:
-        from torch.distributed.tensor import distribute_tensor
-
-        logger.info_rank0(f"starting to load model weights from {weights_path}...")
-        if is_peft_model:
-            if adapter_path is not None:
-                logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
-            else:
-                logger.info_rank0("also init peft model lora weights...")
-
-        fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
-        if kwargs.get("broadcast_model_weights_from_rank0"):
-            logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_weights(
-                model,
-                weights_path,
-                materialize_device,
-                dtensor_factory=distribute_tensor,
-                cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
-                max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
-                is_peft_model=is_peft_model,
-                adapter_path=adapter_path,
-                fqn_to_index_mapping=fqn_to_index_mapping,
-            )
-        else:
-            _dt_local_split = partial(distribute_tensor, src_data_rank=None)
-            if kwargs.get("ep_sharded_stream_load"):
-                # Opt-in fast/low-memory path for large MoE checkpoints: each rank
-                # reads only its ExtraParallel dim-0 slice of the expert tensors
-                # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
-                # Only valid on the every-rank-reads (non-broadcast) path. An
-                # unsupported model/checkpoint raises ``NotImplementedError``, which we
-                # surface directly rather than silently falling back -- an opt-in flag
-                # that quietly degrades is hard to reason about, so fail early instead.
-                logger.info_rank0(
-                    "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
-                )
-                load_model_weights_ep_sharded(
-                    model,
-                    weights_path,
-                    materialize_device,
-                    dtensor_factory=_dt_local_split,
-                    is_peft_model=is_peft_model,
-                    adapter_path=adapter_path,
-                    fqn_to_index_mapping=fqn_to_index_mapping,
-                )
-            else:
-                logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-                load_model_weights(
-                    model,
-                    weights_path,
-                    materialize_device,
-                    dtensor_factory=_dt_local_split,
-                    is_peft_model=is_peft_model,
-                    adapter_path=adapter_path,
-                    fqn_to_index_mapping=fqn_to_index_mapping,
-                )
+    _materialize_and_load_weights(
+        model,
+        weights_path,
+        materialize_device,
+        should_skip_hf_weight_load=should_skip_hf_weight_load,
+        is_peft_model=kwargs.pop("is_peft_model", False),
+        adapter_path=kwargs.pop("adapter_path", None),
+        broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+        cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+        max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+        fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
+    )
 
     if materialize_device == "cpu":
         _move_buffers_to_device(model, get_device_type())
@@ -585,6 +618,73 @@ def parallelize_model_fsdp2(
     model.clip_grad_norm_ = types.MethodType(clip_grad_norm_fn, model)
 
     return model
+
+
+def parallelize_model_ddp(
+    model: "nn.Module",
+    weights_path: Optional[str] = None,
+    should_skip_hf_weight_load: bool = False,
+    **kwargs,
+) -> "nn.Module":
+    """Replicate the model with DDP, materializing it first under meta-init.
+
+    DDP keeps a full replica of plain tensors per rank: it registers gradient
+    hooks and broadcasts rank0's parameters at construction, but it neither
+    materializes meta parameters nor loads weights. Under ``init_device="meta"``
+    nothing else does either — ``build_model`` returns an empty model and
+    ``BaseTrainer`` has no load step of its own — so the wrap used to reach DDP's
+    constructor with meta parameters and die there on ``Tensor.item()``. The
+    other init devices arrive with real weights already loaded by the model
+    builder, so they must not be touched here.
+    """
+    parallel_state = get_parallel_state()
+
+    # Only fsdp2 applies the ExtraParallel plan that shards expert weights, so a
+    # DDP module's experts are whole. Refuse rather than load full tensors into a
+    # model whose config says they are sharded -- until now the meta crash below
+    # hid this combination.
+    if parallel_state.any_extra_parallel_enabled:
+        raise RuntimeError(
+            "ExtraParallel (ep) requires fsdp_mode='fsdp2'; DDP does not apply the parallel plan that shards experts."
+        )
+    if kwargs.get("ep_sharded_stream_load"):
+        raise RuntimeError("train.ep_sharded_stream_load requires fsdp_mode='fsdp2'; DDP experts are not sharded.")
+
+    if kwargs.get("init_device") == "meta":
+        _materialize_and_load_weights(
+            model,
+            weights_path,
+            get_device_type(),
+            should_skip_hf_weight_load=should_skip_hf_weight_load,
+            is_peft_model=kwargs.pop("is_peft_model", False),
+            adapter_path=kwargs.pop("adapter_path", None),
+            # ``broadcast_model_weights_from_rank0`` is fsdp2-only and the
+            # arguments layer already warns that it is ignored otherwise.
+            broadcast_from_rank0=False,
+            cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+            fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+        )
+
+    # ``init_device`` is not the only way to end up on meta: with ``cpu`` every
+    # rank but 0 builds empty and skips the load (``veomni/models/loader.py``).
+    # Say so here instead of letting DDP's constructor report ``Tensor.item()``.
+    if any(param.is_meta for param in model.parameters()):
+        raise RuntimeError(
+            f"DDP received unmaterialized parameters with init_device={kwargs.get('init_device')!r}. "
+            "Use init_device='meta' or 'cuda'/'npu' for fsdp_mode='ddp'."
+        )
+
+    # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
+    # module's buffer semantics must not change with the ``fsdp_mode`` a config
+    # happened to pick. Nothing is lost: rank0's copy is either identical to the
+    # others or, for dynamic-rope ``inv_freq``, wrong for them. See constraint 7a
+    # in `.agents/knowledge/constraints.md`.
+    return DDP(
+        model,
+        device_ids=[parallel_state.local_rank],
+        process_group=parallel_state.dp_group,
+        broadcast_buffers=False,
+    )
 
 
 def build_parallelize_model(
@@ -670,7 +770,12 @@ def build_parallelize_model(
         else:
             if compile_config.enable:
                 raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
-            model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+            model = parallelize_model_ddp(
+                model=model,
+                weights_path=weights_path,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
+                **kwargs,
+            )
     elif compile_config.enable:
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
 
