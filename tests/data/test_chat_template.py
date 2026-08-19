@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from veomni.data.chat_template import (
@@ -168,9 +170,12 @@ def test_one_registry_holds_both_template_kinds(template_name, is_multimodal):
 
 
 def test_build_chat_template_builds_both_kinds():
-    # One build function now covers both, so each trainer keeps calling it with
-    # whatever its config names.
-    assert isinstance(build_chat_template("qwen3vl", _VisionTokenizer()), MultimodalChatTemplate)
+    # One build function covers both, taking whatever the caller's modality has:
+    # the VLM trainer holds a processor, the text trainers only a tokenizer.
+    multimodal = build_chat_template("qwen3vl", _Processor(_VisionTokenizer()))
+    assert isinstance(multimodal, MultimodalChatTemplate)
+    assert multimodal.tokenizer is multimodal.processor.tokenizer
+
     assert not isinstance(build_chat_template("chatml", _VisionTokenizer()), MultimodalChatTemplate)
 
 
@@ -214,6 +219,18 @@ class _SpecialTokenTokenizer:
         return ids
 
 
+class _Processor:
+    """The minimum a multimodal template reads off a processor.
+
+    Real processors carry the tokenizer and the video grid parameters together,
+    which is why templates take one instead of a bare tokenizer.
+    """
+
+    def __init__(self, tokenizer, temporal_patch_size=2):
+        self.tokenizer = tokenizer
+        self.video_processor = SimpleNamespace(temporal_patch_size=temporal_patch_size)
+
+
 def _video_metadata(total_num_frames, fps=2.0, frames_indices=None):
     from transformers.video_utils import VideoMetadata
 
@@ -232,7 +249,7 @@ def test_qwen3vl_emits_one_video_placeholder_per_processor_token(num_frames, num
     # The vision tower produces exactly num_video_tokens embeddings, and
     # process_sample_qwen_vl builds video_mask from these placeholder positions.
     # Any shortfall silently misaligns visual features against text positions.
-    template = build_chat_template("qwen3vl", _SpecialTokenTokenizer())
+    template = build_chat_template("qwen3vl", _Processor(_SpecialTokenTokenizer()))
 
     encoded = template.encode_messages(
         [("user", ("video", None))],
@@ -250,7 +267,7 @@ def test_qwen3vl_rejects_a_video_token_count_it_cannot_lay_out_evenly(num_frames
     # from video_grid_thw, so it only matches the processor while the two agree.
     # Flooring the split would emit fewer placeholders than there are embeddings
     # and misalign every visual feature after the shortfall, silently.
-    template = build_chat_template("qwen3vl", _SpecialTokenTokenizer())
+    template = build_chat_template("qwen3vl", _Processor(_SpecialTokenTokenizer()))
 
     with pytest.raises(ValueError, match="divide evenly"):
         template.encode_messages(
@@ -265,7 +282,7 @@ def test_qwen3vl_rejects_a_video_token_count_it_cannot_lay_out_evenly(num_frames
 def test_encode_messages_names_the_modality_whose_counts_ran_out(template_name, modality):
     # Bare StopIteration from inside a dataloader worker gives no clue which
     # modality was short.
-    template = build_chat_template(template_name, _SpecialTokenTokenizer())
+    template = build_chat_template(template_name, _Processor(_SpecialTokenTokenizer()))
 
     with pytest.raises(ValueError, match=f"{modality.capitalize()} token number is missing"):
         template.encode_messages(
@@ -281,7 +298,7 @@ def test_qwen3vl_does_not_pad_the_caller_video_metadata():
     metadata = _video_metadata(15)
     frames_indices_before = list(metadata.frames_indices)
 
-    template = build_chat_template("qwen3vl", _SpecialTokenTokenizer())
+    template = build_chat_template("qwen3vl", _Processor(_SpecialTokenTokenizer()))
     template.encode_messages([("user", ("video", None))], {"video": [128]}, video_metadata=[metadata])
 
     assert list(metadata.frames_indices) == frames_indices_before
@@ -289,7 +306,7 @@ def test_qwen3vl_does_not_pad_the_caller_video_metadata():
 
 @pytest.mark.parametrize("num_image_tokens", [1, 7, 64])
 def test_qwen2vl_emits_one_image_placeholder_per_processor_token(num_image_tokens):
-    template = build_chat_template("qwen2vl", _SpecialTokenTokenizer())
+    template = build_chat_template("qwen2vl", _Processor(_SpecialTokenTokenizer()))
 
     encoded = template.encode_messages([("user", ("image", None))], {"image": [num_image_tokens]})
 
@@ -302,7 +319,7 @@ def test_input_ids_carry_no_negative_id_other_than_the_input_sentinels(template_
     # process_sample_qwen_vl only zeroes the input sentinels, so any other
     # negative id survives into the embedding lookup. An image in an assistant
     # turn used to produce one.
-    template = build_chat_template(template_name, _SpecialTokenTokenizer())
+    template = build_chat_template(template_name, _Processor(_SpecialTokenTokenizer()))
 
     encoded = template.encode_messages(
         [("user", ("text", "draw a cat")), ("assistant", ("image", None))],
@@ -313,49 +330,52 @@ def test_input_ids_carry_no_negative_id_other_than_the_input_sentinels(template_
     assert negatives <= {TYPE2INDEX["input"]["image"], TYPE2INDEX["input"]["video"]}
 
 
-def test_qwen3vl_chunks_time_the_way_the_caller_patched_it():
-    # 8 frames patched by 4 gives 2 chunks, not the default 2 -> 4 chunks. Getting
-    # this from the processor matters for models that reuse the qwen3vl template
-    # without sharing its temporal_patch_size.
-    template = build_chat_template("qwen3vl", _SpecialTokenTokenizer())
+def test_qwen3vl_leaves_the_video_processor_alone_without_video():
+    # The grid parameter is only meaningful for video, and a processor built for
+    # an image-only model has no video side to read it from.
+    class _ImageOnlyProcessor:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    template = build_chat_template("qwen3vl", _ImageOnlyProcessor(_SpecialTokenTokenizer()))
+
+    encoded = template.encode_messages(
+        [("user", ("image", None), ("text", "what is this"))],
+        {"image": [4]},
+    )
+
+    assert int((encoded["input_ids"] == TYPE2INDEX["input"]["image"]).sum()) == 4
+
+
+@pytest.mark.parametrize("temporal_patch_size, num_chunks", [(2, 4), (4, 2)])
+def test_qwen3vl_chunks_time_the_way_its_processor_patched_it(temporal_patch_size, num_chunks):
+    # 8 frames give 4 chunks at 2 and 2 chunks at 4. The template reads this off
+    # its own processor so the layout cannot drift from the grid that processor
+    # derived; models reusing this template need not all patch time by 2.
+    template = build_chat_template(
+        "qwen3vl", _Processor(_SpecialTokenTokenizer(), temporal_patch_size=temporal_patch_size)
+    )
 
     encoded = template.encode_messages(
         [("user", ("video", None))],
         {"video": [64]},
         video_metadata=[_video_metadata(8)],
-        temporal_patch_size=4,
     )
 
-    # One "<t seconds>" marker plus a vision_start per chunk.
-    assert int((encoded["input_ids"] == 3).sum()) == 2
+    # One vision_start per time chunk.
+    assert int((encoded["input_ids"] == 3).sum()) == num_chunks
     assert int((encoded["input_ids"] == TYPE2INDEX["input"]["video"]).sum()) == 64
 
 
-def test_qwen3vl_falls_back_when_the_caller_has_no_temporal_patch_size():
-    # data_transform reads the attribute off the video processor, so a processor
-    # without it hands over None rather than omitting the key.
-    template = build_chat_template("qwen3vl", _SpecialTokenTokenizer())
-
-    encoded = template.encode_messages(
-        [("user", ("video", None))],
-        {"video": [64]},
-        video_metadata=[_video_metadata(8)],
-        temporal_patch_size=None,
-    )
-
-    assert int((encoded["input_ids"] == 3).sum()) == 4
-
-
-def test_qwen2vl_tolerates_the_video_kwargs_qwen3vl_needs():
+def test_qwen2vl_tolerates_the_video_metadata_qwen3vl_needs():
     # One call site feeds every multimodal template, and configs/multimodal/qwen2_vl
     # ships this combination.
-    template = build_chat_template("qwen2vl", _SpecialTokenTokenizer())
+    template = build_chat_template("qwen2vl", _Processor(_SpecialTokenTokenizer()))
 
     encoded = template.encode_messages(
         [("user", ("text", "hello")), ("assistant", ("text", "hi"))],
         {},
         video_metadata=[],
-        temporal_patch_size=2,
     )
 
     assert len(encoded["input_ids"]) > 0
@@ -376,8 +396,8 @@ def test_qwen_vl_variants_render_the_same_ids_for_a_text_only_turn():
             return None
 
     messages = [("user", ("text", "hi")), ("assistant", ("text", "hello"))]
-    qwen2 = NoSystemPrompt(_SpecialTokenTokenizer()).encode_messages(messages, {})
-    qwen3 = Qwen3VLChatTemplate(_SpecialTokenTokenizer()).encode_messages(messages, {})
+    qwen2 = NoSystemPrompt(_Processor(_SpecialTokenTokenizer())).encode_messages(messages, {})
+    qwen3 = Qwen3VLChatTemplate(_Processor(_SpecialTokenTokenizer())).encode_messages(messages, {})
 
     for key in ("input_ids", "attention_mask", "labels"):
         assert qwen2[key].tolist() == qwen3[key].tolist(), key
@@ -388,7 +408,7 @@ def test_encode_messages_does_not_consume_the_caller_token_counts(template_name)
     # The caller derives these counts from grid_thw and owns the dict; a template
     # must read them, not consume them.
     num_tokens = {"image": [4]}
-    template = build_chat_template(template_name, _SpecialTokenTokenizer())
+    template = build_chat_template(template_name, _Processor(_SpecialTokenTokenizer()))
 
     template.encode_messages([("user", ("image", None))], num_tokens)
 

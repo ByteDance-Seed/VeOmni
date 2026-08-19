@@ -174,7 +174,7 @@ def veomni_process_sample(
     # Initialize chat template
     chat_template = build_chat_template(
         config.chat_template_name,
-        veomni_processor.tokenizer,
+        veomni_processor,
     )
 
     position_id_func = veomni_model.get_position_id_func()

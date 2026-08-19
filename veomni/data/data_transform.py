@@ -329,9 +329,6 @@ def _process_sample_qwen_vl_base(
     encode_kwargs = {}
     if video_metadata is not None:
         encode_kwargs["video_metadata"] = video_metadata
-        # Templates that lay tokens out per time chunk must chunk the same way
-        # the processor patched time, or the two disagree on the chunk count.
-        encode_kwargs["temporal_patch_size"] = getattr(processor.video_processor, "temporal_patch_size", None)
 
     tokenized_example = chat_template.encode_messages(conversations, token_num_inputs, **encode_kwargs)
 

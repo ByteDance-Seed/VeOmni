@@ -250,7 +250,7 @@ from veomni.data import build_chat_template, build_data_transform
 from veomni.models import build_processor
 
 processor = build_processor(args.model.tokenizer_path)
-chat_template = build_chat_template(args.data.chat_template, processor.tokenizer)
+chat_template = build_chat_template(args.data.chat_template, processor)
 position_id_func = model.get_position_id_func()
 transform = build_data_transform(
     model.config.model_type,
@@ -272,7 +272,7 @@ Multimodal dataset transform follows the similar pipeline:
 
 ### Chat Template
 VeOmni default supports several chat templates, text-only and multimodal alike, all registered in [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) and built by name through the single `build_chat_template` entrypoint.
-You can add your custom chat template by implementing the `ChatTemplate` class — or `MultimodalChatTemplate` if it needs the per-modality token counts.
+You can add your custom chat template by implementing the `ChatTemplate` class — or `MultimodalChatTemplate` if it needs the per-modality token counts. A `ChatTemplate` is built from a tokenizer; a `MultimodalChatTemplate` is built from the processor instead, since laying out placeholders also needs the grid parameters the processor used.
 **Custom Template Implementation**:  
 ```python
 from veomni.data.chat_template import ChatTemplate

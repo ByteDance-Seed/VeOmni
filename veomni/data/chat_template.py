@@ -15,7 +15,7 @@
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Sequence
+from typing import TYPE_CHECKING, Dict, List, Sequence, Union
 
 import torch
 
@@ -26,7 +26,7 @@ from ..utils.registry import Registry
 
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizer
+    from transformers import PreTrainedTokenizer, ProcessorMixin
 
 
 logger = logging.get_logger(__name__)
@@ -37,16 +37,20 @@ CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
 
 def build_chat_template(
     template_name: str,
-    tokenizer: "PreTrainedTokenizer",
+    tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"],
     **kwargs,
 ) -> "ChatTemplate":
     """Builds any registered template, text-only or multimodal.
+
+    Text-only templates take a tokenizer; multimodal ones take the processor,
+    which carries both the tokenizer and the grid parameters they need. Callers
+    pass whatever their modality has, matching the template their config names.
 
     ``kwargs`` reach the template constructor. No template currently declares
     one, so an unrecognised option raises there instead of being silently
     dropped.
     """
-    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer, **kwargs)
+    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer_or_processor, **kwargs)
 
 
 class ChatTemplate(ABC):
@@ -288,7 +292,14 @@ class MultimodalChatTemplate(ChatTemplate):
     pixels, because only then can the template expand a placeholder into the
     right number of pad tokens. Selecting one of these by name from a text-only
     trainer therefore fails at encode time, not at build time.
+
+    Built from the processor rather than the tokenizer, since laying those
+    placeholders out also needs the grid parameters the processor used.
     """
+
+    def __init__(self, processor: "ProcessorMixin") -> None:
+        super().__init__(processor.tokenizer)
+        self.processor = processor
 
     @abstractmethod
     def encode_messages(
@@ -303,8 +314,8 @@ class MultimodalChatTemplate(ChatTemplate):
 
 
 class Qwen2VLTemplate(MultimodalChatTemplate):
-    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
-        super().__init__(tokenizer)
+    def __init__(self, processor: "ProcessorMixin") -> None:
+        super().__init__(processor)
         self.image_pad = "<|image_pad|>"
         self.video_pad = "<|video_pad|>"
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
@@ -422,13 +433,12 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
         return self._tokenize_and_remap(messages)
 
 
+# Qwen2.5-VL shares Qwen2-VL's template; the decorator form takes one name per class.
+CHAT_TEMPLATE_REGISTRY.register("qwen2_5vl", Qwen2VLChatTemplate)
+
+
 @CHAT_TEMPLATE_REGISTRY.register("qwen3vl")
 class Qwen3VLChatTemplate(Qwen2VLTemplate):
-    # Fallback for callers that do not pass the video processor's value. Frames
-    # are grouped into time chunks of this size, matching the processor's own
-    # temporal patching, so a mismatch shifts every timestamp and chunk boundary.
-    DEFAULT_TEMPORAL_PATCH_SIZE = 2
-
     def _calculate_timestamps(self, indices: List[int], video_fps: float, temporal_patch_size: int):
         """
         Replicates Qwen3-VL official logic: Pad -> Convert to Seconds -> Average.
@@ -462,10 +472,6 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
 
         # Retrieve video metadata iterator; ensures order matches video inputs in conversations
         video_metadata_list = iter(kwargs.get("video_metadata", []))
-        # Supplied by the caller that ran the video processor, so the chunking
-        # here matches the grid the processor derived. Models reusing this
-        # template need not all patch time by the same amount.
-        temporal_patch_size = kwargs.get("temporal_patch_size") or self.DEFAULT_TEMPORAL_PATCH_SIZE
 
         for message in conversations:
             role = message[0]
@@ -478,6 +484,11 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
 
                 elif value[0] == "video":
                     total_video_tokens = self._next_token_num(video_token_num_list, "video")
+                    # Read off the same video processor that derived the grid, so
+                    # the two agree on the chunk count. Models reusing this
+                    # template need not all patch time by the same amount. Read
+                    # here so a processor with no video side is never touched.
+                    temporal_patch_size = self.processor.video_processor.temporal_patch_size
 
                     # Get metadata for the current video
                     try:
@@ -543,7 +554,3 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
             )
 
         return self._tokenize_and_remap(messages)
-
-
-# Qwen2.5-VL shares Qwen2-VL's template; the decorator form takes one name per class.
-CHAT_TEMPLATE_REGISTRY.register("qwen2_5vl", Qwen2VLChatTemplate)
