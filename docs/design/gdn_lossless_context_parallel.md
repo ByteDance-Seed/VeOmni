@@ -26,16 +26,16 @@ tile 8); there are no environment-variable backend overrides or silent torch
 fallbacks. GPU model paths reject `kcp` explicitly.
 
 The implementation targets packed text training on Ascend NPU with a
-power-of-two CP size. Both `state_passing_lossless` and `kcp` are currently
-Ascend-only production routes. Planner/CPU distributed-oracle coverage includes
+power-of-two CP size. `state_passing_lossless` and `kcp` are currently supported on Ascend NPU;
+GPU CP remains outside this lossless gate. Planner/CPU distributed-oracle coverage includes
 CP2/4/8/16. Full attention uses causal Ring CP; GDN uses lossless chunk
 ownership plus state passing or KCP. The following GDN inputs fail closed:
 selector without CP, non-packed batches, attention dropout,
 sliding-window/softcap, non-causal or multimodal/cross-attention, `kcp` on GPU,
 a missing hardware-specific fused-attention backend, and `cp_size > 1` without
-an explicit lossless GDN selector. Generic Ring CP is not yet exposed as a
-production configuration; this prevents the collator from silently sharding
-tokens for an attention path that never executes Ring communication.
+an explicit lossless GDN selector for Qwen3.5. The backwards-compatible
+`disabled` selector is the generic Ring/Hybrid CP path for non-GDN causal
+models; Qwen3.5 never silently falls back to it.
 
 ## Layout contract
 
@@ -63,21 +63,6 @@ tokens for an attention path that never executes Ring communication.
 All ranks compile the same plan and exchange its digest before the first
 all-to-all. A topology, CU, split, route, rank, or hash mismatch aborts before
 communication instead of risking a collective hang.
-
-## KCP and FSDP2
-
-The Ascend fused gated RMSNorm requires its complete 128-element weight. Under
-KCP, VeOmni marks only those fused-norm *instances* and wraps them as one nested
-FSDP2 group before the parent decoder layers are sharded. That small group uses
-the parent mesh and mixed-precision policy with `reshard_after_forward=False`,
-so every live forward and its activation-checkpoint replay see a full local
-Tensor rather than a rank-local DTensor shard. CP-off and
-`state_passing_lossless` models retain the ordinary parent-layer FSDP layout.
-
-The nested group is part of the DCP state-dict topology. A release candidate
-therefore needs a device save plus new-process cold-resume gate; loading only
-the local shard with `to_local()` or gathering ad hoc inside the fused kernel is
-not a valid substitute.
 
 ## Correctness contract
 

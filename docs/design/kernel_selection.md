@@ -331,15 +331,15 @@ the recurrent-state P2P chain with a fixed-size fp32 affine all-gather/prefix
 composition. Its production affine backend is the immutable Ascend TTX
 BC8/M1 configuration; CUDA/GPU paths reject it instead of falling back.
 
-The GDN selector is fail-closed: selecting `state_passing_lossless` or `kcp`
+The selector is fail-closed: selecting `state_passing_lossless` or `kcp`
 requires `cp_size > 1`, packed dynamic batches, causal text self-attention,
-zero attention dropout, and the required accelerator kernels. Generic Ring CP
-modules remain implementation building blocks and CPU correctness oracles, but
-there is no production generic-Ring selector yet: `cp_size > 1` with the GDN
-selector disabled fails before the collator can shard tokens. GPU and NPU paths
-support `state_passing_lossless`; only the Ascend path supports `kcp`.
-Eager/SDPA, `kcp` on CUDA, non-Qwen3.5 models, and
-multimodal/cross-attention are intentionally unsupported in this foundation. See
+zero attention dropout, and the required accelerator kernels. The backwards-
+compatible `disabled` selector enables generic Ring/Hybrid CP for non-GDN causal
+models; it does not silently enable Ring for Qwen3.5 GDN, which must select an
+explicit lossless GDN mode. The current validated lossless paths run on Ascend NPU;
+GPU CP remains outside this gate, and only the Ascend path supports `kcp`. Eager/SDPA, `kcp` on CUDA,
+non-Qwen3.5 models using a GDN selector, and multimodal/cross-attention are
+intentionally unsupported in this foundation. See
 [Lossless GDN Context Parallelism](gdn_lossless_context_parallel.md) for
 layout, correctness, and test contracts.
 

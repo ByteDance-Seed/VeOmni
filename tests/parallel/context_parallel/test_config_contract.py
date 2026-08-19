@@ -59,12 +59,31 @@ def test_root_config_accepts_typed_gdn_cp_implementations(implementation):
     validate_gdn_context_parallel_config(cp_size=2, implementation=implementation, dyn_bsz=True)
 
 
-def test_generic_context_parallel_without_a_selector_fails_closed():
-    with pytest.raises(ValueError, match="generic Ring CP is not a production configuration"):
-        validate_gdn_context_parallel_config(cp_size=3, implementation="disabled", dyn_bsz=False)
+def test_generic_ring_context_parallel_uses_disabled_selector_for_non_gdn_models():
+    validate_gdn_context_parallel_config(cp_size=2, implementation="disabled", dyn_bsz=True)
+    validate_context_parallel_config(
+        cp_size=2,
+        implementation="disabled",
+        dyn_bsz=True,
+        attn_implementation="veomni_flash_attention_2_with_sp",
+        data_type="conversation",
+        model_type="llama",
+    )
 
-    with pytest.raises(ValueError, match="generic Ring CP is not enabled"):
-        ParallelState(cp_size=2)
+    with pytest.raises(ValueError, match="to be one of"):
+        ParallelState(cp_size=2, gdn_context_parallel_implementation="experimental")
+
+
+def test_generic_ring_selector_never_silently_enables_qwen_gdn():
+    with pytest.raises(ValueError, match="requires explicit"):
+        validate_context_parallel_config(
+            cp_size=2,
+            implementation="disabled",
+            dyn_bsz=True,
+            attn_implementation="veomni_flash_attention_2_with_sp",
+            data_type="conversation",
+            model_type="qwen3_5_moe",
+        )
 
 
 def test_combined_cp_ulysses_malformed_sp_mesh_fails_closed():
@@ -213,5 +232,5 @@ def test_root_config_rejects_cp_before_collator_can_slice_tokens():
         data=DataArguments(train_path="unused-test-data"),
     )
     arguments.train.accelerator.cp_size = 3
-    with pytest.raises(ValueError, match="generic Ring CP is not a production configuration"):
+    with pytest.raises(ValueError, match="requires cp_size to be a power of two"):
         VeOmniArguments.__post_init__(arguments)

@@ -1125,7 +1125,8 @@ class OpsImplementationConfig:
     gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless", "kcp"] = field(
         default="disabled",
         metadata={
-            "help": "Gated DeltaNet context-parallel algorithm. 'disabled' (default) rejects CP for GDN models; "
+            "help": "Context-parallel algorithm selector. 'disabled' (default) uses generic Ring/Hybrid CP for "
+            "non-GDN causal models and rejects CP at Qwen3.5 GDN model binding; "
             "'state_passing_lossless' uses native-chunk ownership, reversible all-to-all, and recurrent-state/halo "
             "autograd across context-parallel ranks; 'kcp' reuses the same lossless ownership/halo layout and "
             "replaces recurrent-state P2P with the fixed-size TTX BC8/M1 affine-prefix collective on Ascend."
@@ -1580,43 +1581,43 @@ def validate_context_parallel_config(
     sliding_window: object = None,
     is_encoder_decoder: bool = False,
 ) -> None:
-    """Fail closed until generic Ring CP has its own public selector and capability matrix.
+    """Validate generic Ring CP and the explicit lossless GDN variants.
 
-    The current production CP entry is deliberately limited to Qwen3.5 GDN
-    models with an explicit lossless-state or KCP selector. Ring attention
-    modules remain available as implementation building blocks and CPU oracles,
-    but ``cp_size>1`` must never make the collator shard tokens by itself.
+    ``disabled`` is retained as the backwards-compatible generic Ring/Hybrid
+    selector for non-GDN causal models. Qwen3.5 GDN is never allowed to
+    silently fall back to Ring: it must select an explicit lossless selector.
     """
     enabled_gdn_cp = {"kcp", "state_passing_lossless"}
-    if cp_size > 1 and implementation not in enabled_gdn_cp:
+    supported_cp = enabled_gdn_cp | {"disabled"}
+    if implementation not in supported_cp:
         raise ValueError(
-            "train.accelerator.cp_size > 1 requires an explicit supported context-parallel algorithm; "
-            "generic Ring CP is not a production configuration yet. Set "
-            "model.ops_implementation.gdn_context_parallel_implementation to 'state_passing_lossless' or 'kcp' "
-            "for a supported Qwen3.5 GDN model."
+            f"gdn_context_parallel_implementation must be one of {sorted(supported_cp)}, got {implementation!r}."
         )
     if implementation in enabled_gdn_cp and cp_size == 1:
         raise ValueError(
             f"gdn_context_parallel_implementation={implementation!r} requires train.accelerator.cp_size > 1."
         )
-    if implementation in enabled_gdn_cp and not dyn_bsz:
-        raise ValueError("GDN context parallelism currently requires train.dyn_bsz=True packed metadata.")
-    if implementation in enabled_gdn_cp and cp_size & (cp_size - 1):
-        raise ValueError("GDN context parallelism requires cp_size to be a power of two.")
-    if implementation not in enabled_gdn_cp:
+    if cp_size <= 1:
         return
+    if not dyn_bsz:
+        raise ValueError("Context parallelism requires train.dyn_bsz=True packed metadata.")
+    if cp_size & (cp_size - 1):
+        raise ValueError("Context parallelism requires cp_size to be a power of two.")
     if attn_implementation not in _RING_ATTENTION_IMPLEMENTATIONS:
         raise ValueError(
-            "GDN context parallelism requires a VeOmni FlashAttention SP backend; "
+            "Context parallelism requires a VeOmni FlashAttention SP backend; "
             f"got attn_implementation={attn_implementation!r}. Eager and SDPA do not execute Ring CP."
         )
     if data_type not in {"conversation", "plaintext"}:
+        raise ValueError(f"Context parallelism supports text-only packed causal-LM data, got data_type={data_type!r}.")
+    if implementation == "disabled" and model_type in _GDN_CP_MODEL_TYPES:
         raise ValueError(
-            f"GDN context parallelism supports text-only packed causal-LM data, got data_type={data_type!r}."
+            "Qwen3.5 GDN context parallelism requires explicit "
+            "gdn_context_parallel_implementation='state_passing_lossless' or 'kcp'."
         )
-    if model_type not in _GDN_CP_MODEL_TYPES:
+    if implementation in enabled_gdn_cp and model_type not in _GDN_CP_MODEL_TYPES:
         raise ValueError(
-            "GDN context parallelism is currently implemented only for Qwen3.5 dense/MoE text models; "
+            "Lossless GDN context parallelism is implemented only for Qwen3.5 dense/MoE text models; "
             f"got model_type={model_type!r}."
         )
     if attention_dropout != 0.0:
@@ -1633,6 +1634,8 @@ def validate_gdn_context_parallel_config(*, cp_size: int, implementation: str, d
     New root configurations must use :func:`validate_context_parallel_config`
     so attention and model capability are validated as well.
     """
+    if implementation == "disabled":
+        return
     validate_context_parallel_config(
         cp_size=cp_size,
         implementation=implementation,

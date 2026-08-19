@@ -335,10 +335,11 @@ class SequenceParallelCollator(DataCollator):
         self.ulysses_size = int(getattr(parallel_state, "ulysses_size", self.sp_size))
         self.ulysses_rank = int(getattr(parallel_state, "ulysses_rank", self.sp_rank)) if self.ulysses_size > 1 else 0
         if self.cp_size > 1 and self.gdn_context_parallel_implementation not in (
+            "disabled",
             "state_passing_lossless",
             "kcp",
         ):
-            raise RuntimeError("Refusing to context-shard tokens without an explicit supported GDN CP implementation.")
+            raise RuntimeError("Refusing to context-shard tokens with an unknown context-parallel implementation.")
         if self.cp_size > 1 and self.metadata_collate_func is not None:
             raise NotImplementedError("Context parallelism currently supports text-only packed batches.")
 
