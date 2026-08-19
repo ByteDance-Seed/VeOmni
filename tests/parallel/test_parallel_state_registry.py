@@ -30,8 +30,11 @@ from veomni.distributed.parallel_state import (
 
 
 @pytest.fixture
-def single_rank_group():
-    dist.init_process_group(backend="gloo", init_method="tcp://127.0.0.1:29677", world_size=1, rank=0)
+def single_rank_group(tmp_path):
+    # A file store under tmp_path rather than a fixed port: the rendezvous is
+    # then unique per test, so a concurrent run of this suite cannot collide with
+    # it. Torch creates the file and never removes it, hence a fresh directory.
+    dist.init_process_group(backend="gloo", init_method=f"file://{tmp_path / 'rendezvous'}", world_size=1, rank=0)
     try:
         yield
     finally:

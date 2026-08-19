@@ -41,11 +41,11 @@ def _allreduce_ddp_sp_grads(model: torch.nn.Module, parallel_state: ParallelStat
             continue
         if param.grad is None:
             param.grad = torch.zeros_like(param)
-        # Defensive: DDP replicates plain tensors, so a DTensor grad only shows
-        # up if TP was applied under it -- a combination the local norm below
-        # does not handle either, since it would cover this rank's shard alone.
-        # ``dp_sp`` excludes ``tp``, so reducing the local shards is at least the
-        # right thing for the part this function owns.
+        # Defensive: DDP replicates plain tensors, so a DTensor grad would only
+        # show up if TP were applied under it, and TP is inert today (the wrap
+        # passes no ``parallelize_plan``, which makes it a no-op). ``dp_sp``
+        # excludes ``tp``, so every rank of the group holds the same TP shard and
+        # reducing the local shards is the right thing if that changes.
         grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
         # SUM + divide rather than ReduceOp.AVG, which the NPU backend rejects.
         dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
@@ -63,6 +63,13 @@ def veomni_clip_grad_norm(
         if parallel_state.sp_size > 1:
             _allreduce_ddp_sp_grads(model, parallel_state)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, foreach=foreach)
+        if isinstance(grad_norm, DTensor):
+            # TP grads would make the norm a DTensor too, and ``.item()`` below
+            # reads a DTensor's local shard rather than the global value. The
+            # clipping itself is already global -- ``clip_grad_norm_`` applies it
+            # internally on DTensors -- so this corrects only what gets reported.
+            # Same conversion the fsdp2 path makes before returning.
+            grad_norm = grad_norm.full_tensor()
     else:
         raise RuntimeError(f"Unknown dp mode {dp_mode}")
 

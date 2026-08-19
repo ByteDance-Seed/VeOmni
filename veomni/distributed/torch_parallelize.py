@@ -51,17 +51,34 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
 def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
     """Materialize parameters without discarding config-derived buffers.
 
-    Distributed checkpoints restore ``state_dict()``, which excludes buffers
-    registered with ``persistent=False``. Snapshot those buffers before
-    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
-    materialization path without duplicating persistent buffers that DCP loads.
+    ``init_empty_weights()`` patches ``register_parameter`` only, so a
+    meta-initialized model still holds real buffer values -- and ``to_empty()``
+    replaces every one of them with uninitialized memory. Snapshot them across it
+    instead, on the random-init path as much as the resume path: distributed
+    checkpoints restore ``state_dict()``, which excludes ``persistent=False``,
+    and HF's ``_init_weights`` recomputes a rope table only for a module that
+    exposes ``original_inv_freq``. Buffers outside that shape -- Gemma3's
+    per-layer-type ``{type}_inv_freq`` and its ``embed_scale``, the Omni audio
+    tower's sinusoidal ``positional_embedding`` -- have nothing else to restore
+    them. Persistent buffers are left to whichever loader runs next.
     """
     buffers = []
     for module in model.modules():
         for name in module._non_persistent_buffers_set:
             buffer = module._buffers.get(name)
-            if buffer is not None:
-                buffers.append((module, name, buffer.detach().clone()))
+            if buffer is None:
+                continue
+            if buffer.is_meta:
+                # A buffer derived from a parameter (``self.weight.detach()``) is
+                # on meta like the parameter, and holds nothing to copy out of.
+                # No model does this today; say so rather than let ``to_empty()``
+                # leave uninitialized memory behind unannounced.
+                logger.warning_rank0(
+                    f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
+                    "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
+                )
+                continue
+            buffers.append((module, name, buffer.detach().clone()))
 
     model.to_empty(device=device)
 
@@ -105,10 +122,10 @@ def _materialize_and_load_weights(
                 "Skipping pretrained weight load for checkpoint resume; "
                 "parameters will be restored from the distributed checkpoint."
             )
-        if should_skip_hf_weight_load:
-            _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
-        else:
-            model.to_empty(device=materialize_device)
+        # Preserve non-persistent buffers on the random-init path too: HF's
+        # ``_init_weights`` recomputes only rope tables shaped the way it expects,
+        # so the rest would train on whatever ``to_empty()`` left behind.
+        _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
         _reset_hf_initialized_flag(model)
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
@@ -637,6 +654,12 @@ def parallelize_model_ddp(
     other init devices arrive with real weights already loaded by the model
     builder, so they must not be touched here.
     """
+    # ``build_parallelize_model`` catches this too, but a direct caller of this
+    # entry point would otherwise have the old name swallowed by ``**kwargs`` and
+    # silently read the HF snapshot the checkpoint is about to overwrite.
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
+
     parallel_state = get_parallel_state()
 
     # Only fsdp2 applies the ExtraParallel plan that shards expert weights, so a

@@ -223,7 +223,7 @@ class TestSkipHfWeightLoadOnResume:
         torch.testing.assert_close(resumed.scale, original.scale, rtol=0, atol=0)
         torch.testing.assert_close(resumed(inputs), expected_output, rtol=0, atol=0)
 
-    @pytest.mark.parametrize("parallelize", [build_parallelize_model, parallelize_model_fsdp2])
+    @pytest.mark.parametrize("parallelize", [build_parallelize_model, parallelize_model_fsdp2, parallelize_model_ddp])
     def test_parallelize_apis_reject_renamed_skip_weights_load(self, parallelize):
         with pytest.raises(TypeError, match="'skip_weights_load' was renamed to 'should_skip_hf_weight_load'"):
             parallelize(MagicMock(), skip_weights_load=True)
@@ -301,6 +301,35 @@ class TestMaterializeAndLoadDispatch:
                 broadcast_from_rank0=False,
             )
 
+    def test_a_buffer_derived_from_a_parameter_is_warned_about_not_preserved(self, monkeypatch):
+        """``init_empty_weights`` patches ``register_parameter`` only, so a buffer
+        built from a real tensor stays real -- but one built from a parameter is on
+        meta, holds no data to copy out of, and ends up as whatever ``to_empty()``
+        allocated. No model registers one; the warning is what makes it findable."""
+
+        class _DerivedBufferModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(2))
+                self.register_buffer("from_config", torch.tensor([0.5, 1.5]), persistent=False)
+                self.register_buffer("from_param", self.weight.detach().clone(), persistent=False)
+
+        with init_empty_weights():
+            model = _DerivedBufferModel()
+        assert model.from_param.is_meta and not model.from_config.is_meta
+
+        # Against the logger rather than captured output: veomni's logger sets
+        # propagate=False and binds its own stdout handler, so neither caplog nor
+        # capsys sees the record.
+        warnings = []
+        monkeypatch.setattr(torch_parallelize.logger, "warning_rank0", warnings.append)
+
+        torch_parallelize._to_empty_preserving_nonpersistent_buffers(model, "cpu")
+
+        torch.testing.assert_close(model.from_config, torch.tensor([0.5, 1.5]), rtol=0, atol=0)
+        assert not model.from_param.is_meta
+        assert any("from_param" in message for message in warnings)
+
 
 # ---------------------------------------------------------------------------
 # DDP under meta-init: the wrap materializes and loads the model itself
@@ -351,6 +380,9 @@ class TestDdpMetaInit:
         assert not wrapped.module.weight.is_meta
         assert wrapped.module.init_weights_calls == 1
         assert wrapped.broadcast_buffers is False
+        # A bare to_empty() would leave uninitialized memory here: this buffer is
+        # shaped like the ones HF's _init_weights does not recompute.
+        torch.testing.assert_close(wrapped.module.scale, torch.tensor([0.25, 2.0]), rtol=0, atol=0)
 
     def test_resume_materializes_without_reading_the_hf_snapshot(self, wrap_ddp, monkeypatch):
         loader = MagicMock()
