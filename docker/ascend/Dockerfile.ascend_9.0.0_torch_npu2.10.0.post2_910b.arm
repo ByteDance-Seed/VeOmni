@@ -39,7 +39,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN pip install -e .[npu_aarch64]
+RUN pip install -e ".[npu_aarch64]"
 
 # Align the parquet/data stack with the uv lockfile. pip install -e (unlike x86's
 # uv sync --locked) ignores the lockfile and floats pyarrow/pandas to latest; pyarrow

@@ -19,9 +19,11 @@ docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0
 ```
 
 ## Step 2: Build the Custom Image
-Build the VeOmni Ascend A3 image using the provided Dockerfile.
+Build the GDN-ready VeOmni Ascend A3 image using the provided Dockerfile. It includes `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`. The existing `Dockerfile.ascend_9.0.0_a3` remains available for the general-purpose image.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
+
+The GDN-ready Dockerfile also accepts `PIP_INDEX` and `APT_SOURCE` build arguments. `APT_SOURCE` must point to an Ubuntu Ports mirror.
 
 ```bash
 # Optional proxy settings (remove if not needed)
@@ -30,7 +32,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a3 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_a3 \
   .
 ```
 
@@ -38,7 +40,7 @@ Without proxy (simplified):
 ```bash
 docker build \
   -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a3 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_a3 \
   .
 ```
 
@@ -47,6 +49,7 @@ The built image includes:
 - Ubuntu 22.04 with Python 3.11
 - Ascend CANN 9.0.0 runtime
 - VeOmni framework with NPU support
+- torch-npu 2.10.0.post2, triton-ascend, and fla_npu for GDN
 - TorchCodec for efficient video processing
 - All necessary development tools and dependencies
 

@@ -27,9 +27,11 @@ docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0
 ```
 
 ## Step 2: Build the Custom Image
-Build the VeOmni Ascend A2 image using the appropriate Dockerfile for your architecture.
+Build the GDN-ready VeOmni Ascend A2 image using the appropriate Dockerfile for your architecture. These Dockerfiles include `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`. The existing `Dockerfile.ascend_9.0.0_a2.x86` and `Dockerfile.ascend_9.0.0_a2.arm` remain available for the general-purpose images.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
+
+The x86 Dockerfile also accepts `APT_SOURCE` and `PIP_INDEX` build arguments. The ARM64 Dockerfile accepts `PIP_INDEX`.
 
 ### For x86 Architecture
 
@@ -40,7 +42,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86 \
   .
 ```
 
@@ -53,7 +55,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.arm \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm \
   .
 ```
 
@@ -63,7 +65,7 @@ For x86:
 ```bash
 docker build \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86 \
   .
 ```
 
@@ -71,7 +73,7 @@ For ARM64:
 ```bash
 docker build \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.arm \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm \
   .
 ```
 
@@ -80,6 +82,7 @@ The built image includes:
 - Ubuntu 22.04 with Python 3.11
 - Ascend CANN 9.0.0 runtime
 - VeOmni framework with NPU support
+- torch-npu 2.10.0.post2, triton-ascend, and fla_npu for GDN
 - TorchCodec for efficient video processing
 - All necessary development tools and dependencies
 
