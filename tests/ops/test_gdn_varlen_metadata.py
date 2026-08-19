@@ -145,6 +145,30 @@ class TestPrecomputeVarlenMetadataContract:
             assert chunk_indices[str(size)].tolist() == expected
             assert chunk_indices_list[str(size)] == [item for pair in expected for item in pair]
 
+    @pytest.mark.parametrize(
+        ("lengths", "expected"),
+        [
+            ([0, 64], [[1, 0]]),
+            ([0, 0, 128], [[2, 0], [2, 1]]),
+            ([0, 0], []),
+        ],
+    )
+    def test_empty_samples_preserve_ordinal_and_all_empty_is_well_formed(
+        self, module, lengths: list[int], expected: list[list[int]]
+    ) -> None:
+        indices = module.prepare_chunk_indices(_make_cu_seqlens(*lengths), chunk_size=64)
+        assert indices.shape == (len(expected), 2)
+        if expected:
+            assert indices.tolist() == expected
+        else:
+            assert indices.numel() == 0
+
+    def test_tensor_and_host_metadata_keep_empty_sample_ordinal_in_sync(self, module) -> None:
+        cu = _make_cu_seqlens(0, 64, 0, 128)
+        _, tensor_indices, list_indices = module.precompute_varlen_metadata(cu, num_heads=4, chunk_size=64)
+        assert tensor_indices["64"].tolist() == [[1, 0], [3, 0], [3, 1]]
+        assert list_indices["64"] == [1, 0, 3, 0, 3, 1]
+
 
 def test_ascendc_module_compatibly_reexports_metadata_helpers() -> None:
     source = (

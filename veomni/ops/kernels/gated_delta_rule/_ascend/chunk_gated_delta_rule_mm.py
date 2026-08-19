@@ -358,7 +358,9 @@ def chunk_gated_delta_rule(
                 plan=active_plan,
                 initial_state=initial_state,
                 output_final_state=output_final_state,
-                state_shape=(int(q.shape[2]), int(q.shape[3]), int(v.shape[3])),
+                # Recurrent state follows KV heads.  Q/KV GQA may have
+                # different head counts, so deriving this from q is invalid.
+                state_shape=(int(k.shape[2]), int(k.shape[3]), int(v.shape[3])),
             )
         cu_seqlens = active_plan.compact_cu_seqlens
         initial_state = active_plan.compact_initial_state(initial_state)

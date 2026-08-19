@@ -25,9 +25,9 @@ BC8/M1 backend (forward column tile 32, backward time tile 128, replay column
 tile 8); there are no environment-variable backend overrides or silent torch
 fallbacks. GPU model paths reject `kcp` explicitly.
 
-The implementation targets packed text training on GPU and Ascend NPU with a
-power-of-two CP size. `state_passing_lossless` is supported on both hardware
-paths; `kcp` is Ascend-only. Planner/CPU distributed-oracle coverage includes
+The implementation targets packed text training on Ascend NPU with a
+power-of-two CP size. Both `state_passing_lossless` and `kcp` are currently
+Ascend-only production routes. Planner/CPU distributed-oracle coverage includes
 CP2/4/8/16. Full attention uses causal Ring CP; GDN uses lossless chunk
 ownership plus state passing or KCP. The following GDN inputs fail closed:
 selector without CP, non-packed batches, attention dropout,

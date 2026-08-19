@@ -397,7 +397,10 @@ class ParallelState:
             return self.device_mesh.get_group("cp")
         if self.ulysses_enabled and not self.cp_enabled:
             return self.device_mesh.get_group("ulysses")
-        return None
+        raise RuntimeError(
+            "sequence-parallel group is unavailable for the combined CP x Ulysses topology; "
+            "initialize ParallelState with a flattened SP mesh"
+        )
 
     @property
     def sp_rank(self) -> int:
@@ -413,7 +416,10 @@ class ParallelState:
             return self.device_mesh.get_local_rank("cp")
         if self.ulysses_enabled and not self.cp_enabled:
             return self.device_mesh.get_local_rank("ulysses")
-        return -1
+        raise RuntimeError(
+            "sequence-parallel rank is unavailable for the combined CP x Ulysses topology; "
+            "initialize ParallelState with a flattened SP mesh"
+        )
 
     @property
     def sp_enabled(self) -> bool:

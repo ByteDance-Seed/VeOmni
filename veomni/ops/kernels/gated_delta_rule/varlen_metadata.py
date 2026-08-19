@@ -38,11 +38,33 @@ def _prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 
 
 def prepare_chunk_indices(cu_seqlens: torch.LongTensor, chunk_size: int) -> torch.LongTensor:
-    indices = torch.cat([torch.arange(n) for n in _ceil_div(_prepare_lens(cu_seqlens), chunk_size).tolist()])
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+    """Return ``[sample_index, chunk_index]`` rows for non-empty samples.
+
+    Build the sample column explicitly.  Inferring it from a reset marker
+    renumbers later samples after an empty one (``[0, 0, 64]``), and
+    ``torch.cat([])`` crashes when every sample is empty.
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    lengths = _prepare_lens(cu_seqlens).detach().cpu().tolist()
+    rows: list[torch.Tensor] = []
+    for sample_index, length in enumerate(lengths):
+        num_chunks = _ceil_div(int(length), chunk_size) if int(length) > 0 else 0
+        if num_chunks == 0:
+            continue
+        sample = torch.full((num_chunks,), sample_index, dtype=cu_seqlens.dtype)
+        chunks = torch.arange(num_chunks, dtype=cu_seqlens.dtype)
+        rows.append(torch.stack((sample, chunks), dim=1))
+
+    if not rows:
+        return torch.empty((0, 2), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    return torch.cat(rows, dim=0).to(device=cu_seqlens.device)
 
 
 def prepare_chunk_indices_list(cu_seqlens: list[int] | torch.LongTensor, chunk_size: int) -> list[int]:
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
     if isinstance(cu_seqlens, torch.Tensor):
         cu_seqlens = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
 

@@ -67,6 +67,25 @@ def test_generic_context_parallel_without_a_selector_fails_closed():
         ParallelState(cp_size=2)
 
 
+def test_combined_cp_ulysses_malformed_sp_mesh_fails_closed():
+    class BrokenMesh:
+        def get_group(self, name):
+            raise KeyError(name)
+
+        def get_local_rank(self, name):
+            raise KeyError(name)
+
+    state = object.__new__(ParallelState)
+    object.__setattr__(state, "cp_size", 2)
+    object.__setattr__(state, "ulysses_size", 2)
+    object.__setattr__(state, "device_mesh", BrokenMesh())
+    object.__setattr__(state, "_sp_mesh", None)
+    with pytest.raises(RuntimeError, match="flattened SP mesh"):
+        _ = state.sp_group
+    with pytest.raises(RuntimeError, match="flattened SP mesh"):
+        _ = state.sp_rank
+
+
 def test_gdn_context_parallel_rejects_cuda_topology_before_mesh_initialization():
     with pytest.raises(NotImplementedError, match="supported on Ascend NPU only"):
         ParallelState(

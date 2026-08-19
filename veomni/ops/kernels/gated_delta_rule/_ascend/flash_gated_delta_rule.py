@@ -582,7 +582,9 @@ def flash_gated_delta_rule(
                 plan=active_plan,
                 initial_state=initial_state,
                 output_final_state=output_final_state,
-                state_shape=(int(q.shape[1]), int(q.shape[3]), int(v.shape[3])),
+                # Recurrent state follows KV heads, not query heads.  This is
+                # required for the all-empty GQA fast path.
+                state_shape=(int(k.shape[1]), int(k.shape[3]), int(v.shape[3])),
             )
 
     # The mathematically empty recurrence above has no native backward and can

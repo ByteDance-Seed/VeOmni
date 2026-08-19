@@ -78,7 +78,7 @@ Context parallelism is currently a fail-closed Qwen3.5 GatedDeltaNet feature,
 not a generic `cp_size` switch. Values greater than one must be powers of two
 and require packed dynamic-batch text training plus
 `model.ops_implementation.gdn_context_parallel_implementation` set to
-`state_passing_lossless` (GPU or NPU) or `kcp` (Ascend NPU only). Other model,
+`state_passing_lossless` (Ascend NPU only) or `kcp` (Ascend NPU only). Other model,
 data, attention, and dropout combinations are rejected during configuration or
 model binding.
 

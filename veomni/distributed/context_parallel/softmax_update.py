@@ -58,14 +58,18 @@ def merge_attention_blocks(
 
     previous_finite = torch.isfinite(previous_max)
     current_finite = torch.isfinite(current_max)
+    # Avoid forming ``-inf - -inf`` in an unselected ``where`` branch. Fully
+    # masked blocks are represented by ``(-inf, 0)`` and contribute exactly
+    # zero rather than a transient NaN.
+    merged_finite = torch.isfinite(merged_max)
     previous_scale = torch.where(
-        previous_finite,
-        torch.exp(previous_max - torch.where(previous_finite, merged_max, previous_max)),
+        previous_finite & merged_finite,
+        torch.exp(previous_max - merged_max),
         torch.zeros_like(previous_max),
     )
     current_scale = torch.where(
-        current_finite,
-        torch.exp(current_max - torch.where(current_finite, merged_max, current_max)),
+        current_finite & merged_finite,
+        torch.exp(current_max - merged_max),
         torch.zeros_like(current_max),
     )
 

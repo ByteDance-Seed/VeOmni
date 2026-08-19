@@ -119,3 +119,24 @@ def test_merge_attention_blocks_handles_empty_previous_statistics():
     torch.testing.assert_close(merged, current_output)
     torch.testing.assert_close(merged_max, current_max)
     torch.testing.assert_close(merged_sum, current_sum)
+
+
+def test_merge_attention_blocks_all_fully_masked_is_finite():
+    previous_output = torch.zeros(1, 1, 2, 4)
+    current_output = torch.ones_like(previous_output)
+    previous_max = torch.full((1, 1, 2, 8), -torch.inf)
+    current_max = torch.full_like(previous_max, -torch.inf)
+    previous_sum = torch.zeros_like(previous_max)
+    current_sum = torch.zeros_like(previous_max)
+
+    output, merged_max, merged_sum = merge_attention_blocks(
+        previous_output,
+        previous_max,
+        previous_sum,
+        current_output,
+        current_max,
+        current_sum,
+    )
+    assert torch.isfinite(output).all()
+    assert torch.isneginf(merged_max).all()
+    assert torch.equal(merged_sum, torch.zeros_like(merged_sum))

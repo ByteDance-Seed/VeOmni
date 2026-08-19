@@ -309,6 +309,7 @@ def test_ttx_public_autograd_entry_rejects_cpu_before_custom_function():
 def test_ttx_forward_backward_warmup_enables_grad_and_caches_only_success(monkeypatch):
     ttx_module._TTX_FORWARD_BACKWARD_WARMUP_CACHE.clear()
     forward_grad_modes = []
+    warmup_dtypes = []
     synchronize_calls = []
 
     monkeypatch.setattr(ttx_module, "validate_ttx_bc8_m1_inputs", lambda *args, **kwargs: None)
@@ -322,6 +323,7 @@ def test_ttx_forward_backward_warmup_enables_grad_and_caches_only_success(monkey
 
     def fake_summary(key, value, g, beta, **kwargs):
         forward_grad_modes.append(torch.is_grad_enabled())
+        warmup_dtypes.append((key.dtype, value.dtype, g.dtype, beta.dtype))
         return key.float().sum() + value.float().sum() + g.float().sum() + beta.float().sum()
 
     monkeypatch.setattr(ttx_module, "ttx_local_affine_summary", fake_summary)
@@ -331,6 +333,7 @@ def test_ttx_forward_backward_warmup_enables_grad_and_caches_only_success(monkey
         ttx_module.warmup_ttx_bc8_m1_forward_backward(key, value, g, beta)
 
     assert forward_grad_modes == [True]
+    assert warmup_dtypes == [(key.dtype, value.dtype, g.dtype, beta.dtype)]
     assert synchronize_calls == [True]
     assert len(ttx_module._TTX_FORWARD_BACKWARD_WARMUP_CACHE) == 1
 

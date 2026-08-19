@@ -302,6 +302,29 @@ def test_mm_wrapper_compacts_native_state_and_restores_full_final(monkeypatch):
     torch.testing.assert_close(final[1:], initial_state[1:] * 2)
 
 
+def test_mm_wrapper_all_empty_gqa_state_uses_kv_heads(monkeypatch):
+    module = _load_wrapper(monkeypatch, backend="mm")
+    # Q has four heads while K/V have one KV head.  The empty fast path must
+    # still return the recurrent state in KV-head layout.
+    q = torch.empty(1, 0, 4, 2, dtype=torch.bfloat16)
+    k = torch.empty(1, 0, 1, 2, dtype=torch.bfloat16)
+    v = torch.empty(1, 0, 1, 3, dtype=torch.bfloat16)
+    g = torch.empty(1, 0, 1, dtype=torch.bfloat16)
+    beta = torch.empty(1, 0, 1, dtype=torch.bfloat16)
+    _, final = module.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        output_final_state=True,
+        cu_seqlens=torch.tensor([0, 0], dtype=torch.int32),
+        cu_seqlens_list=[0, 0],
+    )
+    assert final is not None
+    assert final.shape == (1, 1, 2, 3)
+
+
 def test_mm_wrapper_preserves_legacy_positional_chunk_size_and_head_first(monkeypatch):
     module = _load_wrapper(monkeypatch, backend="mm")
     captured = {}
