@@ -283,9 +283,6 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
@@ -654,12 +651,6 @@ def parallelize_model_ddp(
     other init devices arrive with real weights already loaded by the model
     builder, so they must not be touched here.
     """
-    # ``build_parallelize_model`` catches this too, but a direct caller of this
-    # entry point would otherwise have the old name swallowed by ``**kwargs`` and
-    # silently read the HF snapshot the checkpoint is about to overwrite.
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
 
     # Only fsdp2 applies the ExtraParallel plan that shards expert weights, so a
@@ -728,9 +719,6 @@ def build_parallelize_model(
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
     chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)

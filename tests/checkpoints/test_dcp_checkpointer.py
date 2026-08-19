@@ -223,11 +223,6 @@ class TestSkipHfWeightLoadOnResume:
         torch.testing.assert_close(resumed.scale, original.scale, rtol=0, atol=0)
         torch.testing.assert_close(resumed(inputs), expected_output, rtol=0, atol=0)
 
-    @pytest.mark.parametrize("parallelize", [build_parallelize_model, parallelize_model_fsdp2, parallelize_model_ddp])
-    def test_parallelize_apis_reject_renamed_skip_weights_load(self, parallelize):
-        with pytest.raises(TypeError, match="'skip_weights_load' was renamed to 'should_skip_hf_weight_load'"):
-            parallelize(MagicMock(), skip_weights_load=True)
-
 
 # ---------------------------------------------------------------------------
 # Materialize + load: one dispatch shared by the fsdp2 and ddp paths
