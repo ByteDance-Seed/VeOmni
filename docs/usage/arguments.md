@@ -133,12 +133,6 @@ Root config — assembles `model`, `data`, and `train`.
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
-| foundation | `Dict[str, str]` | `{}` | Foundation model extra config. |
-| encoders | `Dict` | `{}` | Multimodal encoder configs keyed by modality (`image`, `video`, `audio`). |
-| decoders | `Dict` | `{}` | Multimodal decoder configs keyed by modality (`image`). |
-| input_encoder | `Literal["encoder", "decoder"]` | `"encoder"` | Whether to use the encoder or decoder to encode input images. |
-| output_encoder | `Literal["encoder", "decoder"]` | `"decoder"` | Whether to use the encoder or decoder to encode output images. |
-| encode_target | `bool` | `False` | Whether to encode training targets with decoder (diffusion only). |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |

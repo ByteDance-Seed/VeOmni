@@ -14,7 +14,7 @@ The multimodal data pipeline lives in `veomni/data/multimodal/` and handles:
 > I2T / T2I / interleave examples.
 2. **Image processing** (`image_utils.py`) — loads images, resizes them to fit pixel budgets while preserving aspect ratio and ViT patch alignment.
 3. **Video processing** (`video_utils.py`) — loads videos (via torchcodec), samples frames by FPS, resizes spatially, and optionally extracts audio.
-4. **Transform** (`multimodal_transform.py`) — orchestrates the above into tokenized model inputs with proper masking.
+4. **Transform** (`veomni/data/data_transform.py`) — orchestrates the above into tokenized model inputs with proper masking.
 
 All processing parameters are configured through the `mm_configs` section in your YAML config.
 

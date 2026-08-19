@@ -156,12 +156,14 @@ Core files:
 
 ### Multimodal Data
 
-15. **Multimodal preprocessing pipeline (`veomni/data/multimodal/`)**
-    - `encode_multimodal_sample()` in `multimodal_transform.py` orchestrates: `conv_preprocess()` → `fetch_images/videos/audios` → `process_mm_data()` → processor tokenization.
+15. **Multimodal preprocessing pipeline (`veomni/data/multimodal/` + `veomni/data/data_transform.py`)**
+    - The two orchestrators differ in where tokenization and label masking happen — do not assume a single shared order.
+      - `process_sample_qwen_vl()`: `conv_preprocess()` → `fetch_images` / `fetch_videos_metadata` → `processor.image_processor` / `processor.video_processor` for pixel features only → `chat_template.encode_messages()`, which does **both** tokenization and label masking.
+      - `process_sample_qwen_omni()`: takes no chat template. `conv_preprocess()` → `fetch_images/videos/audios` → `processor(text=..., images=..., videos=..., audios=...)` for tokenization → labels masked inline by a user/assistant token scan.
     - Images: load → RGB PIL → `smart_resize` (pixel min/max, scale_factor for grid alignment, max aspect ratio).
     - Videos: `torchcodec` decode → `calculate_frame_indices` (FPS, min/max frames, `frame_factor`/`frame_factor_remainder` for VAE-friendly counts); optional paired audio.
     - Audio: `librosa` at configurable `sample_rate` (default 16kHz).
-    - Placeholder IDs: `TYPE2INDEX` maps modality tokens (e.g. image input → `-200`, output → `-201`). `mask_input_ids()` replaces these with `0` for text embedding and exposes `{modality}_{input|output}_mask`.
+    - Placeholder IDs: `veomni/utils/constants.py` defines the negative placeholders (`IMAGE_INPUT_INDEX = -200`, `VIDEO_INPUT_INDEX = -300`, `AUDIO_INPUT_INDEX = -400`; `TYPE2INDEX` groups them by input/output). `MultimodalChatTemplate` writes them into `input_ids`, and `process_sample_qwen_vl()` derives `image_mask` / `video_mask` from them, then zeroes the placeholders before text embedding. `process_sample_qwen_omni()` instead derives `image_mask` / `video_mask` / `audio_mask` from the model's own multimodal token ids. The mask keys are `{modality}_mask` — the V1 `{modality}_{input|output}_mask` convention went away with the SeedOmni V1 stack.
 
 ## Checkpoint
 

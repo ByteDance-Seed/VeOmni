@@ -26,7 +26,7 @@ veomni/
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
 │   ├── transformers/   Per-model patches (one subpackage per model family)
-│   ├── diffusers/      Diffusion model definitions (Wan T2V)
+│   ├── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 │   └── seed_omni/      Omni-model architecture (encoder-foundation-decoder)
 │       ├── configuration_omni.py   OmniConfig (pure HF PretrainedConfig, checkpoint I/O,
 │       │                           all generation scenarios keyed by infer_type)
