@@ -420,6 +420,7 @@ class _Qwen3_5LinearAttentionStub(nn.Module):
         cache_position=None,
         attention_mask=None,
         cu_seq_lens_q=None,
+        cu_seqlens_list=None,
     ):
         self.cu_seq_lens_calls.append(cu_seq_lens_q.detach().clone())
         projected = self.proj(hidden_states)

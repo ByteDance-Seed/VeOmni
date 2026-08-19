@@ -26,6 +26,7 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
+| GDN context parallel | `gdn_context_parallel_implementation` | `disabled`, `state_passing_lossless`, `kcp` | `"disabled"` | Config validation + Qwen3.5 OpSlot binding; `kcp` is Ascend-only TTX BC8/M1 |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
 
@@ -39,9 +40,11 @@ model-specific and are not auto-resolved: set them to `npu` explicitly because
 the causal-convolution and gated-delta-rule `eager` fallbacks do not support
 dynamic-batch `cu_seqlens`.
 
-The per-op fields are typed as plain `str` (not `Literal`), so third-party
-backends can be registered via `extra_backends` in a model's `device_patch.py`
-without modifying `OpsImplementationConfig`.
+The selector types intentionally use a mixed contract. Closed selectors such as
+attention, GDN context parallelism, DSA, and mHC use `Literal` allow-lists.
+Registry-extensible selectors remain plain `str`, so a model's
+`device_patch.py` can register third-party implementations through
+`extra_backends` without modifying `OpsImplementationConfig`.
 
 ---
 
@@ -297,6 +300,7 @@ model:
     rms_norm_gated_implementation: npu
     causal_conv1d_implementation: npu
     chunk_gated_delta_rule_implementation: npu
+    gdn_context_parallel_implementation: state_passing_lossless
 ```
 
 | Field | GPU values | NPU value | Eager limitation |
@@ -312,6 +316,32 @@ kernel) and `npu_ascendc` (an AscendC fused `torch.ops.npu.*` path), the latter
 requiring a manual `fla_npu` install. Registrations live in
 `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
 values are documented by `OpsImplementationConfig`.
+
+### Lossless GDN and KCP context parallelism
+
+`state_passing_lossless` is the correctness foundation for hybrid Ring CP ×
+Ulysses training. It assigns complete native 64-token GDN chunks to monotonic
+owners, uses a reversible variable-split all-to-all between the physical Ring
+layout and the owned layout, and connects recurrent state plus causal-conv halo
+with autograd-aware P2P. Per-sample padding never enters the ownership wire and
+its inverse gradient is zero.
+
+`kcp` reuses that exact ownership, padding, BOS, and halo plan, but replaces
+the recurrent-state P2P chain with a fixed-size fp32 affine all-gather/prefix
+composition. Its production affine backend is the immutable Ascend TTX
+BC8/M1 configuration; CUDA/GPU paths reject it instead of falling back.
+
+The selector is fail-closed: selecting `state_passing_lossless` or `kcp`
+requires `cp_size > 1`, packed dynamic batches, causal text self-attention,
+zero attention dropout, and the required accelerator kernels. The backwards-
+compatible `disabled` selector enables generic Ring/Hybrid CP for non-GDN causal
+models; it does not silently enable Ring for Qwen3.5 GDN, which must select an
+explicit lossless GDN mode. The current validated lossless paths run on Ascend NPU;
+GPU CP remains outside this gate, and only the Ascend path supports `kcp`. Eager/SDPA, `kcp` on CUDA,
+non-Qwen3.5 models using a GDN selector, and multimodal/cross-attention are
+intentionally unsupported in this foundation. See
+[Lossless GDN Context Parallelism](gdn_lossless_context_parallel.md) for
+layout, correctness, and test contracts.
 
 ---
 

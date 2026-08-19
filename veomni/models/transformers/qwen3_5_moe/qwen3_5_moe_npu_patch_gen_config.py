@@ -88,10 +88,59 @@ config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import(
+    "veomni.ops.kernels.attention._replicated_dummy",
+    names=[
+        "_DUMMY_SP_TOKEN",
+        "_call_replicated_dummy_checkpointed_module",
+        "_replicated_dummy_sequence_parallel",
+        "is_replicated_dummy_sequence_parallel",
+        "reject_public_sequence_parallel_bypass",
+    ],
+)
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+)
+config.add_import(
+    "veomni.distributed.context_parallel.gdn_lossless",
+    names=[
+        "align_gdn_varlen_chunks",
+        "aligned_gdn_cu_seqlens",
+        "attach_state_dependency",
+        "compile_gdn_lossless_runtime_plan",
+        "exchange_conv_halo",
+        "make_state_participation",
+        "make_state_template",
+        "owned_to_physical",
+        "physical_to_owned",
+        "receive_initial_state",
+        "send_final_state",
+        "trim_conv_halo",
+        "unpad_gdn_varlen_output",
+    ],
+)
+config.add_import(
+    "veomni.distributed.context_parallel.gdn_kcp",
+    names=["kcp_plan_requires_affine_scan", "prepare_kcp_ttx_warmup", "resolve_kcp_initial_state"],
+)
+config.add_import("veomni.distributed.context_parallel.gdn_runtime", names=["make_gdn_cp_runtime_observer"])
+config.add_import(
+    "veomni.ops.kernels.gated_delta_rule.normalization",
+    names=["producer_dtype_l2norm"],
+)
+config.add_import(
+    "veomni.ops.kernels.gated_delta_rule.backend_adapter",
+    names=["call_chunk_gated_delta_rule", "requires_chunked_varlen_metadata"],
+)
+config.add_import(
+    "veomni.distributed.context_parallel.packed_sharding",
+    names=[
+        "reorder_sample_major_to_ulysses_rank_major",
+        "reorder_ulysses_rank_major_to_sample_major",
+        "ulysses_local_head_count",
+    ],
 )
 # gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
 # (re-exported by the package __init__), not in .ulysses.
@@ -133,7 +182,7 @@ config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
     veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
@@ -143,6 +192,9 @@ config.add_post_import_block(
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_gdn_context_parallel_implementation = OpsConfigSlot(
+        "gdn_context_parallel_implementation", "disabled"
+    )
     """
 )
 
@@ -155,6 +207,7 @@ slice_input_tensor = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+veomni_gdn_context_parallel_implementation = None  # OpsConfigSlot, declared in post-import block above
 
 # Mirror the qwen3_5 NPU sentinel: this NPU config reuses
 # qwen3_5_vision_model_forward (Patch.5) but does NOT register the
@@ -353,7 +406,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
         "and to remove the full Flash Attention CPU-GPU sync."
     )
     linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
-    linear_attn_cu_seqlens_list = kwargs.pop("cu_seqlens_list_q", None)
+    linear_attn_cu_seqlens_list = kwargs.pop("linear_attn_cu_seqlens_list_q", None)
     linear_attn_chunk_indices = kwargs.pop("chunk_indices_q", None)
     linear_attn_chunk_indices_list = kwargs.pop("chunk_indices_list_q", None)
 

@@ -74,6 +74,14 @@ More details about torch device mesh, you can refer to the [Getting Started with
 
 - source code [veomni/distributed/parallel_state.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/distributed/parallel_state.py).
 
+Context parallelism is a packed, causal-only feature. For non-GDN causal models on the validated NPU route,
+ the default `gdn_context_parallel_implementation: disabled` selects the generic
+Ring/Hybrid attention path. Qwen3.5 GatedDeltaNet must opt into
+`state_passing_lossless` (Ascend NPU only) or `kcp` (Ascend NPU only); it never
+silently falls back to Ring because recurrent-state ownership and backward
+semantics are different. In all cases, CP sizes must be powers of two and
+dynamic packed metadata is required.
+
 ```python
 from veomni.distributed.parallel_state import (
     get_parallel_state,
@@ -88,7 +96,7 @@ init_parallel_state(
     dp_shard_size=args.train.accelerator.dp_shard_size, # data parallel shard degree
     tp_size=args.train.accelerator.tp_size, # tensor parallel size
     pp_size=args.train.accelerator.pp_size, # pipeline parallel size, not support now
-    cp_size=args.train.accelerator.cp_size, # context parallel size, not support now
+    cp_size=args.train.accelerator.cp_size, # packed Ring/Hybrid CP or explicit Qwen3.5 GDN CP
     ulysses_size=args.train.accelerator.ulysses_size, # ulysses parallel size
     extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
     extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
