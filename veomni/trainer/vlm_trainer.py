@@ -240,9 +240,7 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.base.args
         self.base.processor = build_processor(args.model.tokenizer_path, max_pixels=MAX_PIXELS)
         if self.base.model_config.model_type not in ("qwen2_5_omni", "qwen3_omni_moe"):
-            self.base.chat_template = build_chat_template(
-                args.data.chat_template, self.base.processor.tokenizer, expect_multimodal=True
-            )
+            self.base.chat_template = build_chat_template(args.data.chat_template, self.base.processor.tokenizer)
             self.base.model_assets = [self.base.processor, self.base.chat_template]
         else:
             self.base.chat_template = None

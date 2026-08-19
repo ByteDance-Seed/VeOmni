@@ -35,18 +35,9 @@ ROLE_SUPPORTED = ["system", "user", "assistant", "tool"]
 CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
 
 
-def _registers_multimodal(registered) -> bool:
-    """Whether a registry entry produces a multimodal template.
-
-    ``Registry`` also accepts plain callables, so this cannot assume a class.
-    """
-    return isinstance(registered, type) and issubclass(registered, MultimodalChatTemplate)
-
-
 def build_chat_template(
     template_name: str,
     tokenizer: "PreTrainedTokenizer",
-    expect_multimodal: bool = None,
     **kwargs,
 ) -> "ChatTemplate":
     """Builds any registered template, text-only or multimodal.
@@ -54,30 +45,8 @@ def build_chat_template(
     ``kwargs`` reach the template constructor. No template currently declares
     one, so an unrecognised option raises there instead of being silently
     dropped.
-
-    One registry holds both kinds, so a config naming the wrong kind resolves
-    here and would only fail later, deep inside a dataloader worker, on the
-    ``encode_messages`` signature mismatch. Callers that know which kind they
-    need pass ``expect_multimodal`` to turn that into an immediate error.
     """
-    template_cls = CHAT_TEMPLATE_REGISTRY[template_name]
-    # Checked before construction so the error names the config mistake. A
-    # multimodal template built on a text-only tokenizer resolves its vision
-    # tokens to None or unk instead of failing, which would turn a wrong
-    # `chat_template` into a confusing downstream error rather than this one.
-    if expect_multimodal is not None:
-        if _registers_multimodal(template_cls) != expect_multimodal:
-            wanted, got = ("multimodal", "text-only") if expect_multimodal else ("text-only", "multimodal")
-            available = sorted(
-                name
-                for name in CHAT_TEMPLATE_REGISTRY
-                if _registers_multimodal(CHAT_TEMPLATE_REGISTRY[name]) == expect_multimodal
-            )
-            raise ValueError(
-                f"Chat template '{template_name}' is {got}, but this training path needs a {wanted} one. "
-                f"Available {wanted} templates: {available}."
-            )
-    return template_cls(tokenizer, **kwargs)
+    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer, **kwargs)
 
 
 class ChatTemplate(ABC):
