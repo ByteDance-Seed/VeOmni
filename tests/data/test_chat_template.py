@@ -184,6 +184,37 @@ def test_build_chat_template_still_rejects_unknown_names():
         build_chat_template("no_such_template", _VisionTokenizer())
 
 
+@pytest.mark.parametrize("template_name", ["qwen2vl", "qwen3vl"])
+def test_qwen_vl_rejects_pads_that_collide_with_unk(template_name):
+    # A tokenizer missing the pads answers with its unk id, so the remap would
+    # rewrite every unk in the batch into a modality sentinel -- marking
+    # positions that hold no pixels, whether or not the sample carries any.
+    class _PadlessTokenizer(_VisionTokenizer):
+        unk_token_id = 7
+
+        def convert_tokens_to_ids(self, token):
+            return {"<|vision_start|>": 3, "<|vision_end|>": 4}.get(token, self.unk_token_id)
+
+    with pytest.raises(ValueError, match=r"requires the <\|image_pad\|> and <\|video_pad\|> tokenizer tokens"):
+        build_chat_template(template_name, _Processor(_PadlessTokenizer()))
+
+
+@pytest.mark.parametrize("template_name", ["qwen2vl", "qwen3vl"])
+def test_qwen_vl_accepts_a_tokenizer_that_only_knows_the_image_pad(template_name):
+    # An image-only processor is a supported shape, and a tokenizer with no unk
+    # id answers None for the video pad, which the remap compares against and
+    # leaves alone. Rejecting it here would break a setup that trains today.
+    class _ImageOnlyTokenizer(_VisionTokenizer):
+        unk_token_id = None
+
+        def convert_tokens_to_ids(self, token):
+            return {"<|image_pad|>": 1, "<|vision_start|>": 3, "<|vision_end|>": 4}.get(token)
+
+    template = build_chat_template(template_name, _Processor(_ImageOnlyTokenizer()))
+    assert template.image_token_id == 1
+    assert template.video_token_id is None
+
+
 class _SpecialTokenTokenizer:
     """Emits one id per special token, so placeholders can be counted.
 

@@ -320,6 +320,18 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
         self.video_pad = "<|video_pad|>"
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
         self.video_token_id = self.tokenizer.convert_tokens_to_ids(self.video_pad)
+        # A tokenizer that never learned a pad answers with its unk id, and
+        # _tokenize_and_remap would then rewrite every unk in the batch into a
+        # modality sentinel, marking positions that carry no pixels. A tokenizer
+        # with no unk id answers None instead, which the remap leaves alone.
+        unk_token_id = getattr(self.tokenizer, "unk_token_id", None)
+        missing_pads = [
+            pad
+            for pad, token_id in ((self.image_pad, self.image_token_id), (self.video_pad, self.video_token_id))
+            if unk_token_id is not None and token_id == unk_token_id
+        ]
+        if missing_pads:
+            raise ValueError(f"The Qwen-VL chat template requires the {' and '.join(missing_pads)} tokenizer tokens.")
 
         logger.info_rank0("Qwen2VLTemplate will not truncate sequence when longer than [max_seq_lens].")
 
@@ -537,7 +549,7 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                     for t_val in timestamps:
                         video_str_buffer += f"<{float(t_val):.1f} seconds>"
                         video_str_buffer += "<|vision_start|>"
-                        video_str_buffer += "<|video_pad|>" * tokens_per_chunk
+                        video_str_buffer += self.video_pad * tokens_per_chunk
                         video_str_buffer += "<|vision_end|>"
 
                     content += video_str_buffer
