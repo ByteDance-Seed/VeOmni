@@ -1206,6 +1206,20 @@ class OpsImplementationConfig:
             "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
         },
     )
+    qat_implementation: Literal["none", "fp8_blockwise"] = field(
+        default="none",
+        metadata={
+            "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
+            "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
+            "true FP8 GEMM (128x128 weight tiles, 1x128 activation blocks, ue8m0 scales), the NoPE "
+            "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
+            "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
+            "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
+            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
+            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
+            "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/."
+        },
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
@@ -1366,6 +1380,32 @@ class OpsImplementationConfig:
                 "load_balancing_loss_implementation='triton' requires the 'triton' package "
                 "on CUDA. Install it or set the field to 'eager'."
             )
+
+        # ``qat_implementation`` selects a quantization recipe instead of a
+        # kernel backend, so no OpSlot resolution validates it. Its fake
+        # quantizers are the SM90-only TileLang kernels: without this check a
+        # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
+        # inside the first fake-quant call.
+        if self.qat_implementation != "none":
+            import torch
+
+            from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+
+            unsupported = torch.version.hip is not None or not IS_CUDA_AVAILABLE
+            if not unsupported:
+                # Reading the capability initializes CUDA, and parsing happens
+                # before the trainer calls ``set_device`` -- query this rank's
+                # own GPU so the early context does not land on device 0 for
+                # every rank. The count is NVML-based and needs no context.
+                local_rank = int(os.getenv("LOCAL_RANK", "0"))
+                device = local_rank if local_rank < torch.cuda.device_count() else 0
+                unsupported = get_gpu_compute_capability(device) < 90
+            if unsupported:
+                raise ValueError(
+                    f"qat_implementation={self.qat_implementation!r} requires an SM90 or later NVIDIA CUDA "
+                    f"GPU, because its fake quantizers are the DeepSeek V4 TileLang kernels. "
+                    f"Set it to 'none' to train in the model dtype."
+                )
 
 
 @dataclass
