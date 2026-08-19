@@ -340,7 +340,7 @@
  class Qwen3_5GatedDeltaNet(nn.Module):
      def __init__(self, config: Qwen3_5Config, layer_idx: int):
          super().__init__()
-@@ -403,23 +607,40 @@
+@@ -403,23 +607,41 @@
          A = torch.empty(self.num_v_heads).uniform_(0, 16)
          self.A_log = nn.Parameter(torch.log(A))
 
@@ -381,6 +381,7 @@
          self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
 -        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
 +        self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
++        self._veomni_chunk_gated_delta_rule_impl = veomni_chunk_gated_delta_rule.implementation
 +        self.gdn_context_parallel_implementation = veomni_gdn_context_parallel_implementation.value
 +        if self.gdn_context_parallel_implementation == "kcp" and getattr(
 +            self.norm, "_veomni_kcp_requires_grouped_nested_fsdp_leaf", False
@@ -389,7 +390,7 @@
          self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
          if not is_fast_path_available:
-@@ -438,27 +659,104 @@
+@@ -438,27 +660,104 @@
          self,
          hidden_states: torch.Tensor,
          cache_params: Cache | None = None,
@@ -504,7 +505,7 @@
 
          z = self.in_proj_z(hidden_states)
          z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-@@ -466,61 +764,249 @@
+@@ -466,61 +765,249 @@
          b = self.in_proj_b(hidden_states)
          a = self.in_proj_a(hidden_states)
 
@@ -789,7 +790,7 @@
              core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                  query,
                  key,
-@@ -531,23 +1017,32 @@
+@@ -531,23 +1018,32 @@
                  output_final_state=cache_params is not None,
                  use_qk_l2norm_in_kernel=True,
              )
@@ -836,7 +837,7 @@
 
          # reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-@@ -557,6 +1052,20 @@
+@@ -557,6 +1053,20 @@
 
          output = self.out_proj(core_attn_out)
          return output
@@ -857,7 +858,7 @@
 
 
  def rotate_half(x):
-@@ -734,6 +1243,12 @@
+@@ -734,6 +1244,12 @@
          return down_proj
 
 
@@ -870,7 +871,7 @@
  class Qwen3_5RMSNorm(nn.Module):
      def __init__(self, dim: int, eps: float = 1e-6):
          super().__init__()
-@@ -743,7 +1258,16 @@
+@@ -743,7 +1259,16 @@
      def _norm(self, x):
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
@@ -887,7 +888,7 @@
          output = self._norm(x.float())
          # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
          # See https://github.com/huggingface/transformers/pull/29402
-@@ -752,6 +1276,12 @@
+@@ -752,6 +1277,12 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.eps}"
@@ -900,7 +901,7 @@
 
 
  class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
-@@ -774,19 +1304,32 @@
+@@ -774,19 +1305,32 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -934,7 +935,7 @@
              )
          elif self.layer_type == "full_attention":
              # Self Attention
-@@ -795,6 +1338,7 @@
+@@ -795,6 +1339,7 @@
                  attention_mask=attention_mask,
                  position_ids=position_ids,
                  past_key_values=past_key_values,
@@ -942,7 +943,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -806,7 +1350,6 @@
+@@ -806,7 +1351,6 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          hidden_states = residual + hidden_states
@@ -950,7 +951,7 @@
          return hidden_states
 
 
-@@ -902,6 +1445,12 @@
+@@ -902,6 +1446,12 @@
      return q_embed, k_embed
 
 
@@ -963,7 +964,7 @@
  class Qwen3_5VisionAttention(nn.Module):
      def __init__(self, config: Qwen3_5VisionConfig) -> None:
          super().__init__()
-@@ -935,13 +1484,18 @@
+@@ -935,13 +1485,18 @@
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
 
@@ -985,7 +986,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -958,6 +1512,9 @@
+@@ -958,6 +1513,9 @@
                  **kwargs,
              )
          else:
@@ -995,7 +996,7 @@
              # Other implementations: Process each chunk separately
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
-@@ -1019,6 +1576,12 @@
+@@ -1019,6 +1577,12 @@
          return hidden_states
 
 
@@ -1008,7 +1009,7 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      input_modalities = ("image", "video")
-@@ -1054,28 +1617,127 @@
+@@ -1054,28 +1618,127 @@
 
          self.post_init()
 
@@ -1156,7 +1157,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1090,39 +1752,217 @@
+@@ -1090,39 +1753,217 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1392,7 +1393,7 @@
          )
 
 
-@@ -1148,6 +1988,12 @@
+@@ -1148,6 +1989,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1405,7 +1406,7 @@
 
 
  class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
-@@ -1233,19 +2079,42 @@
+@@ -1233,19 +2080,42 @@
              past_key_values=past_key_values,
          )
 
@@ -1459,7 +1460,7 @@
 
 
  @auto_docstring
-@@ -1441,64 +2310,43 @@
+@@ -1441,64 +2311,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1549,7 +1550,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1564,13 +2412,18 @@
+@@ -1564,13 +2413,18 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1568,7 +1569,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1578,29 +2431,170 @@
+@@ -1578,29 +2432,170 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1749,7 +1750,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1610,6 +2604,18 @@
+@@ -1610,6 +2605,18 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1768,7 +1769,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1617,6 +2623,7 @@
+@@ -1617,6 +2624,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1776,7 +1777,7 @@
              **kwargs,
          )
 
-@@ -1624,6 +2631,12 @@
+@@ -1624,6 +2632,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1789,7 +1790,7 @@
 
 
  @auto_docstring
-@@ -1654,10 +2667,13 @@
+@@ -1654,10 +2668,13 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1803,7 +1804,7 @@
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
              config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-@@ -1679,6 +2695,10 @@
+@@ -1679,6 +2696,10 @@
          >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
          "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
          ```"""
@@ -1814,7 +1815,7 @@
          outputs: BaseModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1686,21 +2706,50 @@
+@@ -1686,21 +2707,50 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1869,7 +1870,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1740,6 +2789,41 @@
+@@ -1740,6 +2790,41 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1911,7 +1912,7 @@
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
      # Reference: fix gemma3 grad acc #37208
-@@ -1796,57 +2880,11 @@
+@@ -1796,57 +2881,11 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1972,7 +1973,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1857,27 +2895,54 @@
+@@ -1857,27 +2896,54 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2033,7 +2034,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2103,6 +3168,24 @@
+@@ -2103,6 +3169,24 @@
 
          return input_ids, model_kwargs
 

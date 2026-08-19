@@ -101,6 +101,17 @@ class OpSlot:
         """``True`` once ``bind()`` has been called."""
         return self._impl_name is not None
 
+    @property
+    def implementation(self) -> str | None:
+        """Return the exact implementation name selected for this slot.
+
+        Generated model code uses this identity to select an explicit kernel
+        metadata ABI.  Returning ``None`` before binding keeps accidental
+        dispatch fail-closed instead of guessing from the callable shape.
+        """
+
+        return self._impl_name
+
     def bound_kernel(self) -> Callable | None:
         """Return the resolved kernel callable, or ``None`` if eager / unbound.
 

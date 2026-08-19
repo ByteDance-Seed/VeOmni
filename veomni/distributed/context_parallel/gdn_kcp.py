@@ -444,6 +444,59 @@ def _validate_local_affine_preflight(
     warmup_ttx_bc8_m1_forward_backward(key, value, g, beta)
 
 
+def prepare_kcp_ttx_warmup(
+    *,
+    device: torch.device,
+    num_heads: int,
+    key_dim: int,
+    value_dim: int,
+    key_dtype: torch.dtype,
+    value_dtype: torch.dtype,
+    g_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    cp_group: ProcessGroup,
+    reference: Tensor,
+) -> None:
+    """Prepare TTX forward+VJP before decoder-layer checkpointing.
+
+    The first TTX launch is local and may import/compile/execute a custom
+    autograd function.  Running it inside a non-reentrant checkpoint is
+    invalid because checkpoint recomputation can replay the launch while the
+    KCP readiness graph is already being rebuilt.  All ranks therefore do the
+    local warmup first, then enter one scalar readiness collective so a single
+    rank's deterministic compile/shape failure is reported uniformly instead
+    of leaving peers in an unmatched checkpoint path.
+    """
+
+    local_error: Exception | None = None
+    try:
+        from veomni.ops.kernels.gdn_kcp_affine_ttx import warmup_ttx_bc8_m1_forward_backward_for_shapes
+
+        warmup_ttx_bc8_m1_forward_backward_for_shapes(
+            device=device,
+            num_heads=num_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            key_dtype=key_dtype,
+            value_dtype=value_dtype,
+            g_dtype=g_dtype,
+            beta_dtype=beta_dtype,
+        )
+    except Exception as exc:
+        local_error = exc
+
+    status = torch.tensor(
+        [int(local_error is not None)],
+        device=reference.device,
+        dtype=torch.int32,
+    )
+    if int(dist.get_world_size(group=cp_group)) > 1:
+        dist.all_reduce(status, op=dist.ReduceOp.MAX, group=cp_group)
+    if int(status.item()) != 0:
+        detail = f" local_error={type(local_error).__name__}: {local_error}" if local_error else ""
+        raise RuntimeError(f"coordinated KCP TTX warmup failed on at least one CP rank.{detail}")
+
+
 def _coordinate_local_affine_readiness(
     *,
     local_error: Exception | None,
@@ -904,6 +957,7 @@ __all__ = [
     "local_affine_summary_fused_torch",
     "local_affine_summary_recurrent",
     "pack_affine_hm",
+    "prepare_kcp_ttx_warmup",
     "prefix_merge_initial_state",
     "resolve_kcp_initial_state",
     "resolve_local_affine_impl",

@@ -123,12 +123,16 @@ config.add_import(
 )
 config.add_import(
     "veomni.distributed.context_parallel.gdn_kcp",
-    names=["kcp_plan_requires_affine_scan", "resolve_kcp_initial_state"],
+    names=["kcp_plan_requires_affine_scan", "prepare_kcp_ttx_warmup", "resolve_kcp_initial_state"],
 )
 config.add_import("veomni.distributed.context_parallel.gdn_runtime", names=["make_gdn_cp_runtime_observer"])
 config.add_import(
     "veomni.ops.kernels.gated_delta_rule.normalization",
     names=["producer_dtype_l2norm"],
+)
+config.add_import(
+    "veomni.ops.kernels.gated_delta_rule.backend_adapter",
+    names=["call_chunk_gated_delta_rule", "requires_chunked_varlen_metadata"],
 )
 config.add_import(
     "veomni.distributed.context_parallel.packed_sharding",

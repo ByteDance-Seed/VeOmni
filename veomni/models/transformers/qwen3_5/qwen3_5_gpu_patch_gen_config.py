@@ -315,6 +315,7 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
     self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
     self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
+    self._veomni_chunk_gated_delta_rule_impl = veomni_chunk_gated_delta_rule.implementation
     self.gdn_context_parallel_implementation = veomni_gdn_context_parallel_implementation.value
     if self.gdn_context_parallel_implementation == "kcp" and getattr(
         self.norm, "_veomni_kcp_requires_grouped_nested_fsdp_leaf", False

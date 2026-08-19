@@ -104,7 +104,11 @@ from transformers.utils.generic import (
 )
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
-from veomni.distributed.context_parallel.gdn_kcp import kcp_plan_requires_affine_scan, resolve_kcp_initial_state
+from veomni.distributed.context_parallel.gdn_kcp import (
+    kcp_plan_requires_affine_scan,
+    prepare_kcp_ttx_warmup,
+    resolve_kcp_initial_state,
+)
 from veomni.distributed.context_parallel.gdn_lossless import (
     align_gdn_varlen_chunks,
     aligned_gdn_cu_seqlens,
@@ -135,6 +139,10 @@ from veomni.ops.kernels.attention._replicated_dummy import (
     _replicated_dummy_sequence_parallel,
     is_replicated_dummy_sequence_parallel,
     reject_public_sequence_parallel_bypass,
+)
+from veomni.ops.kernels.gated_delta_rule.backend_adapter import (
+    call_chunk_gated_delta_rule,
+    requires_chunked_varlen_metadata,
 )
 from veomni.ops.kernels.gated_delta_rule.normalization import producer_dtype_l2norm
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -645,6 +653,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.causal_conv1d_fn = veomni_causal_conv1d.bound_kernel()
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
         self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
+        self._veomni_chunk_gated_delta_rule_impl = veomni_chunk_gated_delta_rule.implementation
         self.gdn_context_parallel_implementation = veomni_gdn_context_parallel_implementation.value
         if self.gdn_context_parallel_implementation == "kcp" and getattr(
             self.norm, "_veomni_kcp_requires_grouped_nested_fsdp_leaf", False
@@ -994,32 +1003,44 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                         # edges without changing the empty numerical output.
                         core_attn_out = attach_state_dependency(core_attn_out, initial_state)
                 else:
-                    # The original precomputed metadata describes the physical
-                    # input. Build the owned/chunk-aligned metadata from host CU
-                    # once per layer+plan, then reuse it across steps. This avoids
-                    # _ensure_varlen_metadata copying aligned_cu back to the host.
-                    from veomni.ops.kernels.gated_delta_rule.varlen_metadata import (
-                        precompute_varlen_metadata,
-                    )
-
-                    metadata_key = (tuple(aligned_host_cu), local_num_v_heads, str(query.device))
-                    cached_metadata = getattr(self, "_gdn_lossless_npu_metadata_cache", None)
-                    if cached_metadata is None or cached_metadata[0] != metadata_key:
-                        cached_metadata = (
-                            metadata_key,
-                            precompute_varlen_metadata(
-                                cu_seqlens=torch.tensor(aligned_host_cu, dtype=torch.int32),
-                                num_heads=local_num_v_heads,
-                                chunk_size=32,
-                                device=query.device,
-                            ),
+                    backend_impl = self._veomni_chunk_gated_delta_rule_impl
+                    if requires_chunked_varlen_metadata(backend_impl):
+                        # The original precomputed metadata describes the physical
+                        # input. Build the owned/chunk-aligned metadata from host CU
+                        # once per layer+plan, then reuse it across steps. This avoids
+                        # _ensure_varlen_metadata copying aligned_cu back to the host.
+                        from veomni.ops.kernels.gated_delta_rule.varlen_metadata import (
+                            precompute_varlen_metadata,
                         )
-                        self._gdn_lossless_npu_metadata_cache = cached_metadata
-                    aligned_cu_list, aligned_chunk_indices, aligned_chunk_indices_list = cached_metadata[1]
-                    core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+
+                        metadata_key = (tuple(aligned_host_cu), local_num_v_heads, str(query.device))
+                        cached_metadata = getattr(self, "_gdn_lossless_npu_metadata_cache", None)
+                        if cached_metadata is None or cached_metadata[0] != metadata_key:
+                            cached_metadata = (
+                                metadata_key,
+                                precompute_varlen_metadata(
+                                    cu_seqlens=torch.tensor(aligned_host_cu, dtype=torch.int32),
+                                    num_heads=local_num_v_heads,
+                                    chunk_size=32,
+                                    device=query.device,
+                                ),
+                            )
+                            self._gdn_lossless_npu_metadata_cache = cached_metadata
+                        aligned_cu_list, aligned_chunk_indices, aligned_chunk_indices_list = cached_metadata[1]
+                    else:
+                        # Legacy cu/host-CU backends deliberately do not consume
+                        # chunk maps. Do not construct or pass maps they cannot
+                        # consume; the adapter still validates canonical CU data.
+                        aligned_cu_list = aligned_host_cu
+                        aligned_chunk_indices = None
+                        aligned_chunk_indices_list = None
+                    core_attn_out, last_recurrent_state = call_chunk_gated_delta_rule(
+                        self.chunk_gated_delta_rule,
                         query_gdr,
                         key_gdr,
                         value_gdr,
+                        implementation=backend_impl,
+                        metadata_is_canonical=not requires_chunked_varlen_metadata(backend_impl),
                         g=g_gdr,
                         beta=beta_gdr,
                         initial_state=initial_state,
@@ -1043,10 +1064,15 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     core_attn_out = attach_state_dependency(core_attn_out, final_state)
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
-                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                core_attn_out, last_recurrent_state = call_chunk_gated_delta_rule(
+                    self.chunk_gated_delta_rule,
                     query,
                     key,
                     value,
+                    implementation=self._veomni_chunk_gated_delta_rule_impl,
+                    metadata_is_canonical=not requires_chunked_varlen_metadata(
+                        self._veomni_chunk_gated_delta_rule_impl
+                    ),
                     g=g,
                     beta=beta,
                     initial_state=None,
@@ -2295,17 +2321,34 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         # Modification: precompute varlen metadata once for all GDN layers.  Keep
         # the full-attention rank-local CU and the GDN global-valid CU separate:
         # their boundaries differ under context parallelism.
+        parallel_state = get_parallel_state()
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
         linear_attn_cu_seq_lens_q = kwargs.get("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
         if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
             kwargs["cu_seqlens_list_q"] = [int(point) for point in cu_seq_lens_q.detach().cpu().tolist()]
-        if linear_attn_cu_seq_lens_q is not None and "chunk_indices_q" not in kwargs:
+        if linear_attn_cu_seq_lens_q is not None and "linear_attn_cu_seqlens_list_q" not in kwargs:
+            kwargs["linear_attn_cu_seqlens_list_q"] = [
+                int(point) for point in linear_attn_cu_seq_lens_q.detach().cpu().tolist()
+            ]
+        first_gdn_for_metadata = next(
+            (
+                getattr(layer, "linear_attn", None)
+                for layer in self.layers[: self.config.num_hidden_layers]
+                if getattr(layer, "layer_type", None) == "linear_attention"
+            ),
+            None,
+        )
+        backend_impl_for_metadata = (
+            getattr(first_gdn_for_metadata, "_veomni_chunk_gated_delta_rule_impl", None)
+            if first_gdn_for_metadata is not None
+            else None
+        )
+        if linear_attn_cu_seq_lens_q is not None and requires_chunked_varlen_metadata(backend_impl_for_metadata):
             from veomni.ops.kernels.gated_delta_rule.varlen_metadata import precompute_varlen_metadata
 
             # Use the Ulysses-local head count so that the precomputed cumsum-block
             # key matches the per-layer _ensure_varlen_metadata computation (which
             # derives h from g.shape[-1], i.e. the local head count after SP split).
-            parallel_state = get_parallel_state()
             num_v_heads = ulysses_local_head_count(
                 self.config.linear_num_value_heads,
                 parallel_state.ulysses_size,
@@ -2325,6 +2368,71 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             kwargs["linear_attn_cu_seqlens_list_q"] = cu_seqlens_list
             kwargs["chunk_indices_q"] = chunk_indices
             kwargs["chunk_indices_list_q"] = chunk_indices_list
+
+        # TTX's first forward+VJP launch must happen outside decoder-layer
+        # checkpointing.  Non-reentrant checkpoint recomputation re-enters the
+        # layer body with a partially rebuilt autograd graph; doing the TTX
+        # compile/warmup there can trigger StopRecomputationError or leave CP
+        # ranks at different readiness points.  Prepare each distinct shape once
+        # before the first checkpointed layer and coordinate failures across CP.
+        if self.training and inputs_embeds.device.type == "npu" and parallel_state.cp_enabled:
+            first_gdn = next(
+                (
+                    getattr(layer, "linear_attn", None)
+                    for layer in self.layers[: self.config.num_hidden_layers]
+                    if getattr(layer, "layer_type", None) == "linear_attention"
+                ),
+                None,
+            )
+            if (
+                first_gdn is not None
+                and getattr(first_gdn, "gdn_context_parallel_implementation", "disabled") == "kcp"
+                and linear_attn_cu_seq_lens_q is not None
+            ):
+                num_v_heads = ulysses_local_head_count(
+                    self.config.linear_num_value_heads,
+                    parallel_state.ulysses_size,
+                )
+                # Do not call a child projection here: decoder layers are fully
+                # sharded by FSDP2 and their pre-forward hook has not run yet.  The
+                # root FSDP cast_forward_inputs hook has already cast
+                # ``inputs_embeds`` to the decoder compute dtype; an active device
+                # autocast policy takes precedence.  This gives the TTX readiness
+                # key the same dtype contract without bypassing FSDP materialization
+                # or adding a one-token forward.
+                device_type = inputs_embeds.device.type
+                try:
+                    autocast_enabled = torch.is_autocast_enabled(device_type)
+                except TypeError:  # older torch signature
+                    autocast_enabled = torch.is_autocast_enabled()
+                autocast_dtype = torch.get_autocast_dtype(device_type) if autocast_enabled else None
+                key_value_dtype = autocast_dtype or inputs_embeds.dtype
+                beta_dtype = autocast_dtype or inputs_embeds.dtype
+                warmup_signature = (
+                    inputs_embeds.device.type,
+                    inputs_embeds.device.index,
+                    int(num_v_heads),
+                    int(self.config.linear_key_head_dim),
+                    int(self.config.linear_value_head_dim),
+                    key_value_dtype,
+                    key_value_dtype,
+                    torch.float32,
+                    beta_dtype,
+                )
+                if getattr(self, "_gdn_kcp_ttx_warmup_signature", None) != warmup_signature:
+                    prepare_kcp_ttx_warmup(
+                        device=inputs_embeds.device,
+                        num_heads=int(num_v_heads),
+                        key_dim=int(self.config.linear_key_head_dim),
+                        value_dim=int(self.config.linear_value_head_dim),
+                        key_dtype=key_value_dtype,
+                        value_dtype=key_value_dtype,
+                        g_dtype=torch.float32,
+                        beta_dtype=beta_dtype,
+                        cp_group=parallel_state.cp_group,
+                        reference=inputs_embeds,
+                    )
+                    self._gdn_kcp_ttx_warmup_signature = warmup_signature
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

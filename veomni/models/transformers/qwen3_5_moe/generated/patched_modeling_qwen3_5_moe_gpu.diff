@@ -346,7 +346,7 @@
  class Qwen3_5MoeGatedDeltaNet(nn.Module):
      def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
          super().__init__()
-@@ -399,23 +612,40 @@
+@@ -399,23 +612,41 @@
          A = torch.empty(self.num_v_heads).uniform_(0, 16)
          self.A_log = nn.Parameter(torch.log(A))
 
@@ -387,6 +387,7 @@
          self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
 -        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
 +        self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
++        self._veomni_chunk_gated_delta_rule_impl = veomni_chunk_gated_delta_rule.implementation
 +        self.gdn_context_parallel_implementation = veomni_gdn_context_parallel_implementation.value
 +        if self.gdn_context_parallel_implementation == "kcp" and getattr(
 +            self.norm, "_veomni_kcp_requires_grouped_nested_fsdp_leaf", False
@@ -395,7 +396,7 @@
          self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
          if not is_fast_path_available:
-@@ -434,27 +664,104 @@
+@@ -434,27 +665,104 @@
          self,
          hidden_states: torch.Tensor,
          cache_params: Cache | None = None,
@@ -510,7 +511,7 @@
 
          z = self.in_proj_z(hidden_states)
          z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-@@ -462,61 +769,249 @@
+@@ -462,61 +770,249 @@
          b = self.in_proj_b(hidden_states)
          a = self.in_proj_a(hidden_states)
 
@@ -795,7 +796,7 @@
              core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                  query,
                  key,
-@@ -527,23 +1022,32 @@
+@@ -527,23 +1023,32 @@
                  output_final_state=cache_params is not None,
                  use_qk_l2norm_in_kernel=True,
              )
@@ -842,7 +843,7 @@
 
          # reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-@@ -553,6 +1057,20 @@
+@@ -553,6 +1058,20 @@
 
          output = self.out_proj(core_attn_out)
          return output
@@ -863,7 +864,7 @@
 
 
  def rotate_half(x):
-@@ -732,12 +1250,24 @@
+@@ -732,12 +1251,24 @@
          return down_proj
 
 
@@ -890,7 +891,7 @@
          self.num_experts = config.num_experts
          self.hidden_dim = config.hidden_size
          self.intermediate_dim = config.moe_intermediate_size
-@@ -751,6 +1281,11 @@
+@@ -751,6 +1282,11 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -902,7 +903,7 @@
          final_hidden_states = torch.zeros_like(hidden_states)
          with torch.no_grad():
              expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-@@ -791,6 +1326,12 @@
+@@ -791,6 +1327,12 @@
          return router_logits, router_scores, router_indices
 
 
@@ -915,7 +916,7 @@
  class Qwen3_5MoeSparseMoeBlock(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -799,18 +1340,47 @@
+@@ -799,18 +1341,47 @@
          self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
          self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -964,7 +965,7 @@
 
 
  class Qwen3_5MoeRMSNorm(nn.Module):
-@@ -822,15 +1392,24 @@
+@@ -822,15 +1393,24 @@
      def _norm(self, x):
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
@@ -991,7 +992,7 @@
 
 
  class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
-@@ -846,6 +1425,7 @@
+@@ -846,6 +1426,7 @@
          self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
          self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -999,7 +1000,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -853,19 +1433,32 @@
+@@ -853,19 +1434,32 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -1033,7 +1034,7 @@
              )
          elif self.layer_type == "full_attention":
              # Self Attention
-@@ -874,6 +1467,7 @@
+@@ -874,6 +1468,7 @@
                  attention_mask=attention_mask,
                  position_ids=position_ids,
                  past_key_values=past_key_values,
@@ -1041,7 +1042,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -888,7 +1482,6 @@
+@@ -888,7 +1483,6 @@
          if isinstance(hidden_states, tuple):
              hidden_states, _ = hidden_states
          hidden_states = residual + hidden_states
@@ -1049,7 +1050,7 @@
          return hidden_states
 
 
-@@ -990,6 +1583,12 @@
+@@ -990,6 +1584,12 @@
      return q_embed, k_embed
 
 
@@ -1062,7 +1063,7 @@
  class Qwen3_5MoeVisionAttention(nn.Module):
      def __init__(self, config: Qwen3_5MoeVisionConfig) -> None:
          super().__init__()
-@@ -1023,13 +1622,18 @@
+@@ -1023,13 +1623,18 @@
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
 
@@ -1084,7 +1085,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -1046,6 +1650,9 @@
+@@ -1046,6 +1651,9 @@
                  **kwargs,
              )
          else:
@@ -1094,7 +1095,7 @@
              # Other implementations: Process each chunk separately
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
-@@ -1107,6 +1714,12 @@
+@@ -1107,6 +1715,12 @@
          return hidden_states
 
 
@@ -1107,7 +1108,7 @@
  class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
      config: Qwen3_5MoeVisionConfig
      input_modalities = ("image", "video")
-@@ -1142,28 +1755,127 @@
+@@ -1142,28 +1756,127 @@
 
          self.post_init()
 
@@ -1255,7 +1256,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1178,39 +1890,217 @@
+@@ -1178,39 +1891,217 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1491,7 +1492,7 @@
          )
 
 
-@@ -1268,6 +2158,37 @@
+@@ -1268,6 +2159,37 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -1529,7 +1530,7 @@
 
 
  class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
-@@ -1353,19 +2274,42 @@
+@@ -1353,19 +2275,42 @@
              past_key_values=past_key_values,
          )
 
@@ -1583,7 +1584,7 @@
 
 
  @auto_docstring
-@@ -1376,7 +2320,19 @@
+@@ -1376,7 +2321,19 @@
      config: Qwen3_5MoeConfig
      _no_split_modules = ["Qwen3_5MoeDecoderLayer", "Qwen3_5MoeVisionBlock"]
 
@@ -1603,7 +1604,7 @@
          super().__init__(config)
          self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
          self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
-@@ -1561,64 +2517,43 @@
+@@ -1561,64 +2518,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1693,7 +1694,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1684,6 +2619,7 @@
+@@ -1684,6 +2620,7 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1701,7 +1702,7 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeModelOutputWithPast:
          r"""
-@@ -1691,6 +2627,10 @@
+@@ -1691,6 +2628,10 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1712,7 +1713,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1698,29 +2638,170 @@
+@@ -1698,29 +2639,170 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1893,7 +1894,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1730,6 +2811,17 @@
+@@ -1730,6 +2812,17 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1911,7 +1912,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1737,6 +2829,7 @@
+@@ -1737,6 +2830,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1919,7 +1920,7 @@
              **kwargs,
          )
 
-@@ -1828,6 +2921,12 @@
+@@ -1828,6 +2922,12 @@
      return overall_loss * num_experts
 
 
@@ -1932,7 +1933,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1848,6 +2947,7 @@
+@@ -1848,6 +2948,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1940,7 +1941,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1860,14 +2960,17 @@
+@@ -1860,14 +2961,17 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -1959,7 +1960,7 @@
 
          Example:
 
-@@ -1889,6 +2992,7 @@
+@@ -1889,6 +2993,7 @@
          output_router_logits = (
              output_router_logits if output_router_logits is not None else self.config.output_router_logits
          )
@@ -1967,7 +1968,7 @@
 
          # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
          outputs: MoeModelOutputWithPast = self.model(
-@@ -1899,30 +3003,70 @@
+@@ -1899,30 +3004,70 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -2049,7 +2050,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1930,7 +3074,14 @@
+@@ -1930,7 +3075,14 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -2065,7 +2066,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -1977,6 +3128,7 @@
+@@ -1977,6 +3129,7 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -2073,7 +2074,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1990,105 +3142,94 @@
+@@ -1990,105 +3143,94 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2235,7 +2236,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2314,6 +3455,30 @@
+@@ -2314,6 +3456,30 @@
 
          return input_ids, model_kwargs
 

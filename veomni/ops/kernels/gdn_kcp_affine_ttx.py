@@ -898,6 +898,44 @@ def warmup_ttx_bc8_m1_forward_backward(
     _TTX_FORWARD_BACKWARD_WARMUP_CACHE.add(signature)
 
 
+def warmup_ttx_bc8_m1_forward_backward_for_shapes(
+    *,
+    device: torch.device,
+    num_heads: int,
+    key_dim: int,
+    value_dim: int,
+    key_dtype: torch.dtype,
+    value_dtype: torch.dtype,
+    g_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+) -> None:
+    """Warm the production TTX forward+VJP from a model-level shape contract.
+
+    Decoder layers are wrapped by non-reentrant activation checkpointing, so
+    the first TTX launch must happen before entering a checkpoint.  This
+    helper intentionally constructs the same small synthetic tensors as the
+    tensor-based warmup, but keeps model code independent from the private
+    cache and custom autograd implementation.
+    """
+
+    device = torch.device(device)
+    if device.type != "npu":
+        raise RuntimeError(f"TTX KCP warmup requires an Ascend NPU device, got {device}")
+    for name, value in (
+        ("num_heads", num_heads),
+        ("key_dim", key_dim),
+        ("value_dim", value_dim),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    token_count = 128
+    key = torch.zeros(1, token_count, num_heads, key_dim, device=device, dtype=key_dtype, requires_grad=True)
+    value = torch.zeros(1, token_count, num_heads, value_dim, device=device, dtype=value_dtype, requires_grad=True)
+    g = torch.zeros(1, token_count, num_heads, device=device, dtype=g_dtype, requires_grad=True)
+    beta = torch.zeros(1, token_count, num_heads, device=device, dtype=beta_dtype, requires_grad=True)
+    warmup_ttx_bc8_m1_forward_backward(key, value, g, beta)
+
+
 __all__ = [
     "TTX_BC8_M1_CONFIG",
     "TtxBc8M1Config",
@@ -909,4 +947,5 @@ __all__ = [
     "validate_ttx_bc8_m1_inputs",
     "validate_ttx_bc8_m1_shape",
     "warmup_ttx_bc8_m1_forward_backward",
+    "warmup_ttx_bc8_m1_forward_backward_for_shapes",
 ]
