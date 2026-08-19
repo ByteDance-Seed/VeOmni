@@ -723,8 +723,11 @@ class BaseTrainer(Stateful, ABC):
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
+        losses = getattr(outputs, "loss_dict", None)
+        if losses is None:
+            losses = outputs.loss
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss,
+            losses,
             self.micro_batch_token_len,
             self.micro_batches_token_len,
             getattr(self, "global_micro_batches_token_len", None),

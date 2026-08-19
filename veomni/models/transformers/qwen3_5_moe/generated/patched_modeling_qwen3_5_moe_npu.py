@@ -37,6 +37,12 @@
 #      Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.
 #    - method_override: Qwen3_5MoeForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
+#    - method_override: Qwen3_5MoeForConditionalGeneration.__init__
+#      Build the MTP head when enabled
+#    - method_override: Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos
+#      Declare the MTP label collate rule
+#    - method_override: Qwen3_5MoeForConditionalGeneration.get_sample_collate_func
+#      Expose the per-sample MTP label shift
 #    - class_replacement: Qwen3_5MoeExperts
 #      Remove @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 #    - method_override: Qwen3_5MoeGatedDeltaNet.__init__
@@ -107,16 +113,14 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
 # Additional import blocks for patches
-# NPU has no fla/flash_qla backend registered today; selecting a non-eager
-# linear-attention impl raises at OpSlot.bind() time. These None
-# placeholders preserve the upstream HF top-level
+# Preserve the upstream availability check; OpSlots provide the kernels.
 # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
 # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
 # assignments in __init__ resolve to torch.
@@ -249,6 +253,26 @@ class _Qwen3_5MoeFakeForPosID(SimpleNamespace):
 
     def get_vision_position_ids(self, *args, **kwargs):
         return Qwen3_5MoeModel.get_vision_position_ids(self, *args, **kwargs)
+
+
+# ── MTP (multi-token prediction) ─────────────────────────────────────────────
+def _mtp_loss_weight(text_config):
+    """Resolve the MTP loss weight, or None when MTP is disabled."""
+    weight = getattr(text_config, "mtp_loss_weight", None)
+    if weight is None:
+        return None
+    weight = float(weight)
+    if weight <= 0.0:
+        return None
+    if int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0) <= 0:
+        return None
+    return weight
+
+
+def make_mtp_labels(feature):
+    """Create depth-1 MTP labels before samples are packed."""
+    labels = feature["labels"]
+    feature["mtp_labels"] = F.pad(labels, (0, 2), value=IGNORE_INDEX)[..., 2:].contiguous()  # noqa: F821
 
 
 logger = logging.get_logger(__name__)
@@ -771,10 +795,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             # Modification: instance-local guard (see GPU patch comment).
             if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
                 raise RuntimeError(
-                    "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
-                    "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
-                    "(and install flash-linear-attention) or 'flash_qla' (ships under the gpu extra, "
-                    "Hopper sm90 only) in OpsImplementationConfig."
+                    "Varlen Qwen3.5 GatedDeltaNet training requires a non-eager "
+                    "chunk_gated_delta_rule backend. On GPU, set the implementation to 'fla' or "
+                    "'flash_qla'; on NPU, set it to 'fla_npu' or 'npu'."
                 )
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -1245,6 +1268,47 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
             hidden_states, _ = hidden_states
         hidden_states = residual + hidden_states
         return hidden_states
+
+
+# ======================================================================
+# [HELPERS AFTER] Qwen3_5MoeDecoderLayer
+# ======================================================================
+
+
+class Qwen3_5MoeMTP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert not getattr(config, "mtp_use_dedicated_embeddings", False)
+        num_layers = int(config.mtp_num_hidden_layers)
+        assert "full_attention" in config.layer_types
+        layer_idx = config.layer_types.index("full_attention")
+        self.pre_fc_norm_embedding = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList([Qwen3_5MoeDecoderLayer(config, layer_idx) for _ in range(num_layers)])
+        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self, hidden_states, inputs_embeds, position_embeddings, attention_mask=None, position_ids=None, **kwargs
+    ):
+        assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False)
+        shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, 1))[:, 1:, :]
+        hidden_states = self.fc(
+            torch.cat([self.pre_fc_norm_embedding(shifted_embeds), self.pre_fc_norm_hidden(hidden_states)], dim=-1)
+        )
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                **kwargs,
+            )
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+        return self.norm(hidden_states)
 
 
 class Qwen3_5MoePreTrainedModel(PreTrainedModel):
@@ -1862,6 +1926,16 @@ class Qwen3_5MoeModelOutputWithPast(ModelOutput):
     router_logits: tuple[torch.FloatTensor] | None = None
 
 
+# ======================================================================
+# [HELPERS AFTER] Qwen3_5MoeModelOutputWithPast
+# ======================================================================
+
+
+@dataclass
+class Qwen3_5MoeMTPContextOutput(Qwen3_5MoeModelOutputWithPast):
+    mtp_context: dict | None = None
+
+
 @auto_docstring(
     custom_intro="""
     Base class for Qwen3_5Moe causal language model (or autoregressive) outputs.
@@ -1916,6 +1990,8 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
+
+    loss_dict: dict[str, torch.Tensor] | None = None
 
 
 # ======================================================================
@@ -2024,9 +2100,25 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
 
-        return Qwen3_5MoeModelOutputWithPast(
+        mtp_context = None
+        if self.training and getattr(self, "_veomni_mtp_enabled", False):
+            mtp_context = {
+                "inputs_embeds": inputs_embeds,
+                "position_embeddings": position_embeddings,
+                "attention_mask": causal_mask,
+                "position_ids": text_position_ids,
+            }
+
+        if mtp_context is None:
+            return Qwen3_5MoeModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=past_key_values,
+            )
+
+        return Qwen3_5MoeMTPContextOutput(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            mtp_context=mtp_context,
         )
 
     def _update_linear_attn_mask(self, attention_mask, cache_position):
@@ -2588,10 +2680,11 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             **kwargs,
         )
 
-        return Qwen3_5MoeModelOutputWithPast(
-            **outputs,
-            rope_deltas=self.rope_deltas,
-        )
+        output_kwargs = dict(outputs)
+        output_kwargs["rope_deltas"] = self.rope_deltas
+        if getattr(outputs, "mtp_context", None) is not None:
+            return Qwen3_5MoeMTPContextOutput(**output_kwargs)  # noqa: F821
+        return Qwen3_5MoeModelOutputWithPast(**output_kwargs)
 
 
 def load_balancing_loss_func(
@@ -2834,7 +2927,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, forward, get_parallel_plan
+# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, get_sample_collate_func, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -2845,11 +2938,20 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
     config: Qwen3_5MoeConfig
     _tp_plan = {"lm_head": "colwise_gather_output"}
 
+    # ── ForConditionalGeneration forward (fused loss + aux_loss) ─────────────────────
     def __init__(self, config):
         super().__init__(config)
         self.model = Qwen3_5MoeModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-
+        self.mtp = None
+        weight = _mtp_loss_weight(config.text_config)  # noqa: F821
+        self.model.language_model._veomni_mtp_enabled = weight is not None
+        if weight is not None:
+            assert not get_parallel_state().sp_enabled, "Qwen3.5 MoE MTP does not support sequence parallel."
+            self.mtp = Qwen3_5MoeMTP(config.text_config)  # noqa: F821
+            logger.info_rank0(
+                f"Qwen3.5 MoE MTP enabled: {config.text_config.mtp_num_hidden_layers} layer(s), loss weight {weight}."
+            )
         self.post_init()
 
     @auto_docstring
@@ -2882,7 +2984,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         """
         return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
-    # ── ForConditionalGeneration forward (fused loss + aux_loss) ─────────────────────
     @can_return_tuple
     def forward(
         self,
@@ -2898,6 +2999,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         video_grid_thw: torch.LongTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        mtp_labels: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
         outputs = self.model(
@@ -2973,8 +3075,41 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
             if labels is not None:
                 loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
 
+        loss_dict = None
+        if self.mtp is not None and labels is not None:
+            if mtp_labels is None:
+                raise ValueError(
+                    "Qwen3.5 MoE MTP training requires tasks/train_text.py; this trainer did not provide `mtp_labels`."
+                )
+            mtp_context = getattr(outputs, "mtp_context", None)
+            if mtp_context is None:
+                raise ValueError("MTP is enabled but the language model returned no mtp_context.")
+            mtp_hidden = self.mtp(
+                hidden_states=outputs[0],
+                inputs_embeds=mtp_context["inputs_embeds"],
+                position_embeddings=mtp_context["position_embeddings"],
+                attention_mask=mtp_context["attention_mask"],
+                position_ids=mtp_context["position_ids"],
+                cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+                cu_seq_lens_k=kwargs.get("cu_seq_lens_k"),
+                max_length_q=kwargs.get("max_length_q"),
+                max_length_k=kwargs.get("max_length_k"),
+            )
+            mtp_loss_fn = veomni_causal_lm_loss if veomni_causal_lm_loss.use_non_eager_impl else self.loss_function
+            mtp_loss, _, _ = mtp_loss_fn(
+                logits=None,
+                labels=labels,
+                vocab_size=self.config.text_config.vocab_size,
+                hidden_states=mtp_hidden,
+                weights=self.lm_head.weight,
+                shift_labels=mtp_labels,
+            )
+            weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821
+            loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
+
         return Qwen3_5MoeCausalLMOutputWithLogProbs(
             loss=loss,
+            loss_dict=loss_dict,
             aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -3225,6 +3360,16 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         # add_helper) — a bare function reference is picklable for the DataLoader
         # workers; the Qwen3.5-VL-MoE ViT formula needs no model config.
         return collate_multimodal_metadata  # noqa: F821 defined via add_helper
+
+    def get_extra_collate_infos(self):
+        if self.mtp is None:
+            return {}
+        return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
+
+    def get_sample_collate_func(self):
+        if self.mtp is None:
+            return None
+        return make_mtp_labels  # noqa: F821
 
     # ── Expert parallel plan ─────────────────────────────────────────────────────
     def get_parallel_plan(self):

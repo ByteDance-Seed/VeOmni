@@ -111,6 +111,17 @@ KERNEL_REGISTRY.register(
     )
 )
 
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="fla_npu",
+        op_name="rms_norm_gated",
+        variant="standard",
+        factory=_fla_fused_rms_norm_gated_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="flash-linear-attention FusedRMSNormGated (Ascend dispatch)",
+    )
+)
+
 
 # ── causal_conv1d (FLA Triton causal conv) ───────────────────────────────────
 
@@ -134,6 +145,16 @@ KERNEL_REGISTRY.register(
     )
 )
 
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="fla_npu",
+        op_name="causal_conv1d",
+        variant="standard",
+        factory=_fla_causal_conv1d_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="flash-linear-attention causal conv1d (Ascend dispatch)",
+    )
+)
 
 # ── causal_conv1d (NPU vendored Triton) ──────────────────────────────────────
 
@@ -180,6 +201,17 @@ KERNEL_REGISTRY.register(
         factory=_fla_chunk_gated_delta_rule_factory,
         hardware=HardwareRequirement(device_type="gpu"),
         description="flash-linear-attention chunk gated delta rule (Triton, varlen-aware)",
+    )
+)
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="fla_npu",
+        op_name="chunk_gated_delta_rule",
+        variant="standard",
+        factory=_fla_chunk_gated_delta_rule_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="flash-linear-attention chunk gated delta rule (Ascend dispatch)",
     )
 )
 

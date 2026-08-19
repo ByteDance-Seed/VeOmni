@@ -61,14 +61,21 @@ from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     PatchedQwen3_5MoeExperts,
     Qwen3_5MoeCausalLMOutputWithLogProbs,
+    Qwen3_5MoeMTP,
+    Qwen3_5MoeMTPContextOutput,
+    _mtp_loss_weight,
     _Qwen3_5MoeFakeForPosID,
     collate_multimodal_metadata,
     get_position_id,
+    make_mtp_labels,
     mm_token_type_ids_from_input_ids,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
+    qwen3_5_moe_forconditional_generation_get_extra_collate_infos,
     qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     qwen3_5_moe_forconditional_generation_get_position_id_func,
+    qwen3_5_moe_forconditional_generation_get_sample_collate_func,
+    qwen3_5_moe_forconditional_generation_init_patched,
     qwen3_5_moe_get_parallel_plan_patched,
     qwen3_5_moe_model_forward_patched,
     qwen3_5_moe_model_init_patched,
@@ -84,6 +91,7 @@ config = PatchConfig(
 )
 
 config.add_import("copy", names=["copy"])
+config.add_import("dataclasses", names=["dataclass"])
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
@@ -98,7 +106,7 @@ config.add_import(
 config.add_import(
     "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
 )
-config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward``
 # (re-used from the GPU config) can return per-token log-probs in the unified
 # MoE output dataclass.
@@ -116,9 +124,7 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
-    # linear-attention impl raises at OpSlot.bind() time. These None
-    # placeholders preserve the upstream HF top-level
+    # Preserve the upstream availability check; OpSlots provide the kernels.
     # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
     # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
     # assignments in __init__ resolve to torch.
@@ -267,6 +273,10 @@ config.override_method(
 
 
 config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast", Qwen3_5MoeCausalLMOutputWithLogProbs)
+config.add_helper_after("Qwen3_5MoeDecoderLayer", Qwen3_5MoeMTP)
+config.add_helper_after("Qwen3_5MoeModelOutputWithPast", Qwen3_5MoeMTPContextOutput)
+config.add_helper(_mtp_loss_weight)
+config.add_helper(make_mtp_labels)
 
 
 config.override_method(
@@ -280,6 +290,24 @@ config.override_method(
     "Qwen3_5MoeForConditionalGeneration.get_metadata_collate_func",
     replacement=qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.__init__",
+    replacement=qwen3_5_moe_forconditional_generation_init_patched,
+    description="Build the MTP head when enabled",
+)
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos",
+    replacement=qwen3_5_moe_forconditional_generation_get_extra_collate_infos,
+    description="Declare the MTP label collate rule",
+)
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_sample_collate_func",
+    replacement=qwen3_5_moe_forconditional_generation_get_sample_collate_func,
+    description="Expose the per-sample MTP label shift",
 )
 
 

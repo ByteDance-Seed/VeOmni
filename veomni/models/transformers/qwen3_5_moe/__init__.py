@@ -15,6 +15,13 @@ from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODELING_REGISTRY
 
 
+def _create_qwen3_5_moe_checkpoint_tensor_converter(model):
+    from ..qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
+
+    text_config = getattr(model.config, "text_config", model.config)
+    return Qwen3MoeCheckpointTensorConverter(num_experts=text_config.num_experts)
+
+
 # Qwen3.5 GatedDeltaNet's three fused ops (FusedRMSNormGated, causal_conv1d,
 # chunk_gated_delta_rule) currently only ship GPU backends via FLA / FlashQLA.
 # Setting any of these to a non-eager value on NPU raises at OpSlot.bind via
@@ -30,6 +37,8 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("qwen3_5_moe")
 def register_qwen3_5_moe_modeling(architecture: str):
+    from ..qwen3_moe.checkpoint_tensor_converter import convert_qwen3_moe_fqn_to_index_mapping
+
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_5_moe_npu import (
             Qwen3_5MoeForCausalLM,
@@ -40,6 +49,10 @@ def register_qwen3_5_moe_modeling(architecture: str):
             Qwen3_5MoeForCausalLM,
             Qwen3_5MoeForConditionalGeneration,
         )
+
+    for model_cls in (Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration):
+        model_cls._create_checkpoint_tensor_converter = staticmethod(_create_qwen3_5_moe_checkpoint_tensor_converter)
+        model_cls._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_moe_fqn_to_index_mapping)
 
     if "ForCausalLM" in architecture:
         return Qwen3_5MoeForCausalLM
