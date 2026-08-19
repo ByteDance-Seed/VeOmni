@@ -19,7 +19,10 @@ from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     build_mot_sdpa_mask,
     pad_mot_attention_metadata,
 )
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoTAttention
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import (
+    BagelQwen2MoTAttention,
+    _sdpa_packed_attention,
+)
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.ops.kernels.attention import fused_attention_forward
 
@@ -157,9 +160,11 @@ def test_block_mask_metadata_matches_dense_attention_oracle(
     assert metadata.dtype == torch.int32
     assert metadata.is_contiguous()
     assert metadata.numel() == 3 * sequence_length
+    sdpa_mask = build_mot_sdpa_mask(metadata)
     assert materialized.any(dim=-1).all()
     assert torch.equal(materialized, dense_oracle)
-    assert torch.equal(build_mot_sdpa_mask(metadata), materialized)
+    assert sdpa_mask.dtype == torch.bool
+    assert torch.equal(sdpa_mask, materialized)
 
 
 def test_randomized_block_mask_metadata_matches_dense_attention_oracle() -> None:
@@ -182,7 +187,10 @@ def test_randomized_block_mask_metadata_matches_dense_attention_oracle() -> None
             sample_attn_modes,
             device=torch.device("cpu"),
         )
+        sdpa_mask = build_mot_sdpa_mask(metadata)
+        assert sdpa_mask.dtype == torch.bool
         torch.testing.assert_close(materialized, dense_oracle)
+        torch.testing.assert_close(sdpa_mask, dense_oracle)
 
 
 def test_block_mask_sparse_layout_covers_dense_attention_oracle() -> None:
@@ -281,7 +289,7 @@ def test_training_attention_dispatches_unified_flex_once(monkeypatch: pytest.Mon
     packed_position_cos = torch.ones(sequence_length, attention.head_dim)
     packed_position_sin = torch.zeros(sequence_length, attention.head_dim)
 
-    output = attention._forward_packed_train(
+    output = attention.forward_packed_train(
         packed_sequence=packed_sequence,
         attention_mask=build_mot_block_mask(metadata),
         packed_position_cos=packed_position_cos,
@@ -305,7 +313,7 @@ def test_eager_training_attention_uses_sdpa() -> None:
     sequence_length = 2
     metadata = build_mot_attention_metadata([[2]], [["causal"]], device=torch.device("cpu"))
 
-    output = attention._forward_packed_train(
+    output = attention.forward_packed_train(
         packed_sequence=torch.randn(sequence_length, config.hidden_size),
         attention_mask=build_mot_sdpa_mask(metadata),
         packed_position_cos=torch.ones(sequence_length, attention.head_dim),
@@ -315,6 +323,43 @@ def test_eager_training_attention_uses_sdpa() -> None:
     )
 
     assert output.shape == (sequence_length, config.hidden_size)
+    assert torch.isfinite(output).all()
+
+
+def test_eager_sdpa_mask_is_boolean() -> None:
+    metadata = build_mot_attention_metadata([[2]], [["causal"]], device=torch.device("cpu"))
+    mask = build_mot_sdpa_mask(metadata)
+    packed = torch.randn(2, 4, 8)
+
+    assert mask.dtype == torch.bool
+    output = _sdpa_packed_attention(
+        packed,
+        packed,
+        packed,
+        attention_mask=mask,
+        scale=1.0,
+        enable_gqa=False,
+    )
+    assert output.shape == packed.shape
+    assert torch.isfinite(output).all()
+
+
+def test_eager_sdpa_masked_gqa_repeats_kv_heads() -> None:
+    metadata = build_mot_attention_metadata([[3]], [["causal"]], device=torch.device("cpu"))
+    mask = build_mot_sdpa_mask(metadata)
+    query = torch.randn(3, 4, 8)
+    key = torch.randn(3, 2, 8)
+    value = torch.randn(3, 2, 8)
+
+    output = _sdpa_packed_attention(
+        query,
+        key,
+        value,
+        attention_mask=mask,
+        scale=1.0,
+        enable_gqa=True,
+    )
+    assert output.shape == query.shape
     assert torch.isfinite(output).all()
 
 
@@ -338,7 +383,7 @@ def test_accelerated_training_attention_rejects_non_flex_backend() -> None:
     metadata = build_mot_attention_metadata([[2]], [["causal"]], device=torch.device("cpu"))
 
     with pytest.raises(ValueError, match="requires packed fused attention"):
-        attention._forward_packed_train(
+        attention.forward_packed_train(
             packed_sequence=torch.randn(sequence_length, config.hidden_size),
             attention_mask=build_mot_block_mask(metadata),
             packed_position_cos=torch.ones(sequence_length, attention.head_dim),

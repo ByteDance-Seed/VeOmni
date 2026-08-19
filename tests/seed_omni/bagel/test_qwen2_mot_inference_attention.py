@@ -57,7 +57,7 @@ def test_forward_inference_temporarily_overrides_and_restores_attention_config(
             past_key_values=kwargs["past_key_values"],
         )
 
-    monkeypatch.setattr(model.model, "_forward_packed_inference", fake_forward)
+    monkeypatch.setattr(model.model, "forward_packed_inference", fake_forward)
     output = model.forward_inference(
         packed_query_sequence=packed_query,
         query_lens=torch.tensor([2], dtype=torch.int32),
@@ -76,7 +76,7 @@ def test_forward_inference_temporarily_overrides_and_restores_attention_config(
         assert model.config._attn_implementation == "veomni_flash_attention_2_with_sp"
         raise RuntimeError("inference failure")
 
-    monkeypatch.setattr(model.model, "_forward_packed_inference", failing_forward)
+    monkeypatch.setattr(model.model, "forward_packed_inference", failing_forward)
     with pytest.raises(RuntimeError, match="inference failure"):
         model.forward_inference(
             packed_query_sequence=packed_query,
@@ -126,7 +126,7 @@ def test_inference_attention_facade_dispatches_flex_for_packed_prefill(
 
     monkeypatch.setattr(accelerated, "fused_attention_forward", fake_flex_facade)
     cache = NaiveCache(num_layers=1)
-    output, output_cache = attention._forward_packed_inference(
+    output, output_cache = attention.forward_packed_inference(
         packed_query_sequence=packed_query,
         query_lens=query_lens,
         packed_query_position_embeddings=(
@@ -310,7 +310,7 @@ def test_inference_attention_facade_dispatches_flash_with_cache(monkeypatch: pyt
         device=device,
         dtype=torch.bfloat16,
     )
-    prefill_output, _ = attention._forward_packed_inference(
+    prefill_output, _ = attention.forward_packed_inference(
         packed_query_sequence=prefill,
         query_lens=prefill_lens,
         packed_query_position_embeddings=(
@@ -334,7 +334,7 @@ def test_inference_attention_facade_dispatches_flash_with_cache(monkeypatch: pyt
         device=device,
         dtype=torch.bfloat16,
     )
-    decode_output, _ = attention._forward_packed_inference(
+    decode_output, _ = attention.forward_packed_inference(
         packed_query_sequence=decode,
         query_lens=decode_lens,
         packed_query_position_embeddings=(

@@ -1,4 +1,4 @@
-"""Combined QKV projection coverage for the BAGEL Qwen2-MoT backbone."""
+"""QKV projection coverage for eager split and accelerated fused BAGEL MoT."""
 
 from __future__ import annotations
 
@@ -9,6 +9,10 @@ from safetensors import safe_open
 from transformers.utils import SAFE_WEIGHTS_NAME
 
 from veomni.models.module_utils import load_model_weights
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import (
+    BagelQwen2MoTAccelerated,
+    BagelQwen2MoTAttentionAccelerated,
+)
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.checkpoint_conversion import (
     BagelQwen2MoTCheckpointTensorConverter,
 )
@@ -19,7 +23,20 @@ from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import (
 )
 
 
-def _config() -> BagelQwen2MoTConfig:
+def _eager_config() -> BagelQwen2MoTConfig:
+    return BagelQwen2MoTConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        max_position_embeddings=64,
+        attn_implementation="sdpa",
+    )
+
+
+def _flex_config() -> BagelQwen2MoTConfig:
     return BagelQwen2MoTConfig(
         vocab_size=128,
         hidden_size=64,
@@ -32,10 +49,40 @@ def _config() -> BagelQwen2MoTConfig:
     )
 
 
+@pytest.mark.parametrize("is_gen", [False, True])
+def test_eager_qkv_uses_split_linears(is_gen: bool) -> None:
+    torch.manual_seed(3013)
+    attention = BagelQwen2MoTAttention(_eager_config(), layer_idx=0)
+    hidden = torch.randn(7, attention.hidden_size, requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    query_proj, key_proj, value_proj = (
+        (attention.q_proj_moe_gen, attention.k_proj_moe_gen, attention.v_proj_moe_gen)
+        if is_gen
+        else (attention.q_proj, attention.k_proj, attention.v_proj)
+    )
+    reference = torch.cat(
+        (
+            query_proj(reference_hidden),
+            key_proj(reference_hidden),
+            value_proj(reference_hidden),
+        ),
+        dim=-1,
+    )
+    eager = attention._project_qkv(hidden, is_gen=is_gen)
+    eager_q, eager_k, eager_v = attention._project_qkv(hidden, is_gen=is_gen, split=True)
+    assert torch.equal(eager, reference)
+    assert torch.equal(torch.cat((eager_q, eager_k, eager_v), dim=-1), reference)
+    torch.autograd.backward(eager, torch.ones_like(eager))
+    torch.autograd.backward(reference, torch.ones_like(reference))
+    assert hidden.grad is not None
+    assert reference_hidden.grad is not None
+    assert torch.equal(hidden.grad, reference_hidden.grad)
+
+
 @pytest.mark.parametrize("projection_name", ["qkv_proj_und", "qkv_proj_gen"])
-def test_combined_qkv_matches_separate_projection_forward_backward(projection_name: str) -> None:
+def test_accelerated_fused_qkv_matches_separate_projection_forward_backward(projection_name: str) -> None:
     torch.manual_seed(3011)
-    attention = BagelQwen2MoTAttention(_config(), layer_idx=0)
+    attention = BagelQwen2MoTAttentionAccelerated(_flex_config(), layer_idx=0)
     projection = getattr(attention, projection_name)
     reference_weights = [
         tensor.detach().clone().requires_grad_()
@@ -113,9 +160,50 @@ def test_checkpoint_tensor_converter_combines_legacy_qkv_groups() -> None:
     torch.testing.assert_close(gen_bias[80:], tensors[f"{prefix}v_proj_moe_gen.bias"])
 
 
-def test_combined_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> None:
+def test_eager_qkv_uses_native_split_checkpoint_schema(tmp_path) -> None:
     torch.manual_seed(3012)
-    reference = BagelQwen2MoT(_config())
+    reference = BagelQwen2MoT(_eager_config())
+    internal_parameter_names = set(dict(reference.named_parameters()))
+    assert "model.layers.0.self_attn.q_proj.weight" in internal_parameter_names
+    assert "model.layers.0.self_attn.k_proj.weight" in internal_parameter_names
+    assert "model.layers.0.self_attn.v_proj.weight" in internal_parameter_names
+    assert "model.layers.0.self_attn.q_proj_moe_gen.weight" in internal_parameter_names
+    assert "model.layers.0.self_attn.qkv_proj_und.weight" not in internal_parameter_names
+    assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in internal_parameter_names
+
+    checkpoint_state = reference.state_dict()
+    assert "model.layers.0.self_attn.q_proj.weight" in checkpoint_state
+    assert "model.layers.0.self_attn.qkv_proj_und.weight" not in checkpoint_state
+
+    loaded = BagelQwen2MoT(_eager_config())
+    loaded.load_state_dict(checkpoint_state)
+    torch.testing.assert_close(
+        loaded.model.layers[0].self_attn.q_proj.weight,
+        reference.model.layers[0].self_attn.q_proj.weight,
+    )
+
+    reference.save_pretrained(tmp_path)
+    with safe_open(tmp_path / SAFE_WEIGHTS_NAME, framework="pt", device="cpu") as checkpoint:
+        checkpoint_keys = set(checkpoint.keys())
+    assert "model.layers.0.self_attn.q_proj.weight" in checkpoint_keys
+    assert "model.layers.0.self_attn.qkv_proj_und.weight" not in checkpoint_keys
+
+    hf_loaded = BagelQwen2MoT.from_pretrained(tmp_path)
+    veomni_loaded = BagelQwen2MoT(_eager_config())
+    load_model_weights(veomni_loaded, str(tmp_path), init_device="cpu")
+    torch.testing.assert_close(
+        hf_loaded.model.layers[0].self_attn.q_proj.weight,
+        reference.model.layers[0].self_attn.q_proj.weight,
+    )
+    torch.testing.assert_close(
+        veomni_loaded.model.layers[0].self_attn.q_proj.weight,
+        reference.model.layers[0].self_attn.q_proj.weight,
+    )
+
+
+def test_accelerated_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> None:
+    torch.manual_seed(3014)
+    reference = BagelQwen2MoTAccelerated(_flex_config())
     internal_parameter_names = set(dict(reference.named_parameters()))
     assert "model.layers.0.self_attn.qkv_proj_und.weight" in internal_parameter_names
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" in internal_parameter_names
@@ -130,7 +218,7 @@ def test_combined_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> No
     assert "model.layers.0.self_attn.qkv_proj_und.weight" not in checkpoint_state
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in checkpoint_state
 
-    state_dict_loaded = BagelQwen2MoT(_config())
+    state_dict_loaded = BagelQwen2MoTAccelerated(_flex_config())
     state_dict_loaded.load_state_dict(checkpoint_state)
     for name in ("qkv_proj_und", "qkv_proj_gen"):
         expected = getattr(reference.model.layers[0].self_attn, name)
@@ -146,8 +234,8 @@ def test_combined_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> No
     assert "model.layers.0.self_attn.qkv_proj_und.weight" not in checkpoint_keys
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in checkpoint_keys
 
-    hf_loaded = BagelQwen2MoT.from_pretrained(tmp_path)
-    veomni_loaded = BagelQwen2MoT(_config())
+    hf_loaded = BagelQwen2MoTAccelerated.from_pretrained(tmp_path)
+    veomni_loaded = BagelQwen2MoTAccelerated(_flex_config())
     load_model_weights(veomni_loaded, str(tmp_path), init_device="cpu")
     for name in ("qkv_proj_und", "qkv_proj_gen"):
         expected = getattr(reference.model.layers[0].self_attn, name)

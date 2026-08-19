@@ -148,3 +148,14 @@ def test_qwen2_mot_liger_rope_matches_eager_forward_backward(monkeypatch):
     assert liger_k_leaf.grad is not None
     torch.testing.assert_close(liger_q_leaf.grad, eager_q_leaf.grad, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(liger_k_leaf.grad, eager_k_leaf.grad, atol=2e-2, rtol=2e-2)
+
+
+def test_rotary_inv_freq_survives_to_bfloat16() -> None:
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.configuration import BagelQwen2MoTConfig
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2RotaryEmbedding
+
+    rope = BagelQwen2RotaryEmbedding(BagelQwen2MoTConfig())
+    original = rope.inv_freq.detach().clone()
+    rope = rope.to(dtype=torch.bfloat16)
+    assert rope.inv_freq.dtype == torch.float32
+    assert torch.equal(rope.inv_freq.cpu(), original.cpu())

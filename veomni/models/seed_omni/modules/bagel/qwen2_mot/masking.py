@@ -2,14 +2,13 @@
 
 `packed_attention_metadata` is the source of truth. `build_mot_block_mask`
 materializes a Flex `BlockMask` for accelerated training. `build_mot_sdpa_mask`
-materializes a dense mask for eager SDPA. Vectorizing the dense path later can
-keep the same signatures.
+materializes a dense boolean mask for eager SDPA (``True`` means attend).
 """
 
 from __future__ import annotations
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask, create_mask
+from torch.nn.attention.flex_attention import BlockMask
 
 
 _MOT_BLOCK_SIZE = 128
@@ -209,17 +208,24 @@ def build_mot_block_mask(packed_attention_metadata: torch.Tensor) -> BlockMask:
 
 
 def build_mot_sdpa_mask(packed_attention_metadata: torch.Tensor) -> torch.Tensor:
-    """Materialize a dense ``[1, 1, S, S]`` SDPA mask from packed MoT metadata."""
-    block_mask = build_mot_block_mask(packed_attention_metadata)
+    """Materialize a dense ``[1, 1, S, S]`` boolean SDPA mask.
+
+    ``True`` means the query may attend that key. Do not store this as float32
+    ``0 / -inf``; PyTorch SDPA already treats boolean ``False`` as masked out.
+    """
+    _validate_mot_attention_metadata(packed_attention_metadata)
     sequence_length = int(packed_attention_metadata.shape[1])
-    return create_mask(
-        block_mask.mask_mod,
-        1,
-        1,
-        sequence_length,
-        sequence_length,
-        device=packed_attention_metadata.device,
-    )
+    if sequence_length == 0:
+        raise ValueError("BAGEL Qwen2-MoT attention metadata must contain at least one token.")
+
+    document_ids, full_span_ids, noise_span_ids = packed_attention_metadata
+    query_idx = torch.arange(sequence_length, device=packed_attention_metadata.device)
+    same_document = document_ids[:, None] == document_ids[None, :]
+    causal = query_idx[:, None] >= query_idx[None, :]
+    same_full_or_noise_span = (full_span_ids[:, None] >= 0) & (full_span_ids[:, None] == full_span_ids[None, :])
+    foreign_noise_key = (noise_span_ids[None, :] >= 0) & (noise_span_ids[:, None] != noise_span_ids[None, :])
+    visible = same_document & (causal | same_full_or_noise_span) & ~foreign_noise_key
+    return visible.to(dtype=torch.bool)[None, None].contiguous()
 
 
 __all__ = [

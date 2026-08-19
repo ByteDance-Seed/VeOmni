@@ -29,6 +29,12 @@ from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from .checkpoint_conversion import (
+    BagelQwen2MoTCheckpointTensorConverter,
+    combine_qkv_state_dict_pre_hook,
+    register_accelerated_qkv_conversion_mapping,
+    split_qkv_state_dict_post_hook,
+)
 from .configuration import BagelQwen2MoTConfig
 from .masking import build_mot_block_mask, pad_mot_attention_metadata
 from .modeling import (
@@ -408,6 +414,34 @@ _PACKED_FUSED_ATTN_IMPLEMENTATIONS = (
 class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
     """MoT attention with fused RoPE and ``fused_attention_forward``."""
 
+    def __init__(
+        self,
+        config: BagelQwen2MoTConfig,
+        layer_idx: int,
+        *,
+        rms_norm_cls: type[Qwen2RMSNorm] = Qwen2RMSNorm,
+    ):
+        super().__init__(config, layer_idx, rms_norm_cls=rms_norm_cls)
+        self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
+        self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
+
+    def _build_qkv_proj(self) -> None:
+        qkv_size = sum(self.qkv_split_sizes)
+        self.qkv_proj_und = torch.nn.Linear(self.hidden_size, qkv_size, bias=True)
+        self.qkv_proj_gen = torch.nn.Linear(self.hidden_size, qkv_size, bias=True)
+
+    def _project_qkv(
+        self,
+        hidden: torch.Tensor,
+        *,
+        is_gen: bool,
+        split: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        projected = (self.qkv_proj_gen if is_gen else self.qkv_proj_und)(hidden)
+        if split:
+            return projected.split(self.qkv_split_sizes, dim=-1)
+        return projected
+
     @staticmethod
     def build_attention_mask(packed_attention_metadata: torch.Tensor) -> BlockMask:
         return build_mot_block_mask(packed_attention_metadata)
@@ -422,7 +456,7 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
-    def _attend(
+    def attend(
         self,
         packed_query_states: torch.Tensor,
         packed_key_states: torch.Tensor,
@@ -447,7 +481,7 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         packed_attn_output = packed_attn_output.squeeze(0)
         return packed_attn_output.reshape(-1, self.num_heads * self.head_dim)
 
-    def _attend_inference(
+    def attend_inference(
         self,
         packed_query_states: torch.Tensor,
         merged_key_states: torch.Tensor,
@@ -535,9 +569,20 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
 
 class BagelQwen2MoTAccelerated(VeOmniMixin, BagelQwen2MoT):
     _supports_flex_attn = True
+    _export_hf_checkpoint_with_weight_conversions = True
     attention_cls = BagelQwen2MoTAttentionAccelerated
     mlp_cls = Qwen2MLPAccelerated
     rms_norm_cls = Qwen2RMSNormAccelerated
+
+    @staticmethod
+    def _create_checkpoint_tensor_converter(
+        model: BagelQwen2MoT,
+    ) -> BagelQwen2MoTCheckpointTensorConverter:
+        del model
+        return BagelQwen2MoTCheckpointTensorConverter()
+
+
+register_accelerated_qkv_conversion_mapping()
 
 
 __all__ = ["BagelQwen2MoTAccelerated"]

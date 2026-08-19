@@ -1,11 +1,12 @@
 """BAGEL Qwen2 MoT backbone."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional
 
 import torch
 import torch.nn as nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
@@ -13,11 +14,6 @@ from transformers.utils import ModelOutput
 from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, get_tail_output_item
 from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY
-from .checkpoint_conversion import (
-    BagelQwen2MoTCheckpointTensorConverter,
-    combine_qkv_state_dict_pre_hook,
-    split_qkv_state_dict_post_hook,
-)
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
 from .masking import build_mot_sdpa_mask
@@ -91,7 +87,7 @@ class InferenceMixin:
             call_kwargs["packed_text_indexes"] = packed_text_indexes
 
         with _temporary_attention_implementation(self.config, attention_implementation):
-            output = self.model._forward_packed_inference(**call_kwargs)
+            output = self.model.forward_packed_inference(**call_kwargs)
 
         return {
             "hidden_states": output.packed_query_sequence,
@@ -268,7 +264,7 @@ class InferenceMixin:
 
         # This is a fresh-cache prefill: forward_inference allocates the cache,
         # while packed attention metadata selects FlexAttention.
-        outputs = self._forward_packed_prefill(packed)
+        outputs = self.forward_packed_prefill(packed)
         packed_cache = outputs["past_key_values"]
 
         # Detach main and cfg_img from the temporary packed cache allocation.
@@ -307,7 +303,7 @@ class InferenceMixin:
             )
         return hidden_states[main_slice]
 
-    def _forward_packed_prefill(self, packed: PackedConversation) -> dict[str, Any]:
+    def forward_packed_prefill(self, packed: PackedConversation) -> dict[str, Any]:
         """Run one fresh-cache Flex prefill over all logical documents."""
         total_length = int(packed.packed_sequence.shape[0])
         document_lens = [sum(split_lens) for split_lens in packed.sample_splits]
@@ -428,7 +424,7 @@ class BagelQwen2MoT(InferenceMixin, OmniPreTrainedModel):
     supports_gradient_checkpointing = True
     _supports_sdpa = True
     _supports_flex_attn = False
-    _export_hf_checkpoint_with_weight_conversions = True
+    _export_hf_checkpoint_with_weight_conversions = False
 
     def __init__(self, config: BagelQwen2MoTConfig):
         super().__init__(config)
@@ -440,16 +436,6 @@ class BagelQwen2MoT(InferenceMixin, OmniPreTrainedModel):
         )
         self._generation_state = MotGenerationState()
         self.post_init()
-
-    # The runtime stores one merged QKV parameter per MoT branch, while existing
-    # HF checkpoints keep separate Q/K/V keys. VeOmni's streaming loader bypasses
-    # load_state_dict hooks, so it needs this dedicated checkpoint converter.
-    @staticmethod
-    def _create_checkpoint_tensor_converter(
-        model: OmniPreTrainedModel,
-    ) -> BagelQwen2MoTCheckpointTensorConverter:
-        del model
-        return BagelQwen2MoTCheckpointTensorConverter()
 
     def forward(  # type: ignore[override]
         self,
@@ -505,6 +491,37 @@ def _apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def _sdpa_context(device: torch.device):
+    """Pin mem-efficient SDPA on CUDA, matching official dense-train Bagel.
+
+    Official 2D-mask training forces ``SDPBackend.EFFICIENT_ATTENTION`` so the
+    dispatcher cannot pick MATH (OOM) or a newer CUDNN kernel. CPU/NPU keep the
+    default dispatcher because Efficient is CUDA-only.
+    """
+    if device.type == "cuda":
+        return sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION])
+    return nullcontext()
+
+
+def _repeat_kv_heads(packed_states: torch.Tensor, num_query_heads: int) -> torch.Tensor:
+    """Expand packed KV from ``[tokens, kv_heads, dim]`` to query heads.
+
+    Official dense-train Bagel repeats KV before Efficient SDPA. The CUDA
+    Efficient kernel does not accept ``enable_gqa`` with a 2D mask.
+    """
+    num_kv_heads = int(packed_states.shape[1])
+    if num_kv_heads == num_query_heads:
+        return packed_states
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(
+            "BAGEL Qwen2-MoT GQA requires query heads divisible by KV heads: "
+            f"num_query_heads={num_query_heads}, num_kv_heads={num_kv_heads}."
+        )
+    groups = num_query_heads // num_kv_heads
+    packed_states = packed_states[:, :, None, :].repeat(1, 1, groups, 1)
+    return packed_states.reshape(-1, num_query_heads, packed_states.shape[-1])
+
+
 def _sdpa_packed_attention(
     packed_query_states: torch.Tensor,
     packed_key_states: torch.Tensor,
@@ -517,24 +534,33 @@ def _sdpa_packed_attention(
     scale: float,
     enable_gqa: bool,
 ) -> torch.Tensor:
-    """Packed SDPA returning ``[tokens, heads, head_dim]``."""
+    """Packed SDPA returning ``[tokens, heads, head_dim]``.
+
+    The 2D-mask path pins Efficient SDPA on CUDA. The varlen / ``is_causal``
+    path is left unpinned: official inference uses ``flash_attn_varlen``, not
+    Efficient.
+    """
     if packed_query_states.shape[0] == 0:
         return packed_query_states.new_zeros(packed_query_states.shape)
 
     if attention_mask is not None:
+        if enable_gqa:
+            num_query_heads = int(packed_query_states.shape[1])
+            packed_key_states = _repeat_kv_heads(packed_key_states, num_query_heads)
+            packed_value_states = _repeat_kv_heads(packed_value_states, num_query_heads)
         query = packed_query_states.transpose(0, 1).unsqueeze(0)
         key = packed_key_states.transpose(0, 1).unsqueeze(0)
         value = packed_value_states.transpose(0, 1).unsqueeze(0)
-        output = scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=scale,
-            enable_gqa=enable_gqa,
-        )
+        with _sdpa_context(packed_query_states.device):
+            output = scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=scale,
+            )
         return output.squeeze(0).transpose(0, 1).contiguous()
 
     if cu_seq_lens_q is None or cu_seq_lens_k is None:
@@ -628,9 +654,15 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
 
     def _apply(self, fn: Any, recurse: bool = True) -> nn.Module:
+        # Snapshot the true fp32 table before ``fn`` can quantize it (``.to(bfloat16)``).
+        # Casting first and then ``.float()`` keeps bf16 rounding, which is not official
+        # mixed-precision train (buffers stay fp32) and is not bitwise with a fresh table.
+        inv_freq = self.inv_freq.detach().to(dtype=torch.float32).clone()
+        original_inv_freq = self.original_inv_freq.detach().to(dtype=torch.float32).clone()
         module = super()._apply(fn, recurse=recurse)
-        self.inv_freq = self.inv_freq.float()
-        self.original_inv_freq = self.original_inv_freq.float()
+        device = self.inv_freq.device
+        self.inv_freq = inv_freq.to(device=device)
+        self.original_inv_freq = original_inv_freq.to(device=device)
         return module
 
     @staticmethod
@@ -687,23 +719,41 @@ class BagelQwen2MoTAttention(nn.Module):
         self.query_size = self.num_heads * self.head_dim
         self.key_value_size = self.num_key_value_heads * self.head_dim
         self.qkv_split_sizes = (self.query_size, self.key_value_size, self.key_value_size)
-        qkv_size = sum(self.qkv_split_sizes)
 
-        self.qkv_proj_und = nn.Linear(self.hidden_size, qkv_size, bias=True)
+        self._build_qkv_proj()
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
-
-        self.qkv_proj_gen = nn.Linear(self.hidden_size, qkv_size, bias=True)
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm_moe_gen = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm_moe_gen = rms_norm_cls(self.head_dim, eps=config.rms_norm_eps)
 
-        # Keep the public checkpoint schema unchanged even though the runtime
-        # parameters are merged: direct PyTorch loads combine legacy Q/K/V keys,
-        # and ordinary state_dict exports split the combined parameters again.
-        self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
-        self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
+    def _build_qkv_proj(self) -> None:
+        self.q_proj = nn.Linear(self.hidden_size, self.query_size, bias=True)
+        self.k_proj = nn.Linear(self.hidden_size, self.key_value_size, bias=True)
+        self.v_proj = nn.Linear(self.hidden_size, self.key_value_size, bias=True)
+        self.q_proj_moe_gen = nn.Linear(self.hidden_size, self.query_size, bias=True)
+        self.k_proj_moe_gen = nn.Linear(self.hidden_size, self.key_value_size, bias=True)
+        self.v_proj_moe_gen = nn.Linear(self.hidden_size, self.key_value_size, bias=True)
+
+    def _project_qkv(
+        self,
+        hidden: torch.Tensor,
+        *,
+        is_gen: bool,
+        split: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query_proj, key_proj, value_proj = (
+            (self.q_proj_moe_gen, self.k_proj_moe_gen, self.v_proj_moe_gen)
+            if is_gen
+            else (self.q_proj, self.k_proj, self.v_proj)
+        )
+        query_states = query_proj(hidden)
+        key_states = key_proj(hidden)
+        value_states = value_proj(hidden)
+        if split:
+            return query_states, key_states, value_states
+        return torch.cat((query_states, key_states, value_states), dim=-1)
 
     @staticmethod
     def build_attention_mask(packed_attention_metadata: torch.Tensor) -> torch.Tensor:
@@ -719,7 +769,7 @@ class BagelQwen2MoTAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
-    def _project_qkv(
+    def project_qkv(
         self,
         packed_sequence: torch.Tensor,
         packed_und_token_indexes: torch.Tensor,
@@ -731,8 +781,8 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_sequence.new_zeros((packed_sequence.shape[0], sum(self.qkv_split_sizes))),
             packed_und_token_indexes,
             packed_gen_token_indexes,
-            self.qkv_proj_und(packed_sequence[packed_und_token_indexes]),
-            self.qkv_proj_gen(packed_sequence[packed_gen_token_indexes]),
+            self._project_qkv(packed_sequence[packed_und_token_indexes], is_gen=False),
+            self._project_qkv(packed_sequence[packed_gen_token_indexes], is_gen=True),
         )
         packed_query_states, packed_key_states, packed_value_states = packed_qkv_states.split(
             self.qkv_split_sizes, dim=-1
@@ -764,7 +814,7 @@ class BagelQwen2MoTAttention(nn.Module):
         )
         return packed_query_states, packed_key_states, packed_value_states
 
-    def _attend(
+    def attend(
         self,
         packed_query_states: torch.Tensor,
         packed_key_states: torch.Tensor,
@@ -781,7 +831,7 @@ class BagelQwen2MoTAttention(nn.Module):
         )
         return packed_attn_output.reshape(-1, self.num_heads * self.head_dim)
 
-    def _project_o(
+    def project_o(
         self,
         packed_attn_output: torch.Tensor,
         packed_und_token_indexes: torch.Tensor,
@@ -795,7 +845,7 @@ class BagelQwen2MoTAttention(nn.Module):
             self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes]),
         )
 
-    def _forward_packed_train(
+    def forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -804,26 +854,26 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_und_token_indexes: torch.Tensor,
         packed_gen_token_indexes: torch.Tensor,
     ) -> torch.Tensor:
-        packed_query_states, packed_key_states, packed_value_states = self._project_qkv(
+        packed_query_states, packed_key_states, packed_value_states = self.project_qkv(
             packed_sequence,
             packed_und_token_indexes,
             packed_gen_token_indexes,
             packed_position_cos,
             packed_position_sin,
         )
-        packed_attn_output = self._attend(
+        packed_attn_output = self.attend(
             packed_query_states,
             packed_key_states,
             packed_value_states,
             attention_mask,
         )
-        return self._project_o(
+        return self.project_o(
             packed_attn_output,
             packed_und_token_indexes,
             packed_gen_token_indexes,
         )
 
-    def _project_qkv_inference(
+    def project_qkv_inference(
         self,
         packed_query_sequence: torch.Tensor,
         *,
@@ -833,9 +883,9 @@ class BagelQwen2MoTAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project packed inference tokens through the matching MoT attention expert."""
         if not is_gen:
-            packed_query_states, packed_key_states, packed_value_states = self.qkv_proj_und(
-                packed_query_sequence
-            ).split(self.qkv_split_sizes, dim=-1)
+            packed_query_states, packed_key_states, packed_value_states = self._project_qkv(
+                packed_query_sequence, is_gen=False, split=True
+            )
             packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
             packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
             packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -847,12 +897,12 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_qkv_states = packed_query_sequence.new_zeros(
             (packed_query_sequence.shape[0], sum(self.qkv_split_sizes))
         )
-
-        packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-        packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-        packed_qkv_states[packed_text_indexes] = self.qkv_proj_und(packed_text_query_sequence)
-        packed_qkv_states[packed_vae_token_indexes] = self.qkv_proj_gen(packed_vae_query_sequence)
-
+        packed_qkv_states[packed_text_indexes] = self._project_qkv(
+            packed_query_sequence[packed_text_indexes], is_gen=False
+        )
+        packed_qkv_states[packed_vae_token_indexes] = self._project_qkv(
+            packed_query_sequence[packed_vae_token_indexes], is_gen=True
+        )
         packed_query_states, packed_key_states, packed_value_states = packed_qkv_states.split(
             self.qkv_split_sizes, dim=-1
         )
@@ -867,7 +917,7 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
         return packed_query_states, packed_key_states, packed_value_states
 
-    def _merge_kv_cache(
+    def merge_kv_cache(
         self,
         packed_key_states: torch.Tensor,
         packed_value_states: torch.Tensor,
@@ -898,7 +948,7 @@ class BagelQwen2MoTAttention(nn.Module):
         merged_value_states[packed_key_value_indexes] = past_value_states
         return merged_key_states, merged_value_states
 
-    def _attend_inference(
+    def attend_inference(
         self,
         packed_query_states: torch.Tensor,
         merged_key_states: torch.Tensor,
@@ -924,7 +974,7 @@ class BagelQwen2MoTAttention(nn.Module):
             enable_gqa=self.num_heads != self.num_key_value_heads,
         )
 
-    def _project_o_inference(
+    def project_o_inference(
         self,
         packed_attn_output: torch.Tensor,
         *,
@@ -943,7 +993,7 @@ class BagelQwen2MoTAttention(nn.Module):
         )
         return packed_attn_output
 
-    def _forward_packed_inference(
+    def forward_packed_inference(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -966,7 +1016,7 @@ class BagelQwen2MoTAttention(nn.Module):
         total_key_value_tokens: int,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         is_gen = _check_packed_inference_mode(mode)
-        packed_query_states, packed_key_states, packed_value_states = self._project_qkv_inference(
+        packed_query_states, packed_key_states, packed_value_states = self.project_qkv_inference(
             packed_query_sequence,
             is_gen=is_gen,
             packed_text_indexes=packed_text_indexes,
@@ -986,7 +1036,7 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
 
-        merged_key_states, merged_value_states = self._merge_kv_cache(
+        merged_key_states, merged_value_states = self.merge_kv_cache(
             packed_key_states,
             packed_value_states,
             packed_query_indexes=packed_query_indexes,
@@ -995,7 +1045,7 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_key_value_indexes=packed_key_value_indexes,
             total_key_value_tokens=total_key_value_tokens,
         )
-        packed_attn_output = self._attend_inference(
+        packed_attn_output = self.attend_inference(
             packed_query_states,
             merged_key_states,
             merged_value_states,
@@ -1006,7 +1056,7 @@ class BagelQwen2MoTAttention(nn.Module):
             max_length_q=max_length_q,
             max_length_k=max_length_k,
         )
-        packed_attn_output = self._project_o_inference(
+        packed_attn_output = self.project_o_inference(
             packed_attn_output,
             is_gen=is_gen,
             packed_text_indexes=packed_text_indexes,
@@ -1023,8 +1073,8 @@ class BagelQwen2MoTAttention(nn.Module):
 
     def forward(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         if self.training:
-            return self._forward_packed_train(*args, **kwargs), None
-        return self._forward_packed_inference(*args, **kwargs)
+            return self.forward_packed_train(*args, **kwargs), None
+        return self.forward_packed_inference(*args, **kwargs)
 
 
 class BagelQwen2MoTDecoderLayer(nn.Module):
@@ -1062,7 +1112,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
             gen_norm(packed_sequence[packed_gen_token_indexes]),
         )
 
-    def _forward_packed_train(
+    def forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -1145,7 +1195,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         mlp_output[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
         return mlp_output
 
-    def _forward_packed_inference(
+    def forward_packed_inference(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -1210,8 +1260,8 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
 
     def forward(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         if self.training:
-            return self._forward_packed_train(*args, **kwargs), None
-        return self._forward_packed_inference(*args, **kwargs)
+            return self.forward_packed_train(*args, **kwargs), None
+        return self.forward_packed_inference(*args, **kwargs)
 
 
 class BagelQwen2MoTBackbone(nn.Module):
@@ -1283,7 +1333,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         normed_sequence[packed_vae_token_indexes] = self.norm_moe_gen(packed_query_sequence[packed_vae_token_indexes])
         return normed_sequence
 
-    def _forward_packed_train(
+    def forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
         packed_position_ids: torch.Tensor,
@@ -1336,7 +1386,7 @@ class BagelQwen2MoTBackbone(nn.Module):
             )
         return self.norm(packed_sequence)
 
-    def _forward_packed_inference(
+    def forward_packed_inference(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -1419,8 +1469,8 @@ class BagelQwen2MoTBackbone(nn.Module):
 
     def forward(self, *args: Any, **kwargs: Any) -> BaseNavitOutputWithPast:
         if self.training:
-            return BaseNavitOutputWithPast(packed_query_sequence=self._forward_packed_train(*args, **kwargs))
-        return self._forward_packed_inference(*args, **kwargs)
+            return BaseNavitOutputWithPast(packed_query_sequence=self.forward_packed_train(*args, **kwargs))
+        return self.forward_packed_inference(*args, **kwargs)
 
 
 BagelQwen2MoT.attention_cls = BagelQwen2MoTAttention
