@@ -330,18 +330,6 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
         except StopIteration as e:
             raise ValueError(f"{modality.capitalize()} token number is missing for a {modality} input.") from e
 
-    def _reject_generated_image(self, role: str) -> None:
-        """Reject an image in an assistant turn, which means image generation.
-
-        Only the input sentinels get masked and zeroed downstream, so any other
-        modality sentinel would reach the embedding lookup as a negative id.
-        """
-        if role == "assistant":
-            raise ValueError(
-                "An image in an assistant turn means image generation, which is no longer supported. "
-                "Use a preprocessor that puts images in user turns."
-            )
-
     def _tokenize_and_remap(self, messages: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
         """Tokenize rendered messages and remap modality pads to TYPE2INDEX.
 
@@ -375,7 +363,6 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
 
         # Replace the Qwen image/video pad ids with VeOmni's modality sentinels,
         # which is what process_sample_qwen_vl turns into image_mask / video_mask.
-        # Every placeholder is an input: generated images are rejected upstream.
         image_mask = tokenized_example["input_ids"] == self.image_token_id
         tokenized_example["input_ids"][image_mask] = TYPE2INDEX["input"]["image"]
 
@@ -419,7 +406,6 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
                 if value[0] == "text":
                     content += value[1]
                 elif value[0] == "image":
-                    self._reject_generated_image(role)
                     content += self.image_pattern(self._next_token_num(image_token_num_list, "image"))
                 elif value[0] == "video":
                     content += self.video_pattern(self._next_token_num(video_token_num_list, "video"))
@@ -488,7 +474,6 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                 if value[0] == "text":
                     content += value[1]
                 elif value[0] == "image":
-                    self._reject_generated_image(role)
                     content += self.image_pattern(self._next_token_num(image_token_num_list, "image"))
 
                 elif value[0] == "video":

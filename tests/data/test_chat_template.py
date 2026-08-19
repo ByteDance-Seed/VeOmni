@@ -298,27 +298,14 @@ def test_qwen2vl_emits_one_image_placeholder_per_processor_token(num_image_token
 
 
 @pytest.mark.parametrize("template_name", ["qwen2vl", "qwen3vl"])
-def test_encode_messages_rejects_an_image_in_an_assistant_turn(template_name):
-    # Image generation went with the SeedOmni V1 stack. Such placeholders used to
-    # be remapped to TYPE2INDEX["output"]["image"], which process_sample_qwen_vl
-    # neither masks nor zeroes, so the negative id reached the embedding lookup.
-    template = build_chat_template(template_name, _SpecialTokenTokenizer())
-
-    with pytest.raises(ValueError, match="image generation"):
-        template.encode_messages(
-            [("user", ("text", "draw a cat")), ("assistant", ("image", None))],
-            {"image": [4]},
-        )
-
-
-@pytest.mark.parametrize("template_name", ["qwen2vl", "qwen3vl"])
 def test_input_ids_carry_no_negative_id_other_than_the_input_sentinels(template_name):
     # process_sample_qwen_vl only zeroes the input sentinels, so any other
-    # negative id survives into the embedding lookup.
+    # negative id survives into the embedding lookup. An image in an assistant
+    # turn used to produce one.
     template = build_chat_template(template_name, _SpecialTokenTokenizer())
 
     encoded = template.encode_messages(
-        [("user", ("image", None), ("text", "what is this")), ("assistant", ("text", "a cat"))],
+        [("user", ("text", "draw a cat")), ("assistant", ("image", None))],
         {"image": [4]},
     )
 
