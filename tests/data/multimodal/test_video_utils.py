@@ -544,7 +544,7 @@ def test_frames_indices_for_qwen3vl():
     merge_size = 2
     indices_list = frames_indices.tolist()
 
-    # Pad to merge_size if needed (as done in Qwen3VLChatTemplate._calculate_timestamps)
+    # Pad to the temporal patch size (as done in Qwen3VLChatTemplate._calculate_timestamps)
     if len(indices_list) % merge_size != 0:
         indices_list.extend([indices_list[-1]] * (merge_size - len(indices_list) % merge_size))
 

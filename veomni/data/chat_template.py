@@ -340,7 +340,6 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
         self.video_pad = "<|video_pad|>"
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
         self.video_token_id = self.tokenizer.convert_tokens_to_ids(self.video_pad)
-        self.image_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")  # 151652
 
         logger.info_rank0("Qwen2VLTemplate will not truncate sequence when longer than [max_seq_lens].")
 
@@ -362,7 +361,19 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
         except StopIteration as e:
             raise ValueError(f"{modality.capitalize()} token number is missing for a {modality} input.") from e
 
-    def _tokenize_and_remap(self, messages: List[Dict[str, str]], data_type: str) -> Dict[str, torch.Tensor]:
+    def _reject_generated_image(self, role: str) -> None:
+        """Reject an image in an assistant turn, which means image generation.
+
+        Only the input sentinels get masked and zeroed downstream, so any other
+        modality sentinel would reach the embedding lookup as a negative id.
+        """
+        if role == "assistant":
+            raise ValueError(
+                "An image in an assistant turn means image generation, which is no longer supported. "
+                "Use a preprocessor that puts images in user turns."
+            )
+
+    def _tokenize_and_remap(self, messages: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
         """Tokenize rendered messages and remap modality pads to TYPE2INDEX.
 
         Shared by every Qwen-VL variant: the subclasses differ only in how they
@@ -395,20 +406,12 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
 
         # Replace the Qwen image/video pad ids with VeOmni's modality sentinels,
         # which is what process_sample_qwen_vl turns into image_mask / video_mask.
+        # Every placeholder is an input: generated images are rejected upstream.
         image_mask = tokenized_example["input_ids"] == self.image_token_id
-        input_mask = tokenized_example["labels"] == IGNORE_INDEX
-        input_image_mask = image_mask & input_mask
-        output_image_mask = image_mask & ~input_mask
-        tokenized_example["input_ids"][input_image_mask] = TYPE2INDEX["input"]["image"]
-        tokenized_example["input_ids"][output_image_mask] = TYPE2INDEX["output"]["image"]
+        tokenized_example["input_ids"][image_mask] = TYPE2INDEX["input"]["image"]
 
         video_mask = tokenized_example["input_ids"] == self.video_token_id
         tokenized_example["input_ids"][video_mask] = TYPE2INDEX["input"]["video"]
-        tokenized_example["labels"][output_image_mask] = IGNORE_INDEX  # the label will be filled in decoder.
-        if data_type == "t2i":  # t2i doesn't train <|vision_start|>
-            labels = tokenized_example["labels"]
-            labels[labels == self.image_start_id] = IGNORE_INDEX
-            tokenized_example["labels"] = labels
 
         return tokenized_example
 
@@ -436,7 +439,6 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
             num_tokens = defaultdict(list)
         sys_msg = self._get_system_message()
         messages = [] if sys_msg is None else [sys_msg]
-        data_type = ""
         # Read, not popped: the per-modality counts belong to the caller, and the
         # local iterators already give the one-shot consumption this needs.
         image_token_num_list = iter(num_tokens.get("image", []))
@@ -448,7 +450,7 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
                 if value[0] == "text":
                     content += value[1]
                 elif value[0] == "image":
-                    data_type = "t2i" if role == "assistant" else "i2t"
+                    self._reject_generated_image(role)
                     content += self.image_pattern(self._next_token_num(image_token_num_list, "image"))
                 elif value[0] == "video":
                     content += self.video_pattern(self._next_token_num(video_token_num_list, "video"))
@@ -462,32 +464,35 @@ class Qwen2VLChatTemplate(Qwen2VLTemplate):
                 }
             )
 
-        return self._tokenize_and_remap(messages, data_type)
+        return self._tokenize_and_remap(messages)
 
 
 @CHAT_TEMPLATE_REGISTRY.register("qwen3vl")
 class Qwen3VLChatTemplate(Qwen2VLTemplate):
-    # Qwen3-VL default temporal_patch_size
-    MERGE_SIZE = 2
+    # Fallback for callers that do not pass the video processor's value. Frames
+    # are grouped into time chunks of this size, matching the processor's own
+    # temporal patching, so a mismatch shifts every timestamp and chunk boundary.
+    DEFAULT_TEMPORAL_PATCH_SIZE = 2
 
-    def _calculate_timestamps(self, indices: List[int], video_fps: float, merge_size: int = 2):
+    def _calculate_timestamps(self, indices: List[int], video_fps: float, temporal_patch_size: int):
         """
         Replicates Qwen3-VL official logic: Pad -> Convert to Seconds -> Average.
         """
-        # 1. Pad frame indices to be divisible by merge_size
+        # 1. Pad frame indices to be divisible by temporal_patch_size
         # Copied first: VideoMetadata.frames_indices is declared list[int], and
         # padding it in place would append duplicate frames to the caller's
         # metadata.
         indices = list(indices)
-        if len(indices) % merge_size != 0:
-            indices.extend([indices[-1]] * (merge_size - len(indices) % merge_size))
+        if len(indices) % temporal_patch_size != 0:
+            indices.extend([indices[-1]] * (temporal_patch_size - len(indices) % temporal_patch_size))
 
         # 2. Convert indices to timestamps (seconds)
         timestamps = [idx / video_fps for idx in indices]
 
         # 3. Merge by size and take the average of start/end timestamps for each chunk
         timestamps = [
-            (timestamps[i] + timestamps[i + merge_size - 1]) / 2 for i in range(0, len(timestamps), merge_size)
+            (timestamps[i] + timestamps[i + temporal_patch_size - 1]) / 2
+            for i in range(0, len(timestamps), temporal_patch_size)
         ]
         return timestamps
 
@@ -497,12 +502,15 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
         if num_tokens is None:
             num_tokens = defaultdict(list)
         messages = []
-        data_type = ""
         image_token_num_list = iter(num_tokens.get("image", []))
         video_token_num_list = iter(num_tokens.get("video", []))
 
         # Retrieve video metadata iterator; ensures order matches video inputs in conversations
         video_metadata_list = iter(kwargs.get("video_metadata", []))
+        # Supplied by the caller that ran the video processor, so the chunking
+        # here matches the grid the processor derived. Models reusing this
+        # template need not all patch time by the same amount.
+        temporal_patch_size = kwargs.get("temporal_patch_size") or self.DEFAULT_TEMPORAL_PATCH_SIZE
 
         for message in conversations:
             role = message[0]
@@ -511,7 +519,7 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                 if value[0] == "text":
                     content += value[1]
                 elif value[0] == "image":
-                    data_type = "t2i" if role == "assistant" else "i2t"
+                    self._reject_generated_image(role)
                     content += self.image_pattern(self._next_token_num(image_token_num_list, "image"))
 
                 elif value[0] == "video":
@@ -540,7 +548,7 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                         indices = list(range(total_frames))
 
                     # 3. Calculate timestamps using the new logic
-                    timestamps = self._calculate_timestamps(indices, fps, merge_size=self.MERGE_SIZE)
+                    timestamps = self._calculate_timestamps(indices, fps, temporal_patch_size=temporal_patch_size)
 
                     # 4. Calculate visual tokens per time chunk
                     num_time_chunks = len(timestamps)
@@ -553,8 +561,8 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                     if num_time_chunks == 0 or total_video_tokens % num_time_chunks != 0:
                         raise ValueError(
                             f"Cannot lay out {total_video_tokens} video tokens over {num_time_chunks} time "
-                            f"chunks ({len(indices)} frame indices, merge_size={self.MERGE_SIZE}): the token "
-                            f"count must divide evenly across chunks."
+                            f"chunks ({len(indices)} frame indices, temporal_patch_size={temporal_patch_size}): "
+                            f"the token count must divide evenly across chunks."
                         )
                     tokens_per_chunk = total_video_tokens // num_time_chunks
 
@@ -580,7 +588,7 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
                 }
             )
 
-        return self._tokenize_and_remap(messages, data_type)
+        return self._tokenize_and_remap(messages)
 
 
 # Qwen2.5-VL shares Qwen2-VL's template; the decorator form takes one name per class.

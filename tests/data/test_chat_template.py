@@ -318,6 +318,83 @@ def test_qwen2vl_emits_one_image_placeholder_per_processor_token(num_image_token
     assert emitted == num_image_tokens
 
 
+@pytest.mark.parametrize("template_name", ["qwen2vl", "qwen3vl"])
+def test_encode_messages_rejects_an_image_in_an_assistant_turn(template_name):
+    # Image generation went with the SeedOmni V1 stack. Such placeholders used to
+    # be remapped to TYPE2INDEX["output"]["image"], which process_sample_qwen_vl
+    # neither masks nor zeroes, so the negative id reached the embedding lookup.
+    template = build_chat_template(template_name, _SpecialTokenTokenizer(), expect_multimodal=True)
+
+    with pytest.raises(ValueError, match="image generation"):
+        template.encode_messages(
+            [("user", ("text", "draw a cat")), ("assistant", ("image", None))],
+            {"image": [4]},
+        )
+
+
+@pytest.mark.parametrize("template_name", ["qwen2vl", "qwen3vl"])
+def test_input_ids_carry_no_negative_id_other_than_the_input_sentinels(template_name):
+    # process_sample_qwen_vl only zeroes the input sentinels, so any other
+    # negative id survives into the embedding lookup.
+    template = build_chat_template(template_name, _SpecialTokenTokenizer(), expect_multimodal=True)
+
+    encoded = template.encode_messages(
+        [("user", ("image", None), ("text", "what is this")), ("assistant", ("text", "a cat"))],
+        {"image": [4]},
+    )
+
+    negatives = {int(i) for i in encoded["input_ids"] if i < 0}
+    assert negatives <= {TYPE2INDEX["input"]["image"], TYPE2INDEX["input"]["video"]}
+
+
+def test_qwen3vl_chunks_time_the_way_the_caller_patched_it():
+    # 8 frames patched by 4 gives 2 chunks, not the default 2 -> 4 chunks. Getting
+    # this from the processor matters for models that reuse the qwen3vl template
+    # without sharing its temporal_patch_size.
+    template = build_chat_template("qwen3vl", _SpecialTokenTokenizer(), expect_multimodal=True)
+
+    encoded = template.encode_messages(
+        [("user", ("video", None))],
+        {"video": [64]},
+        video_metadata=[_video_metadata(8)],
+        temporal_patch_size=4,
+    )
+
+    # One "<t seconds>" marker plus a vision_start per chunk.
+    assert int((encoded["input_ids"] == 3).sum()) == 2
+    assert int((encoded["input_ids"] == TYPE2INDEX["input"]["video"]).sum()) == 64
+
+
+def test_qwen3vl_falls_back_when_the_caller_has_no_temporal_patch_size():
+    # data_transform reads the attribute off the video processor, so a processor
+    # without it hands over None rather than omitting the key.
+    template = build_chat_template("qwen3vl", _SpecialTokenTokenizer(), expect_multimodal=True)
+
+    encoded = template.encode_messages(
+        [("user", ("video", None))],
+        {"video": [64]},
+        video_metadata=[_video_metadata(8)],
+        temporal_patch_size=None,
+    )
+
+    assert int((encoded["input_ids"] == 3).sum()) == 4
+
+
+def test_qwen2vl_tolerates_the_video_kwargs_qwen3vl_needs():
+    # One call site feeds every multimodal template, and configs/multimodal/qwen2_vl
+    # ships this combination.
+    template = build_chat_template("qwen2vl", _SpecialTokenTokenizer(), expect_multimodal=True)
+
+    encoded = template.encode_messages(
+        [("user", ("text", "hello")), ("assistant", ("text", "hi"))],
+        {},
+        video_metadata=[],
+        temporal_patch_size=2,
+    )
+
+    assert len(encoded["input_ids"]) > 0
+
+
 def test_qwen_vl_variants_share_one_tokenize_and_remap():
     # The variants differ only in how they render messages. If a subclass grows
     # its own copy of the tail, a change to the modality contract can land in one
