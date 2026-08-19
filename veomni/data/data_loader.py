@@ -14,10 +14,10 @@
 
 
 import math
-from typing import Any, Callable, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Iterator, Literal, Optional, Sequence
 
 import torch
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
@@ -53,10 +53,62 @@ class DistributedDataloader(StatefulDataLoader):
     sampler: "StatefulDistributedSampler"
 
     def set_epoch(self, epoch: int) -> None:
-        if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+        if self.batch_sampler is not None and hasattr(self.batch_sampler, "set_epoch"):
+            self.batch_sampler.set_epoch(epoch)
+        elif self.sampler is not None and hasattr(self.sampler, "set_epoch"):
             self.sampler.set_epoch(epoch)
         elif hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)
+
+
+class ExactDistributedBatchSampler(Sampler[Sequence[int]]):
+    """Partition map-style evaluation data without padding or materializing indices.
+
+    Every rank yields the same number of batches so distributed forwards stay
+    collective-safe. Across all ranks, every dataset index is visited exactly
+    once. Configurations that cannot satisfy both properties without an empty
+    batch are rejected instead of duplicating samples.
+    """
+
+    def __init__(self, dataset_size: int, batch_size: int, num_replicas: int, rank: int) -> None:
+        if dataset_size <= 0:
+            raise ValueError(f"Validation dataset must be non-empty, got {dataset_size} samples.")
+        if batch_size <= 0:
+            raise ValueError(f"Validation batch size must be positive, got {batch_size}.")
+        if num_replicas <= 0:
+            raise ValueError(f"Number of replicas must be positive, got {num_replicas}.")
+        if not 0 <= rank < num_replicas:
+            raise ValueError(f"Rank must be in [0, {num_replicas}), got {rank}.")
+
+        num_steps = math.ceil(dataset_size / (num_replicas * batch_size))
+        num_batch_slots = num_steps * num_replicas
+        if num_batch_slots > dataset_size:
+            raise ValueError(
+                "Validation dataset cannot be partitioned into non-empty batches with equal steps per rank: "
+                f"dataset_size={dataset_size}, batch_size={batch_size}, num_replicas={num_replicas}. "
+                "Increase the validation dataset or batch size."
+            )
+
+        self.dataset_size = dataset_size
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.num_steps = num_steps
+        self._num_batch_slots = num_batch_slots
+        self._base_batch_size, self._remainder = divmod(dataset_size, num_batch_slots)
+
+    def __iter__(self) -> Iterator[Sequence[int]]:
+        for step in range(self.num_steps):
+            slot = step * self.num_replicas + self.rank
+            size = self._base_batch_size + int(slot < self._remainder)
+            start = slot * self._base_batch_size + min(slot, self._remainder)
+            yield range(start, start + size)
+
+    def __len__(self) -> int:
+        return self.num_steps
+
+    def set_epoch(self, _epoch: int) -> None:
+        """Keep the exact source order across validation epochs."""
 
 
 def _build_worker_init_fn(worker_num_threads: int) -> Callable[[int], None]:
@@ -96,6 +148,8 @@ def build_native_dataloader(
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
     save_steps: int = 0,
+    batch_sampler: Optional[Sampler[Sequence[int]]] = None,
+    generator: Optional[torch.Generator] = None,
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
@@ -145,10 +199,17 @@ def build_native_dataloader(
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
+        batch_sampler: Optional custom map-style batch sampler. It is mutually
+            exclusive with dynamic batching and replaces the native distributed
+            sampler, batch size, and ``drop_last`` configuration.
+        generator: Optional dedicated RNG used by the underlying dataloader.
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     parallel_state = get_parallel_state()
+
+    if batch_sampler is not None and dyn_bsz:
+        raise ValueError("A custom batch_sampler is supported only when dyn_bsz=False.")
 
     if collate_fn is None:
         if build_collate_fn:
@@ -233,7 +294,7 @@ def build_native_dataloader(
         collate_fn = MakeMicroBatchCollator(num_micro_batch=num_micro_batch, internal_data_collator=collate_fn)
 
     sampler = None
-    if not isinstance(dataset, IterableDataset):
+    if batch_sampler is None and not isinstance(dataset, IterableDataset):
         sampler = StatefulDistributedSampler(
             dataset,
             num_replicas=parallel_state.dp_size,
@@ -253,22 +314,28 @@ def build_native_dataloader(
         snapshot_every_n_steps = save_steps
     else:
         snapshot_every_n_steps = 1
-    dataloader = DistributedDataloader(
-        dataset,
-        batch_size=dataloader_batch_size,
-        sampler=sampler,
+    dataloader_kwargs = dict(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
         pin_memory_device=get_device_type(),
-        drop_last=drop_last,
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers and num_workers > 0,
         in_order=in_order,
         worker_init_fn=worker_init_fn,
         multiprocessing_context=multiprocessing_context,
+        generator=generator,
         snapshot_every_n_steps=snapshot_every_n_steps,
     )
+    if batch_sampler is None:
+        dataloader_kwargs.update(
+            batch_size=dataloader_batch_size,
+            sampler=sampler,
+            drop_last=drop_last,
+        )
+    else:
+        dataloader_kwargs["batch_sampler"] = batch_sampler
+    dataloader = DistributedDataloader(dataset, **dataloader_kwargs)
 
     if dyn_bsz and dyn_bsz_runtime == "main":
         dataloader = DynamicBatchSizeDataLoader(

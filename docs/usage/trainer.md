@@ -108,6 +108,37 @@ VeOmni includes several built-in callbacks:
 - **[HuggingfaceCkptCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves HuggingFace checkpoints.
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
 
+### Training-time validation
+
+`TextTrainer` can report globally weighted `validation/loss` from a separate map-style dataset
+(token-weighted for causal LM and sample-weighted for classification). Set `data.eval_path` and
+enable at least one schedule with `train.eval_steps` or `train.eval_epochs`.
+Validation uses fixed sample batching even when training uses dynamic batching, preserves the source
+order, visits every validation sample exactly once, and restores the training/evaluation mode of every
+model module after a successful or failed validation run.
+Validation reuses the configured worker count but disables persistent validation workers, so its
+second worker pool is released after each pass instead of remaining resident for the trainer lifetime.
+
+```yaml
+data:
+  eval_path: /path/to/validation.jsonl
+  datasets_type: mapping
+train:
+  eval_steps: 100
+  eval_epochs: 0
+```
+
+The initial support boundary is intentionally narrow: single-source conversation and classification
+Text SFT with the native dataloader under pure DP/FSDP2. Plaintext is rejected because one raw row can
+expand into multiple chunks, and weighted multisource YAML is rejected because its interleave schedule
+does not represent an exact union of source samples. Iterable datasets, VLM, DPO, diffusion, RL,
+sequence/tensor/pipeline/extra parallelism, async sequence parallelism, ChunkMBS, and `torch.compile`
+are rejected explicitly until their task-specific data, forward, and collective contracts are implemented.
+MoE router monitoring and torch profiling are also rejected so validation forwards cannot pollute
+training-only observability state.
+Every data-parallel rank must receive a non-empty batch on every validation step; increase the validation
+dataset or `train.micro_batch_size` if exact, equally stepped partitioning is impossible.
+
 ### Custom Callbacks
 
 You can create custom callbacks by inheriting from [`Callback`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/base.py) and registering them with `trainer.add_callback`.

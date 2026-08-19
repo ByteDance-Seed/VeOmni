@@ -30,6 +30,7 @@ from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
 from .base import BaseTrainer, VeOmniIter
+from .validation import TextValidationRunner
 
 
 logger = helper.create_logger(__name__)
@@ -63,11 +64,16 @@ class TextTrainer:
             self.base._build_dataset()
             self.base._build_collate_fn()
             self.base._build_dataloader()
+            self._build_validation_runner()
             self.base._build_parallelized_model()
             self.base._build_optimizer()
             self.base._build_lr_scheduler()
             self.base._build_training_context()
             self.base._init_callbacks()
+
+    def _build_validation_runner(self):
+        if TextValidationRunner.is_requested(self.base):
+            self.base.validation_runner = TextValidationRunner(self.base)
 
     def _build_model_assets(self):
         args: VeOmniArguments = self.base.args

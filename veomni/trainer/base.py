@@ -635,8 +635,19 @@ class BaseTrainer(Stateful, ABC):
             self.args.train.accelerator.offload_config.activation_gpu_limit,
         )
 
+    def _validate_validation_configuration(self) -> None:
+        args = self.args
+        requested = args.data.eval_path is not None and bool(args.train.eval_steps or args.train.eval_epochs)
+        if requested and getattr(self, "validation_runner", None) is None:
+            raise ValueError(
+                "Training-time validation is currently supported only by TextTrainer. "
+                "VLMTrainer, TextDPOTrainer, DiTTrainer, and RL trainers must provide task-specific validation "
+                "data and forward semantics before using data.eval_path."
+            )
+
     def _init_callbacks(self):
         """Initialize callbacks."""
+        self._validate_validation_configuration()
         self.environ_meter_callback = EnvironMeterCallback(self)
         self.tqdm_callback = TqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)
