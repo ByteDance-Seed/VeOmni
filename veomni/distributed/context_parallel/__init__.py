@@ -62,6 +62,7 @@ from .packed_sharding import (
     reorder_sample_major_to_ulysses_rank_major,
     reorder_ulysses_rank_major_to_sample_major,
     ulysses_local_cu_from_global,
+    ulysses_local_cu_to_cp_local_cu,
     ulysses_local_head_count,
 )
 from .ring_attention import (
@@ -117,6 +118,7 @@ __all__ = [
     "trim_conv_halo",
     "unpad_gdn_varlen_output",
     "ulysses_local_cu_from_global",
+    "ulysses_local_cu_to_cp_local_cu",
     "ulysses_local_head_count",
     "validate_gdn_lossless_plan",
     "local_affine_summary",

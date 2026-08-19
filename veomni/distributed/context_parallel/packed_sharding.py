@@ -195,6 +195,23 @@ def ulysses_local_cu_from_global(
     return global_cu_seqlens.new_tensor([0] + local_lengths, dtype=torch.int32).cumsum(0).to(torch.int32)
 
 
+def ulysses_local_cu_to_cp_local_cu(local_cu_seqlens: Tensor, ulysses_size: int) -> Tensor:
+    """Scale Ulysses-local CU points after a sequence gather.
+
+    This compatibility spelling is used by the Ring attention adapter from
+    PR969. The input describes one Ulysses rank's samples; after gathering all
+    Ulysses ranks, every sample span is multiplied by ulysses_size.
+    """
+    if isinstance(ulysses_size, bool) or not isinstance(ulysses_size, Integral):
+        raise TypeError("ulysses_size must be an integer")
+    ulysses_size = int(ulysses_size)
+    if ulysses_size < 1:
+        raise ValueError("ulysses_size must be positive")
+    points = _cu_points(local_cu_seqlens)
+    lengths = [(end - start) * ulysses_size for start, end in zip(points, points[1:])]
+    return local_cu_seqlens.new_tensor([0] + lengths, dtype=torch.int32).cumsum(0).to(torch.int32)
+
+
 def ulysses_local_head_count(total_heads: int, ulysses_size: int) -> int:
     """Return the head shard width; context parallelism never shards heads."""
     if isinstance(total_heads, bool) or not isinstance(total_heads, Integral):
@@ -265,5 +282,6 @@ __all__ = [
     "reorder_sample_major_to_ulysses_rank_major",
     "reorder_ulysses_rank_major_to_sample_major",
     "ulysses_local_cu_from_global",
+    "ulysses_local_cu_to_cp_local_cu",
     "ulysses_local_head_count",
 ]

@@ -83,6 +83,9 @@ class ParallelState:
     async_enabled: Optional[bool] = False
     # Append new public fields so legacy positional constructors retain the
     # exact pre-context-parallel argument order.
+    # "disabled" selects the generic Ring/Hybrid attention path for
+    # non-GDN models. Qwen3.5 GDN requires one of the explicit lossless
+    # implementations below; its model binding rejects "disabled".
     gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless", "kcp"] = "disabled"
     # Ascend DeviceMesh may not expose a named flattened group through the
     # root mesh. Retain the explicit CP×Ulysses mesh returned by ``_flatten``.
@@ -92,11 +95,12 @@ class ParallelState:
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
+        supported_cp = {"disabled", "state_passing_lossless", "kcp"}
         enabled_gdn_cp = {"state_passing_lossless", "kcp"}
-        if self.cp_size > 1 and self.gdn_context_parallel_implementation not in enabled_gdn_cp:
+        if self.cp_size > 1 and self.gdn_context_parallel_implementation not in supported_cp:
             raise ValueError(
-                "cp_size > 1 requires an explicit supported GDN context-parallel implementation; "
-                "generic Ring CP is not enabled as a production topology."
+                "cp_size > 1 requires gdn_context_parallel_implementation to be one of "
+                f"{sorted(supported_cp)}, got {self.gdn_context_parallel_implementation!r}."
             )
         if self.cp_size == 1 and self.gdn_context_parallel_implementation in enabled_gdn_cp:
             raise ValueError(

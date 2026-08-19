@@ -33,9 +33,9 @@ ownership plus state passing or KCP. The following GDN inputs fail closed:
 selector without CP, non-packed batches, attention dropout,
 sliding-window/softcap, non-causal or multimodal/cross-attention, `kcp` on GPU,
 a missing hardware-specific fused-attention backend, and `cp_size > 1` without
-an explicit lossless GDN selector. Generic Ring CP is not yet exposed as a
-production configuration; this prevents the collator from silently sharding
-tokens for an attention path that never executes Ring communication.
+an explicit lossless GDN selector for Qwen3.5. The backwards-compatible
+`disabled` selector is the generic Ring/Hybrid CP path for non-GDN causal
+models; Qwen3.5 never silently falls back to it.
 
 ## Layout contract
 

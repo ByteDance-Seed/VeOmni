@@ -136,7 +136,13 @@ def test_text_collator_refuses_unselected_context_parallel_sharding(monkeypatch)
     monkeypatch.setattr(
         m,
         "get_parallel_state",
-        lambda: _fake_ps(sp_enabled=True, sp_size=2, cp_size=2, cp_rank=0),
+        lambda: _fake_ps(
+            sp_enabled=True,
+            sp_size=2,
+            cp_size=2,
+            cp_rank=0,
+            gdn_context_parallel_implementation="experimental",
+        ),
     )
     with pytest.raises(RuntimeError, match="Refusing to context-shard tokens"):
         m.MainCollator()
