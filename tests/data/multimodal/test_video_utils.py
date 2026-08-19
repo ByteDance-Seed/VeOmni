@@ -540,7 +540,7 @@ def test_frames_indices_for_qwen3vl():
     assert (frames_indices[1:] >= frames_indices[:-1]).all(), "Frame indices should be non-decreasing"
 
     # Simulate Qwen3-VL timestamp calculation (simplified version)
-    # This replicates the logic in multimodal_chat_template.py
+    # This replicates the logic in chat_template.py
     merge_size = 2
     indices_list = frames_indices.tolist()
 

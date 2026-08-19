@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
-from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
+from ..data import MainCollator, build_chat_template, build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.torch_compile import (
@@ -240,8 +240,8 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.base.args
         self.base.processor = build_processor(args.model.tokenizer_path, max_pixels=MAX_PIXELS)
         if self.base.model_config.model_type not in ("qwen2_5_omni", "qwen3_omni_moe"):
-            self.base.chat_template = build_multimodal_chat_template(
-                args.data.chat_template, self.base.processor.tokenizer
+            self.base.chat_template = build_chat_template(
+                args.data.chat_template, self.base.processor.tokenizer, expect_multimodal=True
             )
             self.base.model_assets = [self.base.processor, self.base.chat_template]
         else:

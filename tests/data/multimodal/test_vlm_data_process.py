@@ -20,7 +20,7 @@ import torch
 from tools import hf_local_or_remote
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from veomni.data import build_multimodal_chat_template
+from veomni.data import build_chat_template
 from veomni.data.data_transform import (
     process_sample_qwen_vl,
 )
@@ -172,7 +172,7 @@ def veomni_process_sample(
     }
 
     # Initialize chat template
-    chat_template = build_multimodal_chat_template(
+    chat_template = build_chat_template(
         config.chat_template_name,
         veomni_processor.tokenizer,
     )

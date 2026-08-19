@@ -1,6 +1,13 @@
 import pytest
 
-from veomni.data.chat_template import GptOssTokenizerTemplate, TokenizerTemplate
+from veomni.data.chat_template import (
+    CHAT_TEMPLATE_REGISTRY,
+    GptOssTokenizerTemplate,
+    MultimodalChatTemplate,
+    Qwen2VLChatTemplate,
+    TokenizerTemplate,
+    build_chat_template,
+)
 from veomni.utils.constants import IGNORE_INDEX
 
 
@@ -121,3 +128,72 @@ def test_gpt_oss_tokenizer_template_rejects_insertion_at_terminal_boundary(inser
                 {"role": "user", "content": [30]},
             ]
         )
+
+
+class _VisionTokenizer:
+    """Minimal stand-in for a Qwen-VL tokenizer, enough to construct a template."""
+
+    pad_token_id = 0
+
+    def convert_tokens_to_ids(self, token):
+        return {"<|image_pad|>": 1, "<|video_pad|>": 2, "<|vision_start|>": 3, "<|vision_end|>": 4}[token]
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) % 97 for c in text]
+
+
+def test_qwen2_5vl_is_an_alias_of_qwen2vl():
+    # The two names must share one class; a copy would let the two drift apart.
+    assert CHAT_TEMPLATE_REGISTRY["qwen2_5vl"] is CHAT_TEMPLATE_REGISTRY["qwen2vl"]
+    assert CHAT_TEMPLATE_REGISTRY["qwen2vl"] is Qwen2VLChatTemplate
+
+
+@pytest.mark.parametrize(
+    "template_name, is_multimodal",
+    [
+        ("chatml", False),
+        ("default", False),
+        ("gpt_oss", False),
+        ("llama2", False),
+        ("tokenizer", False),
+        ("qwen2vl", True),
+        ("qwen2_5vl", True),
+        ("qwen3vl", True),
+    ],
+)
+def test_one_registry_holds_both_template_kinds(template_name, is_multimodal):
+    template_cls = CHAT_TEMPLATE_REGISTRY[template_name]
+    assert issubclass(template_cls, MultimodalChatTemplate) is is_multimodal
+
+
+def test_build_chat_template_accepts_the_expected_kind():
+    assert isinstance(
+        build_chat_template("qwen3vl", _VisionTokenizer(), expect_multimodal=True), MultimodalChatTemplate
+    )
+    assert not isinstance(
+        build_chat_template("chatml", _VisionTokenizer(), expect_multimodal=False), MultimodalChatTemplate
+    )
+
+
+def test_build_chat_template_without_expectation_skips_the_kind_check():
+    assert isinstance(build_chat_template("qwen3vl", _VisionTokenizer()), MultimodalChatTemplate)
+
+
+@pytest.mark.parametrize(
+    "template_name, expect_multimodal, message",
+    [
+        ("chatml", True, "is text-only"),
+        ("qwen3vl", False, "is multimodal"),
+    ],
+)
+def test_build_chat_template_rejects_the_wrong_kind(template_name, expect_multimodal, message):
+    # Both kinds now live in one registry, so a config naming the wrong one
+    # resolves. Without this guard it would only fail later inside a dataloader
+    # worker, on the differing encode_messages signature.
+    with pytest.raises(ValueError, match=message):
+        build_chat_template(template_name, _VisionTokenizer(), expect_multimodal=expect_multimodal)
+
+
+def test_build_chat_template_still_rejects_unknown_names():
+    with pytest.raises(ValueError, match="Unknown ChatTemplate name"):
+        build_chat_template("no_such_template", _VisionTokenizer())

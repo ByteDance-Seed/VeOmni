@@ -172,7 +172,9 @@ class TextDPOTrainer:
         args: VeOmniDPOArguments = self.base.args
         model_config = self.base.model_config
         self.base.tokenizer = build_tokenizer(args.model.tokenizer_path)
-        self.base.chat_template = build_chat_template(args.data.chat_template, self.base.tokenizer)
+        self.base.chat_template = build_chat_template(
+            args.data.chat_template, self.base.tokenizer, expect_multimodal=False
+        )
         self.base.model_assets = [model_config, self.base.chat_template]
 
     def _build_data_transform(self):
