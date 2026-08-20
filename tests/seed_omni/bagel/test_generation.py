@@ -1,6 +1,7 @@
+"""BAGEL generation graph smoke and eager/accelerated denoise structure."""
+
 from __future__ import annotations
 
-import pytest
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -9,7 +10,6 @@ from tests.seed_omni.bagel.helpers import (
     bagel_cfg_dir,
     config_cls,
     load_omni_config,
-    model_cls,
     native_model_cls,
     tiny_bagel_qwen2_cfg,
 )
@@ -18,7 +18,6 @@ from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.mixins.inference_module_mixin import InferenceModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.generation_state import MotGenerationState
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
@@ -42,7 +41,7 @@ def test_bagel_infer_gen_denoise_signal_smoke():
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
         infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
-    runtime, model = _make_veomni_runtime(
+    runtime, _model = _make_veomni_runtime(
         cfg,
         {
             "bagel_text_encoder": _InferGenTextEncoder(),
@@ -81,7 +80,7 @@ def test_bagel_infer_gen_user_image_runs_siglip_context_only():
         infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
     )
     siglip = _CountingInferGenBagelSiglip()
-    runtime, model = _make_veomni_runtime(
+    runtime, _model = _make_veomni_runtime(
         cfg,
         {
             "bagel_text_encoder": _InferGenTextEncoder(),
@@ -125,7 +124,7 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
         infer_graph_path=bagel_cfg_dir() / "graph_infer_edit.yaml",
     )
-    runtime, model = _make_veomni_runtime(
+    runtime, _model = _make_veomni_runtime(
         cfg,
         {
             "bagel_text_encoder": _InferGenTextEncoder(),
@@ -172,234 +171,11 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
     assert "timestep" not in request["conversation_list"][-1].meta
 
 
-def test_bagel_infer_gen_cfg_text_branch_signal_smoke():
-    cfg = load_omni_config(
-        modules_path=bagel_cfg_dir() / "modules_train.yaml",
-        train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
-    )
-    runtime, model = _make_veomni_runtime(
-        cfg,
-        {
-            "bagel_text_encoder": _InferGenTextEncoder(),
-            "bagel_siglip_navit": _NoopBagelSiglip(),
-            "bagel_qwen2_mot": _InferGenBagelQwen(),
-            "bagel_flow_connector": _InferGenBagelFlow(),
-            "bagel_vae": _InferGenBagelVAE(),
-        },
-    )
-    profiler = GraphProfiler()
-    request = {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]}
-    generated = runtime.generate(
-        request,
-        profiler=profiler,
-        generation_kwargs={
-            "max_new_tokens": 8,
-            "do_sample": False,
-            "image_height": 64,
-            "image_width": 64,
-            "cfg_text_scale": 4.0,
-            "cfg_img_scale": 1.0,
-        },
-    )
-
-    trace = profiler.save_records()
-    assert not any("module_signal(need_denoise_branch)" in entry for entry in trace)
-    assert any(
-        "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
-    )
-    assert any(item["type"] == "image" for item in generated)
-    assert "timestep" not in request["conversation_list"][-1].meta
-
-
-def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
-    cfg = load_omni_config(
-        modules_path=bagel_cfg_dir() / "modules_train.yaml",
-        train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
-    )
-    runtime, model = _make_veomni_runtime(
-        cfg,
-        {
-            "bagel_text_encoder": _InferGenTextEncoder(),
-            "bagel_siglip_navit": _NoopBagelSiglip(),
-            "bagel_qwen2_mot": _InferGenBagelQwen(),
-            "bagel_flow_connector": _InferGenBagelFlow(),
-            "bagel_vae": _InferGenBagelVAE(),
-        },
-    )
-    profiler = GraphProfiler()
-    request = {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]}
-    generated = runtime.generate(
-        request,
-        profiler=profiler,
-        generation_kwargs={
-            "max_new_tokens": 12,
-            "do_sample": False,
-            "image_height": 64,
-            "image_width": 64,
-            "cfg_text_scale": 4.0,
-            "cfg_img_scale": 1.5,
-        },
-    )
-
-    trace = profiler.save_records()
-    assert not any("module_signal(need_denoise_branch)" in entry for entry in trace)
-    assert any(
-        "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
-    )
-    assert any(item["type"] == "image" for item in generated)
-    assert "timestep" not in request["conversation_list"][-1].meta
-
-
-def test_bagel_qwen2_mot_cfg_text_context_install_is_internal():
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
-
-    empty_cache = model._new_empty_cache()
-    model._generation_state.cfg_text.install_cache(
-        cache=empty_cache,
-        cache_len=0,
-        next_position_id=torch.tensor(7),
-        device=model.device,
-    )
-    cfg_text_context = model._generation_state.cfg_text
-    assert cfg_text_context.cache is empty_cache
-    assert cfg_text_context.cache_len() == 0
-    assert cfg_text_context.repeated_position_ids(3, device=model.device).tolist() == [7, 7, 7]
-    assert cfg_text_context.key_values_lens.tolist() == [0]
-    assert cfg_text_context.packed_key_value_indexes.numel() == 0
-
+def _fake_cache(model: nn.Module, values: torch.Tensor):
     cache = model._new_empty_cache()
-    model._generation_state.cfg_text.install_cache(
-        cache=cache,
-        cache_len=5,
-        next_position_id=torch.tensor(11),
-        device=model.device,
-    )
-
-    assert cfg_text_context.cache is cache
-    assert cfg_text_context.cache_len() == 5
-    assert cfg_text_context.repeated_position_ids(2, device=model.device).tolist() == [11, 11]
-    assert cfg_text_context.packed_key_value_indexes.tolist() == [0, 1, 2, 3, 4]
-
-
-def test_bagel_qwen2_mot_cfg_img_context_accessors_are_internal():
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
-
-    empty_cache = model._new_empty_cache()
-    model._generation_state.cfg_img.install_cache(
-        cache=empty_cache,
-        cache_len=0,
-        next_position_id=torch.tensor(0),
-        device=model.device,
-    )
-    cfg_img_context = model._generation_state.cfg_img
-    assert cfg_img_context.cache is empty_cache
-    assert cfg_img_context.cache_len() == 0
-    assert cfg_img_context.repeated_position_ids(3, device=model.device).tolist() == [0, 0, 0]
-    assert cfg_img_context.key_values_lens.tolist() == [0]
-    assert cfg_img_context.packed_key_value_indexes.numel() == 0
-
-
-def test_bagel_qwen2_mot_cfg_img_requires_text_cfg():
-    with pytest.raises(ValueError, match="cfg_img_scale > 1.0 requires cfg_text_scale > 1.0"):
-        MotGenerationState().validate_cfg_request({"cfg_text_scale": 1.0, "cfg_img_scale": 1.5})
-
-
-def test_bagel_qwen2_mot_branch_batch_indexes_use_per_branch_attention_offsets():
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
-    state = model._generation_state
-    state.main.install_cache(
-        cache=_fake_cache(model, torch.tensor([10.0, 11.0])),
-        cache_len=2,
-        next_position_id=torch.tensor(3),
-        device=model.device,
-    )
-    state.cfg_text.install_cache(
-        cache=model._new_empty_cache(),
-        cache_len=0,
-        next_position_id=torch.tensor(7),
-        device=model.device,
-    )
-    state.cfg_img.install_cache(
-        cache=_fake_cache(model, torch.tensor([20.0, 21.0, 22.0])),
-        cache_len=3,
-        next_position_id=torch.tensor(11),
-        device=model.device,
-    )
-
-    inputs = state.preprocess_parallel_denoise_inputs(
-        torch.zeros(5, int(model.config.hidden_size)),
-        {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5},
-        timestep=0.5,
-        empty_cache_factory=model._new_empty_cache,
-        device=model.device,
-        dtype=model.dtype,
-    )
-
-    assert inputs["query_lens"].tolist() == [5, 5, 5]
-    assert inputs["key_values_lens"].tolist() == [2, 0, 3]
-    assert inputs["packed_query_indexes"].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19]
-    assert inputs["packed_key_value_indexes"].tolist() == [0, 1, 12, 13, 14]
-    assert inputs["packed_text_indexes"].tolist() == [0, 4, 5, 9, 10, 14]
-    assert inputs["packed_vae_token_indexes"].tolist() == [1, 2, 3, 6, 7, 8, 11, 12, 13]
-    assert inputs["packed_query_position_ids"].tolist() == [3, 3, 3, 3, 3, 7, 7, 7, 7, 7, 11, 11, 11, 11, 11]
-    assert inputs["past_key_values"].key_cache[0].reshape(-1).tolist() == [10.0, 11.0, 20.0, 21.0, 22.0]
-
-
-def test_bagel_qwen2_mot_serial_denoise_indexes_match_official_per_branch_calls():
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
-    state = model._generation_state
-    state.main.install_cache(
-        cache=_fake_cache(model, torch.tensor([10.0, 11.0])),
-        cache_len=2,
-        next_position_id=torch.tensor(3),
-        device=model.device,
-    )
-    state.cfg_text.install_cache(
-        cache=model._new_empty_cache(),
-        cache_len=0,
-        next_position_id=torch.tensor(7),
-        device=model.device,
-    )
-    state.cfg_img.install_cache(
-        cache=_fake_cache(model, torch.tensor([20.0, 21.0, 22.0])),
-        cache_len=3,
-        next_position_id=torch.tensor(11),
-        device=model.device,
-    )
-    query = torch.zeros(5, int(model.config.hidden_size))
-    calls = list(
-        state.iter_serial_denoise_inputs(
-            query,
-            {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5},
-            timestep=0.5,
-            device=model.device,
-            dtype=model.dtype,
-        )
-    )
-    assert len(calls) == 3
-    assert calls[0]["packed_query_indexes"].tolist() == [2, 3, 4, 5, 6]
-    assert calls[0]["packed_query_position_ids"].tolist() == [3, 3, 3, 3, 3]
-    assert calls[0]["packed_key_value_indexes"].tolist() == [0, 1]
-    assert calls[1]["packed_query_indexes"].tolist() == [0, 1, 2, 3, 4]
-    assert calls[1]["packed_query_position_ids"].tolist() == [7, 7, 7, 7, 7]
-    assert calls[1]["packed_key_value_indexes"].numel() == 0
-    assert calls[2]["packed_query_indexes"].tolist() == [3, 4, 5, 6, 7]
-    assert calls[2]["packed_query_position_ids"].tolist() == [11, 11, 11, 11, 11]
-    assert calls[2]["packed_key_value_indexes"].tolist() == [0, 1, 2]
-    for call in calls:
-        assert call["packed_text_indexes"].tolist() == [0, 4]
-        assert call["packed_vae_token_indexes"].tolist() == [1, 2, 3]
-        assert torch.equal(call["packed_query_sequence"], query)
+    cache.key_cache[0] = values.reshape(-1, 1, 1)
+    cache.value_cache[0] = (values + 100.0).reshape(-1, 1, 1)
+    return cache
 
 
 def _install_three_branch_caches(model: nn.Module) -> None:
@@ -483,147 +259,6 @@ def test_bagel_qwen2_mot_accelerated_denoise_branch_packs_cfg_branches(monkeypat
     assert int(captured["packed_query_sequence"].shape[0]) == 15
     assert tail.source == BAGEL_FLOW_HIDDEN
     assert int(tail.value.shape[0]) == 15
-
-
-@pytest.mark.parametrize(
-    ("branches", "generation_kwargs", "timestep", "renorm_type"),
-    [
-        (("main",), {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}, 0.5, "global"),
-        (("main", "cfg_text"), {"cfg_text_scale": 2.0, "cfg_img_scale": 1.0}, 0.5, "global"),
-        (("main", "cfg_text", "cfg_img"), {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5}, 0.5, "global"),
-        (
-            ("main",),
-            {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5, "cfg_interval": [0.2, 0.8]},
-            0.1,
-            "global",
-        ),
-        (("main", "cfg_text"), {"cfg_text_scale": 2.0, "cfg_img_scale": 1.0}, 0.5, "channel"),
-        (("main", "cfg_text", "cfg_img"), {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5}, 0.5, "text_channel"),
-    ],
-)
-def test_bagel_qwen2_mot_collects_stacked_cfg_velocity_like_serial_oracle(
-    branches: tuple[str, ...],
-    generation_kwargs: dict[str, float],
-    timestep: float,
-    renorm_type: str,
-):
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
-    main = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    cfg_text = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
-    cfg_img = torch.tensor([[0.25, 0.5], [0.75, 1.0]])
-    velocity_by_branch = {"main": main, "cfg_text": cfg_text, "cfg_img": cfg_img}
-    generation_kwargs = {
-        **generation_kwargs,
-        "cfg_interval": generation_kwargs.get("cfg_interval", [0.0, 1.0]),
-        "cfg_renorm_type": renorm_type,
-        "cfg_renorm_min": 0.0,
-    }
-    conversation = [
-        ConversationItem(
-            type="output",
-            value=torch.cat([_marker_wrap(velocity_by_branch[branch]) for branch in branches], dim=0),
-            role="assistant",
-            source=BAGEL_FLOW_VELOCITY,
-            meta={"timestep": torch.tensor(timestep)},
-        )
-    ]
-    state = model._generation_state
-    state.main.install_cache(
-        cache=model._new_empty_cache(),
-        cache_len=0,
-        next_position_id=torch.tensor(0),
-        device=model.device,
-    )
-    if "cfg_text" in branches:
-        state.cfg_text.install_cache(
-            cache=model._new_empty_cache(),
-            cache_len=0,
-            next_position_id=torch.tensor(0),
-            device=model.device,
-        )
-    if "cfg_img" in branches:
-        state.cfg_img.install_cache(
-            cache=model._new_empty_cache(),
-            cache_len=0,
-            next_position_id=torch.tensor(0),
-            device=model.device,
-        )
-    state.preprocess_parallel_denoise_inputs(
-        torch.zeros(4, int(model.config.hidden_size)),
-        generation_kwargs,
-        timestep=torch.tensor(timestep),
-        empty_cache_factory=model._new_empty_cache,
-        device=model.device,
-        dtype=model.dtype,
-    )
-    out = model.collect_velocity(
-        conversation_list=conversation,
-        generation_kwargs=generation_kwargs,
-    )
-
-    expected = _serial_cfg_velocity_oracle(
-        main,
-        cfg_text if "cfg_text" in branches else None,
-        cfg_img if "cfg_img" in branches else None,
-        generation_kwargs,
-    )
-
-    assert FSM_SIGNAL_KEY not in out
-    torch.testing.assert_close(conversation[-1].value, expected)
-
-
-def _fake_cache(model: nn.Module, values: torch.Tensor):
-    cache = model._new_empty_cache()
-    cache.key_cache[0] = values.reshape(-1, 1, 1)
-    cache.value_cache[0] = (values + 100.0).reshape(-1, 1, 1)
-    return cache
-
-
-def _marker_wrap(velocity: torch.Tensor) -> torch.Tensor:
-    return torch.cat([torch.zeros_like(velocity[:1]), velocity, torch.zeros_like(velocity[:1])], dim=0)
-
-
-def _serial_cfg_velocity_oracle(
-    main: torch.Tensor,
-    cfg_text: torch.Tensor | None,
-    cfg_img: torch.Tensor | None,
-    generation_kwargs: dict[str, object],
-) -> torch.Tensor:
-    if cfg_text is None:
-        return main
-
-    cfg_text_scale = float(generation_kwargs.get("cfg_text_scale", 1.0))
-    cfg_img_scale = float(generation_kwargs.get("cfg_img_scale", 1.0))
-    cfg_renorm_min = float(generation_kwargs.get("cfg_renorm_min", 0.0))
-    cfg_renorm_type = str(generation_kwargs.get("cfg_renorm_type", "global"))
-
-    guided = cfg_text + cfg_text_scale * (main - cfg_text)
-    if cfg_renorm_type == "text_channel":
-        scale = (torch.norm(main, dim=-1, keepdim=True) / (torch.norm(guided, dim=-1, keepdim=True) + 1e-8)).clamp(
-            min=cfg_renorm_min,
-            max=1.0,
-        )
-        merged = guided * scale
-        if cfg_img_scale > 1.0:
-            assert cfg_img is not None
-            merged = cfg_img + cfg_img_scale * (merged - cfg_img)
-        return merged
-
-    if cfg_img_scale > 1.0:
-        assert cfg_img is not None
-        guided = cfg_img + cfg_img_scale * (guided - cfg_img)
-
-    if cfg_renorm_type == "global":
-        norm_main = torch.norm(main)
-        norm_guided = torch.norm(guided)
-    elif cfg_renorm_type == "channel":
-        norm_main = torch.norm(main, dim=-1, keepdim=True)
-        norm_guided = torch.norm(guided, dim=-1, keepdim=True)
-    else:
-        raise NotImplementedError(cfg_renorm_type)
-    return guided * (norm_main / (norm_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
 
 
 def _fake_cfg_branch_count(generation_kwargs: dict | None) -> int:

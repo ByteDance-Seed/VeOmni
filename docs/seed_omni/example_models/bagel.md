@@ -222,13 +222,8 @@ YAML.
 ## 6. Contract checks
 
 The Bagel module and graph contracts cover carrier/source routing, generation
-state transitions, prompt-parallel behavior, and graph config structure:
+state transitions, packing/cache behavior, and graph config structure:
 
 ```bash
-.venv/bin/python -m pytest -q \
-  tests/seed_omni/bagel/test_processing.py \
-  tests/seed_omni/bagel/test_generation.py \
-  tests/seed_omni/bagel/test_graph_config.py \
-  tests/seed_omni/bagel/test_prompt_parallel.py \
-  tests/seed_omni/bagel/test_source_routing.py
+.venv/bin/python -m pytest -q tests/seed_omni/bagel
 ```
