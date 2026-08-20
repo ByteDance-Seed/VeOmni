@@ -75,6 +75,55 @@ class TestOptimizerStateNoFill:
             OptimizerState(model, optimizer, fill_missing_optimizer_states=True)
 
 
+class TestMultiOptimizerState:
+    """Non-ExtraParallel MultiOptimizer must use its own DCP protocol."""
+
+    def test_single_process_dcp_roundtrip(self, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.optim.muon import DistributedMuon
+        from veomni.optim.optimizer import MultiOptimizer
+
+        def build_model_and_optimizer():
+            model = nn.Linear(4, 4)
+            optimizer = MultiOptimizer(
+                model,
+                {
+                    "muon": DistributedMuon([model.weight], lr=1e-2, ns_implementation="std"),
+                    "adamw": torch.optim.AdamW([model.bias], lr=1e-3),
+                },
+                ["muon", "adamw"],
+            )
+            return model, optimizer
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        source_model, source_optimizer = build_model_and_optimizer()
+        for param in source_model.parameters():
+            param.grad = torch.randn_like(param)
+        source_optimizer.step()
+        expected = source_optimizer.state_dict()
+        assert any("momentum_buffer" in key for key in expected)
+        assert any("exp_avg" in key for key in expected)
+
+        target_model, target_optimizer = build_model_and_optimizer()
+        dcp.save(
+            {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target_optimizer, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        actual = target_optimizer.state_dict()
+        assert expected.keys() == actual.keys()
+        for key, expected_value in expected.items():
+            actual_value = actual[key]
+            if torch.is_tensor(expected_value):
+                torch.testing.assert_close(expected_value, actual_value, atol=0.0, rtol=0.0)
+            else:
+                assert expected_value == actual_value
+
+
 class TestAllowPartialLoad:
     """DCP load may be partial for optimizer state, but not full model state."""
 

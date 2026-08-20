@@ -293,6 +293,9 @@ class OptimizerState(Stateful):
             )
             return optim_sd_with_extra_parallel_dim
 
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            return self.optimizer.state_dict()
+
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
@@ -306,6 +309,11 @@ class OptimizerState(Stateful):
             self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
             # MultiOptimizer sub-optimizers can also lose param-group hyperparams
             # (betas/...) for empty groups after load; restore recurses into them.
+            restore_optimizer_param_group_defaults(self.optimizer)
+            return
+
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            self.optimizer.load_state_dict(optim_state_from_dcp_load)
             restore_optimizer_param_group_defaults(self.optimizer)
             return
 
