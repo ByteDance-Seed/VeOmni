@@ -250,7 +250,7 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_
     yaml_path = _yaml_for_mode(mode)
     base_overrides = _fused_model_path_overrides(fused_toy_base_dir) + [
         _fused_ops_override(),
-        "--train.accelerator.ep_size=2",
+        "--model.accelerator.ep_size=2",
     ]
 
     # ── 1. Seeder: produce the HF adapter (adapter_model.safetensors) ───
@@ -279,8 +279,8 @@ def test_peft_ep_sharded_stream_load_matches_broadcast(tmp_path, fused_toy_base_
         stream_dir,
         extra_overrides=base_overrides
         + [
-            "--train.broadcast_model_weights_from_rank0=False",
-            "--train.ep_sharded_stream_load=True",
+            "--model.accelerator.broadcast_model_weights_from_rank0=False",
+            "--model.accelerator.ep_sharded_stream_load=True",
         ],
         nproc=nproc,
     )

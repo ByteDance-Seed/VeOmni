@@ -37,7 +37,7 @@ def test_configure_hsdp_allreduce_toggles_outer_micro_steps():
     calls = []
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.args = SimpleNamespace(
-        train=SimpleNamespace(
+        model=SimpleNamespace(
             accelerator=SimpleNamespace(
                 fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
                 dp_replicate_size=2,

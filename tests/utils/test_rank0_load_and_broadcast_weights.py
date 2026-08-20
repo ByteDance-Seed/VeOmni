@@ -219,23 +219,23 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
     dist.init_process_group(backend=args.test.backend)
 
     init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.train.accelerator.extra_parallel_names,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
     )
 
     dtensor_factory = distribute_tensor if distribute_tensor is not None else None
     if dtensor_factory is None:
         raise RuntimeError("torch.distributed.tensor.distribute_tensor is required for fsdp2 weight loading test")
-    dtensor_to_cpu = args.train.accelerator.fsdp_config.offload
+    dtensor_to_cpu = args.model.accelerator.fsdp_config.offload
     load_device = "cpu" if dtensor_to_cpu else get_device_type()
 
     try:
@@ -275,10 +275,10 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         rank0_load_model = build_parallelize_model(
             rank0_load_model,
             weights_path=None,
-            init_device=args.train.init_device,
-            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
+            init_device=args.model.accelerator.init_device,
+            mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=False,
-            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
+            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
             basic_modules=[],
             broadcast_model_weights_from_rank0=True,
         )
@@ -301,10 +301,10 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         all_rank_load_model = build_parallelize_model(
             all_rank_load_model,
             weights_path=None,
-            init_device=args.train.init_device,
-            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
+            init_device=args.model.accelerator.init_device,
+            mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=False,
-            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
+            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
             basic_modules=[],
             broadcast_model_weights_from_rank0=False,
         )
@@ -415,23 +415,23 @@ def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: b
         "--model.config_path=test",
         "--data.train_path=tests",
         "--train.checkpoint.output_dir=.tests/cache",
-        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--train.init_device=meta",
-        "--train.accelerator.fsdp_config.mixed_precision.enable=False",
-        "--train.gradient_checkpointing.enable=False",
-        "--train.broadcast_model_weights_from_rank0=True",
-        "--train.accelerator.ep_size=2",
-        "--train.accelerator.ep_outside=False",
-        "--train.accelerator.extra_parallel_sizes=2",
-        "--train.accelerator.extra_parallel_placement_innermost=False",
-        "--train.accelerator.extra_parallel_names=emb",
+        "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
+        "--model.accelerator.init_device=meta",
+        "--model.accelerator.fsdp_config.mixed_precision.enable=False",
+        "--model.accelerator.gradient_checkpointing.enable=False",
+        "--model.accelerator.broadcast_model_weights_from_rank0=True",
+        "--model.accelerator.ep_size=2",
+        "--model.accelerator.ep_outside=False",
+        "--model.accelerator.extra_parallel_sizes=2",
+        "--model.accelerator.extra_parallel_placement_innermost=False",
+        "--model.accelerator.extra_parallel_names=emb",
         f"--test.weights_path={weights_path}",
         f"--test.device_type={get_device_type()}",
         f"--test.backend={get_dist_comm_backend()}",
         "--test.mode=broadcast",
     ]
     if cpu_offload:
-        command.append("--train.accelerator.fsdp_config.offload=True")
+        command.append("--model.accelerator.fsdp_config.offload=True")
 
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
@@ -454,17 +454,17 @@ def run_load_weights_test(args: Arguments) -> None:
     dist.init_process_group(backend=args.test.backend)
 
     init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.train.accelerator.extra_parallel_names,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
     )
 
     try:
@@ -473,10 +473,10 @@ def run_load_weights_test(args: Arguments) -> None:
         fsdp_model = build_parallelize_model(
             ToyModel(),
             weights_path=str(weights_path),
-            init_device=args.train.init_device,
-            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
+            init_device=args.model.accelerator.init_device,
+            mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=False,
-            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
+            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
             basic_modules=[],
         )
         """
@@ -504,7 +504,7 @@ def run_load_weights_test(args: Arguments) -> None:
         load_model_weights(reference_model, str(weights_path), init_device=get_device_type())
         reference_model = reference_model.cpu()
 
-        if args.train.accelerator.fsdp_config.offload:
+        if args.model.accelerator.fsdp_config.offload:
             _assert_model_parameters_on_device(fsdp_model, "cpu")
 
         torch.testing.assert_close(
@@ -590,18 +590,18 @@ def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
         "--model.config_path=test",
         "--data.train_path=tests",
         "--train.checkpoint.output_dir=.tests/cache",
-        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--train.init_device=meta",
-        "--train.accelerator.fsdp_config.mixed_precision.enable=False",
-        "--train.gradient_checkpointing.enable=False",
-        "--train.broadcast_model_weights_from_rank0=False",
+        "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
+        "--model.accelerator.init_device=meta",
+        "--model.accelerator.fsdp_config.mixed_precision.enable=False",
+        "--model.accelerator.gradient_checkpointing.enable=False",
+        "--model.accelerator.broadcast_model_weights_from_rank0=False",
         f"--test.weights_path={weights_path}",
         f"--test.device_type={get_device_type()}",
         f"--test.backend={get_dist_comm_backend()}",
         "--test.mode=load_weights",
     ]
     if cpu_offload:
-        command.append("--train.accelerator.fsdp_config.offload=True")
+        command.append("--model.accelerator.fsdp_config.offload=True")
 
     result = subprocess.run(command, check=True)
     assert result.returncode == 0

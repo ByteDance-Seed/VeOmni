@@ -15,6 +15,7 @@
 
 from .arguments_types import (
     AcceleratorConfig,
+    BaseModelArguments,
     CheckpointConfig,
     ChunkMBSConfig,
     DataArguments,
@@ -24,6 +25,7 @@ from .arguments_types import (
     InferArguments,
     MixedPrecisionConfig,
     ModelArguments,
+    ModelRuntimeArguments,
     OffloadConfig,
     OpsImplementationConfig,
     OptimizerConfig,

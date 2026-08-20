@@ -248,11 +248,11 @@ def build_command(dataset_type: str, dyn_bsz: bool, data_path: str):
         "--data.max_seq_len=16",
         "--train.global_batch_size=16",
         "--train.micro_batch_size=2",
-        "--train.accelerator.fsdp_config.fsdp_mode=ddp",
+        "--model.accelerator.fsdp_config.fsdp_mode=ddp",
         f"--data.datasets_type={dataset_type}",
         f"--train.dyn_bsz={dyn_bsz}",
         "--train.wandb.enable=True",
-        "--train.accelerator.ulysses_size=2",
+        "--model.accelerator.ulysses_size=2",
         "--train.bsz_warmup_ratio=0",
         "--data.dataloader.num_workers=1",
         # Force pin_memory=False: on NPU the pin_memory background thread
