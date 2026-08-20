@@ -173,7 +173,6 @@ def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
     monkeypatch.setattr(arguments_types.logger, "warning_rank0", lambda msg, *a, **k: warnings.append(msg))
 
     acc = AcceleratorConfig(
-        init_device="cuda",
         broadcast_model_weights_from_rank0=True,
         fsdp_config=FSDPConfig(fsdp_mode="ddp"),
     )
