@@ -426,7 +426,7 @@ def parallelize_model_fsdp2(
             async_enabled=parallel_state.async_enabled,
         )
         if compiled_count == 0:
-            raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
+            raise RuntimeError("model.accelerator.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True
         model._veomni_compile_uses_cuda_graphs = compile_config.uses_cuda_graphs()
 
@@ -447,6 +447,7 @@ def parallelize_model_fsdp2(
         fsdp_kwargs["mp_policy"] = mp_policy
     # prepare offload_policy kwargs
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
+    offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
         logger.info_rank0("Enable FSDP2 CPU offload for parameters, gradients, and optimizer states.")
@@ -458,7 +459,6 @@ def parallelize_model_fsdp2(
         # the cgroup during load. ``fsdp_offload_pin_memory=False`` keeps the
         # shards in ordinary pageable anon memory (what a bespoke manual offload
         # does) at the cost of a non-pinned (slightly slower) H2D per layer.
-        offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=offload_pin_memory)
 
     if hasattr(model, "get_ignore_modules_in_mixed_precision"):
@@ -843,7 +843,9 @@ def build_parallelize_model(
             )
         else:
             if compile_config.enable:
-                raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
+                raise RuntimeError(
+                    "model.accelerator.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported."
+                )
             model = parallelize_model_ddp(
                 model=model,
                 weights_path=weights_path,
@@ -851,6 +853,8 @@ def build_parallelize_model(
                 **kwargs,
             )
     elif compile_config.enable:
-        raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable requires FSDP2; compile without FSDP is not supported."
+        )
 
     return model

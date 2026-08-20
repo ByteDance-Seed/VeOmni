@@ -745,7 +745,7 @@ def test_init_applies_eager_defaults_for_inference():
         modules={
             "janus_siglip": {
                 "model_path": "janus_siglip",
-                "accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "full_shard": False}},
+                "accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "reshard_after_forward": False}},
             },
             "janus_llama": {"model_path": "janus_llama"},
         },

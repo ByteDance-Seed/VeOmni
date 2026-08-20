@@ -91,8 +91,8 @@ Qwen3.5 Dense 9B:
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
-    --train.init_device meta \
+    --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
+    --model.accelerator.init_device meta \
     --train.max_steps 20 \
     --train.checkpoint.output_dir ./exp/qwen3_5_9b_sft
 ```
@@ -104,8 +104,8 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-35B-A3B \
     --model.ops_implementation.moe_implementation fused_triton \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
-    --train.init_device meta \
+    --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
+    --model.accelerator.init_device meta \
     --train.global_batch_size 16 \
     --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
@@ -230,7 +230,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_a
 ```
 
 The config sets `ulysses_size: 4`, so the world size must be a multiple of 4. To run without
-sequence parallelism, override `--train.accelerator.ulysses_size 1`; the attention kernels adapt
+sequence parallelism, override `--model.accelerator.ulysses_size 1`; the attention kernels adapt
 on their own.
 
 ## ChunkMBS
@@ -244,9 +244,10 @@ The example config exposes the feature but keeps it disabled by default:
 
 ```yaml
 train:
-  chunk_mbs_config:
-    enable: true
-    chunk_mbs: 2
+  accelerator:
+    chunk_mbs_config:
+      enable: true
+      chunk_mbs: 2
 ```
 
 `chunk_mbs` is the number of packed samples per layer chunk, not a token count or `train.micro_batch_size`.
@@ -262,9 +263,9 @@ Qwen3.5 supports Ulysses sequence parallelism for both its softmax attention lay
 linear attention (GatedDeltaNet) layers. This enables training with longer sequences by
 distributing the sequence across multiple GPUs.
 
-To enable Ulysses SP, set `train.accelerator.ulysses_size`. VeOmni derives the effective
+To enable Ulysses SP, set `model.accelerator.ulysses_size`. VeOmni derives the effective
 data-parallel size from the world size and the other parallel dimensions; set
-`train.accelerator.dp_shard_size` only when you need to pin the FSDP shard degree explicitly.
+`model.accelerator.dp_shard_size` only when you need to pin the FSDP shard degree explicitly.
 For the example below, the total GPU count is `dp_shard_size * ulysses_size = 4 * 2 = 8`.
 
 ```shell
@@ -272,8 +273,8 @@ For the example below, the total GPU count is `dp_shard_size * ulysses_size = 4 
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.accelerator.dp_shard_size 4 \
-    --train.accelerator.ulysses_size 2 \
+    --model.accelerator.dp_shard_size 4 \
+    --model.accelerator.ulysses_size 2 \
     --model.ops_implementation.attn_implementation flash_attention_3
 ```
 

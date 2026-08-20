@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from veomni.arguments.arguments_types import (
+    AcceleratorConfig,
     ChunkMBSConfig,
     DataArguments,
     GradientCheckpointingConfig,
@@ -32,10 +33,11 @@ from veomni.distributed.torch_compile import (
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
-def _model_args() -> ModelArguments:
+def _model_args(**kwargs) -> ModelArguments:
     return ModelArguments(
         config_path="dummy_config.json",
         ops_implementation=OpsImplementationConfig(load_balancing_loss_implementation="eager"),
+        **kwargs,
     )
 
 
@@ -152,7 +154,7 @@ def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch
 def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
-    with pytest.raises(RuntimeError, match="train.torch_compile.dynamic=False"):
+    with pytest.raises(RuntimeError, match="model.accelerator.torch_compile.dynamic=False"):
         compile_decoder_blocks(
             ToyQwen3VLModel(ToyDecoderLayer()),
             CompileConfig(dynamic=True),
@@ -434,7 +436,7 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
 
     trainer = VLMTrainer.__new__(VLMTrainer)
     trainer.base = SimpleNamespace(
-        args=SimpleNamespace(train=SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=1.0))),
+        args=SimpleNamespace(model=SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=1.0))),
         state=SimpleNamespace(global_step=0),
         model=SimpleNamespace(_veomni_compile_uses_cuda_graphs=True),
         model_reshard=lambda *_: None,
@@ -469,9 +471,13 @@ def test_vlm_trainer_rejects_unsupported_compile_model_before_data_setup(monkeyp
     monkeypatch.setattr(VLMTrainer, "_freeze_model_module", lambda _: calls.append("freeze_model"))
 
     args = SimpleNamespace(
-        train=SimpleNamespace(
-            torch_compile=ArgumentsTorchCompileConfig(enable=True),
-            accelerator=SimpleNamespace(ulysses_size=1, cp_size=1, enable_async=False),
+        model=SimpleNamespace(
+            accelerator=SimpleNamespace(
+                torch_compile=ArgumentsTorchCompileConfig(enable=True),
+                ulysses_size=1,
+                cp_size=1,
+                enable_async=False,
+            ),
         )
     )
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
@@ -572,24 +578,28 @@ def test_torch_compile_config_defaults():
 
 
 def test_enable_compile_requires_dynamic_batching():
-    with pytest.raises(ValueError, match="train.torch_compile.enable requires train.dyn_bsz=True"):
+    with pytest.raises(ValueError, match="model.accelerator.torch_compile.enable requires train.dyn_bsz=True"):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
             data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True), dyn_bsz=False, pad_to_length=False
+                dyn_bsz=False,
+                pad_to_length=False,
             ),
         )
 
 
 def test_enable_compile_rejects_chunk_mbs():
-    with pytest.raises(ValueError, match="train.chunk_mbs_config.enable is not supported"):
+    with pytest.raises(ValueError, match="model.accelerator.chunk_mbs_config.enable is not supported"):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(
+                accelerator=AcceleratorConfig(
+                    torch_compile=ArgumentsTorchCompileConfig(enable=True),
+                    chunk_mbs_config=ChunkMBSConfig(enable=True),
+                ),
+            ),
             data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True),
-                chunk_mbs_config=ChunkMBSConfig(enable=True),
                 dyn_bsz=True,
                 pad_to_length=False,
             ),
@@ -599,10 +609,9 @@ def test_enable_compile_rejects_chunk_mbs():
 def test_chunk_mbs_rejects_static_padding():
     with pytest.raises(ValueError, match="not supported with train.pad_to_length"):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(accelerator=AcceleratorConfig(chunk_mbs_config=ChunkMBSConfig(enable=True))),
             data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
-                chunk_mbs_config=ChunkMBSConfig(enable=True),
                 dyn_bsz=True,
                 pad_to_length=True,
                 micro_batch_size=2,
@@ -613,28 +622,32 @@ def test_chunk_mbs_rejects_static_padding():
 def test_chunk_mbs_rejects_reentrant_gradient_checkpointing():
     with pytest.raises(ValueError, match="requires non-reentrant gradient checkpointing"):
         VeOmniArguments(
-            model=_model_args(),
-            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
-            train=TrainingArguments(
-                chunk_mbs_config=ChunkMBSConfig(enable=True),
-                gradient_checkpointing=GradientCheckpointingConfig(enable_reentrant=True),
+            model=_model_args(
+                accelerator=AcceleratorConfig(
+                    chunk_mbs_config=ChunkMBSConfig(enable=True),
+                    gradient_checkpointing=GradientCheckpointingConfig(enable_reentrant=True),
+                ),
             ),
+            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
+            train=TrainingArguments(),
         )
 
 
 def test_chunk_mbs_rejects_dpo_trainer():
     with pytest.raises(ValueError, match="not supported by the DPO trainer"):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(accelerator=AcceleratorConfig(chunk_mbs_config=ChunkMBSConfig(enable=True))),
             data=DataArguments(train_path="dummy.jsonl", max_seq_len=8, data_type="dpo"),
-            train=TrainingArguments(chunk_mbs_config=ChunkMBSConfig(enable=True)),
+            train=TrainingArguments(),
         )
 
 
 def test_dpo_trainer_rejects_chunk_mbs_regardless_of_data_type():
     from veomni.trainer.text_dpo_trainer import TextDPOTrainer
 
-    args = SimpleNamespace(train=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True)))
+    args = SimpleNamespace(
+        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True)))
+    )
     with pytest.raises(ValueError, match="not supported by the DPO trainer"):
         TextDPOTrainer(args)
 
@@ -642,7 +655,9 @@ def test_dpo_trainer_rejects_chunk_mbs_regardless_of_data_type():
 def test_rl_trainer_rejects_chunk_mbs():
     from veomni.trainer.base_rl_trainer import BaseRLTrainer
 
-    args = SimpleNamespace(train=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True)))
+    args = SimpleNamespace(
+        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True)))
+    )
     trainer = BaseRLTrainer.__new__(BaseRLTrainer)
     trainer.args = args
     with pytest.raises(ValueError, match="not supported by RL trainers"):
@@ -651,23 +666,24 @@ def test_rl_trainer_rejects_chunk_mbs():
 
 def test_enable_compile_requires_padding_for_dynamic_batching():
     with pytest.raises(
-        ValueError, match="train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True"
+        ValueError,
+        match="model.accelerator.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True",
     ):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
             data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True), dyn_bsz=True, pad_to_length=False
+                dyn_bsz=True,
+                pad_to_length=False,
             ),
         )
 
 
 def test_enable_compile_accepts_static_padded_dynamic_batching():
     args = VeOmniArguments(
-        model=_model_args(),
+        model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
         data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
         train=TrainingArguments(
-            torch_compile=ArgumentsTorchCompileConfig(enable=True),
             dyn_bsz=True,
             pad_to_length=True,
             micro_batch_size=2,
@@ -687,10 +703,9 @@ class ToyMultimodalDataArguments(DataArguments):
 def test_enable_compile_rejects_unsupported_data_pipeline():
     with pytest.raises(ValueError, match="not supported by this data pipeline"):
         VeOmniArguments(
-            model=_model_args(),
+            model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
             data=ToyMultimodalDataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True),
                 dyn_bsz=True,
                 pad_to_length=True,
                 micro_batch_size=2,
@@ -702,10 +717,9 @@ def test_enable_compile_accepts_vlm_static_padded_dynamic_batching():
     from veomni.trainer.vlm_trainer import VeOmniVLMArguments, VLMMDataArguments
 
     args = VeOmniVLMArguments(
-        model=_model_args(),
+        model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
         data=VLMMDataArguments(train_path="dummy.jsonl", max_seq_len=8),
         train=TrainingArguments(
-            torch_compile=ArgumentsTorchCompileConfig(enable=True),
             dyn_bsz=True,
             pad_to_length=True,
             micro_batch_size=2,
@@ -722,10 +736,9 @@ class ToyTextDataArguments(DataArguments):
 
 def test_enable_compile_accepts_text_data_argument_subclass():
     args = VeOmniArguments(
-        model=_model_args(),
+        model=_model_args(accelerator=AcceleratorConfig(torch_compile=ArgumentsTorchCompileConfig(enable=True))),
         data=ToyTextDataArguments(train_path="dummy.jsonl", max_seq_len=8),
         train=TrainingArguments(
-            torch_compile=ArgumentsTorchCompileConfig(enable=True),
             dyn_bsz=True,
             pad_to_length=True,
             micro_batch_size=2,

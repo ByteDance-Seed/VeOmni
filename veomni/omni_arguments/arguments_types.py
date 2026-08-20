@@ -913,13 +913,14 @@ class OmniTrainingArguments:
 
 
 def _validate_omni_accelerator(accelerator: AcceleratorConfig, *, pad_to_length: bool | int = False) -> None:
-    """Cross-field checks for the SeedOmni-V2-only knobs living on ``AcceleratorConfig``.
+    """Checks an ``AcceleratorConfig`` cannot make for itself, for the Omni launcher.
 
-    Kept Omni-side (not on the shared :class:`AcceleratorConfig` used by V1 trainers too) since
-    some of these constraints (e.g. the blanket ``torch_compile`` ban) do not apply to V1, which
-    fully supports ``torch_compile`` with its own, different validation. ``accelerator`` is
-    self-contained for every check except the ``chunk_mbs_config`` vs ``pad_to_length`` one, which
-    needs the launcher-wide ``train.pad_to_length`` passed in explicitly.
+    Everything self-contained — the init-device rules, the ``ep_sharded_stream_load``
+    /``broadcast_model_weights_from_rank0`` exclusion — now runs in
+    ``AcceleratorConfig.__post_init__``, so it holds for a config built anywhere and is
+    not repeated here. What is left needs context the config does not have: the
+    launcher-wide ``train.pad_to_length``, and the V2-only ``torch_compile`` ban (V1
+    supports it, with its own validation in ``VeOmniArguments``).
 
     Called once for the top-level default (``model.accelerator``, at ``OmniArguments.__post_init__``
     time, before modules are resolved) and once per module (in :func:`resolve_omni_model`, after
@@ -927,28 +928,6 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig, *, pad_to_length:
     validated too, not just the global default.
     """
     acc = accelerator
-
-    assert acc.ep_size == 1 or acc.init_device != "cpu", (
-        "cpu init is not supported when enable ep. Please use `accelerator.init_device = cuda` or "
-        "`accelerator.init_device = meta` instead."
-    )
-    if acc.fsdp_config.fsdp_mode == "fsdp2":
-        assert acc.init_device == "meta", "Please use accelerator.init_device: meta for FSDP2 training"
-    else:
-        # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
-        # CPU-resident module. Fail here so every rank stops at parse time rather
-        # than let rank0 die in DDP's constructor while the others block in its
-        # first collective. ``broadcast_model_weights_from_rank0`` needs no warning
-        # alongside it: ``parallelize_model_ddp`` honours the flag now that it
-        # loads weights of its own.
-        assert acc.init_device != "cpu", (
-            "accelerator.init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
-        )
-
-    assert not (acc.ep_sharded_stream_load and acc.broadcast_model_weights_from_rank0), (
-        "accelerator.ep_sharded_stream_load requires accelerator.broadcast_model_weights_from_rank0=False "
-        "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
-    )
 
     if acc.chunk_mbs_config.enable:
         if pad_to_length:

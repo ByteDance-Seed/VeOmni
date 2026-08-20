@@ -1,5 +1,5 @@
 # Sample DeepSeek-V4-Flash-Base SFT config (FSDP2 + optional EP).
-# Default optimizer is Muon + AdamW. Override with train.optimizer.type=adamw if needed.
+# Default optimizer is Muon + AdamW. Override with model.optimizer.type=adamw if needed.
 
 model:
   model_path: DeepSeek-V4-Flash-Base
@@ -13,34 +13,6 @@ model:
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel
     rotary_pos_emb_implementation: eager
-
-data:
-  train_path: tulu-3-sft-mixture
-  data_type: conversation
-  chat_template: chatml
-  max_seq_len: 2048
-  train_size: 100000000
-  text_keys: messages
-  dyn_bsz_buffer_size: 200
-
-train:
-  dyn_bsz: false
-  accelerator:
-    # DeepSeek-V4 SP: Ulysses on Q heads + sequence all-gather for MQA/compressors.
-    # Requires num_attention_heads % ulysses_size == 0.
-    ulysses_size: 1
-    ep_size: 1
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: true
-    offload:
-      enable_activation: false
-  gradient_checkpointing:
-    enable: true
-  global_batch_size: 8
-  micro_batch_size: 1
-  bsz_warmup_ratio: 0.007
   optimizer:
     # Muon + AdamW: 2D hidden / 3D expert stacks use Muon; embed/lm_head/norms/bias use AdamW.
     # Switch back with `type: adamw` if needed.
@@ -51,7 +23,7 @@ train:
     lr_decay_ratio: 1.0
     weight_decay: 0.01
     max_grad_norm: 1.0
-    # match_rms_adamw: muon_lr can be omitted and inherits train.optimizer.lr
+    # match_rms_adamw: muon_lr can be omitted and inherits model.optimizer.lr
     # muon_lr: 3.0e-4
     muon_momentum: 0.95
     muon_nesterov: true
@@ -67,7 +39,35 @@ train:
     # muon_head_split_modules: [q_b_proj]
     # MoE + EP: whole-expert Shard(0) when (num_experts/ep_size) % ep_fsdp_size == 0
     muon_expert_zero_comm: true
-  init_device: meta
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    # DeepSeek-V4 SP: Ulysses on Q heads + sequence all-gather for MQA/compressors.
+    # Requires num_attention_heads % ulysses_size == 0.
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 2048
+  train_size: 100000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  dyn_bsz: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
   enable_full_determinism: false
   max_steps: 1000
   empty_cache_steps: 500

@@ -125,6 +125,9 @@ jobs:
             --no-install-package create-block-mask-cuda \
             --no-install-package flash-attn-cute \
             --no-install-package magi-to-hstu-cuda
+      - name: Run arguments tests
+        run: |
+          uv run --frozen pytest -s -x tests/arguments
       - name: Run parallel tests
         # TODO: run all tests under tests/parallel/ulysses after we verify
         #       tests/parallel/ulysses/test_ulysses_async.py still works

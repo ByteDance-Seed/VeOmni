@@ -38,23 +38,23 @@ def run_environ_meter(args: Arguments):
     dist.init_process_group(backend=get_dist_comm_backend(), world_size=world_size, rank=rank)
 
     init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.train.accelerator.extra_parallel_names,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
     )
 
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
-        init_device=args.train.init_device,
+        init_device=args.model.accelerator.init_device,
         ops_implementation=args.model.ops_implementation,
     )
     print(f"Model Class: {type(model)}")
@@ -85,7 +85,7 @@ def test_model_loader(model_path):
         f"--model.config_path={model_path}",
         "--data.train_path=tests",
         "--train.checkpoint.output_dir=.tests/cache",
-        f"--train.init_device={get_device_type()}",
+        f"--model.accelerator.init_device={get_device_type()}",
         # On NPU the dataclass defaults raise at parse time; pin to the
         # NPU-supported backend per op. No-op on GPU.
         *resolve_ops_overrides(_MODEL_NAME_FOR_OVERRIDES[model_path]),

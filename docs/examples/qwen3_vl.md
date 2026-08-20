@@ -77,7 +77,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --train.dyn_bsz true \
     --train.pad_to_length true \
-    --train.torch_compile.enable true
+    --model.accelerator.torch_compile.enable true
 ```
 
-This path currently requires CUDA, FSDP2, the default `train.torch_compile.backend=inductor` and `train.torch_compile.mode=None`, `train.torch_compile.dynamic=false`, `train.accelerator.ulysses_size=1`, `train.accelerator.cp_size=1`, and `train.accelerator.enable_async=false`. Padding fixes the token-tensor shapes, while different packed sequence boundaries can still produce separate Inductor specializations. CUDA Graph replay, Qwen3-VL-MoE, ChunkMBS, ExtraParallel, and NPU execution are not yet supported.
+This path currently requires CUDA, FSDP2, the default `model.accelerator.torch_compile.backend=inductor` and `model.accelerator.torch_compile.mode=None`, `model.accelerator.torch_compile.dynamic=false`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=false`. Padding fixes the token-tensor shapes, while different packed sequence boundaries can still produce separate Inductor specializations. CUDA Graph replay, Qwen3-VL-MoE, ChunkMBS, ExtraParallel, and NPU execution are not yet supported.
