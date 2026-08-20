@@ -645,10 +645,10 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Ring-attn context parallel size."},
     )
-    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
+    init_device: Literal["cuda", "meta", "npu"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
@@ -720,16 +720,16 @@ class AcceleratorConfig:
             self.dp_shard_size = self.dp_size
 
     def _validate_init_device(self):
-        assert self.ep_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
         if self.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use model.accelerator.init_device: meta for FSDP2 training"
-        elif self.broadcast_model_weights_from_rank0:
-            logger.warning_rank0(
-                "Ignoring model.accelerator.broadcast_model_weights_from_rank0=True because it is only "
-                "used with model.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
-                f"Received fsdp_mode={self.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
+        else:
+            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+            # CPU-resident module, and only rank0 would hold weights anyway. Fail
+            # here so every rank stops at parse time, rather than let rank0 die in
+            # DDP's constructor while the others block in its first collective.
+            assert self.init_device != "cpu", (
+                "model.accelerator.init_device: cpu is not supported with fsdp_mode: ddp. "
+                "Use meta or an accelerator device."
             )
 
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is

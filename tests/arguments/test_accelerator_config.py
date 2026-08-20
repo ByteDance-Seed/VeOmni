@@ -145,10 +145,15 @@ def test_fsdp2_requires_meta_init(world_size):
         AcceleratorConfig(init_device="cpu")
 
 
-def test_ep_rejects_cpu_init(world_size):
+def test_ddp_rejects_cpu_init(world_size):
+    """A CPU module cannot be wrapped by DDP's ``device_ids=[local_rank]``.
+
+    The Literal does not enforce this: it only becomes argparse choices, so a
+    YAML ``init_device: cpu`` reaches the constructor unchecked.
+    """
     world_size(1)
-    with pytest.raises(AssertionError, match="cpu init is not supported when enable ep"):
-        AcceleratorConfig(ep_size=2, init_device="cpu", fsdp_config=FSDPConfig(fsdp_mode="ddp"))
+    with pytest.raises(AssertionError, match="init_device: cpu is not supported"):
+        AcceleratorConfig(init_device="cpu", fsdp_config=FSDPConfig(fsdp_mode="ddp"))
 
 
 def test_ep_sharded_stream_load_conflicts_with_broadcast(world_size):
@@ -157,18 +162,24 @@ def test_ep_sharded_stream_load_conflicts_with_broadcast(world_size):
         AcceleratorConfig(ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=True)
 
 
-def test_ddp_warns_that_broadcast_is_ignored(world_size, monkeypatch):
+def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
+    """DDP loads weights itself now, so the flag applies verbatim under it.
+
+    It used to warn that the flag was fsdp2-only, which held only while the DDP
+    path loaded nothing at all.
+    """
     world_size(1)
     warnings = []
     monkeypatch.setattr(arguments_types.logger, "warning_rank0", lambda msg, *a, **k: warnings.append(msg))
 
-    AcceleratorConfig(
+    acc = AcceleratorConfig(
         init_device="cuda",
         broadcast_model_weights_from_rank0=True,
         fsdp_config=FSDPConfig(fsdp_mode="ddp"),
     )
 
-    assert any("broadcast_model_weights_from_rank0=True" in msg for msg in warnings)
+    assert acc.broadcast_model_weights_from_rank0 is True
+    assert not any("broadcast_model_weights_from_rank0" in msg for msg in warnings)
 
 
 @pytest.mark.parametrize(

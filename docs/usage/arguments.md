@@ -449,7 +449,7 @@ configured and never round-trip through a saved config.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
-| init_device | `Literal["cpu", "cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2. |
+| init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
 | ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
