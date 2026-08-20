@@ -108,6 +108,22 @@ def test_text_validation_runner_computes_weighted_loss_and_restores_mixed_module
     assert torch.equal(torch.random.get_rng_state(), global_rng_state)
 
 
+@pytest.mark.parametrize(
+    ("labels", "expected_units"),
+    [
+        ([[7, 8, 9]], 2),
+        ([[7]], 0),
+        ([[7, -100, 9]], 1),
+        ([[-100, 8, 9]], 2),
+    ],
+)
+def test_text_validation_runner_counts_only_shifted_causal_targets(labels, expected_units):
+    runner = _runner(_ValidationModel(), [])
+
+    # Position zero has no preceding logit, even when its label is valid.
+    assert runner._count_loss_units(torch.tensor(labels)).item() == expected_units
+
+
 def test_text_validation_runner_restores_module_modes_when_forward_fails(monkeypatch):
     monkeypatch.setattr(validation_module, "use_parallel_state", lambda _name: nullcontext())
     monkeypatch.setattr(validation_module, "set_batch_invariant_mode", lambda _enabled: nullcontext())
