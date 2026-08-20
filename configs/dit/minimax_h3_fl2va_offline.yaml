@@ -47,7 +47,7 @@ data:
   train_path: output/minimax_h3_fl2va_embedding
   data_type: diffusion
   source_name: minimax_h3
-  data_transform: minimax_h3_offline
+  data_transform: dit_offline
   datasets_type: minimax_h3_offline
   log_sample: false
   shuffle: false
@@ -56,7 +56,7 @@ data:
     repeat: 100
   dataloader:
     type: native
-    num_workers: 2
+    num_workers: 8
     drop_last: true
 
 # -----------------------------------------------------------------------------
@@ -65,7 +65,7 @@ data:
 train:
   training_task: offline_training
 
-  global_batch_size: 8
+  global_batch_size: 16
   micro_batch_size: 1
   dyn_bsz: false
 
@@ -73,7 +73,7 @@ train:
   seed: 42
 
   num_train_epochs: 1
-  max_steps: 500
+  max_steps: 20
 
   enable_full_determinism: true
   enable_batch_invariant_mode: true
@@ -95,7 +95,7 @@ train:
       enable: true
       start_step: 10
       end_step: 13
-      trace_dir: "./profiling/minimax_h3/baseline_nostack"
+      trace_dir: "./profiling/minimax_h3/repalce_rope_mbs2_nostack"
       record_shapes: true
       profile_memory: true
       with_stack: false
@@ -103,8 +103,7 @@ train:
       rank0_only: true
 
   accelerator:
-    ulysses_size: 1
-    dp_shard_size: 1
+    ulysses_size: 2
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:

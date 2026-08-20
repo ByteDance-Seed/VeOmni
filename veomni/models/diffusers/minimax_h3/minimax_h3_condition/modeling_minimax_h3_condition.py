@@ -523,12 +523,12 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
 
         # Packed x: [1, seq_len, feats]
         x = torch.zeros(1, seq_len, video_rows.shape[-1], device=device, dtype=dtype)
-        x[0].index_copy_(0, img_pos[cond_rows:], video_rows.to(dtype))
+        x[0, img_pos[cond_rows:]] = video_rows.to(dtype)
         if cond_anchor is not None:
-            x[0].index_copy_(0, img_pos[:cond_rows], cond_anchor.to(dtype))
+            x[0, img_pos[:cond_rows]] = cond_anchor.to(dtype)
 
         audio_x = torch.zeros(1, seq_len, audio_rows.shape[-1], device=device, dtype=dtype)
-        audio_x[0].index_copy_(0, audio_pos, audio_rows.to(dtype))
+        audio_x[0, audio_pos] = audio_rows.to(dtype)
 
         # 4. Per-token timesteps (t = 1 - sigma format)
         timesteps = torch.full((seq_len,), t_video, dtype=torch.float32, device=device)

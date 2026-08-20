@@ -1,7 +1,7 @@
 """MiniMax H3 offline data loader.
 
 Scans directory for VeOmni offline_embedding parquet shards and yields
-per-row dicts (pickle-bytes columns). The minimax_h3_offline data_transform
+per-row dicts (pickle-bytes columns). The dit_offline data_transform
 restores each row to the per-sample dict that process_condition consumes.
 """
 

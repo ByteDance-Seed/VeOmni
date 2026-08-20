@@ -2,7 +2,7 @@
 
 The base DiTTrainer hardcodes "dit_offline" / "dit_online" data transforms
 and builds the VeOmni optimizer.
-- data transform comes from YAML (minimax_h3_offline / minimax_h3_online)
+- data transform: offline reuses "dit_offline", online uses "minimax_h3_online"
 - optimizer: fp32 master params with ZeRO-3-style sharding across dp ranks
 - lr schedule: EmulatedConstantLR
 """
@@ -121,7 +121,7 @@ class MinimaxH3DiTTrainer(DiTTrainer):
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
         if args.data.datasets_type == "minimax_h3_offline":
-            self.base.data_transform = build_data_transform("minimax_h3_offline")
+            self.base.data_transform = build_data_transform("dit_offline")
         elif args.data.datasets_type == "minimax_h3_online":
             self.base.data_transform = build_data_transform("minimax_h3_online", **args.data.mm_configs)
         else:

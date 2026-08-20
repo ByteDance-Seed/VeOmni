@@ -5,7 +5,13 @@ import math
 import torch
 import torch.nn as nn
 
+from veomni.utils.device import IS_NPU_AVAILABLE
+
 from .core import attention_forward, gradient_checkpoint_forward
+
+
+if IS_NPU_AVAILABLE:
+    from torch_npu import npu_rotary_mul
 
 
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -49,12 +55,14 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    rot_dim = freqs.shape[-1]
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # cos/sin are precomputed once per forward and shared across all blocks.
+    rot_dim = cos.shape[-1]
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    cos = torch.cos(freqs).to(x.dtype).unsqueeze(1)
-    sin = torch.sin(freqs).to(x.dtype).unsqueeze(1)
-    x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
+    if IS_NPU_AVAILABLE:
+        x_rot = npu_rotary_mul(x_rot, cos, sin, rotary_mode="half")
+    else:
+        x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
     return torch.cat((x_rot, x_pass), dim=-1)
 
 
@@ -131,7 +139,7 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
 
-    def forward(self, x, *, rope_freqs, cu_seqlens, max_seqlen=None):
+    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None):
         total = x.shape[0]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
@@ -140,9 +148,9 @@ class MiniMaxH3Attention(nn.Module):
         v = qkv[:, :, 2, :]
         q = self.q_norm(q)
         k = self.k_norm(k)
-        if rope_freqs is not None:
-            q = _apply_rope(q, rope_freqs)
-            k = _apply_rope(k, rope_freqs)
+        if rope_cos is not None:
+            q = _apply_rope(q, rope_cos, rope_sin)
+            k = _apply_rope(k, rope_cos, rope_sin)
         out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
@@ -190,7 +198,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
 
     def forward(self, x, *, cu_seqlens, max_seqlen):
-        x = x + self.attn(self.norm1(x), rope_freqs=None, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        x = x + self.attn(self.norm1(x), rope_cos=None, rope_sin=None, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -245,12 +253,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM
         )
 
-    def forward(self, x, *, t_emb, combined_indices, rope_freqs, cu_seqlens, max_seqlen):
+    def forward(self, x, *, t_emb, combined_indices, rope_cos, rope_sin, cu_seqlens, max_seqlen):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices)
-        h = self.attn(h, rope_freqs=rope_freqs, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        h = self.attn(h, rope_cos=rope_cos, rope_sin=rope_sin, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = _modulate_gate(residual, gate_msa, h, combined_indices)
         residual = x
         h = self.norm2(x)
@@ -410,9 +418,9 @@ class MiniMaxH3DiT(nn.Module):
         text_embed = self.token_refiner(text_embed, cu_seqlens=refiner_cu_seqlens, max_seqlen=refiner_max_seqlen)
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=dtype)
-        embeddings.index_add_(0, text_pos, text_embed.to(dtype)[: text_pos.shape[0]])
-        embeddings.index_add_(0, img_pos, video_embed.to(dtype)[: img_pos.shape[0]])
-        embeddings.index_add_(0, audio_pos, audio_embed.to(dtype)[: audio_pos.shape[0]])
+        embeddings[text_pos] = text_embed.to(dtype)[: text_pos.shape[0]]
+        embeddings[img_pos] = video_embed.to(dtype)[: img_pos.shape[0]]
+        embeddings[audio_pos] = audio_embed.to(dtype)[: audio_pos.shape[0]]
 
         t_emb = self.time_embedder(unique_timesteps, dtype=dtype)
         return embeddings, t_emb
@@ -479,6 +487,11 @@ class MiniMaxH3DiT(nn.Module):
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
 
+        # cos/sin are shared across all blocks; compute once instead of per q/k
+        # in _apply_rope. Same fp32 inputs, same ops: bit-identical results.
+        rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
+        rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
+
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         block_swap = self._block_swap if self._block_offload_enabled else 0
@@ -499,7 +512,8 @@ class MiniMaxH3DiT(nn.Module):
                 hidden,
                 t_emb=t_emb,
                 combined_indices=combined_indices,
-                rope_freqs=rope_freqs,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )

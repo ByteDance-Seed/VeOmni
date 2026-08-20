@@ -108,26 +108,3 @@ def process_dit_offline_example(example, **kwargs):
 
     processed_example = {key: pk.loads(value) for key, value in example.items()}
     return [processed_example]
-
-
-@DATA_TRANSFORM_REGISTRY.register("minimax_h3_offline")
-def process_minimax_h3_offline_example(example, **kwargs):
-    """Restore one VeOmni offline_embedding parquet row to a per-sample dict.
-
-    Each parquet row holds one sample per column as pickle-bytes (saved by
-    OfflineEmbeddingSaver): prompt_embeds, input_latents, audio_input_latents,
-    keyframe_cond_anchor, packed, imgvid_cond_noise_aug, audio_cond_noise_aug,
-    use_gradient_checkpointing.
-
-    The packed dict already carries process_condition's metadata keys
-    (cond_rows, audio_channel, text_len, latent_*, audio_t) because VeOmni's
-    build_packed_fl2va emits them.
-
-    Do NOT wrap tensors/dicts in lists — DiTDataCollator handles batching via
-    batch[key].append(feature[key]), so process_condition receives
-    List[Tensor] (one per micro-batch sample).
-    """
-    import pickle as pk
-
-    row = {key: pk.loads(value) for key, value in example.items()}
-    return [row]

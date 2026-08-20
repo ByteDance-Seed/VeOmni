@@ -1292,15 +1292,15 @@ def model_fn_minimax_h3(
     cond_anchor = ref_visual_anchor if ref_visual_anchor is not None else keyframe_cond_anchor
     cond_rows_count = 0 if cond_anchor is None else cond_anchor.shape[0]
     x = torch.zeros(1, seq_len, 96, dtype=dtype, device=device)
-    x[0].index_copy_(0, img_pos[cond_rows_count:], video_rows)
+    x[0, img_pos[cond_rows_count:]] = video_rows
     if cond_anchor is not None:
-        x[0].index_copy_(0, img_pos[:cond_rows_count], cond_anchor)
+        x[0, img_pos[:cond_rows_count]] = cond_anchor
     # Audio Sequence
     ref_audio_rows_count = 0 if ref_audio_anchor is None else ref_audio_anchor.shape[0]
     audio_x = torch.zeros(1, seq_len, 32, dtype=dtype, device=device)
-    audio_x[0].index_copy_(0, audio_pos[ref_audio_rows_count:], audio_rows)
+    audio_x[0, audio_pos[ref_audio_rows_count:]] = audio_rows
     if ref_audio_anchor is not None:
-        audio_x[0].index_copy_(0, audio_pos[:ref_audio_rows_count], ref_audio_anchor)
+        audio_x[0, audio_pos[:ref_audio_rows_count]] = ref_audio_anchor
 
     timesteps = torch.full((seq_len,), float(t_video), dtype=torch.float32, device=device)
     timesteps[audio_pos] = float(t_audio)
