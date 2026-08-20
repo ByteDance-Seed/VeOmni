@@ -688,6 +688,45 @@ def test_bagel_flow_training_decode_consumes_velocity_target_items() -> None:
     assert out["hidden_states"].shape == (2, int(model.config.hidden_size))
 
 
+def test_bagel_flow_training_decode_uses_dummy_when_sample_has_no_velocity_target() -> None:
+    model = _tiny_flow_connector()
+    hidden_size = int(model.config.hidden_size)
+    dummy_hidden = torch.randn(3, hidden_size, requires_grad=True)
+    real_hidden = torch.randn(2, hidden_size, requires_grad=True)
+    dummy_sample = [
+        ConversationItem(type="text", value=dummy_hidden, role="assistant", meta={}),
+    ]
+    real_sample = [
+        ConversationItem(
+            type="image",
+            value=real_hidden,
+            role="assistant",
+            source=BAGEL_FLOW_HIDDEN,
+            meta={"flow_velocity_target": torch.ones(2, int(model.config.patch_latent_dim))},
+        )
+    ]
+
+    assert hasattr(model, "_anchor_dummy_decode_velocity_inputs")
+    groups = model._select_velocity_target_groups([dummy_sample, real_sample])
+    assert groups == [[], real_sample]
+    dummy_inputs = model._anchor_dummy_decode_velocity_inputs([dummy_sample])
+    assert dummy_inputs["hidden_states"].shape == (1, hidden_size)
+
+    inputs = model.decode_velocity_pre(conversation_list=[dummy_sample, real_sample])
+    assert model._decode_target_groups == [[], real_sample]
+    assert model._decode_lengths == [1, 2]
+    assert inputs["hidden_states"].shape == (3, hidden_size)
+
+    outputs = model.decode_velocity(**inputs)
+    result = model.decode_velocity_post(**outputs)
+    assert torch.isfinite(result["_loss"])
+    result["_loss"].backward()
+    assert dummy_hidden.grad is not None
+    assert torch.count_nonzero(dummy_hidden.grad) == 0
+    head_grads = [p.grad for p in model.llm2vae.parameters() if p.grad is not None]
+    assert head_grads, "dummy decode_velocity must keep llm2vae in the graph"
+
+
 def test_bagel_qwen2_mot_velocity_collect_requires_flow_velocity_source() -> None:
     model = _tiny_qwen2_mot()
     item = ConversationItem(

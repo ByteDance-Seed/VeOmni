@@ -239,7 +239,7 @@ class TrainingMixin(TrainingModuleMixin):
             loss = loss + mse.mean(dim=-1).sum() / token_count
         return {"conversation_list": conversation, "_loss": loss}
 
-    def _select_velocity_target_groups(
+    def _anchor_dummy_decode_velocity_inputs(
         self,
         conversation_list: list[list[ConversationItem]] | None,
     ) -> dict[str, torch.Tensor]:
