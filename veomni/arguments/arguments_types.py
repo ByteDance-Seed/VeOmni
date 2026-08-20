@@ -712,10 +712,10 @@ class TrainingArguments:
             )
         },
     )
-    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
+    init_device: Literal["cuda", "meta", "npu"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
@@ -856,9 +856,6 @@ class TrainingArguments:
             )
 
         # init method constraints
-        assert acc.ep_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
         else:
