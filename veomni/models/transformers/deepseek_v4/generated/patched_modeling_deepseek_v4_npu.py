@@ -1642,7 +1642,7 @@ class DeepseekV4Experts(nn.Module):
         if veomni_moe_experts_forward.use_non_eager_impl:
             # QAT is wired on the fused path only, which is the one that gets
             # deployed; the eager loop below stays in the model dtype.
-            expert_output = fused_moe_forward(
+            return fused_moe_forward(
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights.to(final_hidden_states.dtype),
                 selected_experts=top_k_index,
@@ -1653,7 +1653,6 @@ class DeepseekV4Experts(nn.Module):
                 fc1_1_2_weight=veomni_qat_fake_quant_expert_weight(self.gate_up_proj, self.expert_dtype),
                 swiglu_limit=self.limit,
             )
-            return veomni_qat_fake_quant_act(expert_output)
         # --- Patch.2 ---
 
         with torch.no_grad():

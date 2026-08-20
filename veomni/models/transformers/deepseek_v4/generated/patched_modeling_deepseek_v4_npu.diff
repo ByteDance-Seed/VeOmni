@@ -1310,7 +1310,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -988,32 +1626,71 @@
+@@ -988,32 +1626,70 @@
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
@@ -1332,7 +1332,7 @@
 +        if veomni_moe_experts_forward.use_non_eager_impl:
 +            # QAT is wired on the fused path only, which is the one that gets
 +            # deployed; the eager loop below stays in the model dtype.
-+            expert_output = fused_moe_forward(
++            return fused_moe_forward(
 +                num_experts=self.num_experts,
 +                routing_weights=top_k_weights.to(final_hidden_states.dtype),
 +                selected_experts=top_k_index,
@@ -1343,7 +1343,6 @@
 +                fc1_1_2_weight=veomni_qat_fake_quant_expert_weight(self.gate_up_proj, self.expert_dtype),
 +                swiglu_limit=self.limit,
 +            )
-+            return veomni_qat_fake_quant_act(expert_output)
 +        # --- Patch.2 ---
 +
          with torch.no_grad():
@@ -1395,7 +1394,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1027,14 +1704,28 @@
+@@ -1027,14 +1703,28 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
@@ -1427,7 +1426,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1057,12 +1748,18 @@
+@@ -1057,12 +1747,18 @@
          self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1448,7 +1447,7 @@
          weights = scores.gather(1, indices)
          weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
          return logits, weights * self.routed_scaling_factor, indices
-@@ -1088,6 +1785,12 @@
+@@ -1088,6 +1784,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1461,7 +1460,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1821,20 @@
+@@ -1118,22 +1820,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -1492,7 +1491,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1934,12 @@
+@@ -1233,6 +1933,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1505,7 +1504,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1959,16 @@
+@@ -1252,6 +1958,16 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1522,7 +1521,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1267,28 +1984,76 @@
+@@ -1267,28 +1983,76 @@
      ) -> MoeModelOutputWithPast:
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1607,7 +1606,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +2157,12 @@
+@@ -1392,6 +2156,12 @@
      return overall_loss * num_experts
 
 
@@ -1620,7 +1619,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +2181,36 @@
+@@ -1410,49 +2180,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1690,7 +1689,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +2223,64 @@
+@@ -1465,26 +2222,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1769,7 +1768,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +2288,17 @@
+@@ -1492,7 +2287,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
