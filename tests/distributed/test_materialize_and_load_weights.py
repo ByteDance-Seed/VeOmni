@@ -1,4 +1,4 @@
-"""Unit tests for ``_apply_weights_load_step`` weights_path dispatch (D2.2).
+"""Unit tests for ``_materialize_and_load_weights`` weights_path dispatch (D2.2).
 
 These tests pin down the three-branch dispatch contract that
 ``parallelize_model_fsdp2`` (and therefore ``build_parallelize_model``)
@@ -29,8 +29,8 @@ import torch
 import torch.nn as nn
 
 from veomni.distributed.torch_parallelize import (
-    _apply_weights_load_step,
     _load_one,
+    _materialize_and_load_weights,
     _resolve_weights_path_mapping,
     parallelize_model_ddp,
 )
@@ -130,7 +130,7 @@ def test_resolve_mapping_unknown_and_missing_both_reported():
     assert "typo" in msg  # unknown
 
 
-# ── _apply_weights_load_step: None branch ─────────────────────────────────
+# ── _materialize_and_load_weights: None branch ─────────────────────────────────
 
 
 def test_apply_load_step_none_calls_to_empty_and_init(monkeypatch):
@@ -154,7 +154,7 @@ def test_apply_load_step_none_calls_to_empty_and_init(monkeypatch):
     monkeypatch.setattr("veomni.distributed.torch_parallelize.load_model_weights", load_model_weights_mock)
     monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
 
-    _apply_weights_load_step(
+    _materialize_and_load_weights(
         model=model,
         weights_path=None,
         materialize_device="cpu",
@@ -173,7 +173,7 @@ def test_apply_load_step_none_calls_to_empty_and_init(monkeypatch):
     rank0_mock.assert_not_called()
 
 
-# ── _apply_weights_load_step: str branch (legacy single-model path) ───────
+# ── _materialize_and_load_weights: str branch (legacy single-model path) ───────
 
 
 def test_apply_load_step_str_with_rank0_broadcast(monkeypatch):
@@ -185,7 +185,7 @@ def test_apply_load_step_str_with_rank0_broadcast(monkeypatch):
     monkeypatch.setattr("veomni.distributed.torch_parallelize.load_model_weights", load_model_weights_mock)
     monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
 
-    _apply_weights_load_step(
+    _materialize_and_load_weights(
         model=model,
         weights_path="/snap/full",
         materialize_device=get_device_type(),
@@ -220,7 +220,7 @@ def test_apply_load_step_str_without_rank0_broadcast(monkeypatch):
     monkeypatch.setattr("veomni.distributed.torch_parallelize.load_model_weights", load_model_weights_mock)
     monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
 
-    _apply_weights_load_step(
+    _materialize_and_load_weights(
         model=model,
         weights_path="/snap/full",
         materialize_device=get_device_type(),
@@ -242,7 +242,7 @@ def test_apply_load_step_str_without_rank0_broadcast(monkeypatch):
     rank0_mock.assert_not_called()
 
 
-# ── _apply_weights_load_step: Mapping branch (V2 multi-snapshot) ──────────
+# ── _materialize_and_load_weights: Mapping branch (V2 multi-snapshot) ──────────
 
 
 def test_apply_load_step_mapping_calls_loader_per_child(monkeypatch):
@@ -261,7 +261,7 @@ def test_apply_load_step_mapping_calls_loader_per_child(monkeypatch):
     monkeypatch.setattr(_Leaf, "init_weights", init_weights_mock, raising=False)
 
     mapping: Mapping[str, str] = {"encoder": "/p/enc", "decoder": "/p/dec"}
-    _apply_weights_load_step(
+    _materialize_and_load_weights(
         model=model,
         weights_path=mapping,
         materialize_device="cpu",
@@ -306,11 +306,13 @@ def test_apply_load_step_forwards_fqn_to_index_mapping(monkeypatch):
         fqn_to_index_mapping=mapping,
     )
 
-    _apply_weights_load_step(model=_Container(), weights_path="/snap/full", **common)
+    _materialize_and_load_weights(model=_Container(), weights_path="/snap/full", **common)
     assert load_model_weights_mock.call_args.kwargs["fqn_to_index_mapping"] is mapping
 
     load_model_weights_mock.reset_mock()
-    _apply_weights_load_step(model=_Container(), weights_path={"encoder": "/p/enc", "decoder": "/p/dec"}, **common)
+    _materialize_and_load_weights(
+        model=_Container(), weights_path={"encoder": "/p/enc", "decoder": "/p/dec"}, **common
+    )
     assert [call.kwargs["fqn_to_index_mapping"] for call in load_model_weights_mock.call_args_list] == [None, None]
 
 
@@ -323,7 +325,7 @@ def test_apply_load_step_mapping_unknown_key_raises(monkeypatch):
     monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
 
     with pytest.raises(KeyError, match="bogus"):
-        _apply_weights_load_step(
+        _materialize_and_load_weights(
             model=model,
             weights_path={"encoder": "/p/enc", "decoder": "/p/dec", "bogus": "/p/x"},
             materialize_device="cpu",
@@ -351,7 +353,7 @@ def test_apply_load_step_mapping_missing_child_raises(monkeypatch):
     monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
 
     with pytest.raises(KeyError, match="decoder"):
-        _apply_weights_load_step(
+        _materialize_and_load_weights(
             model=model,
             weights_path={"encoder": "/p/enc"},  # decoder missing
             materialize_device="cpu",
@@ -380,7 +382,7 @@ def test_apply_load_step_mapping_rejects_peft(monkeypatch):
     monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
 
     with pytest.raises(NotImplementedError, match="is_peft_model=True"):
-        _apply_weights_load_step(
+        _materialize_and_load_weights(
             model=model,
             weights_path={"encoder": "/p/enc", "decoder": "/p/dec"},
             materialize_device="cpu",
@@ -464,7 +466,9 @@ def _frozen_meta_leaf() -> _Leaf:
 def test_ddp_honors_should_skip_hf_weight_load(monkeypatch, should_skip):
     """A distributed-checkpoint resume must not re-read the HF snapshot under
     DDP, but the params still have to leave the meta device."""
-    load_model_weights_mock = MagicMock()
+    # A real loader materialises as it fills, and ``parallelize_model_ddp``
+    # re-checks for meta params afterwards, so the stub has to materialise too.
+    load_model_weights_mock = MagicMock(side_effect=lambda model, *a, **k: model.to_empty(device="cpu"))
     rank0_mock = MagicMock()
     monkeypatch.setattr("veomni.distributed.torch_parallelize.load_model_weights", load_model_weights_mock)
     monkeypatch.setattr("veomni.distributed.torch_parallelize.rank0_load_and_broadcast_weights", rank0_mock)
@@ -477,10 +481,10 @@ def test_ddp_honors_should_skip_hf_weight_load(monkeypatch, should_skip):
     )
 
     assert load_model_weights_mock.call_count == (0 if should_skip else 1)
-    if should_skip:
-        # Nothing else will materialise these params once the loader is skipped,
-        # so a meta param here would blow up on the first forward.
-        assert not any(param.is_meta for param in model.parameters())
+    # Nothing else materialises these params, so a meta one here would blow up on
+    # the first forward -- on the resume path because the loader is skipped, and
+    # on the load path if the loader ever left one behind.
+    assert not any(param.is_meta for param in model.parameters())
 
 
 # ── DDP path: buffers are never broadcast (FSDP2 / HSDP parity) ────────────

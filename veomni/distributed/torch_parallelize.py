@@ -51,17 +51,34 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
 def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
     """Materialize parameters without discarding config-derived buffers.
 
-    Distributed checkpoints restore ``state_dict()``, which excludes buffers
-    registered with ``persistent=False``. Snapshot those buffers before
-    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
-    materialization path without duplicating persistent buffers that DCP loads.
+    ``init_empty_weights()`` patches ``register_parameter`` only, so a
+    meta-initialized model still holds real buffer values -- and ``to_empty()``
+    replaces every one of them with uninitialized memory. Snapshot them across it
+    instead, on the random-init path as much as the resume path: distributed
+    checkpoints restore ``state_dict()``, which excludes ``persistent=False``,
+    and HF's ``_init_weights`` recomputes a rope table only for a module that
+    exposes ``original_inv_freq``. Buffers outside that shape -- Gemma3's
+    per-layer-type ``{type}_inv_freq`` and its ``embed_scale``, the Omni audio
+    tower's sinusoidal ``positional_embedding`` -- have nothing else to restore
+    them. Persistent buffers are left to whichever loader runs next.
     """
     buffers = []
     for module in model.modules():
         for name in module._non_persistent_buffers_set:
             buffer = module._buffers.get(name)
-            if buffer is not None:
-                buffers.append((module, name, buffer.detach().clone()))
+            if buffer is None:
+                continue
+            if buffer.is_meta:
+                # A buffer derived from a parameter (``self.weight.detach()``) is
+                # on meta like the parameter, and holds nothing to copy out of.
+                # No model does this today; say so rather than let ``to_empty()``
+                # leave uninitialized memory behind unannounced.
+                logger.warning_rank0(
+                    f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
+                    "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
+                )
+                continue
+            buffers.append((module, name, buffer.detach().clone()))
 
     model.to_empty(device=device)
 
@@ -110,7 +127,7 @@ def _resolve_weights_path_mapping(
     return [(name, children[name], weights_path[name]) for name in weights_path]
 
 
-def _apply_weights_load_step(
+def _materialize_and_load_weights(
     model: nn.Module,
     weights_path: Optional[Union[str, Mapping[str, str]]],
     materialize_device: str,
@@ -166,7 +183,14 @@ def _apply_weights_load_step(
       ``to_empty`` propagating through FSDP DTensor parameters.  This
       composition is exercised end-to-end by D2.3's smoke tests (which
       run real FSDP) — the unit tests here only cover dispatch.
+
+    Shared by the FSDP2 and DDP paths: both build the model on ``meta`` and this
+    is the only place that materialises it, so the choice between random init,
+    an HF snapshot and a checkpoint resume is made identically for each.
     """
+    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
+    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
+    # and still need the HF base weights.
     if should_skip_hf_weight_load and is_peft_model:
         raise ValueError(
             "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
@@ -183,7 +207,10 @@ def _apply_weights_load_step(
         return
 
     if weights_path is None:
-        model.to_empty(device=materialize_device)
+        # Preserve non-persistent buffers on the random-init path too: HF's
+        # ``_init_weights`` recomputes only rope tables shaped the way it expects,
+        # so the rest would train on whatever ``to_empty()`` left behind.
+        _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
         _reset_hf_initialized_flag(model)
         model.init_weights()
         return
@@ -425,9 +452,6 @@ def parallelize_model_fsdp2(
               owns its own HF folder.  Incompatible with
               ``is_peft_model=True`` — raises ``NotImplementedError``.
     """
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
@@ -756,7 +780,7 @@ def parallelize_model_fsdp2(
 
     from torch.distributed.tensor import distribute_tensor
 
-    _apply_weights_load_step(
+    _materialize_and_load_weights(
         model=model,
         weights_path=weights_path,
         materialize_device=materialize_device,
@@ -793,9 +817,13 @@ def parallelize_model_ddp(
     DDP keeps a **full replica of plain
     tensors** per rank: :class:`~torch.nn.parallel.DistributedDataParallel` only
     registers gradient-sync hooks and broadcasts rank-0's params at construction.
-    It does **not** materialise meta-init params nor load weights — so under the
-    meta-init flow we must materialise + load the full weights *before* wrapping;
-    DDP then broadcasts the loaded rank-0 weights to every rank.
+    It does **not** materialise meta-init params nor load weights, and nothing
+    else on this path does either — ``build_model`` returns an empty model and
+    ``BaseTrainer`` has no load step of its own — so we must materialise + load
+    the full weights *before* wrapping, or DDP's constructor dies on
+    ``Tensor.item() cannot be called on meta tensors``. DDP then broadcasts the
+    loaded rank-0 weights to every rank. A model that arrives with real weights
+    already loaded must be left untouched.
 
     Args:
         weights_path: One of three forms:
@@ -820,12 +848,15 @@ def parallelize_model_ddp(
     """
     parallel_state = get_parallel_state()
 
-    # Under meta-init the params are still on `meta` here; DDP wrapping neither
-    # materialises them nor loads weights, so do it now (full-tensor load).
-    if kwargs.get("init_device") == "meta":
+    # Ask the parameters, not ``init_device``: the flag states an intent a model
+    # builder is free to ignore -- the data tests construct their model eagerly
+    # while the config still says ``meta`` -- and materialising a model that
+    # already holds real weights would discard them, or raise outright on a plain
+    # nn.Module with no ``init_weights``.
+    if any(param.is_meta for param in model.parameters()):
         from torch.distributed.tensor import distribute_tensor
 
-        _apply_weights_load_step(
+        _materialize_and_load_weights(
             model=model,
             weights_path=weights_path,
             materialize_device=get_device_type(),
@@ -841,6 +872,16 @@ def parallelize_model_ddp(
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
             should_skip_hf_weight_load=should_skip_hf_weight_load,
         )
+
+        # Anything the loader left behind would otherwise surface as
+        # ``Tensor.item() cannot be called on meta tensors`` from inside DDP's
+        # constructor, which names neither the parameter nor the cause.
+        unmaterialized = [name for name, param in model.named_parameters() if param.is_meta]
+        if unmaterialized:
+            raise RuntimeError(
+                f"DDP received unmaterialized parameters after loading from {weights_path!r}: "
+                f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
+            )
 
     # PyTorch DDP rejects modules with zero trainable params. Fully-frozen
     # encoders (e.g. Seedream offline_cache OE/ViT/VAE under ``no_grad``) still
@@ -870,6 +911,8 @@ def parallelize_model_ddp(
     # first node's autograd graph saved for backward (PyTorch #22095 / #66504).
     # ``SyncBatchNorm`` is the one real fix — it all-reduces the statistics inside
     # forward — and it works identically under DDP, FSDP2 and HSDP.
+    #
+    # See constraint 7e in `.agents/knowledge/constraints.md`.
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],
@@ -907,9 +950,6 @@ def build_parallelize_model(
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
     chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)
