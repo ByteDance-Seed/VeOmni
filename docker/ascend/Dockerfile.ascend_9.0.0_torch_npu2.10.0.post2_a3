@@ -40,7 +40,6 @@ RUN pip install --upgrade pip setuptools packaging --no-cache-dir --progress-bar
     pip cache purge
 
 RUN pip config set global.index-url "${PIP_INDEX}" && \
-    pip config set global.extra-index-url "${PIP_INDEX}" && \
     pip config set global.no-cache-dir "true" && \
     pip config --user set global.progress_bar off && \
     python -m pip install --upgrade pip
@@ -51,7 +50,10 @@ WORKDIR /app
 
 COPY . .
 
-RUN pip install -e ".[npu_aarch64]"
+# pyproject.toml pins transformers==5.9.0 in the transformers-stable uv default
+# group. pip install -e does not install uv dependency groups, so pin and verify it here.
+RUN pip install -e ".[npu_aarch64]" "transformers==5.9.0" && \
+    python -c "import transformers; assert transformers.__version__ == '5.9.0'"
 
 # Align the parquet/data stack with the uv lockfile. pip install -e (unlike x86's
 # uv sync --locked) ignores the lockfile and floats pyarrow/pandas to latest; pyarrow
@@ -77,11 +79,12 @@ RUN pip install torch-npu==2.10.0.post2 pybind11
 # verifies the patch stuck.
 # aarch64 triton-ascend 3.2.1 requires triton==3.5.0 (x86's is 3.2.0) — an arch-specific
 # dep, confirmed via `pip install triton-ascend==3.2.1 --dry-run` on an aarch64 host.
-# Use Huawei Cloud's Ascend package index so TLS verification remains enabled.
+# Install the pinned wheel directly from Huawei Cloud so only triton-ascend uses
+# that source; its dependencies continue to resolve from the configured PIP_INDEX.
 RUN (pip uninstall -y triton triton-ascend || true) && \
     pip install triton==3.5.0 && \
-    pip install triton-ascend==3.2.1 \
-        --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
+    pip install \
+        "https://mirrors.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" && \
     echo "Verifying triton-ascend patched libtriton.so ..." && \
     python -c "from triton._C.libtriton import ascend"
 

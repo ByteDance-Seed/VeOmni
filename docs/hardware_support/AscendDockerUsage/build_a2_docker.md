@@ -176,7 +176,7 @@ For x86 architecture, you need to activate the virtual environment created by `u
 source /app/.venv/bin/activate
 ```
 
-### Training Command Example
+### General Qwen3-VL Smoke Test
 
 After starting the container with appropriate mounts (and activating the environment for x86), you can run training commands. Here's an example for Qwen3-VL training using generic paths:
 
@@ -191,6 +191,24 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
 ```
 
 **Note:** Replace `/app/ckpt/your-model-checkpoint` and `/app/dataset/your-dataset.json` with the actual paths you used in your mount configuration.
+
+### Qwen3.5 GDN Training Example
+
+The GDN-ready image includes `triton-ascend` and `fla_npu`. Select the NPU
+implementations explicitly when running Qwen3.5:
+
+```bash
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
+    --model.model_path /app/ckpt/Qwen3.5-9B \
+    --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
+    --model.ops_implementation.rms_norm_gated_implementation npu \
+    --model.ops_implementation.causal_conv1d_implementation npu \
+    --model.ops_implementation.chunk_gated_delta_rule_implementation npu_ascendc \
+    --train.max_steps 20
+```
+
+See the [Qwen3.5 training guide](../../examples/qwen3_5.md#start-training-on-npu)
+for backend details and the Qwen3.5 MoE example.
 
 ## Step 5: Stop and Remove the Container
 When you're done, stop and remove the container:
