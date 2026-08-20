@@ -259,7 +259,6 @@ class TestMaterializeAndLoadDispatch:
             adapter_path=None,
             cpu_load_param_name=None,
             max_load_broadcast_size=20.0,
-            distribute_tensor_fn=lambda *args, **kwargs: None,
             fqn_to_index_mapping=None,
             **{"broadcast_from_rank0": False, **flags},
         )
@@ -299,7 +298,6 @@ class TestMaterializeAndLoadDispatch:
                 broadcast_from_rank0=False,
                 cpu_load_param_name=None,
                 max_load_broadcast_size=20.0,
-                distribute_tensor_fn=lambda *args, **kwargs: None,
                 fqn_to_index_mapping=None,
             )
 
