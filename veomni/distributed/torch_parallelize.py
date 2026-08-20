@@ -707,6 +707,7 @@ def parallelize_model_ddp(
             # defaults to avoiding.
             broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
             cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+            max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         )
 
