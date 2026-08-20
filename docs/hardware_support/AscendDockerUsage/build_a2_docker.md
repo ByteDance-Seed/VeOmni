@@ -27,7 +27,14 @@ docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0
 ```
 
 ## Step 2: Build the Custom Image
-Build the GDN-ready VeOmni Ascend A2 image using the appropriate Dockerfile for your architecture. These Dockerfiles include `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`. The existing `Dockerfile.ascend_9.0.0_a2.x86` and `Dockerfile.ascend_9.0.0_a2.arm` remain available for the general-purpose images.
+
+Build the GDN-ready VeOmni Ascend A2 image using
+`Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86` for x86 or
+`Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm` for ARM64. These Dockerfiles include
+`torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`.
+
+The existing `Dockerfile.ascend_9.0.0_a2.x86` and `Dockerfile.ascend_9.0.0_a2.arm` remain available for
+general-purpose images.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
 
@@ -242,14 +249,14 @@ Update the proxy settings in both the build and run commands to match your envir
 
 ### Dockerfile Details
 
-#### x86 Dockerfile (Dockerfile.ascend_9.0.0_a2)
+#### x86 Dockerfile (Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Installs and configures `uv` for dependency management
 4. Uses `uv` to install VeOmni framework with NPU support
 5. Sets up the virtual environment
 
-#### ARM64 Dockerfile (Dockerfile.ascend_9.0.0_a2.arm)
+#### ARM64 Dockerfile (Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Uses `pip` to install VeOmni framework with NPU support
