@@ -133,6 +133,11 @@ class _SplitQKV(ConversionOps):
 
         values = next(iter(input_dict.values()))
         tensor = values[0] if isinstance(values, list) else values
+        # FSDP2 / DCP keeps a dim-0 DTensor on the fused parameter. Q/K/V row
+        # sizes do not line up with those shards, so gather before splitting.
+        full_tensor = getattr(tensor, "full_tensor", None)
+        if callable(full_tensor) and getattr(tensor, "device_mesh", None) is not None:
+            tensor = full_tensor()
         config = kwargs["config"]
         head_dim = config.hidden_size // config.num_attention_heads
         split_sizes = (

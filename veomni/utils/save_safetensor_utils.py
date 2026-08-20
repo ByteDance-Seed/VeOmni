@@ -33,6 +33,26 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 logger = helper.create_logger(__name__)
 
 
+def _attach_weight_conversions_from_mro(model: torch.nn.Module) -> None:
+    """Recover class-name converters after FSDP2 wraps the module class.
+
+    ``fully_shard`` builds a subclass whose ``__name__`` no longer matches the
+    registered mapping. ``model_type`` fallback is wrong for Bagel: eager and
+    accelerated share ``bagel_qwen2_mot``, but only accelerated exports fused
+    QKV through converters. Walk the MRO until a class-name mapping hits.
+    """
+    if getattr(model, "_weight_conversions", None) is not None:
+        return
+
+    from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+
+    for cls in type(model).__mro__:
+        conversions = get_checkpoint_conversion_mapping(cls.__name__)
+        if conversions is not None:
+            model._weight_conversions = list(conversions)
+            return
+
+
 def _revert_model_weight_conversions_for_hf(
     model: Optional[torch.nn.Module],
     state_dict: Dict[str, torch.Tensor],
@@ -42,6 +62,7 @@ def _revert_model_weight_conversions_for_hf(
 
     from transformers.core_model_loading import revert_weight_conversion
 
+    _attach_weight_conversions_from_mro(model)
     return revert_weight_conversion(model, state_dict)
 
 
