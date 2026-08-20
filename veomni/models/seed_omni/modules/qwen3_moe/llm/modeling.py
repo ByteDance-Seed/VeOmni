@@ -38,8 +38,8 @@ class Qwen3MoeLlm(SimpleArGenerationMixin, OmniPreTrainedModel):
     on the ``conversation_list`` items.  :meth:`pre_forward` concatenates every
     non-dummy item's ``value`` in order into one packed bs=1 sequence.  Experts
     are stored in the v5 fused layout (``experts.gate_up_proj`` /
-    ``experts.down_proj``); Expert Parallel is applied via
-    :meth:`Qwen3MoeLlmModuleMixin.get_parallel_plan`.
+    ``experts.down_proj``); Expert Parallel is applied via ``get_parallel_plan``
+    on the ``VeOmniMixin`` in the sibling ``accelerated.py``.
 
     ``generate()`` / inference-state reset come from :class:`SimpleArGenerationMixin`
     — shared verbatim with the dense Qwen3 backbone (:class:`~...qwen3.llm.modeling.Qwen3Llm`).

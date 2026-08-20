@@ -11,7 +11,11 @@ Item shape
 ----------
 Each item is ``{type, value, role, meta}``:
 
-* ``type``  — ``"text"`` | ``"image"`` | ``"output"`` (and the legacy
+* ``type``  — ``"text"`` | ``"image"`` | ``"video"`` | ``"output"``.  ``"output"``
+  is the transient row a backbone appends while generating; :func:`seal_outputs`
+  renames it to its final modality once the span closes.  Janus interleaved
+  generation also accepts the legacy ``"image_output"`` on input, which
+  ``JanusSiglip.generate`` re-encodes and seals to ``"image"``.
 * ``value`` — polymorphic: raw content (``str`` / PIL image / pixel tensor)
   before encoding, an ``(L, D)`` / ``(1, L, D)`` embedding tensor after.
 * ``role``  — ``"user"`` | ``"assistant"`` | ``"dummy"`` (``"dummy"`` rows are
@@ -40,7 +44,7 @@ import torch
 from PIL import Image
 
 
-ItemType = str  # "text" | "image" | "output"
+ItemType = str  # "text" | "image" | "video" | "output" (+ legacy "image_output")
 ItemRole = str  # "user" | "assistant" | "dummy"
 ItemValue = Union[str, torch.Tensor, Image.Image]
 
@@ -117,7 +121,7 @@ def maybe_merge_outputs(parts: list[ConversationItem]) -> bool:
     return True
 
 
-def seal_outputs(parts: list[ConversationItem], new_type: ItemType) -> int:
+def seal_outputs(parts: list[ConversationItem], new_type: ItemType) -> None:
     """Rename completed ``output`` spans to a sealed type (``text`` / ``image``)."""
     assert parts[-1].type == "output"
     parts[-1].type = new_type

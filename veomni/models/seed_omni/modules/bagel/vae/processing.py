@@ -438,7 +438,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
 
         Returns ``None`` under ``cache_mode="process_only"``: training then reads
         already-preprocessed cached conversations, so no CPU image prep is needed
-        for this module (mirrors the old ``build_preprocessor`` early return).
+        for this module.
         BAGEL ships no standalone ``preprocessor_config.json``; the image
         processor is derived from the module's own ``config.json``.
 

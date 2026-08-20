@@ -22,7 +22,7 @@ It deliberately does **not** do ``smart_resize`` (patch-aligned / min-max-pixel
 rounding) — that is a model-specific decision owned by the vision module's
 processor (e.g. ``Qwen2VLImageProcessor``), which receives the pixels and does
 its own resize + patchify + normalize. Keeping the data layer model-agnostic is
-the whole point of SeedOmni V2 (see ``docs/seed_omni/design.md`` "Layer 2").
+the whole point of SeedOmni V2 (see ``docs/seed_omni/seed_omni_v2.md`` § 3).
 """
 
 from __future__ import annotations

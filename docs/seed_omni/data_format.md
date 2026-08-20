@@ -170,8 +170,8 @@ e.g. assistant prefix ``0``, boi/eoi/eos ``1``). Module-specific keys live in
 ``meta`` and are written during forward.
 
 Modules read this list directly — chat template, tokenize, normalize, and
-patchify happen inside each SeedOmni module at forward time (see `design.md`
-§ "数据路由").
+patchify happen inside each SeedOmni module at forward time (see
+`seed_omni_v2.md` § 3).
 
 ## Janus multisource training
 

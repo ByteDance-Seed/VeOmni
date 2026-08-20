@@ -24,8 +24,7 @@ Intentionally tiny — just enough to avoid OOM when a clip is large:
 
 It deliberately does **not** do ``smart_resize`` / temporal frame-factor
 alignment / patchify — that model-specific work is owned by the video module's
-processor (e.g. ``Qwen3VLVideoProcessor``). See ``docs/seed_omni/design.md``
-"Layer 2".
+processor (e.g. ``Qwen3VLVideoProcessor``).
 """
 
 from __future__ import annotations
@@ -63,9 +62,9 @@ class VideoInputs:
       ``self.fps``; also the basis for the temporal grid timeline
       (``video_second_per_grid = temporal_patch_size / video_fps``).
     * ``audio`` — optional in-video waveform (``None`` when there is no audio
-      track or extraction was disabled). When present, downstream modules wrap it
-      with ``<|vision_bos|><|audio_bos|> … <|audio_eos|><|vision_eos|>`` and
-      time-interleave the streams (see ``design.md`` § av-video).
+      track or extraction was disabled). No module consumes it yet; the intended
+      wrapping and time-interleave are recorded in
+      ``docs/seed_omni/av_video_design.md``.
     * ``audio_fps`` — audio sample rate, kept for the backbone's TMRoPE timeline.
     """
 

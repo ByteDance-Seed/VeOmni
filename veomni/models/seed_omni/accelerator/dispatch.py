@@ -56,8 +56,8 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> nn.Module:
     common case is a :class:`BaseMixin`, which owns graph endpoint methods and
     the shared :meth:`~veomni.models.seed_omni.mixins.base_mixin.BaseMixin._omni_hook_name`
     registry.  Training call-sites dispatch ``pre_forward`` / ``post_forward``
-    through :class:`TrainingModuleMixin`; inference call-sites dispatch
-    ``pre_generate`` / ``post_generate`` through :class:`InferenceModuleMixin`.
+    through :class:`TrainingModuleMixin`; inference call-sites call the endpoint
+    directly, with no hooks (see :func:`.executor.execute_generation_node`).
     FSDP2 is composable and leaves the module itself as the
     callable object; DDP-style wrappers expose the mixin through ``.module``.
 
