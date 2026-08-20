@@ -644,12 +644,11 @@ def parallelize_model_ddp(
 
     DDP keeps a full replica of plain tensors per rank: it registers gradient
     hooks and broadcasts rank0's parameters at construction, but it neither
-    materializes meta parameters nor loads weights. Under ``init_device="meta"``
-    nothing else does either — ``build_model`` returns an empty model and
-    ``BaseTrainer`` has no load step of its own — so the wrap used to reach DDP's
-    constructor with meta parameters and die there on ``Tensor.item()``. The
-    other init devices arrive with real weights already loaded by the model
-    builder, so they must not be touched here.
+    materializes meta parameters nor loads weights. Under meta-init nothing else
+    does either — ``build_model`` returns an empty model and ``BaseTrainer`` has
+    no load step of its own — so the wrap used to reach DDP's constructor with
+    meta parameters and die there on ``Tensor.item()``. A model that arrives with
+    real weights already loaded must not be touched here.
     """
     parallel_state = get_parallel_state()
 
@@ -664,7 +663,22 @@ def parallelize_model_ddp(
     if kwargs.get("ep_sharded_stream_load"):
         raise RuntimeError("train.ep_sharded_stream_load requires fsdp_mode='fsdp2'; DDP experts are not sharded.")
 
-    if kwargs.get("init_device") == "meta":
+    # ``device_ids`` below names an accelerator, so a CPU-resident replica cannot
+    # be wrapped at all: under ``init_device="cpu"`` rank0 keeps its weights on
+    # CPU while every other rank builds empty (``veomni/models/loader.py``).
+    # Refuse on every rank before any snapshot is read, rather than let rank0 die
+    # in DDP's constructor while the others block in its first collective.
+    if kwargs.get("init_device") == "cpu":
+        raise RuntimeError(
+            "init_device='cpu' is not supported with fsdp_mode='ddp'; use 'meta' or an accelerator device."
+        )
+
+    # Ask the parameters, not ``init_device``: the flag states an intent a model
+    # builder is free to ignore -- the data tests construct their model eagerly
+    # while the config still says ``meta`` -- and materializing a model that
+    # already holds real weights would discard them, or raise outright on a plain
+    # nn.Module with no ``init_weights``.
+    if any(param.is_meta for param in model.parameters()):
         _materialize_and_load_weights(
             model,
             weights_path,
@@ -679,14 +693,15 @@ def parallelize_model_ddp(
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         )
 
-    # ``init_device`` is not the only way to end up on meta: with ``cpu`` every
-    # rank but 0 builds empty and skips the load (``veomni/models/loader.py``).
-    # Say so here instead of letting DDP's constructor report ``Tensor.item()``.
-    if any(param.is_meta for param in model.parameters()):
-        raise RuntimeError(
-            f"DDP received unmaterialized parameters with init_device={kwargs.get('init_device')!r}. "
-            "Use init_device='meta' or 'cuda'/'npu' for fsdp_mode='ddp'."
-        )
+        # Anything the loader left behind would otherwise surface as
+        # ``Tensor.item() cannot be called on meta tensors`` from inside DDP's
+        # constructor, which names neither the parameter nor the cause.
+        unmaterialized = [name for name, param in model.named_parameters() if param.is_meta]
+        if unmaterialized:
+            raise RuntimeError(
+                f"DDP received unmaterialized parameters after loading from {weights_path!r}: "
+                f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
+            )
 
     # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
     # module's buffer semantics must not change with the ``fsdp_mode`` a config

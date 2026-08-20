@@ -24,7 +24,6 @@ from veomni.distributed.torch_parallelize import (
 from veomni.models.module_utils import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
-from veomni.utils.device import get_device_type
 
 
 # ---------------------------------------------------------------------------
@@ -425,30 +424,61 @@ class TestDdpMetaInit:
             lambda: SimpleNamespace(local_rank=0, dp_group=None, any_extra_parallel_enabled=True),
         )
         with pytest.raises(RuntimeError, match="requires fsdp_mode='fsdp2'"):
-            parallelize_model_ddp(nn.Linear(2, 2), init_device=get_device_type())
+            parallelize_model_ddp(nn.Linear(2, 2))
 
     def test_rejects_ep_sharded_stream_load(self, wrap_ddp):
         with pytest.raises(RuntimeError, match="ep_sharded_stream_load"):
-            wrap_ddp(nn.Linear(2, 2), init_device=get_device_type(), ep_sharded_stream_load=True)
+            wrap_ddp(nn.Linear(2, 2), ep_sharded_stream_load=True)
 
-    def test_reports_parameters_still_on_meta(self, wrap_ddp):
-        # init_device="cpu" leaves every rank but 0 on meta (models/loader.py).
+    def test_reports_parameters_the_loader_left_on_meta(self, wrap_ddp, monkeypatch):
+        # A loader that fills nothing would otherwise fail inside DDP's
+        # constructor on Tensor.item(), naming neither parameter nor cause.
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", MagicMock())
         with init_empty_weights():
             model = _MetaInitModel()
 
-        with pytest.raises(RuntimeError, match="unmaterialized parameters"):
-            wrap_ddp(model, weights_path="hf-path", init_device="cpu")
+        with pytest.raises(RuntimeError, match="unmaterialized parameters") as excinfo:
+            wrap_ddp(model, weights_path="hf-path", init_device="meta")
 
-    def test_leaves_an_already_materialized_model_alone(self, wrap_ddp, monkeypatch):
+        assert "weight" in str(excinfo.value)
+
+    @pytest.mark.parametrize("weights_path", [None, "hf-path"])
+    def test_leaves_a_real_model_alone_when_init_device_says_meta(self, wrap_ddp, monkeypatch, weights_path):
+        """``init_device`` is a request to the model builder, not a fact about the
+        model it returns: tests/data construct theirs eagerly and leave the flag at
+        its ``meta`` default. Materializing that model would re-read the snapshot
+        over weights it already holds, and a plain nn.Module has no
+        ``init_weights`` to fall back on when there is no snapshot."""
+        loader = MagicMock()
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        model = nn.Linear(2, 2)
+        weight = model.weight.detach().clone()
+
+        wrapped = wrap_ddp(model, weights_path=weights_path, init_device="meta")
+
+        loader.assert_not_called()
+        torch.testing.assert_close(wrapped.module.weight, weight, rtol=0, atol=0)
+
+    def test_rejects_cpu_init_device(self, wrap_ddp):
+        # device_ids names an accelerator, so rank0's CPU replica cannot be
+        # wrapped and the meta ranks would block in DDP's first collective.
+        with pytest.raises(RuntimeError, match="init_device='cpu' is not supported"):
+            wrap_ddp(nn.Linear(2, 2), weights_path="hf-path", init_device="cpu")
+
+    def test_does_not_reinitialize_a_real_model_that_has_init_weights(self, wrap_ddp, monkeypatch):
+        # The nn.Linear case above fails loudly; a model that does define
+        # init_weights would instead have its weights silently overwritten.
         loader = MagicMock()
         monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
         model = _MetaInitModel()
+        with torch.no_grad():
+            model.weight.fill_(7.0)
 
-        wrapped = wrap_ddp(model, weights_path="hf-path", init_device=get_device_type())
+        wrapped = wrap_ddp(model, weights_path="hf-path", init_device="meta")
 
-        # A non-meta init device means build_model already loaded the weights.
         loader.assert_not_called()
         assert wrapped.module.init_weights_calls == 0
+        torch.testing.assert_close(wrapped.module.weight, torch.full((2, 2), 7.0), rtol=0, atol=0)
 
     def test_build_parallelize_model_forwards_should_skip_hf_weight_load_to_ddp(self, monkeypatch):
         parallelize_ddp = MagicMock(return_value=MagicMock())
