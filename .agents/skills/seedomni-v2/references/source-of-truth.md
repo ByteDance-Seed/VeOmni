@@ -7,7 +7,7 @@ Use this reference to decide which files to trust before editing SeedOmni V2.
 - `veomni/models/seed_omni/mixins/`
   - `base_mixin.py` — shared assets / hook registry.
   - `training_module_mixin.py` — `pre_forward`, `post_forward`, training dispatch.
-  - `inference_module_mixin.py` — `pre_generate`, `post_generate`, inference dispatch (opt-in; not used by the standard `InferenceMixin` pattern).
+  - `inference_module_mixin.py` — live `reset_*` / `finalize` hooks; its `pre_generate` / `post_generate` dispatchers have no call-site (both FSM drivers call endpoints directly).
   - `metric_meter_mixin.py` — optional per-module FLOPs meter.
 - `veomni/models/seed_omni/modules/**/modeling.py`
   - native HF class + in-file `InferenceMixin` (`generate()` + FSM state).
@@ -37,12 +37,15 @@ Use this reference to decide which files to trust before editing SeedOmni V2.
 
 ## Docs
 
-- `docs/seed_omni/design.md`
-  - Background and design rationale. Read for intent, but verify schema details
-    against current graph source because some old examples may remain.
+- `docs/seed_omni/seed_omni_v2.md`
+  - Authoritative architecture and developer guide. Start here for intent, but
+    verify schema details against current graph source.
+- `docs/seed_omni/av_video_design.md`
+  - Decided-but-unimplemented design for audio-bearing video. Read only when
+    adding an audio modality.
 - `docs/seed_omni/omni_v2_refactor_migration.md`
-  - Useful migration notes. The CPU preprocessor section reflects the current
-    shared training/inference direction.
+  - Historical merge notes; its path map predates `accelerator/`. Read only for
+    the CPU preprocessor rationale, and verify every path against the tree.
 - `docs/seed_omni/example_models/janus.md`
   - Janus pipeline notes when present.
 

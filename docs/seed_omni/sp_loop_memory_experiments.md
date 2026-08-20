@@ -126,6 +126,9 @@ Params / FSDP：
 
 ## 5. 相关代码 / 配置
 
+> 下表是 Arch A 当时的路径快照，**其中每一项在 Arch B 迁移中都已删除**（含 bench
+> 脚本与 `modules_train_sp*.yaml` 配置）。仅供追溯当时的实现范围。
+
 | 路径 | 作用 |
 |--|--|
 | `veomni/models/seed_omni/graphs/dispatch.py` | `run_sp_looped_endpoint` + per-sample `checkpoint`（`ckpt`）/ 同步 offload（`offload_sync`，`_SyncCpuOffload`） |

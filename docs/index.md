@@ -91,7 +91,7 @@ key_features/lora.md
 
 seed_omni/seed_omni_v2.md
 seed_omni/data_format.md
-seed_omni/design.md
+seed_omni/av_video_design.md
 seed_omni/example_models/janus.md
 seed_omni/example_models/qwen3.md
 seed_omni/example_models/qwen3vl.md

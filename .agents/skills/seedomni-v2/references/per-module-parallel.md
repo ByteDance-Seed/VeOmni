@@ -53,9 +53,10 @@ backbone:
 > (data-balance, compute-packing, audio/video halo): `docs/seed_omni/module_level_sp.md`.
 
 SP is **uniform**. Set the SP size on the outer trainer
-(`accelerator.ulysses_size`); `OmniTrainer._validate_uniform_sp()` raises at
-build time unless every module's `ulysses_size` equals it. Do NOT add per-module
-`ulysses_size` overrides — modules inherit the outer size. The dataloader is the
+(`accelerator.ulysses_size`); every module inherits it through the per-module
+accelerator deep-merge in `build_module_runtime_args`. Do NOT add per-module
+`ulysses_size` overrides — nothing validates uniformity, so an override silently
+produces a non-uniform run. The dataloader is the
 standard `BaseTrainer` build-time sharded loader: it yields `dp_size = world / sp`
 **distinct** shards and **replicates** each shard across its SP group, so every
 rank of an SP group holds the SAME sample.

@@ -38,7 +38,7 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
     """Worker-side image normalize for the SigLIP (understanding) tower.
 
     Holds only the (picklable) HF image processor + a CPU zero-pixel template —
-    never the model. Runs the same normalize as ``JanusSiglipModuleMixin._pixels_from_raw_images``
+    never the model. Runs the same normalize as ``JanusSiglip._pixels_from_raw_images``
     but on **CPU** (bf16, to halve worker→main IPC); writes the pixel tensor back into
     each ``user``-image item. For each sample without a user image, appends a
     ``role="dummy"`` placeholder carrying the zero pixels, so the GPU

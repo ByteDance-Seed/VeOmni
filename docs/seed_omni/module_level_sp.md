@@ -41,7 +41,7 @@
 
 ### 3.1 Uniform outer SP + 复制数据
 
-- 最外侧 `accelerator.ulysses_size` 承载**统一** SP size；`OmniTrainer._validate_uniform_sp()` 在 build 时**硬性校验**所有模块 SP size 与 outer 一致，否则报错。
+- 最外侧 `accelerator.ulysses_size` 承载**统一** SP size；各模块经 `build_module_runtime_args` 的 accelerator deep-merge **继承**该值。框架**不**校验一致性——模块 YAML 里写 per-module `ulysses_size` 覆盖会静默产生非 uniform SP，不要这么用。
 - dataloader 用 `BaseTrainer` 的标准 build-time sharded loader：给出 `dp_size = world / sp` 条 **distinct** shard，并把每条 shard **复制**到其 SP 组的所有 rank（collator 不做按模态切分）。因此一个 SP 组内每卡持有**相同**样本。
 - 每个开 SP 的模块在 `pre_forward` 内以 `if get_parallel_state().sp_size > 1:` 分支把复制样本**切 1/sp**（`sp_pad` + `slice_input_tensor` / `sp_pad_and_slice`），跑**一次**前向（attention 组内 all-to-all），再在 `post_forward` 内的同名分支 **all-gather** 回全序列（`gather_outputs`）。SP 逻辑完全收在模块自己的 `pre_forward` / `post_forward` 里（与 veomni v1 单模型 SP 一致，无独立 sp hook）。forward 与 backward 峰值均 ≈ `1/sp`。
 
@@ -101,7 +101,7 @@ encoder 与 LLM 的输出都 all-gather 回**全序列**（每卡相同），emb
 - `fsdp_config.sp_activation_offload` 整套压 bwd 机制（`ckpt` / `offload_sync` + `_SyncCpuOffload` + profiler）与 `sp_keep_params_unsharded`。
 - `veomni/distributed/fsdp2_ac_patch.py`（multi-forward AC recompute unshard，pytorch#171779 backport）。
 - `sequence_parallel/data.py` 的 `sp_gather_seqs` / `sp_take_own_seq` / `sp_broadcast_from_rank` / `sp_gather_to_owner` / `_GatherConcatSP` / `_sp_unify_dtype` 等 Arch A 重分发原语。
-- `OmniTrainer` 的 outer-SP=1 **硬禁**，改为**驱动** uniform outer SP + `_validate_uniform_sp()` 校验。
+- `OmniTrainer` 的 outer-SP=1 **硬禁**，改为**驱动** uniform outer SP（由各模块继承 outer `accelerator.ulysses_size` 达成）。
 
 **未来工作（尚未实现）**：
 
@@ -122,6 +122,6 @@ for each node:
 # 全图一次 loss.backward()；FSDP2 在含 sp 的 mesh 上规约梯度
 ```
 
-- 入口：`veomni/models/seed_omni/graphs/training_graph.py::TrainingGraph.step`（`pre_forward → endpoint → post_forward`，SP 收在模块 `pre_forward` / `post_forward` 的 `if sp_size>1` 分支里）。
+- 入口：`veomni/models/seed_omni/accelerator/executor.py::execute_train_node`（`pre_forward → endpoint → post_forward`；`TrainingGraph` 只负责选节点。SP 收在模块 `pre_forward` / `post_forward` 的 `if sp_size>1` 分支里）。
 - 原语：`slice_input_tensor` / `sp_pad` / `sp_pad_and_slice` / `gather_outputs`（`sequence_parallel/data.py`）。
 - 细节见 `.agents/knowledge/constraints.md` §7-outer / §7a / §7b / §7c / §7d / §7e。
