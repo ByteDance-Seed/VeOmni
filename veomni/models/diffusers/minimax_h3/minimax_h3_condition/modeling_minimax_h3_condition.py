@@ -506,12 +506,23 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         if isinstance(use_gradient_checkpointing, list):
             use_gradient_checkpointing = use_gradient_checkpointing[0]
 
-        # Process first sample (batch=1 per micro_batch)
-        if len(input_latents) != 1:
-            raise ValueError(
-                f"MiniMaxH3ConditionModel.process_condition supports micro_batch_size=1 only, "
-                f"got {len(input_latents)} samples."
-            )
+        # Process first sample (batch=1 per micro_batch); reject any other
+        # size for every supplied collection so a mismatched length cannot
+        # silently truncate to index 0.
+        supplied = {
+            "input_latents": input_latents,
+            "audio_input_latents": audio_input_latents,
+            "prompt_embeds": prompt_embeds,
+            "packed": packed,
+        }
+        if keyframe_cond_anchor is not None:
+            supplied["keyframe_cond_anchor"] = keyframe_cond_anchor
+        for name, coll in supplied.items():
+            if len(coll) != 1:
+                raise ValueError(
+                    f"MiniMaxH3ConditionModel.process_condition supports micro_batch_size=1 only, "
+                    f"got {len(coll)} samples in {name}."
+                )
         clean_video = input_latents[0]
         clean_audio = audio_input_latents[0]
         prompt = prompt_embeds[0]
