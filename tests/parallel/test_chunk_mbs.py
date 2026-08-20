@@ -1174,10 +1174,10 @@ def test_dit_trainer_rejects_chunk_mbs():
     from veomni.trainer.dit_trainer import DiTTrainer
 
     args = types.SimpleNamespace(
+        model=types.SimpleNamespace(accelerator=types.SimpleNamespace(chunk_mbs_config=_config(chunk_mbs=2))),
         train=types.SimpleNamespace(
-            chunk_mbs_config=_config(chunk_mbs=2),
             channel_loss=types.SimpleNamespace(enable=False),
-        )
+        ),
     )
 
     with pytest.raises(ValueError, match="not supported by DiTTrainer"):

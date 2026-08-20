@@ -666,10 +666,10 @@ model:
 
 train:
   accelerator:
+    init_device: meta
     ulysses_size: 4
     fsdp_config:
       fsdp_mode: fsdp2
-  init_device: meta
   global_batch_size: 8
   micro_batch_size: 1
 ```
