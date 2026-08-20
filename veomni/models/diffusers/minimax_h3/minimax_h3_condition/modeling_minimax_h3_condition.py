@@ -277,6 +277,15 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
                         f"Sample {i}: got {len(keyframe_images)} keyframe images, "
                         f"expected {len(cfg.keyframe_indices)} for keyframe_indices={cfg.keyframe_indices}"
                     )
+                # Transform-provided keyframes carry their source indices;
+                # validate them, not only the count.
+                sample_keyframe_indices = kwargs.get("keyframe_indices")
+                if sample_keyframe_indices is not None and i < len(sample_keyframe_indices):
+                    if list(sample_keyframe_indices[i]) != list(cfg.keyframe_indices):
+                        raise ValueError(
+                            f"Sample {i}: keyframes were extracted at indices "
+                            f"{sample_keyframe_indices[i]}, expected {cfg.keyframe_indices}"
+                        )
                 keyframe_cond_anchor = self._encode_keyframe_cond(keyframe_images, device, input_latent.shape[2])
             else:
                 if cfg.use_keyframe_condition and cfg.keyframe_indices:

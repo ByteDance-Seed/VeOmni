@@ -51,29 +51,62 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
     n_frames = num_frames
     if videos and videos[0]:
         reader = imageio.get_reader(videos[0])
-        meta = reader.get_meta_data()
-        raw_fps = meta["fps"]
-        total_raw_frames = int(reader.count_frames())
-        duration = meta["duration"] if "duration" in meta else total_raw_frames / raw_fps
-        available = math.floor(duration * frame_rate)
-        if int(available) < num_frames:
-            n_frames = int(available)
-            while n_frames > 1 and n_frames % 17 != 5:
-                n_frames -= 1
-        for i in range(n_frames):
-            raw_idx = min(int(round(i / frame_rate * raw_fps)), total_raw_frames - 1)
-            img = PIL.Image.fromarray(reader.get_data(raw_idx))
-            # ImageCropAndResize(height, width)
-            w, h = img.size
-            scale = max(width / w, height / h)
-            img = TF.resize(
-                img,
-                (round(h * scale), round(w * scale)),
-                interpolation=TF.InterpolationMode.BILINEAR,
-            )
-            img = TF.center_crop(img, (height, width))
-            frames.append(img)
-        reader.close()
+        try:
+            meta = reader.get_meta_data()
+            raw_fps = meta["fps"]
+            if "duration" in meta:
+                available = math.floor(meta["duration"] * frame_rate)
+            else:
+                # No duration in meta: fall back to a full frame-count scan.
+                total_raw_frames = int(reader.count_frames())
+                available = math.floor((total_raw_frames / raw_fps) * frame_rate)
+            if int(available) < num_frames:
+                n_frames = int(available)
+                if n_frames < 5:
+                    raise ValueError(
+                        f"Video clip is too short: {n_frames} frames available at "
+                        f"{frame_rate:g}fps, but MiniMax-H3 needs at least 5 frames "
+                        "(frame count must satisfy (N-5) % 17 == 0)."
+                    )
+                while n_frames > 1 and n_frames % 17 != 5:
+                    n_frames -= 1
+            # Single sequential pass over the stream. raw_idx only moves
+            # forward, so selected indices are consumed in order; repeated
+            # indices (round collisions) re-append the current frame, and
+            # indices past the end of the stream clamp to the last frame —
+            # exactly the frames the previous get_data(raw_idx) loop selected.
+            desired = [int(round(i / frame_rate * raw_fps)) for i in range(n_frames)]
+            ptr = 0
+            for j, raw_frame in enumerate(reader.iter_data()):
+                while ptr < n_frames and desired[ptr] <= j:
+                    img = PIL.Image.fromarray(raw_frame)
+                    # ImageCropAndResize(height, width)
+                    w, h = img.size
+                    scale = max(width / w, height / h)
+                    img = TF.resize(
+                        img,
+                        (round(h * scale), round(w * scale)),
+                        interpolation=TF.InterpolationMode.BILINEAR,
+                    )
+                    img = TF.center_crop(img, (height, width))
+                    frames.append(img)
+                    ptr += 1
+                last_raw_frame = raw_frame
+            # Indices beyond the stream end clamp to the last decoded frame.
+            while frames and ptr < n_frames:
+                img = PIL.Image.fromarray(last_raw_frame)
+                w, h = img.size
+                scale = max(width / w, height / h)
+                img = TF.resize(
+                    img,
+                    (round(h * scale), round(w * scale)),
+                    interpolation=TF.InterpolationMode.BILINEAR,
+                )
+                img = TF.center_crop(img, (height, width))
+                frames.append(img)
+                ptr += 1
+        finally:
+            reader.close()
     # preprocess_video(torch_dtype=float32, min_value=0): [0,1] float32
     frames_t = [torch.tensor(np.array(f, dtype=np.float32)).permute(2, 0, 1) * (1.0 / 255.0) for f in frames]
 
@@ -90,13 +123,22 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
             waveform = torch.nn.functional.pad(waveform, (0, target_samples - current_samples))
         audio_out = (waveform, sample_rate)
 
+    # FL2VA keyframes selected by keyframe_indices (config, default first +
+    # last), kept as native uint8 PIL (rebuilding PIL from float tensors later
+    # would round-trip through *255/uint8 and lose exactness). Source indices
+    # travel with the sample so the condition model can validate them.
+    keyframe_indices = list(kwargs.get("keyframe_indices", [0, -1]))
+    keyframe_images = []
+    for idx in keyframe_indices:
+        if not -len(frames) <= idx < len(frames):
+            raise ValueError(f"keyframe index {idx} out of range for {len(frames)} frames")
+        keyframe_images.append(frames[idx])
+
     processed_example = {
         "inputs": prompt,
         "audios": audio_out,
-        # FL2VA keyframes = first + last cropped frame, kept as native uint8 PIL
-        # (rebuilding PIL from float tensors later would round-trip through
-        # *255/uint8 and lose exactness)
-        "images": [frames[0], frames[-1]] if frames else [],
+        "images": keyframe_images,
+        "keyframe_indices": keyframe_indices,
         "videos": frames_t,
     }
     return [processed_example]

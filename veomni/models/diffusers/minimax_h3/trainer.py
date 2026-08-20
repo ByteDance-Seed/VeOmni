@@ -34,6 +34,36 @@ class FP32MasterOptimizer(torch.optim.AdamW):
         local_masters = [self.params[i].detach().float() for i in self.local_idx]
         super().__init__(local_masters, lr=lr, weight_decay=weight_decay)
 
+    def state_dict(self):
+        state_dict = super().state_dict()
+        # Persist the shard layout: AdamW's default load maps state by
+        # positional order, which silently corrupts the fp32 masters if
+        # dp_size (and thus the local shard) changed. Validate both sides
+        # explicitly instead.
+        state_dict["shard_meta"] = {
+            "world_size": self.world_size,
+            "local_idx": list(self.local_idx),
+        }
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        meta = state_dict.pop("shard_meta", None)
+        if meta is None:
+            raise ValueError(
+                "Optimizer checkpoint lacks shard_meta; it was saved by an "
+                "older FP32MasterOptimizer and its shard layout cannot be "
+                "validated."
+            )
+        if meta["world_size"] != self.world_size or list(meta["local_idx"]) != list(self.local_idx):
+            raise ValueError(
+                f"Optimizer checkpoint shard layout ({meta.get('world_size')}, "
+                f"{meta.get('local_idx')}) is incompatible with the current "
+                f"optimizer ({self.world_size}, {list(self.local_idx)}): restore "
+                "with the same dp_size, or drop the optimizer state and resume "
+                "training from model weights only."
+            )
+        super().load_state_dict(state_dict)
+
     def step(self, closure=None):
         from torch import distributed as dist
 
@@ -85,6 +115,10 @@ class EmulatedConstantLR(torch.optim.lr_scheduler.LRScheduler):
 
     Plain ConstantLR(total_iters=5) stays at 1/3 lr until step 6 and diverges at
     step 4.
+
+    This scheduler REPLACES the VeOmni lr schedule; the optimizer
+    configuration fields lr_decay_style, lr_min, lr_warmup_ratio etc. are
+    inert while it is active. A warning is logged when it is installed.
     """
 
     def get_lr(self):
@@ -115,6 +149,14 @@ class MinimaxH3DiTTrainer(DiTTrainer):
                 self.base.model,
                 lr=args.train.optimizer.lr,
                 weight_decay=args.train.optimizer.weight_decay,
+            )
+            from veomni.utils.logging import get_logger
+
+            get_logger(__name__).warning_rank0(
+                "MiniMax H3 replaces the configured lr schedule with "
+                "EmulatedConstantLR (1/3 lr for 2 steps, then full lr); "
+                "lr_decay_style / lr_min / lr_warmup_ratio in the optimizer "
+                "config are inert."
             )
             self.base.lr_scheduler = EmulatedConstantLR(self.base.optimizer)
 

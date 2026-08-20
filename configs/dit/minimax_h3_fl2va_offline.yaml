@@ -17,7 +17,7 @@
 model:
   model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer
   condition_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
-  config_path: configs/model_configs/minimax_h3/fl2va_config.json
+  config_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json
 
   condition_model_cfg:
     base_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
@@ -89,21 +89,9 @@ train:
     lr_min: 1.0e-5
     lr_warmup_ratio: 0.0
     weight_decay: 0.01
-    max_grad_norm: 1.0e9
-
-  profile:
-      enable: true
-      start_step: 10
-      end_step: 13
-      trace_dir: "./profiling/minimax_h3/repalce_rope_mbs2_nostack"
-      record_shapes: true
-      profile_memory: true
-      with_stack: false
-      with_modules: false
-      rank0_only: true
 
   accelerator:
-    ulysses_size: 2
+    ulysses_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:

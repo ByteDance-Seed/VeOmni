@@ -29,18 +29,31 @@ def _search_parquet_files(base_path: str) -> list[str]:
 
 
 class _ParquetIterableDataset(IterableDataset):
-    """Iterable dataset over .parquet shards; each yielded item is one row dict."""
+    """Iterable dataset over .parquet shards; each yielded item is one row dict.
+
+    Checkpoint resume: state_dict records the per-worker position (repeat,
+    shard index, row index) of the last yielded row; load_state_dict restores
+    it so iteration continues after that row. Resume assumes the same
+    num_workers / shuffle seed, otherwise the per-worker shard slices and
+    shuffle order change and the saved position is meaningless.
+    """
 
     def __init__(self, file_paths: list[str], shuffle: bool, seed: int, repeat: int = 1):
         self._paths = file_paths
         self._shuffle = shuffle
         self._seed = seed
         self._repeat = repeat
+        self._pos = None  # {worker_key: {"rep": int, "path_idx": int, "row_idx": int}}, set while iterating
+        self._resume = None  # same schema, restored via load_state_dict
+
+    def _worker_key(self, wid):
+        return wid if wid is not None else 0
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             paths = list(self._paths)
+            wid = 0
         else:
             per_worker = len(self._paths) // worker_info.num_workers
             wid = worker_info.id
@@ -52,21 +65,38 @@ class _ParquetIterableDataset(IterableDataset):
             rng = random.Random(self._seed)
             rng.shuffle(paths)
 
+        resume = None if self._resume is None else self._resume.get(self._worker_key(wid))
+        self._pos = {self._worker_key(wid): {"rep": 0, "path_idx": 0, "row_idx": 0}}
+
         import pandas as pd
 
-        for _ in range(self._repeat):
-            for p in paths:
+        for rep in range(resume["rep"] if resume is not None else 0, self._repeat):
+            for pi, p in enumerate(paths):
+                if resume is not None and rep == resume["rep"] and pi < resume["path_idx"]:
+                    continue
                 df = pd.read_parquet(p)
-                yield from df.to_dict(orient="records")
+                for ri, row in enumerate(df.to_dict(orient="records")):
+                    if (
+                        resume is not None
+                        and rep == resume["rep"]
+                        and pi == resume["path_idx"]
+                        and ri < resume["row_idx"]
+                    ):
+                        continue
+                    self._pos[self._worker_key(wid)] = {"rep": rep, "path_idx": pi, "row_idx": ri}
+                    yield row
+                    self._pos[self._worker_key(wid)] = {"rep": rep, "path_idx": pi, "row_idx": ri + 1}
 
     def set_epoch(self, epoch: int):
         self._seed = epoch
 
     def state_dict(self):
-        return {}
+        # Empty before the first sample is consumed; checkpointing then
+        # resumes from the beginning.
+        return {"worker_positions": self._pos if self._pos is not None else {}}
 
     def load_state_dict(self, state_dict):
-        pass
+        self._resume = dict(state_dict.get("worker_positions", {}))
 
 
 @DATASET_REGISTRY.register("minimax_h3_online")
@@ -128,11 +158,11 @@ def build_minimax_h3_offline_dataset(
     # Round-robin distribution: rank i gets files[i], files[i+dp_size], ...
     rank_files = parquet_files[dp_rank::dp_size]
     if not rank_files:
-        logger.warning(
-            f"Rank {dp_rank} has no files after sharding "
-            f"({len(parquet_files)} files / {dp_size} ranks); using all files."
+        raise ValueError(
+            f"Rank {dp_rank} got no files after sharding: {len(parquet_files)} "
+            f".parquet files split across {dp_size} dp ranks. Reduce dp_size or "
+            "re-run offline embedding with more shards."
         )
-        rank_files = list(parquet_files)
 
     raw_dataset = _ParquetIterableDataset(file_paths=rank_files, shuffle=shuffle, seed=seed, repeat=repeat)
     return IterativeDataset(raw_dataset, transform=transform)
