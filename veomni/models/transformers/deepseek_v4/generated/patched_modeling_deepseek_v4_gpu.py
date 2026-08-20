@@ -87,6 +87,7 @@ from veomni.ops import fused_moe_forward
 # Additional import blocks for patches
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
+from veomni.ops.qat import fp8_fake_quant_act, fp8_fake_quant_act_prefix, qat_linear
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -102,6 +103,70 @@ veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
 veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+veomni_qat_implementation = OpsConfigSlot("qat_implementation", default="none")
+
+
+# ======================================================================
+# [HELPERS] Module-level helpers injected via config.add_helper
+# ======================================================================
+
+
+# ================================================================
+# QAT: FP8 fake-quantized linears
+# ================================================================
+def veomni_qat_linear(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Run ``linear`` with FP8 fake-quantized operands when QAT is enabled.
+
+    Every projection that an FP8 inference kernel would run as a true FP8 GEMM
+    goes through here, so the recipe is one grep away and the on/off decision is
+    made in a single place instead of being re-derived at each call site. The
+    block sizes are fixed rather than exposed: 128x128 weight tiles and 1x128
+    activation blocks with ue8m0 scales are what the checkpoint's
+    ``quantization_config`` declares, so a per-site override would train against
+    rounding no inference kernel performs.
+
+    Which linears call this *is* the quantization recipe -- see the module
+    docstring for the layers deliberately left in the model dtype.
+    """
+    return qat_linear(linear, x, enabled=veomni_qat_implementation.value == "fp8_blockwise")
+
+
+def veomni_qat_fake_quant_kv(kv: torch.Tensor, rope_features: int) -> torch.Tensor:
+    """FP8-simulate the NoPE channels of an attention KV entry.
+
+    This is a *storage* recipe, not a GEMM operand: inference keeps the KV entry
+    it caches in FP8 but attends in BF16, so training only has to reproduce the
+    rounding the cache round-trip introduces. The trailing ``rope_features``
+    channels stay in the model dtype -- RoPE encodes position as an angle, and
+    FP8 mantissa noise there costs more than it saves.
+
+    Blocks are 64 wide rather than 128 because the NoPE half is ``head_dim`` minus
+    the RoPE channels (448 of 512 on V4-Flash), which no 128-wide block divides.
+
+    Empty entries pass through: the compressors legitimately produce a
+    zero-length KV before the first window closes.
+    """
+    if veomni_qat_implementation.value != "fp8_blockwise" or kv.numel() == 0:
+        return kv
+    return fp8_fake_quant_act_prefix(kv, kv.shape[-1] - rope_features, block_size=64)
+
+
+def veomni_qat_fake_quant_index_entry(x: torch.Tensor) -> torch.Tensor:
+    """FP8-simulate a stored indexer Q or compressed-K entry.
+
+    Unlike the attention KV above this covers the whole head, RoPE channels
+    included, because the indexer's logits are served as a real FP8 x FP8 product
+    instead of being dequantized for a BF16 attention -- so every channel that
+    enters the product is rounded, and 128-wide blocks divide the 128-wide
+    indexer head exactly.
+
+    DeepSeek's reference implementation instead rotates by a Hadamard matrix and
+    quantizes to FP4; the SM90 deployment this targets has no Hadamard, so the
+    recipe here is the FP8 variant.
+    """
+    if veomni_qat_implementation.value != "fp8_blockwise" or x.numel() == 0:
+        return x
+    return fp8_fake_quant_act(x, block_size=128)
 
 
 # ======================================================================
@@ -524,6 +589,10 @@ class DeepseekV4HCACompressor(nn.Module):
                 rate_metadata,
                 overlap=False,
             )
+            # `compress_packed_windows` normalizes and applies RoPE internally, so the
+            # entry is in its cached form here -- the same point the non-packed path
+            # below quantizes.
+            compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
             block_bias = packed_compressed_block_bias(rate_metadata)
             result = (compressed.unsqueeze(1), block_bias)
             return (*result, None) if return_topk_indices else result
@@ -555,6 +624,7 @@ class DeepseekV4HCACompressor(nn.Module):
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
         compressed_kv = compressed.unsqueeze(1)
@@ -710,13 +780,22 @@ class DeepseekV4Indexer(nn.Module):
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+        # Covers the packed, windowed and empty branches above, all of which leave
+        # `compressed` in the form the indexer's K cache holds.
+        compressed = veomni_qat_fake_quant_index_entry(compressed)
         compressed_kv = (
             compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
         )
 
         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
-        q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
+        q = veomni_qat_linear(self.q_b_proj, q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+        # Both sides of the index logits are rounded, so Q is quantized like K --
+        # in contrast to the main attention, whose Q stays BF16.
+        q = veomni_qat_fake_quant_index_entry(q)
+        # `weights_proj` stays unquantized: it produces one score per head, so its
+        # [index_n_heads, hidden_size] weight has too few rows to tile at 128 in the
+        # first place, and inference keeps it BF16.
         weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
         compressed_len = compressed_kv.shape[1]
         top_k = min(self.index_topk, compressed_len)
@@ -890,6 +969,9 @@ class DeepseekV4CSACompressor(nn.Module):
                 rate_metadata,
                 overlap=True,
             )
+            # See the HCA compressor: the packed helper already normalized and applied
+            # RoPE, so this is the cached form.
+            compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
             compressed_kv = compressed.unsqueeze(1)
             top_k_indices = self.indexer(
                 hidden_states,
@@ -947,6 +1029,7 @@ class DeepseekV4CSACompressor(nn.Module):
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
         compressed_kv = compressed.unsqueeze(1)
@@ -1154,13 +1237,17 @@ class DeepseekV4Attention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings[self.rope_layer_type]
 
-        q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-        q = self.q_b_norm(self.q_b_proj(q_residual).view(*hidden_shape))
+        q_residual = self.q_a_norm(veomni_qat_linear(self.q_a_proj, hidden_states))
+        q = self.q_b_norm(veomni_qat_linear(self.q_b_proj, q_residual).view(*hidden_shape))
         q = q.transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos, sin)
 
-        kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
+        kv = self.kv_norm(veomni_qat_linear(self.kv_proj, hidden_states)).view(*hidden_shape).transpose(1, 2)
         kv = apply_rotary_pos_emb(kv, cos, sin)
+        # After RoPE and before the cache, matching where inference rounds it. Q is
+        # deliberately not quantized here -- it is never stored, so it stays BF16 all
+        # the way into attention.
+        kv = veomni_qat_fake_quant_kv(kv, self.config.qk_rope_head_dim)
 
         if past_key_values is not None:
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
@@ -1266,10 +1353,18 @@ class DeepseekV4Attention(nn.Module):
                 attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
             )
 
+        # `-sin` un-rotates RoPE before the output projection, so the operand
+        # `o_a_proj` quantizes carries the RoPE channels in their de-rotated form --
+        # which is the tensor the inference-side FP8 GEMM sees, hence no channel
+        # split here (contrast `fp8_fake_quant_act_prefix` on the live KV).
         attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
-        grouped = self.o_a_proj(grouped).flatten(2)
-        output = self.o_b_proj(grouped)
+        # `o_a_proj` is block-diagonal: its flat [o_groups*o_lora_rank, heads*head_dim/o_groups]
+        # weight is quantized as one matrix, and because `o_lora_rank` is a multiple
+        # of the 128 tile no tile straddles two groups -- the same tiling the
+        # checkpoint stores.
+        grouped = veomni_qat_linear(self.o_a_proj, grouped).flatten(2)
+        output = veomni_qat_linear(self.o_b_proj, grouped)
         return output, attn_weights
 
 
@@ -1427,10 +1522,15 @@ class DeepseekV4MLP(nn.Module):
         # that first, then optionally fuse only the silu*mul via Liger. The generic
         # ``veomni_swiglu_mlp(self, x)`` path re-runs projections without clamp and
         # would change arithmetic under the default ``swiglu_limit``.
+        # All three shared-expert projections are FP8 GEMMs at inference, in every
+        # checkpoint: the routed experts switch to FP4 on V4-Flash (`expert_dtype`),
+        # but the shared expert follows the checkpoint-wide `quantization_config`.
+        # The clamp stays outside the quantizer because it runs in FP32 on the GEMM's
+        # *output*, so it is not an operand of the FP8 product.
         dtype = x.dtype
-        gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+        gate = veomni_qat_linear(self.gate_proj, x).float().clamp(max=self.config.swiglu_limit)
         up = (
-            self.up_proj(x)
+            veomni_qat_linear(self.up_proj, x)
             .float()
             .clamp(
                 min=-self.config.swiglu_limit,
@@ -1440,10 +1540,10 @@ class DeepseekV4MLP(nn.Module):
         if veomni_swiglu_mlp.use_non_eager_impl:
             from liger_kernel.ops.swiglu import LigerSiLUMulFunction
 
-            return self.down_proj(LigerSiLUMulFunction.apply(gate.to(dtype), up.to(dtype)))
+            return veomni_qat_linear(self.down_proj, LigerSiLUMulFunction.apply(gate.to(dtype), up.to(dtype)))
 
         hidden_states = self.act_fn(gate) * up
-        return self.down_proj(hidden_states.to(dtype))
+        return veomni_qat_linear(self.down_proj, hidden_states.to(dtype))
 
 
 # ======================================================================

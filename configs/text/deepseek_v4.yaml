@@ -13,6 +13,11 @@ model:
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel
     rotary_pos_emb_implementation: eager
+    # FP8 quantization-aware training. `fp8_blockwise` fake-quantizes the
+    # operands of every attention/indexer projection FP8 inference runs as a true
+    # FP8 GEMM, plus the KV entries and index logits it rounds, so training sees
+    # deployment's rounding. Needs SM90+.
+    qat_implementation: none
 
 data:
   train_path: tulu-3-sft-mixture
