@@ -87,6 +87,19 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
         materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
 
 
+def _has_extra_parallel_plan(model: nn.Module) -> bool:
+    """True when the model's parallel plan declares ExtraParallel-sharded tensors.
+
+    The question both ExtraParallel guards below actually need to ask. A plan is
+    a property of the *model*, unlike ``ParallelState.any_extra_parallel_enabled``,
+    which only says an ep dim exists in the mesh — and a mesh dim is inherited by
+    every sub-module of a SeedOmni V2 config, including the ones that have no
+    experts.
+    """
+    plan = get_runtime_parallel_plan(model)
+    return plan is not None and bool(getattr(plan, "extra_parallel_plan", None))
+
+
 def _materialize_and_load_weights(
     model: nn.Module,
     weights_path: Optional[str],
@@ -156,14 +169,14 @@ def _materialize_and_load_weights(
         )
     else:
         _dt_local_split = partial(distribute_tensor, src_data_rank=None)
-        if ep_sharded_stream_load:
+        if ep_sharded_stream_load and _has_extra_parallel_plan(model):
             # Opt-in fast/low-memory path for large MoE checkpoints: each rank
             # reads only its ExtraParallel dim-0 slice of the expert tensors
             # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
             # Only valid on the every-rank-reads (non-broadcast) path. An
-            # unsupported model/checkpoint raises ``NotImplementedError``, which we
-            # surface directly rather than silently falling back -- an opt-in flag
-            # that quietly degrades is hard to reason about, so fail early instead.
+            # unsupported *checkpoint* still raises ``NotImplementedError``, which
+            # we surface directly rather than silently falling back -- an opt-in
+            # flag that quietly degrades is hard to reason about.
             logger.info_rank0(
                 "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
             )
@@ -177,6 +190,15 @@ def _materialize_and_load_weights(
                 fqn_to_index_mapping=fqn_to_index_mapping,
             )
         else:
+            if ep_sharded_stream_load:
+                # The flag is set once for a whole run, but this helper runs once
+                # per model -- once per OmniModule under SeedOmni V2 -- and a model
+                # with no ExtraParallel plan (vision encoder, VAE, connector) has
+                # no expert tensors to stream. Skipping is not a silent degrade:
+                # there was never a fast path to take here, and refusing instead
+                # would make the flag unusable for any heterogeneous model whose
+                # MoE backbone wants it.
+                logger.info_rank0("Ignoring ep_sharded_stream_load for a model with no ExtraParallel parallel_plan.")
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
             load_model_weights(
                 model,
@@ -654,14 +676,15 @@ def parallelize_model_ddp(
 
     # Only fsdp2 applies the ExtraParallel plan that shards expert weights, so a
     # DDP module's experts are whole. Refuse rather than load full tensors into a
-    # model whose config says they are sharded -- until now the meta crash below
-    # hid this combination.
-    if parallel_state.any_extra_parallel_enabled:
+    # model whose plan says they are sharded -- until now the meta crash below hid
+    # this combination. Keyed on the model's plan, not on
+    # ``any_extra_parallel_enabled``: a SeedOmni V2 sub-module inherits the global
+    # accelerator's ep dim whether or not it owns any experts, so the mesh alone
+    # would refuse a plan-less DDP vision tower that is perfectly fine.
+    if parallel_state.any_extra_parallel_enabled and _has_extra_parallel_plan(model):
         raise RuntimeError(
             "ExtraParallel (ep) requires fsdp_mode='fsdp2'; DDP does not apply the parallel plan that shards experts."
         )
-    if kwargs.get("ep_sharded_stream_load"):
-        raise RuntimeError("train.ep_sharded_stream_load requires fsdp_mode='fsdp2'; DDP experts are not sharded.")
 
     # Ask the parameters, not ``init_device``: the flag states an intent a model
     # builder is free to ignore -- the data tests construct their model eagerly
@@ -676,9 +699,13 @@ def parallelize_model_ddp(
             should_skip_hf_weight_load=should_skip_hf_weight_load,
             is_peft_model=kwargs.pop("is_peft_model", False),
             adapter_path=kwargs.pop("adapter_path", None),
-            # ``broadcast_model_weights_from_rank0`` is fsdp2-only and the
-            # arguments layer already warns that it is ignored otherwise.
-            broadcast_from_rank0=False,
+            # The flag was fsdp2-only while DDP loaded nothing at all. Now that
+            # this path loads, it applies verbatim: ``rank0_load_and_broadcast_weights``
+            # broadcasts over the default (world) group from global rank0, and a
+            # DDP replica wants exactly that whole tensor. Honouring it is what
+            # keeps a DDP run off the every-rank-reads path, which the flag
+            # defaults to avoiding.
+            broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
             cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         )
