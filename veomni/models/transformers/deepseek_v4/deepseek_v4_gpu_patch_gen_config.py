@@ -54,7 +54,7 @@ Patches:
    always perform the official FP32 router projection.
 11. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 12. FP8 fake quantization for QAT, selected by
-    ``qat_implementation=fp8_blockwise``. Three recipes, one per helper:
+    ``qat_implementation=fp8_blockwise``. Four recipes, one per helper:
 
     - ``veomni_qat_linear`` — GEMM operands. Covers exactly the projections an
       FP8 inference kernel runs as a true FP8 GEMM: attention ``q_a_proj`` /
@@ -64,16 +64,27 @@ Patches:
     - ``veomni_qat_fake_quant_kv`` — attention KV entries as *stored*, which
       inference caches in FP8 and then attends to in BF16. NoPE channels only,
       1x64 blocks; applies to the live KV and to both compressors' output.
-    - ``veomni_qat_fake_quant_index_entry`` — the indexer's Q and compressed K,
-      whose logits are served as a real FP8 x FP8 product. Whole head including
-      the RoPE channels, 1x128 blocks. DeepSeek's reference rotates by a
-      Hadamard matrix and uses FP4 here; the SM90 target has no Hadamard.
+    - ``veomni_qat_fake_quant_act`` — activations whose every channel enters an
+      FP8 product, 1x128 blocks over the whole last dimension. Two kinds of
+      site: the indexer's Q and compressed K, whose logits are served as a real
+      FP8 x FP8 product (DeepSeek's reference rotates by a Hadamard matrix and
+      uses FP4 here; the SM90 target has no Hadamard), and the routed experts'
+      input tokens and output.
+    - ``veomni_qat_fake_quant_expert_weight`` — routed expert weights, on the
+      fused-MoE path only, following the checkpoint's ``expert_dtype``: FP4 with
+      ``[out, in/32]`` scales on V4-Flash, otherwise FP8 128x128 tiles.
 
     Left in the model dtype, because inference does not quantize them either:
     the main attention's Q (never stored, so it stays BF16 into attention), the
     indexer's ``weights_proj``, all compressor ``kv_proj`` / ``gate_proj``, the
-    mHC parameters and the MoE router. The routed experts are a separate recipe
-    (FP4 weights on V4-Flash) and not wired up here.
+    mHC parameters and the MoE router.
+
+    Two known gaps, both consequences of the routed experts living behind a
+    fused kernel. The intermediate feeding the second expert GEMM is not
+    quantized: it never leaves the fused MoE autograd function, so covering it
+    would mean teaching shared MoE kernels this recipe. And the eager expert
+    loop is not wired at all, so ``moe_implementation=eager`` trains the experts
+    unquantized.
 
 Intentionally NOT patched:
 
@@ -127,7 +138,13 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
 from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
-from veomni.ops.qat import fp8_fake_quant_act, fp8_fake_quant_act_prefix, qat_linear
+from veomni.ops.qat import (
+    fp4_fake_quant_weight,
+    fp8_fake_quant_act,
+    fp8_fake_quant_act_prefix,
+    fp8_fake_quant_stacked_weight,
+    qat_linear,
+)
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -207,7 +224,16 @@ config.add_import(
     names=["get_active_replay", "maybe_replay_indices"],
 )
 
-config.add_import("veomni.ops.qat", names=["fp8_fake_quant_act", "fp8_fake_quant_act_prefix", "qat_linear"])
+config.add_import(
+    "veomni.ops.qat",
+    names=[
+        "fp4_fake_quant_weight",
+        "fp8_fake_quant_act",
+        "fp8_fake_quant_act_prefix",
+        "fp8_fake_quant_stacked_weight",
+        "qat_linear",
+    ],
+)
 
 config.add_post_import_block(
     """
@@ -271,18 +297,44 @@ def veomni_qat_fake_quant_kv(kv: torch.Tensor, rope_features: int) -> torch.Tens
 
 
 @config.add_helper
-def veomni_qat_fake_quant_index_entry(x: torch.Tensor) -> torch.Tensor:
-    """FP8-simulate a stored indexer Q or compressed-K entry.
+def veomni_qat_fake_quant_expert_weight(weight: torch.Tensor, expert_dtype: str) -> torch.Tensor:
+    """Fake-quantize a stacked routed-expert weight ``[E, out, in]``.
 
-    Unlike the attention KV above this covers the whole head, RoPE channels
-    included, because the indexer's logits are served as a real FP8 x FP8 product
-    instead of being dequantized for a BF16 attention -- so every channel that
-    enters the product is rounded, and 128-wide blocks divide the 128-wide
-    indexer head exactly.
+    The experts are the one place V4 does not necessarily use FP8: a V4-Flash
+    checkpoint declares ``expert_dtype: fp4``, and its scales are laid out as
+    ``[out, in / 32]`` rather than as square 128x128 tiles. The recipe therefore
+    follows the checkpoint instead of the global QAT flag, matching what
+    ``checkpoint_tensor_converter`` writes on export.
 
-    DeepSeek's reference implementation instead rotates by a Hadamard matrix and
-    quantizes to FP4; the SM90 deployment this targets has no Hadamard, so the
-    recipe here is the FP8 variant.
+    Each expert is quantized as its own matrix, which is also what expert
+    parallelism needs: EP shards only the expert dimension, so a rank quantizes
+    exactly the matrices it owns and no block spans a shard boundary.
+    """
+    if veomni_qat_implementation.value != "fp8_blockwise":
+        return weight
+    if expert_dtype == "fp4":
+        return fp4_fake_quant_weight(weight)
+    return fp8_fake_quant_stacked_weight(weight)
+
+
+@config.add_helper
+def veomni_qat_fake_quant_act(x: torch.Tensor) -> torch.Tensor:
+    """FP8-simulate an activation over its whole last dimension, 1x128 blocks.
+
+    The plain recipe, for operands where every channel enters the FP8 product.
+    Two kinds of call site share it:
+
+    - The indexer's Q and compressed-K entries. Unlike the attention KV above,
+      the RoPE channels are included, because the indexer's logits are served as
+      a real FP8 x FP8 product rather than dequantized for a BF16 attention. The
+      128-wide blocks divide the 128-wide indexer head exactly. DeepSeek's
+      reference instead rotates by a Hadamard matrix and quantizes to FP4; the
+      SM90 deployment this targets has no Hadamard, so this is the FP8 variant.
+    - The routed experts' input tokens and output, on the fused-MoE path. The
+      intermediate feeding the second expert GEMM is deliberately not covered:
+      it never leaves the fused MoE autograd function, so reaching it would mean
+      teaching shared MoE kernels about this recipe. Training therefore rounds
+      one operand fewer there than FP8 inference does.
     """
     if veomni_qat_implementation.value != "fp8_blockwise" or x.numel() == 0:
         return x
@@ -723,7 +775,7 @@ def deepseek_v4_indexer_forward_patched(
 
     # Covers the packed, windowed and empty branches above, all of which leave
     # `compressed` in the form the indexer's K cache holds.
-    compressed = veomni_qat_fake_quant_index_entry(compressed)
+    compressed = veomni_qat_fake_quant_act(compressed)
     compressed_kv = compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
 
     cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
@@ -731,7 +783,7 @@ def deepseek_v4_indexer_forward_patched(
     q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
     # Both sides of the index logits are rounded, so Q is quantized like K --
     # in contrast to the main attention, whose Q stays BF16.
-    q = veomni_qat_fake_quant_index_entry(q)
+    q = veomni_qat_fake_quant_act(q)
     # `weights_proj` stays unquantized: it produces one score per head, so its
     # [index_n_heads, hidden_size] weight has too few rows to tile at 128 in the
     # first place, and inference keeps it BF16.
@@ -1236,6 +1288,9 @@ class PatchedDeepseekV4Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
+        # Absent from `DeepseekV4Config`; a published checkpoint carries it as an
+        # extra config key, and only V4-Flash sets it to "fp4".
+        self.expert_dtype = getattr(config, "expert_dtype", "fp8")
 
     def forward(
         self,
@@ -1247,17 +1302,20 @@ class PatchedDeepseekV4Experts(nn.Module):
 
         # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
+            # QAT is wired on the fused path only, which is the one that gets
+            # deployed; the eager loop below stays in the model dtype.
+            expert_output = fused_moe_forward(
                 num_experts=self.num_experts,
                 routing_weights=top_k_weights.to(final_hidden_states.dtype),
                 selected_experts=top_k_index,
-                hidden_states=hidden_states,
+                hidden_states=veomni_qat_fake_quant_act(hidden_states),
                 fc1_1_weight=None,
                 fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
+                fc2_weight=veomni_qat_fake_quant_expert_weight(self.down_proj, self.expert_dtype),
+                fc1_1_2_weight=veomni_qat_fake_quant_expert_weight(self.gate_up_proj, self.expert_dtype),
                 swiglu_limit=self.limit,
             )
+            return veomni_qat_fake_quant_act(expert_output)
         # --- Patch.2 ---
 
         with torch.no_grad():

@@ -19,16 +19,22 @@ These are library ops: model code calls them directly instead of going through
 granularity is a property of the model's quantization recipe rather than a
 kernel the user picks.
 
-The only recipe implemented so far is DeepSeek-V4's block-wise FP8, which is
-also where the underlying quantizers come from
-(`veomni.ops.kernels.deepseek_v4`). They are SM90-only and loaded lazily, so
-importing this package on CPU or NPU stays free.
+The recipes implemented so far are DeepSeek-V4's: block-wise FP8 everywhere
+except the routed experts of a V4-Flash checkpoint, whose weights are FP4. Both
+reuse the V4 TileLang quantizers (`veomni.ops.kernels.deepseek_v4`), so training
+stays bit-aligned with inference by construction. They are SM90-only and loaded
+lazily, so importing this package on CPU or NPU stays free.
 """
 
+from .fp4_blockwise import (
+    FP4_BLOCK_SIZE,
+    fp4_fake_quant_weight,
+)
 from .fp8_blockwise import (
     DEFAULT_SCALE_FMT,
     fp8_fake_quant_act,
     fp8_fake_quant_act_prefix,
+    fp8_fake_quant_stacked_weight,
     fp8_fake_quant_weight,
     qat_linear,
 )
@@ -36,8 +42,11 @@ from .fp8_blockwise import (
 
 __all__ = [
     "DEFAULT_SCALE_FMT",
+    "FP4_BLOCK_SIZE",
+    "fp4_fake_quant_weight",
     "fp8_fake_quant_act",
     "fp8_fake_quant_act_prefix",
+    "fp8_fake_quant_stacked_weight",
     "fp8_fake_quant_weight",
     "qat_linear",
 ]

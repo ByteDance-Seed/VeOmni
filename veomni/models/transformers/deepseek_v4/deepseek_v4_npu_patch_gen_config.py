@@ -113,7 +113,8 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_rotary_embedding_forward_patched,
     deepseek_v4_topk_router_forward_patched,
     deepseek_v4_unweighted_rmsnorm_forward_patched,
-    veomni_qat_fake_quant_index_entry,
+    veomni_qat_fake_quant_act,
+    veomni_qat_fake_quant_expert_weight,
     veomni_qat_fake_quant_kv,
     veomni_qat_linear,
 )
@@ -174,10 +175,20 @@ config.add_import(
 # passthrough that never reaches the SM90-only kernels. Importing
 # `veomni.ops.qat` is likewise safe -- TileLang loads inside the kernel
 # wrappers, not at import.
-config.add_import("veomni.ops.qat", names=["fp8_fake_quant_act", "fp8_fake_quant_act_prefix", "qat_linear"])
+config.add_import(
+    "veomni.ops.qat",
+    names=[
+        "fp4_fake_quant_weight",
+        "fp8_fake_quant_act",
+        "fp8_fake_quant_act_prefix",
+        "fp8_fake_quant_stacked_weight",
+        "qat_linear",
+    ],
+)
 config.add_helper(veomni_qat_linear)
 config.add_helper(veomni_qat_fake_quant_kv)
-config.add_helper(veomni_qat_fake_quant_index_entry)
+config.add_helper(veomni_qat_fake_quant_act)
+config.add_helper(veomni_qat_fake_quant_expert_weight)
 
 config.add_post_import_block(
     """

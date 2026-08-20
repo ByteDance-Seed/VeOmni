@@ -50,6 +50,7 @@ __all__ = [
     "DEFAULT_SCALE_FMT",
     "fp8_fake_quant_act",
     "fp8_fake_quant_act_prefix",
+    "fp8_fake_quant_stacked_weight",
     "fp8_fake_quant_weight",
     "qat_linear",
 ]
@@ -178,6 +179,40 @@ def fp8_fake_quant_weight(
     if rows % block_size or cols % block_size:
         raise ValueError(f"weight shape {(rows, cols)} is not divisible by block_size {block_size}")
     return _Fp8FakeQuantWeight.apply(weight, block_size, scale_fmt)
+
+
+def fp8_fake_quant_stacked_weight(
+    weight: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: str | None = DEFAULT_SCALE_FMT,
+) -> torch.Tensor:
+    """Fake-quantize a stack of 2D weights that inference quantizes independently.
+
+    MoE expert weights arrive as ``[E, rows, cols]`` -- E separate GEMM operands,
+    each of which gets its own tile scales. Flattening to ``[E * rows, cols]`` and
+    running the quantizer once is *identical* to quantizing the E slices
+    separately, provided ``rows`` is a multiple of ``block_size``: only then does
+    every tile fall inside one expert instead of straddling two. That condition
+    is checked rather than assumed, because when it fails the result is not an
+    error but a subtly wrong scale shared across an expert boundary.
+
+    Args:
+        weight: BF16 weight of shape ``[E, rows, cols]``.
+        block_size: Side length of the quantization tile.
+        scale_fmt: See :func:`fp8_fake_quant_act`.
+
+    Returns:
+        A BF16 tensor of the input shape holding the dequantized weight,
+        differentiable into ``weight`` through a straight-through estimator.
+    """
+    _check_operand(weight, scale_fmt, "weight")
+    if weight.dim() != 3:
+        raise ValueError(f"FP8 stacked weight fake quantization expects a 3D weight, got {tuple(weight.shape)}")
+    experts, rows, cols = weight.shape
+    if rows % block_size or cols % block_size:
+        raise ValueError(f"per-expert weight shape {(rows, cols)} is not divisible by block_size {block_size}")
+    flat = _Fp8FakeQuantWeight.apply(weight.reshape(experts * rows, cols), block_size, scale_fmt)
+    return flat.view(experts, rows, cols)
 
 
 def qat_linear(

@@ -29,6 +29,7 @@ the wiring, plus the two properties that distinguish the recipes from each other
 import ast
 import inspect
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -79,8 +80,8 @@ _EXPECTED_PLAIN = {
 _EXPECTED_ACT_QUANT = {
     "DeepseekV4Attention.forward": [("veomni_qat_fake_quant_kv", "kv")],
     "DeepseekV4Indexer.forward": [
-        ("veomni_qat_fake_quant_index_entry", "compressed"),
-        ("veomni_qat_fake_quant_index_entry", "q"),
+        ("veomni_qat_fake_quant_act", "compressed"),
+        ("veomni_qat_fake_quant_act", "q"),
     ],
     "DeepseekV4HCACompressor.forward": [
         ("veomni_qat_fake_quant_kv", "compressed"),
@@ -91,6 +92,15 @@ _EXPECTED_ACT_QUANT = {
         ("veomni_qat_fake_quant_kv", "compressed"),
     ],
     "DeepseekV4MLP.forward": [],
+    # The routed experts, wired on the fused path only. The intermediate feeding
+    # the second expert GEMM is absent on purpose: it never leaves the fused MoE
+    # autograd function, so it cannot be reached from the model.
+    "DeepseekV4Experts.forward": [
+        ("veomni_qat_fake_quant_expert_weight", "self.down_proj"),
+        ("veomni_qat_fake_quant_expert_weight", "self.gate_up_proj"),
+        ("veomni_qat_fake_quant_act", "expert_output"),
+        ("veomni_qat_fake_quant_act", "hidden_states"),
+    ],
 }
 
 
@@ -236,7 +246,7 @@ def test_qat_linear_helper_fake_quantizes_when_enabled(monkeypatch):
 
 @pytest.mark.parametrize(
     "helper, args",
-    [("veomni_qat_fake_quant_kv", (64,)), ("veomni_qat_fake_quant_index_entry", ())],
+    [("veomni_qat_fake_quant_kv", (64,)), ("veomni_qat_fake_quant_act", ())],
 )
 def test_activation_helpers_pass_through_while_disabled(monkeypatch, helper, args):
     monkeypatch.setattr(modeling_gpu, "veomni_qat_implementation", OpsConfigSlot("qat_implementation", default="none"))
@@ -248,7 +258,7 @@ def test_activation_helpers_pass_through_while_disabled(monkeypatch, helper, arg
 
 @pytest.mark.parametrize(
     "helper, args, shape",
-    [("veomni_qat_fake_quant_kv", (64,), (2, 0, 512)), ("veomni_qat_fake_quant_index_entry", (), (2, 0, 128))],
+    [("veomni_qat_fake_quant_kv", (64,), (2, 0, 512)), ("veomni_qat_fake_quant_act", (), (2, 0, 128))],
 )
 def test_activation_helpers_pass_empty_entries_through(monkeypatch, helper, args, shape):
     """A compressor produces a zero-length KV until its first window closes."""
@@ -283,7 +293,141 @@ def test_kv_helper_quantizes_the_nope_channels_and_spares_the_rope_tail(monkeypa
     assert torch.equal(actual, fp8_fake_quant_act_prefix(x, nope, block_size=64))
 
 
-def test_index_helper_quantizes_the_whole_head_including_rope(monkeypatch):
+@pytest.mark.parametrize("expert_dtype", ["fp4", "fp8"])
+def test_expert_weight_recipe_follows_the_checkpoint_dtype(monkeypatch, expert_dtype):
+    """V4-Flash ships FP4 experts; the geometry differs, not just the width."""
+    _require_tilelang_cuda()
+    from veomni.ops.qat import fp4_fake_quant_weight, fp8_fake_quant_stacked_weight
+
+    monkeypatch.setattr(
+        modeling_gpu, "veomni_qat_implementation", OpsConfigSlot("qat_implementation", default="fp8_blockwise")
+    )
+
+    torch.manual_seed(0)
+    weight = torch.randn(2, 256, 384, device=DEVICE, dtype=torch.bfloat16)
+
+    actual = modeling_gpu.veomni_qat_fake_quant_expert_weight(weight, expert_dtype)
+
+    expected = fp4_fake_quant_weight(weight) if expert_dtype == "fp4" else fp8_fake_quant_stacked_weight(weight)
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, weight)
+
+
+def test_expert_weight_recipe_is_a_passthrough_while_disabled(monkeypatch):
+    monkeypatch.setattr(modeling_gpu, "veomni_qat_implementation", OpsConfigSlot("qat_implementation", default="none"))
+
+    weight = torch.randn(2, 256, 384, dtype=torch.bfloat16)
+
+    assert modeling_gpu.veomni_qat_fake_quant_expert_weight(weight, "fp4") is weight
+
+
+def test_expert_weights_reach_the_fused_kernel_quantized(monkeypatch):
+    """Pin what the fused kernel is handed, since QAT is applied outside it."""
+    _require_tilelang_cuda()
+    from veomni.ops.qat import fp4_fake_quant_weight, fp8_fake_quant_act
+
+    monkeypatch.setattr(
+        modeling_gpu, "veomni_qat_implementation", OpsConfigSlot("qat_implementation", default="fp8_blockwise")
+    )
+
+    config = SimpleNamespace(
+        num_local_experts=2,
+        hidden_size=256,
+        intermediate_size=128,
+        hidden_act="silu",
+        swiglu_limit=7.0,
+        expert_dtype="fp4",
+    )
+    torch.manual_seed(0)
+    experts = modeling_gpu.DeepseekV4Experts(config).to(device=DEVICE, dtype=torch.bfloat16)
+    # `__init__` leaves the expert weights uninitialized, and a NaN would make
+    # every `torch.equal` below false regardless of the quantization.
+    with torch.no_grad():
+        experts.gate_up_proj.normal_(std=0.05)
+        experts.down_proj.normal_(std=0.05)
+    hidden_states = torch.randn(4, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+
+    captured = {}
+
+    def fake_fused_moe_forward(**kwargs):
+        captured.update(kwargs)
+        return torch.randn(hidden_states.shape, device=DEVICE, dtype=torch.bfloat16)
+
+    class _FusedSlot:
+        use_non_eager_impl = True
+
+    monkeypatch.setattr(modeling_gpu, "veomni_moe_experts_forward", _FusedSlot())
+    monkeypatch.setattr(modeling_gpu, "fused_moe_forward", fake_fused_moe_forward)
+
+    top_k_index = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0]], device=DEVICE)
+    top_k_weights = torch.full((4, 2), 0.5, device=DEVICE, dtype=torch.bfloat16)
+    output = experts(hidden_states, top_k_index, top_k_weights)
+
+    assert torch.equal(captured["fc1_1_2_weight"], fp4_fake_quant_weight(experts.gate_up_proj))
+    assert torch.equal(captured["fc2_weight"], fp4_fake_quant_weight(experts.down_proj))
+    assert torch.equal(captured["hidden_states"], fp8_fake_quant_act(hidden_states, block_size=128))
+    # The kernel's own output is quantized on the way out.
+    assert not torch.equal(output, captured["hidden_states"])
+
+
+def test_expert_weight_gradients_survive_the_straight_through_estimator():
+    """The reason quantizing outside the fused kernel is safe at all.
+
+    The fused MoE autograd function saves whatever weight tensor it was handed
+    and writes gradients shaped like it, so the gradient has to travel back
+    through the fake-quant node to land on the parameter.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.moe import apply_veomni_fused_moe_patch
+
+    apply_veomni_fused_moe_patch("triton")
+
+    config = SimpleNamespace(
+        num_local_experts=2,
+        hidden_size=256,
+        intermediate_size=128,
+        hidden_act="silu",
+        swiglu_limit=7.0,
+        expert_dtype="fp4",
+    )
+    torch.manual_seed(0)
+    experts = modeling_gpu.DeepseekV4Experts(config).to(device=DEVICE, dtype=torch.bfloat16)
+    with torch.no_grad():
+        experts.gate_up_proj.normal_(std=0.05)
+        experts.down_proj.normal_(std=0.05)
+    hidden_states = torch.randn(8, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+    top_k_index = torch.tensor([[0, 1]] * 8, device=DEVICE)
+    top_k_weights = torch.full((8, 2), 0.5, device=DEVICE, dtype=torch.bfloat16)
+
+    class _FusedSlot:
+        use_non_eager_impl = True
+
+    def run(qat):
+        for param in experts.parameters():
+            param.grad = None
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(modeling_gpu, "veomni_qat_implementation", OpsConfigSlot("qat_implementation", default=qat))
+            # QAT is wired on the fused path only.
+            patch.setattr(modeling_gpu, "veomni_moe_experts_forward", _FusedSlot())
+            out = experts(hidden_states, top_k_index, top_k_weights)
+        out.float().square().mean().backward()
+        return out.detach().clone(), {n: p.grad.detach().clone() for n, p in experts.named_parameters()}
+
+    plain, plain_grads = run("none")
+    quantized, quant_grads = run("fp8_blockwise")
+
+    assert not torch.equal(plain, quantized), "fp8_blockwise did not change the expert forward"
+    for name in ("gate_up_proj", "down_proj"):
+        grad = quant_grads[name]
+        assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0, (
+            f"no usable gradient reached {name} through the fake-quant node"
+        )
+        assert grad.shape == getattr(experts, name).shape
+        assert not torch.equal(grad, plain_grads[name])
+
+
+def test_act_helper_quantizes_the_whole_last_dimension(monkeypatch):
+    """Shared by the indexer entries and the routed-expert activations."""
     _require_tilelang_cuda()
     from veomni.ops.qat import fp8_fake_quant_act
 
@@ -294,7 +438,7 @@ def test_index_helper_quantizes_the_whole_head_including_rope(monkeypatch):
     torch.manual_seed(0)
     x = torch.randn(2, 3, 4, 128, device=DEVICE, dtype=torch.bfloat16)
 
-    actual = modeling_gpu.veomni_qat_fake_quant_index_entry(x)
+    actual = modeling_gpu.veomni_qat_fake_quant_act(x)
 
     assert torch.equal(actual, fp8_fake_quant_act(x, block_size=128))
     # Unlike the KV recipe, the trailing RoPE channels are rounded too.
