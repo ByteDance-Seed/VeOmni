@@ -37,10 +37,9 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     accelerator = SimpleNamespace(fsdp_config=fsdp_config)
     train_cfg = SimpleNamespace(
         checkpoint=checkpoint_cfg,
-        accelerator=accelerator,
         global_rank=0,
     )
-    model_cfg = SimpleNamespace(fqn_to_index_mapping={})
+    model_cfg = SimpleNamespace(fqn_to_index_mapping={}, accelerator=accelerator)
     args = SimpleNamespace(train=train_cfg, model=model_cfg)
 
     trainer = MagicMock()

@@ -15,7 +15,7 @@ class GraphConfig(Protocol):
 
     Satisfied by both :class:`~veomni.models.seed_omni.configuration_omni.OmniConfig`
     and the launcher-side
-    :class:`~veomni.omni_arguments.arguments_types.OmniModelRuntimeArguments`,
+    :class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments`,
     so diagrams can be drawn without projecting the runtime view onto a checkpoint.
     """
 

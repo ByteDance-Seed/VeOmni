@@ -34,7 +34,7 @@ from typing import Any, Dict, Type
 
 import yaml
 
-from ..arguments.parser import T, _add_arguments_recursive, _deep_update, _instantiate_recursive
+from .parser import T, _add_arguments_recursive, _deep_update, _instantiate_recursive
 
 
 _INHERIT_KEY = "__inherit__"

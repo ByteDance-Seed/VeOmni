@@ -33,8 +33,9 @@ Terminology (three different "processor" layers)
   analogue of HuggingFace ``AutoProcessor``.
 
 This module defines only the **middle** layer's abstract base.  It is **not**
-a graph mixin; family mixins declare ``preprocessor_class = XxxPreprocessor``
-as a registry pointer and optionally receive copied assets via
+a graph mixin; each module's native model class declares
+``preprocessor_class = XxxPreprocessor``
+as a registry pointer and optionally receives copied assets via
 :func:`~veomni.models.seed_omni.processing.binding.bind_module_assets`.
 """
 

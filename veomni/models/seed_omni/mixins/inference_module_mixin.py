@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generation-FSM hooks shared by every SeedOmni V2 sub-model."""
+"""Generation-FSM hooks shared by every SeedOmni V2 sub-model.
+
+Only :meth:`InferenceModuleMixin.reset_global_inference_state` and
+:meth:`InferenceModuleMixin.finalize` are wired in, on both inference paths —
+eager (``OmniModel.reset`` / ``OmniModel._invoke_module_finalize``) and
+distributed (``OmniModelRuntime``, ``accelerator/omni_model_runtime.py``).
+
+The ``pre_generate`` / ``post_generate`` / ``generate_step`` surface has NO
+call-site: both FSM drivers invoke each graph endpoint directly with no hooks
+(``accelerator/executor.py::execute_generation_node``,
+``OmniModel._run_generation_node``), so a module cannot opt in without new
+plumbing.
+"""
 
 from __future__ import annotations
 

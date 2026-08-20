@@ -9,14 +9,19 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 
-from veomni.arguments import OmniArguments, OmniDataArguments
+from veomni.arguments import (
+    OmniArguments,
+    OmniDataArguments,
+    OmniModelRuntimeArguments,
+    build_module_runtime_args,
+    build_omni_model_runtime,
+)
 from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_MODEL_REGISTRY
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import PackedConversation, preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
-from veomni.omni_arguments import OmniModelRuntimeArguments, build_module_runtime_args, build_omni_model_runtime
 
 
 ToyCase = Literal["ce_only", "vit_ce", "mse_only", "mixed"]

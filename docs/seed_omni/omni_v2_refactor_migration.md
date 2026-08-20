@@ -1,5 +1,14 @@
 # SeedOmni V2 Refactor — Merge / Migration Guide
 
+> **⚠️ Historical document.** The `szl.refact_omni_v2` refactor described here is
+> long merged, and the layout has moved on since: `mixins/module_mixin.py`,
+> `omni_module_trainer.py` and `OmniModuleInferencer` no longer exist (the
+> per-module training runtime is now `accelerator/module_runtime.py`'s
+> `ModuleRuntime`), and per-node execution lives in `accelerator/executor.py`
+> rather than `TrainingGraph.step`. Read this only to understand *why* things
+> moved; for current structure use
+> [`seed_omni_v2.md`](./seed_omni_v2.md) § 7 (file map).
+
 > **Audience:** an agent (or human) whose branch adds or modifies a SeedOmni V2
 > model and now needs to merge the `szl.refact_omni_v2` refactor (target branch
 > `szl.omni_v2`). This document is self-contained: it lists every structural move,
@@ -215,7 +224,7 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   ```
 - Cross-field validation (`init_device` vs `fsdp_mode`/`ep_size`, `chunk_mbs_config` vs
   `pad_to_length`/`gradient_checkpointing.enable_reentrant`, the blanket `torch_compile.enable`
-  ban) is Omni-only (`_validate_omni_accelerator` in `veomni/omni_arguments/arguments_types.py`),
+  ban) is Omni-only (`_validate_omni_accelerator` in `veomni/arguments/omni_arguments_types.py`),
   run once against the top-level default and once per resolved module — so a per-module override
   is validated too, not just the global default.
 - The default all-eager accelerator for inference (`resolve_model(for_inference=True)` /

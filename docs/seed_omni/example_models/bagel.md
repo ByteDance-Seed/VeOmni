@@ -132,6 +132,44 @@ bash train.sh tasks/omni/train_omni.py \
   --train.wandb.enable false
 ```
 
+### 3.1 Offline VAE posterior cache (two stages)
+
+Caching is not a special framework mode — it is a different `train_graph` plus a
+different dataset type. A module opts in with `model_config.support_cache: true`,
+and `OfflineEncodingMixin.derive_cache_mode`
+(`veomni/models/seed_omni/mixins/offline_encoding_mixin.py`) turns
+`train.train_type` into that module's cache mode.
+
+**Stage 1 — produce the cache** (`train.train_type: offline_cache` ⇒ VAE cache
+mode `encode_only`). `modules_train_offline_cache.yaml` declares only
+`bagel_vae`, and the DAG is a single edge, so nothing else is built:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/offline_cache.yaml
+```
+
+```text
+bagel_vae.offline_encode -> end
+```
+
+Posteriors are written to `train.offline_cache_dir`
+(`outputs/bagel_vae_cached_dataset` by default), reading normal `seedomni` data.
+
+**Stage 2 — train from the cache** (`train.train_type: train_with_cache` ⇒ VAE
+cache mode `process_only`, which makes the VAE preprocessor return `None` and
+skips CPU image prep entirely). `data.data_type` becomes `seedomni_cached` and
+`data.train_path` points at the stage-1 output directory:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train_with_cache.yaml
+```
+
+The DAG matches §3 except that `bagel_vae.online_process` replaces
+`bagel_vae.encode` as the latent source — it rehydrates the cached posterior
+instead of encoding pixels.
+
 ---
 
 ## 4. Inference

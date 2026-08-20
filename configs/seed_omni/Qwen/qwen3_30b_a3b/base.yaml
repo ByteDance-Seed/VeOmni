@@ -33,7 +33,6 @@ model:
       enable_reentrant: false
     fsdp_config:
       fsdp_mode: fsdp2
-      full_shard: true
       reshard_after_forward: true
       reshard_after_backward: true
       forward_prefetch: true

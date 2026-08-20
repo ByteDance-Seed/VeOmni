@@ -40,14 +40,13 @@ Anything else (chat-template formatting, tokenization, boundary marker
 emission, ``input_ids`` / ``labels`` / ``attention_mask`` construction,
 position id calculation, image normalization, image patchification) is
 deliberately **not** done here — it belongs in model modules per the V2
-design contract (see ``docs/seed_omni/design.md`` § "数据路由" and the per-module
-responsibility table).
+design contract (see ``docs/seed_omni/seed_omni_v2.md`` § 3).
 
 Video turns (``("video", _)``) are paired with the per-sample ``videos`` list
 and decoded via ``fetch_videos`` into a :class:`VideoInputs` bundle — the
 sampled-frame tensor plus the optional in-video audio waveform.  Both streams
-ride on one media item; the downstream video / audio modules each read their
-own stream (see ``design.md`` § av-video).
+ride on one media item; the intended split across a video and an audio module is
+recorded in ``docs/seed_omni/av_video_design.md`` (not implemented yet).
 
 Registered as ``data_type: seedomni`` in
 ``veomni/data/data_transform.py``::

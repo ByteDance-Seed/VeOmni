@@ -5,9 +5,9 @@ from unittest.mock import patch
 
 import torch
 
+from veomni.arguments import OmniArguments, build_module_runtime_args, parse_omni_args
 from veomni.distributed import torch_parallelize
 from veomni.models.seed_omni.accelerator.module_runtime import ModuleRuntime
-from veomni.omni_arguments import OmniArguments, build_module_runtime_args, parse_omni_args
 from veomni.trainer.omni import OmniTrainer
 
 

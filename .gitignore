@@ -10,6 +10,7 @@ __pycache__/
 .Python
 build/
 output/
+outputs/
 develop-eggs/
 dist/
 downloads/
@@ -175,3 +176,7 @@ nsysoutput/
 
 # Agents worksspace should not be tracked by the primary repo.
 .agents_workspace/
+
+# Mermaid diagrams written by scripts/visualize_omni_graph.py. The authoritative
+# copies are the ones OmniConfig.save_pretrained writes into the model directory.
+/graphs/

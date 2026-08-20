@@ -29,7 +29,7 @@ from ..mixins.offline_encoding_mixin import OfflineEncodingMixin
 
 
 if TYPE_CHECKING:
-    from ....omni_arguments.arguments_types import OmniModuleRuntimeArguments
+    from ....arguments.omni_arguments_types import OmniModuleRuntimeArguments
     from ....trainer.callbacks import TrainerState
     from ..accelerator.module_runtime import ModuleRuntime
 

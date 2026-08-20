@@ -25,7 +25,7 @@ class TextEncoderPreprocessor(ModulePreprocessorBase):
     main process's thin ``encode_pre`` does the single ``.to(device)``.
 
     :meth:`bind_module_assets` also copies ``_tokenizer`` onto the model —
-    :class:`~veomni.models.seed_omni.modules.base.text_encoder.modulemixin.TextEncoderModuleMixin`
+    :class:`~veomni.models.seed_omni.modules.base.text_encoder.modeling.TextEncoder`
     decodes generated text via ``self._tokenizer``.
     """
 

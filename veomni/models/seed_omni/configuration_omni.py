@@ -11,13 +11,13 @@ selects which one is active; :attr:`OmniConfig.generation_graph` returns it.  Sc
 choice is therefore a property of the config, not something baked in at YAML-load time.
 
 Building one from the launcher split-file layout is the runtime layer's job:
-:func:`~veomni.omni_arguments.arguments_types.resolve_omni_model` /
-:func:`~veomni.omni_arguments.arguments_types.build_omni_model_runtime`
-return :class:`~veomni.omni_arguments.arguments_types.OmniModelRuntimeArguments`
+:func:`~veomni.arguments.omni_arguments_types.resolve_omni_model` /
+:func:`~veomni.arguments.omni_arguments_types.build_omni_model_runtime`
+return :class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments`
 (the full launcher view), and its ``.to_hf_config()`` projects that onto this
 checkpoint-shaped config.
 Per-module **runtime** args (FSDP, optimizer, dataloader, …) live on
-:class:`~veomni.omni_arguments.arguments_types.OmniModelRuntimeArguments.modules`.
+:class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments.modules`.
 
 Launcher inputs consumed by that builder (see :class:`~veomni.arguments.OmniArguments`):
 
@@ -108,7 +108,7 @@ def select_graph(
     """Pick the active graph out of a scenario map; unset ``scenario`` takes the first.
 
     Shared by :class:`OmniConfig` and
-    :class:`~veomni.omni_arguments.arguments_types.OmniModelRuntimeArguments`
+    :class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments`
     so both resolve training and generation scenarios identically.
     """
     if not graphs:
@@ -478,7 +478,7 @@ class OmniConfig(PretrainedConfig):
 
         Module blocks are kept verbatim; the split-checkpoint root and per-module
         path resolution belong to the runtime layer
-        (:class:`~veomni.omni_arguments.arguments_types.OmniModelRuntimeArguments`)
+        (:class:`~veomni.arguments.omni_arguments_types.OmniModelRuntimeArguments`)
         and are not stored here. Unknown top-level keys are dropped silently so the
         launcher YAML can carry training-only fields.
 

@@ -226,9 +226,10 @@ the `train.graph_profile.enable_*` switches only add suffix fields to those node
 Training writes rank-0 graph traces only when any detail switch is enabled,
 under `train.checkpoint.output_dir/graph_trace`.
 
-Execution is driven by the model itself (not the module's `pre_forward`).
-`OmniModel.forward` loops the FSM (`TrainingGraph.step` → `_collect_training_loss`
-→ `maybe_transition`), and `TrainingGraph.step` runs one node end-to-end, which:
+Execution is driven by the runtime, not the module's `pre_forward`.
+`OmniModelRuntime.forward` loops `TrainingGraph.iter_nodes()` (which selects nodes
+and advances via `maybe_transition`), draining each node's `_loss` as it goes, and
+`execute_train_node` runs one node end-to-end, which:
 
 1. runs the module's `pre_forward` → real input tensors (and, for metered
    modules, `metric_meter_set_seqlens(method, seqlens)` stashes the token lengths);
@@ -537,7 +538,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 |------|----------------|
 | `mixins/base_mixin.py` | shared assets, `_omni_hook_name` registry |
 | `mixins/training_module_mixin.py` | `pre_forward` / `post_forward` dispatch |
-| `mixins/inference_module_mixin.py` | `pre_generate` / `post_generate` dispatch (opt-in; not used by the standard `InferenceMixin` pattern — see §2.1) |
+| `mixins/inference_module_mixin.py` | live `reset_*` / `finalize` hooks, plus `pre_generate` / `post_generate` dispatchers that nothing invokes (both FSM drivers call endpoints directly — see §2.1) |
 | `omni_pretrained_model.py` | `OmniPreTrainedModel` — base for every native `modeling.py` class; ships no-op `reset_local_inference_state` / `reset_global_inference_state` / `finalize` defaults, shadowed by each module's `InferenceMixin` (§2.1) |
 | `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
 | `utils/conversation.py` | `ConversationItem` + carrier helpers |
@@ -546,7 +547,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `graphs/training_graph.py` | DAG view (topological forward order) |
 | `graphs/generation_graph.py` | FSM view (states / transitions / signals) |
 | `configuration_omni.py` | `OmniConfig` — plain `PretrainedConfig`, checkpoint read/write only |
-| `omni_arguments/arguments_types.py` | launcher argument schema (`OmniArguments`) + parse/merge the launcher YAML into `OmniModelRuntimeArguments`; `.to_hf_config()` projects it onto `OmniConfig` |
+| `arguments/omni_arguments_types.py` | launcher argument schema (`OmniArguments`) + parse/merge the launcher YAML into `OmniModelRuntimeArguments`; `.to_hf_config()` projects it onto `OmniConfig` |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
 | `modules/<family>/<sub>/` | per-module `configuration.py`, `modeling.py` (native, incl. `generate`), `accelerated.py` (training-graph hooks) [, `processing.py`] |
 | `veomni/trainer/omni/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |

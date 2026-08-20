@@ -809,10 +809,11 @@ def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch)
     trainer.state = TrainerState(global_step=1)
     trainer.device = torch.device("cpu")
     trainer.args = SimpleNamespace(
+        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=False))),
         train=SimpleNamespace(
             enable_batch_invariant_mode=False,
             local_rank=0,
-        )
+        ),
     )
     trainer.model = _TinyLossModel()
     trainer.model_fwd_context = nullcontext()
@@ -838,11 +839,12 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     trainer.state = TrainerState(global_step=1)
     trainer.device = torch.device("cpu")
     trainer.args = SimpleNamespace(
+        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=False))),
         train=SimpleNamespace(
             channel_loss=cfg,
             enable_batch_invariant_mode=False,
             local_rank=0,
-        )
+        ),
     )
     trainer.model = _TinyLossModel()
     trainer.model_fwd_context = nullcontext()
@@ -941,12 +943,12 @@ def test_base_forward_backward_composes_channel_loss_and_chunk_mbs_contexts(monk
     trainer.state = TrainerState(global_step=1)
     trainer.device = torch.device("cpu")
     trainer.args = SimpleNamespace(
+        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True, chunk_mbs=1))),
         train=SimpleNamespace(
             channel_loss=ChannelLossConfig(enable=True, interval=1),
-            chunk_mbs_config=ChunkMBSConfig(enable=True, chunk_mbs=1),
             enable_batch_invariant_mode=False,
             local_rank=0,
-        )
+        ),
     )
     trainer.model = CheckpointedLossModel(lambda: trainer.channel_loss_callback.computer.capture_active)
     trainer.model.gradient_checkpointing_enable(
@@ -960,7 +962,7 @@ def test_base_forward_backward_composes_channel_loss_and_chunk_mbs_contexts(monk
         lambda: SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
     )
     monkeypatch.setattr(base_trainer_module, "use_parallel_state", lambda _: nullcontext())
-    chunk_mbs.apply_chunk_mbs(trainer.model, trainer.args.train.chunk_mbs_config)
+    chunk_mbs.apply_chunk_mbs(trainer.model, trainer.args.model.accelerator.chunk_mbs_config)
     trainer.model_fwd_context = nullcontext()
     trainer.model_bwd_context = nullcontext()
     trainer.micro_batch_token_len = 1
@@ -1163,7 +1165,10 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
 
 
 def test_dit_rejects_channel_loss_before_initialization():
-    args = SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True)))
+    args = SimpleNamespace(
+        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=False))),
+        train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True)),
+    )
     with pytest.raises(ValueError, match="causal-LM trainers"):
         DiTTrainer(args)
 

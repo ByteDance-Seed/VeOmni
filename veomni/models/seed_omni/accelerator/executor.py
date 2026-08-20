@@ -8,8 +8,9 @@ endpoint.
 
 For a profiler-free eager path (HF ``from_pretrained`` / single-process), use
 :class:`~veomni.models.seed_omni.modeling_omni.OmniModel` directly — its
-``forward`` / ``generate`` call ``pre_forward`` → method → ``post_forward``
-without any of the machinery here.
+``generate`` calls each FSM endpoint without any of the machinery here. That
+model is inference-only; its ``forward`` raises, so training always goes through
+``execute_train_node``.
 """
 
 from contextlib import nullcontext

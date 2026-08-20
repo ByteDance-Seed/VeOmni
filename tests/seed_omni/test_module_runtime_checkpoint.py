@@ -135,17 +135,19 @@ def test_base_trainer_combines_caller_decision_with_resume_fallback(
             lora_config=None,
             fqn_to_index_mapping=None,
             basic_modules=[],
+            optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
+            accelerator=SimpleNamespace(
+                fsdp_config=fsdp_config,
+                chunk_mbs_config=SimpleNamespace(enable=False),
+                init_device="meta",
+                gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
+                broadcast_model_weights_from_rank0=False,
+                ep_sharded_stream_load=False,
+                torch_compile=CompileConfig(),
+            ),
         ),
         train=SimpleNamespace(
             checkpoint=SimpleNamespace(load_path=_RESUME_PATH),
-            optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
-            chunk_mbs_config=SimpleNamespace(enable=False),
-            init_device="meta",
-            accelerator=SimpleNamespace(fsdp_config=fsdp_config),
-            gradient_checkpointing=SimpleNamespace(enable=False, enable_reentrant=False, early_stop=True),
-            broadcast_model_weights_from_rank0=False,
-            ep_sharded_stream_load=False,
-            torch_compile=CompileConfig(),
         ),
     )
 

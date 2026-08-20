@@ -16,7 +16,7 @@ import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import ClassVar, Dict, List, Literal, Optional
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -43,25 +43,40 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 # ================================ Training Arguments ======================================
 #
 # Hierarchy:
-#   train.*
+#   model.*
+#   ├── ops_implementation.* → OpsImplementationConfig
 #   ├── optimizer.*          → OptimizerConfig
+#   └── accelerator.*        → AcceleratorConfig
+#       ├── fsdp_config.*    → FSDPConfig
+#       |   └── mixed_precision.* → MixedPrecisionConfig
+#       ├── offload_config.* → OffloadConfig
+#       ├── gradient_checkpointing.*  → GradientCheckpointingConfig
+#       ├── torch_compile.*  → TorchCompileConfig
+#       └── chunk_mbs_config.*   → ChunkMBSConfig
+#   train.*
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
 #   ├── channel_loss.*       → ChannelLossConfig
-#   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
-#   ├── torch_compile.*      → TorchCompileConfig
-#   ├── chunk_mbs_config.*   → ChunkMBSConfig
-#   ├── accelerator.*        → AcceleratorConfig
-#   │   ├── fsdp_config.*    → FSDPConfig
-#   │   |   └── mixed_precision.* → MixedPrecisionConfig
-#   │   └── offload_config.* → OffloadConfig
 #   └── checkpoint.*         → CheckpointConfig
+#
+# `accelerator` and `optimizer` sit under `model`, not `train`, because both are
+# per-model decisions: an omni model gives each module its own block, so
+# `model.modules.<name>.accelerator.*` has the same shape as `model.accelerator.*`
+# and the two merge through one code path. What is left under `train.*` is the
+# job-level schedule — batch sizes, steps, logging, checkpointing — which stays
+# singular no matter how many modules the model has.
+#
+# `model.*` is split so an omni module can reuse it without inheriting a
+# single-model loader's baggage:
+#   BaseModelArguments      model fields alone (model_path, lora_config, ops, …)
+#   └── ModelRuntimeArguments   + accelerator + optimizer — one training unit
+#       └── ModelArguments      + config/tokenizer/safetensor-index paths
 #
 
 
 @dataclass
 class OptimizerConfig:
-    """train.optimizer.* — Optimizer and learning-rate schedule.
+    """model.optimizer.* — Optimizer and learning-rate schedule.
 
     ``type="muon"`` builds a Muon + AdamW multi-optimizer: 2D hidden weights
     and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases and
@@ -130,8 +145,8 @@ class OptimizerConfig:
         metadata={
             "help": (
                 "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
-                "If unset: inherits train.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
-                "(default); uses 25x train.optimizer.lr when muon_adjust_lr_fn=original "
+                "If unset: inherits model.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
+                "(default); uses 25x model.optimizer.lr when muon_adjust_lr_fn=original "
                 "(Moonlight-style starting point)."
             )
         },
@@ -379,7 +394,7 @@ class ChannelLossConfig:
 
 @dataclass
 class GradientCheckpointingConfig:
-    """train.gradient_checkpointing.* — Activation recomputation settings."""
+    """model.accelerator.gradient_checkpointing.* — Activation recomputation settings."""
 
     enable: bool = field(
         default=True,
@@ -408,7 +423,7 @@ class GradientCheckpointingConfig:
 
 @dataclass
 class ChunkMBSConfig:
-    """train.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
+    """model.accelerator.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
 
     enable: bool = field(
         default=False,
@@ -426,7 +441,7 @@ class ChunkMBSConfig:
 
 @dataclass
 class MixedPrecisionConfig:
-    """train.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
+    """model.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
 
     enable: bool = field(
         default=True,
@@ -461,12 +476,17 @@ class MixedPrecisionConfig:
 
 @dataclass
 class FSDPConfig:
-    """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
+    """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
     # eager mode use HF.from_pretrained(..., device_map='auto') for inference
     fsdp_mode: Literal["ddp", "fsdp2", "eager"] = field(
         default="fsdp2",
-        metadata={"help": "Data parallel mode."},
+        metadata={
+            "help": (
+                "Data parallel mode. 'eager' skips every wrapper for the single-process "
+                "inference path an OmniModule takes via _init_eager_inference."
+            )
+        },
     )
     reshard_after_forward: bool = field(
         default=True,
@@ -502,13 +522,14 @@ class FSDPConfig:
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
-                "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."
+                "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
+                "'ddp', or 'eager'."
             )
 
 
 @dataclass
 class OffloadConfig:
-    """train.accelerator.offload_config.* — Activation offload settings."""
+    """model.accelerator.offload_config.* — Activation offload settings."""
 
     enable_activation: bool = field(
         default=False,
@@ -556,14 +577,10 @@ class TorchCompileConfig:
 
 @dataclass
 class AcceleratorConfig:
-    """train.accelerator.* — Parallelism and distributed-training topology.
+    """model.accelerator.* — Parallelism and distributed-training topology.
 
-    ``init_device``, ``broadcast_model_weights_from_rank0``, ``ep_sharded_stream_load``,
-    ``gradient_checkpointing``, ``torch_compile`` and ``chunk_mbs_config`` are consulted by
-    SeedOmni V2 only (``veomni.models.seed_omni``), where this config is per-module and these
-    knobs can therefore be overridden per module. V1 trainers keep their own top-level
-    ``train.init_device`` / ``train.gradient_checkpointing`` / ... equivalents and never read
-    these fields off ``accelerator``.
+    Per-module: an omni model builds one of these for each module, so every knob
+    here is overridable per module.
     """
 
     dp_replicate_size: int = field(
@@ -614,13 +631,10 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Ring-attn context parallel size."},
     )
-    fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
-    offload_config: OffloadConfig = field(default_factory=OffloadConfig)
-    # ---- SeedOmni V2 per-module knobs (see class docstring) ----------------
-    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
+    init_device: Literal["cuda", "meta", "npu"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
@@ -632,19 +646,86 @@ class AcceleratorConfig:
     ep_sharded_stream_load: bool = field(
         default=False,
         metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`). A model with no ExtraParallel parallel_plan logs and falls back to the standard loader, so a heterogeneous OmniModel can enable this for its MoE module alone; a model that has a plan but an unsupported checkpoint layout raises `NotImplementedError`."
         },
     )
+    fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
+    offload_config: OffloadConfig = field(default_factory=OffloadConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
     chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
 
     def __post_init__(self):
         # although expert parallel and extra parallel are both provided in the arguments,
-        # the implementation is configuring extra parallelism to include expert parallelism
-        self.extra_parallel_sizes.append(self.ep_size)
-        self.extra_parallel_names.append("ep")
-        self.extra_parallel_placement_innermost.append(self.ep_outside)
+        # the implementation is configuring extra parallelism to include expert parallelism.
+        # Guarded so re-instantiating from a saved config (asdict round-trip) does not
+        # append a second "ep" dimension.
+        if "ep" not in self.extra_parallel_names:
+            self.extra_parallel_sizes.append(self.ep_size)
+            self.extra_parallel_names.append("ep")
+            self.extra_parallel_placement_innermost.append(self.ep_outside)
+
+        # world_size and dp_size are plain attributes rather than fields: an omni model
+        # builds one of these per module, and a field would let asdict() round-trip a
+        # value derived under a different WORLD_SIZE back in as if the user had set it.
+        self.world_size = int(os.getenv("WORLD_SIZE", 1))
+        self._resolve_topology()
+        self._validate_init_device()
+
+    def _resolve_topology(self):
+        non_dp_size = self.pp_size * self.ulysses_size * self.cp_size * self.tp_size
+        if self.world_size % non_dp_size != 0:
+            raise ValueError(
+                f"World size should be a multiple of pp_size: {self.pp_size}, "
+                f"ulysses_size: {self.ulysses_size}, cp_size: {self.cp_size}, "
+                f"tp_size: {self.tp_size}."
+            )
+        assert self.tp_size == 1, "Tensor parallel size not supported yet."
+        assert self.pp_size == 1, "Pipeline parallel size not supported yet."
+        assert self.cp_size == 1, "Context parallel size not supported yet."
+
+        self.dp_size = self.world_size // non_dp_size
+
+        # dp_replicate_size / dp_shard_size stay fields so HSDP is configurable, and
+        # are resolved in place: -1 means "derive me".
+        if self.dp_replicate_size > 0 and self.dp_shard_size > 0:
+            assert self.dp_size == self.dp_replicate_size * self.dp_shard_size, (
+                f"dp_size should be equal to dp_replicate_size: {self.dp_replicate_size} "
+                f"* dp_shard_size: {self.dp_shard_size}."
+            )
+        elif self.dp_replicate_size > 0:
+            if self.dp_size % self.dp_replicate_size != 0:
+                raise ValueError("dp_size should be a multiple of dp_replicate_size.")
+            self.dp_shard_size = self.dp_size // self.dp_replicate_size
+        elif self.dp_shard_size > 0:
+            if self.dp_size % self.dp_shard_size != 0:
+                raise ValueError("dp_size should be a multiple of dp_shard_size.")
+            self.dp_replicate_size = self.dp_size // self.dp_shard_size
+        else:
+            self.dp_replicate_size = 1
+            self.dp_shard_size = self.dp_size
+
+    def _validate_init_device(self):
+        if self.fsdp_config.fsdp_mode == "fsdp2":
+            assert self.init_device == "meta", "Please use model.accelerator.init_device: meta for FSDP2 training"
+        else:
+            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+            # CPU-resident module, and only rank0 would hold weights anyway. Fail
+            # here so every rank stops at parse time, rather than let rank0 die in
+            # DDP's constructor while the others block in its first collective.
+            assert self.init_device != "cpu", (
+                "model.accelerator.init_device: cpu is not supported with fsdp_mode: ddp. "
+                "Use meta or an accelerator device."
+            )
+
+        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
+        # instead of silently ignoring the flag.
+        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
+            "model.accelerator.ep_sharded_stream_load requires "
+            "model.accelerator.broadcast_model_weights_from_rank0=False "
+            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+        )
 
         # `world_size`/`dp_size`/`dp_shard_size`/`dp_replicate_size` are process-global,
         # runtime-derived state, not CLI/YAML-configurable — so (like `world_size` on
@@ -806,24 +887,6 @@ class TrainingArguments:
             )
         },
     )
-    init_device: Literal["cuda", "meta", "npu"] = field(
-        default="meta",
-        metadata={
-            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU."
-        },
-    )
-    broadcast_model_weights_from_rank0: bool = field(
-        default=True,
-        metadata={
-            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
-        },
-    )
-    ep_sharded_stream_load: bool = field(
-        default=False,
-        metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations warn and fall back to the standard loader, so a heterogeneous OmniModel can enable it for its MoE sub-module alone."
-        },
-    )
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
@@ -877,14 +940,9 @@ class TrainingArguments:
     )
 
     # sub-argument groups
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
-    gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
-    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
-    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
-    accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
@@ -898,23 +956,14 @@ class TrainingArguments:
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
 
-        self._validate_accelerator()
-        self._derive_batch_config()
+        self._warn_multi_node()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
 
     # -- validation & derivation helpers (called by __post_init__) -----------------------
 
-    def _validate_accelerator(self):
-        # `dp_size`/`dp_shard_size`/`dp_replicate_size` are already resolved by
-        # `AcceleratorConfig.__post_init__` at construction time. What's left here are
-        # cross-checks against *this* owner's own fields (`init_device`,
-        # `broadcast_model_weights_from_rank0`, `ep_sharded_stream_load`), which
-        # `AcceleratorConfig` has no access to.
-        acc = self.accelerator
-
-        # multi-node warning
-        num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
+    def _warn_multi_node(self):
+        num_nodes = self.world_size // int(os.getenv("LOCAL_WORLD_SIZE", 1))
         if num_nodes > 1:
             logger.warning_rank0(
                 f"Detected {num_nodes} nodes. "
@@ -922,28 +971,13 @@ class TrainingArguments:
                 "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
             )
 
-        # init method constraints
-        if acc.fsdp_config.fsdp_mode == "fsdp2":
-            assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
-        else:
-            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
-            # CPU-resident module, and only rank0 would hold weights anyway. Fail
-            # here so every rank stops at parse time, rather than let rank0 die in
-            # DDP's constructor while the others block in its first collective.
-            assert self.init_device != "cpu", (
-                "init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
-            )
+    def _derive_batch_config(self, accelerator: AcceleratorConfig):
+        """Derive batch/accumulation sizes from the model's accelerator topology.
 
-        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
-        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
-        # instead of silently ignoring the flag.
-        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
-            "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
-            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
-        )
-
-    def _derive_batch_config(self):
-        acc = self.accelerator
+        Takes the accelerator as an argument rather than reading it off ``self``:
+        it lives on ``model`` now, so only the root config can pair the two.
+        """
+        acc = accelerator
 
         # gradient accumulation steps
         if self.global_batch_size is None:
@@ -1309,13 +1343,14 @@ class OpsImplementationConfig:
 
 
 @dataclass
-class ModelArguments:
-    """model.* — Model architecture, paths, and multimodal encoder/decoder setup."""
+class BaseModelArguments:
+    """Model fields shared by every trainable unit, whole model or single module.
 
-    config_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
-    )
+    Deliberately excludes the config/tokenizer/index paths: an omni module is
+    addressed by its subfolder inside a composed checkpoint and never carries
+    its own tokenizer, so those belong on :class:`ModelArguments` alone.
+    """
+
     model_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
@@ -1323,16 +1358,6 @@ class ModelArguments:
     model_config: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config to overwrite foundation model config."},
-    )
-    tokenizer_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
-    )
-    safetensor_idx_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
-        },
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
@@ -1344,13 +1369,92 @@ class ModelArguments:
     )
     ops_implementation: OpsImplementationConfig = field(default_factory=OpsImplementationConfig)
 
+    _fqn_to_index_mapping_cache: ClassVar[Dict[str, Optional[Dict[str, int]]]] = {}
+
+    def __post_init__(self):
+        # Localize here rather than in each owner: every subclass needs a
+        # ``model_path`` that exists on disk before any loader touches it, and a
+        # composed model resolves its module subfolders against this root.
+        self.model_path = _resolve_hdfs_path(self.model_path)
+
+    def _safetensor_idx_path(self) -> Optional[str]:
+        """Where to read the HF ``weight_map`` from. Overridden to allow an explicit path."""
+        if self.model_path is None:
+            return None
+        return os.path.join(self.model_path, "model.safetensors.index.json")
+
+    @property
+    def fqn_to_index_mapping(self) -> Optional[Dict[str, int]]:
+        """Raw HF ``weight_map`` from the safetensor index (MoE key renames happen at runtime).
+
+        Resolved lazily and cached per index path: a composed model builds one of
+        these per module and re-instantiates them on every merge, and sibling
+        modules routinely share a checkpoint, so parsing eagerly would re-read the
+        same index file several times per job.
+        """
+        idx_path = self._safetensor_idx_path()
+        if idx_path is None:
+            self._warn_unsharded()
+            return None
+
+        cache = BaseModelArguments._fqn_to_index_mapping_cache
+        if idx_path not in cache:
+            if os.path.exists(idx_path):
+                from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
+
+                cache[idx_path] = parse_fqn_to_index_mapping_from_json(idx_path)
+            else:
+                cache[idx_path] = None
+
+        mapping = cache[idx_path]
+        if mapping is None:
+            self._warn_unsharded()
+        return mapping
+
+    @staticmethod
+    def _warn_unsharded() -> None:
+        logger.warning_once("fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded.")
+
+
+@dataclass
+class ModelRuntimeArguments(BaseModelArguments):
+    """Everything one training unit needs: model fields + its own accelerator and optimizer.
+
+    This is the shape a per-module runtime consumes. An omni model builds one of
+    these per module and merges it over the model-level defaults, which is why
+    the pair is declared here rather than on :class:`ModelArguments`.
+    """
+
+    accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+
+@dataclass
+class ModelArguments(ModelRuntimeArguments):
+    """model.* — One composed model, plus the paths its loaders resolve from."""
+
+    config_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
+    )
+    tokenizer_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
+    )
+    safetensor_idx_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
+        },
+    )
+
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
             raise ValueError("`config_path` must be specified when `model_path` is None.")
 
         # Download HDFS-hosted paths to a local cache before resolving defaults so
         # that all downstream loaders (config/tokenizer/safetensors) see local paths.
-        self.model_path = _resolve_hdfs_path(self.model_path)
+        super().__post_init__()
         self.config_path = _resolve_hdfs_path(self.config_path)
         self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
 
@@ -1360,22 +1464,9 @@ class ModelArguments:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
 
-        # Auto-resolve safetensor_idx_path from model_path if not specified
-        if self.safetensor_idx_path is None and self.model_path is not None:
-            default_idx_path = os.path.join(self.model_path, "model.safetensors.index.json")
-            if os.path.exists(default_idx_path):
-                self.safetensor_idx_path = default_idx_path
-
-        # Parse raw HF weight_map from safetensor index json (MoE key renames happen at runtime).
-        self.fqn_to_index_mapping = None
-        if self.safetensor_idx_path is not None:
-            from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
-
-            self.fqn_to_index_mapping = parse_fqn_to_index_mapping_from_json(self.safetensor_idx_path)
-        if self.fqn_to_index_mapping is None:
-            logger.warning_rank0(
-                "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
-            )
+    def _safetensor_idx_path(self) -> Optional[str]:
+        """Honour an explicit index path, else fall back to the one under ``model_path``."""
+        return self.safetensor_idx_path or super()._safetensor_idx_path()
 
 
 # ================================ Data Arguments ======================================
@@ -1535,6 +1626,8 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
+        self.train._derive_batch_config(self.model.accelerator)
+
         if self.train.pad_to_length:
             if not self.train.dyn_bsz:
                 logger.warning_rank0(
@@ -1546,36 +1639,41 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
-        if self.train.chunk_mbs_config.enable:
+        accelerator = self.model.accelerator
+        if accelerator.chunk_mbs_config.enable:
             if self.train.pad_to_length:
-                raise ValueError("train.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
-            if self.train.gradient_checkpointing.enable and self.train.gradient_checkpointing.enable_reentrant:
                 raise ValueError(
-                    "train.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
-                    "Set train.gradient_checkpointing.enable_reentrant=False."
+                    "model.accelerator.chunk_mbs_config.enable is not supported with train.pad_to_length yet."
+                )
+            if accelerator.gradient_checkpointing.enable and accelerator.gradient_checkpointing.enable_reentrant:
+                raise ValueError(
+                    "model.accelerator.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
+                    "Set model.accelerator.gradient_checkpointing.enable_reentrant=False."
                 )
             if self.data.data_type == "dpo":
-                raise ValueError("train.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
+                raise ValueError("model.accelerator.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
 
-        if self.train.torch_compile.enable:
-            if self.train.chunk_mbs_config.enable:
+        if accelerator.torch_compile.enable:
+            if accelerator.chunk_mbs_config.enable:
                 raise ValueError(
-                    "train.chunk_mbs_config.enable is not supported with train.torch_compile.enable yet. "
+                    "model.accelerator.chunk_mbs_config.enable is not supported with "
+                    "model.accelerator.torch_compile.enable yet. "
                     "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
                 )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
-                    "train.torch_compile.enable is not supported by this data pipeline. "
+                    "model.accelerator.torch_compile.enable is not supported by this data pipeline. "
                     "The pipeline must implement pad_to_length for static packed shapes."
                 )
             if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports packed language-model data types only; "
+                    "model.accelerator.torch_compile.enable currently supports packed language-model data types only; "
                     f"got data.data_type={self.data.data_type!r}."
                 )
             if not self.train.dyn_bsz or not self.train.pad_to_length:
                 raise ValueError(
-                    "train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True. "
+                    "model.accelerator.torch_compile.enable requires train.dyn_bsz=True and "
+                    "train.pad_to_length=True. "
                     "Variable packed lengths trigger recompilation and prevent stable CUDA Graph replay when enabled; "
                     "see https://github.com/ByteDance-Seed/VeOmni/issues/401."
                 )

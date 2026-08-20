@@ -22,7 +22,7 @@ from veomni.arguments.arguments_types import (
     GradientCheckpointingConfig,
     TorchCompileConfig,
 )
-from veomni.omni_arguments.arguments_types import (
+from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniModelRuntimeArguments,
     OmniModuleRuntimeArguments,
@@ -43,7 +43,7 @@ def _janus_args(*, modules_override: dict | None = None) -> OmniArguments:
         "infer_graph": {"infer_gen": str(cfg_dir / "graph_infer_gen.yaml")},
     }
     if modules_override is not None:
-        from veomni.omni_arguments.parser import load_yaml_with_inherit
+        from veomni.arguments.omni_parser import load_yaml_with_inherit
 
         loaded = load_yaml_with_inherit(str(cfg_dir / "modules_train.yaml"))
         for name, override in modules_override.items():
@@ -77,22 +77,24 @@ def test_validate_omni_accelerator_accepts_defaults():
     _validate_omni_accelerator(AcceleratorConfig())
 
 
-def test_validate_omni_accelerator_rejects_cpu_init_with_ep():
-    acc = AcceleratorConfig(ep_size=2, init_device="cpu")
-    with pytest.raises(AssertionError, match="cpu init"):
-        _validate_omni_accelerator(acc)
+def test_meta_init_for_fsdp2_is_enforced_at_construction():
+    """The rule moved onto ``AcceleratorConfig`` itself, so a module override cannot dodge it.
 
-
-def test_validate_omni_accelerator_requires_meta_init_for_fsdp2():
-    acc = AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="fsdp2"), init_device="cpu")
+    ``_validate_omni_accelerator`` no longer repeats it: it could only ever see a
+    config that already passed.
+    """
     with pytest.raises(AssertionError, match="init_device: meta"):
-        _validate_omni_accelerator(acc)
+        AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="fsdp2"), init_device="cpu")
 
 
-def test_validate_omni_accelerator_rejects_ep_sharded_stream_load_with_broadcast():
-    acc = AcceleratorConfig(ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=True)
+def test_ddp_cpu_init_is_enforced_at_construction():
+    with pytest.raises(AssertionError, match="init_device: cpu is not supported"):
+        AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="ddp"), init_device="cpu")
+
+
+def test_ep_sharded_stream_load_with_broadcast_is_enforced_at_construction():
     with pytest.raises(AssertionError, match="ep_sharded_stream_load"):
-        _validate_omni_accelerator(acc)
+        AcceleratorConfig(ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=True)
 
 
 def test_validate_omni_accelerator_rejects_chunk_mbs_with_pad_to_length():

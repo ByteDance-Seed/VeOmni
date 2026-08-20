@@ -51,7 +51,7 @@ from .dispatch import unwrap_module_chain
 
 
 if TYPE_CHECKING:
-    from ....omni_arguments.arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
+    from ....arguments.omni_arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
     from ....trainer.callbacks import TrainerState
 
 

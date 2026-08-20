@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from veomni.omni_arguments.arguments_types import _resolve_model_path
+from veomni.arguments.omni_arguments_types import _resolve_model_path
 
 
 def _resolved(root: str, module_path: str) -> str:

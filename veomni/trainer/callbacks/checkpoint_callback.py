@@ -40,7 +40,7 @@ class CheckpointerCallback(Callback):
         self.every_n_epochs = args.train.checkpoint.save_epochs
         self._last_saved_step: int = -1
         self.trainer.checkpointer: CheckpointerBase = build_checkpointer(
-            dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
+            dist_backend=args.model.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
         )
 
     def on_step_end(self, state: TrainerState, **kwargs):
