@@ -466,23 +466,21 @@ def init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
-    name: Optional[str] = None,
+    name: Optional[str] = "base",
 ) -> "ParallelState":
     """
-    Initialize a parallel state, optionally register it under ``name``, and set
-    it as the global state when none is current yet.
+    Initialize a parallel state, register it under ``name``, and set it as the
+    global state when none is current yet.
 
-    A name is what standalone trainers register under (normally ``"base"``), and
-    what per-module callers use to keep independently scoped module meshes apart.
-    If a supplied name is already registered, log a warning and return the
-    existing state without building, caching, or overwriting anything.
+    If ``name`` is already registered, log a warning and return the existing
+    state without building, caching, or overwriting anything.
 
-    ``name=None``, the default, claims no registry key, for a caller that holds
-    the returned state itself rather than looking it up later — it would
-    otherwise have to collide on ``"base"`` with the standalone trainers or
-    invent a key nobody reads. Only the registry is opted out of: the state is
-    still topology-cached and still becomes the ambient global if none is set, so
-    a later named call with the same topology hands back this same object.
+    ``name=None`` claims no registry key, for a caller that holds the returned
+    state itself rather than looking it up later — it would otherwise have to
+    collide on ``"base"`` with the standalone trainers or invent a key nobody
+    reads. Only the registry is opted out of: the state is still topology-cached
+    and still becomes the ambient global if none is set, so a later named call
+    with the same topology hands back this same object.
     """
     global _PARALLEL_STATE
 
