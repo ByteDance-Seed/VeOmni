@@ -906,10 +906,16 @@ def write_video_audio(
         ValueError: If an audio tensor is provided but the sample rate cannot be determined.
     """
     duration = len(video) / fps
-    if audio_sample_rate is None:
+    if audio is not None and audio_sample_rate is None:
         audio_sample_rate = int(audio.shape[-1] / duration)
 
     width, height = video[0].size
+    # yuv420p (4:2:0) requires even dimensions: crop odd-sized frames to the
+    # even bound, consistent with save_video_tensors_to_file.
+    width = width // 2 * 2
+    height = height // 2 * 2
+    if (width, height) != video[0].size:
+        video = [frame.crop((0, 0, width, height)) for frame in video]
     container = av.open(output_path, mode="w")
     stream = container.add_stream("libx264", rate=int(fps))
     stream.width = width

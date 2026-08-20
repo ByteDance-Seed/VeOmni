@@ -235,7 +235,15 @@ def _resample_audio(
         if rframe.pts is None:
             rframe.pts = audio_next_pts
         audio_next_pts += rframe.samples
-        rframe.sample_rate = frame_in.sample_rate
+        # Keep the resampler-assigned sample_rate (the target rate), not the
+        # input frame's rate: the encoder/muxer stamps packets from it.
+        container.mux(audio_stream.encode(rframe))
+
+    # Drain the resampler so tail samples are not dropped.
+    for rframe in audio_resampler.resample(None):
+        if rframe.pts is None:
+            rframe.pts = audio_next_pts
+        audio_next_pts += rframe.samples
         container.mux(audio_stream.encode(rframe))
 
     # flush audio encoder

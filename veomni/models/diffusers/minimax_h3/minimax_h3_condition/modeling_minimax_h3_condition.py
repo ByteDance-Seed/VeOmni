@@ -73,8 +73,8 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             try:
                 self._processor = AutoProcessor.from_pretrained(proc_path)
                 self._tokenizer = self._processor.tokenizer
-            except Exception:
-                logger.warning("Failed to load Qwen3-VL processor from %s", proc_path)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load Qwen3-VL processor from {proc_path}") from exc
 
         # Load weights if base path provided
         if base:
@@ -94,26 +94,51 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
                 )
 
             n = self._stream_load_weights(self._text_encoder, te_path, filter_fn=te_filter)
+            if n == 0:
+                raise RuntimeError(
+                    f"Text encoder loaded 0 tensors from {te_path}: no .safetensors shards found in the subfolder."
+                )
             logger.info_rank0("Text encoder loaded (%d tensors).", n)
 
         # ── Video VAE ──
+        # HF layout nests the shards under video_vae/source/; fall back to
+        # the top level for layouts that keep them directly in video_vae/.
         vv_path = f"{base}/{config.video_vae_subfolder}"
+        if os.path.isdir(f"{vv_path}/source"):
+            vv_path = f"{vv_path}/source"
         if os.path.isdir(vv_path):
             n = self._stream_load_weights(self._video_vae, vv_path, key_converter=self._convert_video_vae_keys)
+            if n == 0:
+                raise RuntimeError(
+                    f"Video VAE loaded 0 tensors from {vv_path}: no .safetensors shards found in the subfolder."
+                )
             logger.info_rank0("Video VAE loaded (%d tensors).", n)
 
         # ── Audio VAE ──
         av_path = f"{base}/{config.audio_vae_subfolder}"
         if os.path.isdir(av_path):
             n = self._stream_load_weights(self._audio_vae, av_path, key_converter=self._convert_audio_vae_keys)
+            if n == 0:
+                raise RuntimeError(
+                    f"Audio VAE loaded 0 tensors from {av_path}: no .safetensors shards found in the subfolder."
+                )
             logger.info_rank0("Audio VAE loaded (%d tensors).", n)
 
         # Cast encoders to bf16: the init context casts buffers too (e.g.
         # vision rotary inv_freq). VeOmni meta-init only replaces parameters,
         # leaving buffers at their construction dtype (fp32), which changes
-        # rotary precision.
+        # rotary precision. Fail loudly if any encoder parameter is still on
+        # the meta device (checkpoint tensors missing / strict=False tolerated
+        # the gap): a meta param would crash or corrupt the forward later.
         for enc in [self._text_encoder, self._video_vae, self._audio_vae]:
             if enc is not None:
+                meta_params = [k for k, p in enc.named_parameters() if p.device.type == "meta"]
+                if meta_params:
+                    raise RuntimeError(
+                        f"{type(enc).__name__}: {len(meta_params)} parameter(s) still on "
+                        f"meta device after loading (first: {meta_params[0]!r}); the "
+                        "checkpoint files are missing these tensors."
+                    )
                 enc.to(torch.bfloat16)
                 enc.requires_grad_(False)
 
@@ -482,6 +507,11 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             use_gradient_checkpointing = use_gradient_checkpointing[0]
 
         # Process first sample (batch=1 per micro_batch)
+        if len(input_latents) != 1:
+            raise ValueError(
+                f"MiniMaxH3ConditionModel.process_condition supports micro_batch_size=1 only, "
+                f"got {len(input_latents)} samples."
+            )
         clean_video = input_latents[0]
         clean_audio = audio_input_latents[0]
         prompt = prompt_embeds[0]

@@ -77,7 +77,10 @@ def _modulate_gate(x, gate, other, indices):
 
 def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
     out = torch.empty_like(q)
-    bounds = cu_seqlens.tolist()
+    # Host-side segment bounds: the DiT / token-refiner entries convert the
+    # cu_seqlens tensor once per forward and pass a tuple. Tensor fallback
+    # keeps any external caller working (paying one sync).
+    bounds = tuple(cu_seqlens) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
     for start, stop in zip(bounds[:-1], bounds[1:]):
         if stop == start:
             continue
@@ -478,7 +481,7 @@ class MiniMaxH3DiT(nn.Module):
             img_pos=img_pos.to(device),
             audio_pos=audio_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device),
+            refiner_cu_seqlens=tuple(refiner_cu.to(device).tolist()),
             refiner_max_seqlen=refiner_max,
             seq_len=seq_len,
             device=device,
@@ -494,6 +497,9 @@ class MiniMaxH3DiT(nn.Module):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
+        # Single device→host sync per forward: segment bounds shared across
+        # every block instead of one tolist() per attention module.
+        cu_bounds = tuple(cu_seqlens.tolist())
         block_swap = self._block_swap if self._block_offload_enabled else 0
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
@@ -514,7 +520,7 @@ class MiniMaxH3DiT(nn.Module):
                 combined_indices=combined_indices,
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=cu_bounds,
                 max_seqlen=max_seqlen,
             )
 

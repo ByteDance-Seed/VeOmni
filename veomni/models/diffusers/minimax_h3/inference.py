@@ -20,8 +20,6 @@ Known deviations:
   unpatchify + negation). ref2va audio references are NOT supported by the
   wrapper (raises NotImplementedError); t2va and fl2va paths are numerically
   equivalent.
-- FlowMatchScheduler.set_timesteps ignores the shift kwarg (VeOmni scheduler
-  pins shift at construction; default shifts are 12.0 video / 3.0 audio).
 """
 
 from __future__ import annotations
@@ -49,6 +47,7 @@ from .minimax_h3_core.minimax_h3_text_encoder import (
     video_token_counts,
 )
 from .minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
+from .minimax_h3_core.packed_sequence import build_packed_fl2va
 from .minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 
 
@@ -459,8 +458,6 @@ class MiniMaxH3Pipeline(BasePipeline):
         seed: int = 42,
         rand_device: str = "cpu",
         cfg_scale: float = 1.0,
-        flow_shift: float = 12.0,
-        audio_flow_shift: float = 3.0,
         tiled: bool = True,
         tile_size: int = 256,
         tile_overlap: int = 64,
@@ -495,8 +492,8 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         Input contract: `video` frame lists must ALREADY. be 24fps the pipeline never resamples frame rate.
         """
-        self.scheduler.set_timesteps(num_inference_steps, shift=flow_shift)
-        self.scheduler_audio.set_timesteps(num_inference_steps, shift=audio_flow_shift)
+        self.scheduler.set_timesteps(num_inference_steps)
+        self.scheduler_audio.set_timesteps(num_inference_steps)
 
         inputs_posi = {"prompt": prompt}
         inputs_nega = {"negative_prompt": negative_prompt}
@@ -897,6 +894,7 @@ class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
                 pipe, self._require(ref, "audio", kind), int(self._require(ref, "sample_rate", kind))
             )
             return {"kind": kind, "audio_clean": rows, "ref_audio_t": ref_audio_t}
+        raise ValueError(f"unknown reference type: {kind!r}")
 
     def process(
         self,
@@ -1038,61 +1036,22 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         )
 
     def _build_packed_fl2va(self, text_len, latent_t, latent_h, latent_w, audio_t, keyframe_indices, audio_channel=2):
-        """fl2va layout: [text | cond | audio | video | pad]."""
-        frame_rows = (latent_h // 2) * (latent_w // 2)
-        video_rows = latent_t * frame_rows
-        audio_rows = audio_t * audio_channel
-        num_keyframes = len(keyframe_indices)
-        cond_rows = num_keyframes * frame_rows
-        used = text_len + cond_rows + audio_rows + video_rows
-        seq_len = self._aligned_seq_len(used)
+        """fl2va layout: [text | cond | audio | video | pad].
 
-        text_sl = slice(0, text_len)
-        cond_sl = slice(text_len, text_len + cond_rows)
-        audio_sl = slice(cond_sl.stop, cond_sl.stop + audio_rows)
-        video_sl = slice(audio_sl.stop, audio_sl.stop + video_rows)
-
-        # img_pos covers both cond AND video rows, conditions first
-        img_pos = torch.cat([torch.arange(cond_sl.start, cond_sl.stop), torch.arange(video_sl.start, video_sl.stop)])
-        audio_pos = torch.arange(audio_sl.start, audio_sl.stop)
-
-        g = torch.zeros(seq_len, 3, dtype=torch.float64)
-        g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
-
-        sqrt_area = np.sqrt(latent_h * latent_w)
-        frame, w_grid = self._frame_grid(latent_h, latent_w, sqrt_area)
-
-        # Condition rows: temporal position depends on frame_index
-        temporal_span = self._temporal_position_span(latent_t)
-        for i, idx in enumerate(keyframe_indices):
-            sl = slice(i * frame_rows, (i + 1) * frame_rows)
-            if idx == 0:
-                cond_t = float(text_len)
-            else:  # idx == -1
-                cond_t = float(text_len) + temporal_span - self._FRAME_RESCALE
-            cond_g = torch.empty(frame_rows, 3, dtype=torch.float64)
-            cond_g[:, 0] = cond_t
-            cond_g[:, 1:] = frame
-            g[cond_sl.start + sl.start : cond_sl.start + sl.stop] = cond_g
-
-        g[video_sl] = self._video_grid(latent_t, frame, float(text_len))
-        g[audio_sl, 0] = (float(text_len) + torch.arange(audio_t, dtype=torch.float64)).repeat(audio_channel)
-        g[audio_sl, 2] = self._audio_w_axis(w_grid, audio_t, audio_rows)
-
-        token_tags = torch.full((seq_len,), -1, dtype=torch.long)
-        token_tags[text_sl] = 1
-        token_tags[audio_sl] = 2
-        token_tags[img_pos] = 0  # both cond and video rows are tagged as video (0)
-
-        return {
-            "img_pos": img_pos,
-            "audio_pos": audio_pos,
-            "text_pos": torch.arange(0, text_len),
-            "img_position_ids": g[None],
-            "token_tags": token_tags,
-            "cu_seqlens": torch.tensor([0, used, seq_len], dtype=torch.int32),
-            "seq_len": seq_len,
-        }
+        Delegates to the shared build_packed_fl2va helper (minimax_h3_core.
+        packed_sequence) so train and inference emit identical packing.
+        The shared builder also returns metadata keys (update_mask, cond_rows,
+        text_len, ...) that model_fn_minimax_h3 ignores.
+        """
+        return build_packed_fl2va(
+            text_len=text_len,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=audio_t,
+            keyframe_indices=keyframe_indices,
+            audio_channel=audio_channel,
+        )
 
     def _build_packed_ref2va(self, text_len, latent_t, latent_h, latent_w, audio_t, ref_blocks, audio_channel=2):
         """ref2va layout: [text | ref_0 | ref_1 | ... | target_audio | target_video | pad]"""

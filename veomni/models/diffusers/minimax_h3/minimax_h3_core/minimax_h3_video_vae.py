@@ -456,16 +456,17 @@ class VAEProcessor:
         self.transform_rev = transform_rev
 
     def transform_tensor(self, x):
+        # Explicit layout contract: 5D input must be (B, C, T, H, W) and 4D
+        # input (B, C, H, W), both channel-first. No shape-based layout
+        # inference: guessing from x.shape[2] == 3 / x.shape[1] == 3 would
+        # silently transpose valid channel-first tensors when T == 3 (5D) or
+        # B == 3 (4D).
         if x.ndim == 5:
-            if x.shape[2] == 3:
-                x = x.transpose(1, 2)
             B, _, T, _, _ = x.shape
             x = rearrange(
                 self.transform(rearrange(x, "b c t h w -> (b t) c h w")), "(b t) c h w -> b c t h w", b=B, t=T
             )
         else:
-            if x.ndim == 4 and x.shape[1] == 3:
-                x = x.transpose(0, 1) if x.shape[0] == 3 else x
             x = self.transform(x)
         return x.contiguous()
 

@@ -32,15 +32,18 @@ class _ParquetIterableDataset(IterableDataset):
     """Iterable dataset over .parquet shards; each yielded item is one row dict.
 
     Checkpoint resume: state_dict records the per-worker position (repeat,
-    shard index, row index) of the last yielded row; load_state_dict restores
-    it so iteration continues after that row. Resume assumes the same
-    num_workers / shuffle seed, otherwise the per-worker shard slices and
-    shuffle order change and the saved position is meaningless.
+    shard index, row index just past the last yielded row); load_state_dict
+    restores it so iteration continues after that row. Resume assumes the
+    same num_workers / base seed, otherwise the per-worker shard slices and
+    shuffle order change and the saved position is meaningless. Shuffle order
+    is re-derived per repeat pass (seed = epoch seed + repeat index), so a
+    resume inside a repeat lands on the same order it was recorded in.
     """
 
     def __init__(self, file_paths: list[str], shuffle: bool, seed: int, repeat: int = 1):
         self._paths = file_paths
         self._shuffle = shuffle
+        self._base_seed = seed  # configured seed; set_epoch derives epoch seeds from it
         self._seed = seed
         self._repeat = repeat
         self._pos = None  # {worker_key: {"rep": int, "path_idx": int, "row_idx": int}}, set while iterating
@@ -55,15 +58,9 @@ class _ParquetIterableDataset(IterableDataset):
             paths = list(self._paths)
             wid = 0
         else:
-            per_worker = len(self._paths) // worker_info.num_workers
-            wid = worker_info.id
-            start = wid * per_worker
-            end = start + per_worker if wid < worker_info.num_workers - 1 else len(self._paths)
-            paths = list(self._paths[start:end])
-
-        if self._shuffle:
-            rng = random.Random(self._seed)
-            rng.shuffle(paths)
+            # Round-robin so every worker receives shards even when
+            # num_workers > len(self._paths).
+            paths = list(self._paths[worker_info.id :: worker_info.num_workers])
 
         resume = None if self._resume is None else self._resume.get(self._worker_key(wid))
         self._pos = {self._worker_key(wid): {"rep": 0, "path_idx": 0, "row_idx": 0}}
@@ -71,7 +68,14 @@ class _ParquetIterableDataset(IterableDataset):
         import pandas as pd
 
         for rep in range(resume["rep"] if resume is not None else 0, self._repeat):
-            for pi, p in enumerate(paths):
+            # Each repeat pass shuffles its own copy with a per-repeat seed:
+            # deterministic across restarts (same base seed + rep), and the
+            # saved {rep, path_idx} resume position still lands on the same
+            # shard order for the repeat it was recorded in.
+            rep_paths = list(paths)
+            if self._shuffle:
+                random.Random(self._seed + rep).shuffle(rep_paths)
+            for pi, p in enumerate(rep_paths):
                 if resume is not None and rep == resume["rep"] and pi < resume["path_idx"]:
                     continue
                 df = pd.read_parquet(p)
@@ -83,12 +87,18 @@ class _ParquetIterableDataset(IterableDataset):
                         and ri < resume["row_idx"]
                     ):
                         continue
-                    self._pos[self._worker_key(wid)] = {"rep": rep, "path_idx": pi, "row_idx": ri}
-                    yield row
+                    # Record the next position BEFORE yielding: the generator
+                    # suspends at the yield, so a post-yield write would only
+                    # run on resume and a checkpoint taken mid-iteration would
+                    # record the row it just yielded (re-yielding it on resume).
                     self._pos[self._worker_key(wid)] = {"rep": rep, "path_idx": pi, "row_idx": ri + 1}
+                    yield row
 
     def set_epoch(self, epoch: int):
-        self._seed = epoch
+        # Keep the configured base seed and derive the epoch seed additively,
+        # instead of replacing it: two configs with different base seeds stay
+        # distinct at the same epoch.
+        self._seed = self._base_seed + epoch
 
     def state_dict(self):
         # Empty before the first sample is consumed; checkpointing then
