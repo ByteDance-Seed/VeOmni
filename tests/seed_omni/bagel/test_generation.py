@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from tests.seed_omni.bagel.contracts.helpers import (
+from tests.seed_omni.bagel.helpers import (
     bagel_cfg_dir,
     config_cls,
     load_omni_config,

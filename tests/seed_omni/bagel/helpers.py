@@ -1,3 +1,5 @@
+"""Shared helpers for BAGEL tests."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,7 +12,7 @@ from veomni.omni_arguments import OmniModelRuntimeArguments, build_module_runtim
 
 
 def bagel_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
+    return Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
 
 
 def config_cls(model_type: str):

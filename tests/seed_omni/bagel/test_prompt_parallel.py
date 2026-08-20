@@ -1,12 +1,14 @@
+"""Prompt-parallel BAGEL behavior."""
+
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 import yaml
 
+from tests.seed_omni.bagel.helpers import bagel_cfg_dir
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import TrainingMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
@@ -18,7 +20,7 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.processing import apply_
 from veomni.models.seed_omni.utils.conversation import ConversationItem, iter_desired_items
 
 
-_BAGEL_CONFIG_DIR = Path(__file__).resolve().parents[4] / "configs/seed_omni/Bagel/bagel_7b_mot"
+_BAGEL_CONFIG_DIR = bagel_cfg_dir()
 _HIDDEN_SIZE = 4
 _Z_CHANNELS = 2
 

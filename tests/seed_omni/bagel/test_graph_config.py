@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from tests.seed_omni.bagel.contracts.helpers import bagel_cfg_dir, load_omni_config
+from tests.seed_omni.bagel.helpers import bagel_cfg_dir, load_omni_config
 
 
 def test_bagel_train_yaml_loads_with_v2_module_names():

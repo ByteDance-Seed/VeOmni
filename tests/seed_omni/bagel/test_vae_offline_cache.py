@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
+from tests.seed_omni.bagel.helpers import config_cls, model_cls
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.vae.accelerated import BAGEL_VAE_PIXEL_SHAPE
 from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor

@@ -1,1 +1,0 @@
-"""BAGEL-local contract tests."""

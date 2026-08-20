@@ -7,7 +7,7 @@ import pytest
 import torch
 from PIL import Image
 
-from tests.seed_omni.bagel.contracts.helpers import (
+from tests.seed_omni.bagel.helpers import (
     config_cls,
     model_cls,
     native_model_cls,
