@@ -934,11 +934,15 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig, *, pad_to_length:
     )
     if acc.fsdp_config.fsdp_mode == "fsdp2":
         assert acc.init_device == "meta", "Please use accelerator.init_device: meta for FSDP2 training"
-    elif acc.broadcast_model_weights_from_rank0:
-        logger.warning_rank0(
-            "Ignoring accelerator.broadcast_model_weights_from_rank0=True because it is only "
-            "used with accelerator.fsdp_config.fsdp_mode='fsdp2'. "
-            f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
+    else:
+        # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+        # CPU-resident module. Fail here so every rank stops at parse time rather
+        # than let rank0 die in DDP's constructor while the others block in its
+        # first collective. ``broadcast_model_weights_from_rank0`` needs no warning
+        # alongside it: ``parallelize_model_ddp`` honours the flag now that it
+        # loads weights of its own.
+        assert acc.init_device != "cpu", (
+            "accelerator.init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
         )
 
     assert not (acc.ep_sharded_stream_load and acc.broadcast_model_weights_from_rank0), (

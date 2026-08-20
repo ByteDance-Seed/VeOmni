@@ -15,7 +15,7 @@
 
 import types
 from functools import partial
-from typing import Any, Callable, List, Mapping, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -51,17 +51,34 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
 def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
     """Materialize parameters without discarding config-derived buffers.
 
-    Distributed checkpoints restore ``state_dict()``, which excludes buffers
-    registered with ``persistent=False``. Snapshot those buffers before
-    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
-    materialization path without duplicating persistent buffers that DCP loads.
+    ``init_empty_weights()`` patches ``register_parameter`` only, so a
+    meta-initialized model still holds real buffer values -- and ``to_empty()``
+    replaces every one of them with uninitialized memory. Snapshot them across it
+    instead, on the random-init path as much as the resume path: distributed
+    checkpoints restore ``state_dict()``, which excludes ``persistent=False``,
+    and HF's ``_init_weights`` recomputes a rope table only for a module that
+    exposes ``original_inv_freq``. Buffers outside that shape -- Gemma3's
+    per-layer-type ``{type}_inv_freq`` and its ``embed_scale``, the Omni audio
+    tower's sinusoidal ``positional_embedding`` -- have nothing else to restore
+    them. Persistent buffers are left to whichever loader runs next.
     """
     buffers = []
     for module in model.modules():
         for name in module._non_persistent_buffers_set:
             buffer = module._buffers.get(name)
-            if buffer is not None:
-                buffers.append((module, name, buffer.detach().clone()))
+            if buffer is None:
+                continue
+            if buffer.is_meta:
+                # A buffer derived from a parameter (``self.weight.detach()``) is
+                # on meta like the parameter, and holds nothing to copy out of.
+                # No model does this today; say so rather than let ``to_empty()``
+                # leave uninitialized memory behind unannounced.
+                logger.warning_rank0(
+                    f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
+                    "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
+                )
+                continue
+            buffers.append((module, name, buffer.detach().clone()))
 
     model.to_empty(device=device)
 
@@ -70,148 +87,65 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
         materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
 
 
-def _resolve_weights_path_mapping(
-    model: nn.Module,
-    weights_path: Mapping[str, str],
-) -> List[Tuple[str, nn.Module, str]]:
-    """Resolve a ``{sub_module_name: snapshot_path}`` mapping against the
-    model's direct children.
+def _has_extra_parallel_plan(model: nn.Module) -> bool:
+    """True when the model's parallel plan declares ExtraParallel-sharded tensors.
 
-    Strict bijection: the mapping's keys must equal the set of
-    ``model.named_children()`` names exactly.  This matches the contract
-    OmniModel exposes after the D2.2 small refactor — every declared
-    sub-module is a direct attribute, not nested under a ``modules_dict.``
-    middle layer.
-
-    Returns
-    -------
-    ``[(name, child, path), ...]`` in the mapping's declared order.
-
-    Raises
-    ------
-    KeyError if (a) any mapping key is not a direct child of ``model``, or
-    (b) any direct child of ``model`` is missing from the mapping.  Either
-    side of the mismatch is named in the error so YAML typos / omissions
-    surface immediately — the caller can't accidentally end up with a
-    silently un-initialised sub-module.
+    The question both ExtraParallel guards below actually need to ask. A plan is
+    a property of the *model*, unlike ``ParallelState.any_extra_parallel_enabled``,
+    which only says an ep dim exists in the mesh — and a mesh dim is inherited by
+    every sub-module of a SeedOmni V2 config, including the ones that have no
+    experts.
     """
-    children = dict(model.named_children())
-    unknown = [name for name in weights_path if name not in children]
-    missing = [name for name in children if name not in weights_path]
-    if unknown or missing:
-        msg_parts = [f"weights_path mapping mismatch on {type(model).__name__}:"]
-        if unknown:
-            msg_parts.append(f"unknown key(s) {sorted(unknown)!r} (not a direct child)")
-        if missing:
-            msg_parts.append(f"missing key(s) {sorted(missing)!r} (child has no path)")
-        msg_parts.append(f"available children: {sorted(children)}")
-        raise KeyError(" ".join(msg_parts))
-
-    return [(name, children[name], weights_path[name]) for name in weights_path]
+    plan = get_runtime_parallel_plan(model)
+    return plan is not None and bool(getattr(plan, "extra_parallel_plan", None))
 
 
-def _apply_weights_load_step(
+def _materialize_and_load_weights(
     model: nn.Module,
-    weights_path: Optional[Union[str, Mapping[str, str]]],
+    weights_path: Optional[str],
     materialize_device: str,
     *,
-    broadcast_from_rank0: bool,
+    should_skip_hf_weight_load: bool,
     is_peft_model: bool,
     adapter_path: Optional[str],
-    cpu_load_param_name: Optional[List[str]],
-    max_load_broadcast_size: float,
-    distribute_tensor_fn: Callable[..., Any],
-    fqn_to_index_mapping: Optional[Mapping[str, int]],
+    broadcast_from_rank0: bool,
+    cpu_load_param_name: Optional[List[str]] = None,
+    max_load_broadcast_size: float = 20.0,
+    fqn_to_index_mapping: Optional[dict] = None,
     ep_sharded_stream_load: bool = False,
-    should_skip_hf_weight_load: bool = False,
 ) -> None:
-    """Materialise meta-initialised parameters and (optionally) load weights.
+    """Move meta-initialized parameters onto a real device and fill them in.
 
-    Three behaviours, dispatched by the type of ``weights_path``:
-
-    * ``None`` — call ``model.to_empty(device=...)`` then ``model.init_weights()``
-      (HF random init).  Behaviourally identical to the pre-D2.2 inline
-      block in ``parallelize_model_fsdp2``.
-    * ``str`` — load the entire ``model`` from the single snapshot at the
-      given path via ``rank0_load_and_broadcast_weights`` (when broadcast
-      is enabled) or ``load_model_weights`` (every-rank-reads fallback).
-      Behaviourally identical to the pre-D2.2 inline block; this is the
-      path BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer all hit.
-    * ``Mapping[str, str]`` — strict bijection over ``model.named_children()``:
-      every direct child must have an entry, every entry must name a
-      direct child.  Each ``(sub_module_name, sub_path)`` pair is loaded
-      via the same ``rank0_load_and_broadcast_weights`` / ``load_model_weights``
-      pair as the ``str`` branch, scoped to the corresponding child
-      subtree.  This is the path OmniTrainer (D2.3) will use to load
-      each named sub-module from its own HF snapshot.
-
-    Notes
-    -----
-    * The ``str`` / ``None`` branches preserve the pre-D2.2 control flow
-      and call sites — ``rank0_load_and_broadcast_weights`` and
-      ``load_model_weights`` are invoked with the same args in the same
-      order.  A small structural cleanup (eager ``distribute_tensor``
-      import; ``kwargs.pop`` of ``is_peft_model`` / ``adapter_path``
-      lifted to the caller) is functionally a no-op for those paths.
-    * The ``Mapping`` branch deliberately rejects ``is_peft_model=True``:
-      the existing PEFT loader (``model_utils.load_model_weights``) maps
-      a single base-model checkpoint into a single PEFT-wrapped model,
-      and there is no sane interpretation of "PEFT" applied uniformly
-      across a heterogeneous set of OmniModel sub-modules.  D-track will
-      design per-sub-module PEFT once V2 trainers settle; refusing the
-      combination today prevents silent miswiring.
-    * Calling ``load_model_weights`` on a child sub-tree of an FSDP-wrapped
-      root mirrors the pre-D2.2 ``str`` path's behaviour against
-      ``model.to_empty(...)`` on the wrapped root — both rely on
-      ``to_empty`` propagating through FSDP DTensor parameters.  This
-      composition is exercised end-to-end by D2.3's smoke tests (which
-      run real FSDP) — the unit tests here only cover dispatch.
+    Shared by the FSDP2 and DDP paths: both build the model on ``meta`` and are
+    the only place that materializes it, so the choice between random init, an
+    HF snapshot and a checkpoint resume has to be made identically for each.
     """
+    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
+    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
+    # and still need the HF base weights.
     if should_skip_hf_weight_load and is_peft_model:
         raise ValueError(
             "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
             "trainable-only and the frozen base must still be loaded from weights_path."
         )
 
-    if should_skip_hf_weight_load:
-        logger.info_rank0(
-            "Skipping pretrained weight load for checkpoint resume; "
-            "parameters will be restored from the distributed checkpoint."
-        )
+    if weights_path is None or should_skip_hf_weight_load:
+        if should_skip_hf_weight_load:
+            logger.info_rank0(
+                "Skipping pretrained weight load for checkpoint resume; "
+                "parameters will be restored from the distributed checkpoint."
+            )
+        # Preserve non-persistent buffers on the random-init path too: HF's
+        # ``_init_weights`` recomputes only rope tables shaped the way it expects,
+        # so the rest would train on whatever ``to_empty()`` left behind.
         _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
         _reset_hf_initialized_flag(model)
+        # Random init is unnecessary when the checkpoint will overwrite every parameter.
+        if not should_skip_hf_weight_load:
+            model.init_weights()
         return
 
-    if weights_path is None:
-        model.to_empty(device=materialize_device)
-        _reset_hf_initialized_flag(model)
-        model.init_weights()
-        return
-
-    if isinstance(weights_path, Mapping):
-        if is_peft_model:
-            raise NotImplementedError(
-                "weights_path: Mapping[str, str] is incompatible with is_peft_model=True. "
-                "PEFT for V2 OmniModel sub-modules will be designed in a follow-up; "
-                "for now, pass a single str weights_path or disable PEFT."
-            )
-        loaded = _resolve_weights_path_mapping(model, weights_path)
-        for name, child, sub_path in loaded:
-            logger.info_rank0(f"Loading weights for sub-module {name!r} from {sub_path}...")
-            _load_one(
-                model=child,
-                weights_path=sub_path,
-                materialize_device=materialize_device,
-                broadcast_from_rank0=broadcast_from_rank0,
-                is_peft_model=False,
-                adapter_path=None,
-                cpu_load_param_name=cpu_load_param_name,
-                max_load_broadcast_size=max_load_broadcast_size,
-                distribute_tensor_fn=distribute_tensor_fn,
-                fqn_to_index_mapping=None,
-                ep_sharded_stream_load=ep_sharded_stream_load,
-            )
-        return
+    from torch.distributed.tensor import distribute_tensor
 
     logger.info_rank0(f"starting to load model weights from {weights_path}...")
     if is_peft_model:
@@ -219,54 +153,33 @@ def _apply_weights_load_step(
             logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
         else:
             logger.info_rank0("also init peft model lora weights...")
-    _load_one(
-        model=model,
-        weights_path=weights_path,
-        materialize_device=materialize_device,
-        broadcast_from_rank0=broadcast_from_rank0,
-        is_peft_model=is_peft_model,
-        adapter_path=adapter_path,
-        cpu_load_param_name=cpu_load_param_name,
-        max_load_broadcast_size=max_load_broadcast_size,
-        distribute_tensor_fn=distribute_tensor_fn,
-        fqn_to_index_mapping=fqn_to_index_mapping,
-        ep_sharded_stream_load=ep_sharded_stream_load,
-    )
 
-
-def _load_one(
-    *,
-    model: nn.Module,
-    weights_path: str,
-    materialize_device: str,
-    broadcast_from_rank0: bool,
-    is_peft_model: bool,
-    adapter_path: Optional[str],
-    cpu_load_param_name: Optional[List[str]],
-    max_load_broadcast_size: float,
-    distribute_tensor_fn: Callable[..., Any],
-    fqn_to_index_mapping: Optional[Mapping[str, int]],
-    ep_sharded_stream_load: bool = False,
-) -> None:
-    """Materialise + load weights into one (sub-)tree from a single snapshot.
-
-    Centralises the rank0-broadcast vs. every-rank-reads choice so both
-    the ``str`` and ``Mapping`` branches above share identical loader
-    behaviour.  ``model`` here may be the full top-level model or a
-    single named child — both are valid ``nn.Module`` instances.
-
-    ``ep_sharded_stream_load`` opts into :func:`load_model_weights_ep_sharded`
-    (each rank reads only its ExtraParallel dim-0 slice of the expert tensors),
-    an independent fast/low-memory path for large MoE checkpoints. It is only
-    valid for the every-rank-reads (non-broadcast) case; if the model/checkpoint
-    is unsupported the loader raises and we fall back to ``load_model_weights``.
-    """
-    if ep_sharded_stream_load and not broadcast_from_rank0:
-        logger.info_rank0(
-            "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
+    if broadcast_from_rank0:
+        logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
+        rank0_load_and_broadcast_weights(
+            model,
+            weights_path,
+            materialize_device,
+            dtensor_factory=distribute_tensor,
+            cpu_load_param_name=cpu_load_param_name,
+            max_load_broadcast_size=max_load_broadcast_size,
+            is_peft_model=is_peft_model,
+            adapter_path=adapter_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
         )
-        _dt_local_split = partial(distribute_tensor_fn, src_data_rank=None)
-        try:
+    else:
+        _dt_local_split = partial(distribute_tensor, src_data_rank=None)
+        if ep_sharded_stream_load and _has_extra_parallel_plan(model):
+            # Opt-in fast/low-memory path for large MoE checkpoints: each rank
+            # reads only its ExtraParallel dim-0 slice of the expert tensors
+            # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
+            # Only valid on the every-rank-reads (non-broadcast) path. An
+            # unsupported *checkpoint* still raises ``NotImplementedError``, which
+            # we surface directly rather than silently falling back -- an opt-in
+            # flag that quietly degrades is hard to reason about.
+            logger.info_rank0(
+                "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
+            )
             load_model_weights_ep_sharded(
                 model,
                 weights_path,
@@ -276,43 +189,26 @@ def _load_one(
                 adapter_path=adapter_path,
                 fqn_to_index_mapping=fqn_to_index_mapping,
             )
-            return
-        except NotImplementedError as e:
-            # Deliberately degrades instead of failing early: the flag is global
-            # (``train.ep_sharded_stream_load``) but this helper runs once per
-            # OmniModule, and every sub-module without an ExtraParallel plan — the
-            # vision encoder, VAE, connector — raises here. Aborting would make the
-            # flag unusable for any heterogeneous model whose MoE backbone wants it.
-            logger.warning_rank0(
-                f"ep_sharded_stream_load unsupported for this model/checkpoint ({e}); "
-                "falling back to load_model_weights."
+        else:
+            if ep_sharded_stream_load:
+                # The flag is set once for a whole run, but this helper runs once
+                # per model -- once per OmniModule under SeedOmni V2 -- and a model
+                # with no ExtraParallel plan (vision encoder, VAE, connector) has
+                # no expert tensors to stream. Skipping is not a silent degrade:
+                # there was never a fast path to take here, and refusing instead
+                # would make the flag unusable for any heterogeneous model whose
+                # MoE backbone wants it.
+                logger.info_rank0("Ignoring ep_sharded_stream_load for a model with no ExtraParallel parallel_plan.")
+            logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
+            load_model_weights(
+                model,
+                weights_path,
+                materialize_device,
+                dtensor_factory=_dt_local_split,
+                is_peft_model=is_peft_model,
+                adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
             )
-
-    if broadcast_from_rank0:
-        logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-        rank0_load_and_broadcast_weights(
-            model,
-            weights_path,
-            materialize_device,
-            dtensor_factory=distribute_tensor_fn,
-            cpu_load_param_name=cpu_load_param_name,
-            max_load_broadcast_size=max_load_broadcast_size,
-            is_peft_model=is_peft_model,
-            adapter_path=adapter_path,
-            fqn_to_index_mapping=fqn_to_index_mapping,
-        )
-    else:
-        logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-        _dt_local_split = partial(distribute_tensor_fn, src_data_rank=None)
-        load_model_weights(
-            model,
-            weights_path,
-            materialize_device,
-            dtensor_factory=_dt_local_split,
-            is_peft_model=is_peft_model,
-            adapter_path=adapter_path,
-            fqn_to_index_mapping=fqn_to_index_mapping,
-        )
 
 
 def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
@@ -377,7 +273,7 @@ def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, 
 
 def parallelize_model_fsdp2(
     model: "nn.Module",
-    weights_path: Optional[Union[str, Mapping[str, str]]] = None,
+    weights_path: Optional[str] = None,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
@@ -408,26 +304,7 @@ def parallelize_model_fsdp2(
         emb_plan = {"embed_tokens.weight": Shard(0), "decoder.embed_tokens.weight": Shard(0)}
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
-
-    Args:
-        weights_path: One of three forms:
-            * ``None`` — random init (``to_empty + init_weights``).
-            * ``str`` — single HF snapshot path; loads the entire ``model``.
-              All existing single-model trainers (BaseTrainer / VLMTrainer /
-              TextTrainer / DiTTrainer) hit this branch.
-            * ``Mapping[str, str]`` — ``{sub_module_name: snapshot_path}``,
-              keyed by the model's direct ``named_children()`` names.
-              **Strict bijection** — every direct child must appear as a
-              key, every key must name a direct child; mismatches raise
-              ``KeyError``.  Each named child is loaded from its own
-              snapshot via the same loader the ``str`` branch uses.
-              Used by V2 OmniModel (D2.3), where each declared sub-module
-              owns its own HF folder.  Incompatible with
-              ``is_peft_model=True`` — raises ``NotImplementedError``.
     """
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
@@ -750,25 +627,22 @@ def parallelize_model_fsdp2(
                 prefetch_modules = prev_block._fsdp_modules
                 current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
-    # Handle meta initialization for FSDP2 (fallback if pre-load not done).
+    # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    from torch.distributed.tensor import distribute_tensor
-
-    _apply_weights_load_step(
-        model=model,
-        weights_path=weights_path,
-        materialize_device=materialize_device,
-        broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+    _materialize_and_load_weights(
+        model,
+        weights_path,
+        materialize_device,
+        should_skip_hf_weight_load=should_skip_hf_weight_load,
         is_peft_model=kwargs.pop("is_peft_model", False),
         adapter_path=kwargs.pop("adapter_path", None),
+        broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
         cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
         max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
-        distribute_tensor_fn=distribute_tensor,
         fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
-        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load", False)),
-        should_skip_hf_weight_load=should_skip_hf_weight_load,
+        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
     )
 
     if materialize_device == "cpu":
@@ -784,63 +658,68 @@ def parallelize_model_fsdp2(
 
 def parallelize_model_ddp(
     model: "nn.Module",
-    weights_path: Optional[Union[str, Mapping[str, str]]] = None,
+    weights_path: Optional[str] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
-    """Apply DDP (replicated) data parallelism to the model.
+    """Replicate the model with DDP, materializing it first under meta-init.
 
-    DDP keeps a **full replica of plain
-    tensors** per rank: :class:`~torch.nn.parallel.DistributedDataParallel` only
-    registers gradient-sync hooks and broadcasts rank-0's params at construction.
-    It does **not** materialise meta-init params nor load weights — so under the
-    meta-init flow we must materialise + load the full weights *before* wrapping;
-    DDP then broadcasts the loaded rank-0 weights to every rank.
-
-    Args:
-        weights_path: One of three forms:
-            * ``None`` — random init (``to_empty + init_weights``).
-            * ``str`` — single HF snapshot path; loads the entire ``model``.
-              All existing single-model trainers (BaseTrainer / VLMTrainer /
-              TextTrainer / DiTTrainer) hit this branch.
-            * ``Mapping[str, str]`` — ``{sub_module_name: snapshot_path}``,
-              keyed by the model's direct ``named_children()`` names.
-              **Strict bijection** — every direct child must appear as a
-              key, every key must name a direct child; mismatches raise
-              ``KeyError``.  Each named child is loaded from its own
-              snapshot via the same loader the ``str`` branch uses.
-              Used by V2 OmniModel (D2.3), where each declared sub-module
-              owns its own HF folder.  Incompatible with
-              ``is_peft_model=True`` — raises ``NotImplementedError``.
-            loaded as full tensors (no DTensor sharding).
-        should_skip_hf_weight_load: On a distributed-checkpoint resume the HF
-            snapshot is about to be overwritten, so skip reading it and only
-            materialise the params. Must be honoured here too, or a DDP resume
-            re-reads the whole snapshot — and fails outright when it is gone.
+    DDP keeps a full replica of plain tensors per rank: it registers gradient
+    hooks and broadcasts rank0's parameters at construction, but it neither
+    materializes meta parameters nor loads weights. Under meta-init nothing else
+    does either — ``build_model`` returns an empty model and ``BaseTrainer`` has
+    no load step of its own — so the wrap used to reach DDP's constructor with
+    meta parameters and die there on ``Tensor.item()``. A model that arrives with
+    real weights already loaded must not be touched here.
     """
     parallel_state = get_parallel_state()
 
-    # Under meta-init the params are still on `meta` here; DDP wrapping neither
-    # materialises them nor loads weights, so do it now (full-tensor load).
-    if kwargs.get("init_device") == "meta":
-        from torch.distributed.tensor import distribute_tensor
+    # Only fsdp2 applies the ExtraParallel plan that shards expert weights, so a
+    # DDP module's experts are whole. Refuse rather than load full tensors into a
+    # model whose plan says they are sharded -- until now the meta crash below hid
+    # this combination. Keyed on the model's plan, not on
+    # ``any_extra_parallel_enabled``: a SeedOmni V2 sub-module inherits the global
+    # accelerator's ep dim whether or not it owns any experts, so the mesh alone
+    # would refuse a plan-less DDP vision tower that is perfectly fine.
+    if parallel_state.any_extra_parallel_enabled and _has_extra_parallel_plan(model):
+        raise RuntimeError(
+            "ExtraParallel (ep) requires fsdp_mode='fsdp2'; DDP does not apply the parallel plan that shards experts."
+        )
 
-        _apply_weights_load_step(
-            model=model,
-            weights_path=weights_path,
-            materialize_device=get_device_type(),
+    # Ask the parameters, not ``init_device``: the flag states an intent a model
+    # builder is free to ignore -- the data tests construct their model eagerly
+    # while the config still says ``meta`` -- and materializing a model that
+    # already holds real weights would discard them, or raise outright on a plain
+    # nn.Module with no ``init_weights``.
+    if any(param.is_meta for param in model.parameters()):
+        _materialize_and_load_weights(
+            model,
+            weights_path,
+            get_device_type(),
+            should_skip_hf_weight_load=should_skip_hf_weight_load,
+            is_peft_model=kwargs.pop("is_peft_model", False),
+            adapter_path=kwargs.pop("adapter_path", None),
+            # The flag was fsdp2-only while DDP loaded nothing at all. Now that
+            # this path loads, it applies verbatim: ``rank0_load_and_broadcast_weights``
+            # broadcasts over the default (world) group from global rank0, and a
+            # DDP replica wants exactly that whole tensor. Honouring it is what
+            # keeps a DDP run off the every-rank-reads path, which the flag
+            # defaults to avoiding.
             broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
-            is_peft_model=kwargs.get("is_peft_model", False),
-            adapter_path=kwargs.get("adapter_path", None),
             cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
             max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
-            # DDP params are plain tensors (not DTensors), so this factory is
-            # never invoked by _dispatch_parameter; passed for signature parity
-            # with the FSDP2 path.
-            distribute_tensor_fn=distribute_tensor,
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
-            should_skip_hf_weight_load=should_skip_hf_weight_load,
         )
+
+        # Anything the loader left behind would otherwise surface as
+        # ``Tensor.item() cannot be called on meta tensors`` from inside DDP's
+        # constructor, which names neither the parameter nor the cause.
+        unmaterialized = [name for name, param in model.named_parameters() if param.is_meta]
+        if unmaterialized:
+            raise RuntimeError(
+                f"DDP received unmaterialized parameters after loading from {weights_path!r}: "
+                f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
+            )
 
     # PyTorch DDP rejects modules with zero trainable params. Fully-frozen
     # encoders (e.g. Seedream offline_cache OE/ViT/VAE under ``no_grad``) still
@@ -870,6 +749,8 @@ def parallelize_model_ddp(
     # first node's autograd graph saved for backward (PyTorch #22095 / #66504).
     # ``SyncBatchNorm`` is the one real fix — it all-reduces the statistics inside
     # forward — and it works identically under DDP, FSDP2 and HSDP.
+    #
+    # See constraint 7e in `.agents/knowledge/constraints.md`.
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],
@@ -881,7 +762,7 @@ def parallelize_model_ddp(
 
 def build_parallelize_model(
     model: "nn.Module",
-    weights_path: Optional[Union[str, Mapping[str, str]]] = None,
+    weights_path: Optional[str] = None,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
@@ -894,22 +775,13 @@ def build_parallelize_model(
     """Apply parallel strategies to the model.
 
     Args:
-        weights_path: One of three forms:
-            * ``None`` — random init under FSDP2.
-            * ``str`` — single HF snapshot for the whole model (the path
-              all single-model trainers — BaseTrainer / VLMTrainer /
-              TextTrainer / DiTTrainer — hit today).
-            * ``Mapping[str, str]`` — ``{sub_module_name: snapshot_path}``
-              keyed by ``model.named_children()`` (strict bijection;
-              missing or extra keys raise ``KeyError``).  Used by V2
-              OmniModel (D2.3) to load each declared sub-module from its
-              own folder.  See :func:`parallelize_model_fsdp2` for details.
+        weights_path: ``None`` for random init, or a single HF snapshot for the
+            whole ``model``. The single-model trainers (BaseTrainer / VLMTrainer
+            / TextTrainer / DiTTrainer) pass ``args.model.model_path``; SeedOmni
+            V2 calls this once per ``ModuleRuntime``, with that module's path.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
     chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)

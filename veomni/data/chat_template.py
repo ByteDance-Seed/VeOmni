@@ -14,18 +14,19 @@
 
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, List, Sequence
+from collections import defaultdict
+from typing import TYPE_CHECKING, Dict, List, Sequence, Union
 
 import torch
 
 from veomni.utils import logging
 
-from ..utils.constants import IGNORE_INDEX
+from ..utils.constants import IGNORE_INDEX, TYPE2INDEX
 from ..utils.registry import Registry
 
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizer
+    from transformers import PreTrainedTokenizer, ProcessorMixin
 
 
 logger = logging.get_logger(__name__)
@@ -34,8 +35,22 @@ ROLE_SUPPORTED = ["system", "user", "assistant", "tool"]
 CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
 
 
-def build_chat_template(template_name: str, tokenizer: "PreTrainedTokenizer") -> "ChatTemplate":
-    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer)
+def build_chat_template(
+    template_name: str,
+    tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"],
+    **kwargs,
+) -> "ChatTemplate":
+    """Builds any registered template, text-only or multimodal.
+
+    Text-only templates take a tokenizer; multimodal ones take the processor,
+    which carries both the tokenizer and the grid parameters they need. Callers
+    pass whatever their modality has, matching the template their config names.
+
+    ``kwargs`` reach the template constructor. No template currently declares
+    one, so an unrecognised option raises there instead of being silently
+    dropped.
+    """
+    return CHAT_TEMPLATE_REGISTRY[template_name](tokenizer_or_processor, **kwargs)
 
 
 class ChatTemplate(ABC):
@@ -236,89 +251,6 @@ class Llama2Template(ChatTemplate):
         )
 
 
-@CHAT_TEMPLATE_REGISTRY.register("Janus")
-class JanusTemplate(ChatTemplate):
-    def encode_messages(
-        self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192, task_type: str = ""
-    ) -> Dict[str, List[int]]:
-        input_ids, attention_mask, labels = [], [], []
-        images_seq_mask, images_emb_mask = [], []
-        seps = ["\n\n", "<｜end▁of▁sentence｜>"]
-        assitant_cnt = 0
-        for idx, message in enumerate(messages):
-            if message["content"] == "":
-                content_str = message["role"] + ":"
-            elif (
-                "assistant" in message["role"]
-                and "wikihow_generation" in task_type
-                or "assistant" in message["role"]
-                and "interleave_generation" in task_type
-            ):
-                prefix = "Assistant: " if assitant_cnt == 0 else ""
-                suffix = seps[1] if idx + 1 == len(messages) else seps[0]
-                content_str = prefix + message["content"].strip() + suffix
-                assitant_cnt += 1
-            elif "assistant" in message["role"]:
-                content_str = "Assistant" + ": " + message["content"].strip() + seps[1]
-            elif "user" in message["role"]:
-                content_str = "User" + ": " + message["content"].strip() + seps[0]
-            elif "system" in message["role"] and "wikihow_generation" in task_type:
-                content_str = (
-                    message["content"].strip()
-                    + seps[0]
-                    + "Please generate a step-by-step tutorial with images for the following question."
-                    + seps[0]
-                )
-            elif "system" in message["role"]:
-                content_str = message["content"].strip() + seps[0]
-            if "system" in message["role"]:
-                content_ids = self.tokenizer.encode(content_str)
-            else:
-                content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
-            input_ids += content_ids
-            attention_mask += [1] * len(content_ids)
-            image_token_id = self.tokenizer.vocab.get("<image_placeholder>")
-            content_ids_tensor = torch.tensor(content_ids)
-            images_seq_mask += (content_ids_tensor == image_token_id).tolist()
-            image_token_id = self.tokenizer.vocab.get("<image_placeholder>")
-            num_image_tokens = torch.sum(content_ids_tensor == image_token_id).item()
-            n_image = num_image_tokens // 576
-            if n_image > 0:
-                for _j, n_image_tokens in enumerate([num_image_tokens]):
-                    images_emb_mask.append([True] * n_image_tokens)
-
-            if message["loss_mask"] == 1:
-                if (
-                    image_token_id in content_ids
-                    and "wikihow_generation" not in task_type
-                    and "interleave_generation" not in task_type
-                ):
-                    labels += [image_token_id if x == image_token_id else IGNORE_INDEX for x in content_ids]
-                else:
-                    labels += content_ids
-            else:
-                labels += [IGNORE_INDEX] * len(content_ids)
-
-        model_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "images_seq_mask": images_seq_mask,
-            "images_emb_mask": images_emb_mask,
-        }
-        model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
-        return model_inputs
-
-    def get_jinja_template(self) -> str:
-        return (
-            "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}"
-            "{% for message in messages %}"
-            "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] | trim + '<|im_end|>\n' }}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
-        )
-
-
 @CHAT_TEMPLATE_REGISTRY.register("chatml")
 class ChatmlTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
@@ -350,3 +282,287 @@ class ChatmlTemplate(ChatTemplate):
             "{% endfor %}"
             "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
         )
+
+
+class MultimodalChatTemplate(ChatTemplate):
+    """Base for templates whose messages carry non-text content.
+
+    ``encode_messages`` takes a different contract from the text-only base: it
+    receives the per-modality token counts the processor derived from the actual
+    pixels, because only then can the template expand a placeholder into the
+    right number of pad tokens. Selecting one of these by name from a text-only
+    trainer therefore fails at encode time, not at build time.
+
+    Built from the processor rather than the tokenizer, since laying those
+    placeholders out also needs the grid parameters the processor used.
+    """
+
+    def __init__(self, processor: "ProcessorMixin") -> None:
+        super().__init__(processor.tokenizer)
+        self.processor = processor
+
+    @abstractmethod
+    def encode_messages(
+        self, messages: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
+    ) -> Dict[str, List[int]]:
+        """
+        Encodes messages to a dictionary of input_ids, attention_mask, labels, and mm with mm_seqlens.
+        """
+
+    def get_jinja_template(self) -> str:
+        return ""
+
+
+class Qwen2VLTemplate(MultimodalChatTemplate):
+    def __init__(self, processor: "ProcessorMixin") -> None:
+        super().__init__(processor)
+        self.image_pad = "<|image_pad|>"
+        self.video_pad = "<|video_pad|>"
+        self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
+        self.video_token_id = self.tokenizer.convert_tokens_to_ids(self.video_pad)
+        # A tokenizer that never learned a pad answers with its unk id, and
+        # _tokenize_and_remap would then rewrite every unk in the batch into a
+        # modality sentinel, marking positions that carry no pixels. A tokenizer
+        # with no unk id answers None instead, which the remap leaves alone.
+        unk_token_id = getattr(self.tokenizer, "unk_token_id", None)
+        missing_pads = [
+            pad
+            for pad, token_id in ((self.image_pad, self.image_token_id), (self.video_pad, self.video_token_id))
+            if unk_token_id is not None and token_id == unk_token_id
+        ]
+        if missing_pads:
+            raise ValueError(f"The Qwen-VL chat template requires the {' and '.join(missing_pads)} tokenizer tokens.")
+
+        logger.info_rank0("Qwen2VLTemplate will not truncate sequence when longer than [max_seq_lens].")
+
+    def image_pattern(self, token_num):
+        return "<|vision_start|>" + self.image_pad * token_num + "<|vision_end|>"
+
+    def video_pattern(self, token_num):
+        return "<|vision_start|>" + self.video_pad * token_num + "<|vision_end|>"
+
+    @staticmethod
+    def _next_token_num(token_nums, modality: str) -> int:
+        """Pull the next per-item token count, naming the modality when short.
+
+        A bare ``StopIteration`` here surfaces inside a dataloader worker with no
+        indication of which modality ran out of counts.
+        """
+        try:
+            return next(token_nums)
+        except StopIteration as e:
+            raise ValueError(f"{modality.capitalize()} token number is missing for a {modality} input.") from e
+
+    def _tokenize_and_remap(self, messages: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
+        """Tokenize rendered messages and remap modality pads to TYPE2INDEX.
+
+        Shared by every Qwen-VL variant: the subclasses differ only in how they
+        render ``messages`` (system prompt, video timestamps), not in how the
+        rendered text becomes ids. Keeping one copy means a change to the
+        modality contract cannot land in one variant and miss the other.
+        """
+        input_ids, attention_mask, labels = [], [], []
+        for message in messages:
+            content_str = message["content"].strip()
+            loss_mask = message["loss_mask"]
+            message_ids = self.tokenizer.encode("<|im_start|>" + message["role"] + "\n", add_special_tokens=False)
+            # The "<|im_start|>{role}\n" header is a fixed prompt prefix, never a training target.
+            prefix_len = len(message_ids)
+
+            if content_str:
+                end_ids = self.tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
+                content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
+                message_ids += content_ids + end_ids
+
+            input_ids += message_ids
+            attention_mask += [1] * len(message_ids)
+            if loss_mask == 1:
+                labels += [IGNORE_INDEX] * prefix_len + message_ids[prefix_len:]
+            else:
+                labels += [IGNORE_INDEX] * len(message_ids)
+
+        tokenized_example = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+
+        # Replace the Qwen image/video pad ids with VeOmni's modality sentinels,
+        # which is what process_sample_qwen_vl turns into image_mask / video_mask.
+        image_mask = tokenized_example["input_ids"] == self.image_token_id
+        tokenized_example["input_ids"][image_mask] = TYPE2INDEX["input"]["image"]
+
+        video_mask = tokenized_example["input_ids"] == self.video_token_id
+        tokenized_example["input_ids"][video_mask] = TYPE2INDEX["input"]["video"]
+
+        return tokenized_example
+
+    @abstractmethod
+    def encode_messages(self, messages: Sequence[Dict[str, str]], **kwargs) -> Dict[str, List[int]]:
+        pass
+
+
+@CHAT_TEMPLATE_REGISTRY.register("qwen2vl")
+class Qwen2VLChatTemplate(Qwen2VLTemplate):
+    system_prompt = "You are a helpful assistant."
+
+    def _get_system_message(self):
+        system_message = {
+            "role": "system",
+            "content": self.system_prompt,
+            "loss_mask": 0,
+        }
+        return system_message
+
+    def encode_messages(
+        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
+    ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
+        sys_msg = self._get_system_message()
+        messages = [] if sys_msg is None else [sys_msg]
+        # Read, not popped: the per-modality counts belong to the caller, and the
+        # local iterators already give the one-shot consumption this needs.
+        image_token_num_list = iter(num_tokens.get("image", []))
+        video_token_num_list = iter(num_tokens.get("video", []))
+        for message in conversations:
+            role = message[0]
+            content = ""
+            for value in message[1:]:
+                if value[0] == "text":
+                    content += value[1]
+                elif value[0] == "image":
+                    content += self.image_pattern(self._next_token_num(image_token_num_list, "image"))
+                elif value[0] == "video":
+                    content += self.video_pattern(self._next_token_num(video_token_num_list, "video"))
+                else:
+                    raise ValueError(f"Unknown value type: {value[0]}")
+            messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "loss_mask": 1 if role == "assistant" else 0,
+                }
+            )
+
+        return self._tokenize_and_remap(messages)
+
+
+# Qwen2.5-VL shares Qwen2-VL's template; the decorator form takes one name per class.
+CHAT_TEMPLATE_REGISTRY.register("qwen2_5vl", Qwen2VLChatTemplate)
+
+
+@CHAT_TEMPLATE_REGISTRY.register("qwen3vl")
+class Qwen3VLChatTemplate(Qwen2VLTemplate):
+    def _calculate_timestamps(self, indices: List[int], video_fps: float, temporal_patch_size: int):
+        """
+        Replicates Qwen3-VL official logic: Pad -> Convert to Seconds -> Average.
+        """
+        # 1. Pad frame indices to be divisible by temporal_patch_size
+        # Copied first: VideoMetadata.frames_indices is declared list[int], and
+        # padding it in place would append duplicate frames to the caller's
+        # metadata.
+        indices = list(indices)
+        if len(indices) % temporal_patch_size != 0:
+            indices.extend([indices[-1]] * (temporal_patch_size - len(indices) % temporal_patch_size))
+
+        # 2. Convert indices to timestamps (seconds)
+        timestamps = [idx / video_fps for idx in indices]
+
+        # 3. Merge by size and take the average of start/end timestamps for each chunk
+        timestamps = [
+            (timestamps[i] + timestamps[i + temporal_patch_size - 1]) / 2
+            for i in range(0, len(timestamps), temporal_patch_size)
+        ]
+        return timestamps
+
+    def encode_messages(
+        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
+    ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
+        messages = []
+        image_token_num_list = iter(num_tokens.get("image", []))
+        video_token_num_list = iter(num_tokens.get("video", []))
+
+        # Retrieve video metadata iterator; ensures order matches video inputs in conversations
+        video_metadata_list = iter(kwargs.get("video_metadata", []))
+
+        for message in conversations:
+            role = message[0]
+            content = ""
+            for value in message[1:]:
+                if value[0] == "text":
+                    content += value[1]
+                elif value[0] == "image":
+                    content += self.image_pattern(self._next_token_num(image_token_num_list, "image"))
+
+                elif value[0] == "video":
+                    total_video_tokens = self._next_token_num(video_token_num_list, "video")
+                    # Read off the same video processor that derived the grid, so
+                    # the two agree on the chunk count. Models reusing this
+                    # template need not all patch time by the same amount. Read
+                    # here so a processor with no video side is never touched.
+                    temporal_patch_size = self.processor.video_processor.temporal_patch_size
+
+                    # Get metadata for the current video
+                    try:
+                        v_meta = next(video_metadata_list)
+                    except StopIteration as e:
+                        raise ValueError("Video metadata is missing for a video input.") from e
+
+                    # 1. Extract FPS (default to 2.0 if missing)
+                    fps = v_meta.fps if v_meta.fps is not None else 2.0
+
+                    # 2. Retrieve sampled frame indices
+                    if hasattr(v_meta, "frames_indices") and v_meta.frames_indices is not None:
+                        indices = v_meta.frames_indices
+                        # Convert numpy array to list if necessary
+                        if hasattr(indices, "tolist"):
+                            indices = indices.tolist()
+                        elif not isinstance(indices, list):
+                            indices = list(indices)
+                    else:
+                        # Fallback: create indices based on total frame count
+                        total_frames = v_meta.total_num_frames if v_meta.total_num_frames is not None else 16
+                        indices = list(range(total_frames))
+
+                    # 3. Calculate timestamps using the new logic
+                    timestamps = self._calculate_timestamps(indices, fps, temporal_patch_size=temporal_patch_size)
+
+                    # 4. Calculate visual tokens per time chunk
+                    num_time_chunks = len(timestamps)
+                    # The vision tower emits exactly total_video_tokens embeddings and
+                    # the model scatters them onto the placeholders emitted below, so
+                    # an uneven split would drop placeholders and misalign every
+                    # visual feature after it. The chunk count is re-derived from
+                    # frames_indices rather than taken from video_grid_thw, so this
+                    # only stays exact while the two agree -- fail loudly when not.
+                    if num_time_chunks == 0 or total_video_tokens % num_time_chunks != 0:
+                        raise ValueError(
+                            f"Cannot lay out {total_video_tokens} video tokens over {num_time_chunks} time "
+                            f"chunks ({len(indices)} frame indices, temporal_patch_size={temporal_patch_size}): "
+                            f"the token count must divide evenly across chunks."
+                        )
+                    tokens_per_chunk = total_video_tokens // num_time_chunks
+
+                    # 5. Construct Qwen3-VL style video string
+                    # Format: <t seconds><|vision_start|>...tokens...<|vision_end|>
+                    video_str_buffer = ""
+                    for t_val in timestamps:
+                        video_str_buffer += f"<{float(t_val):.1f} seconds>"
+                        video_str_buffer += "<|vision_start|>"
+                        video_str_buffer += self.video_pad * tokens_per_chunk
+                        video_str_buffer += "<|vision_end|>"
+
+                    content += video_str_buffer
+
+                else:
+                    raise ValueError(f"Unknown value type: {value[0]}")
+
+            messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "loss_mask": 1 if role == "assistant" else 0,
+                }
+            )
+
+        return self._tokenize_and_remap(messages)
