@@ -22,7 +22,7 @@ from veomni.arguments.arguments_types import (
     GradientCheckpointingConfig,
     TorchCompileConfig,
 )
-from veomni.omni_arguments.arguments_types import (
+from veomni.arguments.omni_arguments_types import (
     OmniArguments,
     OmniModelRuntimeArguments,
     OmniModuleRuntimeArguments,
@@ -43,7 +43,7 @@ def _janus_args(*, modules_override: dict | None = None) -> OmniArguments:
         "infer_graph": {"infer_gen": str(cfg_dir / "graph_infer_gen.yaml")},
     }
     if modules_override is not None:
-        from veomni.omni_arguments.parser import load_yaml_with_inherit
+        from veomni.arguments.omni_parser import load_yaml_with_inherit
 
         loaded = load_yaml_with_inherit(str(cfg_dir / "modules_train.yaml"))
         for name, override in modules_override.items():

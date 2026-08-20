@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
-
 from .arguments_types import (
     AcceleratorConfig,
     BaseModelArguments,
@@ -40,53 +38,29 @@ from .arguments_types import (
     VeOmniArguments,
     WandbConfig,
 )
-from .parser import parse_args, save_args
-
-
-if TYPE_CHECKING:
-    from ..omni_arguments import (
-        OMNI_TRAIN_WORKFLOWS,
-        OmniArguments,
-        OmniDataArguments,
-        OmniGraphProfileArguments,
-        OmniInferArguments,
-        OmniModelRuntimeArguments,
-        OmniModuleRuntimeArguments,
-        OmniTrainingArguments,
-        parse_omni_args,
-    )
-
-_OMNI_EXPORTS = frozenset(
-    {
-        "OMNI_TRAIN_WORKFLOWS",
-        "OmniArguments",
-        "OmniDataArguments",
-        "OmniGraphProfileArguments",
-        "OmniInferArguments",
-        "OmniModelRuntimeArguments",
-        "OmniModuleRuntimeArguments",
-        "OmniTrainingArguments",
-        "parse_omni_args",
-    }
+from .omni_arguments_types import (
+    DEFAULT_SCENARIO,
+    OMNI_TRAIN_WORKFLOWS,
+    OmniArguments,
+    OmniDataArguments,
+    OmniGraphProfileArguments,
+    OmniInferArguments,
+    OmniModelRuntimeArguments,
+    OmniModuleRuntimeArguments,
+    OmniTrainingArguments,
+    build_module_args,
+    build_module_runtime_args,
+    build_omni_model_runtime,
+    resolve_omni_model,
 )
-
-
-def __getattr__(name: str) -> Any:
-    """Re-export the V2 argument types lazily.
-
-    ``veomni.omni_arguments`` builds its dataclasses on top of this package's V1
-    config objects, so importing it eagerly here would break whichever of the two
-    packages a process happens to import first.
-    """
-    if name in _OMNI_EXPORTS:
-        from .. import omni_arguments
-
-        return getattr(omni_arguments, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+from .omni_parser import load_yaml_with_inherit, parse_omni_args
+from .parser import parse_args, save_args
 
 
 __all__ = [
     "AcceleratorConfig",
+    "BaseModelArguments",
+    "ModelRuntimeArguments",
     "CheckpointConfig",
     "ChunkMBSConfig",
     "DataArguments",
@@ -112,7 +86,13 @@ __all__ = [
     "OmniModelRuntimeArguments",
     "OmniTrainingArguments",
     "OMNI_TRAIN_WORKFLOWS",
+    "DEFAULT_SCENARIO",
+    "build_module_args",
+    "build_module_runtime_args",
+    "build_omni_model_runtime",
+    "load_yaml_with_inherit",
     "parse_args",
     "parse_omni_args",
+    "resolve_omni_model",
     "save_args",
 ]

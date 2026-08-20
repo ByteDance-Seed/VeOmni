@@ -11,7 +11,7 @@
 > `VeOmniMixin`，且 `generate` 已经不在其列——它现在是 native `modeling.py` 里
 > `InferenceMixin` 的方法。以下正文保留原文，只作历史参考。
 
-> SeedOmni V2 (`veomni/models/seed_omni/`) 重写——把固定的 `Encoder → Foundation → Decoder` 三元结构换成**显式图声明**的模块化系统。`ModuleMixin` 是共享 mixin 基类；每个子模型再写 `XxxModuleMixin(ModuleMixin)`（`modulemixin.py`）并与 HuggingFace `PreTrainedModel` 多继承（`modeling.py`）。`training_graph` 是一条条 edge（`{from, to}`，端点为 `module[.method]`），node 由 endpoints 自动并出；同一 module 可挂多个 method。每个 node 必有出边——指向另一个 node 或保留关键字 `end`（虚拟终点），保证图无孤岛、无环。训练执行序由 topo sort 推导（可视化时画出 forward queue + `data` 伪节点）；推理由 FSM 驱动，每个 state 的 `body` 也是一条条内联 edge，可无限循环（text→image→text→image→...）。**数据完全 model-agnostic**：raw_batch 起点只有 `conversation_list`（list of dict，含 type / value / role / loss_mask），chat template / tokenize / image processor / boundary marker 注入全部由对应 module 在 forward 阶段自管——同一份数据可同时喂给任意 ug 模型；每个 module 的 `forward(**kwargs) -> Dict` 返回 dict 被框架写回共享 `raw_batch`（data 100% 走 raw_batch、module 之间不互相返回值）；collator helper / SP slice 由各 module 自己在 pre_forward 中按需调用（ViT 切 image batch、text encoder 切 sequence，各管各的）。loss 按 `_loss` 后缀隐式收集——每个 module 一次 forward 内部把所有 micro-batch 跑完，`post_forward` 自己做 token-level mean，OmniModel 顶层只把各 module 的标量 `_loss` 加起来。并行采用全局单一 `ParallelState`，OmniModel 顶层单次 `build_parallelize_model` 包装，`ParallelPlan` 由子模块递归聚合。生命周期上 weights 走 `build_foundation_model` + `build_parallelize_model`（多模块 path dict）、save 由各 module-trainer 的 `OmniModuleHfCallback` / `OmniModuleLoraCallback` 写到各 subfolder（config + 可选 processor/tokenizer 资产）。**配置拆分**：`base.yaml`（`model.model.model_path` + `model.model.model_config.modules` + `model.model.model_config.train_graph` + `model.accelerator` + `infer` 块）→ `OmniArguments.resolve_model()`（`omni_arguments/arguments_types.py`）合并 train/infer module 覆盖并解析相对 `model.model.model_path`，产出 runtime config（`OmniModelRuntimeArguments`）；`.to_hf_config()` 才投影成 HF `OmniConfig`。**FSM 转移**：只有 `module_signal` 与 `default` 两种 condition；text 侧由 `JanusTextEncoder` 通过 `module._tokenizer` 解析后发出 `start_image_gen` / `text_done` 等信号。**不保留 V1 兼容**。
+> SeedOmni V2 (`veomni/models/seed_omni/`) 重写——把固定的 `Encoder → Foundation → Decoder` 三元结构换成**显式图声明**的模块化系统。`ModuleMixin` 是共享 mixin 基类；每个子模型再写 `XxxModuleMixin(ModuleMixin)`（`modulemixin.py`）并与 HuggingFace `PreTrainedModel` 多继承（`modeling.py`）。`training_graph` 是一条条 edge（`{from, to}`，端点为 `module[.method]`），node 由 endpoints 自动并出；同一 module 可挂多个 method。每个 node 必有出边——指向另一个 node 或保留关键字 `end`（虚拟终点），保证图无孤岛、无环。训练执行序由 topo sort 推导（可视化时画出 forward queue + `data` 伪节点）；推理由 FSM 驱动，每个 state 的 `body` 也是一条条内联 edge，可无限循环（text→image→text→image→...）。**数据完全 model-agnostic**：raw_batch 起点只有 `conversation_list`（list of dict，含 type / value / role / loss_mask），chat template / tokenize / image processor / boundary marker 注入全部由对应 module 在 forward 阶段自管——同一份数据可同时喂给任意 ug 模型；每个 module 的 `forward(**kwargs) -> Dict` 返回 dict 被框架写回共享 `raw_batch`（data 100% 走 raw_batch、module 之间不互相返回值）；collator helper / SP slice 由各 module 自己在 pre_forward 中按需调用（ViT 切 image batch、text encoder 切 sequence，各管各的）。loss 按 `_loss` 后缀隐式收集——每个 module 一次 forward 内部把所有 micro-batch 跑完，`post_forward` 自己做 token-level mean，OmniModel 顶层只把各 module 的标量 `_loss` 加起来。并行采用全局单一 `ParallelState`，OmniModel 顶层单次 `build_parallelize_model` 包装，`ParallelPlan` 由子模块递归聚合。生命周期上 weights 走 `build_foundation_model` + `build_parallelize_model`（多模块 path dict）、save 由各 module-trainer 的 `OmniModuleHfCallback` / `OmniModuleLoraCallback` 写到各 subfolder（config + 可选 processor/tokenizer 资产）。**配置拆分**：`base.yaml`（`model.model.model_path` + `model.model.model_config.modules` + `model.model.model_config.train_graph` + `model.accelerator` + `infer` 块）→ `OmniArguments.resolve_model()`（`arguments/omni_arguments_types.py`）合并 train/infer module 覆盖并解析相对 `model.model.model_path`，产出 runtime config（`OmniModelRuntimeArguments`）；`.to_hf_config()` 才投影成 HF `OmniConfig`。**FSM 转移**：只有 `module_signal` 与 `default` 两种 condition；text 侧由 `JanusTextEncoder` 通过 `module._tokenizer` 解析后发出 `start_image_gen` / `text_done` 等信号。**不保留 V1 兼容**。
 
 ## 总纲（不变量）
 
@@ -224,7 +224,7 @@ class JanusTextEncoderAccelerated(VeOmniMixin, JanusTextEncoder): ...
 | **Infer modules**（`modules_infer.yaml`，可选） | 每个 module 的推理覆盖，与 train modules **按模块名 deep-merge**；默认每个 module 走 eager 加载 |
 | **Infer graph**（`graph_infer_*.yaml`） | 一个文件一个场景，文件本身**就是**那张 FSM（顶层 `initial:` / `states:`，无 wrapper key），由 `infer.infer_graph` 映射 |
 
-运行时加载（训练 / 推理均通过 `veomni.omni_arguments.arguments_types`，由 `OmniArguments.resolve_model()` 调用；推理时传 `for_inference=True`）：
+运行时加载（训练 / 推理均通过 `veomni.arguments.omni_arguments_types`，由 `OmniArguments.resolve_model()` 调用；推理时传 `for_inference=True`）：
 
 ```python
 from veomni.arguments import OmniArguments
@@ -888,7 +888,7 @@ property dict view，**不**是 `nn.ModuleDict`。
 不同模块可以各自声明 `accelerator.init_device` / `accelerator.gradient_checkpointing.enable` 等。这些字段的
 交叉校验（`init_device` 与 `fsdp_mode`/`ep_size` 的关系、`chunk_mbs_config` 与 `pad_to_length`/
 `gradient_checkpointing.enable_reentrant` 的关系、`torch_compile.enable` 的整体禁用）由
-`veomni.omni_arguments.arguments_types._validate_omni_accelerator` 负责，分别对顶层默认 `model.accelerator`
+`veomni.arguments.omni_arguments_types._validate_omni_accelerator` 负责，分别对顶层默认 `model.accelerator`
 （`OmniArguments.__post_init__` 时）和每个模块解析后的 `accelerator`（`resolve_omni_model` 里，模块合并之后）各
 校验一次——只放在 Omni 侧，不写进 V1 也会用到的共享 `AcceleratorConfig.__post_init__`（V1 的 `torch_compile` 是
 支持的，且校验逻辑不同）。
@@ -1420,7 +1420,7 @@ veomni/models/seed_omni/                    # 整个目录完全重写，不保�
 ├── training_graph.py                       # TrainingGraph：DAG 视图，按 edges topo 推执行序
 ├── generation_graph.py                     # GenerationGraph：FSM 视图，按 state.body (edges) 分发
 ├── configuration_omni.py                   # OmniConfig：纯 HF PretrainedConfig（checkpoint 读写 + graph sidecar）
-├── omni_arguments/arguments_types.py       # OmniArguments launcher schema + resolve_omni_model / build_omni_model_runtime：launcher YAML -> OmniModelRuntimeArguments；.to_hf_config() 投影成 HF OmniConfig
+├── arguments/omni_arguments_types.py       # OmniArguments launcher schema + resolve_omni_model / build_omni_model_runtime：launcher YAML -> OmniModelRuntimeArguments；.to_hf_config() 投影成 HF OmniConfig
 ├── modeling_omni.py                        # OmniModel：DAG forward + FSM generate + parallel plan 聚合 + 多模块 build/load/save
 └── modules/                                # 每个子模块：configuration + modeling（native）+ accelerated（训练钩子）[+ processing]
     ├── base/                                # 跨 family 复用的轻量模块
@@ -1524,7 +1524,7 @@ veomni/models/seed_omni/                    # 整个目录完全重写，不保�
 
 20. **FSM 转移完全由模块驱动，state 无步数预算**：state body 跑一次后持续循环，直到某条转移触发——"跑多少步、何时结束 state" 由模块决定，不由 YAML 的步数预算控制（框架已无 `token_length` 概念）。AR 循环靠 `module_signal`：模块在 return dict 写语义化一次性 flag（`image_complete`、`start_image_gen`、`text_done` …），YAML 用 `{type: module_signal, key: K}`，框架 pop key 防 stale；单趟 bridge / leaf state（prompt encode、emit `<boi>`/`<eoi>`）靠 `{type: default}`（catch-all 无条件匹配，body 跑一次即转移；与 `module_signal` 并列时必须排在最后做 fallback，否则框架报错）。框架只有 `module_signal` 与 `default` 两种 condition，不在 YAML 硬编码 vocab id。
 
-21. **配置拆分：base launcher + 拆分的 module / graph 文件**：`base.yaml` 管 `model.model.model_path` / `model.model.model_config.modules` / `model.model.model_config.train_graph` / `model.accelerator` / 训练超参 / `infer` 块；`modules_train.yaml` 管每模块训练覆盖，`graph_train.yaml` 本身就是 training DAG 的 edge 列表；`modules_infer.yaml`（可选）覆盖推理模块（按模块名 deep-merge，默认 eager），`graph_infer_*.yaml` 本身就是一张 generation FSM。graph 文件顶层不再包 `training_graph:` / `generation_graph:` —— 文件即 graph（checkpoint sidecar 例外，它要用 key 承载多场景 map）。加载走 `OmniArguments.resolve_model()`（底层 `resolve_omni_model`，见 `omni_arguments/arguments_types.py`），返回 **runtime config**（`OmniModelRuntimeArguments`）；需要 HF checkpoint 形态时再显式 `.to_hf_config()`。`infer_graph` 传整张场景 map，全部载入 `generation_graphs`，`infer_type` 选激活项。`visualize_omni_graph.py` 与 trainer 共用这条路径（且只需 build 一次 config 就能画出全部场景的 FSM；可视化只读图，直接用 runtime config 不做转换）。
+21. **配置拆分：base launcher + 拆分的 module / graph 文件**：`base.yaml` 管 `model.model.model_path` / `model.model.model_config.modules` / `model.model.model_config.train_graph` / `model.accelerator` / 训练超参 / `infer` 块；`modules_train.yaml` 管每模块训练覆盖，`graph_train.yaml` 本身就是 training DAG 的 edge 列表；`modules_infer.yaml`（可选）覆盖推理模块（按模块名 deep-merge，默认 eager），`graph_infer_*.yaml` 本身就是一张 generation FSM。graph 文件顶层不再包 `training_graph:` / `generation_graph:` —— 文件即 graph（checkpoint sidecar 例外，它要用 key 承载多场景 map）。加载走 `OmniArguments.resolve_model()`（底层 `resolve_omni_model`，见 `arguments/omni_arguments_types.py`），返回 **runtime config**（`OmniModelRuntimeArguments`）；需要 HF checkpoint 形态时再显式 `.to_hf_config()`。`infer_graph` 传整张场景 map，全部载入 `generation_graphs`，`infer_type` 选激活项。`visualize_omni_graph.py` 与 trainer 共用这条路径（且只需 build 一次 config 就能画出全部场景的 FSM；可视化只读图，直接用 runtime config 不做转换）。
 
 ---
 

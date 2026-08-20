@@ -19,7 +19,7 @@ points (``tasks/omni/train_omni.py`` / ``tasks/omni/infer_omni.py``) are the onl
 consumers of this package-level surface. Everything else (``ModuleRuntime``,
 ``OmniModelRuntime``, the per-module callbacks, ``MultiOptimizer``/``MultiLRScheduler``,
 ``build_module_runtime_args``, …) is always imported directly from its owning submodule
-(``veomni.models.seed_omni.accelerator.*``, ``veomni.omni_arguments.*``,
+(``veomni.models.seed_omni.accelerator.*``, ``veomni.arguments.*``,
 ``veomni.trainer.callbacks.omni_callbacks``, ``veomni.trainer.omni.omni_trainer``) —
 import it from there instead of adding it back here.
 """

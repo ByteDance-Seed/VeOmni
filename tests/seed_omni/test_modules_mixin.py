@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.arguments import OmniArguments, OmniDataArguments
+from veomni.arguments import OmniArguments, OmniDataArguments, OmniModelRuntimeArguments, build_omni_model_runtime
 from veomni.models.seed_omni import (
     OMNI_ACCELERATED_MODEL_REGISTRY,
     OMNI_MODEL_REGISTRY,
@@ -18,7 +18,6 @@ from veomni.models.seed_omni import (
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.models.seed_omni.utils.conversation import ConversationItem
-from veomni.omni_arguments import OmniModelRuntimeArguments, build_omni_model_runtime
 
 
 def _config_cls(model_type: str):
@@ -737,7 +736,7 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
 
 def test_init_applies_eager_defaults_for_inference():
     """Inference applies all-eager defaults on top of ``model.model_config.modules``."""
-    from veomni.omni_arguments.arguments_types import build_module_runtime_args
+    from veomni.arguments.omni_arguments_types import build_module_runtime_args
 
     runtime_args = build_module_runtime_args(
         global_args=_omni_base_args(model_path="/tmp/janus"),
@@ -772,7 +771,7 @@ def test_init_resolves_relative_module_paths():
     assert cfg.generation_graph is not None
     assert cfg.generation_graph["initial"] == "prompt_encode"
 
-    from veomni.omni_arguments.arguments_types import build_module_runtime_args
+    from veomni.arguments.omni_arguments_types import build_module_runtime_args
 
     runtime_args = build_module_runtime_args(
         global_args=_omni_base_args(model_path=root),

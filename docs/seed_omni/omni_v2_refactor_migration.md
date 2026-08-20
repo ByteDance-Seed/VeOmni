@@ -215,7 +215,7 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   ```
 - Cross-field validation (`init_device` vs `fsdp_mode`/`ep_size`, `chunk_mbs_config` vs
   `pad_to_length`/`gradient_checkpointing.enable_reentrant`, the blanket `torch_compile.enable`
-  ban) is Omni-only (`_validate_omni_accelerator` in `veomni/omni_arguments/arguments_types.py`),
+  ban) is Omni-only (`_validate_omni_accelerator` in `veomni/arguments/omni_arguments_types.py`),
   run once against the top-level default and once per resolved module — so a per-module override
   is validated too, not just the global default.
 - The default all-eager accelerator for inference (`resolve_model(for_inference=True)` /

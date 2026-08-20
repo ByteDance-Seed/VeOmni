@@ -11,7 +11,7 @@ Scope
 Full end-to-end (real Janus weights) inference is covered by
 ``tasks/infer/infer_omni.py`` and the broader integration suite; this file
 stays runnable without GPU / weights and assumes the caller passes a
-well-formed :class:`~veomni.omni_arguments.OmniArguments`
+well-formed :class:`~veomni.arguments.OmniArguments`
 (no construction-time defensive checks to pin).
 """
 
@@ -126,8 +126,8 @@ def test_module_exports_inferencer_and_request():
 
 
 def test_module_needs_distributed_only_when_declared_non_eager():
+    from veomni.arguments import OmniModuleRuntimeArguments
     from veomni.arguments.parser import _instantiate_recursive
-    from veomni.omni_arguments import OmniModuleRuntimeArguments
     from veomni.trainer.omni.omni_inferencer import _module_needs_distributed
 
     # fsdp2 / ddp need a distributed (torchrun) launch + own ParallelState.
@@ -161,8 +161,8 @@ def test_module_needs_distributed_only_when_declared_non_eager():
 
 
 def test_build_module_args_from_checkpoint_module_entry():
+    from veomni.arguments.omni_arguments_types import build_module_args
     from veomni.models.seed_omni.configuration_omni import OmniConfig
-    from veomni.omni_arguments.arguments_types import build_module_args
 
     omni_config = OmniConfig.from_dict(
         {

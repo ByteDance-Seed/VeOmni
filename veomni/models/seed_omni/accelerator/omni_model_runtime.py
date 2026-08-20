@@ -34,7 +34,7 @@ from .utils import iter_named_omni_modules, save_module_subdirectory
 
 if TYPE_CHECKING:
     from ....arguments import OmniGraphProfileArguments
-    from ....omni_arguments.arguments_types import OmniModelRuntimeArguments
+    from ....arguments.omni_arguments_types import OmniModelRuntimeArguments
     from ....trainer.callbacks import TrainerState
     from .module_runtime import ModuleRuntime
 
@@ -92,7 +92,7 @@ class OmniModelRuntime:
     ) -> OmniModelRuntime:
         """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`.
 
-        ``train`` is the global :class:`~....omni_arguments.arguments_types.OmniTrainingArguments`
+        ``train`` is the global :class:`~....arguments.omni_arguments_types.OmniTrainingArguments`
         (unset for inference) — forwarded to every :class:`ModuleRuntime` so its
         checkpoint manager can resolve the shared ``save_path``/``output_dir``/``load_path``.
         """

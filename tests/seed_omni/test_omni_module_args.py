@@ -7,9 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from veomni.arguments import OmniArguments, OmniDataArguments, OmniInferArguments
+from veomni.arguments import (
+    OmniArguments,
+    OmniDataArguments,
+    OmniInferArguments,
+    OmniModelRuntimeArguments,
+    build_module_runtime_args,
+    build_omni_model_runtime,
+)
 from veomni.models.seed_omni.configuration_omni import OmniConfig
-from veomni.omni_arguments import OmniModelRuntimeArguments, build_module_runtime_args, build_omni_model_runtime
 
 
 def _janus_cfg_dir() -> Path:
@@ -135,7 +141,7 @@ def test_build_module_runtime_args_resolves_relative_model_paths():
 def test_build_module_runtime_args_merges_module_optimizer():
     """Global ``model.optimizer`` is the base; per-module YAML can override."""
     from veomni.arguments import OptimizerConfig
-    from veomni.omni_arguments.arguments_types import OmniModuleRuntimeArguments
+    from veomni.arguments.omni_arguments_types import OmniModuleRuntimeArguments
 
     global_args = OmniModuleRuntimeArguments(
         optimizer=OptimizerConfig(lr=1e-4, weight_decay=0.01),
