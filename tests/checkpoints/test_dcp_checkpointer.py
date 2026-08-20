@@ -459,12 +459,6 @@ class TestDdpMetaInit:
         loader.assert_not_called()
         torch.testing.assert_close(wrapped.module.weight, weight, rtol=0, atol=0)
 
-    def test_rejects_cpu_init_device(self, wrap_ddp):
-        # device_ids names an accelerator, so rank0's CPU replica cannot be
-        # wrapped and the meta ranks would block in DDP's first collective.
-        with pytest.raises(RuntimeError, match="init_device='cpu' is not supported"):
-            wrap_ddp(nn.Linear(2, 2), weights_path="hf-path", init_device="cpu")
-
     def test_does_not_reinitialize_a_real_model_that_has_init_weights(self, wrap_ddp, monkeypatch):
         # The nn.Linear case above fails loudly; a model that does define
         # init_weights would instead have its weights silently overwritten.

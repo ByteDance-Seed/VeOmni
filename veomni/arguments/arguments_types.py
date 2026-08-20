@@ -859,6 +859,13 @@ class TrainingArguments:
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
         else:
+            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+            # CPU-resident module, and only rank0 would hold weights anyway. Fail
+            # here so every rank stops at parse time, rather than let rank0 die in
+            # DDP's constructor while the others block in its first collective.
+            assert self.init_device != "cpu", (
+                "init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
+            )
             if self.broadcast_model_weights_from_rank0:
                 logger.warning_rank0(
                     "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "

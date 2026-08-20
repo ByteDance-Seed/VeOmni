@@ -663,16 +663,6 @@ def parallelize_model_ddp(
     if kwargs.get("ep_sharded_stream_load"):
         raise RuntimeError("train.ep_sharded_stream_load requires fsdp_mode='fsdp2'; DDP experts are not sharded.")
 
-    # ``device_ids`` below names an accelerator, so a CPU-resident replica cannot
-    # be wrapped at all: under ``init_device="cpu"`` rank0 keeps its weights on
-    # CPU while every other rank builds empty (``veomni/models/loader.py``).
-    # Refuse on every rank before any snapshot is read, rather than let rank0 die
-    # in DDP's constructor while the others block in its first collective.
-    if kwargs.get("init_device") == "cpu":
-        raise RuntimeError(
-            "init_device='cpu' is not supported with fsdp_mode='ddp'; use 'meta' or an accelerator device."
-        )
-
     # Ask the parameters, not ``init_device``: the flag states an intent a model
     # builder is free to ignore -- the data tests construct their model eagerly
     # while the config still says ``meta`` -- and materializing a model that
