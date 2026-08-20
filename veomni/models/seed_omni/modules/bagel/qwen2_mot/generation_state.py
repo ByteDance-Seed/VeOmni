@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import torch
 
@@ -269,6 +270,45 @@ class MotGenerationState:
 
     # ── Denoise velocity round ──────────────────────────────────
 
+    def iter_serial_denoise_inputs(
+        self,
+        query: torch.Tensor,
+        generation_kwargs: dict[str, object],
+        *,
+        timestep: object,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield one ``forward_inference`` input dict per active CFG branch."""
+        query = query.to(device=device, dtype=dtype)
+        query_len = int(query.shape[0])
+        if query_len < 3:
+            raise ValueError("BAGEL Qwen2-MoT denoise query must include start/end marker embeddings.")
+
+        branches = self._denoise_branches_for_timestep(generation_kwargs, timestep)
+        self._pending_denoise_branches = branches
+        self._pending_denoise_query_len = query_len
+        for branch in branches:
+            context = self._cache_for_branch(branch)
+            context.require_ready()
+            cache_len = context.cache_len()
+            packed_key_value_indexes = context.packed_key_value_indexes
+            if packed_key_value_indexes is None:
+                packed_key_value_indexes = torch.empty(0, device=device, dtype=torch.long)
+            yield {
+                "packed_query_sequence": query,
+                "query_lens": torch.tensor([query_len], device=device, dtype=torch.int32),
+                "packed_query_position_ids": context.repeated_position_ids(query_len, device=device),
+                "packed_query_indexes": torch.arange(
+                    cache_len, cache_len + query_len, device=device, dtype=torch.long
+                ),
+                "past_key_values": context.cache,
+                "key_values_lens": context.key_values_lens,
+                "packed_key_value_indexes": packed_key_value_indexes,
+                "packed_text_indexes": torch.tensor([0, query_len - 1], device=device, dtype=torch.long),
+                "packed_vae_token_indexes": torch.arange(1, query_len - 1, device=device, dtype=torch.long),
+            }
+
     def preprocess_parallel_denoise_inputs(
         self,
         query: torch.Tensor,
@@ -279,7 +319,7 @@ class MotGenerationState:
         device: torch.device,
         dtype: torch.dtype,
     ) -> dict[str, Any]:
-        """Stack active CFG branches into one span-wise FlashAttention call."""
+        """Stack active CFG branches into one packed ``forward_inference`` call."""
         query = query.to(device=device, dtype=dtype)
         query_len = int(query.shape[0])
         if query_len < 3:
@@ -365,8 +405,8 @@ class MotGenerationState:
         if cfg_text_scale <= 1.0:
             return False
 
-        # CFG is enabled only for the configured open-left, closed-right
-        # diffusion-time interval, matching official BAGEL scheduling.
+        # CFG applies only inside the configured open-left, closed-right
+        # diffusion-time interval.
         interval = generation_kwargs.get("cfg_interval", (0.0, 1.0))
         if interval is None:
             lower, upper = 0.0, 1.0
@@ -415,34 +455,35 @@ class MotGenerationState:
         cfg_renorm_min = float(generation_kwargs.get("cfg_renorm_min", 0.0))
         cfg_renorm_type = str(generation_kwargs.get("cfg_renorm_type", "global"))
 
-        # Text guidance first moves from the text-unconditional branch toward
-        # main; optional image guidance then moves from cfg_img toward it.
-        guided = cfg_text_velocity + cfg_text_scale * (main_velocity - cfg_text_velocity)
-        if cfg_renorm_type == "text_channel":
-            norm_main = torch.norm(main_velocity, dim=-1, keepdim=True)
-            norm_text = torch.norm(guided, dim=-1, keepdim=True)
-            scale = (norm_main / (norm_text + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-            merged = guided * scale
+        # Official InterleaveInferencer wraps generate_image in bf16 autocast, so
+        # the CFG scale/norm/renorm math is not the same as eager bf16 * python float.
+        autocast = torch.amp.autocast(device.type, dtype=torch.bfloat16) if device.type == "cuda" else nullcontext()
+        with autocast:
+            guided = cfg_text_velocity + cfg_text_scale * (main_velocity - cfg_text_velocity)
+            if cfg_renorm_type == "text_channel":
+                norm_main = torch.norm(main_velocity, dim=-1, keepdim=True)
+                norm_text = torch.norm(guided, dim=-1, keepdim=True)
+                scale = (norm_main / (norm_text + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+                merged = guided * scale
+                if cfg_img_scale > 1.0:
+                    assert cfg_img_velocity is not None
+                    merged = cfg_img_velocity + cfg_img_scale * (merged - cfg_img_velocity)
+                return merged.to(device=device)
+
             if cfg_img_scale > 1.0:
                 assert cfg_img_velocity is not None
-                merged = cfg_img_velocity + cfg_img_scale * (merged - cfg_img_velocity)
-            return merged.to(device=device)
+                guided = cfg_img_velocity + cfg_img_scale * (guided - cfg_img_velocity)
 
-        if cfg_img_scale > 1.0:
-            assert cfg_img_velocity is not None
-            guided = cfg_img_velocity + cfg_img_scale * (guided - cfg_img_velocity)
-
-        if cfg_renorm_type == "global":
-            norm_main = torch.norm(main_velocity)
-            norm_guided = torch.norm(guided)
-        elif cfg_renorm_type == "channel":
-            norm_main = torch.norm(main_velocity, dim=-1, keepdim=True)
-            norm_guided = torch.norm(guided, dim=-1, keepdim=True)
-        else:
-            raise NotImplementedError(f"BAGEL infer_gen CFG renorm type {cfg_renorm_type!r} is not implemented.")
-        scale = (norm_main / (norm_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-
-        return (guided * scale).to(device=device)
+            if cfg_renorm_type == "global":
+                norm_main = torch.norm(main_velocity)
+                norm_guided = torch.norm(guided)
+            elif cfg_renorm_type == "channel":
+                norm_main = torch.norm(main_velocity, dim=-1, keepdim=True)
+                norm_guided = torch.norm(guided, dim=-1, keepdim=True)
+            else:
+                raise NotImplementedError(f"BAGEL infer_gen CFG renorm type {cfg_renorm_type!r} is not implemented.")
+            scale = (norm_main / (norm_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+            return (guided * scale).to(device=device)
 
     def _merged_branch_cache(
         self,

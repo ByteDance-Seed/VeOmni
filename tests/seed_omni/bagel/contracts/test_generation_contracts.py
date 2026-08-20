@@ -10,6 +10,7 @@ from tests.seed_omni.bagel.contracts.helpers import (
     config_cls,
     load_omni_config,
     model_cls,
+    native_model_cls,
     tiny_bagel_qwen2_cfg,
 )
 from veomni.models.seed_omni.accelerator import OmniModelRuntime
@@ -350,6 +351,138 @@ def test_bagel_qwen2_mot_branch_batch_indexes_use_per_branch_attention_offsets()
     assert inputs["packed_vae_token_indexes"].tolist() == [1, 2, 3, 6, 7, 8, 11, 12, 13]
     assert inputs["packed_query_position_ids"].tolist() == [3, 3, 3, 3, 3, 7, 7, 7, 7, 7, 11, 11, 11, 11, 11]
     assert inputs["past_key_values"].key_cache[0].reshape(-1).tolist() == [10.0, 11.0, 20.0, 21.0, 22.0]
+
+
+def test_bagel_qwen2_mot_serial_denoise_indexes_match_official_per_branch_calls():
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
+    state = model._generation_state
+    state.main.install_cache(
+        cache=_fake_cache(model, torch.tensor([10.0, 11.0])),
+        cache_len=2,
+        next_position_id=torch.tensor(3),
+        device=model.device,
+    )
+    state.cfg_text.install_cache(
+        cache=model._new_empty_cache(),
+        cache_len=0,
+        next_position_id=torch.tensor(7),
+        device=model.device,
+    )
+    state.cfg_img.install_cache(
+        cache=_fake_cache(model, torch.tensor([20.0, 21.0, 22.0])),
+        cache_len=3,
+        next_position_id=torch.tensor(11),
+        device=model.device,
+    )
+    query = torch.zeros(5, int(model.config.hidden_size))
+    calls = list(
+        state.iter_serial_denoise_inputs(
+            query,
+            {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5},
+            timestep=0.5,
+            device=model.device,
+            dtype=model.dtype,
+        )
+    )
+    assert len(calls) == 3
+    assert calls[0]["packed_query_indexes"].tolist() == [2, 3, 4, 5, 6]
+    assert calls[0]["packed_query_position_ids"].tolist() == [3, 3, 3, 3, 3]
+    assert calls[0]["packed_key_value_indexes"].tolist() == [0, 1]
+    assert calls[1]["packed_query_indexes"].tolist() == [0, 1, 2, 3, 4]
+    assert calls[1]["packed_query_position_ids"].tolist() == [7, 7, 7, 7, 7]
+    assert calls[1]["packed_key_value_indexes"].numel() == 0
+    assert calls[2]["packed_query_indexes"].tolist() == [3, 4, 5, 6, 7]
+    assert calls[2]["packed_query_position_ids"].tolist() == [11, 11, 11, 11, 11]
+    assert calls[2]["packed_key_value_indexes"].tolist() == [0, 1, 2]
+    for call in calls:
+        assert call["packed_text_indexes"].tolist() == [0, 4]
+        assert call["packed_vae_token_indexes"].tolist() == [1, 2, 3]
+        assert torch.equal(call["packed_query_sequence"], query)
+
+
+def _install_three_branch_caches(model: nn.Module) -> None:
+    state = model._generation_state
+    state.main.install_cache(
+        cache=_fake_cache(model, torch.tensor([10.0, 11.0])),
+        cache_len=2,
+        next_position_id=torch.tensor(3),
+        device=model.device,
+    )
+    state.cfg_text.install_cache(
+        cache=model._new_empty_cache(),
+        cache_len=0,
+        next_position_id=torch.tensor(7),
+        device=model.device,
+    )
+    state.cfg_img.install_cache(
+        cache=_fake_cache(model, torch.tensor([20.0, 21.0, 22.0])),
+        cache_len=3,
+        next_position_id=torch.tensor(11),
+        device=model.device,
+    )
+
+
+def test_bagel_qwen2_mot_eager_denoise_branch_runs_serial_forward_inference(monkeypatch):
+    BagelQwen2MoT = native_model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
+    _install_three_branch_caches(model)
+    query = torch.zeros(5, int(model.config.hidden_size))
+    calls: list[dict[str, object]] = []
+
+    def _capture_forward_inference(self, **kwargs):
+        del self
+        calls.append(kwargs)
+        return {"hidden_states": kwargs["packed_query_sequence"]}
+
+    monkeypatch.setattr(type(model), "forward_inference", _capture_forward_inference)
+    tail = ConversationItem(
+        type="output",
+        value=query,
+        role="assistant",
+        source=BAGEL_FLOW_QUERY,
+        meta={"timestep": 0.5},
+    )
+    model.denoise_branch([tail], generation_kwargs={"cfg_text_scale": 2.0, "cfg_img_scale": 1.5})
+
+    assert len(calls) == 3
+    assert tail.source == BAGEL_FLOW_HIDDEN
+    assert int(tail.value.shape[0]) == 15
+    assert calls[0]["query_lens"].tolist() == [5]
+    assert calls[1]["query_lens"].tolist() == [5]
+    assert calls[2]["query_lens"].tolist() == [5]
+
+
+def test_bagel_qwen2_mot_accelerated_denoise_branch_packs_cfg_branches(monkeypatch):
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import BagelQwen2MoTAccelerated
+
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoTAccelerated(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
+    _install_three_branch_caches(model)
+    query = torch.zeros(5, int(model.config.hidden_size))
+    captured: dict[str, object] = {}
+
+    def _capture_forward_inference(self, **kwargs):
+        del self
+        captured.update(kwargs)
+        return {"hidden_states": kwargs["packed_query_sequence"]}
+
+    monkeypatch.setattr(type(model), "forward_inference", _capture_forward_inference)
+    tail = ConversationItem(
+        type="output",
+        value=query,
+        role="assistant",
+        source=BAGEL_FLOW_QUERY,
+        meta={"timestep": 0.5},
+    )
+    model.denoise_branch([tail], generation_kwargs={"cfg_text_scale": 2.0, "cfg_img_scale": 1.5})
+
+    assert captured["query_lens"].tolist() == [5, 5, 5]
+    assert int(captured["packed_query_sequence"].shape[0]) == 15
+    assert tail.source == BAGEL_FLOW_HIDDEN
+    assert int(tail.value.shape[0]) == 15
 
 
 @pytest.mark.parametrize(

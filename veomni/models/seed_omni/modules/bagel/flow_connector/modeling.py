@@ -204,8 +204,22 @@ class InferenceMixin:
                 f"got {hidden.shape[-1]}, expected {self.config.hidden_size}."
             )
 
-        outputs = self.decode_velocity(hidden_states=hidden)
-        velocity = outputs["velocity"]
+        # Official llm2vae is one GEMM per CFG branch. A stacked GEMM over
+        # concatenated branches is not bitwise even when each branch hidden
+        # matches, so split back to the per-branch query length.
+        query_len = int(self._generation_state.token_count) + 2
+        if (
+            self._generation_state.initialized
+            and query_len >= 3
+            and int(hidden.shape[0]) >= query_len
+            and int(hidden.shape[0]) % query_len == 0
+        ):
+            velocity = torch.cat(
+                [self.decode_velocity(hidden_states=chunk)["velocity"] for chunk in hidden.split(query_len, dim=0)],
+                dim=0,
+            )
+        else:
+            velocity = self.decode_velocity(hidden_states=hidden)["velocity"]
         item.type = "output"
         item.role = "assistant"
         item.source = BAGEL_FLOW_VELOCITY

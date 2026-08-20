@@ -41,13 +41,12 @@ def _temporary_attention_implementation(
 
 
 class InferenceMixin:
-    """FSM ``generate`` / denoise-branch / velocity-collection — HF ``GenerationMixin`` analog.
+    """FSM ``generate`` / serial denoise / velocity-collection — HF ``GenerationMixin`` analog.
 
-    Listed *before* :class:`~....omni_pretrained_model.OmniPreTrainedModel` in
-    :class:`BagelQwen2MoT`'s bases: ``OmniPreTrainedModel`` ships a no-op
-    ``reset_local_inference_state`` default (kept as a safety net for modules
-    that don't need real inference state), and MRO resolves left-to-right —
-    put second, that no-op would shadow the real one below.
+    Listed *before* :class:`BagelQwen2MoTCore` (and therefore before
+    :class:`~....omni_pretrained_model.OmniPreTrainedModel`): the pretrained
+    base ships a no-op ``reset_local_inference_state``, and MRO resolves
+    left-to-right — put second, that no-op would shadow the real one below.
     """
 
     def forward_inference(
@@ -130,13 +129,11 @@ class InferenceMixin:
             )
         return {"conversation_list": conversation_list}
 
-    def denoise_branch(
+    def _prepare_denoise_query(
         self,
-        conversation_list: list[ConversationItem] | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del kwargs
+        conversation_list: list[ConversationItem] | None,
+        generation_kwargs: dict[str, Any] | None,
+    ) -> tuple[ConversationItem, torch.Tensor]:
         if conversation_list is None:
             raise ValueError("BAGEL Qwen2-MoT denoise_branch requires conversation_list.")
 
@@ -158,27 +155,38 @@ class InferenceMixin:
             )
         if int(query.shape[0]) < 3:
             raise ValueError("BAGEL Qwen2-MoT denoise query must include start/end marker embeddings.")
+        return tail, query
 
-        # All active CFG branches share this denoise query. Stack them into one
-        # packed FA call; caches are read-only during denoising.
-        inputs = self._generation_state.preprocess_parallel_denoise_inputs(
+    def denoise_branch(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        tail, query = self._prepare_denoise_query(conversation_list, generation_kwargs)
+
+        hiddens: list[torch.Tensor] = []
+        for inputs in self._generation_state.iter_serial_denoise_inputs(
             query,
             generation_kwargs or {},
             timestep=tail.meta.get("timestep"),
-            empty_cache_factory=self._new_empty_cache,
             device=self.device,
             dtype=self.dtype,
-        )
-        outputs = self.forward_inference(
-            **inputs,
-            update_past_key_values=False,
-            is_causal=False,
-            mode="gen",
-            attention_implementation=_FLASH_ATTENTION_2,
-        )
+        ):
+            outputs = self.forward_inference(
+                **inputs,
+                update_past_key_values=False,
+                is_causal=False,
+                mode="gen",
+                attention_implementation=_FLASH_ATTENTION_2,
+            )
+            hiddens.append(outputs["hidden_states"])
+        if not hiddens:
+            raise RuntimeError("BAGEL Qwen2-MoT denoise branch produced no branch hidden states.")
 
         tail.source = BAGEL_FLOW_HIDDEN
-        tail.value = outputs["hidden_states"].to(device=self.device, dtype=self.dtype)
+        tail.value = torch.cat(hiddens, dim=0).to(device=self.device, dtype=self.dtype)
         return {"conversation_list": conversation_list}
 
     def collect_velocity(
@@ -416,7 +424,13 @@ class InferenceMixin:
         return NaiveCache(len(self.model.layers))
 
 
-class BagelQwen2MoT(InferenceMixin, OmniPreTrainedModel):
+class BagelQwen2MoTCore(OmniPreTrainedModel):
+    """Shared weights, packed train/infer forward, and generation-state shell.
+
+    Public eager and accelerated classes mix their inference mixins onto this
+    core. It is not registered on ``OMNI_*_REGISTRY``.
+    """
+
     config_class = BagelQwen2MoTConfig
     base_model_prefix = "bagel_qwen2_mot"
     main_input_name = "inputs_embeds"
@@ -454,6 +468,10 @@ class BagelQwen2MoT(InferenceMixin, OmniPreTrainedModel):
             packed_gen_token_indexes=packed_gen_token_indexes,
         )
         return {"hidden_states": output.packed_query_sequence}
+
+
+class BagelQwen2MoT(InferenceMixin, BagelQwen2MoTCore):
+    """HF-native eager Qwen2-MoT with serial CFG denoise."""
 
 
 class NaiveCache:
@@ -1473,9 +1491,15 @@ class BagelQwen2MoTBackbone(nn.Module):
         return self.forward_packed_inference(*args, **kwargs)
 
 
-BagelQwen2MoT.attention_cls = BagelQwen2MoTAttention
-BagelQwen2MoT.mlp_cls = Qwen2MLP
-BagelQwen2MoT.rms_norm_cls = Qwen2RMSNorm
+BagelQwen2MoTCore.attention_cls = BagelQwen2MoTAttention
+BagelQwen2MoTCore.mlp_cls = Qwen2MLP
+BagelQwen2MoTCore.rms_norm_cls = Qwen2RMSNorm
 
 
-__all__ = ["BaseNavitOutputWithPast", "BagelQwen2MoT", "InferenceMixin", "NaiveCache"]
+__all__ = [
+    "BaseNavitOutputWithPast",
+    "BagelQwen2MoT",
+    "BagelQwen2MoTCore",
+    "InferenceMixin",
+    "NaiveCache",
+]

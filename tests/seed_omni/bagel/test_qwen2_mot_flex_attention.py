@@ -12,6 +12,7 @@ from torch.nn.attention.flex_attention import create_mask
 from torch.nn.functional import scaled_dot_product_attention
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
+from veomni.models.seed_omni.mixins.base_mixin import BaseMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     build_mot_attention_metadata,
@@ -20,7 +21,10 @@ from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     pad_mot_attention_metadata,
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import (
+    BagelQwen2MoT,
     BagelQwen2MoTAttention,
+    BagelQwen2MoTCore,
+    InferenceMixin,
     _sdpa_packed_attention,
 )
 from veomni.models.seed_omni.utils.conversation import ConversationItem
@@ -364,8 +368,6 @@ def test_eager_sdpa_masked_gqa_repeats_kv_heads() -> None:
 
 
 def test_eager_model_advertises_sdpa_only() -> None:
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoT
-
     assert BagelQwen2MoT._supports_sdpa is True
     assert BagelQwen2MoT._supports_flex_attn is False
 
@@ -373,6 +375,22 @@ def test_eager_model_advertises_sdpa_only() -> None:
 def test_accelerated_model_advertises_flex_attention() -> None:
     assert accelerated.BagelQwen2MoTAccelerated._supports_flex_attn is True
     assert accelerated.BagelQwen2MoTAccelerated._supports_sdpa is True
+
+
+def test_eager_and_accelerated_share_core_not_each_other() -> None:
+    assert issubclass(BagelQwen2MoT, InferenceMixin)
+    assert issubclass(BagelQwen2MoT, BagelQwen2MoTCore)
+    assert not issubclass(BagelQwen2MoT, BaseMixin)
+    assert not issubclass(BagelQwen2MoT, accelerated.InferenceMixinAccelerated)
+
+    accelerated_cls = accelerated.BagelQwen2MoTAccelerated
+    assert issubclass(accelerated_cls, accelerated.InferenceMixinAccelerated)
+    assert issubclass(accelerated_cls, InferenceMixin)
+    assert issubclass(accelerated_cls, BagelQwen2MoTCore)
+    assert issubclass(accelerated_cls, BaseMixin)
+    assert not issubclass(accelerated_cls, BagelQwen2MoT)
+    assert BagelQwen2MoT.denoise_branch is InferenceMixin.denoise_branch
+    assert accelerated_cls.denoise_branch is accelerated.InferenceMixinAccelerated.denoise_branch
 
 
 def test_accelerated_training_attention_rejects_non_flex_backend() -> None:

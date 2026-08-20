@@ -645,6 +645,91 @@ def test_bagel_vae_training_encode_crops_padded_latents_before_flow_patchify():
     assert wide.meta["flow_velocity_target"].shape == (2, 1)
 
 
+def test_bagel_vae_training_encode_pads_variable_batch_through_cnn_then_crops():
+    from veomni.models.seed_omni.modules.bagel.flow_connector.processing import preprocess_latent_embed
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated import BAGEL_VAE_PIXEL_SHAPE
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEPreprocessor, BagelVAEProcessor
+
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    # One CNN downsample so config.downsample matches encoder spatial reduction.
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            downsample=2,
+            ch=32,
+            ch_mult=[1, 1],
+            num_res_blocks=1,
+            z_channels=2,
+            max_image_size=8,
+            min_image_size=4,
+            image_stride=4,
+            max_pixels=64,
+        )
+    )
+    model._image_processor = BagelVAEProcessor.from_config(model.config)
+    preprocessor = BagelVAEPreprocessor(model._image_processor)
+
+    tall = ConversationItem(
+        type="image",
+        value=Image.new("RGB", (4, 8), color=(255, 0, 0)),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+    )
+    wide = ConversationItem(
+        type="image",
+        value=Image.new("RGB", (8, 4), color=(0, 255, 0)),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+    )
+    conversation = [[tall], [wide]]
+
+    unpadded_tall = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 8, 4),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+    )
+    unpadded_wide = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 4, 8),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+    )
+    with pytest.raises(RuntimeError, match="stack expects each tensor to be equal size"):
+        model.encode_pre(conversation_list=[[unpadded_tall], [unpadded_wide]])
+
+    preprocessor(conversation)
+    encode_inputs = model.encode_pre(conversation_list=conversation)
+    padded_pixels = encode_inputs["pixel_values"]
+
+    assert padded_pixels.shape == (2, 3, 8, 8)
+    assert torch.equal(tall.meta[BAGEL_VAE_PIXEL_SHAPE], torch.tensor([8, 4]))
+    assert torch.equal(wide.meta[BAGEL_VAE_PIXEL_SHAPE], torch.tensor([4, 8]))
+    assert torch.equal(padded_pixels[0, :, :, 4:], torch.zeros(3, 8, 4, dtype=padded_pixels.dtype))
+    assert torch.equal(padded_pixels[1, :, 4:, :], torch.zeros(3, 4, 8, dtype=padded_pixels.dtype))
+
+    padded_latents = model.encode(**encode_inputs)["latents"]
+    assert padded_latents.shape == (2, 2, 4, 4)
+
+    model.encode_post(padded_latents)
+
+    assert tall.value.shape == (2, 4, 2)
+    assert wide.value.shape == (2, 2, 4)
+    assert torch.equal(tall.value, padded_latents[0, :, :4, :2])
+    assert torch.equal(wide.value, padded_latents[1, :, :2, :4])
+
+    flow_inputs, flow_lengths = preprocess_latent_embed(
+        [tall, wide],
+        config=SimpleNamespace(z_channels=2, latent_patch_size=1, max_latent_size=4),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        timestep_shift=1.0,
+    )
+    assert flow_lengths == [8, 8]
+    assert flow_inputs["latents"].shape == (16, 2)
+
+
 def test_bagel_flow_embed_latent_infer_context_keeps_numeric_state_out_of_meta():
     BagelFlowConnector = model_cls("bagel_flow_connector")
     BagelFlowConnectorConfig = config_cls("bagel_flow_connector")

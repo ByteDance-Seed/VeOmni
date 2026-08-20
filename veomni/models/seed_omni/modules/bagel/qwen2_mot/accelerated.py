@@ -1,7 +1,7 @@
 """VeOmni-accelerated BAGEL Qwen2-MoT — fused OpSlot ops plus training-graph hooks.
 
-Native weights, packed ``forward``, and FSM ``generate`` live on
-:class:`BagelQwen2MoT` in ``modeling.py``. This module supplies the fused RMSNorm / SwiGLU / RoPE replacements,
+Native weights and packed ``forward`` live on :class:`BagelQwen2MoTCore`.
+This module adds packed CFG denoise, fused RMSNorm / SwiGLU / RoPE,
 ``fused_attention_forward``, and the training pre/forward/post hooks.
 """
 
@@ -28,7 +28,7 @@ from ....mixins.base_mixin import BaseMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
-from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from .checkpoint_conversion import (
     BagelQwen2MoTCheckpointTensorConverter,
     combine_qkv_state_dict_pre_hook,
@@ -38,8 +38,10 @@ from .checkpoint_conversion import (
 from .configuration import BagelQwen2MoTConfig
 from .masking import build_mot_block_mask, pad_mot_attention_metadata
 from .modeling import (
-    BagelQwen2MoT,
+    _FLASH_ATTENTION_2,
     BagelQwen2MoTAttention,
+    BagelQwen2MoTCore,
+    InferenceMixin,
 )
 from .modeling import (
     _apply_rotary_pos_emb as _apply_rotary_pos_emb_eager,
@@ -52,7 +54,7 @@ if IS_NPU_AVAILABLE:
 
 
 class TrainingMixin(TrainingModuleMixin):
-    """Training-graph hooks — depends on :class:`BagelQwen2MoT` modeling APIs."""
+    """Training-graph hooks — depends on :class:`BagelQwen2MoTCore` modeling APIs."""
 
     config: BagelQwen2MoTConfig
     device: torch.device
@@ -318,10 +320,8 @@ class MeterMixin(MetricMeterMixin):
 class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     """Carrier hooks and graph entrypoints for BAGEL's packed MoT backbone.
 
-    ``generate()`` / ``denoise_branch()`` / ``collect_velocity()`` and the
-    shared MoT generation-FSM state already live on the native
-    :class:`~.modeling.BagelQwen2MoT` (via its own :class:`~.modeling.InferenceMixin`),
-    so no ``InferenceMixin`` is needed here.
+    Packed CFG denoise is mixed in separately via :class:`InferenceMixinAccelerated`
+    so this mixin stays runtime-only.
     """
 
 
@@ -567,7 +567,43 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         )[0]
 
 
-class BagelQwen2MoTAccelerated(VeOmniMixin, BagelQwen2MoT):
+class InferenceMixinAccelerated(InferenceMixin):
+    """Packed CFG denoise for the FSDP/runtime MoT class.
+
+    Stacks active CFG branches into one ``forward_inference`` call so decoder
+    layers unshard once per denoise step. ``generate`` and ``collect_velocity``
+    stay on :class:`~.modeling.InferenceMixin`.
+    """
+
+    def denoise_branch(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        tail, query = self._prepare_denoise_query(conversation_list, generation_kwargs)
+        inputs = self._generation_state.preprocess_parallel_denoise_inputs(
+            query,
+            generation_kwargs or {},
+            timestep=tail.meta.get("timestep"),
+            empty_cache_factory=self._new_empty_cache,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        outputs = self.forward_inference(
+            **inputs,
+            update_past_key_values=False,
+            is_causal=False,
+            mode="gen",
+            attention_implementation=_FLASH_ATTENTION_2,
+        )
+        tail.source = BAGEL_FLOW_HIDDEN
+        tail.value = outputs["hidden_states"].to(device=self.device, dtype=self.dtype)
+        return {"conversation_list": conversation_list}
+
+
+class BagelQwen2MoTAccelerated(VeOmniMixin, InferenceMixinAccelerated, BagelQwen2MoTCore):
     _supports_flex_attn = True
     _export_hf_checkpoint_with_weight_conversions = True
     attention_cls = BagelQwen2MoTAttentionAccelerated
@@ -576,7 +612,7 @@ class BagelQwen2MoTAccelerated(VeOmniMixin, BagelQwen2MoT):
 
     @staticmethod
     def _create_checkpoint_tensor_converter(
-        model: BagelQwen2MoT,
+        model: BagelQwen2MoTCore,
     ) -> BagelQwen2MoTCheckpointTensorConverter:
         del model
         return BagelQwen2MoTCheckpointTensorConverter()
@@ -585,4 +621,4 @@ class BagelQwen2MoTAccelerated(VeOmniMixin, BagelQwen2MoT):
 register_accelerated_qkv_conversion_mapping()
 
 
-__all__ = ["BagelQwen2MoTAccelerated"]
+__all__ = ["BagelQwen2MoTAccelerated", "InferenceMixinAccelerated"]
