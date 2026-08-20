@@ -933,12 +933,6 @@ class TrainingArguments:
             assert self.init_device != "cpu", (
                 "init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
             )
-            if self.broadcast_model_weights_from_rank0:
-                logger.warning_rank0(
-                    "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "
-                    "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
-                    f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
-                )
 
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early

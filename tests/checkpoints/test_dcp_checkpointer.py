@@ -242,14 +242,21 @@ class TestMaterializeAndLoadDispatch:
         return loaders
 
     @pytest.mark.parametrize(
-        ("flags", "expected"),
+        ("flags", "has_plan", "expected"),
         [
-            ({}, "plain"),
-            ({"broadcast_from_rank0": True}, "broadcast"),
-            ({"ep_sharded_stream_load": True}, "ep_sharded"),
+            ({}, False, "plain"),
+            ({"broadcast_from_rank0": True}, False, "broadcast"),
+            ({"ep_sharded_stream_load": True}, True, "ep_sharded"),
+            # ``ep_sharded_stream_load`` is set once per run but this helper runs
+            # once per model, so a model with no ExtraParallel plan -- every
+            # SeedOmni V2 sub-module that owns no experts -- must fall through to
+            # the loader it would have used anyway, not raise.
+            ({"ep_sharded_stream_load": True}, False, "plain"),
         ],
     )
-    def test_dispatches_to_one_loader(self, loaders, flags, expected):
+    def test_dispatches_to_one_loader(self, loaders, monkeypatch, flags, has_plan, expected):
+        monkeypatch.setattr(torch_parallelize, "_has_extra_parallel_plan", lambda model: has_plan)
+
         torch_parallelize._materialize_and_load_weights(
             nn.Linear(2, 2),
             "hf-path",
@@ -416,16 +423,40 @@ class TestDdpMetaInit:
         with init_empty_weights():
             model = _MetaInitModel()
 
-        wrap_ddp(
-            model,
-            weights_path="hf-path",
-            init_device="meta",
-            broadcast_model_weights_from_rank0=broadcast,
-        )
+        wrap_ddp(model, weights_path="hf-path", init_device="meta", broadcast_model_weights_from_rank0=broadcast)
 
         used, unused = (broadcast_loader, loader) if broadcast else (loader, broadcast_loader)
         assert used.call_args.args[1] == "hf-path"
         unused.assert_not_called()
+
+    def test_rejects_a_model_whose_plan_shards_experts(self, monkeypatch):
+        # Only the fsdp2 path applies the plan that shards experts, so loading a
+        # sharded-expert config here would quietly produce whole ones.
+        monkeypatch.setattr(
+            torch_parallelize,
+            "get_parallel_state",
+            lambda: SimpleNamespace(local_rank=0, dp_group=None, any_extra_parallel_enabled=True),
+        )
+        monkeypatch.setattr(
+            torch_parallelize,
+            "_has_extra_parallel_plan",
+            lambda model: True,
+        )
+        with pytest.raises(RuntimeError, match="requires fsdp_mode='fsdp2'"):
+            parallelize_model_ddp(nn.Linear(2, 2))
+
+    def test_allows_a_plan_less_model_under_an_inherited_ep_mesh(self, monkeypatch):
+        """An ep dim in the mesh says nothing about *this* model. A SeedOmni V2
+        sub-module inherits the global accelerator's ep size whether or not it owns
+        experts, so refusing on the mesh alone would block a DDP vision tower."""
+        monkeypatch.setattr(
+            torch_parallelize,
+            "get_parallel_state",
+            lambda: SimpleNamespace(local_rank=0, dp_group=None, any_extra_parallel_enabled=True),
+        )
+        monkeypatch.setattr(torch_parallelize, "DDP", lambda module, **kwargs: module)
+
+        assert parallelize_model_ddp(nn.Linear(2, 2)) is not None
 
     def test_reports_parameters_the_loader_left_on_meta(self, wrap_ddp, monkeypatch):
         # A loader that fills nothing would otherwise fail inside DDP's
