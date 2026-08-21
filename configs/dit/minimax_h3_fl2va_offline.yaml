@@ -1,0 +1,111 @@
+# =============================================================================
+# MiniMax H3 FL2VA offline training
+# =============================================================================
+#
+# Entry point: tasks/train_dit.py (plain DiTTrainer; embedding stage picks the transform from data_transform)
+# Usage: bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_offline.yaml
+#
+# Uses pre-computed VAE latents from offline_embedding stage.
+#   offline_embedding: get_condition() encodes raw data → saves parquet
+#   offline_training: skip encoders, process_condition() adds noise + packs
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
+model:
+  model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer
+  condition_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
+  config_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json
+
+  condition_model_cfg:
+    base_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
+    skip_encoder_load: true
+    use_keyframe_condition: true
+    keyframe_indices: [0, -1]
+    video_max_frames: 120
+    video_max_resolution: 832
+    sigma_shift_video: 12.0
+    sigma_shift_audio: 3.0
+    imgvid_cond_noise_aug: 0.999
+    audio_cond_noise_aug: 1.0
+
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  train_path: output/minimax_h3_fl2va_embedding
+  data_type: diffusion
+  source_name: minimax_h3
+  data_transform: dit_offline
+  datasets_type: minimax_h3_offline
+  log_sample: false
+  shuffle: false
+  text_keys: text
+  mm_configs:
+    repeat: 100
+  dataloader:
+    type: native
+    num_workers: 8
+    drop_last: true
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+train:
+  training_task: offline_training
+
+  global_batch_size: 16
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  init_device: meta
+  seed: 42
+
+  num_train_epochs: 1
+  max_steps: 20
+
+  enable_full_determinism: true
+  enable_batch_invariant_mode: true
+
+  gradient_checkpointing:
+    enable: true
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.999]
+    lr_decay_style: linear
+    lr_min: 1.0e-5
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+
+  checkpoint:
+    output_dir: output/minimax_h3_fl2va_offline
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: false
+
+  wandb:
+    enable: false
+    project: minimax_h3_fl2va

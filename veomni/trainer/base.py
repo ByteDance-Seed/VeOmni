@@ -605,6 +605,7 @@ class BaseTrainer(Stateful, ABC):
         self.optimizer = build_optimizer(
             self.model,
             lr=args.train.optimizer.lr,
+            betas=args.train.optimizer.betas,
             weight_decay=args.train.optimizer.weight_decay,
             fused=True,
             optimizer_type=args.train.optimizer.type,
