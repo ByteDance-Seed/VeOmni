@@ -146,7 +146,7 @@ class DiTDataArguments(DataArguments):
         metadata={"help": "Whether or not to shuffle the dataset."},
     )
     data_transform: Optional[str] = field(
-        default=None,
+        default="dit_online",
         metadata={
             "help": "Override the DATA_TRANSFORM_REGISTRY transform name. "
             "When None, DiTTrainer picks dit_offline/dit_online by training_task."
@@ -336,16 +336,12 @@ class DiTTrainer:
 
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
-        if self.training_task == "offline_embedding":
-            self.base.data_transform = build_data_transform(
-                args.data.data_transform,
-                **args.data.mm_configs,
-            )
-        elif self.training_task == "offline_training":
+        logger.info(f"args.data.data_transform: {args.data.data_transform}, training_task: {self.training_task}")
+        if self.training_task == "offline_training":
             self.base.data_transform = build_data_transform("dit_offline")
         else:
             self.base.data_transform = build_data_transform(
-                "dit_online",
+                args.data.data_transform,
                 **args.data.mm_configs,
             )
 
