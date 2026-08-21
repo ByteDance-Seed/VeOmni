@@ -208,40 +208,6 @@ class VeOmniIter:
         return {}
 
 
-def _resolve_muon_lr(optimizer_cfg) -> float:
-    """Resolve Muon LR, inheriting AdamW lr under match_rms_adamw when unset."""
-    if optimizer_cfg.muon_lr is not None:
-        return float(optimizer_cfg.muon_lr)
-    adamw_lr = float(optimizer_cfg.lr)
-    if optimizer_cfg.muon_adjust_lr_fn == "match_rms_adamw":
-        return adamw_lr
-    # original: Moonlight-style ~25x AdamW lr starting point
-    return 25.0 * adamw_lr
-
-
-def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
-    """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
-    return {
-        "lr": _resolve_muon_lr(optimizer_cfg),
-        "momentum": optimizer_cfg.muon_momentum,
-        "nesterov": optimizer_cfg.muon_nesterov,
-        "weight_decay": optimizer_cfg.muon_weight_decay,
-        "ns_steps": optimizer_cfg.muon_ns_steps,
-        "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
-        "eps": optimizer_cfg.muon_eps,
-        "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
-        "ns_implementation": optimizer_cfg.muon_ns_implementation,
-        "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
-        # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
-        "head_group_size": int(optimizer_cfg.muon_head_group_size),
-        "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
-        # Surface for startup summary only; not a DistributedMuon ctor kwarg.
-        "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
-        "adamw_lr": float(optimizer_cfg.lr),
-        "muon_lr_explicit": optimizer_cfg.muon_lr is not None,
-    }
-
-
 class BaseTrainer(Stateful, ABC):
     """
     Base trainer class for distributed model training.
@@ -610,7 +576,7 @@ class BaseTrainer(Stateful, ABC):
             optimizer_type=args.train.optimizer.type,
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
-            muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
+            optimizer_config=args.train.optimizer,
         )
 
     def _build_lr_scheduler(self):

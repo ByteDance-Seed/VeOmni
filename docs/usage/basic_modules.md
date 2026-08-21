@@ -497,6 +497,10 @@ optimizer = build_optimizer(
     model,
     lr=args.train.optimizer.lr,
     weight_decay=args.train.optimizer.weight_decay,
+    optimizer_type=args.train.optimizer.type,
+    # Hand over the config so optimizer-specific knobs (the muon_* fields) are
+    # read here instead of being unpacked by each trainer.
+    optimizer_config=args.train.optimizer,
     # ... other parameters
 )
 
