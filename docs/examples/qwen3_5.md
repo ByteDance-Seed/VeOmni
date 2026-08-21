@@ -233,6 +233,23 @@ The config sets `ulysses_size: 4`, so the world size must be a multiple of 4. To
 sequence parallelism, override `--train.accelerator.ulysses_size 1`; the attention kernels adapt
 on their own.
 
+### Qwen3.5 MoE 35B VL Muon training
+
+The Ascend text recipe uses EP8, `fused_npu` MoE, the AscendC GatedDeltaNet
+backend, and the pure-PyTorch `gram` Muon backend:
+
+```shell
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_muon_ascendc.yaml \
+    --model.model_path ${HOME}/Qwen3.5-35B-A3B \
+    --data.train_path ${HOME}/tulu-first2000.parquet \
+    --train.max_steps 20
+```
+
+`muon_expert_zero_comm: true` selects whole-expert `Shard(0)` when the
+EP-local expert count is divisible by the EP-FSDP size; otherwise VeOmni logs
+a warning and falls back to the communication path.
+
 ## ChunkMBS
 
 Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,
