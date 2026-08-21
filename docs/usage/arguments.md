@@ -399,18 +399,51 @@ distinct from the first emission.
 
 `train.chunk_mbs_config.*` — Packed-sequence layer micro-batching settings.
 
-`chunk_mbs` is the number of packed samples per layer chunk. With dynamic batching, the runtime sample
-count is inferred from `cu_seq_lens_q`, so it is independent of `train.micro_batch_size`. Chunks are cut
-only on packed sample boundaries. The current implementation supports trainer-based SFT with packed-sequence
-FlashAttention kwargs using `torch.int32` cumulative lengths, identical query/key metadata, exactly one
-`*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
-`GradientCheckpointingLayer`, and decoder states with shape `[1, sequence, hidden]`. Gradient checkpointing may be
-enabled or disabled; when enabled, it must use the non-reentrant implementation. CPU model-level numerical coverage
-currently includes Qwen3-VL and dense Qwen3.5; accelerator-specific kernels require separate hardware validation. Sequence parallelism,
-tensor parallelism, pipeline parallelism, ExtraParallel/MoE, DiT trainers, RL trainers, DPO, the custom Omni training loop,
-`pad_to_length`, and `torch.compile` are not supported. Chunk boundaries must also align with linear-attention
-cumulative sequence boundaries when that metadata is present. Models with ambiguous decoder classes or stacks fail
-validation instead of applying ChunkMBS to multiple stacks.
+`chunk_mbs` is the number of packed samples per layer chunk. With dynamic
+batching, the runtime sample count comes from `cu_seq_lens_q` and is independent
+of `train.micro_batch_size`. Chunks are cut only on packed sample boundaries.
+
+Supported:
+
+- Trainer-based SFT with packed-sequence FlashAttention metadata, `torch.int32`
+  cumulative lengths, identical query/key metadata, exactly one decoder class
+  and stack, and decoder states shaped `[1, sequence, hidden]`.
+- Qwen3-VL dense and MoE Ulysses on the mask-free FlashAttention path.
+  Qwen3-VL-MoE also supports expert parallelism, alone or with Ulysses.
+- Non-reentrant gradient checkpointing. CPU model-level numerical coverage
+  includes Qwen3-VL and dense Qwen3.5; optimized kernels require separate
+  hardware validation.
+
+Each Ulysses chunk is temporarily resharded and padded to an even rank-local
+length before its decoder call. Router logits are restored to the original
+layout, so padding does not affect Qwen3-VL-MoE load-balancing loss.
+
+Dynamic batches may contain different packed-sample counts on FSDP or expert
+parallel ranks. Once per micro-batch, VeOmni performs one minimum reduction per
+owning mesh dimension and one device-to-host read, then repartitions local
+samples so all ranks execute the same forward, FSDP, and EP collective
+schedule. This synchronization is shared by every decoder layer. Ulysses ranks
+need no separate Ulysses-group reduction because sequence-parallel collation
+shards identical packed metadata across those ranks; the owning FSDP or EP-FSDP
+mesh may already contain fused SP ranks. A local chunk may therefore exceed
+`chunk_mbs`; if any participant has one chunk, the whole mesh uses the
+unchunked decoder path for that micro-batch.
+
+Not supported:
+
+- Asynchronous Ulysses, context parallelism, tensor parallelism, or pipeline
+  parallelism.
+- ExtraParallel other than Qwen3-VL-MoE expert parallelism, or other MoE
+  decoder families.
+- DiT, RL, DPO, the custom Omni training loop, `pad_to_length`, or
+  `torch.compile`.
+- Linear-attention models with Ulysses. Qwen3-VL's collator compatibility
+  alias is ignored because the supported decoder allowlist has no
+  linear-attention layers. Without Ulysses, chunk boundaries must align with
+  linear-attention cumulative sequence boundaries.
+
+Models with ambiguous decoder classes or stacks fail validation instead of
+applying ChunkMBS to multiple stacks.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
