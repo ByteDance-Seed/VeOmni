@@ -1,25 +1,26 @@
-"""Combined QKV projection coverage for the BAGEL Qwen2-MoT backbone."""
+"""BAGEL Qwen2-MoT attention dispatch and QKV checkpoint schema."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 from safetensors import safe_open
 from transformers.utils import SAFE_WEIGHTS_NAME
 
+from tests.seed_omni.bagel.helpers import config_cls, tiny_bagel_qwen2_cfg
 from veomni.models.module_utils import load_model_weights
+from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.checkpoint_conversion import (
     BagelQwen2MoTCheckpointTensorConverter,
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.configuration import BagelQwen2MoTConfig
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import (
-    BagelQwen2MoT,
-    BagelQwen2MoTAttention,
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
+    build_mot_attention_metadata,
+    build_mot_block_mask,
 )
 
 
-def _config() -> BagelQwen2MoTConfig:
+def _flex_config() -> BagelQwen2MoTConfig:
     return BagelQwen2MoTConfig(
         vocab_size=128,
         hidden_size=64,
@@ -32,51 +33,32 @@ def _config() -> BagelQwen2MoTConfig:
     )
 
 
-@pytest.mark.parametrize("projection_name", ["qkv_proj_und", "qkv_proj_gen"])
-def test_combined_qkv_matches_separate_projection_forward_backward(projection_name: str) -> None:
-    torch.manual_seed(3011)
-    attention = BagelQwen2MoTAttention(_config(), layer_idx=0)
-    projection = getattr(attention, projection_name)
-    reference_weights = [
-        tensor.detach().clone().requires_grad_()
-        for tensor in projection.weight.split(attention.qkv_split_sizes, dim=0)
-    ]
-    reference_biases = [
-        tensor.detach().clone().requires_grad_() for tensor in projection.bias.split(attention.qkv_split_sizes, dim=0)
-    ]
-    combined_input = torch.randn(7, attention.hidden_size, requires_grad=True)
-    reference_input = combined_input.detach().clone().requires_grad_()
+def test_accelerated_training_attention_rejects_non_flex_backend() -> None:
+    config = config_cls("bagel_qwen2_mot")(**tiny_bagel_qwen2_cfg(), attn_implementation="sdpa")
+    attention = accelerated.BagelQwen2MoTAttentionAccelerated(config, layer_idx=0)
+    sequence_length = 2
+    metadata = build_mot_attention_metadata([[2]], [["causal"]], device=torch.device("cpu"))
 
-    combined_outputs = projection(combined_input).split(attention.qkv_split_sizes, dim=-1)
-    reference_outputs = tuple(
-        F.linear(reference_input, weight, bias)
-        for weight, bias in zip(reference_weights, reference_biases, strict=True)
-    )
-    grad_outputs = tuple(torch.randn_like(output) for output in combined_outputs)
-    torch.autograd.backward(combined_outputs, grad_outputs)
-    torch.autograd.backward(reference_outputs, grad_outputs)
+    with pytest.raises(ValueError, match="requires packed fused attention"):
+        attention.forward_packed_train(
+            packed_sequence=torch.randn(sequence_length, config.hidden_size),
+            attention_mask=build_mot_block_mask(metadata),
+            packed_position_cos=torch.ones(sequence_length, attention.head_dim),
+            packed_position_sin=torch.zeros(sequence_length, attention.head_dim),
+            packed_und_token_indexes=torch.arange(sequence_length),
+            packed_gen_token_indexes=torch.empty(0, dtype=torch.long),
+        )
 
-    for combined_output, reference_output in zip(combined_outputs, reference_outputs, strict=True):
-        torch.testing.assert_close(combined_output, reference_output)
-    assert combined_input.grad is not None
-    assert reference_input.grad is not None
-    torch.testing.assert_close(combined_input.grad, reference_input.grad)
-    assert projection.weight.grad is not None
-    assert projection.bias.grad is not None
-    for combined_grad, reference_weight in zip(
-        projection.weight.grad.split(attention.qkv_split_sizes, dim=0),
-        reference_weights,
-        strict=True,
-    ):
-        assert reference_weight.grad is not None
-        torch.testing.assert_close(combined_grad, reference_weight.grad)
-    for combined_grad, reference_bias in zip(
-        projection.bias.grad.split(attention.qkv_split_sizes, dim=0),
-        reference_biases,
-        strict=True,
-    ):
-        assert reference_bias.grad is not None
-        torch.testing.assert_close(combined_grad, reference_bias.grad)
+
+def test_native_gqa_rejects_invalid_global_head_ratio_at_config_init() -> None:
+    with pytest.raises(ValueError, match="query heads must be divisible"):
+        config_cls("bagel_qwen2_mot")(
+            **{
+                **tiny_bagel_qwen2_cfg(),
+                "num_attention_heads": 6,
+                "num_key_value_heads": 4,
+            }
+        )
 
 
 def test_checkpoint_tensor_converter_combines_legacy_qkv_groups() -> None:
@@ -113,9 +95,9 @@ def test_checkpoint_tensor_converter_combines_legacy_qkv_groups() -> None:
     torch.testing.assert_close(gen_bias[80:], tensors[f"{prefix}v_proj_moe_gen.bias"])
 
 
-def test_combined_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> None:
-    torch.manual_seed(3012)
-    reference = BagelQwen2MoT(_config())
+def test_accelerated_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> None:
+    torch.manual_seed(3014)
+    reference = accelerated.BagelQwen2MoTAccelerated(_flex_config())
     internal_parameter_names = set(dict(reference.named_parameters()))
     assert "model.layers.0.self_attn.qkv_proj_und.weight" in internal_parameter_names
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" in internal_parameter_names
@@ -130,7 +112,7 @@ def test_combined_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> No
     assert "model.layers.0.self_attn.qkv_proj_und.weight" not in checkpoint_state
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in checkpoint_state
 
-    state_dict_loaded = BagelQwen2MoT(_config())
+    state_dict_loaded = accelerated.BagelQwen2MoTAccelerated(_flex_config())
     state_dict_loaded.load_state_dict(checkpoint_state)
     for name in ("qkv_proj_und", "qkv_proj_gen"):
         expected = getattr(reference.model.layers[0].self_attn, name)
@@ -146,8 +128,8 @@ def test_combined_qkv_preserves_hf_checkpoint_schema_and_loaders(tmp_path) -> No
     assert "model.layers.0.self_attn.qkv_proj_und.weight" not in checkpoint_keys
     assert "model.layers.0.self_attn.qkv_proj_gen.weight" not in checkpoint_keys
 
-    hf_loaded = BagelQwen2MoT.from_pretrained(tmp_path)
-    veomni_loaded = BagelQwen2MoT(_config())
+    hf_loaded = accelerated.BagelQwen2MoTAccelerated.from_pretrained(tmp_path)
+    veomni_loaded = accelerated.BagelQwen2MoTAccelerated(_flex_config())
     load_model_weights(veomni_loaded, str(tmp_path), init_device="cpu")
     for name in ("qkv_proj_und", "qkv_proj_gen"):
         expected = getattr(reference.model.layers[0].self_attn, name)

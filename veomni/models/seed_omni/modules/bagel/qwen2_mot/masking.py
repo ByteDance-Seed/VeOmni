@@ -1,4 +1,9 @@
-"""Attention visibility metadata and FlexAttention masks for BAGEL Qwen2-MoT."""
+"""Attention visibility metadata and mask materializers for BAGEL Qwen2-MoT.
+
+`packed_attention_metadata` is the source of truth. `build_mot_block_mask`
+materializes a Flex `BlockMask` for accelerated training. `build_mot_sdpa_mask`
+materializes a dense boolean mask for eager SDPA (``True`` means attend).
+"""
 
 from __future__ import annotations
 
@@ -22,8 +27,8 @@ def build_mot_attention_metadata(
     ``noise``). Row 2 identifies noise spans so their keys remain invisible
     outside that same noise span. ``-1`` means that a row does not apply.
 
-    The model turns this compact representation into a native FlexAttention
-    ``BlockMask`` without materializing an O(sequence²) token mask.
+    Callers materialize this compact representation either as a Flex
+    ``BlockMask`` or as a dense SDPA mask, without changing the metadata.
     """
     total_length = sum(sum(split_lens) for split_lens in sample_splits)
     metadata = torch.full((3, total_length), -1, device=device, dtype=torch.int32)
@@ -202,8 +207,30 @@ def build_mot_block_mask(packed_attention_metadata: torch.Tensor) -> BlockMask:
     )
 
 
+def build_mot_sdpa_mask(packed_attention_metadata: torch.Tensor) -> torch.Tensor:
+    """Materialize a dense ``[1, 1, S, S]`` boolean SDPA mask.
+
+    ``True`` means the query may attend that key. Do not store this as float32
+    ``0 / -inf``; PyTorch SDPA already treats boolean ``False`` as masked out.
+    """
+    _validate_mot_attention_metadata(packed_attention_metadata)
+    sequence_length = int(packed_attention_metadata.shape[1])
+    if sequence_length == 0:
+        raise ValueError("BAGEL Qwen2-MoT attention metadata must contain at least one token.")
+
+    document_ids, full_span_ids, noise_span_ids = packed_attention_metadata
+    query_idx = torch.arange(sequence_length, device=packed_attention_metadata.device)
+    same_document = document_ids[:, None] == document_ids[None, :]
+    causal = query_idx[:, None] >= query_idx[None, :]
+    same_full_or_noise_span = (full_span_ids[:, None] >= 0) & (full_span_ids[:, None] == full_span_ids[None, :])
+    foreign_noise_key = (noise_span_ids[None, :] >= 0) & (noise_span_ids[:, None] != noise_span_ids[None, :])
+    visible = same_document & (causal | same_full_or_noise_span) & ~foreign_noise_key
+    return visible.to(dtype=torch.bool)[None, None].contiguous()
+
+
 __all__ = [
     "build_mot_attention_metadata",
     "build_mot_block_mask",
+    "build_mot_sdpa_mask",
     "pad_mot_attention_metadata",
 ]

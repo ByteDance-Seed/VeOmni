@@ -131,13 +131,16 @@ class FlowGenerationState:
     def advance(self, velocity: torch.Tensor) -> bool:
         x_t = self.latents
         dts = self.dt_values
-        velocity = velocity.to(device=x_t.device, dtype=x_t.dtype)
+        # Official generate_image does `x_t - v_t.to(x_t.device) * dts[i]` without
+        # pre-casting velocity to fp32. bf16 * fp32 is not always the same as
+        # fp32(v) * fp32(dt); keep the mixed-dtype multiply.
+        velocity = velocity.to(device=x_t.device)
         if velocity.shape != x_t.shape:
             raise ValueError(
                 f"BAGEL flow velocity shape mismatch: got {tuple(velocity.shape)}, expected {tuple(x_t.shape)}."
             )
 
-        dt = dts[self._step_index].to(device=x_t.device, dtype=x_t.dtype)
+        dt = dts[self._step_index].to(device=x_t.device)
         self._latents = x_t - velocity * dt
         self._step_index += 1
         return self.step_index >= int(dts.numel())

@@ -1,8 +1,9 @@
-"""Checkpoint compatibility for BAGEL's combined QKV projections.
+"""Checkpoint compatibility for accelerated BAGEL fused QKV projections.
 
-The runtime uses one merged ``qkv_proj_und`` or ``qkv_proj_gen`` parameter per
-MoT branch to issue one linear projection. Existing checkpoints keep their
-separate Q/K/V keys, so each load/save API needs an adapter at its own boundary:
+Eager attention owns official split ``q_proj`` / ``k_proj`` / ``v_proj``
+parameters. Accelerated attention stores one merged ``qkv_proj_und`` or
+``qkv_proj_gen`` parameter per MoT branch. Existing checkpoints keep their
+separate Q/K/V keys, so only the accelerated runtime needs an adapter:
 PyTorch state-dict hooks, Transformers weight converters, or VeOmni's streaming
 checkpoint converter.
 """
@@ -132,6 +133,11 @@ class _SplitQKV(ConversionOps):
 
         values = next(iter(input_dict.values()))
         tensor = values[0] if isinstance(values, list) else values
+        # FSDP2 / DCP keeps a dim-0 DTensor on the fused parameter. Q/K/V row
+        # sizes do not line up with those shards, so gather before splitting.
+        full_tensor = getattr(tensor, "full_tensor", None)
+        if callable(full_tensor) and getattr(tensor, "device_mesh", None) is not None:
+            tensor = full_tensor()
         config = kwargs["config"]
         head_dim = config.hidden_size // config.num_attention_heads
         split_sizes = (
@@ -162,18 +168,21 @@ def _qkv_weight_converters() -> list[WeightConverter]:
     return converters
 
 
-# Transformers v5 can bypass load_state_dict while loading and reverses this
-# mapping during save, preserving the legacy split Q/K/V checkpoint schema.
-for model_identifier in ("BagelQwen2MoT", "bagel_qwen2_mot"):
+def register_accelerated_qkv_conversion_mapping() -> None:
+    """Register fused-QKV converters for the accelerated class only.
+
+    Lookups prefer class name over ``model_type``. Do not register
+    ``bagel_qwen2_mot`` here: eager ``BagelQwen2MoT`` uses native split keys.
+    """
     register_checkpoint_conversion_mapping(
-        model_identifier,
+        "BagelQwen2MoTAccelerated",
         _qkv_weight_converters(),
         overwrite=True,
     )
 
 
 class BagelQwen2MoTCheckpointTensorConverter:
-    """Stream legacy Q/K/V tensors into the combined runtime parameters.
+    """Stream legacy Q/K/V tensors into accelerated combined runtime parameters.
 
     VeOmni's ``load_model_weights`` assigns tensors directly instead of calling
     ``load_state_dict``, so the PyTorch pre-hook cannot perform this merge.
