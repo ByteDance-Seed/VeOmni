@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
@@ -824,8 +825,6 @@ class TrainingArguments:
             )
         assert acc.tp_size == 1, "Tensor parallel size not supported yet."
         assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
-        assert acc.cp_size == 1, "Context parallel size not supported yet."
-
         acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
 
         # resolve dp_replicate_size / dp_shard_size
@@ -1124,6 +1123,14 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
+    gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless"] = field(
+        default="disabled",
+        metadata={
+            "help": "Gated DeltaNet context-parallel algorithm. 'disabled' (default) rejects CP for GDN models; "
+            "'state_passing_lossless' uses native-chunk ownership, reversible all-to-all, and recurrent-state/halo "
+            "autograd across context-parallel ranks."
+        },
+    )
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
         default="eager",
         metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
@@ -1141,6 +1148,12 @@ class OpsImplementationConfig:
     )
 
     def __post_init__(self):
+        allowed_gdn_cp = {"disabled", "state_passing_lossless"}
+        if self.gdn_context_parallel_implementation not in allowed_gdn_cp:
+            raise ValueError(
+                "gdn_context_parallel_implementation must be one of "
+                f"{sorted(allowed_gdn_cp)}, got {self.gdn_context_parallel_implementation!r}."
+            )
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
@@ -1505,6 +1518,123 @@ class DataArguments:
 # ================================ Top-Level Arguments ======================================
 
 
+_GDN_CP_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"})
+_RING_ATTENTION_IMPLEMENTATIONS = frozenset(
+    {
+        "veomni_flash_attention_2_with_sp",
+        "veomni_flash_attention_3_with_sp",
+        "veomni_flash_attention_4_with_sp",
+    }
+)
+
+
+def _context_parallel_model_contract(model: ModelArguments) -> tuple[Optional[str], float, object, bool]:
+    """Read the small, local HF config surface needed by the CP fail-closed gate."""
+    raw: dict = {}
+    path = Path(model.config_path) if model.config_path else None
+    if path is not None:
+        config_file = path / "config.json" if path.is_dir() else path
+        if config_file.is_file():
+            try:
+                loaded = json.loads(config_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Cannot read model config for context parallel validation: {config_file}") from exc
+            if isinstance(loaded, dict):
+                raw.update(loaded)
+    if model.model_config:
+        overrides = dict(model.model_config)
+        text_overrides = overrides.pop("text_config", None)
+        raw.update(overrides)
+        if isinstance(text_overrides, dict):
+            merged_text = dict(raw.get("text_config", {}))
+            merged_text.update(text_overrides)
+            raw["text_config"] = merged_text
+
+    text_config = raw.get("text_config")
+    text = text_config if isinstance(text_config, dict) else raw
+    model_type = text.get("model_type") or raw.get("model_type")
+    attention_dropout = float(text.get("attention_dropout", raw.get("attention_dropout", 0.0)) or 0.0)
+    use_sliding_window = bool(text.get("use_sliding_window", raw.get("use_sliding_window", False)))
+    sliding_window = text.get("sliding_window", raw.get("sliding_window")) if use_sliding_window else None
+    is_encoder_decoder = bool(text.get("is_encoder_decoder", raw.get("is_encoder_decoder", False)))
+    return model_type, attention_dropout, sliding_window, is_encoder_decoder
+
+
+def validate_context_parallel_config(
+    *,
+    cp_size: int,
+    implementation: str,
+    dyn_bsz: bool,
+    attn_implementation: Optional[str] = None,
+    data_type: Optional[str] = None,
+    model_type: Optional[str] = None,
+    attention_dropout: float = 0.0,
+    sliding_window: object = None,
+    is_encoder_decoder: bool = False,
+) -> None:
+    """Fail closed until generic Ring CP has its own public selector and capability matrix.
+
+    The current production CP entry is deliberately limited to Qwen3.5 GDN
+    models with an explicit lossless-state selector. Ring attention
+    modules remain available as implementation building blocks and CPU oracles,
+    but ``cp_size>1`` must never make the collator shard tokens by itself.
+    """
+    enabled_gdn_cp = {"state_passing_lossless"}
+    if cp_size > 1 and implementation not in enabled_gdn_cp:
+        raise ValueError(
+            "train.accelerator.cp_size > 1 requires an explicit supported context-parallel algorithm; "
+            "generic Ring CP is not a production configuration yet. Set "
+            "model.ops_implementation.gdn_context_parallel_implementation to 'state_passing_lossless' "
+            "for a supported Qwen3.5 GDN model."
+        )
+    if implementation in enabled_gdn_cp and cp_size == 1:
+        raise ValueError(
+            f"gdn_context_parallel_implementation={implementation!r} requires train.accelerator.cp_size > 1."
+        )
+    if implementation in enabled_gdn_cp and not dyn_bsz:
+        raise ValueError("GDN context parallelism currently requires train.dyn_bsz=True packed metadata.")
+    if implementation in enabled_gdn_cp and cp_size & (cp_size - 1):
+        raise ValueError("GDN context parallelism requires cp_size to be a power of two.")
+    if implementation not in enabled_gdn_cp:
+        return
+    if attn_implementation not in _RING_ATTENTION_IMPLEMENTATIONS:
+        raise ValueError(
+            "GDN context parallelism requires a VeOmni FlashAttention SP backend; "
+            f"got attn_implementation={attn_implementation!r}. Eager and SDPA do not execute Ring CP."
+        )
+    if data_type not in {"conversation", "plaintext"}:
+        raise ValueError(
+            f"GDN context parallelism supports text-only packed causal-LM data, got data_type={data_type!r}."
+        )
+    if model_type not in _GDN_CP_MODEL_TYPES:
+        raise ValueError(
+            "GDN context parallelism is currently implemented only for Qwen3.5 dense/MoE text models; "
+            f"got model_type={model_type!r}."
+        )
+    if attention_dropout != 0.0:
+        raise ValueError("GDN context parallelism requires attention_dropout=0.")
+    if sliding_window is not None:
+        raise ValueError("GDN context parallelism does not support sliding-window attention.")
+    if is_encoder_decoder:
+        raise ValueError("GDN context parallelism supports causal self-attention decoder models only.")
+
+
+def validate_gdn_context_parallel_config(*, cp_size: int, implementation: str, dyn_bsz: bool) -> None:
+    """Compatibility wrapper for topology-only callers.
+
+    New root configurations must use :func:`validate_context_parallel_config`
+    so attention and model capability are validated as well.
+    """
+    validate_context_parallel_config(
+        cp_size=cp_size,
+        implementation=implementation,
+        dyn_bsz=dyn_bsz,
+        attn_implementation="veomni_flash_attention_2_with_sp",
+        data_type="conversation",
+        model_type="qwen3_5_text",
+    )
+
+
 @dataclass
 class VeOmniArguments:
     """Root config — assembles model, data, and train."""
@@ -1514,6 +1644,30 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
+        cp_size = self.train.accelerator.cp_size
+        gdn_cp_impl = self.model.ops_implementation.gdn_context_parallel_implementation
+        # Validate topology before reading model capability so malformed CP
+        # configs fail with the primary, actionable error.
+        validate_gdn_context_parallel_config(
+            cp_size=cp_size,
+            implementation=gdn_cp_impl,
+            dyn_bsz=self.train.dyn_bsz,
+        )
+        model_type, attention_dropout, sliding_window, is_encoder_decoder = _context_parallel_model_contract(
+            self.model
+        )
+        validate_context_parallel_config(
+            cp_size=cp_size,
+            implementation=gdn_cp_impl,
+            dyn_bsz=self.train.dyn_bsz,
+            attn_implementation=self.model.ops_implementation.attn_implementation,
+            data_type=self.data.data_type,
+            model_type=model_type,
+            attention_dropout=attention_dropout,
+            sliding_window=sliding_window,
+            is_encoder_decoder=is_encoder_decoder,
+        )
+
         if self.train.pad_to_length:
             if not self.train.dyn_bsz:
                 logger.warning_rank0(
