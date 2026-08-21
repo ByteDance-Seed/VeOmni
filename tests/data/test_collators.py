@@ -5,6 +5,7 @@ import torch
 
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.helper import _compute_seqlens
 
 
 def _fake_ps(
@@ -129,6 +130,52 @@ def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, fea
     assert torch.equal(out["linear_attn_cu_seq_lens_q"], torch.tensor([0, 3, 5], dtype=torch.int32))
     assert out["attention_mask"].shape[-1] == 16
     assert torch.equal(out["router_attention_mask"], torch.tensor([[1, 0, 0, 0]], dtype=torch.long))
+
+
+@pytest.mark.parametrize("cp_size, ulysses_size", [(2, 2), (4, 1), (8, 1)])
+def test_text_collator_cp_pad_to_length_preserves_logical_accounting(
+    monkeypatch, features_two_samples, cp_size, ulysses_size
+):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(
+        m,
+        "get_parallel_state",
+        lambda: _fake_ps(
+            sp_enabled=True,
+            sp_size=cp_size * ulysses_size,
+            cp_size=cp_size,
+            ulysses_size=ulysses_size,
+        ),
+    )
+    token_labels = [
+        {**features_two_samples[0], "labels": torch.tensor([2, 3, 4], dtype=torch.long)},
+        {**features_two_samples[1], "labels": torch.tensor([1, 2], dtype=torch.long)},
+    ]
+
+    out = m.MainCollator(pad_to_length=16)(token_labels)
+
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], torch.tensor([0, 3, 5, 16], dtype=torch.int32))
+    assert _compute_seqlens(out) == [3, 2]
+
+
+def test_post_collator_fails_closed_for_context_parallel_output(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, cp_size=2))
+
+    with pytest.raises(ValueError, match="does not support context-parallel output reordering"):
+        m.SeqlensComputePostCollator()({"cu_seq_lens_q": torch.tensor([0, 3], dtype=torch.int32)})
+
+
+def test_post_collator_accepts_logical_only_metadata_without_cp(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+
+    assert m.SeqlensComputePostCollator()(
+        {"linear_attn_cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=torch.int32)}
+    ) == [3, 2]
 
 
 def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_samples):

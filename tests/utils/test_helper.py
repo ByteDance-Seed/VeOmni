@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 from transformers import Qwen2Config
@@ -17,6 +18,71 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 
 
 logger = helper.create_logger(__name__)
+
+
+def test_compute_seqlens_uses_logical_cp_metadata():
+    micro_batch = {
+        "cu_seq_lens_q": torch.tensor([0, 4, 6], dtype=torch.int32),
+        "linear_attn_cu_seq_lens_q": torch.tensor([0, 12, 16], dtype=torch.int32),
+        "tail_padding_length": torch.tensor(4, dtype=torch.int32),
+    }
+
+    assert helper._compute_seqlens(micro_batch) == [12]
+
+
+def test_compute_seqlens_accepts_logical_metadata_without_local_view():
+    micro_batch = {
+        "linear_attn_cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=torch.int32),
+    }
+
+    assert helper._compute_seqlens(micro_batch) == [3, 2]
+
+
+def test_compute_seqlens_preserves_zero_length_logical_sample():
+    micro_batch = {
+        "cu_seq_lens_q": torch.tensor([0, 0, 5], dtype=torch.int32),
+        "linear_attn_cu_seq_lens_q": torch.tensor([0, 0, 5], dtype=torch.int32),
+    }
+
+    assert helper._compute_seqlens(micro_batch) == [0, 5]
+
+
+def test_multisource_tracker_zero_token_step_is_defined(monkeypatch):
+    tracker = helper.MultiSourceInfoTracker.__new__(helper.MultiSourceInfoTracker)
+    tracker.parallel_state = SimpleNamespace(dp_size=1, dp_group=None)
+    tracker.accumulate_counter = {}
+    tracker.batch_idx = 0
+    tracker.names = ["source"]
+    tracker.boundary_type = "token"
+    tracker.dataloader = SimpleNamespace()
+
+    def gather_one(output, value, group=None):
+        output[0] = value
+
+    monkeypatch.setattr(helper.dist, "all_gather_object", gather_one)
+
+    tracker.step([0], [4])
+    metrics = tracker.step([0], [0])
+
+    assert metrics["multi_source/step_consumed_ratio/source"] == 0.0
+
+
+def test_multisource_tracker_rejects_metadata_length_mismatch(monkeypatch):
+    tracker = helper.MultiSourceInfoTracker.__new__(helper.MultiSourceInfoTracker)
+    tracker.parallel_state = SimpleNamespace(dp_size=1, dp_group=None)
+    tracker.accumulate_counter = {}
+    tracker.batch_idx = 0
+    tracker.names = ["source"]
+    tracker.boundary_type = "token"
+    tracker.dataloader = SimpleNamespace()
+
+    def gather_one(output, value, group=None):
+        output[0] = value
+
+    monkeypatch.setattr(helper.dist, "all_gather_object", gather_one)
+
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        tracker.step([0, 0], [4])
 
 
 def test_environ_meter_passes_supported_lora_config(monkeypatch):

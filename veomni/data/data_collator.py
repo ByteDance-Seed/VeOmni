@@ -28,8 +28,8 @@ from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import (
     coalesce_tail_padding_cu_seqlens,
+    logical_seqlens_from_cu_seqlens,
     prepare_fa_kwargs_from_position_ids,
-    valid_seqlens_from_cu_seqlens,
 )
 
 
@@ -632,9 +632,15 @@ class PostCollator(DataCollator):
 @dataclass
 class SeqlensComputePostCollator(DataCollator):
     def __call__(self, micro_batch: Dict[str, torch.Tensor]):
+        if getattr(get_parallel_state(), "cp_size", 1) > 1:
+            raise ValueError(
+                "PostCollator does not support context-parallel output reordering yet; "
+                "use a non-CP RL/DPO topology or a CP-aware post-collator."
+            )
         tail_padding_length = micro_batch.get("tail_padding_length")
-        seq_lens = valid_seqlens_from_cu_seqlens(
-            micro_batch["cu_seq_lens_q"],
+        seq_lens = logical_seqlens_from_cu_seqlens(
+            micro_batch.get("cu_seq_lens_q"),
+            logical_cu_seqlens=micro_batch.get("linear_attn_cu_seq_lens_q"),
             tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
         ).tolist()
         return seq_lens
