@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import veomni.utils.loss_utils as loss_utils
+from veomni.utils.constants import IGNORE_INDEX
 
 
 def test_reduce_global_loss_token_reduces_each_denominator_once(monkeypatch):
@@ -69,3 +70,32 @@ def test_mean_global_loss_falls_back_to_reducing_denominator(monkeypatch):
 
     assert loss_dict["foundation_loss"].item() == pytest.approx(0.8)
     assert calls == [(5, "sum", None)]
+
+
+def test_count_loss_token_accumulates_extra_label_keys_across_micro_batches():
+    """Verify extra supervised heads accumulate valid tokens across micro-batches."""
+    micro_batch = {
+        "labels": torch.tensor([[1, 2, 3, IGNORE_INDEX]]),
+        "mtp_labels": torch.tensor([[3, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]]),
+    }
+
+    single = loss_utils.count_loss_token(micro_batch)
+    assert single["foundation_tokens"].item() == 3
+    assert single["mtp_tokens"].item() == 1
+
+    accumulated = loss_utils.count_loss_token([micro_batch, micro_batch, micro_batch])
+    assert accumulated["foundation_tokens"].item() == 9
+    assert accumulated["mtp_tokens"].item() == 3
+
+
+def test_count_loss_token_handles_several_extra_label_keys():
+    """Verify each additional label field receives an independent token count."""
+    token_len = loss_utils.count_loss_token(
+        {
+            "labels": torch.tensor([[1, 2]]),
+            "mtp_labels": torch.tensor([[2, IGNORE_INDEX]]),
+            "image_labels": torch.tensor([[7, 8]]),
+        }
+    )
+    assert token_len["mtp_tokens"].item() == 1
+    assert token_len["image_tokens"].item() == 2

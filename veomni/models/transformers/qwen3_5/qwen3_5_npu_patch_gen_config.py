@@ -39,14 +39,21 @@ from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    Qwen3_5MTP,
+    Qwen3_5MTPContextOutput,
+    _mtp_loss_weight,
     _Qwen3_5FakeForPosID,
     collate_multimodal_metadata,
     get_position_id,
+    make_mtp_labels,
     mm_token_type_ids_from_input_ids,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forconditional_generation_forward_patched,
+    qwen3_5_forconditional_generation_get_extra_collate_infos,
     qwen3_5_forconditional_generation_get_metadata_collate_func,
     qwen3_5_forconditional_generation_get_position_id_func,
+    qwen3_5_forconditional_generation_get_sample_collate_func,
+    qwen3_5_forconditional_generation_init_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_forward,
@@ -87,7 +94,7 @@ config.add_import(
 config.add_import(
     "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
 )
-config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
 # from the GPU config) can return per-token log-probs in the unified output
 # dataclass.
@@ -104,10 +111,7 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
-    # linear-attention impl raises at OpSlot.bind() time, which is desirable —
-    # a silent fallback would mask the misconfiguration. These None
-    # placeholders preserve the upstream HF top-level
+    # Preserve the upstream availability check; OpSlots provide the kernels.
     # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
     # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
     # assignments in __init__ resolve to torch.
@@ -174,6 +178,12 @@ config.add_helper(mm_token_type_ids_from_input_ids)
 config.add_helper(get_position_id)
 config.add_helper(collate_multimodal_metadata)
 config.add_helper(_Qwen3_5FakeForPosID)
+
+# MTP helpers shared with the GPU patch.
+config.add_helper(_mtp_loss_weight)
+config.add_helper(make_mtp_labels)
+config.add_helper_after("Qwen3_5DecoderLayer", Qwen3_5MTP)
+config.add_helper_after("Qwen3_5ModelOutputWithPast", Qwen3_5MTPContextOutput)
 
 
 config.override_method(
@@ -257,6 +267,7 @@ def qwen3_5_gated_deltanet_forward_patched(
     chunk_indices: dict | None = None,
     chunk_indices_list: dict | None = None,
 ):
+    """Run GatedDeltaNet with precomputed varlen metadata on Ascend NPU."""
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     # Set up dimensions for reshapes later
@@ -385,10 +396,9 @@ def qwen3_5_gated_deltanet_forward_patched(
         # Modification: instance-local guard (see GPU patch comment).
         if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
             raise RuntimeError(
-                "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
-                "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
-                "(and install flash-linear-attention) or 'flash_qla' (ships under the gpu extra, "
-                "Hopper sm90 only) in OpsImplementationConfig."
+                "Varlen Qwen3.5 GatedDeltaNet training requires a non-eager "
+                "chunk_gated_delta_rule backend. On GPU, set the implementation to 'fla' or "
+                "'flash_qla'; on NPU, set it to 'fla_npu' or 'npu'."
             )
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -522,6 +532,20 @@ def qwen3_5_text_model_forward_patched(
     use_cache: bool | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5ModelOutputWithPast:
+    """Run the NPU text backbone and expose precomputed MTP and varlen context.
+
+    Args:
+        input_ids: Token IDs when embeddings are not provided.
+        attention_mask: Attention or padding mask used to derive varlen metadata.
+        position_ids: Text and multimodal rotary position IDs.
+        past_key_values: Optional generation cache.
+        inputs_embeds: Precomputed token embeddings.
+        use_cache: Whether to populate the generation cache.
+        kwargs: Additional transformer arguments forwarded to decoder layers.
+
+    Returns:
+        Text model outputs including MTP context and reused NPU varlen metadata.
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -593,9 +617,25 @@ def qwen3_5_text_model_forward_patched(
 
     hidden_states = self.norm(hidden_states)
 
-    return Qwen3_5ModelOutputWithPast(
+    mtp_context = None
+    if self.training and getattr(self, "_veomni_mtp_enabled", False):
+        mtp_context = {
+            "inputs_embeds": inputs_embeds,
+            "position_embeddings": position_embeddings,
+            "attention_mask": causal_mask,
+            "position_ids": text_position_ids,
+        }
+
+    if mtp_context is None:
+        return Qwen3_5ModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+
+    return Qwen3_5MTPContextOutput(
         last_hidden_state=hidden_states,
         past_key_values=past_key_values,
+        mtp_context=mtp_context,
     )
 
 
@@ -851,6 +891,27 @@ config.override_method(
 
 
 config.override_method(
+    "Qwen3_5ForConditionalGeneration.__init__",
+    replacement=qwen3_5_forconditional_generation_init_patched,
+    description="Build the MTP head when text_config.mtp_loss_weight is set",
+)
+
+
+config.override_method(
+    "Qwen3_5ForConditionalGeneration.get_extra_collate_infos",
+    replacement=qwen3_5_forconditional_generation_get_extra_collate_infos,
+    description="Declare the MTP label collate rule for the VeOmni collator",
+)
+
+
+config.override_method(
+    "Qwen3_5ForConditionalGeneration.get_sample_collate_func",
+    replacement=qwen3_5_forconditional_generation_get_sample_collate_func,
+    description="Expose the per-sample MTP label shift to the VeOmni collator",
+)
+
+
+config.override_method(
     "Qwen3_5ForConditionalGeneration.forward",
     replacement=qwen3_5_forconditional_generation_forward_patched,
     description="Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward",
@@ -869,4 +930,11 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
+    loss_dict (`dict[str, torch.Tensor]`, *optional*):
+        Per-head losses when more than one head is supervised (MTP). Mirrors the
+        GPU config — see there for why this cannot live in ``loss`` itself
+        (``ModelOutput.__post_init__`` scatters a dict first field and deletes
+        ``loss`` when every other field is None).
     """
+
+    loss_dict: dict[str, torch.Tensor] | None = None

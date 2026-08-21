@@ -41,6 +41,8 @@ from ..utils.seqlen_pos_transform_utils import (
 # ``batch`` in place, writing ``batch["multimodal_metadata"]``.
 MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 
+SampleCollateFunc = Callable[[Dict[str, Any]], None]
+
 
 logger = logging.get_logger(__name__)
 
@@ -212,6 +214,20 @@ class PrecomputePositionIDsCollator(DataCollator):
             if "position_ids" not in feature:
                 # default position_ids is 0 ~ seq_len - 1 for text models
                 feature["position_ids"] = torch.arange(feature["input_ids"].size(-1), dtype=torch.int64)
+        return features
+
+
+@dataclass
+class SampleFieldsCollator(DataCollator):
+    """Apply a model-provided hook to each sample before packing."""
+
+    sample_collate_func: Optional[SampleCollateFunc] = None
+
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
+        """Apply the optional model hook to every sample before packing."""
+        if self.sample_collate_func is not None:
+            for feature in features:
+                self.sample_collate_func(feature)
         return features
 
 
@@ -433,6 +449,7 @@ class MainCollator(DataCollator):
     pad_to_length: bool = False
     seq_classification: bool = False
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    sample_collate_func: Optional[SampleCollateFunc] = None
 
     """
     Data collator pipeline with a unified collate info.
@@ -448,9 +465,15 @@ class MainCollator(DataCollator):
             Optional model-provided hook (``model.get_metadata_collate_func()``)
             that derives ``multimodal_metadata`` from the packed + SP-padded
             batch. ``None`` for text models. See ``MetadataCollateFunc``.
+        sample_collate_func:
+            Optional model-provided hook (``model.get_sample_collate_func()``)
+            that derives extra tensors on each un-packed sample, before packing.
+            ``None`` for models without extra supervised heads. See
+            ``SampleCollateFunc``.
     """
 
     def __post_init__(self):
+        """Build the ordered collation pipeline and merge model-specific field rules."""
         self.preforward_pipeline = []
         self.collate_infos: Dict[str, DataCollateInfo] = {}
 
@@ -474,6 +497,8 @@ class MainCollator(DataCollator):
         assert self.collate_infos["attention_mask"].sp_pad_value == 1
 
         self.preforward_pipeline.append(PrecomputePositionIDsCollator())
+        if self.sample_collate_func is not None:
+            self.preforward_pipeline.append(SampleFieldsCollator(sample_collate_func=self.sample_collate_func))
         self.preforward_pipeline.append(
             PackingCollator(
                 collate_infos=self.collate_infos,

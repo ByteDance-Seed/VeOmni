@@ -42,8 +42,10 @@ from transformers.modeling_outputs import (
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeCausalLMOutputWithPast,
+    Qwen3_5MoeDecoderLayer,
     Qwen3_5MoeModel,
     Qwen3_5MoeModelOutputWithPast,
+    Qwen3_5MoeRMSNorm,
     Qwen3_5MoeTextModel,
     Qwen3_5MoeVisionModel,
     load_balancing_loss_func,
@@ -53,11 +55,14 @@ from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    _mtp_loss_weight,
+    make_mtp_labels,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_forward_patched,
     qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
@@ -66,7 +71,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -95,7 +100,7 @@ config.add_import(
 config.add_import(
     "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
 )
-config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward`` can return
 # per-token log-probs in the unified MoE output dataclass.
 config.add_import(
@@ -103,6 +108,8 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
+config.add_helper(_mtp_loss_weight)
+config.add_helper(make_mtp_labels)
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -299,6 +306,14 @@ config.override_method(
         "the per-block GPU->CPU sync that flash_attn_varlen_func incurs when "
         "`max_length_q/k` are 0-D GPU tensors (FA's C++ binding `.item()`s them)."
     ),
+)
+
+
+config.override_method(
+    "Qwen3_5MoeTextModel.forward",
+    replacement=qwen3_5_text_model_forward_patched,
+    name_map={"Qwen3_5": "Qwen3_5Moe"},
+    description="Expose MTP context while training",
 )
 
 
@@ -536,10 +551,11 @@ def qwen3_5_moe_model_forward_patched(
         **kwargs,
     )
 
-    return Qwen3_5MoeModelOutputWithPast(
-        **outputs,
-        rope_deltas=self.rope_deltas,
-    )
+    output_kwargs = dict(outputs)
+    output_kwargs["rope_deltas"] = self.rope_deltas
+    if getattr(outputs, "mtp_context", None) is not None:
+        return Qwen3_5MoeMTPContextOutput(**output_kwargs)  # noqa: F821
+    return Qwen3_5MoeModelOutputWithPast(**output_kwargs)
 
 
 # Surface ``Qwen3_5MoeCausalLMOutputWithLogProbs`` so the patched multimodal
@@ -561,6 +577,53 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
+
+    loss_dict: dict[str, torch.Tensor] | None = None
+
+
+@config.add_helper_after("Qwen3_5MoeModelOutputWithPast")
+@dataclass
+class Qwen3_5MoeMTPContextOutput(Qwen3_5MoeModelOutputWithPast):
+    mtp_context: dict | None = None
+
+
+@config.add_helper_after("Qwen3_5MoeDecoderLayer")
+class Qwen3_5MoeMTP(nn.Module):
+    def __init__(self, config):
+        """Build the MoE MTP head from copies of a full-attention decoder layer."""
+        super().__init__()
+        assert not getattr(config, "mtp_use_dedicated_embeddings", False)
+        num_layers = int(config.mtp_num_hidden_layers)
+        assert "full_attention" in config.layer_types
+        layer_idx = config.layer_types.index("full_attention")
+        self.pre_fc_norm_embedding = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList([Qwen3_5MoeDecoderLayer(config, layer_idx) for _ in range(num_layers)])
+        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self, hidden_states, inputs_embeds, position_embeddings, attention_mask=None, position_ids=None, **kwargs
+    ):
+        """Predict future hidden states with shifted embeddings and MoE decoder layers."""
+        assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False)
+        shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, 1))[:, 1:, :]
+        hidden_states = self.fc(
+            torch.cat([self.pre_fc_norm_embedding(shifted_embeds), self.pre_fc_norm_hidden(hidden_states)], dim=-1)
+        )
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                **kwargs,
+            )
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+        return self.norm(hidden_states)
 
 
 @config.add_helper
@@ -987,6 +1050,49 @@ def qwen3_5_moe_forcausallm_forward_patched(
 
 
 @config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.__init__",
+    description="Build the MTP head when enabled",
+)
+def qwen3_5_moe_forconditional_generation_init_patched(self, config):
+    """Initialize Qwen3.5-MoE conditional generation and its optional MTP head."""
+    super().__init__(config)
+    self.model = Qwen3_5MoeModel(config)
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    self.mtp = None
+    weight = _mtp_loss_weight(config.text_config)  # noqa: F821
+    self.model.language_model._veomni_mtp_enabled = weight is not None
+    if weight is not None:
+        assert not get_parallel_state().sp_enabled, "Qwen3.5 MoE MTP does not support sequence parallel."
+        self.mtp = Qwen3_5MoeMTP(config.text_config)  # noqa: F821
+        logger.info_rank0(
+            f"Qwen3.5 MoE MTP enabled: {config.text_config.mtp_num_hidden_layers} layer(s), loss weight {weight}."
+        )
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos",
+    description="Declare the MTP label collate rule",
+)
+def qwen3_5_moe_forconditional_generation_get_extra_collate_infos(self):
+    """Declare the packing rule for MoE MTP labels when enabled."""
+    if self.mtp is None:
+        return {}
+    return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_sample_collate_func",
+    description="Expose the per-sample MTP label shift",
+)
+def qwen3_5_moe_forconditional_generation_get_sample_collate_func(self):
+    """Return the per-sample MoE MTP label builder when enabled."""
+    if self.mtp is None:
+        return None
+    return make_mtp_labels  # noqa: F821
+
+
+@config.override_method(
     "Qwen3_5MoeForConditionalGeneration.forward",
     description="Support fused cross entropy path in Qwen3_5MoeForConditionalGeneration.forward",
 )
@@ -1004,8 +1110,10 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     video_grid_thw: torch.LongTensor | None = None,
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
+    mtp_labels: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
+    """Run MoE conditional generation and combine foundation, MTP, and router losses."""
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1079,8 +1187,41 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         if labels is not None:
             loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
 
+    loss_dict = None
+    if self.mtp is not None and labels is not None:
+        if mtp_labels is None:
+            raise ValueError(
+                "Qwen3.5 MoE MTP training requires tasks/train_text.py; this trainer did not provide `mtp_labels`."
+            )
+        mtp_context = getattr(outputs, "mtp_context", None)
+        if mtp_context is None:
+            raise ValueError("MTP is enabled but the language model returned no mtp_context.")
+        mtp_hidden = self.mtp(
+            hidden_states=outputs[0],
+            inputs_embeds=mtp_context["inputs_embeds"],
+            position_embeddings=mtp_context["position_embeddings"],
+            attention_mask=mtp_context["attention_mask"],
+            position_ids=mtp_context["position_ids"],
+            cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+            cu_seq_lens_k=kwargs.get("cu_seq_lens_k"),
+            max_length_q=kwargs.get("max_length_q"),
+            max_length_k=kwargs.get("max_length_k"),
+        )
+        mtp_loss_fn = veomni_causal_lm_loss if veomni_causal_lm_loss.use_non_eager_impl else self.loss_function
+        mtp_loss, _, _ = mtp_loss_fn(
+            logits=None,
+            labels=labels,
+            vocab_size=self.config.text_config.vocab_size,
+            hidden_states=mtp_hidden,
+            weights=self.lm_head.weight,
+            shift_labels=mtp_labels,
+        )
+        weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821
+        loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
+
     return Qwen3_5MoeCausalLMOutputWithLogProbs(
         loss=loss,
+        loss_dict=loss_dict,
         aux_loss=aux_loss,
         logits=logits,
         past_key_values=outputs.past_key_values,

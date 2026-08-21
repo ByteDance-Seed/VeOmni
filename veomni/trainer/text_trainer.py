@@ -19,6 +19,7 @@ import torch
 
 from ..arguments import VeOmniArguments
 from ..data import (
+    MainCollator,
     build_chat_template,
     build_data_transform,
 )
@@ -39,6 +40,7 @@ class TextTrainer:
     base: BaseTrainer
 
     def __init__(self, args: VeOmniArguments):
+        """Build the text training stack within the base parallel-state scope."""
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the sequence is explicit.
         self.base = BaseTrainer.__new__(BaseTrainer)
@@ -61,7 +63,7 @@ class TextTrainer:
             self._build_data_transform()
 
             self.base._build_dataset()
-            self.base._build_collate_fn()
+            self._build_collate_fn()
             self.base._build_dataloader()
             self.base._build_parallelized_model()
             self.base._build_optimizer()
@@ -88,6 +90,18 @@ class TextTrainer:
             chat_template=self.base.chat_template,
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
+        )
+
+    def _build_collate_fn(self):
+        """Build MainCollator with any extra fields and sample hook from the model."""
+        model = self.base.model
+        get_extra_infos = getattr(model, "get_extra_collate_infos", None)
+        get_sample_func = getattr(model, "get_sample_collate_func", None)
+        self.base.collate_fn = MainCollator(
+            pad_to_length=self.base.args.train.pad_to_length,
+            seq_classification=self.base.args.data.data_type == "classification",
+            data_collate_info=get_extra_infos() if get_extra_infos is not None else {},
+            sample_collate_func=get_sample_func() if get_sample_func is not None else None,
         )
 
     def on_train_begin(self):
