@@ -224,6 +224,7 @@ class SampleFieldsCollator(DataCollator):
     sample_collate_func: Optional[SampleCollateFunc] = None
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
+        """Apply the optional model hook to every sample before packing."""
         if self.sample_collate_func is not None:
             for feature in features:
                 self.sample_collate_func(feature)
@@ -472,6 +473,7 @@ class MainCollator(DataCollator):
     """
 
     def __post_init__(self):
+        """Build the ordered collation pipeline and merge model-specific field rules."""
         self.preforward_pipeline = []
         self.collate_infos: Dict[str, DataCollateInfo] = {}
 

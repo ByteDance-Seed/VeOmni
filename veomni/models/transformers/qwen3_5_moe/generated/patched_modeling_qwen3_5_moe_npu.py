@@ -255,7 +255,6 @@ class _Qwen3_5MoeFakeForPosID(SimpleNamespace):
         return Qwen3_5MoeModel.get_vision_position_ids(self, *args, **kwargs)
 
 
-# ── MTP (multi-token prediction) ─────────────────────────────────────────────
 def _mtp_loss_weight(text_config):
     """Resolve the MTP loss weight, or None when MTP is disabled."""
     weight = getattr(text_config, "mtp_loss_weight", None)
@@ -664,6 +663,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         chunk_indices: dict | None = None,
         chunk_indices_list: dict | None = None,
     ):
+        """Run GatedDeltaNet with precomputed varlen metadata on Ascend NPU."""
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         # Set up dimensions for reshapes later
@@ -1277,6 +1277,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
 
 class Qwen3_5MoeMTP(nn.Module):
     def __init__(self, config):
+        """Build the MoE MTP head from copies of a full-attention decoder layer."""
         super().__init__()
         assert not getattr(config, "mtp_use_dedicated_embeddings", False)
         num_layers = int(config.mtp_num_hidden_layers)
@@ -1291,6 +1292,7 @@ class Qwen3_5MoeMTP(nn.Module):
     def forward(
         self, hidden_states, inputs_embeds, position_embeddings, attention_mask=None, position_ids=None, **kwargs
     ):
+        """Predict future hidden states with shifted embeddings and MoE decoder layers."""
         assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False)
         shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, 1))[:, 1:, :]
         hidden_states = self.fc(
@@ -2029,6 +2031,20 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3_5MoeModelOutputWithPast:
+        """Run the NPU text backbone and expose precomputed MTP and varlen context.
+
+        Args:
+            input_ids: Token IDs when embeddings are not provided.
+            attention_mask: Attention or padding mask used to derive varlen metadata.
+            position_ids: Text and multimodal rotary position IDs.
+            past_key_values: Optional generation cache.
+            inputs_embeds: Precomputed token embeddings.
+            use_cache: Whether to populate the generation cache.
+            kwargs: Additional transformer arguments forwarded to decoder layers.
+
+        Returns:
+            Text model outputs including MTP context and reused NPU varlen metadata.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -2940,6 +2956,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
 
     # ── ForConditionalGeneration forward (fused loss + aux_loss) ─────────────────────
     def __init__(self, config):
+        """Initialize Qwen3.5-MoE conditional generation and its optional MTP head."""
         super().__init__(config)
         self.model = Qwen3_5MoeModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
@@ -3002,6 +3019,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         mtp_labels: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
+        """Run MoE conditional generation and combine foundation, MTP, and router losses."""
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -3362,11 +3380,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         return collate_multimodal_metadata  # noqa: F821 defined via add_helper
 
     def get_extra_collate_infos(self):
+        """Declare the packing rule for MoE MTP labels when enabled."""
         if self.mtp is None:
             return {}
         return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
 
     def get_sample_collate_func(self):
+        """Return the per-sample MoE MTP label builder when enabled."""
         if self.mtp is None:
             return None
         return make_mtp_labels  # noqa: F821

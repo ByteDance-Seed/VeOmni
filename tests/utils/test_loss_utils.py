@@ -73,6 +73,7 @@ def test_mean_global_loss_falls_back_to_reducing_denominator(monkeypatch):
 
 
 def test_count_loss_token_accumulates_extra_label_keys_across_micro_batches():
+    """Verify extra supervised heads accumulate valid tokens across micro-batches."""
     micro_batch = {
         "labels": torch.tensor([[1, 2, 3, IGNORE_INDEX]]),
         "mtp_labels": torch.tensor([[3, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]]),
@@ -88,6 +89,7 @@ def test_count_loss_token_accumulates_extra_label_keys_across_micro_batches():
 
 
 def test_count_loss_token_handles_several_extra_label_keys():
+    """Verify each additional label field receives an independent token count."""
     token_len = loss_utils.count_loss_token(
         {
             "labels": torch.tensor([[1, 2]]),

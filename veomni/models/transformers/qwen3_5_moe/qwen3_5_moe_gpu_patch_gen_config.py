@@ -590,6 +590,7 @@ class Qwen3_5MoeMTPContextOutput(Qwen3_5MoeModelOutputWithPast):
 @config.add_helper_after("Qwen3_5MoeDecoderLayer")
 class Qwen3_5MoeMTP(nn.Module):
     def __init__(self, config):
+        """Build the MoE MTP head from copies of a full-attention decoder layer."""
         super().__init__()
         assert not getattr(config, "mtp_use_dedicated_embeddings", False)
         num_layers = int(config.mtp_num_hidden_layers)
@@ -604,6 +605,7 @@ class Qwen3_5MoeMTP(nn.Module):
     def forward(
         self, hidden_states, inputs_embeds, position_embeddings, attention_mask=None, position_ids=None, **kwargs
     ):
+        """Predict future hidden states with shifted embeddings and MoE decoder layers."""
         assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False)
         shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, 1))[:, 1:, :]
         hidden_states = self.fc(
@@ -1052,6 +1054,7 @@ def qwen3_5_moe_forcausallm_forward_patched(
     description="Build the MTP head when enabled",
 )
 def qwen3_5_moe_forconditional_generation_init_patched(self, config):
+    """Initialize Qwen3.5-MoE conditional generation and its optional MTP head."""
     super().__init__(config)
     self.model = Qwen3_5MoeModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
@@ -1072,6 +1075,7 @@ def qwen3_5_moe_forconditional_generation_init_patched(self, config):
     description="Declare the MTP label collate rule",
 )
 def qwen3_5_moe_forconditional_generation_get_extra_collate_infos(self):
+    """Declare the packing rule for MoE MTP labels when enabled."""
     if self.mtp is None:
         return {}
     return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
@@ -1082,6 +1086,7 @@ def qwen3_5_moe_forconditional_generation_get_extra_collate_infos(self):
     description="Expose the per-sample MTP label shift",
 )
 def qwen3_5_moe_forconditional_generation_get_sample_collate_func(self):
+    """Return the per-sample MoE MTP label builder when enabled."""
     if self.mtp is None:
         return None
     return make_mtp_labels  # noqa: F821
@@ -1108,6 +1113,7 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     mtp_labels: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
+    """Run MoE conditional generation and combine foundation, MTP, and router losses."""
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,

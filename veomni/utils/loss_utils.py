@@ -31,6 +31,7 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
     }
 
     def _count(obj):
+        """Accumulate valid-token counts from a nested batch structure."""
         if isinstance(obj, dict) and not obj.get("padding_flag", False):
             token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
 

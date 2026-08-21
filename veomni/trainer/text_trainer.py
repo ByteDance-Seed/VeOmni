@@ -40,6 +40,7 @@ class TextTrainer:
     base: BaseTrainer
 
     def __init__(self, args: VeOmniArguments):
+        """Build the text training stack within the base parallel-state scope."""
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the sequence is explicit.
         self.base = BaseTrainer.__new__(BaseTrainer)
@@ -92,6 +93,7 @@ class TextTrainer:
         )
 
     def _build_collate_fn(self):
+        """Build MainCollator with any extra fields and sample hook from the model."""
         model = self.base.model
         get_extra_infos = getattr(model, "get_extra_collate_infos", None)
         get_sample_func = getattr(model, "get_sample_collate_func", None)

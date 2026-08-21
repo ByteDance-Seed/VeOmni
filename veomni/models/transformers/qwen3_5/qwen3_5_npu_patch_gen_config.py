@@ -267,6 +267,7 @@ def qwen3_5_gated_deltanet_forward_patched(
     chunk_indices: dict | None = None,
     chunk_indices_list: dict | None = None,
 ):
+    """Run GatedDeltaNet with precomputed varlen metadata on Ascend NPU."""
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
     # Set up dimensions for reshapes later
@@ -531,6 +532,20 @@ def qwen3_5_text_model_forward_patched(
     use_cache: bool | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5ModelOutputWithPast:
+    """Run the NPU text backbone and expose precomputed MTP and varlen context.
+
+    Args:
+        input_ids: Token IDs when embeddings are not provided.
+        attention_mask: Attention or padding mask used to derive varlen metadata.
+        position_ids: Text and multimodal rotary position IDs.
+        past_key_values: Optional generation cache.
+        inputs_embeds: Precomputed token embeddings.
+        use_cache: Whether to populate the generation cache.
+        kwargs: Additional transformer arguments forwarded to decoder layers.
+
+    Returns:
+        Text model outputs including MTP context and reused NPU varlen metadata.
+    """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 

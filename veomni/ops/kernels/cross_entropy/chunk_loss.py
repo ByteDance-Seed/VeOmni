@@ -97,6 +97,7 @@ def chunk_loss_function(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
+    """Compute memory-efficient cross entropy with optional pre-shifted labels."""
     sp_enabled = get_parallel_state().sp_enabled
     explicit_shift = shift_labels is not None
 

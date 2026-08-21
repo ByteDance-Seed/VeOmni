@@ -12,6 +12,7 @@ from veomni.models.transformers.qwen3_5_moe.parallel_plan import get_parallel_pl
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
 from veomni.utils.device import IS_NPU_AVAILABLE
 
+
 if IS_NPU_AVAILABLE:
     from veomni.models.transformers.qwen3_5_moe.generated import patched_modeling_qwen3_5_moe_npu as modeling
 else:
@@ -25,16 +26,19 @@ INTERMEDIATE_DIM = 6
 
 
 def _make_mtp_expert_key(expert: int, proj: str) -> str:
+    """Build an HF-style checkpoint key for one MTP expert projection."""
     return f"mtp.layers.0.mlp.experts.{expert}.{proj}.weight"
 
 
 def _make_expert_tensor(proj: str, expert_id: int) -> torch.Tensor:
+    """Create a deterministic tensor for one expert projection."""
     shape = (HIDDEN_DIM, INTERMEDIATE_DIM) if proj == "down_proj" else (INTERMEDIATE_DIM, HIDDEN_DIM)
     offset = {"gate_proj": 0.0, "up_proj": 0.1, "down_proj": 0.2}[proj]
     return torch.full(shape, expert_id + offset)
 
 
 def test_qwen3_5_moe_mtp_structure():
+    """Verify the MoE MTP head mirrors a decoder layer and owns its projection."""
     text_config = AutoConfig.from_pretrained(TOY_CONFIG).text_config
     mtp = modeling.Qwen3_5MoeMTP(text_config)
 
@@ -46,6 +50,7 @@ def test_qwen3_5_moe_mtp_structure():
 
 
 def test_qwen3_5_moe_mtp_outputs_keep_auxiliary_fields():
+    """Verify MTP model outputs retain router, context, and per-head loss fields."""
     context = {"position_ids": torch.arange(4)}
     router_logits = (torch.zeros(4, 2),)
     model_output = modeling.Qwen3_5MoeMTPContextOutput(
@@ -62,6 +67,7 @@ def test_qwen3_5_moe_mtp_outputs_keep_auxiliary_fields():
 
 
 def test_qwen3_5_moe_parallel_plan_covers_mtp_experts():
+    """Verify the EP plan shards both trunk and MTP expert parameters."""
     plan = get_parallel_plan()
     patterns = plan.extra_parallel_plan["ep"]
     no_shard_patterns = plan.extra_parallel_fsdp_no_shard_module["ep"]
@@ -73,6 +79,7 @@ def test_qwen3_5_moe_parallel_plan_covers_mtp_experts():
 
 
 def test_qwen3_5_moe_registry_attaches_checkpoint_converter():
+    """Verify the registry attaches checkpoint conversion helpers to the model."""
     model_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
 
     assert callable(model_cls._create_checkpoint_tensor_converter)
@@ -80,6 +87,7 @@ def test_qwen3_5_moe_registry_attaches_checkpoint_converter():
 
 
 def test_qwen3_5_moe_reuses_checkpoint_converter_for_mtp_experts():
+    """Verify the Qwen3 MoE converter also fuses Qwen3.5 MTP expert weights."""
     model_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
     config = SimpleNamespace(text_config=SimpleNamespace(num_experts=NUM_EXPERTS))
     converter = model_cls._create_checkpoint_tensor_converter(SimpleNamespace(config=config, mtp=object()))
@@ -117,6 +125,7 @@ def test_qwen3_5_moe_reuses_checkpoint_converter_for_mtp_experts():
 
 
 def test_qwen3_5_moe_checkpoint_converter_rejects_incomplete_mtp_experts():
+    """Verify incomplete MTP expert groups fail checkpoint finalization."""
     model_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
     config = SimpleNamespace(text_config=SimpleNamespace(num_experts=NUM_EXPERTS))
     converter = model_cls._create_checkpoint_tensor_converter(SimpleNamespace(config=config, mtp=object()))
@@ -127,6 +136,7 @@ def test_qwen3_5_moe_checkpoint_converter_rejects_incomplete_mtp_experts():
 
 
 def test_qwen3_5_moe_checkpoint_converter_handles_trunk_without_mtp():
+    """Verify trunk expert conversion remains valid when MTP is disabled."""
     model_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
     config = SimpleNamespace(text_config=SimpleNamespace(num_experts=NUM_EXPERTS))
     converter = model_cls._create_checkpoint_tensor_converter(SimpleNamespace(config=config, mtp=None))
@@ -148,6 +158,7 @@ def test_qwen3_5_moe_checkpoint_converter_handles_trunk_without_mtp():
 
 
 def test_qwen3_5_moe_reuses_checkpoint_index_mapping():
+    """Verify checkpoint index conversion fuses MTP expert entries."""
     model_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
     trunk_key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
     mapping = {trunk_key: 1}
@@ -164,6 +175,7 @@ def test_qwen3_5_moe_reuses_checkpoint_index_mapping():
 
 
 def test_qwen3_5_moe_conditional_generation_builds_mtp(monkeypatch):
+    """Verify enabling MTP constructs the head and registers its parameters."""
     config = AutoConfig.from_pretrained(TOY_CONFIG)
     config.text_config.mtp_loss_weight = 0.3
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))

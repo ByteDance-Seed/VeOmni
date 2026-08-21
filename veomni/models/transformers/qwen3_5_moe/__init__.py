@@ -16,6 +16,7 @@ from ...loader import MODELING_REGISTRY
 
 
 def _create_qwen3_5_moe_checkpoint_tensor_converter(model):
+    """Create the shared Qwen3 MoE converter for trunk and MTP expert weights."""
     from ..qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
 
     text_config = getattr(model.config, "text_config", model.config)
@@ -37,6 +38,7 @@ def _create_qwen3_5_moe_checkpoint_tensor_converter(model):
 
 @MODELING_REGISTRY.register("qwen3_5_moe")
 def register_qwen3_5_moe_modeling(architecture: str):
+    """Register Qwen3.5-MoE classes with checkpoint conversion support."""
     from ..qwen3_moe.checkpoint_tensor_converter import convert_qwen3_moe_fqn_to_index_mapping
 
     if IS_NPU_AVAILABLE:

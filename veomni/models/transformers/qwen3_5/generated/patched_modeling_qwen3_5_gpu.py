@@ -152,7 +152,6 @@ _VEOMNI_VISION_ATTENTION_PATCHED = True
 # ======================================================================
 
 
-# ── MTP (multi-token prediction) ─────────────────────────────────────────────
 def _mtp_loss_weight(text_config):
     """Resolve the MTP loss weight, or None when MTP is disabled."""
     weight = getattr(text_config, "mtp_loss_weight", None)
@@ -1165,6 +1164,7 @@ class Qwen3_5MTP(nn.Module):
     """Qwen3.5 multi-token-prediction head."""
 
     def __init__(self, config: Qwen3_5TextConfig):
+        """Build MTP decoder layers that share the foundation embeddings and head."""
         super().__init__()
         assert not getattr(config, "mtp_use_dedicated_embeddings", False), (
             "mtp_use_dedicated_embeddings=True is not supported: the MTP head shares the main "
@@ -1193,6 +1193,7 @@ class Qwen3_5MTP(nn.Module):
         position_ids: torch.LongTensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Predict the next-token hidden states from shifted embeddings and trunk states."""
         assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False), (
             "Qwen3.5 MTP is training-only in VeOmni; speculative decoding runs in the inference engine."
         )
@@ -1880,6 +1881,20 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3_5ModelOutputWithPast:
+        """Run the text backbone and expose the inputs required by the MTP head.
+
+        Args:
+            input_ids: Token IDs when embeddings are not provided.
+            attention_mask: Attention or padding mask for decoder layers.
+            position_ids: Text and multimodal rotary position IDs.
+            past_key_values: Optional generation cache.
+            inputs_embeds: Precomputed token embeddings.
+            use_cache: Whether to populate the generation cache.
+            kwargs: Additional transformer arguments forwarded to decoder layers.
+
+        Returns:
+            Text model outputs including the context needed by the MTP head.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -2692,6 +2707,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     config: Qwen3_5Config
 
     def __init__(self, config):
+        """Initialize conditional generation and construct the MTP head when enabled."""
         super().__init__(config)
         self.model = Qwen3_5Model(config)  # noqa: F821
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
@@ -2761,6 +2777,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         mtp_labels: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
+        """Run conditional generation and combine foundation and weighted MTP losses."""
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -3081,11 +3098,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         return input_ids, model_kwargs
 
     def get_extra_collate_infos(self):
+        """Declare the packing rule for MTP labels when the head is enabled."""
         if self.mtp is None:
             return {}
         return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
 
     def get_sample_collate_func(self):
+        """Return the per-sample MTP label builder when the head is enabled."""
         if self.mtp is None:
             return None
         return make_mtp_labels  # noqa: F821 defined via add_helper
