@@ -37,7 +37,7 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
 
     3. LoRA-adapter resume subprocess:
        ``model.lora_config.lora_adapter=<adapter>`` ->
-       :meth:`BaseTrainer._setup_lora` resume branch
+       :meth:`BaseTrainer.setup_lora` resume branch
        (:meth:`veomni.lora.VeOmniLoraModel.from_pretrained`, which rebuilds the
        MoE wrappers from the ``veomni_lora`` block in adapter_config.json) ->
        the FSDP2 adapter-load path inside :func:`build_parallelize_model` ->
@@ -668,7 +668,7 @@ def test_save_load_resume_round_trip(tmp_path, toy_base_dir, mode):
 
     # ── 3. LoRA-adapter resume ─────────────────────────────────────────
     # Load the writer's final-step HF LoRA adapter via
-    # ``model.lora_config.lora_adapter`` -> ``_setup_lora`` resume branch
+    # ``model.lora_config.lora_adapter`` -> ``setup_lora`` resume branch
     # -> ``VeOmniLoraModel.from_pretrained`` (rebuilds MoE wrappers from the
     # ``veomni_lora`` block in adapter_config.json) -> FSDP2 adapter-load path
     # inside ``build_parallelize_model``. The resumer's pre-train snapshot is

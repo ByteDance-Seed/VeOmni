@@ -91,16 +91,17 @@ model:
 
 ---
 
-## 2. LoRA Initialization in BaseTrainer
+## 2. LoRA Initialization in the Model Runtime
 
-LoRA wrapping happens in `BaseTrainer._setup_lora()`, called from `_freeze_model_module()`.
+LoRA wrapping happens in `VeOmniModelRuntime.setup_lora()`, called from `freeze_model()`.
+Every trainer inherits both, so `BaseTrainer.setup_lora()` reaches the same code.
 A single native path wraps the model with `VeOmniLoraModel`, handling dense `nn.Linear`
 LoRA, MoE expert LoRA, and the two combined:
 
 ```python
-# veomni/trainer/base.py
-def _setup_lora(self):
-    lora_config = self.args.model.lora_config
+# veomni/models/model_runtime.py
+def setup_lora(self):
+    lora_config = self.model_args.lora_config
     if not bool(lora_config):
         return
 
@@ -206,7 +207,7 @@ VeOmni LoRA training uses FSDP2 with `init_device: meta`. Weight loading goes th
 1. **Base-model weights**: loaded via `rank0_load_and_broadcast_weights` or
    `load_model_weights` — the standard FSDP2 path, unchanged for LoRA.
 
-2. **Adapter weights** (resume only): `_build_parallelized_model` passes `adapter_path`
+2. **Adapter weights** (resume only): `build_parallelized_model` passes `adapter_path`
    to `build_parallelize_model`, which — for a `VeOmniLoraModel` — calls the native
    `veomni.lora.weight_loading.load_lora_weights` (all-ranks read) or
    `rank0_load_and_broadcast_lora_weights` (rank-0 reads then broadcasts). Both read the
@@ -307,7 +308,7 @@ model:
 The mapping is driven by a per-model `_convert_lora_targets_to_parameters` hook
 (registered in the model's `__init__.py`) plus
 `veomni.lora.resolve_fused_moe_lora_targets`, invoked by
-`BaseTrainer._setup_lora` before the adapter is built. It is a **no-op on dense
+`BaseTrainer.setup_lora` before the adapter is built. It is a **no-op on dense
 models and on models without the hook**, so `gate_proj` / `up_proj` /
 `down_proj` there stay ordinary `nn.Linear` LoRA targets.
 

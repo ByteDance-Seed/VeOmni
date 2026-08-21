@@ -62,7 +62,7 @@ class TestDiTTrainer(DiTTrainer):
     def _build_condition_model(self, condition_model_type: str) -> None:
         self.condition_model = None
 
-    def _freeze_model_module(self) -> None:
+    def freeze_model(self) -> None:
         self.base.lora = False
 
     def _build_model_assets(self) -> None:

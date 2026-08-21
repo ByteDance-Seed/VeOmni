@@ -645,10 +645,10 @@ class TrainerTest(BaseTrainer):
     def _setup(self):
         self.device, _ = setup_test_distributed(self.args)
 
-    def _freeze_model_module(self):
+    def freeze_model(self):
         pass
 
-    def _build_model(self):
+    def build_model(self):
         self.model = FakeModel().to(get_device_type())
         self.model_config = PretrainedConfig()
 
@@ -704,13 +704,13 @@ class TrainerTest(BaseTrainer):
             **dataloader_kwargs,
         )
 
-    def _build_parallelized_model(self):
+    def build_parallelized_model(self):
         self.model.train()
 
-    def _build_optimizer(self):
+    def build_optimizer(self):
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.model.optimizer.lr)
 
-    def _build_lr_scheduler(self):
+    def build_lr_scheduler(self, total_steps=None):
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
 
     def _build_training_context(self):

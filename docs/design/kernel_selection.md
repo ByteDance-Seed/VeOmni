@@ -57,7 +57,7 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
   ├─ rewrite attn_implementation for SP
   └─ set_ops_config(self)                     # populate singleton
 
-BaseTrainer._build_model()                    # (3) model build time
+BaseTrainer.build_model()                    # (3) model build time
   └─ build_foundation_model(..., ops_implementation=ops)
        ├─ apply_ops_config(ops)               # install LOSS_MAPPING + GLOBAL patches
        │    ├─ install_loss_mapping(ce_impl)  # partial(ForCausalLMLoss, cross_entropy_fn=<impl>)

@@ -53,6 +53,6 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     trainer = VLMTrainer.__new__(VLMTrainer)
     trainer.base = SimpleNamespace(args=args, model=model, model_config=model.config)
 
-    trainer._freeze_model_module()
+    trainer.freeze_model()
 
     assert all(param.requires_grad is not freeze_vit for param in visual.parameters())

@@ -25,7 +25,6 @@ from transformers import PreTrainedModel
 from ..arguments import MixedPrecisionConfig, VeOmniArguments
 from ..data import build_chat_template, build_data_transform
 from ..data.data_collator import PostCollator
-from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
@@ -150,8 +149,8 @@ class TextDPOTrainer:
         # case; keeps each module building over its own mesh once modules build
         # separately.
         with use_parallel_state("base"):
-            self.base._build_model()
-            self.base._freeze_model_module()
+            self.base.build_model()
+            self.base.freeze_model()
 
             self._build_model_assets()
             self._build_data_transform()
@@ -160,9 +159,9 @@ class TextDPOTrainer:
             self.base._build_collate_fn()
             self.base._build_dataloader()
             self._build_postforward()
-            self.base._build_parallelized_model()
-            self.base._build_optimizer()
-            self.base._build_lr_scheduler()
+            self.base.build_parallelized_model()
+            self.base.build_optimizer()
+            self.base.build_lr_scheduler()
             self.base._build_training_context()
             self.base._init_callbacks()
 
@@ -409,7 +408,6 @@ class TextDPOTrainer:
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        args: VeOmniDPOArguments = self.base.args
         self.base.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -432,8 +430,7 @@ class TextDPOTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
+        grad_norm = self.base.clip_grad_norm()
 
         self.base.optimizer.step()
         self.base.lr_scheduler.step()

@@ -1350,6 +1350,16 @@ class BaseModelArguments:
         # composed model resolves its module subfolders against this root.
         self.model_path = _resolve_hdfs_path(self.model_path)
 
+    @property
+    def foundation_config_path(self) -> Optional[str]:
+        """Where the model loader reads ``config.json`` from.
+
+        A module inside a composed checkpoint is addressed by its own subfolder,
+        so the model path doubles as the config path. :class:`ModelArguments`
+        overrides this to honour a separately configured ``config_path``.
+        """
+        return self.model_path
+
     def _safetensor_idx_path(self) -> Optional[str]:
         """Where to read the HF ``weight_map`` from. Overridden to allow an explicit path."""
         if self.model_path is None:
@@ -1436,6 +1446,11 @@ class ModelArguments(ModelRuntimeArguments):
 
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
+
+    @property
+    def foundation_config_path(self) -> Optional[str]:
+        """A whole model carries its own config path, defaulted to ``model_path`` above."""
+        return self.config_path
 
     def _safetensor_idx_path(self) -> Optional[str]:
         """Honour an explicit index path, else fall back to the one under ``model_path``."""

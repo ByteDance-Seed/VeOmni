@@ -21,6 +21,9 @@ veomni/
 ├── models/             Model loading and patching
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
+│   ├── model_runtime.py  VeOmniModelRuntime: the model-bound half of a job
+│   │                   (build, freeze/LoRA, parallelize, optimizer,
+│   │                   lr-scheduler, grad clip, its own ParallelState)
 │   ├── transformers/   Per-model patches (one subpackage per model family)
 │   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 ├── optim/              Optimizer and LR scheduler construction
@@ -63,7 +66,8 @@ veomni/
 ├── patchgen/           Auto-generate model patches from HuggingFace models
 ├── schedulers/         LR scheduler implementations (flow matching)
 ├── trainer/            Training loop implementations
-│   ├── base.py         BaseTrainer (ABC): the composable training skeleton
+│   ├── base.py         BaseTrainer (ABC): VeOmniModelRuntime + the job-bound
+│   │                   half (distributed init, data pipeline, loop, callbacks)
 │   ├── text_trainer.py TextTrainer: LLM SFT training
 │   ├── vlm_trainer.py  VLMTrainer: vision-language model training
 │   ├── dit_trainer.py  DitTrainer: diffusion transformer training
@@ -75,27 +79,37 @@ veomni/
 
 ## Trainer Hierarchy
 
+A training job splits in two. `VeOmniModelRuntime` (`veomni/models/model_runtime.py`) owns everything bound to *one* model; `BaseTrainer` inherits it and adds everything bound to the *job*, of which there is exactly one. A single-model job is one runtime inside one trainer; a composed omni model is many runtimes under one orchestrator.
+
 ```
-BaseTrainer (ABC)
-├── TextTrainer          -> tasks/train_text.py
-├── VLMTrainer           -> tasks/train_vlm.py
-├── DitTrainer           -> tasks/train_dit.py
-├── TextDPOTrainer       -> tasks/train_text_dpo.py
-└── BaseRLTrainer (ABC)
-    ├── (text RL)        -> tasks/train_text_rl.py
-    └── (VLM RL)         -> tasks/train_vlm_rl.py
+VeOmniModelRuntime                one model: build, freeze/LoRA, parallelize,
+└── BaseTrainer (ABC)             optimizer, lr-scheduler, clip, ParallelState
+    ├── TextTrainer          -> tasks/train_text.py
+    ├── VLMTrainer           -> tasks/train_vlm.py
+    ├── DitTrainer           -> tasks/train_dit.py
+    ├── TextDPOTrainer       -> tasks/train_text_dpo.py
+    └── BaseRLTrainer (ABC)
+        ├── (text RL)        -> tasks/train_text_rl.py
+        └── (VLM RL)         -> tasks/train_vlm_rl.py
 ```
 
-`BaseTrainer` provides the composable training skeleton:
-- `build_model()` -> model construction and parallelization
-- `build_dataloader()` -> data pipeline setup
-- `build_optimizer()` / `build_lr_scheduler()` -> optimization
+`VeOmniModelRuntime` contributes the model-bound half:
+- `build_model()` -> meta-init through the registry-aware loader
+- `freeze_model()` / `setup_lora()` -> trainable surface
+- `build_parallelized_model()` -> FSDP2/DDP wrap + weight load
+- `build_optimizer()` / `build_lr_scheduler(total_steps)` -> optimization
+- `clip_grad_norm()` -> gradient clipping under this model's mesh
+
+It is usable on its own, with no trainer at all (see `tests/models/test_model_runtime.py`). Subclasses supply three seams saying where their config lives — `model_args`, `runtime_name`, `checkpoint_load_path` — which is what lets a single-model trainer (args nested under `model.*`) and a per-module omni runtime (args handed in directly) share one build sequence.
+
+`BaseTrainer` adds the job-bound half:
+- `_build_dataloader()` -> data pipeline setup
 - `train_step()` -> single training step (forward + backward + update)
 - `training_loop()` -> main loop with callbacks
 
-Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop.
+Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop. Note that `TextTrainer`, `VLMTrainer`, `DiTTrainer` and `TextDPOTrainer` *compose* a `BaseTrainer` in `self.base` rather than subclassing it, and drive the build steps one at a time (constraint 24).
 
-**Parallel-state scoping**: `_setup()` calls `init_parallel_state(name="base")` before seed/determinism; then each trainer builds under `use_parallel_state("base")`. Run time uses **per-op** wraps with `"base"` (forward / postforward / backward / clip). No `self.parallel_state` on trainers. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
+**Parallel-state scoping**: `_setup()` calls `register_parallel_state("base")` before seed/determinism; then each trainer builds under `use_parallel_state("base")`. Run time uses **per-op** wraps with `"base"` (forward / postforward / backward / clip). The inherited `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 
 ## Data Flow
 

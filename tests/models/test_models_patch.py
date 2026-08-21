@@ -215,14 +215,10 @@ class TrainerTest(BaseTrainer):
     def _build_dataloader(self):
         pass
 
-    def _build_parallelize_model(self):
-        # no parallel in this ci
-        pass
-
     def forward_backward_step(self, state_dict: Dict[str, torch.Tensor], model_mode: ModelMode, dataloader):
         # Aggressive teardown of any model / optimizer / lr_scheduler from the
         # previous mode iteration. Without this the prior FSDP-wrapped model
-        # plus its optimizer states stay pinned across `_build_model` calls
+        # plus its optimizer states stay pinned across `build_model` calls
         # (Python GC alone is not enough because FSDP / lazy-init hold cross
         # references), and on multi-mode runs over qwen3_5 we accumulate
         # 5+ GiB per mode, eventually OOM'ing on the embedding tensor for the
@@ -263,10 +259,10 @@ class TrainerTest(BaseTrainer):
             self.args.model.ops_implementation.rotary_pos_emb_implementation = "eager"
             self.args.model.ops_implementation.cross_entropy_loss_implementation = "eager"
 
-        self._build_model()
+        self.build_model()
         self._verify_opslot_state(model_mode)
-        self._build_optimizer()
-        self._build_lr_scheduler()
+        self.build_optimizer()
+        self.build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
         # Sync weights — every model that test_models_patch covers ships a

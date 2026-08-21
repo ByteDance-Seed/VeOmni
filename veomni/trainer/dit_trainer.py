@@ -28,7 +28,6 @@ from transformers.modeling_outputs import ModelOutput
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
-from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_foundation_model
 from ..models.auto import build_config
@@ -198,11 +197,11 @@ class DiTTrainer:
         # single-model case; keeps each module building over its own mesh once
         # multiple modules build separately.
         with use_parallel_state("base"):
-            # rewrite _build_model, build condition model & dit model
-            self._build_model()
+            # rewrite build_model, build condition model & dit model
+            self.build_model()
 
-            # rewrite _freeze_model_module, freeze condition model
-            self._freeze_model_module()
+            # rewrite freeze_model, freeze condition model
+            self.freeze_model()
 
             # rewrite _build_model_assets to support processor of condition model
             self._build_model_assets()
@@ -220,9 +219,9 @@ class DiTTrainer:
             self._build_dataloader()
 
             if self.training_task != "offline_embedding":
-                self.base._build_parallelized_model()
-                self.base._build_optimizer()
-                self.base._build_lr_scheduler()
+                self.base.build_parallelized_model()
+                self.base.build_optimizer()
+                self.base.build_lr_scheduler()
                 self.base._build_training_context()
 
             self.base._init_callbacks()
@@ -258,7 +257,7 @@ class DiTTrainer:
 
         self.training_task = args.train.training_task
 
-    def _build_model(self):
+    def build_model(self):
         logger.info_rank0("Build model")
         args: VeOmniDiTArguments = self.base.args
         # Apply ops config eagerly so the condition model (built below via
@@ -308,11 +307,11 @@ class DiTTrainer:
             self.condition_model.to(get_device_type())
             logger.info_rank0("Condition model loaded.")
 
-    def _freeze_model_module(self):
+    def freeze_model(self):
         self.condition_model.requires_grad_(False)
 
         if self.training_task == "offline_training" or self.training_task == "online_training":
-            self.base._freeze_model_module()
+            self.base.freeze_model()
 
     def _build_model_assets(self):
         if self.training_task == "offline_training" or self.training_task == "online_training":
@@ -489,7 +488,6 @@ class DiTTrainer:
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        args = self.base.args
         self.base.state.global_step += 1
 
         # SP broadcast of micro_batches
@@ -536,8 +534,7 @@ class DiTTrainer:
                     total_loss_dict[k] += v.item()
 
         if self.training_task != "offline_embedding":
-            with use_parallel_state("base"):
-                grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
+            grad_norm = self.base.clip_grad_norm()
             self.base.optimizer.step()
             self.base.lr_scheduler.step()
             self.base.optimizer.zero_grad()

@@ -61,7 +61,7 @@ class TrainerTest(BaseTrainer):
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
-    def _build_model(self):
+    def build_model(self):
         # only build fake model
         self.model = FakeModel().to(get_device_type())
         self.model_config = PretrainedConfig()

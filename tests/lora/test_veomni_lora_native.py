@@ -149,7 +149,7 @@ def test_base_trainer_rejects_lora_without_trainable_adapters():
     )
 
     with pytest.raises(ValueError, match="no trainable adapters"):
-        trainer._setup_lora()
+        trainer.setup_lora()
 
 
 @pytest.mark.parametrize("is_trainable", [True, False])
@@ -164,11 +164,11 @@ def test_base_trainer_validates_resumed_adapter(tmp_path, is_trainable):
     )
 
     if is_trainable:
-        trainer._setup_lora()
+        trainer.setup_lora()
         assert any(param.requires_grad for param in trainer.model.parameters())
     else:
         with pytest.raises(ValueError, match="no trainable adapters"):
-            trainer._setup_lora()
+            trainer.setup_lora()
 
 
 def test_init_is_noop():

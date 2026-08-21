@@ -19,10 +19,10 @@ class VLMRLTrainer(VLMTrainer):
         # so scope the whole build under this trainer's own state (see BaseTrainer).
         with use_parallel_state("base"):
             # rewrite build model to support data balancing
-            self._build_model()
+            self.build_model()
 
             # rewrite freeze_model_module to support freeze multimodal encoder, etc.
-            self._freeze_model_module()
+            self.freeze_model()
 
             # rewrite build_model_assets to support chat_template and processor for multimodal datasets
             self._build_model_assets()
@@ -36,12 +36,12 @@ class VLMRLTrainer(VLMTrainer):
             self._build_collate_fn()
 
             self.base._build_dataloader()
-            self.base._build_parallelized_model()
+            self.base.build_parallelized_model()
 
             # rewrite build_optimizer to support different lr param groups
-            self._build_optimizer()
+            self.build_optimizer()
 
-            self.base._build_lr_scheduler()
+            self.base.build_lr_scheduler()
             self.base._build_training_context()
             self.base._init_callbacks()
 

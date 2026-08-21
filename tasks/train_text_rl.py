@@ -17,8 +17,8 @@ class TextRLTrainer(TextTrainer):
         # All build steps read the current ParallelState via ``get_parallel_state()``,
         # so scope the whole build under this trainer's own state (see BaseTrainer).
         with use_parallel_state("base"):
-            self.base._build_model()
-            self.base._freeze_model_module()
+            self.base.build_model()
+            self.base.freeze_model()
 
             # rewrite build_model_assets to support chat_template for conversation dataset
             self._build_model_assets()
@@ -29,9 +29,9 @@ class TextRLTrainer(TextTrainer):
             self.base._build_dataset()
             self.base._build_collate_fn()
             self.base._build_dataloader()
-            self.base._build_parallelized_model()
-            self.base._build_optimizer()
-            self.base._build_lr_scheduler()
+            self.base.build_parallelized_model()
+            self.base.build_optimizer()
+            self.base.build_lr_scheduler()
             self.base._build_training_context()
             self.base._init_callbacks()
 

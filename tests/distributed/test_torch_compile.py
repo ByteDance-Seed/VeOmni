@@ -432,11 +432,11 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token", lambda _: 1)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.reduce_global_loss_token", lambda token_count: token_count)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.veomni_clip_grad_norm", lambda *_: torch.tensor(0.0))
 
     trainer = VLMTrainer.__new__(VLMTrainer)
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(model=SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=1.0))),
+        clip_grad_norm=lambda: torch.tensor(0.0),
         state=SimpleNamespace(global_step=0),
         model=SimpleNamespace(_veomni_compile_uses_cuda_graphs=True),
         model_reshard=lambda *_: None,
@@ -467,8 +467,8 @@ def test_vlm_trainer_rejects_unsupported_compile_model_before_data_setup(monkeyp
 
     monkeypatch.setattr("veomni.trainer.vlm_trainer.BaseTrainer._setup", lambda _: None)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr(VLMTrainer, "_build_model", build_unsupported_model)
-    monkeypatch.setattr(VLMTrainer, "_freeze_model_module", lambda _: calls.append("freeze_model"))
+    monkeypatch.setattr(VLMTrainer, "build_model", build_unsupported_model)
+    monkeypatch.setattr(VLMTrainer, "freeze_model", lambda _: calls.append("freeze_model"))
 
     args = SimpleNamespace(
         model=SimpleNamespace(

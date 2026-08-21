@@ -22,7 +22,6 @@ from ..data import (
     build_chat_template,
     build_data_transform,
 )
-from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import use_parallel_state
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..models import build_tokenizer
@@ -51,8 +50,8 @@ class TextTrainer:
         # single-model case; keeps each module building over its own mesh once
         # multiple modules build separately.
         with use_parallel_state("base"):
-            self.base._build_model()
-            self.base._freeze_model_module()
+            self.base.build_model()
+            self.base.freeze_model()
 
             # rewrite build_model_assets to support chat_template for conversation dataset
             self._build_model_assets()
@@ -63,9 +62,9 @@ class TextTrainer:
             self.base._build_dataset()
             self.base._build_collate_fn()
             self.base._build_dataloader()
-            self.base._build_parallelized_model()
-            self.base._build_optimizer()
-            self.base._build_lr_scheduler()
+            self.base.build_parallelized_model()
+            self.base.build_optimizer()
+            self.base.build_lr_scheduler()
             self.base._build_training_context()
             self.base._init_callbacks()
 
@@ -112,7 +111,6 @@ class TextTrainer:
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        args: VeOmniArguments = self.base.args
         self.base.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -145,8 +143,7 @@ class TextTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
-        with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
+        grad_norm = self.base.clip_grad_norm()
 
         # Optimizer and scheduler step
         self.base.optimizer.step()

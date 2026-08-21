@@ -20,7 +20,6 @@ import torch
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_chat_template, build_data_transform
-from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.torch_compile import (
     CompileConfig,
@@ -29,12 +28,13 @@ from ..distributed.torch_compile import (
     validate_compile_runtime,
 )
 from ..models import build_foundation_model, build_processor
+from ..models.model_runtime import _collect_muon_kwargs
 from ..optim import build_optimizer
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs
+from .base import BaseTrainer, VeOmniIter
 
 
 logger = helper.create_logger(__name__)
@@ -124,11 +124,11 @@ class VLMTrainer:
         # multiple modules build separately.
         with use_parallel_state("base"):
             # rewrite build model to support data balancing
-            self._build_model()
+            self.build_model()
             self._validate_torch_compile()
 
             # rewrite freeze_model_module to support freeze multimodal encoder, etc.
-            self._freeze_model_module()
+            self.freeze_model()
 
             # rewrite build_model_assets to support chat_template and processor for multimodal datasets
             self._build_model_assets()
@@ -142,16 +142,16 @@ class VLMTrainer:
             self._build_collate_fn()
 
             self.base._build_dataloader()
-            self.base._build_parallelized_model()
+            self.base.build_parallelized_model()
 
             # rewrite build_optimizer to support different lr param groups
-            self._build_optimizer()
+            self.build_optimizer()
 
-            self.base._build_lr_scheduler()
+            self.base.build_lr_scheduler()
             self.base._build_training_context()
             self.base._init_callbacks()
 
-    def _build_model(self):
+    def build_model(self):
         args: VeOmniVLMArguments = self.base.args
         logger.info_rank0("Build model")
         self.base.model = build_foundation_model(
@@ -194,7 +194,7 @@ class VLMTrainer:
             enable_reshard_after_forward=accelerator.fsdp_config.reshard_after_forward,
         )
 
-    def _freeze_model_module(self):
+    def freeze_model(self):
         args: VeOmniVLMArguments = self.base.args
         model_config = self.base.model_config
         lora_enabled = bool(args.model.lora_config)
@@ -205,7 +205,7 @@ class VLMTrainer:
         # it must opt into the shared LoRA setup explicitly. The wrapper freezes
         # all base weights and re-enables only matched adapter parameters.
         if lora_enabled:
-            self.base._setup_lora()
+            self.base.setup_lora()
 
         is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
         visual = self.base.model.thinker.visual if is_omni else _get_vlm_visual_module(self.base.model)
@@ -285,7 +285,7 @@ class VLMTrainer:
             metadata_collate_func=metadata_collate_func,
         )
 
-    def _build_optimizer(self):
+    def build_optimizer(self):
         args: VeOmniVLMArguments = self.base.args
 
         vit_params, other_params = [], []
@@ -340,7 +340,6 @@ class VLMTrainer:
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        args: VeOmniVLMArguments = self.base.args
         self.base.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -373,8 +372,7 @@ class VLMTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
-        with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
+        grad_norm = self.base.clip_grad_norm()
 
         # Optimizer and scheduler step
         self.base.optimizer.step()
