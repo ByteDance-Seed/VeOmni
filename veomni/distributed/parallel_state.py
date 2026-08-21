@@ -441,6 +441,16 @@ def get_parallel_state_by_name(name: str) -> "ParallelState":
     return _PARALLEL_STATE_REGISTRY[name]
 
 
+def is_parallel_state_registered(name: str) -> bool:
+    """True when ``name`` has a ParallelState in the global registry.
+
+    Distributed Omni modules register their state via ``init_parallel_state(
+    name=...)`` in ``ModuleRuntime._setup``; eager modules never do. Callers
+    use this to decide whether a module's forward must be scoped by name.
+    """
+    return name in _PARALLEL_STATE_REGISTRY
+
+
 def init_parallel_state(
     dp_size: int = 1,
     dp_replicate_size: int = 1,
@@ -456,7 +466,7 @@ def init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
-    name: str = "base",
+    name: Optional[str] = "base",
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the
@@ -464,10 +474,17 @@ def init_parallel_state(
 
     If ``name`` is already registered, log a warning and return the existing
     state without building, caching, or overwriting anything.
+
+    ``name=None`` claims no registry key, for a caller that holds the returned
+    state itself rather than looking it up later — it would otherwise have to
+    collide on ``"base"`` with the standalone trainers or invent a key nobody
+    reads. Only the registry is opted out of: the state is still topology-cached
+    and still becomes the ambient global if none is set, so a later named call
+    with the same topology hands back this same object.
     """
     global _PARALLEL_STATE
 
-    if name in _PARALLEL_STATE_REGISTRY:
+    if name is not None and name in _PARALLEL_STATE_REGISTRY:
         logger.warning(
             f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
         )
@@ -524,7 +541,8 @@ def init_parallel_state(
         # never clear the cache), so a same-topology hit may find the global cleared.
         if _PARALLEL_STATE is None:
             _PARALLEL_STATE = cached_state
-        _PARALLEL_STATE_REGISTRY[name] = cached_state
+        if name is not None:
+            _PARALLEL_STATE_REGISTRY[name] = cached_state
         return cached_state
 
     logger.info_rank0(
@@ -652,7 +670,8 @@ def init_parallel_state(
         _PARALLEL_STATE = parallel_state
 
     _PARALLEL_STATE_CACHE[cache_key] = parallel_state
-    _PARALLEL_STATE_REGISTRY[name] = parallel_state
+    if name is not None:
+        _PARALLEL_STATE_REGISTRY[name] = parallel_state
     return parallel_state
 
 

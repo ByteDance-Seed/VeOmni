@@ -1,0 +1,102 @@
+# VeOmni offline VAE posterior cache config for OmniModel V2 - BAGEL-7B-MoT.
+
+model:
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
+  model_config:
+    modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_train_offline_cache.yaml
+    train_graph: configs/seed_omni/Bagel/bagel_7b_mot/graph_train_offline_cache.yaml
+    infer_graph:
+      infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
+      infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_und.yaml
+    infer_type: infer_und
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: configs/seed_omni/Bagel/bagel_7b_mot/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  chat_template: default
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: false
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  train_type: offline_cache
+  offline_cache_dir: outputs/bagel_vae_cached_dataset
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 32
+  micro_batch_size: 2
+  dyn_bsz: false
+
+  checkpoint:
+    output_dir: outputs/bagel_7b_mot_offline_cache
+    save_steps: 0
+    save_epochs: 0
+    save_hf_weights: false
+    hf_save_steps: 0
+    hf_save_epochs: 0
+
+  wandb:
+    enable: false
+    project: VeOmni_omni
+    name: bagel_7b_mot_offline_cache
+
+infer:
+  generation_kwargs:
+    max_new_tokens: 2048
+    temperature: 0.0
+    top_p: 1.0
+    do_sample: false
+    image_height: 1024
+    image_width: 1024
+    latent_downsample: 16
+    num_timesteps: 50
+    timestep_shift: 3.0
+    cfg_text_scale: 1.0
+    cfg_img_scale: 1.0
+    cfg_interval: [0.0, 1.0]
+    cfg_renorm_min: 0.0
+    cfg_renorm_type: global
+    enable_taylorseer: false

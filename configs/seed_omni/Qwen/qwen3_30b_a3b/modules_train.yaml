@@ -1,0 +1,10 @@
+qwen3_text_encoder:
+  model_path: qwen3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+qwen3_moe_llm:
+  model_path: qwen3_moe_llm
+  accelerator:
+    ep_size: 4
+    ep_outside: false

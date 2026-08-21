@@ -1,0 +1,63 @@
+# Janus-1.3B self-contained HF omni checkpoint — inference-only launcher.
+#
+# ``model_path`` points at an exported omni root (``config.json`` + graph sidecars
+# + module subfolders). Training graph, generation graphs and ``infer_type`` are
+# all read from that checkpoint's own ``config.json`` — this launcher declares
+# no ``model_config`` at all. ``resolve_model(for_inference=True)`` defaults
+# every module to eager (single-process replica) when no ``modules`` override
+# is given.
+#
+# Eager single-process T2I (default, no override):
+#   python tasks/omni/infer_omni.py configs/seed_omni/Janus/janus_1.3b_hf/base.yaml \
+#     --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
+#     --infer.output_dir outputs/runtime_hf
+#
+# Distributed T2I (siglip/vqvae ddp, llama fsdp2, text_encoder emb-parallel):
+#   bash train.sh tasks/omni/infer_omni.py \
+#     configs/seed_omni/Janus/janus_1.3b_hf/base.yaml \
+#     --model.model_config.modules configs/seed_omni/Janus/janus_1.3b_hf/modules_infer_fsdp.yaml \
+#     --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
+#     --infer.output_dir outputs/runtime_hf_fsdp
+model:
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B-hf
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: false
+      enable_reentrant: false
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: configs/seed_omni/Janus/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+    pin_memory: false
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  checkpoint:
+    output_dir: outputs/janus_1.3b_hf
+  wandb:
+    enable: false
+
+infer:
+  generation_kwargs:
+    max_new_tokens: 2048
+    temperature: 0.0
+    top_p: 1.0
+    do_sample: false
+    guidance_scale: 5.0
+  output_dir: outputs/runtime_infer
+  seed: 42

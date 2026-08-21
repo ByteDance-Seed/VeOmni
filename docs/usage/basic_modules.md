@@ -43,7 +43,7 @@ class Arguments(VeOmniArguments):
 
 if __name__ == "__main__":
     args = parse_args(Arguments)
-    print(args.train.optimizer.lr)  # Access default arguments
+    print(args.model.optimizer.lr)  # Access default arguments
 ```
 
 **Custom Parameter Extension**:  
@@ -83,18 +83,18 @@ from veomni.distributed.parallel_state import (
 )
 
 init_parallel_state(
-    dp_size=args.train.accelerator.dp_size, # data parallel size
-    dp_replicate_size=args.train.accelerator.dp_replicate_size, # data parallel replicate size
-    dp_shard_size=args.train.accelerator.dp_shard_size, # data parallel shard degree
-    tp_size=args.train.accelerator.tp_size, # tensor parallel size
-    pp_size=args.train.accelerator.pp_size, # pipeline parallel size, not support now
-    cp_size=args.train.accelerator.cp_size, # context parallel size, not support now
-    ulysses_size=args.train.accelerator.ulysses_size, # ulysses parallel size
-    extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
-    extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-    extra_parallel_names=args.train.accelerator.extra_parallel_names,
-    dp_mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
-    async_enabled=args.train.accelerator.enable_async, # async ulysses
+    dp_size=args.model.accelerator.dp_size, # data parallel size
+    dp_replicate_size=args.model.accelerator.dp_replicate_size, # data parallel replicate size
+    dp_shard_size=args.model.accelerator.dp_shard_size, # data parallel shard degree
+    tp_size=args.model.accelerator.tp_size, # tensor parallel size
+    pp_size=args.model.accelerator.pp_size, # pipeline parallel size, not support now
+    cp_size=args.model.accelerator.cp_size, # context parallel size, not support now
+    ulysses_size=args.model.accelerator.ulysses_size, # ulysses parallel size
+    extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes, # including expert parallel size
+    extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+    extra_parallel_names=args.model.accelerator.extra_parallel_names,
+    dp_mode=args.model.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
+    async_enabled=args.model.accelerator.enable_async, # async ulysses
     name="base",
 )
 
@@ -174,7 +174,7 @@ If your dataset is mapping, you are recommended to pass `len(train_dataset)` to 
 ```python
 dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
 if args.data.datasets_type == "mapping":
-    dataset_length = dataset_length / args.train.accelerator.dp_size
+    dataset_length = dataset_length / args.model.accelerator.dp_size
 args.compute_train_steps(dataset_length)
 train_steps = args.train_steps
 ```
@@ -246,11 +246,11 @@ VeOmni offers unified multimodal transform functions in [veomni/data/data_transf
 
 Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
 ```python
-from veomni.data import build_data_transform, build_multimodal_chat_template
+from veomni.data import build_chat_template, build_data_transform
 from veomni.models import build_processor
 
 processor = build_processor(args.model.tokenizer_path)
-chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
+chat_template = build_chat_template(args.data.chat_template, processor)
 position_id_func = model.get_position_id_func()
 transform = build_data_transform(
     model.config.model_type,
@@ -271,8 +271,8 @@ Multimodal dataset transform follows the similar pipeline:
 
 
 ### Chat Template
-VeOmni default supports several chat template(source code: [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) for text-only model and [veomni/data/multimodal/multimodal_chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/multimodal_chat_template.py) for multimodal model):
-you can add your custom chat template by implementing the `ChatTemplate` class.
+VeOmni default supports several chat templates, text-only and multimodal alike, all registered in [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) and built by name through the single `build_chat_template` entrypoint.
+You can add your custom chat template by implementing the `ChatTemplate` class — or `MultimodalChatTemplate` if it needs the per-modality token counts. A `ChatTemplate` is built from a tokenizer; a `MultimodalChatTemplate` is built from the processor instead, since laying out placeholders also needs the grid parameters the processor used.
 **Custom Template Implementation**:  
 ```python
 from veomni.data.chat_template import ChatTemplate
@@ -355,8 +355,8 @@ from veomni.models import build_foundation_model
 model = build_foundation_model(
     config_path=args.model.config_path, # model config path, can be None if weights_path is not None
     weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
-    init_device=args.train.init_device, # model init device
-    torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+    init_device=args.model.accelerator.init_device, # model init device
+    torch_dtype="float32" if args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
     ops_implementation=args.model.ops_implementation,
     config_kwargs=config_kwargs,
 )
@@ -370,25 +370,25 @@ model = build_foundation_model(
 from veomni.distributed.torch_parallelize import build_parallelize_model
 model = build_parallelize_model(
     model,
-    init_device=args.train.init_device, # model init device
+    init_device=args.model.accelerator.init_device, # model init device
     weights_path=args.model.model_path,
-    enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward, # enable reshard after forward for FSDP2
-    mixed_precision=args.train.accelerator.fsdp_config.mixed_precision, # enable mixed precision
-    enable_gradient_checkpointing=args.train.gradient_checkpointing.enable, # enable gradient checkpointing
-    enable_fsdp_offload=args.train.accelerator.fsdp_config.offload, # enable fsdp offload
+    enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward, # enable reshard after forward for FSDP2
+    mixed_precision=args.model.accelerator.fsdp_config.mixed_precision, # enable mixed precision
+    enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable, # enable gradient checkpointing
+    enable_fsdp_offload=args.model.accelerator.fsdp_config.offload, # enable fsdp offload
     basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)), # FSDP basic modules
-    enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
-    early_stop=args.train.gradient_checkpointing.early_stop,
-    enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-    broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0, # load model weights
-    ep_sharded_stream_load=args.train.ep_sharded_stream_load,
-    max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
+    enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
+    early_stop=args.model.accelerator.gradient_checkpointing.early_stop,
+    enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
+    broadcast_model_weights_from_rank0=args.model.accelerator.broadcast_model_weights_from_rank0, # load model weights
+    ep_sharded_stream_load=args.model.accelerator.ep_sharded_stream_load,
+    max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
 )
 ```
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports three optimizer types via `train.optimizer.type`:
+`build_optimizer` supports three optimizer types via `model.optimizer.type`:
 
 | Type | Description |
 |------|-------------|
@@ -396,7 +396,7 @@ model = build_parallelize_model(
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 
-Muon-specific hyperparameters live under `train.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` / `eps` continue to drive the AdamW sibling group.
+Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` / `eps` continue to drive the AdamW sibling group.
 
 Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 
@@ -495,8 +495,8 @@ from veomni.optim import build_lr_scheduler, build_optimizer
 
 optimizer = build_optimizer(
     model,
-    lr=args.train.optimizer.lr,
-    weight_decay=args.train.optimizer.weight_decay,
+    lr=args.model.optimizer.lr,
+    weight_decay=args.model.optimizer.weight_decay,
     # ... other parameters
 )
 

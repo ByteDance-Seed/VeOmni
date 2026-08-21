@@ -7,17 +7,35 @@ each of which contains further nested sub-configs.
 Example YAML structure:
 
 ```yaml
+model:
+  model_path: Qwen3-8B-Base
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+  accelerator:
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
 train:
+  global_batch_size: 8
   wandb:
     enable: true
     project: VeOmni
-  accelerator:
-    fsdp_config:
-      fsdp_mode: fsdp2
-  init_device: meta
   checkpoint:
     manager: dcp
 ```
+
+Every knob that describes *how a model is placed on the hardware* — and the
+optimizer that steps it — lives under `model.*`, not `train.*`. Both are
+per-model decisions, so an omni model gives each module its own pair under
+`model.modules.<name>.accelerator.*` / `.optimizer.*` with the same shape, and
+the two merge through one code path. Anything that describes the *job* — batch
+sizes, schedules, checkpointing, logging — stays on `train.*`, which is singular
+no matter how many modules the model has.
+
+Unknown keys are rejected. A config carrying a key that no dataclass declares
+fails at parse time rather than being silently dropped, and a key that has moved
+is reported together with its new path.
 
 ---
 
@@ -36,7 +54,15 @@ Top-level configuration that assembles all argument groups.
 Model architecture, paths, and multimodal encoder / decoder setup.
 
 * `ModelArguments` — `model.*`
-* `OpsImplementationConfig` — `model.ops_implementation.*`
+    * `OpsImplementationConfig` — `model.ops_implementation.*`
+    * `OptimizerConfig` — `model.optimizer.*`
+    * `AcceleratorConfig` — `model.accelerator.*`
+        * `FSDPConfig` — `model.accelerator.fsdp_config.*`
+            * `MixedPrecisionConfig` — `model.accelerator.fsdp_config.mixed_precision.*`
+        * `OffloadConfig` — `model.accelerator.offload_config.*`
+        * `GradientCheckpointingConfig` — `model.accelerator.gradient_checkpointing.*`
+        * `TorchCompileConfig` — `model.accelerator.torch_compile.*`
+        * `ChunkMBSConfig` — `model.accelerator.chunk_mbs_config.*`
 
 ### VLM Extensions
 
@@ -67,20 +93,13 @@ Dataset paths, tokenization, and batching configuration.
 
 ## Training
 
-Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
+Training loop, checkpointing, profiling, and logging. Optimizer and parallelism
+live on `model.*` — see the **Model** section above.
 
 * `TrainingArguments` — `train.*`
-    * `OptimizerConfig` — `train.optimizer.*`
     * `WandbConfig` — `train.wandb.*`
     * `ProfileConfig` — `train.profile.*`
     * `ChannelLossConfig` — `train.channel_loss.*`
-    * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
-    * `TorchCompileConfig` — `train.torch_compile.*`
-    * `ChunkMBSConfig` — `train.chunk_mbs_config.*`
-    * `AcceleratorConfig` — `train.accelerator.*`
-        * `FSDPConfig` — `train.accelerator.fsdp_config.*`
-          * `MixedPrecisionConfig` — `train.accelerator.fsdp_config.mixed_precision`
-        * `OffloadConfig` — `train.accelerator.offload_config.*`
     * `CheckpointConfig` — `train.checkpoint.*`
 
 ### VLM Extensions
@@ -133,15 +152,11 @@ Root config — assembles `model`, `data`, and `train`.
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
-| foundation | `Dict[str, str]` | `{}` | Foundation model extra config. |
-| encoders | `Dict` | `{}` | Multimodal encoder configs keyed by modality (`image`, `video`, `audio`). |
-| decoders | `Dict` | `{}` | Multimodal decoder configs keyed by modality (`image`). |
-| input_encoder | `Literal["encoder", "decoder"]` | `"encoder"` | Whether to use the encoder or decoder to encode input images. |
-| output_encoder | `Literal["encoder", "decoder"]` | `"decoder"` | Whether to use the encoder or decoder to encode output images. |
-| encode_target | `bool` | `False` | Whether to encode training targets with decoder (diffusion only). |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
+| optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
+| accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
 ### OpsImplementationConfig
 
@@ -255,9 +270,6 @@ NPU validation runs at two times:
 | pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
 | bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |
 | bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
-| init_device | `Literal["cpu", "cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2. |
-| broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
 | sync_each_train_step | `bool` | `True` | Synchronize the accelerator before each training step's forward/backward work. Disable to allow async dataloader and H2D work to overlap with the next step. |
@@ -268,33 +280,28 @@ NPU validation runs at two times:
 | seed | `int` | `42` | Random seed. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | moe_load_balance_monitor_interval | `int` | `0` | Log a globally reduced MoE expert-load heatmap every N steps. `0` disables monitoring. |
-| optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
 | channel_loss | `ChannelLossConfig` | — | Detached per-channel causal-LM loss logging. |
-| gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
-| torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
-| chunk_mbs_config | `ChunkMBSConfig` | — | Packed-sequence layer micro-batching settings. |
-| accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
 | checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
 
 ### TorchCompileConfig
 
-`train.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `train.torch_compile.dynamic=False`, `train.accelerator.ulysses_size=1`, `train.accelerator.cp_size=1`, and `train.accelerator.enable_async=False`. Qwen3-VL-MoE, ChunkMBS, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
+`model.accelerator.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `model.accelerator.torch_compile.dynamic=False`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=False`. Qwen3-VL-MoE, ChunkMBS, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
 
-The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `train.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
+The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `model.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable per-block `torch.compile` on supported FSDP2 decoder blocks. |
 | backend | `Optional[str]` | `"inductor"` | Backend passed to `torch.compile`. |
-| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `train.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
+| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `model.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
 | fullgraph | `bool` | `True` | Whether to pass `fullgraph=True` to `torch.compile`. |
 | dynamic | `bool` | `False` | Whether to pass `dynamic=True` to `torch.compile`. |
 
 ### OptimizerConfig
 
-`train.optimizer.*` — Optimizer and learning-rate schedule.
+`model.optimizer.*` — Optimizer and learning-rate schedule.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -309,6 +316,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
+| grad_clip_scope | `Literal["per_module", "global"]` | `"per_module"` | Which parameters `max_grad_norm` is computed over. `"per_module"` clips each module against its own norm; `"global"` would clip every module against one norm taken across all of them, but is not implemented yet and raises `NotImplementedError`. A single-model job has one module, so the two agree and only an omni model would see a difference. |
 | muon_lr | `Optional[float]` | `None` | Learning rate for Muon-managed 2-D/3-D weights. Unset: inherits `lr` under `match_rms_adamw`, else `25×lr` under `original`. |
 | muon_momentum | `float` | `0.95` | Momentum factor for Muon. |
 | muon_nesterov | `bool` | `True` | Enable Nesterov momentum for Muon. |
@@ -361,10 +369,8 @@ not change the returned training loss or gradients. Fused-loss backends may
 recompute the LM-head projection on sampled steps, so the default interval is
 10 steps; set `interval=1` for per-step metrics. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
-a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
-because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
-is unsupported because it packs source alignment metadata after the common step
-lifecycle. In DPO training, only the policy-model forward is observed; the
+a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
+alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
 reference-model forward is excluded, and the chosen/rejected segments both use
 their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
@@ -386,7 +392,7 @@ distinct from the first emission.
 
 ### GradientCheckpointingConfig
 
-`train.gradient_checkpointing.*` — Activation recomputation settings.
+`model.accelerator.gradient_checkpointing.*` — Activation recomputation settings.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -397,7 +403,7 @@ distinct from the first emission.
 
 ### ChunkMBSConfig
 
-`train.chunk_mbs_config.*` — Packed-sequence layer micro-batching settings.
+`model.accelerator.chunk_mbs_config.*` — Packed-sequence layer micro-batching settings.
 
 `chunk_mbs` is the number of packed samples per layer chunk. With dynamic batching, the runtime sample
 count is inferred from `cu_seq_lens_q`, so it is independent of `train.micro_batch_size`. Chunks are cut
@@ -419,12 +425,20 @@ validation instead of applying ChunkMBS to multiple stacks.
 
 ### AcceleratorConfig
 
-`train.accelerator.*` — Parallelism and distributed-training topology.
+`model.accelerator.*` — Everything about how one model is placed on the hardware:
+topology, weight initialization, activation recomputation, and compilation.
+
+The config resolves itself. `__post_init__` reads `WORLD_SIZE`, derives `dp_size`
+from the non-DP dimensions, fills in whichever of `dp_replicate_size` /
+`dp_shard_size` was left at `-1`, and enforces the init-device rules — no
+surrounding `TrainingArguments` required. `world_size` and `dp_size` are exposed
+as plain attributes rather than fields, so they are derived rather than
+configured and never round-trip through a saved config.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| dp_replicate_size | `int` | `-1` | Data parallel replicate size for both dense and moe parameters. |
-| dp_shard_size | `int` | `-1` | Data parallel shard degree. |
+| dp_replicate_size | `int` | `-1` | HSDP replicate degree for both dense and MoE parameters. `-1` derives it from `dp_size` and `dp_shard_size`. |
+| dp_shard_size | `int` | `-1` | HSDP shard degree. `-1` derives it from `dp_size` and `dp_replicate_size`. Setting neither gives pure sharding (`dp_replicate_size=1`). |
 | tp_size | `int` | `1` | Tensor parallel size. |
 | ep_size | `int` | `1` | Expert parallel size, should be fit into dp_shard group if HSDP enabled |
 | ep_outside | `bool` | `False` | Expert parallelism outside in EP-FSDP. |
@@ -435,26 +449,33 @@ validation instead of applying ChunkMBS to multiple stacks.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
+| init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
+| broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
+| gradient_checkpointing | `GradientCheckpointingConfig` | — | Activation recomputation settings. |
+| torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
+| chunk_mbs_config | `ChunkMBSConfig` | — | Packed-sequence layer micro-batching settings. |
 
 ### FSDPConfig
 
-`train.accelerator.fsdp_config.*` — FSDP sharding configuration.
+`model.accelerator.fsdp_config.*` — FSDP sharding configuration.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| fsdp_mode | `Literal["ddp", "fsdp2"]` | `"fsdp2"` | Data parallel mode. |
+| fsdp_mode | `Literal["ddp", "fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"eager"` is reserved for a future single-process `from_pretrained(device_map=...)` inference path that skips every wrapper; it is not implemented yet and raises `NotImplementedError`. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
+| offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
 ### MixedPrecisionConfig
 
-`train.accelerator.fsdp_config.mixed_precision.*` — Mixed precision configuration.
+`model.accelerator.fsdp_config.mixed_precision.*` — Mixed precision configuration.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -467,7 +488,7 @@ validation instead of applying ChunkMBS to multiple stacks.
 
 ### OffloadConfig
 
-`train.accelerator.offload_config.*` — Activation offload settings.
+`model.accelerator.offload_config.*` — Activation offload settings.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |

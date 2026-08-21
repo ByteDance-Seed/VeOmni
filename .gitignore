@@ -10,6 +10,7 @@ __pycache__/
 .Python
 build/
 output/
+outputs/
 develop-eggs/
 dist/
 downloads/
@@ -120,6 +121,9 @@ dmypy.json
 # wandb
 wandb/
 
+# Local experiment outputs
+outputs/
+
 # ckpt
 config.json
 generation_config.json
@@ -147,6 +151,7 @@ preprocessor_config.json
 special_tokens_map.json
 vocab.json
 processor_config.json
+chat_template.jinja
 
 # trace file
 *.pt.trace.json
@@ -171,3 +176,7 @@ nsysoutput/
 
 # Agents worksspace should not be tracked by the primary repo.
 .agents_workspace/
+
+# Mermaid diagrams written by scripts/visualize_omni_graph.py. The authoritative
+# copies are the ones OmniConfig.save_pretrained writes into the model directory.
+/graphs/

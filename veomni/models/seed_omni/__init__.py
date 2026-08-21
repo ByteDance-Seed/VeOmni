@@ -12,38 +12,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
-from .auto import SeedOmniConfig, SeedOmniModel, SeedOmniProcessor, build_omni_model, build_omni_processor
-from .decoder import *
-from .encoder import *
-from .foundation import *
-
-
-@MODEL_CONFIG_REGISTRY.register("seed_omni")
-def register_seed_omni_config():
-    from .configuration_seed_omni import SeedOmniConfig
-
-    return SeedOmniConfig
-
-
-@MODELING_REGISTRY.register("seed_omni")
-def register_seed_omni_modeling(architecture: str):
-    from .modeling_seed_omni import SeedOmniModel
-
-    return SeedOmniModel
-
-
-@MODEL_PROCESSOR_REGISTRY.register("SeedOmniProcessor")
-def register_seed_omni_processor():
-    from .processing_seed_omni import SeedOmniProcessor
-
-    return SeedOmniProcessor
+# ── SeedOmni V2 public API ──────────────────────────────────────────────────
+# Exports cluster around three concerns:
+#
+#   1. Core graph / runtime types (:class:`OmniConfig`, :class:`OmniModel`,
+#      :class:`BaseMixin`, :class:`TrainingGraph`, :class:`GenerationGraph`).
+#   2. Module registries — :data:`OMNI_CONFIG_REGISTRY`,
+#      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
+#      ``model_type → class`` lazily at runtime.
+from .configuration_omni import OmniConfig
+from .graphs.base import END, EdgeDef, NodeDef
+from .graphs.generation_graph import GenerationGraph
+from .graphs.training_graph import TrainingGraph
+from .mixins.base_mixin import BaseMixin
+from .mixins.inference_module_mixin import InferenceModuleMixin
+from .mixins.metric_meter_mixin import MetricMeterMixin
+from .mixins.offline_encoding_mixin import OfflineEncodingMixin
+from .mixins.training_module_mixin import TrainingModuleMixin
+from .modeling_omni import OmniModel
+from .modules import (
+    OMNI_ACCELERATED_MODEL_REGISTRY,
+    OMNI_CONFIG_REGISTRY,
+    OMNI_MODEL_REGISTRY,
+    OMNI_PROCESSOR_REGISTRY,
+    read_hf_model_type,
+    read_model_type,
+)
+from .omni_pretrained_model import OmniPreTrainedModel
+from .processing_omni import OmniProcessor
+from .utils.conversation import build_conversation
 
 
 __all__ = [
-    "build_omni_model",
-    "build_omni_processor",
-    "SeedOmniModel",
-    "SeedOmniConfig",
-    "SeedOmniProcessor",
+    # Core
+    "OmniConfig",
+    "OmniModel",
+    "OmniPreTrainedModel",
+    "OmniProcessor",
+    "BaseMixin",
+    "TrainingModuleMixin",
+    "InferenceModuleMixin",
+    "MetricMeterMixin",
+    "OfflineEncodingMixin",
+    "TrainingGraph",
+    "GenerationGraph",
+    "NodeDef",
+    "EdgeDef",
+    "END",
+    "build_conversation",
+    # Module registry
+    "OMNI_ACCELERATED_MODEL_REGISTRY",
+    "OMNI_CONFIG_REGISTRY",
+    "OMNI_MODEL_REGISTRY",
+    "OMNI_PROCESSOR_REGISTRY",
+    "read_hf_model_type",
+    "read_model_type",
 ]

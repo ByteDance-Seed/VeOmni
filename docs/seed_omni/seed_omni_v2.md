@@ -1,0 +1,556 @@
+# SeedOmni V2 — Architecture & Developer Guide
+
+> A ~10-minute tour of the composable, graph-driven multi-modal model in
+> `veomni/models/seed_omni/`. By the end you will know how the modules fit
+> together, what data flows between them, how Janus trains and generates, and
+> how to add a new model.
+
+---
+
+## 1. What SeedOmni V2 is
+
+SeedOmni V2 is a **model-agnostic runtime** for multi-modal models. The
+framework (`OmniModel`) knows *nothing* about Janus, vision towers, VQ codecs,
+or boundary tokens. It only knows how to:
+
+1. Build a set of independent sub-models (each is a ``*ModuleMixin`` +
+   HuggingFace ``PreTrainedModel`` pair).
+2. Walk a **graph** declared in YAML, calling one sub-model per node.
+3. Pass a single shared data object — the **conversation list** — through
+   those calls, and sum up a single `_loss` per node during training.
+
+Everything model-specific (how to embed a SigLIP image, when to emit a
+`<begin_of_image>` token, how to decode a VQ grid) lives inside the modules.
+Swap the modules + the YAML graph and you have a different model — no
+framework changes.
+
+```mermaid
+flowchart LR
+    YAML[("YAML config<br/>modules<br/>training_graph / generation_graphs")] --> CFG[OmniConfig]
+    CFG --> TR[OmniTrainer<br/><i>build + FSDP wrap each module</i>]
+    TR --> OM[OmniModel<br/><i>graph runtime</i>]
+    OM --> M1[janus_siglip]
+    OM --> M2[janus_vqvae]
+    OM --> M3[janus_text_encoder]
+    OM --> M4[janus_llama]
+    classDef f fill:#eef,stroke:#669
+    class YAML,CFG f
+```
+
+---
+
+## 2. The four building blocks
+
+### 2.1 Native / accelerated split (`modeling.py` + `accelerated.py`)
+
+Every sub-model is defined **twice**: a pure HuggingFace-native class in
+``modeling.py`` (weights, ``forward``, and the FSM ``generate()`` endpoint —
+loadable with plain ``from_pretrained`` / ``AutoModel``, no VeOmni import
+required) and a VeOmni-accelerated wrapper in ``accelerated.py`` that composes
+training-graph mixins around it. This mirrors HF's own split between a model's
+`forward` and its `GenerationMixin.generate`: ``modeling.py`` defines the model
+class's `forward`, plus an in-file `InferenceMixin` (the omni analog of
+`GenerationMixin`) that owns `generate()` and all FSM inference state:
+
+```python
+# modeling.py — pure HF-native. InferenceMixin owns generate() + FSM state;
+# the model class owns weights + forward, and inherits both.
+class InferenceMixin:
+    """FSM generate() — analog of HF's GenerationMixin."""
+
+    def reset_local_inference_state(self) -> None: ...
+    def reset_global_inference_state(self) -> None: ...
+
+    def generate(self, conversation_list=None, generation_kwargs=None, **kwargs):
+        ...  # one FSM inference step (sample / embed) — CFG cache, etc.
+
+class JanusLlama(InferenceMixin, OmniPreTrainedModel):
+    def forward(self, ...): ...
+
+# accelerated.py — VeOmni-only. Owns training-graph hooks; no InferenceMixin.
+class TrainingMixin(TrainingModuleMixin): ...
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin): ...
+class JanusLlamaAccelerated(VeOmniMixin, JanusLlama): ...
+```
+
+Rule of thumb: **if a real HF user loading this checkpoint outside VeOmni
+would expect it to work (chat, `generate`, `AutoModel.from_pretrained`), it
+belongs in `modeling.py`.** Only things that are meaningless without the
+VeOmni graph runtime — FSDP dummy inputs, sequence-parallel slicing, the
+per-module metric meter, training pre/post hooks — belong in
+`accelerated.py`. Both classes are registered:
+``OMNI_MODEL_REGISTRY`` → the native class (`OmniModel.from_pretrained`, pure
+HF / eager inference); ``OMNI_ACCELERATED_MODEL_REGISTRY`` → the accelerated
+class (`ModuleRuntime`, training and distributed inference).
+
+Construction: cooperative ``__init__`` through the mixin chain → build
+submodules in ``modeling.py`` → ``self.post_init()`` for HF weight init.
+Core ``forward`` / ``encode`` / … **and** ``generate`` / FSM inference state
+stay in ``modeling.py``; only training-graph hooks (``pre_forward`` /
+``post_forward`` / ``dummy_inputs`` / SP-awareness) stay in
+``accelerated.py``. If accelerated behavior genuinely differs from native
+inference (e.g. a module needs SP-aware dispatch during distributed
+inference), override the relevant method on the accelerated class — do not
+duplicate the whole method.
+
+#### `InferenceMixin` (`modeling.py`) — the `GenerationMixin` analog
+
+Each module's ``modeling.py`` defines its own ``InferenceMixin`` holding
+``generate()`` plus whatever FSM inference state / sampling helpers it needs
+(`reset_local_inference_state`, `reset_global_inference_state`, `finalize`,
+top-p / sampling utilities, …). The model class lists it **first**:
+``class JanusLlama(InferenceMixin, OmniPreTrainedModel)``. Order matters:
+``OmniPreTrainedModel`` ships dead-by-default `reset_local_inference_state` /
+`reset_global_inference_state` / `finalize` stubs (kept as a safety net for
+modules that don't need real inference state — e.g. the FSM runtime's
+unconditional `module.finalize(ctx=...)` call), and Python MRO resolves
+left-to-right, so listing `OmniPreTrainedModel` first would let those no-ops
+silently shadow the real implementations in `InferenceMixin`.
+
+`accelerated.py` needs **no `InferenceMixin`** of its own any more:
+`generate()` / `reset_*` / `finalize` reach the accelerated wrapper unshadowed
+through normal inheritance from the native class (`JanusLlamaAccelerated`
+inherits `JanusLlama`, which already has the real `InferenceMixin` ahead of
+`OmniPreTrainedModel` in its own MRO). Only add accelerated-only inference
+behavior by overriding the relevant method directly on the `Accelerated`
+class if it genuinely differs from native inference — do not reintroduce an
+empty `InferenceMixin` marker in `accelerated.py`.
+
+A few backbones (`qwen3/llm`, `qwen3_moe/llm`) share a family-wide
+`SimpleArGenerationMixin` (`modules/base/llm_packing.py`) instead of a
+per-module `InferenceMixin` — same MRO rule applies: it's listed before
+`OmniPreTrainedModel`.
+
+#### IDE type stubs (static analysis only)
+
+`accelerated.py`'s ``TrainingMixin`` hooks call native modeling APIs via
+``self.method(...))``, but the mixin class does not contain the
+implementation (it lives on ``modeling.py``, mixed in only at
+``JanusLlamaAccelerated(VeOmniMixin, JanusLlama)``). Declare **only what that
+mixin's hooks use**:
+
+```python
+class TrainingMixin(TrainingModuleMixin):
+    config: BagelFlowConnectorConfig
+    device: torch.device
+    dtype: torch.dtype
+
+    def embed_latent(
+        self,
+        latents: torch.Tensor,
+        position_ids: torch.LongTensor,
+        timesteps: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """IDE stub — implemented on :class:`BagelFlowConnector` in ``modeling.py``."""
+        ...
+```
+
+Rules:
+
+- Signatures must match ``modeling.py`` exactly; body is always ``...``.
+- Docstring template: `IDE stub — implemented on :class:`Xxx` in modeling.py.`
+- Properties defined on ``VeOmniMixin`` in the same file use
+  ``IDE stub — see :class:`VeOmniMixin` below (``config.field``).``
+- Do **not** copy modeling logic into the mixin.
+- `generate()` and its FSM helpers live entirely on the native class now —
+  `accelerated.py` needs no IDE stub for `generate` itself unless a training
+  hook calls a `generate`-only helper.
+
+See ``.agents/skills/seedomni-v2/references/modulemixin-ide-stubs.md`` and
+``modules/bagel/flow_connector/accelerated.py`` for the full convention.
+
+`accelerated.py`'s mixins expose **optional training-graph hooks** with safe
+defaults; `generate` / FSM inference lives natively on `modeling.py` (see
+§2.1) and is not part of this hook table:
+
+| Hook | When | Purpose |
+|------|------|---------|
+| `forward(**kwargs)` | training | the node's main compute; may return one `_loss` |
+| `pre_forward(method, **kwargs)` | training | prep inputs (read from conversation list) |
+| `post_forward(method, **outputs)` | training | write results back onto conversation list |
+| `freeze_model()` | build | freeze a parameter subset |
+| `get_parallel_plan()` | build | per-module FSDP/SP plan |
+| `get_assets()` | save | processors / tokenizers to checkpoint |
+| `dummy_inputs(...)` | training | zero placeholders to keep FSDP aligned |
+| `metric_meter_set_seqlens(...)` / `metric_meter_add(...)` / `metric_meter_collect(...)` | training | **optional** per-module token + theoretical-FLOPs meter (`MetricMeterMixin`; tokens stashed in `pre_forward` before any SP slice, drained right after) |
+
+Native `modeling.py` hooks (used during inference, no VeOmni graph required):
+
+| Hook | When | Purpose |
+|------|------|---------|
+| `generate(conversation_list, generation_kwargs, **kwargs)` | inference | one FSM step (sample / embed); implemented per module |
+| `reset_local_inference_state()` / `reset_global_inference_state()` | inference | clear per-request / per-generation FSM state |
+| `finalize(*, ctx)` | inference | flush buffered output if `max_new_tokens` hit |
+
+#### Optional per-module metric meter (`mixins/metric_meter_mixin.py`, `MetricMeterMixin`)
+
+`OmniModel` has no single `model_type` to estimate FLOPs on, so **FLOPs / MFU
+accounting is per-module and opt-in**. The per-module meter is the optional
+`MetricMeterMixin` living on the module itself (`self.base.model` may or may not be a
+`MetricMeterMixin`) — the per-module analogue of how `helper.EnvironMeter` lives on the
+trainer. A module opts in by mixing in `MetricMeterMixin` on `VeOmniMixin` and:
+1. **reporting its tokens** by calling `metric_meter_set_seqlens(method, seqlens)`
+   **inside `pre_forward`, before any SP slice** (the one uniform token entry
+   point — even AR backbones use it, building `seqlens` from their `cu_seqlens`);
+2. **implementing `estimate_flops(seqlens)`** (its own theoretical-FLOPs formula).
+
+The default `metric_meter_token_lengths(method, data)` just drains that stash, so a
+module never reads its (possibly SP-sliced) forward `data` for metering. There is
+**no** shared whole-model FLOPs counter: that would mis-count at module granularity
+(e.g. an AR backbone owns no `wte` / `lm_head`, so those FLOPs belong to the
+`text_encoder`, not the backbone — each module counts only what it actually computes).
+
+A module has exactly **one** `seqlens`: a token is a token, whether it's a text
+token, an image patch, or a VQ token — the mixin does not distinguish modalities.
+A module only ever produces **time-independent** quantities (tokens + theoretical
+FLOPs); all timing / MFU lives at the orchestrator.
+
+#### Optional graph profiler (`train.graph_profile.*`, `GraphProfiler`)
+
+SeedOmni also has a lightweight graph profiler for execution-path records and
+optional graph-node timing. This is separate from `train.profile.*`, which owns
+PyTorch profiler traces. The graph profiler is configured under `train`:
+
+```yaml
+train:
+  graph_profile:
+    enable_wall_time: true    # append wall_ms=...
+    enable_cuda_events: true  # append cuda_ms=...
+    enable_memory: true       # append peak_allocated_gb / peak_reserved_gb
+    train_start_step: 1       # training only: save global steps 1-10
+    train_end_step: 10
+```
+
+Inference always writes the graph path to `<output_dir>/<infer_type>/trace.txt`;
+the `train.graph_profile.enable_*` switches only add suffix fields to those node lines.
+Training writes rank-0 graph traces only when any detail switch is enabled,
+under `train.checkpoint.output_dir/graph_trace`.
+
+Execution is driven by the runtime, not the module's `pre_forward`.
+`OmniModelRuntime.forward` loops `TrainingGraph.iter_nodes()` (which selects nodes
+and advances via `maybe_transition`), draining each node's `_loss` as it goes, and
+`execute_train_node` runs one node end-to-end, which:
+
+1. runs the module's `pre_forward` → real input tensors (and, for metered
+   modules, `metric_meter_set_seqlens(method, seqlens)` stashes the token lengths);
+2. feeds the meter `metric_meter_add(method, data)` — the analogue of `EnvironMeter.add`.
+   The default `metric_meter_token_lengths` drains the `pre_forward` stash; each
+   module implements only `estimate_flops(seqlens)`. For Janus:
+   - `janus_llama` (backbone) — per-sample lengths from packed `cu_seqlens`; FLOPs
+     = transformer layers (no `lm_head`/`wte`).
+   - `janus_text_encoder` (via base `text_encoder`) — packed `input_ids` length on
+     `encode`; FLOPs = `lm_head` (`vocab × hidden`).
+   - `janus_siglip` — patches-per-image from `pixel_values`; FLOPs = ViT.
+   - `janus_vqvae` — VQ tokens on `encode`, nothing on `decode`; FLOPs = 0 (frozen
+     codec, generation head not counted) — token count only.
+
+   **SP invariance:** every module stashes its **own** lengths
+   **before** the SP gather/slice — the AR backbones from the pre-gather
+   `position_ids`, the text encoder from the pre-gather `input_ids`, and the
+   vision modules from the pre-gather image count. `OmniEnvironMeter` sums
+   tokens + FLOPs over the **`dp_group`** only (which excludes SP), so
+   "each rank reports its own data" + "DP-sum" reconstructs the true global total.
+   The reported tokens/FLOPs/MFU are therefore **identical** across SP configs —
+   verified `sp1` == `llama-sp4` == `all-sp4` (per-module `consume_tokens` match
+   to the digit). Reporting the *post*-gather aggregate instead would over-count
+   by ~`module_sp` in per-module SP;
+3. runs the requested method (through the FSDP wrapper) + `post_forward`.
+
+At the module-trainer's `on_step_end`, `metric_meter_collect()` returns
+`(estimate_flops(seqlens), seqlens)` — **no timing, no MFU, no reduction**. The
+orchestrator (`OmniEnvironMeterCallback` + `OmniEnvironMeter`, in
+`veomni/utils/omni_helper.py`) owns the single whole-graph timing and the
+**global** roll-up. Its `add(micro_batch)` (per micro-batch) computes **only** the
+sample count + multi-source ds_idx — **not** token lengths (those come from the
+modules); its `step(...)` then:
+
+- **achieved FLOPs / MFU** — sum every module's theoretical FLOPs, DP-reduce, and
+  divide by the one forward+backward delta. (A per-module wall-clock is
+  meaningless: a module's `on_step_end` fires only after the *whole* graph, so it
+  would see the whole-step time, not its own.)
+- **merge** all modules' token lengths into one batch → token / consume-tokens /
+  tokens-per-second statistics. The **chunk count** is the real sample count from
+  `add` (one per conversation), not the merged-seqlens length;
+- **multi-source** per-dataset accounting — ds_idx from `add` zipped with the
+  per-sample seqlens of the backbone (the module whose `seqlens` has one entry
+  per sample); skipped with a warning if none aligns;
+- **device / host memory** + cache-empty / GC cadence.
+
+`OmniTrainer.on_step_begin` only records the single start time + calls `add` per
+micro-batch; it does **not** cascade to module-trainers. There is **no
+image-seqlens concept** anywhere. Modules that don't implement the trace hooks
+contribute nothing.
+
+### 2.2 `ConversationItem` — the data carrier (`utils/conversation.py`)
+
+There are **no per-field data channels** between modules. Instead, a single
+mutable list is threaded through every call. One element:
+
+```python
+@dataclass
+class ConversationItem:
+    type: str    # "text" | "image" | "output"
+    value: Any   # raw content → embedding tensor → hidden state (mutated in place)
+    role: str    # "user" | "assistant" | "dummy"
+    meta: dict   # per-module baggage: labels, attention_mask, janus_vqvae_labels, ...
+```
+
+- Training carries a **batch**: `list[list[ConversationItem]]`.
+- Inference carries **one request**: `list[ConversationItem]`.
+
+**`value` has a lifecycle** — modules overwrite it as data flows downstream:
+
+```mermaid
+flowchart LR
+    A["raw<br/>(str / PIL / pixels)"] -->|encoder| B["embedding<br/>(L, D)"]
+    B -->|backbone| C["hidden state<br/>(L, D)"]
+    C -->|decode head| D["loss / sampled token"]
+```
+
+A `role="dummy"` item is a zero-tensor placeholder an encoder appends on a
+micro-batch that lacks its modality (e.g. a text-only sample has no image). The
+backbone skips dummy rows when packing but folds a `+ value.mean()*0.0` anchor
+so FSDP gradient-sync stays aligned across ranks.
+
+### 2.3 Two graph views (`graphs/base.py`, `graphs/training_graph.py`, `graphs/generation_graph.py`)
+
+There is **no shared `nodes` / `edges` pool**. Both views are written as plain
+lists of **edges** (`{from, to}`), and each endpoint is a self-describing
+`module[.method]` string. A bare endpoint takes the view's default method
+(`forward` for training, `generate` for inference); a dotted `module.method`
+uses that method verbatim. A node's identity is its canonical
+`"<module>.<method>"` form.
+
+- **`TrainingGraph`** — a **DAG**. `training_graph` is a flat list of edges;
+  active nodes are derived from the endpoints, and a topological sort gives the
+  forward order. Each active node runs **exactly once** per forward. **Edges
+  are pure topology** — they declare order only, not data routing.
+- **`GenerationGraph`** — a **finite-state machine**. Each `state.body` is a
+  list of inline `{from, to}` edges to run that step; `transitions` pick the
+  next state by `module_signal` (a string a module writes into `ctx`) or
+  `default`.
+
+### 2.4 `OmniModel` — the runtime (`modeling_omni.py`)
+
+Holds the sub-modules (as direct attributes, so param FQNs are
+`<module>.<rest>`), the `TrainingGraph`, and the optional `GenerationGraph`.
+
+**Loss protocol:** each module returns at most one scalar `_loss` (already
+token-mean-reduced over its own micro-batches); `OmniModel.forward` simply sums
+them. No central averaging — token counts stay correct across modules.
+
+---
+
+## 3. Training flow (Janus joint SFT)
+
+The default Janus `training_graph` (`configs/seed_omni/Janus/janus_1.3b/graph_train.yaml`):
+
+```mermaid
+flowchart LR
+    data[("conversation_list<br/>(batch)")] -.-> S[janus_siglip]
+    data -.-> V[janus_vqvae.encode]
+    data -.-> T[janus_text_encoder.encode]
+    S --> L[janus_llama]
+    V --> L
+    T --> L
+    L --> TD[janus_text_encoder.decode]
+    L --> VD[janus_vqvae.decode]
+    TD --> E((end))
+    VD --> E
+```
+
+What each node does to the shared carrier:
+
+1. **`janus_siglip`** — replaces user `image` items' raw pixels with SigLIP
+   patch embeddings.
+2. **`janus_vqvae.encode`** — replaces assistant `image` items with VQ
+   embeddings and stashes `meta.janus_vqvae_labels`.
+3. **`janus_text_encoder.encode`** — applies the Janus chat template to `text`
+   items, tokenises, runs word-token embedding (`wte`), and stores
+   `meta.labels`.
+4. **`janus_llama`** — concatenates every non-dummy item's embedding into one
+   packed `bs=1` sequence, runs the LLaMA backbone (no `wte`, no `lm_head`),
+   and writes the hidden state back onto each item's `value`.
+5. **`janus_text_encoder.decode`** / **`janus_vqvae.decode`** — read hidden
+   states + labels off the carrier and each return one `_loss`.
+
+The runtime loop (simplified from `OmniModel.forward` + `TrainingGraph.iter_nodes`,
+which mirrors `OmniModel.generate` + `GenerationGraph.iter_nodes`):
+
+```python
+training_graph.reset()
+profiler = GraphProfiler()
+# The graph only SELECTS nodes (profiler-free — it is model-bound); execution is
+# external (execute_train_node) and the profiler lives at the call site.
+for node in training_graph.iter_nodes():
+    # execute_train_node runs the selected node end-to-end: unwrap the wrapped
+    # sub-module (held by OmniModel), scope its ParallelState (scope_fn), pre_forward →
+    # call (through the FSDP/DDP wrapper) → post_forward, merge conversation_list
+    # + _loss back into the shared batch (edges are topology only, no input routing).
+    execute_train_node(modules, node, batch, profiler=profiler, scope_fn=scope_fn)
+    self._collect_training_loss(batch, node.name, profiler)   # pop _loss → self._losses[node]
+total_loss = sum(self._losses.values())
+```
+
+**Dummy forward (training only):** every active node must run on every
+micro-batch or FSDP all-reduce hangs. Missing a modality? The encoder runs its
+`dummy_inputs()` zeros and appends a `role="dummy"` item; the backbone folds the
+anchor term described in §2.2. Inference has no such constraint — modules may
+`return {}` and the FSM skips the edge.
+
+---
+
+## 4. Inference flow (FSM)
+
+`OmniModel.generate(request, trace, generation_kwargs)` loops: run the current
+state's body, drain any one-shot `generated` payloads, then take the first
+matching transition. It stops at the `done` state or the
+`generation_kwargs["max_new_tokens"]` cap (default 2048). It does **not** reset
+the FSM — `OmniInferencer` calls `reset()` at request boundaries.
+
+The same node pool backs three different FSMs, selected by
+`infer.infer_type` (a key into the `infer.infer_graph` map, each pointing at one
+`graph_infer_*.yaml`):
+
+**Understanding — `graph_infer_und.yaml` (I2T / VQA):**
+
+```mermaid
+stateDiagram-v2
+    [*] --> prompt_encode
+    prompt_encode --> done: text_done
+    prompt_encode --> text_ar: default
+    text_ar --> text_ar: (sample next token)
+    text_ar --> done: text_done
+```
+
+The `token_generate` node (the text encoder's `generate`) samples a token each
+step and emits the `text_done` signal when it hits `</s>`.
+
+**Generation — `graph_infer_gen.yaml` (T2I):**
+
+```mermaid
+stateDiagram-v2
+    [*] --> prompt_encode
+    prompt_encode --> image_vq_start: default
+    image_vq_start --> image_vq: default
+    image_vq --> image_vq_end: image_complete
+    image_vq_end --> done: default
+```
+
+`image_vq_start` emits `<begin_of_image>`; `image_vq` loops backbone →
+`vqvae.generate` for 576 VQ steps and emits `image_complete` when the grid is
+full; `image_vq_end` emits `<end_of_image>`.
+
+**Interleave — `graph_infer_interleave.yaml`:** the model decides mid-stream whether
+to open an image span (`start_image_gen` on a sampled `<boi>`), so `text_ar`
+and `image_vq` transition into each other instead of straight to `done`.
+
+---
+
+## 5. The Janus modules
+
+| Module (`model_type`) | HF base | Role |
+|-----------------------|---------|------|
+| `janus_siglip` | `SiglipVisionModel` | encode **understanding** images → patch embeds |
+| `janus_vqvae` | `JanusVQVAE` + gen heads | encode **generation** images / decode VQ grid → pixels |
+| `janus_text_encoder` | LLaMA `wte` + `lm_head` | chat template, token embed, LM head, `<boi>`/`<eoi>` emit |
+| `janus_llama` | patched `LlamaModel` | backbone (no `wte`, no `lm_head`) |
+
+Why split the LLM into `text_encoder` + `llama`? Word-token embedding and the
+LM head are vocabulary-dependent — they mirror the discrete-image VQ codec on
+the text side. Splitting them lets the graph treat text and image
+symmetrically (both have `encode` / `decode` nodes), and lets Janus own the
+boundary-token logic without the framework knowing about it.
+
+---
+
+## 6. Adding a new model
+
+Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
+
+1. **Split the checkpoint.** Register a converter in `modules/<family>/convert_model.py` (dispatched by `scripts/convert_model.py`)
+   to break the upstream HF checkpoint into one self-contained subfolder per
+   module (`config.json` + `model.safetensors` + any processor/tokenizer JSON).
+
+2. **Write each module** under
+   `veomni/models/seed_omni/modules/<family>/<sub>/`:
+   - `configuration.py` — a `PretrainedConfig` with a unique `model_type`.
+   - `modeling.py` — `class X(InferenceMixin, OmniPreTrainedModel)` — pure
+     HF-native: `__init__`, submodule layout, `forward` on `X`, and (if
+     inference-capable) an in-file `InferenceMixin` (§2.1) holding the FSM
+     `generate()` plus its state/helpers, listed **before**
+     `OmniPreTrainedModel` in `X`'s bases. This class must load and run under
+     plain `from_pretrained` with no VeOmni import.
+   - `accelerated.py` — `TrainingMixin` / `VeOmniMixin` (no `InferenceMixin` —
+     see §2.1) **and** IDE type stubs for native APIs those training hooks
+     call (see §2.1). `class XAccelerated(VeOmniMixin, X)`. Janus modules
+     under `modules/janus/*/` are the reference pattern.
+   - `processing.py` (optional) — if the module consumes raw images / audio.
+
+   Reuse cross-family helpers in `modules/base/` where possible.
+
+3. **Register** the classes in `modules/__init__.py`
+   (`OMNI_CONFIG_REGISTRY` / `OMNI_MODEL_REGISTRY` — native `modeling.py`
+   classes — / `OMNI_ACCELERATED_MODEL_REGISTRY` — `accelerated.py` classes —
+   / `OMNI_PROCESSOR_REGISTRY`), keyed by `model_type`. The trainer resolves a
+   module by reading `config.json` → `model_type` → registry.
+
+4. **Write the YAML** (`configs/seed_omni/<model>/`):
+   - `base.yaml` — top-level launcher: `model.*` (incl. `modules` / `train_graph`
+     paths), top-level `accelerator`, `data.*`, `train.*`, and the `infer` block.
+   - `modules_train.yaml` — per-module training overrides (`model` / `train` /
+     `accelerator` per module). A module's `accelerator` block drives its own
+     parallel topology on the full world (heterogeneous FSDP2 / FSDP2+`emb`/`ep`
+     / DDP); modules matching the global topology reuse it, others build their
+     own `ParallelState`.
+   - `graph_train.yaml` — the `training_graph` (a flat list of edges whose
+     endpoints are `module[.method]` strings). Remember: edges only declare
+     order; modules move data via the conversation list.
+   - `modules_infer.yaml` (optional) — per-module inference overrides.
+   - `graph_infer_*.yaml` — one `generation_graph` (FSM) per scenario, mapped
+     under `infer.infer_graph`. `OmniConfig` loads **all** of them into
+     `generation_graphs` and `infer.infer_type` selects the active one, so an
+     exported checkpoint keeps serving every scenario.
+
+5. **Honour the contracts:**
+   - Return at most one scalar `_loss` per node (token-mean reduced).
+   - Read inputs in `pre_forward`, write results in `post_forward`, always
+     returning `{"conversation_list": ...}` so the carrier flows on.
+   - Implement `dummy_inputs()` for any encoder whose modality can be absent
+     from a micro-batch.
+   - For inference modules, emit `module_signal` strings to drive FSM
+     transitions, and clear private buffers in
+     `reset_local_inference_state()` / `reset_global_inference_state()` /
+     `finalize()`.
+
+6. **Validate:** render the graph with `TrainingGraph.to_mermaid()`, run the
+   unit tests in `tests/seed_omni/`, then the end-to-end train/infer pipeline.
+   Worked examples under `docs/seed_omni/example_models/`:
+   - [`janus.md`](example_models/janus.md) — multimodal understanding + generation (SigLIP / VQVAE / LLaMA).
+   - [`qwen3.md`](example_models/qwen3.md) — minimal text-only split.
+   - [`qwen3moe.md`](example_models/qwen3moe.md) — MoE backbone with Expert Parallel (fsdp2 + ep).
+
+---
+
+## 7. File map
+
+| Path | Responsibility |
+|------|----------------|
+| `mixins/base_mixin.py` | shared assets, `_omni_hook_name` registry |
+| `mixins/training_module_mixin.py` | `pre_forward` / `post_forward` dispatch |
+| `mixins/inference_module_mixin.py` | live `reset_*` / `finalize` hooks, plus `pre_generate` / `post_generate` dispatchers that nothing invokes (both FSM drivers call endpoints directly — see §2.1) |
+| `omni_pretrained_model.py` | `OmniPreTrainedModel` — base for every native `modeling.py` class; ships no-op `reset_local_inference_state` / `reset_global_inference_state` / `finalize` defaults, shadowed by each module's `InferenceMixin` (§2.1) |
+| `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
+| `utils/conversation.py` | `ConversationItem` + carrier helpers |
+| `utils/convert_registry.py` | HF → split-checkpoint conversion registry |
+| `graphs/base.py` | shared `NodeDef` / `EdgeDef` / `END` |
+| `graphs/training_graph.py` | DAG view (topological forward order) |
+| `graphs/generation_graph.py` | FSM view (states / transitions / signals) |
+| `configuration_omni.py` | `OmniConfig` — plain `PretrainedConfig`, checkpoint read/write only |
+| `arguments/omni_arguments_types.py` | launcher argument schema (`OmniArguments`) + parse/merge the launcher YAML into `OmniModelRuntimeArguments`; `.to_hf_config()` projects it onto `OmniConfig` |
+| `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
+| `modules/<family>/<sub>/` | per-module `configuration.py`, `modeling.py` (native, incl. `generate`), `accelerated.py` (training-graph hooks) [, `processing.py`] |
+| `veomni/trainer/omni/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
+| `veomni/trainer/omni/omni_inferencer.py` | request loop, `reset` + `finalize` |
+| `configs/seed_omni/<model>/` | `base.yaml` + `modules_train.yaml` + `graph_train.yaml` (+ `modules_infer.yaml` / `graph_infer_*.yaml`) |
+```

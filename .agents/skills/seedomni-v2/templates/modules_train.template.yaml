@@ -1,0 +1,31 @@
+# Per-module training overrides.
+# `model.model_path` is relative to the split checkpoint root from base.yaml.
+# Do not put `model_type` here; it belongs in each module config.json.
+
+vision_encoder:
+  model:
+    model_path: vision_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: ddp
+
+text_encoder:
+  model:
+    model_path: text_encoder
+  accelerator:
+    extra_parallel_sizes: [4]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+
+backbone:
+  model:
+    model_path: backbone
+    ops_implementation:
+      attn_implementation: flash_attention_2
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+decoder:
+  model:
+    model_path: decoder

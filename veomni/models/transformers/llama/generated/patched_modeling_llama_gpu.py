@@ -15,6 +15,8 @@
 #      OpSlot guard for Liger fused SwiGLU MLP
 #    - function_replacement: apply_rotary_pos_emb
 #      OpSlot guard for Liger fused RoPE
+#    - method_override: LlamaModel.forward
+#      Drop deprecated cache_position kwarg from create_causal_mask (transformers >= 5.9)
 #    - method_override: LlamaForCausalLM.forward
 #      OpSlot guard for fused cross entropy in LlamaForCausalLM.forward
 #    - method_override: LlamaForSequenceClassification.forward
@@ -392,6 +394,12 @@ class LlamaPreTrainedModel(PreTrainedModel):
     }
 
 
+# ======================================================================
+# [MODIFIED CLASS] LlamaModel
+# Methods patched: forward
+# ======================================================================
+
+
 @auto_docstring
 class LlamaModel(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -410,6 +418,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    # ── LlamaModel.forward (transformers >= 5.9 create_causal_mask API) ──────────
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -427,7 +436,7 @@ class LlamaModel(LlamaPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -499,7 +508,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
@@ -510,7 +518,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -575,7 +582,6 @@ class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreT
         inputs_embeds=None,
         labels=None,
         use_cache=None,
-        cache_position=None,
         **kwargs,
     ):
         outputs = self.model(
@@ -585,7 +591,6 @@ class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreT
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cache_position=cache_position,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
