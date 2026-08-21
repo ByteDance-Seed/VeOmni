@@ -383,6 +383,8 @@ model = build_parallelize_model(
     broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0, # load model weights
     ep_sharded_stream_load=args.train.ep_sharded_stream_load,
     max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
+    # Muon's zero-comm expert layout is decided here, not by build_optimizer.
+    muon_expert_zero_comm=args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm,
 )
 ```
 
@@ -499,7 +501,9 @@ optimizer = build_optimizer(
     weight_decay=args.train.optimizer.weight_decay,
     optimizer_type=args.train.optimizer.type,
     # Hand over the config so optimizer-specific knobs (the muon_* fields) are
-    # read here instead of being unpacked by each trainer.
+    # read here instead of being unpacked by each trainer. The one exception is
+    # muon_expert_zero_comm, which picks an FSDP shard layout and so has to be
+    # passed to build_parallelize_model above.
     optimizer_config=args.train.optimizer,
     # ... other parameters
 )

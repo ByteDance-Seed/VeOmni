@@ -261,6 +261,10 @@ def main():
             f"will skip HF weight load from {args.model.model_path}."
         )
 
+    # Consumed while sharding, so it cannot be picked up from the OptimizerConfig
+    # that build_optimizer reads further down.
+    muon_expert_zero_comm = args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm
+
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
@@ -276,6 +280,7 @@ def main():
         cpu_load_param_name=cpu_load_param_name,
         max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
         should_skip_hf_weight_load=skip_hf_weight_load,
+        muon_expert_zero_comm=muon_expert_zero_comm,
     )
     optimizer = build_optimizer(
         model,
