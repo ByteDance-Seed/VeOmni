@@ -293,6 +293,15 @@ class OptimizerState(Stateful):
             )
             return optim_sd_with_extra_parallel_dim
 
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            # MultiOptimizer (e.g. Muon+AdamW without ExtraParallel) is not a
+            # real torch.optim.Optimizer: it has no .state/.param_groups, so
+            # torch DCP's get_optimizer_state_dict crashes on _init_optim_state
+            # with "AttributeError: 'MultiOptimizer' object has no attribute
+            # 'state'". Delegate to its Stateful API, which returns a merged,
+            # DCP-compatible flattened state dict.
+            return self.optimizer.state_dict()
+
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
@@ -306,6 +315,14 @@ class OptimizerState(Stateful):
             self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
             # MultiOptimizer sub-optimizers can also lose param-group hyperparams
             # (betas/...) for empty groups after load; restore recurses into them.
+            restore_optimizer_param_group_defaults(self.optimizer)
+            return
+
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            # Mirror the save path: MultiOptimizer.load_state_dict feeds the
+            # merged flattened dict to each sub-optimizer, which picks out its
+            # own entries.
+            self.optimizer.load_state_dict(optim_state_from_dcp_load)
             restore_optimizer_param_group_defaults(self.optimizer)
             return
 
