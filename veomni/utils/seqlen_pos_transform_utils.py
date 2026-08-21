@@ -141,3 +141,32 @@ def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor, tail_padding_length:
 
     pad = int((torch.flip(diff == 1, (0,)).cumprod(0)).sum().item())
     return diff[:-pad] if pad else diff
+
+
+def logical_seqlens_from_cu_seqlens(
+    cu_seqlens: Optional[torch.Tensor] = None,
+    *,
+    logical_cu_seqlens: Optional[torch.Tensor] = None,
+    tail_padding_length: Optional[int] = None,
+) -> torch.Tensor:
+    """Return logical sample lengths from packed metadata.
+
+    Context-parallel collation keeps two cumulative-length views: the local
+    physical view used by attention and the original logical view used by
+    accounting/recurrent metadata.  Tail padding is expressed in the same
+    coordinate system as the logical view, so it must never be applied to the
+    local physical view.
+
+    When an explicit logical view is supplied, a missing tail length means
+    that no tail should be stripped.  This avoids the heuristic in
+    :func:`valid_seqlens_from_cu_seqlens` removing a legitimate one-token
+    sample at the end of a packed batch.
+    """
+    if logical_cu_seqlens is not None:
+        return valid_seqlens_from_cu_seqlens(
+            logical_cu_seqlens,
+            tail_padding_length=0 if tail_padding_length is None else tail_padding_length,
+        )
+    if cu_seqlens is None:
+        raise ValueError("either cu_seqlens or logical_cu_seqlens must be provided")
+    return valid_seqlens_from_cu_seqlens(cu_seqlens, tail_padding_length=tail_padding_length)

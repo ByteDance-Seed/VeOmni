@@ -22,6 +22,11 @@ from transformers.integrations.flex_attention import flex_attention_forward as h
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, causal_mask_function
 
 from ....distributed.parallel_state import get_parallel_state
+from ._replicated_dummy import (
+    _FLEX_SCOPE_ERROR,
+    is_replicated_dummy_sequence_parallel,
+    reject_public_sequence_parallel_bypass,
+)
 from .ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -105,6 +110,9 @@ def flex_attention_forward(
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the pinned Transformers FlexAttention adapter with optional Ulysses exchange."""
+    reject_public_sequence_parallel_bypass(kwargs)
+    if is_replicated_dummy_sequence_parallel():
+        raise NotImplementedError(_FLEX_SCOPE_ERROR)
     if not isinstance(attention_mask, BlockMask):
         raise TypeError(f"FlexAttention requires a BlockMask, got {type(attention_mask).__name__}.")
 

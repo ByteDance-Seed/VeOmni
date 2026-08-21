@@ -47,7 +47,7 @@ from .device import (
 )
 from .dist_utils import all_reduce
 from .multisource_utils import parse_multisource_config
-from .seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
+from .seqlen_pos_transform_utils import logical_seqlens_from_cu_seqlens
 
 
 try:
@@ -87,11 +87,12 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 
 
 def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
-    if "cu_seq_lens_q" in micro_batch:
+    if "linear_attn_cu_seq_lens_q" in micro_batch or "cu_seq_lens_q" in micro_batch:
         # packed micro batch
         tail_padding_length = micro_batch.get("tail_padding_length")
-        seqlens = valid_seqlens_from_cu_seqlens(
-            micro_batch["cu_seq_lens_q"],
+        seqlens = logical_seqlens_from_cu_seqlens(
+            micro_batch.get("cu_seq_lens_q"),
+            logical_cu_seqlens=micro_batch.get("linear_attn_cu_seq_lens_q"),
             tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
         ).tolist()
         return seqlens
@@ -379,15 +380,32 @@ class MultiSourceInfoTracker:
         """
         Computes the statistics about the weighted multi-source dataset. It should be called at every rank to update dataloader.
         """
+        local_lengths = (len(batch_ds_idx), len(batch_seqlens))
         counter = defaultdict(MultiSourceCounterItem)
-        for ds_idx, seq_len in zip(batch_ds_idx, batch_seqlens):
-            counter[ds_idx].increment(seq_len, 1)
+        if local_lengths[0] == local_lengths[1]:
+            for ds_idx, seq_len in zip(batch_ds_idx, batch_seqlens):
+                counter[ds_idx].increment(seq_len, 1)
 
-        counter_list: List[Dict[int, MultiSourceCounterItem]] = [None for _ in range(self.parallel_state.dp_size)]
-        dist.all_gather_object(counter_list, counter, group=self.parallel_state.dp_group)
+        gathered: List[Optional[tuple[tuple[int, int], Dict[int, MultiSourceCounterItem]]]] = [
+            None for _ in range(self.parallel_state.dp_size)
+        ]
+        dist.all_gather_object(gathered, (local_lengths, counter), group=self.parallel_state.dp_group)
+        mismatched_ranks = []
+        for rank, payload in enumerate(gathered):
+            if payload is None:
+                raise RuntimeError("multi-source token accounting metadata gather returned an empty rank payload")
+            lengths, _counter = payload
+            if lengths[0] != lengths[1]:
+                mismatched_ranks.append((rank, lengths[0], lengths[1]))
+        if mismatched_ranks:
+            raise ValueError(
+                "multi-source token accounting metadata mismatch: expected one sequence length per source index; "
+                f"rank(lengths)={mismatched_ranks}"
+            )
 
         global_counter = defaultdict(MultiSourceCounterItem)
-        for counter in counter_list:
+        for payload in gathered:
+            _lengths, counter = payload
             for ds_idx, item in counter.items():
                 global_counter[ds_idx].increment(item.num_tokens, item.num_samples)
                 self.accumulate_counter.setdefault(ds_idx, MultiSourceCounterItem()).increment(
@@ -429,7 +447,9 @@ class MultiSourceInfoTracker:
                     f"multi_source/step_consumed_tokens(M)/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
                     / 1e6,
                     f"multi_source/step_consumed_ratio/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
-                    / step_consumed_tokens,
+                    / step_consumed_tokens
+                    if step_consumed_tokens > 0
+                    else 0.0,
                 }
             )
 

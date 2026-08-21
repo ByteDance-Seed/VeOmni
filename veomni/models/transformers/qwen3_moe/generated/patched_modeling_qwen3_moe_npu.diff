@@ -371,7 +371,7 @@
  @auto_docstring
  class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -636,37 +726,23 @@
+@@ -636,37 +726,28 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -409,12 +409,18 @@
          output_router_logits = (
              output_router_logits if output_router_logits is not None else self.config.output_router_logits
          )
-
+-
 -        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
++        # CP keeps the full attention mask for Ring/Hybrid attention, while MoE
++        # router logits are rank-local. Consume the collator-provided local mask
++        # here so it is used only for the auxiliary loss and is not forwarded into
++        # decoder layers. Non-CP callers retain the original attention mask.
++        router_attention_mask = kwargs.pop("router_attention_mask", attention_mask)
++
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -675,30 +751,69 @@
+@@ -675,30 +756,69 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -477,14 +483,14 @@
 +                    outputs.router_logits,
 +                    self.num_experts,
 +                    self.num_experts_per_tok,
-+                    attention_mask,
++                    router_attention_mask,
 +                )
 +            else:
 +                aux_loss = load_balancing_loss_func(
 +                    outputs.router_logits,
 +                    self.num_experts,
 +                    self.num_experts_per_tok,
-+                    attention_mask,
++                    router_attention_mask,
 +                )
              if labels is not None:
 -                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
@@ -496,7 +502,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -706,7 +821,13 @@
+@@ -706,7 +826,13 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
