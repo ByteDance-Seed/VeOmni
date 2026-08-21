@@ -27,6 +27,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     apply_rotary_pos_emb_vision_patched,
     qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
+    qwen3_vl_get_pre_sp_collate_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_rmsnorm_forward_patched,
@@ -155,6 +156,12 @@ config.override_method(
     replacement=qwen3_vl_get_metadata_collate_func_patched,
     name_map=_NAME_MAP,
     description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+config.override_method(
+    "Qwen3VLMoeForConditionalGeneration.get_pre_sp_collate_func",
+    replacement=qwen3_vl_get_pre_sp_collate_func_patched,
+    name_map=_NAME_MAP,
+    description="Expose the pre-SP pixel-stream merge hook to the VeOmni collator",
 )
 
 # MoE-specific patches reused verbatim from the GPU config.
