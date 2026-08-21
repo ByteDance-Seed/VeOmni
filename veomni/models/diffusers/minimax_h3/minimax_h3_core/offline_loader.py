@@ -1,7 +1,7 @@
 """MiniMax H3 offline data loader.
 
 Scans directory for VeOmni offline_embedding parquet shards and yields
-per-row dicts (pickle-bytes columns). The dit_offline data_transform
+per-row dicts (pickle-bytes columns). The minimax_h3_offline data_transform
 restores each row to the per-sample dict that process_condition consumes.
 """
 
@@ -37,30 +37,51 @@ class _ParquetIterableDataset(IterableDataset):
     same num_workers / base seed, otherwise the per-worker shard slices and
     shuffle order change and the saved position is meaningless. Shuffle order
     is re-derived per repeat pass (seed = epoch seed + repeat index), so a
-    resume inside a repeat lands on the same order it was recorded in.
+    resume inside a repeat lands on the same order it was recorded in. DP
+    split is row-level: each rank keeps rows at (global row position in the
+    pass order) % dp_size == dp_rank, so every rank yields data even when
+    shard count < dp_size. Resume also assumes the same dp_rank/dp_size.
     """
 
-    def __init__(self, file_paths: list[str], shuffle: bool, seed: int, repeat: int = 1):
+    def __init__(
+        self, file_paths: list[str], shuffle: bool, seed: int, repeat: int = 1, dp_rank: int = 0, dp_size: int = 1
+    ):
         self._paths = file_paths
         self._shuffle = shuffle
         self._base_seed = seed  # configured seed; set_epoch derives epoch seeds from it
         self._seed = seed
         self._repeat = repeat
+        # Row-level DP split: every rank iterates every shard and keeps only
+        # rows at (global row position) % dp_size == dp_rank, so shard count
+        # no longer bounds dp_size (total row count does).
+        self._dp_rank = dp_rank
+        self._dp_size = dp_size
+        self._row_counts = {}  # path -> num_rows (parquet metadata, cached)
+        if dp_size > 1:
+            total_rows = sum(self._row_count(p) for p in file_paths)
+            if total_rows < dp_size:
+                raise ValueError(
+                    f"Only {total_rows} rows across {len(file_paths)} shards for "
+                    f"dp_size={dp_size}: every rank would get zero samples. "
+                    "Re-shard the data or run offline embedding on more ranks."
+                )
         self._pos = None  # {worker_key: {"rep": int, "path_idx": int, "row_idx": int}}, set while iterating
         self._resume = None  # same schema, restored via load_state_dict
 
     def _worker_key(self, wid):
         return wid if wid is not None else 0
 
+    def _row_count(self, path: str) -> int:
+        if path not in self._row_counts:
+            import pyarrow.parquet as pq
+
+            self._row_counts[path] = pq.ParquetFile(path).metadata.num_rows
+        return self._row_counts[path]
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            paths = list(self._paths)
-            wid = 0
-        else:
-            # Round-robin so every worker receives shards even when
-            # num_workers > len(self._paths).
-            paths = list(self._paths[worker_info.id :: worker_info.num_workers])
+        wid = 0 if worker_info is None else worker_info.id
+        nw = 1 if worker_info is None else worker_info.num_workers
 
         resume = None if self._resume is None else self._resume.get(self._worker_key(wid))
         self._pos = {self._worker_key(wid): {"rep": 0, "path_idx": 0, "row_idx": 0}}
@@ -71,14 +92,26 @@ class _ParquetIterableDataset(IterableDataset):
             # Each repeat pass shuffles its own copy with a per-repeat seed:
             # deterministic across restarts (same base seed + rep), and the
             # saved {rep, path_idx} resume position still lands on the same
-            # shard order for the repeat it was recorded in.
-            rep_paths = list(paths)
+            # shard order for the repeat it was recorded in. All ranks and
+            # workers derive the same pass order from the same seed.
+            rep_paths = list(self._paths)
             if self._shuffle:
                 random.Random(self._seed + rep).shuffle(rep_paths)
-            for pi, p in enumerate(rep_paths):
+            # Global row offset of each file in the pass order; the DP filter
+            # below is positional: (offset + row index) % dp_size == dp_rank.
+            offset_by_path = {}
+            off = 0
+            for p in rep_paths:
+                offset_by_path[p] = off
+                off += self._row_count(p)
+            # Worker round-robin over the pass order, so every worker receives
+            # shards even when num_workers > len(self._paths).
+            worker_paths = rep_paths[wid::nw]
+            for pi, p in enumerate(worker_paths):
                 if resume is not None and rep == resume["rep"] and pi < resume["path_idx"]:
                     continue
                 df = pd.read_parquet(p)
+                base = offset_by_path[p]
                 for ri, row in enumerate(df.to_dict(orient="records")):
                     if (
                         resume is not None
@@ -86,6 +119,8 @@ class _ParquetIterableDataset(IterableDataset):
                         and pi == resume["path_idx"]
                         and ri < resume["row_idx"]
                     ):
+                        continue
+                    if (base + ri) % self._dp_size != self._dp_rank:
                         continue
                     # Record the next position BEFORE yielding: the generator
                     # suspends at the yield, so a post-yield write would only
@@ -160,19 +195,16 @@ def build_minimax_h3_offline_dataset(
     dp_rank = parallel_state.dp_rank
     dp_size = parallel_state.dp_size
 
-    # Repeat each file repeat times so each DP rank has enough iterations.
+    # Repeat the whole pass repeat times so each DP rank has enough iterations.
     # Controlled by data.mm_configs.repeat in YAML.
     mm_configs = kwargs.get("mm_configs", {}) or {}
     repeat = int(mm_configs.get("repeat", 1))
 
-    # Round-robin distribution: rank i gets files[i], files[i+dp_size], ...
-    rank_files = parquet_files[dp_rank::dp_size]
-    if not rank_files:
-        raise ValueError(
-            f"Rank {dp_rank} got no files after sharding: {len(parquet_files)} "
-            f".parquet files split across {dp_size} dp ranks. Reduce dp_size or "
-            "re-run offline embedding with more shards."
-        )
-
-    raw_dataset = _ParquetIterableDataset(file_paths=rank_files, shuffle=shuffle, seed=seed, repeat=repeat)
+    # Row-level DP split: every rank iterates every shard and keeps only the
+    # rows at (global row position) % dp_size == dp_rank, so shard count no
+    # longer bounds dp_size (total row count does). Checkpoint resume records
+    # per-worker positions, unaffected by the filter.
+    raw_dataset = _ParquetIterableDataset(
+        file_paths=parquet_files, shuffle=shuffle, seed=seed, repeat=repeat, dp_rank=dp_rank, dp_size=dp_size
+    )
     return IterativeDataset(raw_dataset, transform=transform)
