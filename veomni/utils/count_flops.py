@@ -106,6 +106,7 @@ class VeomniFlopsCounter:
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
             "gpt_oss": self._estimate_gpt_oss_flops,
+            "hunyuan_image_3_moe": self._estimate_hunyuan_image_3_flops,
         }
 
         self.config = config
@@ -514,6 +515,69 @@ class VeomniFlopsCounter:
         )
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved
+
+    def _estimate_hunyuan_image_3_flops(self, tokens_sum, batch_seqlens, delta_time):
+        """Estimate HunyuanImage 3 training FLOPs.
+
+        Same shape as :meth:`_estimate_qwen3_moe_flops`, except: ``lm_head`` is
+        skipped when the component policy marks it absent, because counting a
+        133k-vocab projection the T2I model never builds would overstate active
+        params by ~4%; and the two Generalized Causal Attention calls together
+        touch each (query, key) pair at most once, so ``seqlen**2`` is still the
+        right upper bound.
+
+        Like the other counters here this ignores recompute. It also omits the
+        T2I-only device work outside the transformer stack: ``patch_embed`` and
+        ``final_layer`` (2D convs over the whole token grid), the three timestep
+        MLPs, and the frozen VAE encode. Every omission is additive, so the
+        number is a floor -- MFU computed from it errs low, not high.
+        """
+        hidden_size = self.config.hidden_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_attention_heads = self.config.num_attention_heads
+        num_key_value_heads = self.config.num_key_value_heads
+        moe_intermediate_size = self.config.moe_intermediate_size
+        moe_num_expert = self.config.num_experts
+        # Active experts per token = routed top-k + the always-on shared MLPs.
+        # ``num_shared_expert`` is normalized to a per-layer list by
+        # ``configuration_hunyuan_image_3`` and only *defaults* to 1, so read it
+        # rather than hardcoding: a variant declaring 2, or 0 on some layers,
+        # would otherwise get a silently wrong denominator and show up as an
+        # unexplained MFU shift instead of a failure. Summed per layer so
+        # heterogeneous stacks stay exact.
+        num_shared_expert = getattr(self.config, "num_shared_expert", 1)
+        if not isinstance(num_shared_expert, (list, tuple)):
+            num_shared_expert = [num_shared_expert] * num_hidden_layers
+        experts_per_token_sum = sum(self.config.moe_topk + int(shared) for shared in num_shared_expert)
+
+        head_dim = getattr(self.config, "attention_head_dim", hidden_size // num_attention_heads)
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        router_N = hidden_size * moe_num_expert
+        # SwiGLU: gate_proj + up_proj + down_proj per active expert. Already
+        # summed over layers (see ``experts_per_token_sum``), so it stays out of
+        # the ``* num_hidden_layers`` term below.
+        expert_mlp_N_all_layers = hidden_size * moe_intermediate_size * experts_per_token_sum * 3
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+
+        component_policy = getattr(self.config, "component_policy", None) or {}
+        if component_policy.get("lm_head", "absent") == "absent":
+            head_N = 0
+        else:
+            head_N = self._compute_lm_head_params(hidden_size, self.config.vocab_size)
+
+        non_attn_N = (router_N + attn_linear_N) * num_hidden_layers + expert_mlp_N_all_layers + head_N
+        dense_N_flops = 6 * non_attn_N * tokens_sum
+
+        seqlen_square_sum = 0
+        for seqlen in batch_seqlens:
+            seqlen_square_sum += seqlen * seqlen
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        flops_all_token = dense_N_flops + attn_qkv_flops
+        return flops_all_token * (1.0 / delta_time) / 1e12
 
     @staticmethod
     def _compute_sliding_attention_score_sum(batch_seqlens, sliding_window):

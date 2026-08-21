@@ -24,6 +24,7 @@ from veomni.utils.registry import Registry
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
 
+    from ..models.transformers.hunyuan_image_3.processing_hunyuan_image_3 import HunyuanImage3Processor
     from .chat_template import ChatTemplate
 
 
@@ -553,3 +554,101 @@ def process_sample_qwen_omni(
         labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
     model_inputs["labels"] = labels
     return [model_inputs]
+
+
+@DATA_TRANSFORM_REGISTRY.register("hunyuan_image_3_moe")
+def process_sample_hunyuan_image_3(
+    sample: dict,
+    *,
+    processor: "HunyuanImage3Processor",
+    **kwargs,
+) -> list[dict]:
+    """Transform one raw T2I sample into single-sample staging tensors.
+
+    Per-run knobs arrive through the ``mm_configs`` splat (``**kwargs``), same
+    convention as the Qwen-VL / Qwen-Omni transforms; names and defaults are in
+    the ``kwargs.get`` block below. Two are non-obvious: ``resolution`` is the
+    fixed ``(height, width)`` for the CenterCrop and must be a multiple of
+    ``vae_downsample_factor * patch_size`` (enforced by the image processor),
+    and ``random_flip`` defaults off because many T2I datasets are
+    direction-sensitive.
+
+    Special-token ids come from ``processor.image_processor.config`` rather than
+    YAML -- they are HI3 model constants, not per-run knobs. Fixed resolution
+    means every sample shares the same ``(C, H, W)`` after the processor, so
+    mbs>1 collate and VAE encode batch trivially.
+    """
+    # deferred import so this shared module never pulls the whole HI3 model
+    # package at import time
+    from ..models.transformers.hunyuan_image_3.sequence_layout import T2ILayout
+
+    # ``text_key`` accepts a single key or a priority list — different T2I
+    # datasets label the caption column differently (``prompt`` / ``text`` /
+    # ``caption``); the default probes those three in order (same pattern as
+    # ``multimodal/dit/preprocess.py::qwen_image_preprocess``). Set an
+    # explicit str/list in ``mm_configs.text_key`` to lock down one dataset.
+    text_key = kwargs.get("text_key", ["prompt", "text", "caption"])
+    max_seq_len = int(kwargs.get("max_seq_len", 8192))
+    target_image_key = kwargs.get("target_image_key", "image")
+    resolution = kwargs.get("resolution", (1024, 1024))
+    prompt_dropout_prob = float(kwargs.get("prompt_dropout_prob", 0.0))
+    random_flip = bool(kwargs.get("random_flip", False))
+
+    image_processor = processor.image_processor
+    tokenizer = getattr(processor, "tokenizer", None)
+    config = image_processor.config
+    im_start_id = int(config.im_start_id)
+    im_end_id = int(config.im_end_id)
+    image_token_id = int(config.image_token_id)
+
+    if isinstance(text_key, str):
+        prompt = sample.get(text_key, "")
+    else:
+        prompt = ""
+        for key in text_key:
+            value = sample.get(key)
+            if value is not None:
+                prompt = value
+                break
+    if prompt_dropout_prob and torch.rand(()).item() < prompt_dropout_prob:
+        prompt = ""
+
+    if tokenizer is not None:
+        text_ids = list(tokenizer.encode(prompt))
+    else:
+        # Toy fallback: one id per whitespace token (at least one).
+        text_ids = [(i % max(image_token_id, 1)) for i in range(max(len(prompt.split()), 1))]
+    if not text_ids:
+        text_ids = [im_start_id]
+
+    processed = image_processor.preprocess(
+        sample[target_image_key],
+        image_size=resolution,
+        random_flip=random_flip,
+    )
+    grid_height = int(processed.token_height)
+    grid_width = int(processed.token_width)
+
+    text_token_count = len(text_ids)
+    layout = T2ILayout(text_len=text_token_count, grid_h=grid_height, grid_w=grid_width)
+    if layout.seq_len > max_seq_len:
+        raise ValueError(f"Compiled sequence length {layout.seq_len} exceeds max_seq_len {max_seq_len}.")
+
+    input_ids = layout.build_input_ids(
+        text_ids,
+        im_start_id=im_start_id,
+        image_token_id=image_token_id,
+        im_end_id=im_end_id,
+    )
+    return [
+        {
+            "input_ids": input_ids,
+            "labels": torch.full((layout.seq_len,), IGNORE_INDEX, dtype=torch.long),
+            "attention_mask": torch.ones((layout.seq_len,), dtype=torch.long),
+            "image_output_mask": layout.build_image_output_mask(),
+            # Reconstruction scalars for the metadata hook (packed over samples).
+            "hy3_text_token_count": torch.tensor([text_token_count], dtype=torch.long),
+            "hy3_grid_hw": torch.tensor([[grid_height, grid_width]], dtype=torch.long),
+            "hy3_pixel_values": processed.image_tensor,  # already unsqueeze(0)-ed
+        }
+    ]

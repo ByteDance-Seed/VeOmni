@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 
 from ...checkpoint import CheckpointerBase, build_checkpointer
+from ...checkpoint.rng_state import restore_rng_state, snapshot_rng_state
 from ...models import save_model_assets
 from ...utils import helper
 from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
@@ -100,7 +101,13 @@ class CheckpointerCallback(Callback):
             self.trainer.train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
 
         self.trainer.environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
-        torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+        # ``torch_rng_state`` is the legacy torch-CPU-only key, kept for checkpoints
+        # written before the full snapshot.
+        rng_state = state["extra_state"].get("rng_state")
+        if rng_state is not None:
+            restore_rng_state(rng_state)
+        elif state["extra_state"].get("torch_rng_state") is not None:
+            torch.set_rng_state(state["extra_state"]["torch_rng_state"])
         if self.trainer.start_step == 0:
             # If resume at the end of epoch, clear resume state and prefetch data
             iter(self.trainer.train_dataloader)
@@ -138,7 +145,7 @@ class CheckpointerCallback(Callback):
                 "train_dataloader": train_dataloader_state,
                 "environ_meter": self.trainer.environ_meter.state_dict(),
                 "channel_loss_callback": channel_loss_state,
-                "torch_rng_state": torch.get_rng_state(),
+                "rng_state": snapshot_rng_state(),
             },
         }
 

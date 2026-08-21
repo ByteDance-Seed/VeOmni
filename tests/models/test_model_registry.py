@@ -1,5 +1,6 @@
 import pytest
 
+from veomni.models import loader
 from veomni.models.loader import get_model_class, get_model_config, get_model_processor
 from veomni.utils.helper import get_cache_dir
 
@@ -45,6 +46,54 @@ def test_local_model_registry(monkeypatch, config_path, is_hf_model, load_proces
             "veomni." if "processor" in veomni_registered else "transformers."
         )
         veomni_processor.save_pretrained(save_path)
+
+
+def test_degraded_autoprocessor_does_not_shadow_registered_processor(monkeypatch):
+    """A registered VeOmni processor must win over a *degraded* AutoProcessor result.
+
+    ``AutoProcessor.from_pretrained`` does not only succeed-or-raise. For a
+    checkpoint that ships no ``preprocessor_config.json`` and no
+    ``AutoProcessor`` entry in ``auto_map`` (HunyuanImage-3), transformers 5.8
+    raised -- which the loader's ``except`` branch caught and rescued -- but
+    transformers 5.9 returns the bare tokenizer instead. Accepting that silently
+    drops the model's image branch, and the run only dies much later inside a
+    dataloader worker with ``TokenizersBackend has no attribute
+    image_processor``.
+    """
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+    class _BareTokenizer:  # stands in for transformers' TokenizersBackend
+        pass
+
+    class _DegradingAutoProcessor:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return _BareTokenizer()
+
+    monkeypatch.setattr(loader, "AutoProcessor", _DegradingAutoProcessor)
+
+    processor = get_model_processor("./tests/toy_config/hunyuan_image_3_toy")
+
+    assert type(processor).__name__ == "HunyuanImage3Processor"
+    assert hasattr(processor, "image_processor")
+
+
+def test_degraded_autoprocessor_kept_when_no_processor_registered(monkeypatch, tmp_path):
+    """The rescue must not fire for models that never registered a processor."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    (tmp_path / "config.json").write_text('{"model_type": "not_a_registered_veomni_model"}')
+
+    class _BareTokenizer:
+        pass
+
+    class _DegradingAutoProcessor:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return _BareTokenizer()
+
+    monkeypatch.setattr(loader, "AutoProcessor", _DegradingAutoProcessor)
+
+    assert isinstance(get_model_processor(str(tmp_path)), _BareTokenizer)
 
 
 remote_test_cases = [
