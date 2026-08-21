@@ -288,6 +288,8 @@ def main():
         weight_decay=args.train.optimizer.weight_decay,
         fused=False,
         optimizer_type=args.train.optimizer.type,
+        no_decay_modules=args.train.optimizer.no_decay_modules,
+        no_decay_params=args.train.optimizer.no_decay_params,
         optimizer_config=args.train.optimizer,
     )
     lr_scheduler = build_lr_scheduler(
