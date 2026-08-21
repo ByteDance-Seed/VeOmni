@@ -262,7 +262,7 @@ class ProfileConfig:
     )
     profile_memory: bool = field(
         default=True,
-        metadata={"help": "Whether or not to profile the memory usage."},
+        metadata={"help": "Whether to record memory events; on NPU these are kept in the profiler trace."},
     )
     with_stack: bool = field(
         default=True,
@@ -278,6 +278,38 @@ class ProfileConfig:
             "help": "whether to profile rank0 only. When false, every rank will be profiled; Please expect many files to save, which can be slow and take a lot of disk space."
         },
     )
+    npu_analysis_mode: Literal["offline", "async"] = field(
+        default="offline",
+        metadata={
+            "help": (
+                "Ascend trace analysis mode. 'offline' finalizes raw data during training and postprocesses it in a "
+                "detached sidecar; 'async' starts torch_npu online analysis in its background "
+                "process pool. This option only affects NPU profiling."
+            )
+        },
+    )
+    npu_postprocess: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Run offline NPU trace analysis and durable copy in a detached sidecar after raw finalization."
+            )
+        },
+    )
+    npu_upload: bool = field(
+        default=True,
+        metadata={"help": "Allow the detached NPU postprocess sidecar to upload a parsed trace asset."},
+    )
+    npu_sidecar_wait_timeout: float = field(
+        default=300.0,
+        metadata={"help": "Maximum seconds to wait for detached NPU postprocessing after training."},
+    )
+
+    def __post_init__(self) -> None:
+        if self.npu_analysis_mode not in {"offline", "async"}:
+            raise ValueError(f"Invalid npu_analysis_mode={self.npu_analysis_mode!r}; expected one of: offline, async.")
+        if self.npu_sidecar_wait_timeout < 0:
+            raise ValueError("train.profile.npu_sidecar_wait_timeout must be non-negative.")
 
 
 @dataclass

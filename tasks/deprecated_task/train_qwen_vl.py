@@ -98,6 +98,12 @@ class Arguments(VeOmniArguments):
 
 def main():
     args = parse_args(Arguments)
+    if args.train.profile.enable and helper.IS_NPU_AVAILABLE:
+        logger.warning(
+            "NPU profiling is not supported by this deprecated entrypoint; disabling profiling. "
+            "Use a current trainer for NPU profiling."
+        )
+        args.train.profile.enable = False
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")

@@ -90,6 +90,12 @@ def get_param_groups(model: torch.nn.Module, default_lr: float, vit_lr: float):
 
 def main():
     args = parse_args(Arguments)
+    if args.train.profile.enable and helper.IS_NPU_AVAILABLE:
+        logger.warning(
+            "NPU profiling is not supported by this deprecated entrypoint; disabling profiling. "
+            "Use a current trainer for NPU profiling."
+        )
+        args.train.profile.enable = False
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
