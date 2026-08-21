@@ -170,6 +170,13 @@ def main():
     if ps.extra_parallel_group("emb") and ps.extra_parallel_fsdp_device_mesh["emb"] is not None:
         emb_fsdp_group = ps.extra_parallel_fsdp_device_mesh["emb"]["emb_fsdp"].get_group()
 
+    if args.train.accelerator.ep_outside:
+        rank = dist.get_rank()
+        expected_ep_group = list(range(rank % 2, dist.get_world_size(), 2))
+        expected_ep_fsdp_group = list(range(rank // 2 * 2, rank // 2 * 2 + 2))
+        assert dist.get_process_group_ranks(ep_group) == expected_ep_group
+        assert dist.get_process_group_ranks(ep_fsdp_group) == expected_ep_fsdp_group
+
     # build optimizer to register ep param groups when ep is enabled
     _ = build_optimizer(
         model,
@@ -287,7 +294,11 @@ def main():
 
 
 def _run_clip_grad_norm_fsdp2_test(
-    ep_size: int, emb_size: int, cpu_offload: bool, dp_replicate_size: int | None = None
+    ep_size: int,
+    emb_size: int,
+    cpu_offload: bool,
+    dp_replicate_size: int | None = None,
+    ep_outside: bool = False,
 ) -> None:
     command = [
         "torchrun",
@@ -296,7 +307,7 @@ def _run_clip_grad_norm_fsdp2_test(
         "--master_port=4321",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
         f"--train.accelerator.ep_size={ep_size}",
-        "--train.accelerator.ep_outside=False",
+        f"--train.accelerator.ep_outside={ep_outside}",
         f"--train.accelerator.extra_parallel_sizes={emb_size}",
         "--train.accelerator.extra_parallel_placement_innermost=False",
         "--train.accelerator.extra_parallel_names=emb",
@@ -329,6 +340,10 @@ def test_clip_grad_norm_fsdp2_ep4(cpu_offload: bool):
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_fsdp2_ep8(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=8, emb_size=1, cpu_offload=cpu_offload)
+
+
+def test_clip_grad_norm_fsdp2_ep4_outside():
+    _run_clip_grad_norm_fsdp2_test(ep_size=4, emb_size=1, cpu_offload=False, ep_outside=True)
 
 
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
