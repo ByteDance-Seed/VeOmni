@@ -22,11 +22,6 @@ from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
 
-# ---------------------------------------------------------------------------
-# ExtraParallel checkpoint mesh semantics
-# ---------------------------------------------------------------------------
-
-
 class _NamedMeshStub:
     def __init__(self, *mesh_dim_names):
         self.mesh_dim_names = mesh_dim_names

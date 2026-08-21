@@ -33,6 +33,24 @@ from veomni.utils.device import (
 logger = helper.create_logger(__name__)
 
 
+def _expected_outer_extra_parallel_group_ranks(
+    rank: int,
+    world_size: int,
+    dp_replicate_size: int,
+    ep_size: int,
+) -> tuple[list[int], list[int]]:
+    """Return EP and EP-FSDP ranks for the row-major outside layout."""
+
+    replica_domain_size = world_size // dp_replicate_size
+    ep_fsdp_size = replica_domain_size // ep_size
+    replica_offset = rank // replica_domain_size * replica_domain_size
+    rank_in_replica = rank % replica_domain_size
+    ep_group = [replica_offset + rank_in_replica % ep_fsdp_size + index * ep_fsdp_size for index in range(ep_size)]
+    ep_fsdp_start = replica_offset + rank_in_replica // ep_fsdp_size * ep_fsdp_size
+    ep_fsdp_group = list(range(ep_fsdp_start, ep_fsdp_start + ep_fsdp_size))
+    return ep_group, ep_fsdp_group
+
+
 def _torch_npu_version() -> str:
     """Return the version of torch_npu if installed, otherwise return "0.0.0"."""
     if importlib.util.find_spec("torch_npu") is None:
@@ -170,10 +188,13 @@ def main():
     if ps.extra_parallel_group("emb") and ps.extra_parallel_fsdp_device_mesh["emb"] is not None:
         emb_fsdp_group = ps.extra_parallel_fsdp_device_mesh["emb"]["emb_fsdp"].get_group()
 
-    if args.train.accelerator.ep_outside:
-        rank = dist.get_rank()
-        expected_ep_group = list(range(rank % 2, dist.get_world_size(), 2))
-        expected_ep_fsdp_group = list(range(rank // 2 * 2, rank // 2 * 2 + 2))
+    if args.train.accelerator.ep_outside and ps.extra_parallel_enabled("ep"):
+        expected_ep_group, expected_ep_fsdp_group = _expected_outer_extra_parallel_group_ranks(
+            dist.get_rank(),
+            dist.get_world_size(),
+            ps.dp_replicate_size,
+            ps.ep_size,
+        )
         assert dist.get_process_group_ranks(ep_group) == expected_ep_group
         assert dist.get_process_group_ranks(ep_fsdp_group) == expected_ep_fsdp_group
 
@@ -325,6 +346,23 @@ def _run_clip_grad_norm_fsdp2_test(
         command.append("--train.accelerator.fsdp_config.offload=True")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("rank", "world_size", "dp_replicate_size", "ep_size", "expected_ep", "expected_ep_fsdp"),
+    [
+        (3, 8, 1, 4, [1, 3, 5, 7], [2, 3]),
+        (5, 8, 2, 2, [5, 7], [4, 5]),
+        (13, 16, 2, 4, [9, 11, 13, 15], [12, 13]),
+    ],
+)
+def test_expected_outer_extra_parallel_group_ranks(
+    rank, world_size, dp_replicate_size, ep_size, expected_ep, expected_ep_fsdp
+):
+    assert _expected_outer_extra_parallel_group_ranks(rank, world_size, dp_replicate_size, ep_size) == (
+        expected_ep,
+        expected_ep_fsdp,
+    )
 
 
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])

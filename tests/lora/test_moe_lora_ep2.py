@@ -665,7 +665,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         seeder_yaml,
         seeder_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2", "--train.accelerator.ep_outside=True"],
         nproc=nproc,
     )
     seeder_adapter = _writer_adapter_path(seeder_dir, save_step=_ALIGN_MAX_STEPS)
@@ -709,7 +709,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         adapter_yaml,
         ep2_adapter_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2", "--train.accelerator.ep_outside=True"],
         nproc=nproc,
     )
 
@@ -718,7 +718,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         dcp_yaml,
         ep2_dcp_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2", "--train.accelerator.ep_outside=True"],
         nproc=nproc,
     )
 
