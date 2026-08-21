@@ -17,6 +17,7 @@ from ...loader import MODELING_REGISTRY
 
 
 def _convert_qwen3_5_moe_conditional_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    """Map semantic expert LoRA targets for the conditional-generation wrapper."""
     return convert_fused_moe_lora_targets(
         lora_modules,
         target_parameter_patterns,
@@ -26,6 +27,7 @@ def _convert_qwen3_5_moe_conditional_lora_targets_to_parameters(_model, lora_mod
 
 
 def _convert_qwen3_5_moe_causal_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    """Map semantic expert LoRA targets for the causal language-model wrapper."""
     return convert_fused_moe_lora_targets(
         lora_modules,
         target_parameter_patterns,
@@ -43,6 +45,7 @@ def _convert_qwen3_5_moe_causal_lora_targets_to_parameters(_model, lora_modules,
 
 @MODELING_REGISTRY.register("qwen3_5_moe")
 def register_qwen3_5_moe_modeling(architecture: str):
+    """Register and return the device-specific Qwen3.5-MoE modeling class."""
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_5_moe_npu import (
             Qwen3_5MoeForCausalLM,
@@ -70,6 +73,7 @@ def register_qwen3_5_moe_modeling(architecture: str):
 
 @MODELING_REGISTRY.register("qwen3_5_moe_text")
 def register_qwen3_5_moe_text_modeling(architecture: str):
+    """Register and return the device-specific text-only Qwen3.5-MoE class."""
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeForCausalLM
     else:

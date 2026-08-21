@@ -37,10 +37,12 @@ _CAUSAL_EXPERT_PATTERNS = [
 
 
 def _production_lora_config():
+    """Load the LoRA section from the production Qwen3.5-MoE config."""
     return yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8"))["model"]["lora_config"]
 
 
 def test_qwen3_5_moe_registers_semantic_expert_target_mapping_for_both_wrappers():
+    """Verify semantic expert targets resolve for both Qwen3.5-MoE wrappers."""
     lora_modules = [*_DENSE_TARGETS, *_SEMANTIC_EXPERT_TARGETS]
 
     conditional_cls = register_qwen3_5_moe_modeling("Qwen3_5MoeForConditionalGeneration")
@@ -57,6 +59,7 @@ def test_qwen3_5_moe_registers_semantic_expert_target_mapping_for_both_wrappers(
 
 
 def test_qwen3_5_moe_production_config_injects_all_targets_and_freezes_base_model():
+    """Verify the production config injects every target and freezes base weights."""
     model = build_foundation_model(
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
