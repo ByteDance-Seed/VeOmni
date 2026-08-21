@@ -104,10 +104,9 @@ config.drop_import_names(
 )
 config.add_post_import_block(
     """
-    # NPU has no fla/flash_qla backend registered today; selecting a non-eager
-    # linear-attention impl raises at OpSlot.bind() time, which is desirable —
-    # a silent fallback would mask the misconfiguration. These None
-    # placeholders preserve the upstream HF top-level
+    # Upstream FLA symbols stay unavailable on NPU; VeOmni's NPU GDN backends
+    # are bound independently through OpSlot. These None placeholders preserve
+    # the upstream HF top-level
     # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
     # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
     # assignments in __init__ resolve to torch.
@@ -123,7 +122,7 @@ config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpsConfigSlot, OpSlot
     veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
     veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
@@ -132,6 +131,7 @@ config.add_post_import_block(
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
+    veomni_chunk_gated_delta_rule_implementation = OpsConfigSlot("chunk_gated_delta_rule_implementation")
     """
 )
 
@@ -147,6 +147,7 @@ sp_pad_and_slice = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
+veomni_chunk_gated_delta_rule_implementation = None  # OpsConfigSlot, declared in post-import block above
 # Names referenced by the patched Qwen3_5TextModel.forward; resolved at
 # codegen time from the imports already present in the generated modeling file.
 DynamicCache = None
@@ -556,7 +557,11 @@ def qwen3_5_text_model_forward_patched(
 
     # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
-    if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
+    if (
+        cu_seq_lens_q is not None
+        and "cu_seqlens_list_q" not in kwargs
+        and veomni_chunk_gated_delta_rule_implementation.value == "npu_ascendc"
+    ):
         from veomni.ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule import precompute_varlen_metadata
 
         # Use the Ulysses-local head count so that the precomputed cumsum-block

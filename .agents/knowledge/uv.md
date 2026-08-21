@@ -72,6 +72,14 @@ stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
 because no compatible aarch64 wheel is available; build it from source when
 video decoding is required.
 
+The Qwen3.5 NPU kernels additionally need Triton-Ascend. NPU CI installs the
+tested x86_64 wheels through `scripts/ci/install_triton_ascend.py` after the
+locked sync. The helper uses direct URLs, SHA256 verification, and `--no-deps`
+because the 3.2.1 wheel exposes development-only exact pins as runtime
+requirements. Do not replace it with an ad-hoc `--extra-index-url`: uv's
+first-index protection correctly prevents an accelerator index from shadowing
+ordinary transitive packages.
+
 ## Transformers Version
 
 `transformers==5.9.0` is pinned by the `transformers-stable` group (in

@@ -11,6 +11,7 @@ from .launch_utils import find_free_port, torchrun
 from .training_utils import (
     ParallelConfig,
     build_torchrun_cmd,
+    is_npu_arch35,
     make_eager_ops_config,
     make_npu_ops_config,
     materialize_weights,

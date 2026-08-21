@@ -273,9 +273,8 @@ def _npu_ascendc_chunk_gated_delta_rule_factory():
             # so the only dep-free fallback here is `eager`.
             raise RuntimeError(
                 "chunk_gated_delta_rule 'npu_ascendc' backend requires the 'triton-ascend' "
-                "package (imported as 'triton'), which is not installed. Install it on NPU "
-                "(pip install triton-ascend==3.2.1 "
-                "--extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple), or set "
+                "package (imported as 'triton'), which is not installed. From a VeOmni source "
+                "checkout, run 'uv run --frozen python scripts/ci/install_triton_ascend.py', or set "
                 "chunk_gated_delta_rule_implementation to 'eager'."
             ) from e
         if e.name in ("fla_npu", "torch_npu"):
