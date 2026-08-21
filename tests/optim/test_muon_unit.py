@@ -509,6 +509,102 @@ class TestMuonLrResolution:
         assert muon_opt.param_groups[0]["lr"] == pytest.approx(3e-3)
 
 
+class TestMuonKwargsFromOptimizerConfig:
+    """``build_optimizer`` reads Muon knobs off ``OptimizerConfig`` itself.
+
+    Trainers used to unpack the ``muon_*`` fields and pre-resolve the Muon LR
+    before calling ``build_optimizer``. These tests pin the equivalent results
+    now that the whole config is handed over instead.
+    """
+
+    def _muon_config(self, **overrides):
+        from veomni.arguments import OptimizerConfig
+
+        kwargs = {"type": "muon", "lr": 1e-4, "muon_ns_implementation": "std"}
+        kwargs.update(overrides)
+        return OptimizerConfig(**kwargs)
+
+    def _build(self, optimizer_config, **kwargs):
+        from veomni.optim import build_optimizer
+
+        kwargs.setdefault("lr", optimizer_config.lr)
+        kwargs.setdefault("weight_decay", optimizer_config.weight_decay)
+        return build_optimizer(
+            _toy_model(),
+            optimizer_type=optimizer_config.type,
+            optimizer_config=optimizer_config,
+            **kwargs,
+        )
+
+    def test_unset_muon_lr_inherits_the_adamw_lr_under_match_rms(self):
+        # match_rms_adamw is also the builder's fallback default, so pin a knob
+        # that is not (ns_steps) to prove the config was actually consulted.
+        config = self._muon_config(muon_adjust_lr_fn="match_rms_adamw", muon_ns_steps=3)
+        group = self._build(config, lr=7e-4).optimizers_dict["muon"].param_groups[0]
+        assert group["lr"] == pytest.approx(7e-4)
+        assert group["ns_steps"] == 3
+
+    def test_unset_muon_lr_is_25x_the_adamw_lr_under_original(self):
+        config = self._muon_config(muon_adjust_lr_fn="original")
+        opt = self._build(config)
+        assert opt.optimizers_dict["muon"].param_groups[0]["lr"] == pytest.approx(2.5e-3)
+
+    def test_explicit_muon_lr_wins_over_inheritance(self):
+        config = self._muon_config(muon_lr=3e-3)
+        opt = self._build(config)
+        assert opt.optimizers_dict["muon"].param_groups[0]["lr"] == pytest.approx(3e-3)
+
+    def test_muon_lr_survives_yaml_exponent_literals(self):
+        # PyYAML resolves "3e-3" to a str, and OptimizerConfig does not coerce.
+        config = self._muon_config(muon_lr="3e-3")
+        group = self._build(config).optimizers_dict["muon"].param_groups[0]
+        assert isinstance(group["lr"], float)
+        assert group["lr"] == pytest.approx(3e-3)
+
+    def test_non_lr_muon_knobs_reach_the_optimizer(self):
+        config = self._muon_config(
+            muon_momentum=0.8,
+            muon_nesterov=False,
+            muon_weight_decay=0.05,
+            muon_ns_steps=3,
+            muon_eps=1e-5,
+            muon_ns_coefficients=[3.0, -4.0, 2.0],
+        )
+        group = self._build(config).optimizers_dict["muon"].param_groups[0]
+        assert group["momentum"] == pytest.approx(0.8)
+        assert group["nesterov"] is False
+        assert group["weight_decay"] == pytest.approx(0.05)
+        assert group["ns_steps"] == 3
+        assert group["eps"] == pytest.approx(1e-5)
+        assert tuple(group["ns_coefficients"]) == (3.0, -4.0, 2.0)
+
+    def test_muon_and_adamw_groups_keep_separate_weight_decay(self):
+        config = self._muon_config(muon_lr=3e-3, weight_decay=0.02, muon_weight_decay=0.05)
+        opt = self._build(config)
+        assert opt.optimizers_dict["muon"].param_groups[0]["weight_decay"] == pytest.approx(0.05)
+        adamw_groups = opt.optimizers_dict["adamw"].param_groups
+        assert max(group["weight_decay"] for group in adamw_groups) == pytest.approx(0.02)
+
+    def test_explicit_muon_kwargs_override_the_config_key_by_key(self):
+        config = self._muon_config(muon_lr=3e-3, muon_momentum=0.8)
+        opt = self._build(config, muon_kwargs={"lr": 7e-3})
+        group = opt.optimizers_dict["muon"].param_groups[0]
+        assert group["lr"] == pytest.approx(7e-3)
+        # Overriding the LR must not reset the knobs the config supplied.
+        assert group["momentum"] == pytest.approx(0.8)
+
+    def test_empty_muon_kwargs_does_not_discard_the_config(self):
+        config = self._muon_config(muon_lr=3e-3, muon_momentum=0.8)
+        group = self._build(config, muon_kwargs={}).optimizers_dict["muon"].param_groups[0]
+        assert group["lr"] == pytest.approx(3e-3)
+        assert group["momentum"] == pytest.approx(0.8)
+
+    def test_head_group_size_reaches_the_builder(self):
+        config = self._muon_config(muon_head_group_size=2)  # no muon_head_split_modules
+        with pytest.raises(ValueError, match="muon_head_split_modules"):
+            self._build(config)
+
+
 class TestHeadSplitInference:
     """``infer_head_block_counts`` must key off declared head layouts, not shapes."""
 
