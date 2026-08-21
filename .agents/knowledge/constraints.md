@@ -36,6 +36,7 @@ VeOmni uses FSDP2 exclusively. FSDP1 has been removed.
 
 Core entry points:
 - `veomni/distributed/parallel_state.py` — `init_parallel_state()`, `ParallelState` dataclass
+- `veomni/distributed/mesh_topology.py` — named ExtraParallel mesh layout policy
 - `veomni/distributed/torch_parallelize.py` — `build_parallelize_model()`, `parallelize_model_fsdp2()`
 - `veomni/distributed/parallel_plan.py` — `ParallelPlan`, `SpecInfo`
 
@@ -50,7 +51,8 @@ Core entry points:
 6. **Device mesh initialization (`init_parallel_state()`)**
    - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `ulysses`, `cp`, `tp` (each included only if size > 1).
    - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).
-   - For each ExtraParallel name (e.g. `ep`), builds a `[para_size × para_fsdp_size]` submesh via `init_para_mesh_matrix()`.
+   - For each ExtraParallel name (e.g. `ep`), builds a named submesh from `build_extra_parallel_mesh_spec()`. The default layout is `(para_fsdp, para)`; an outside layout is `(para, para_fsdp)`. HSDP keeps `para_replicate` outermost.
+   - Consumers must select ExtraParallel, FSDP, and replicate dimensions by name. Positional slicing such as `mesh_dim_names[:-1]` is invalid because the ExtraParallel/FSDP order is configurable.
 
 ### Sequence Parallel (Ulysses)
 
@@ -75,7 +77,7 @@ Core entry points:
    - Weight sharding: `ParallelPlan` in `parallel_plan.py` defines which expert parameters get `Shard(0)` on the EP mesh. `ParallelPlan.apply()` wraps matching params as DTensors and redistributes to local shards.
    - Token routing: `veomni/distributed/moe/moe_layer.py` — `preprocess()` computes dispatch counts, `token_pre_all2all()` / `tokens_post_all2all()` exchange tokens between EP ranks via `all_to_all` / `all_to_all_async` in `moe/comm.py`.
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
-   - Device mesh: `init_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
+   - Device mesh: `init_parallel_state()` builds a named EP/FSDP submesh whose order depends on placement; access it via `ParallelState.extra_parallel_mesh("ep")`, `ParallelState.extra_parallel_fsdp_mesh("ep")`, `ep_group`, and `ep_rank` rather than positional slicing.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
 
 ## Data Pipeline

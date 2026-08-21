@@ -11,6 +11,7 @@ Usage:
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -339,6 +340,53 @@ class TestExecutionOrdering(unittest.TestCase):
         idx_get = call_order.index("get_state")
         idx_writer = call_order.index("writer_init")
         self.assertLess(idx_get, idx_writer, f"Wrong order: {call_order}")
+
+
+class TestLoraExtraParallelCheckpointPlacement(unittest.TestCase):
+    def test_forwards_spec_shard_dimensions_to_checkpoint_restore(self):
+        import tempfile
+
+        from torch.distributed._tensor import Shard
+
+        from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+        full_mesh = MagicMock()
+        fsdp_mesh = MagicMock()
+        full_mesh.__getitem__.return_value = fsdp_mesh
+        spec = SimpleNamespace(
+            para_name="ep",
+            placement=Shard(0),
+            para_fsdp_mesh=full_mesh,
+            fsdp_shard_dim=0,
+        )
+        model = MagicMock()
+        model._fqn2spec_info = {"experts.lora_A.default.weight": spec}
+        model.get_lora_config.return_value = MagicMock()
+        restore = MagicMock(side_effect=lambda tensor, *args, **kwargs: tensor)
+        mock_dist = MagicMock()
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 1
+
+        with tempfile.TemporaryDirectory() as save_path:
+            with (
+                patch("veomni.lora.is_veomni_lora_model", return_value=True),
+                patch(
+                    "veomni.lora.state_dict.get_lora_state_dict",
+                    return_value={"experts.lora_A.weight": torch.ones(2, 2)},
+                ),
+                patch("veomni.checkpoint.dcp_checkpointer.restore_extra_parallel_dim", restore),
+                patch(f"{_MOD}.dist", mock_dist),
+                patch(f"{_MOD}.dcp"),
+                patch(f"{_MOD}.synchronize"),
+                patch(f"{_MOD}.gc"),
+                patch(f"{_MOD}.helper"),
+            ):
+                save_lora_adapter_with_dcp(model, save_path)
+
+        restore.assert_called_once()
+        self.assertEqual(restore.call_args.kwargs["extra_parallel_name"], "ep")
+        self.assertEqual(restore.call_args.kwargs["ep_shard_dim"], 0)
+        self.assertEqual(restore.call_args.kwargs["fsdp_shard_dim"], 0)
 
 
 class TestLegacySaveModelWeights(unittest.TestCase):

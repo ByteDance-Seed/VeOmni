@@ -381,13 +381,13 @@ def _assert_metric_close(
 
 @pytest.mark.parametrize("mode", ["shared", "independent"])
 def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
-    """End-to-end EP=2 trainer run: assert plan-bridge + slice + DCP-consolidate.
+    """End-to-end outside-EP=2 run: assert plan-bridge + slice + DCP-consolidate.
 
     Runs the merged trainer twice on the same toy yaml + base + seed --
     once at ``ep_size=1`` to provide reference adapter shapes, once at
     ``ep_size=2`` to exercise the production EP path -- and asserts:
 
-    * ep2 trainer completes the same 4 steps without error;
+    * ep2 trainer completes the same 4 steps with the outside mesh order;
     * ep2 ``parallel_plan.shard_tensor`` log shows every layer's
       ``mlp.experts.gate_up_proj`` and ``mlp.experts.down_proj`` got
       sliced 16 -> 8 (= ``ep_size=2``);
@@ -428,7 +428,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     ep2_stdout = _torchrun_capture(
         yaml_path,
         ep2_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2", "--train.accelerator.ep_outside=True"],
         nproc=nproc,
     )
 
