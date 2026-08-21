@@ -197,14 +197,6 @@ def cascade_module_reshard(
         module_runtime._model_reshard(reshard)
 
 
-def build_module_lr_schedulers(module_runtimes: Mapping[str, ModuleRuntime], total_steps: int) -> None:
-    """Build each :class:`ModuleRuntime`'s lr-scheduler once ``total_steps`` (train_steps *
-    num_train_epochs) is known. ``_build_lr_scheduler`` itself no-ops for a frozen module.
-    """
-    for module_runtime in module_runtimes.values():
-        module_runtime._build_lr_scheduler(total_steps)
-
-
 def build_omni_model(
     global_args: OmniArguments,
 ) -> OmniModelRuntime:
@@ -450,9 +442,14 @@ class OmniTrainer:
         logger.info_rank0(f"OmniTrainer: wired {len(optimizers)} optimizer(s): {list(optimizers)}.")
 
     def _build_multi_lr_scheduler(self) -> None:
-        """Build per-module lr-schedulers and wrap them in :class:`MultiLRScheduler`."""
+        """Build per-module lr-schedulers and wrap them in :class:`MultiLRScheduler`.
+
+        ``_build_lr_scheduler`` no-ops for a fully-frozen module, so such modules
+        contribute no entry to the wrapper.
+        """
         total_steps = self.args.train_steps * self.args.train.num_train_epochs
-        build_module_lr_schedulers(self.model.module_runtimes, total_steps)
+        for module_runtime in self.model.module_runtimes.values():
+            module_runtime._build_lr_scheduler(total_steps)
         lr_schedulers = {
             name: module_runtime.lr_scheduler
             for name, module_runtime in self.model.module_runtimes.items()

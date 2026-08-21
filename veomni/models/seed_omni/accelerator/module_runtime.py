@@ -83,8 +83,8 @@ class ModuleRuntime:
     * :meth:`_build_optimizer` / :meth:`_build_lr_scheduler` — one each, over this
       module's still-trainable params. Optimizer is built during :meth:`__init__`
       after FSDP wrap + freeze; the lr-scheduler is built later by
-      :func:`~veomni.trainer.omni.omni_trainer.build_module_lr_schedulers` once
-      ``train_steps`` is fixed from the dataset — building it needs no reference
+      :meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_multi_lr_scheduler`
+      once ``train_steps`` is fixed from the dataset — building it needs no reference
       to the global :class:`OmniTrainingArguments`, only the ``total_steps`` the
       caller passes to :meth:`_build_lr_scheduler`. Checkpointing is the one
       exception: :attr:`train` (the global :class:`OmniTrainingArguments`,
@@ -463,7 +463,7 @@ class ModuleRuntime:
     def _build_lr_scheduler(self, total_steps: int):
         """Build this module's lr-scheduler over ``total_steps`` (train_steps * num_train_epochs).
 
-        The orchestrator (:func:`~veomni.trainer.omni.omni_trainer.build_module_lr_schedulers`)
+        The orchestrator (:meth:`~veomni.trainer.omni.omni_trainer.OmniTrainer._build_multi_lr_scheduler`)
         computes ``total_steps`` once the dataset-derived ``train_steps`` (already clamped by the
         global ``train.max_steps`` debug cap) is known, mirroring :meth:`BaseTrainer._build_lr_scheduler`.
         A no-op for a fully-frozen module (no ``self.optimizer`` to schedule).
