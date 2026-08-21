@@ -11,16 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....lora.target_mapping import convert_fused_moe_lora_targets
 from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODELING_REGISTRY
 
 
-# Qwen3.5 GatedDeltaNet's three fused ops (FusedRMSNormGated, causal_conv1d,
-# chunk_gated_delta_rule) currently only ship GPU backends via FLA / FlashQLA.
-# Setting any of these to a non-eager value on NPU raises at OpSlot.bind via
-# KERNEL_REGISTRY.resolve's HardwareRequirement check; the varlen
-# (dyn_bsz=True) caveat is documented in docs/usage/arguments.md and on the
-# OpsImplementationConfig field metadata.
+def _convert_qwen3_5_moe_conditional_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    """Map semantic expert LoRA targets for the conditional-generation wrapper."""
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "model.language_model.layers.*.mlp.experts.gate_up_proj",
+        "model.language_model.layers.*.mlp.experts.down_proj",
+    )
+
+
+def _convert_qwen3_5_moe_causal_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    """Map semantic expert LoRA targets for the causal language-model wrapper."""
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "model.layers.*.mlp.experts.gate_up_proj",
+        "model.layers.*.mlp.experts.down_proj",
+    )
+
+
 #
 # NPU branch is opt-in; everything else (CUDA, CPU-only) falls back to the GPU
 # generated file. The GPU generated module imports cleanly without an active
@@ -30,6 +45,7 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("qwen3_5_moe")
 def register_qwen3_5_moe_modeling(architecture: str):
+    """Register and return the device-specific Qwen3.5-MoE modeling class."""
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_5_moe_npu import (
             Qwen3_5MoeForCausalLM,
@@ -41,6 +57,12 @@ def register_qwen3_5_moe_modeling(architecture: str):
             Qwen3_5MoeForConditionalGeneration,
         )
 
+    Qwen3_5MoeForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_5_moe_conditional_lora_targets_to_parameters
+    )
+    Qwen3_5MoeForCausalLM._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_5_moe_causal_lora_targets_to_parameters
+    )
     if "ForCausalLM" in architecture:
         return Qwen3_5MoeForCausalLM
     elif "ForConditionalGeneration" in architecture:
@@ -51,9 +73,13 @@ def register_qwen3_5_moe_modeling(architecture: str):
 
 @MODELING_REGISTRY.register("qwen3_5_moe_text")
 def register_qwen3_5_moe_text_modeling(architecture: str):
+    """Register and return the device-specific text-only Qwen3.5-MoE class."""
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeForCausalLM
     else:
         from .generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeForCausalLM
 
+    Qwen3_5MoeForCausalLM._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_5_moe_causal_lora_targets_to_parameters
+    )
     return Qwen3_5MoeForCausalLM
