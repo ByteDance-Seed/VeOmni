@@ -130,6 +130,44 @@ def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, 
     return True
 
 
+def _validate_fsdp_shard_divisibility(
+    module: "nn.Module",
+    *,
+    module_fqn: str,
+    shard_dim: int,
+    shard_size: int,
+) -> None:
+    """Fail early when FSDP2 cannot evenly shard a nonzero dimension.
+
+    FSDP2 pads uneven dim-0 shards, but nonzero shard dimensions must divide
+    evenly across the mesh. ExtraParallel modules use ``Shard(1)`` by default,
+    so validate their EP-local parameters before entering ``fully_shard()`` to
+    report the model FQN and topology instead of a lower-level PyTorch error.
+    """
+    if shard_dim == 0 or shard_size == 1:
+        return
+
+    for param_name, param in module.named_parameters():
+        param_fqn = f"{module_fqn}.{param_name}" if param_name else module_fqn
+        if param.ndim <= shard_dim:
+            raise ValueError(
+                f"FSDP2 cannot shard parameter {param_fqn!r}: it has {param.ndim} dimensions, "
+                f"but the ExtraParallel layout selects dim {shard_dim}."
+            )
+        dim_size = param.size(shard_dim)
+        if dim_size % shard_size != 0:
+            raise ValueError(
+                f"FSDP2 cannot evenly shard parameter {param_fqn!r} on dim {shard_dim}: "
+                f"size {dim_size} is not divisible by the ExtraParallel FSDP mesh size {shard_size}."
+            )
+
+
+def _extra_parallel_fsdp_shard_size(parallel_state, para_name: str) -> int:
+    """Return only the named FSDP shard degree, excluding HSDP replication."""
+    para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para_name]
+    return para_mesh[f"{para_name}_fsdp"].size()
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -344,6 +382,7 @@ def parallelize_model_fsdp2(
 
     # prepare extra_parallel_fsdp2 kwargs
     extra_parallel_fsdp_kwargs = {}
+    extra_parallel_fsdp_shard_dims = {}
     for para in parallel_state.extra_parallel_names:
         if parallel_state.extra_parallel_enabled(para):
             para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
@@ -375,6 +414,7 @@ def parallelize_model_fsdp2(
                     )
             para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
+            extra_parallel_fsdp_shard_dims[para] = shard_dim_for_para
             # Record the FSDP shard dim on the spec_info so the checkpointer can
             # build correct DTensor placements (EP dim vs FSDP dim) on save/load.
             for spec_info in getattr(model, "_fqn2spec_info", {}).values():
@@ -382,6 +422,7 @@ def parallelize_model_fsdp2(
                     spec_info.fsdp_shard_dim = shard_dim_for_para
         else:
             extra_parallel_fsdp_kwargs[para] = None
+            extra_parallel_fsdp_shard_dims[para] = None
 
     # Here we have a basic assumption for target module (e.g. embed_tokens, decoder) hierarchy:
     # | -- target module A (e.g. decoder)
@@ -422,6 +463,15 @@ def parallelize_model_fsdp2(
             for _para_mod in extra_parallel_mod[para]:
                 if isinstance(_para_mod, FSDPModule):
                     continue
+                para_mod_fqn = next(
+                    fqn for fqn, candidate in _extra_parallel_map[para].items() if candidate is _para_mod
+                )
+                _validate_fsdp_shard_divisibility(
+                    _para_mod,
+                    module_fqn=para_mod_fqn,
+                    shard_dim=extra_parallel_fsdp_shard_dims[para],
+                    shard_size=_extra_parallel_fsdp_shard_size(parallel_state, para),
+                )
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
                 fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
