@@ -6,7 +6,7 @@ from veomni.utils.helper import get_cache_dir
 
 local_test_cases = [
     pytest.param("./tests/toy_config/qwen2vl_toy", True, False, ["config", "model", "processor"], ["model"]),
-    pytest.param("./tests/toy_config/janus_siglip_toy", False, True, [], ["config", "model", "processor"]),
+    pytest.param("./tests/toy_config/movqgan_toy", False, True, [], ["config", "model", "processor"]),
     pytest.param("./tests/toy_config/gpt_oss_toy", True, False, ["config", "model"], ["model"]),
 ]
 
@@ -49,9 +49,6 @@ def test_local_model_registry(monkeypatch, config_path, is_hf_model, load_proces
 
 remote_test_cases = [
     pytest.param("Qwen/Qwen2-VL-2B-Instruct", ["config", "model", "processor"], ["model"]),
-    pytest.param(
-        "deepseek-community/Janus-Pro-1B", ["config", "model", "processor"], ["config", "model", "processor"]
-    ),
 ]
 
 
@@ -82,7 +79,3 @@ def test_remote_model_registry(monkeypatch, config_path, hf_registered, veomni_r
         "veomni." if "processor" in veomni_registered else "transformers."
     )
     veomni_processor.save_pretrained(save_path)
-
-
-if __name__ == "__main__":
-    test_remote_model_registry("deepseek-community/Janus-Pro-1B")
