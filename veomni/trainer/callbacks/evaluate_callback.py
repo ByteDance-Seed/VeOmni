@@ -24,6 +24,10 @@ if TYPE_CHECKING:
 
 
 class EvaluateCallback(Callback):
+    def __init__(self, trainer) -> None:
+        super().__init__(trainer)
+        self._last_evaluated_step = None
+
     def on_epoch_end(self, state: TrainerState, **kwargs):
         args: "Arguments" = self.trainer.args
         if args.train.eval_epochs and (state.epoch + 1) % args.train.eval_epochs == 0:
@@ -35,5 +39,17 @@ class EvaluateCallback(Callback):
             self._evaluate(state)
 
     def _evaluate(self, state: TrainerState):
-        # TODO: implement evaluate
-        pass
+        runner = getattr(self.trainer, "validation_runner", None)
+        if runner is None or self._last_evaluated_step == state.global_step:
+            return None
+
+        metrics = runner.run()
+        self._last_evaluated_step = state.global_step
+        self.trainer.last_validation_metrics = metrics
+
+        args: "Arguments" = self.trainer.args
+        if args.train.global_rank == 0 and args.train.wandb.enable:
+            import wandb
+
+            wandb.log({f"validation/{name}": value for name, value in metrics.items()}, step=state.global_step)
+        return metrics
