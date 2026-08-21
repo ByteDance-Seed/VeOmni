@@ -113,6 +113,10 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_rotary_embedding_forward_patched,
     deepseek_v4_topk_router_forward_patched,
     deepseek_v4_unweighted_rmsnorm_forward_patched,
+    veomni_qat_fake_quant_act,
+    veomni_qat_fake_quant_expert_weight,
+    veomni_qat_fake_quant_kv,
+    veomni_qat_linear,
 )
 
 
@@ -164,6 +168,28 @@ config.add_import(
     names=["get_active_replay", "maybe_replay_indices"],
 )
 
+# The reused attention / indexer / compressor forwards route their projections
+# and stored KV through the GPU config's QAT helpers, so the generated NPU module
+# needs them too. Emitting them here costs nothing on Ascend: `qat_implementation`
+# has no NPU backend, so the slot stays at "none" and every helper is a
+# passthrough that never reaches the SM90-only kernels. Importing
+# `veomni.ops.qat` is likewise safe -- TileLang loads inside the kernel
+# wrappers, not at import.
+config.add_import(
+    "veomni.ops.qat",
+    names=[
+        "fp4_fake_quant_weight",
+        "fp8_fake_quant_act",
+        "fp8_fake_quant_act_prefix",
+        "fp8_fake_quant_stacked_weight",
+        "qat_linear",
+    ],
+)
+config.add_helper(veomni_qat_linear)
+config.add_helper(veomni_qat_fake_quant_kv)
+config.add_helper(veomni_qat_fake_quant_act)
+config.add_helper(veomni_qat_fake_quant_expert_weight)
+
 config.add_post_import_block(
     """
     from veomni.ops.dispatch import OpSlot, OpsConfigSlot
@@ -178,6 +204,7 @@ config.add_post_import_block(
     veomni_mhc_head = OpSlot("mhc", "head")
     veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
     veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+    veomni_qat_implementation = OpsConfigSlot("qat_implementation", default="none")
     """
 )
 
@@ -411,6 +438,7 @@ def deepseek_v4_hca_compressor_forward_patched(
             rate_metadata,
             overlap=False,
         )
+        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         if compressed.shape[1] == 0:
             anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
             compressed = compressed + anchor.to(compressed.dtype)
@@ -440,6 +468,7 @@ def deepseek_v4_hca_compressor_forward_patched(
     else:
         compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
     if cache_layer is not None:
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     compressed_kv = compressed.unsqueeze(1)
@@ -498,6 +527,7 @@ def deepseek_v4_csa_compressor_forward_patched(
             rate_metadata,
             overlap=True,
         )
+        compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
         # The indexer submodule is intentionally NOT anchored here: its outputs
         # are non-differentiable top-k indices, so its params already receive no
         # gradient on every rank uniformly, and anchoring them would create the
@@ -555,6 +585,7 @@ def deepseek_v4_csa_compressor_forward_patched(
     else:
         compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+    compressed = veomni_qat_fake_quant_kv(compressed, self.rotary_emb.config.qk_rope_head_dim)
     if cache_layer is not None:
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     compressed_kv = compressed.unsqueeze(1)

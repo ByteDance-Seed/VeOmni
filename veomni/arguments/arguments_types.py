@@ -1139,6 +1139,20 @@ class OpsImplementationConfig:
             "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
         },
     )
+    qat_implementation: Literal["none", "fp8_blockwise"] = field(
+        default="none",
+        metadata={
+            "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
+            "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
+            "true FP8 GEMM (128x128 weight tiles, 1x128 activation blocks, ue8m0 scales), the NoPE "
+            "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
+            "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
+            "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
+            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
+            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
+            "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/."
+        },
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
