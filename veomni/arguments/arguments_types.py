@@ -529,7 +529,7 @@ class AcceleratorConfig:
     )
     extra_parallel_placement_innermost: List[bool] = field(
         default_factory=list,
-        metadata={"help": "Extra parallelism outside in para-fsdp."},
+        metadata={"help": "Legacy placement flags; true places each extra-parallel dimension outside FSDP."},
     )
     extra_parallel_names: List[str] = field(
         default_factory=list,

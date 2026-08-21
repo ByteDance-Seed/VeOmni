@@ -64,6 +64,7 @@ def get_checkpoint_test_command(
     ep_size,
     save_hf_weights=False,
     dp_replicate_size=None,
+    ep_outside=False,
 ):
     config_path = MODEL_CONFIGS[model_name]["config_path"]
     tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
@@ -110,6 +111,8 @@ def get_checkpoint_test_command(
     # 3-placement save/load path in the DCP checkpointer.
     if dp_replicate_size is not None:
         params.append(f"--train.accelerator.dp_replicate_size {dp_replicate_size}")
+    if ep_outside:
+        params.append("--train.accelerator.ep_outside True")
 
     exec_script = " \\\n".join(params)
 

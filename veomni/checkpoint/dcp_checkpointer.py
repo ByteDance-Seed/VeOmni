@@ -85,9 +85,9 @@ def _validate_extra_parallel_meshes(parallel_state) -> None:
     """Fail-fast precondition for ExtraParallel state dict preprocessing.
 
     At least one ExtraParallel mesh must be non-None, and at least one
-    of those meshes must carry the ExtraParallel + FSDP composition:
-    2D ``(ep_fsdp, ep)`` for plain FSDP or 3D
-    ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
+    of those meshes must carry the ExtraParallel + FSDP composition. The
+    ExtraParallel and FSDP dimensions may appear in either order, while an
+    HSDP replicate dimension remains outermost.
     """
     extra_parallel_mesh = {
         para: parallel_state.extra_parallel_fsdp_device_mesh[para][para]
@@ -103,8 +103,8 @@ def _validate_extra_parallel_meshes(parallel_state) -> None:
         and parallel_state.extra_parallel_fsdp_device_mesh[para].ndim in (2, 3)
         for para in parallel_state.extra_parallel_names
     ), (
-        "At least one extra_parallel fsdp_device_mesh must carry the ExtraParallel+FSDP "
-        "composition: 2D (ep_fsdp, ep) for plain FSDP or 3D (ep_replicate, ep_fsdp, ep) for HSDP"
+        "At least one extra_parallel fsdp_device_mesh must carry a 2D ExtraParallel+FSDP "
+        "or 3D ExtraParallel+HSDP composition"
     )
 
 
@@ -164,11 +164,14 @@ def _apply_extra_parallel_dim(
 
         assert spec_info.para_fsdp_mesh is not None, f"ExtraParallel spec {name} must have an ExtraParallel FSDP mesh"
 
-        # Drop the innermost ExtraParallel (e.g. ``ep``) dim and keep the FSDP
-        # sub-mesh: 1D ``(ep_fsdp,)`` for plain FSDP, or 2D
-        # ``(ep_replicate, ep_fsdp)`` for HSDP. Mirrors the mesh slicing used
-        # when sharding the module in ``torch_parallelize``.
-        fsdp_submesh = spec_info.para_fsdp_mesh[spec_info.para_fsdp_mesh.mesh_dim_names[:-1]]
+        # Drop the named ExtraParallel (e.g. ``ep``) dim and keep the FSDP
+        # sub-mesh. The ExtraParallel dim can be either inside or outside its
+        # FSDP dim, so selecting dimensions by position would choose the wrong
+        # process group for an outside layout.
+        fsdp_dim_names = tuple(
+            dim_name for dim_name in spec_info.para_fsdp_mesh.mesh_dim_names if dim_name != spec_info.para_name
+        )
+        fsdp_submesh = spec_info.para_fsdp_mesh[fsdp_dim_names]
         # The ExtraParallel (e.g. ``ep``) dim shards the tensor along
         # ``spec_info.placement.dim`` (dim 0 for experts), while FSDP shards it
         # along ``spec_info.fsdp_shard_dim`` (1 by default, 0 for Muon zero-comm).
@@ -177,10 +180,15 @@ def _apply_extra_parallel_dim(
         ep_shard_dim = spec_info.placement.dim
         fsdp_shard_dim = spec_info.fsdp_shard_dim
         if action == "drop":
-            tensor = drop_extra_parallel_dim(tensor, fsdp_submesh, fsdp_shard_dim)
+            tensor = drop_extra_parallel_dim(tensor, fsdp_submesh, fsdp_shard_dim, spec_info.para_name)
         else:
             tensor = restore_extra_parallel_dim(
-                tensor, spec_info.para_fsdp_mesh, fsdp_submesh, ep_shard_dim, fsdp_shard_dim
+                tensor,
+                spec_info.para_fsdp_mesh,
+                fsdp_submesh,
+                ep_shard_dim,
+                fsdp_shard_dim,
+                spec_info.para_name,
             )
         state_dict[name] = tensor
 
@@ -335,7 +343,34 @@ class OptimizerState(Stateful):
         )
 
 
-def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
+def _named_extra_parallel_placements(
+    mesh_dim_names: tuple[str, ...],
+    extra_parallel_name: str,
+    ep_shard_dim: int,
+    fsdp_shard_dim: int,
+) -> list[Union[Replicate, Shard]]:
+    """Map named ExtraParallel mesh dimensions to their DTensor placements."""
+
+    placement_by_dim_name = {
+        f"{extra_parallel_name}_replicate": Replicate(),
+        extra_parallel_name: Shard(ep_shard_dim),
+        f"{extra_parallel_name}_fsdp": Shard(fsdp_shard_dim),
+    }
+    unknown_dim_names = tuple(name for name in mesh_dim_names if name not in placement_by_dim_name)
+    if unknown_dim_names:
+        raise RuntimeError(
+            f"Unexpected dimensions {unknown_dim_names} in {extra_parallel_name!r} checkpoint mesh {mesh_dim_names}"
+        )
+
+    return [placement_by_dim_name[name] for name in mesh_dim_names]
+
+
+def drop_extra_parallel_dim(
+    loaded_tensor: torch.Tensor,
+    device_mesh: DeviceMesh,
+    fsdp_shard_dim: int = 1,
+    extra_parallel_name: str = "ep",
+):
     """
     Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
 
@@ -343,25 +378,30 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     1D ``(ep_fsdp,)`` for plain FSDP, or 2D ``(ep_replicate, ep_fsdp)`` for HSDP.
     ``fsdp_shard_dim`` is the tensor dim FSDP shards along (1 by default, 0 for
     the Muon zero-comm layout). The number of placements on the loaded DTensor
-    reflects the full saved mesh:
+    reflects the full saved mesh. FSDP placements are rebuilt from the named
+    sub-mesh dimensions rather than from their positions:
 
     * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
-    * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(fsdp_shard_dim)`` on
-      the 1D sub-mesh.
-    * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
-      ``[Replicate(), Shard(fsdp_shard_dim)]`` on the 2D sub-mesh.
+    * 2 placements: ExtraParallel+FSDP -> keep FSDP
+      ``Shard(fsdp_shard_dim)`` on the 1D sub-mesh.
+    * 3 placements: ExtraParallel+HSDP -> keep replicate and FSDP placements
+      on the 2D sub-mesh.
     """
 
     num_placements = len(loaded_tensor.placements)
     if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
-    elif num_placements == 2:
-        tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
+    elif num_placements in (2, 3):
+        placements = _named_extra_parallel_placements(
+            device_mesh.mesh_dim_names,
+            extra_parallel_name,
+            ep_shard_dim=0,
+            fsdp_shard_dim=fsdp_shard_dim,
         )
-    elif num_placements == 3:
         tensor_to_put = DTensor.from_local(
-            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
+            loaded_tensor._local_tensor,
+            device_mesh=device_mesh,
+            placements=placements,
         )
     else:
         raise RuntimeError(
@@ -378,6 +418,7 @@ def restore_extra_parallel_dim(
     extra_parallel_fsdp_mesh: DeviceMesh,
     ep_shard_dim: int = 0,
     fsdp_shard_dim: int = 1,
+    extra_parallel_name: str = "ep",
 ):
     """
     Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
@@ -389,35 +430,28 @@ def restore_extra_parallel_dim(
 
     args:
         orgin_tensor (torch.Tensor): The orgin tensor (FSDP-local shard).
-        fsdp_mesh (DeviceMesh): The full ExtraParallel mesh, i.e. 2D
-            ``(ep_fsdp, ep)`` for plain FSDP or 3D
-            ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
+        fsdp_mesh (DeviceMesh): The full named ExtraParallel mesh. The
+            ExtraParallel and FSDP dimensions may appear in either order.
         extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
             dim excluded), used for the pure-ExtraParallel (no FSDP) path.
         ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
         fsdp_shard_dim (int): Tensor dim FSDP shards along.
+        extra_parallel_name (str): Name of the ExtraParallel mesh dimension.
 
     Note:
-        When ``ep_shard_dim == fsdp_shard_dim`` (e.g. the Muon zero-comm layout
-        shards experts on dim 0 just like EP), both mesh dims split the SAME
-        tensor dim. The mesh order ``(ep_fsdp, ep)`` then composes ``ep_fsdp``
-        OUTER of ``ep``, whereas the physical layout is EP-outer / FSDP-inner,
-        so the reconstructed GLOBAL tensor is block-transposed along that dim.
-        Save->load into the SAME parallel config still round-trips correctly
-        (drop is the exact inverse); only resharding / external reads of such a
-        checkpoint see the permuted layout. Fixing this needs the EP mesh dims
-        reordered so ``ep`` precedes ``ep_fsdp`` (a parallel_state change).
+        When ``ep_shard_dim == fsdp_shard_dim``, the named mesh order determines
+        how the two shards compose along that tensor dimension. Placements must
+        therefore follow ``fsdp_mesh.mesh_dim_names`` exactly.
     """
     assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
 
     if isinstance(orgin_tensor, DTensor):
-        # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
-        # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
-        # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
-        if fsdp_mesh.ndim == 3:
-            placements = [Replicate(), Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
-        else:
-            placements = [Shard(fsdp_shard_dim), Shard(ep_shard_dim)]
+        placements = _named_extra_parallel_placements(
+            fsdp_mesh.mesh_dim_names,
+            extra_parallel_name,
+            ep_shard_dim,
+            fsdp_shard_dim,
+        )
         dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel

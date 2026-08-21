@@ -429,7 +429,7 @@ validation instead of applying ChunkMBS to multiple stacks.
 | ep_size | `int` | `1` | Expert parallel size, should be fit into dp_shard group if HSDP enabled |
 | ep_outside | `bool` | `False` | Expert parallelism outside in EP-FSDP. |
 | extra_parallel_sizes | `List[int]` | `[]` | Sizes of additional parallel dimensions; EP is appended automatically. |
-| extra_parallel_placement_innermost | `List[bool]` | `[]` | Whether each additional parallel dimension is placed innermost relative to FSDP. |
+| extra_parallel_placement_innermost | `List[bool]` | `[]` | Legacy/misnamed placement flags; `True` places each additional parallel dimension outside its FSDP dimension. |
 | extra_parallel_names | `List[str]` | `[]` | Names of additional parallel dimensions; `ep` is appended automatically. |
 | pp_size | `int` | `1` | Pipeline parallel size. |
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
