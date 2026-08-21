@@ -34,10 +34,6 @@ def _convert_qwen3_5_moe_causal_lora_targets_to_parameters(_model, lora_modules,
     )
 
 
-# Qwen3.5 GatedDeltaNet defaults are GPU-oriented. NPU configs must explicitly
-# select the NPU backends for rms_norm_gated, causal_conv1d, and
-# chunk_gated_delta_rule; the varlen caveat is documented in
-# docs/usage/arguments.md and on the OpsImplementationConfig field metadata.
 #
 # NPU branch is opt-in; everything else (CUDA, CPU-only) falls back to the GPU
 # generated file. The GPU generated module imports cleanly without an active
