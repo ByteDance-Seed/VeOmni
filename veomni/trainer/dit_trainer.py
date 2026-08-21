@@ -248,9 +248,7 @@ class DiTTrainer:
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
         args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
         if args.train.training_task == "offline_embedding":
-            assert args.data.datasets_type in ("mapping", "minimax_h3_online"), (
-                "Datasets type must be mapping for offline embedding."
-            )
+            assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
             if args.data.offline_embedding_save_dir is None:
                 self.offline_embedding_save_dir = f"{args.data.train_path}_offline"
             else:
