@@ -471,8 +471,20 @@ validation instead of applying ChunkMBS to multiple stacks.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable_activation | `bool` | `False` | Enable activation offload to CPU. |
+| enable_activation | `bool` | `False` | Enable synchronous activation offload to CPU. |
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
+| enable_async_activation | `bool` | `False` | Enable async activation offload via stream-based D2H/H2D. Mutually exclusive with `enable_activation`. When `activation_offload_modules` is empty, targets are discovered from `model._no_split_modules`; missing or unmatched model metadata fails closed. |
+| activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
+| activation_offload_host_cache_limit_gb | `float` | `4.0` | Maximum GB of free host buffers retained between steps. In-flight offloads may temporarily exceed this value. Set to `0` to disable reuse. |
+
+Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
+through unchanged. Only private, dense, contiguous activations are swapped so
+shared-storage views are never resized. Host buffers are pooled per model,
+keyed by shape, stride, and dtype, and evicted by least-recently-used layout to
+enforce `activation_offload_host_cache_limit_gb`. The manager is reset at every training-step
+boundary, including before a step after a failed forward/backward, so stale
+autograd keys cannot affect the next step. The path wraps selected module instances
+and is not intended to be captured by `torch.compile`.
 
 ### CheckpointConfig
 
