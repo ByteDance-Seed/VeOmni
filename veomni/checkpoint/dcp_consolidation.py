@@ -15,7 +15,8 @@
 # ruff: noqa: F821
 # Reason: This module patches PyTorch internal functions using types.FunctionType
 # with __globals__ bound to the target module. Variables like DATA_OFFSETS_KEY,
-# _read_tensor_data_mmap, etc. are resolved at runtime from torch.distributed.checkpoint.
+# _read_tensor_data_mmap / _read_tensor_data, etc. are resolved at runtime from
+# torch.distributed.checkpoint.
 
 """Patches for PyTorch DCP (Distributed Checkpoint) safetensors consolidation.
 
@@ -34,7 +35,7 @@ import types
 _dcp_consolidation_patch_applied = False
 
 # Fixed torch versions for this patch - update when upgrading torch
-_SUPPORTED_TORCH_VERSION_PREFIXES = ("2.9", "2.10", "2.11")
+_SUPPORTED_TORCH_VERSION_PREFIXES = ("2.9", "2.10", "2.11", "2.12")
 _EXPECTED_PROCESS_OUTPUT_FILE_ARGS = ("output_file", "output_data", "input_files_data")
 _EXPECTED_PARSE_INPUT_METADATA_ARGS = ("input_files_data", "output_files_data")
 _SUPPORTED_PROCESS_OUTPUT_FILE_SHA256 = {
@@ -46,9 +47,11 @@ _SUPPORTED_PROCESS_OUTPUT_FILE_SHA256 = {
     "ff25a85cc52018707334f1206760fe186146771e5357388f0b4d6bc19bdf61c1",
     # torch 2.11.0+cu130 CI wheel
     "433c9d026092f48f5ba02631975294de1a8ae98e020d5cb6ffd0f5db760476fe",
+    # torch 2.12.0 / 2.12.1 (handle-based _read_tensor_data API)
+    "26f969037aed2bad375fa167bbe9d4e49ead5b900ea152afc353d40c11529af3",
 }
 _SUPPORTED_PARSE_INPUT_METADATA_SHA256 = {
-    # torch 2.9.1, 2.10.0, and 2.11.0 (upstream source and cu130 CI wheel)
+    # torch 2.9.1, 2.10.0, 2.11.0, and 2.12.x (unchanged)
     "f6c476c9467a32928c8b29c211988c78a14a934bc4cbc5763a3882a7fc3b11f0",
 }
 
@@ -76,8 +79,9 @@ def apply_dcp_consolidation_patch():
     is already ensured by sorting tensors before writing.
 
     The patch uses types.FunctionType to create a new function with __globals__
-    bound to the target module, enabling access to internal functions like
-    _read_tensor_data_mmap and _write_sub_tensor_to_file_optimized.
+    bound to the target module, enabling access to internal helpers such as
+    ``_read_tensor_data_mmap`` (torch <= 2.11) or ``_read_tensor_data``
+    (torch >= 2.12) and ``_write_sub_tensor_to_file_optimized``.
     """
     global _dcp_consolidation_patch_applied
 
@@ -143,11 +147,10 @@ def apply_dcp_consolidation_patch():
             "Please update the DCP consolidation patch."
         )
 
-    # Define the replacement function logic
-    # This is a modified version of torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file
-    # Original: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
-    # Key change: Use append mode ("ab") instead of read-write mode ("r+b") for HDFS FUSE compatibility
-    def _process_output_file_impl(output_file, output_data, input_files_data):
+    # torch <= 2.11: mmap-based reader (_read_tensor_data_mmap)
+    # torch >= 2.12: handle-based reader (_read_tensor_data)
+    # Both upstream variants still open the output with r+b; keep "ab" for HDFS FUSE.
+    def _process_output_file_impl_mmap(output_file, output_data, input_files_data):
         sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
 
         with open(output_file, "ab") as output_stream:  # Changed from "r+b"
@@ -187,6 +190,58 @@ def apply_dcp_consolidation_patch():
                     )
 
                 output_stream.write(full_tensor_mv)
+
+    def _process_output_file_impl_handle(output_file, output_data, input_files_data):
+        sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
+
+        file_handles = {}
+        dcp_metadata = {}
+        for safetensors_file, file_data in input_files_data.items():
+            dcp_metadata[safetensors_file] = _get_dcp_custom_metadata(file_data.metadata)
+
+        try:
+            for safetensors_file in input_files_data:
+                file_handles[safetensors_file] = open(safetensors_file, "rb")  # noqa: SIM115
+
+            with open(output_file, "ab") as output_stream:  # Changed from "r+b"
+                for tensor_fqn, tensor_fqn_data in sorted_tensors:
+                    full_tensor_mv = memoryview(
+                        bytearray(math.prod(tensor_fqn_data.shape_in_file) * tensor_fqn_data.dtype_size)
+                    )
+
+                    for safetensors_file in input_files_data:
+                        file_metadata = input_files_data[safetensors_file].metadata
+                        input_metadata_size = input_files_data[safetensors_file].metadata_size
+
+                        if tensor_fqn not in file_metadata:
+                            continue
+
+                        metadata = file_metadata[tensor_fqn]
+                        data_offsets = metadata[DATA_OFFSETS_KEY]
+
+                        data_to_write = _read_tensor_data(
+                            file_handles[safetensors_file],
+                            data_offsets[0],
+                            data_offsets[1],
+                            input_metadata_size,
+                        )
+
+                        fqn_custom_metadata = dcp_metadata[safetensors_file][tensor_fqn]
+                        offsets_of_tensor_being_read = fqn_custom_metadata[SAVED_OFFSETS_KEY]
+
+                        _write_sub_tensor_to_file_optimized(
+                            full_tensor_mv,
+                            data_to_write,
+                            tensor_fqn_data.dtype_size,
+                            tensor_fqn_data.shape_in_file,
+                            offsets_of_tensor_being_read,
+                            metadata[SHAPE_KEY],
+                        )
+
+                    output_stream.write(full_tensor_mv)
+        finally:
+            for f in file_handles.values():
+                f.close()
 
     def _parse_input_metadata_impl(input_files_data, output_files_data):
         from safetensors.torch import _getdtype
@@ -228,14 +283,20 @@ def apply_dcp_consolidation_patch():
                         dtype_str=dtype_str,
                     )
 
+    process_impl = (
+        _process_output_file_impl_mmap
+        if hasattr(hf_module, "_read_tensor_data_mmap")
+        else _process_output_file_impl_handle
+    )
+
     # Create a new function with the target module's globals
-    # This ensures that internal functions like _read_tensor_data_mmap are resolved correctly
+    # This ensures that internal helpers are resolved correctly.
     patched_func = types.FunctionType(
-        _process_output_file_impl.__code__,
+        process_impl.__code__,
         hf_module.__dict__,  # Use target module's globals for symbol resolution
-        _process_output_file_impl.__name__,
-        _process_output_file_impl.__defaults__,
-        _process_output_file_impl.__closure__,
+        process_impl.__name__,
+        process_impl.__defaults__,
+        process_impl.__closure__,
     )
 
     patched_parse_input_metadata = types.FunctionType(
