@@ -48,9 +48,14 @@ class MoERouterMonitorCallback(Callback):
             return
 
         config = self.trainer.model_config
-        if not hasattr(config, "num_experts"):
+        num_experts = getattr(config, "num_experts", None)
+        if not isinstance(num_experts, int) or isinstance(num_experts, bool) or num_experts <= 0:
+            text_config = getattr(config, "text_config", None)
+            num_experts = getattr(text_config, "num_experts", None)
+        if not isinstance(num_experts, int) or isinstance(num_experts, bool) or num_experts <= 0:
             logger.warning_rank0(
-                "moe_load_balance_monitor_interval > 0 but model config has no 'num_experts'. "
+                "moe_load_balance_monitor_interval > 0 but model config has no positive "
+                "'num_experts' or 'text_config.num_experts'. "
                 "MoE router monitor not activated."
             )
             return
@@ -59,11 +64,11 @@ class MoERouterMonitorCallback(Callback):
 
         # Process groups are read lazily in on_train_begin once the device
         # mesh is guaranteed to be initialized.
-        self.monitor = MoERouterMonitor(num_experts=config.num_experts)
+        self.monitor = MoERouterMonitor(num_experts=num_experts)
         set_active_monitor(self.monitor)
         ps = self.parallel_state
         logger.info_rank0(
-            f"MoE router monitor created: num_experts={config.num_experts}, "
+            f"MoE router monitor created: num_experts={num_experts}, "
             f"interval={args.train.moe_load_balance_monitor_interval}, "
             f"ep_size={ps.ep_size if ps.ep_enabled else 1}"
         )
@@ -97,39 +102,54 @@ class MoERouterMonitorCallback(Callback):
         if self.monitor is None or state.global_step % args.train.moe_load_balance_monitor_interval != 0:
             return
 
-        # compute_metrics runs an all-reduce across EP/DP groups, so every rank
-        # must call it — but only rank 0 logs.
-        metrics = self.monitor.compute_metrics(current_step=state.global_step)
-        if not metrics or args.train.global_rank != 0 or not args.train.wandb.enable:
+        # Every rank participates in the cached DP+SP/FSDP collective and
+        # resets its interval. Only global rank 0 formats scalars and images.
+        metrics = self.monitor.compute_metrics(
+            current_step=state.global_step,
+            format_only_on=args.train.global_rank == 0,
+        )
+        if not metrics:
             return
 
-        import wandb
+        scalar_metrics = {key: value for key, value in metrics.items() if not key.endswith("_heatmap")}
+        if not hasattr(self.trainer, "step_env_metrics") or self.trainer.step_env_metrics is None:
+            self.trainer.step_env_metrics = {}
+        self.trainer.step_env_metrics.update(scalar_metrics)
 
-        wandb_metrics = {}
-        for k, v in metrics.items():
-            if k.endswith("expert_load_heatmap"):
+        if args.train.wandb.enable:
+            import wandb
+
+            wandb_metrics = {}
+            for k, v in metrics.items():
+                if not k.endswith("_heatmap"):
+                    continue
                 start, end = self.monitor._last_step_range
                 wandb_metrics[k] = wandb.Image(v, caption=f"Steps {start}-{end}")
-            else:
-                wandb_metrics[k] = v
-        wandb.log(wandb_metrics, step=state.global_step)
+            if wandb_metrics:
+                # The following WandbTraceCallback commits the scalar payload
+                # for this same step; keep the image write in that open row.
+                wandb.log(wandb_metrics, step=state.global_step, commit=False)
 
         start, end = self.monitor._last_step_range
-        logger.info_rank0(
-            f"Step {state.global_step}: uploaded MoE load balance heatmap "
-            f"(steps {start}-{end}), "
-            f"max_vio max={metrics['moe/max_vio/max']:.4f} avg={metrics['moe/max_vio/avg']:.4f}, "
-            f"min_vio max={metrics['moe/min_vio/max']:.4f} avg={metrics['moe/min_vio/avg']:.4f}, "
-            f"avg_vio max={metrics['moe/avg_vio/max']:.4f} avg={metrics['moe/avg_vio/avg']:.4f}."
-        )
+        summaries = []
+        for key in (
+            "moe/avg_vio/avg",
+            "moe/ep_rank_imbalance_before/avg",
+            "moe/ep_rank_imbalance_after/avg",
+            "moe/ep_moved_tokens/sum",
+        ):
+            if key in scalar_metrics:
+                summaries.append(f"{key.rsplit('/', 2)[-2:]!s}={scalar_metrics[key]:.4f}")
+        summary = ", ".join(summaries) if summaries else "no scalar summaries"
+        logger.info_rank0(f"Step {state.global_step}: collected MoE monitor metrics (steps {start}-{end}); {summary}.")
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
-        if self.monitor is not None:
-            from ...utils.moe_monitor import set_active_monitor
+        from ...utils.moe_monitor import set_active_monitor
 
-            set_active_monitor(None)
-            self.monitor = None
+        set_active_monitor(None)
+        if self.monitor is not None:
             logger.info_rank0("MoE router monitor disabled.")
+        self.monitor = None
 
 
 class WandbTraceCallback(Callback):

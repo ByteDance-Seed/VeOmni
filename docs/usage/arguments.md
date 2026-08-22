@@ -77,6 +77,7 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
     * `TorchCompileConfig` — `train.torch_compile.*`
     * `ChunkMBSConfig` — `train.chunk_mbs_config.*`
+    * `MoEEPBalanceConfig` — `train.moe_ep_load_balance.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
           * `MixedPrecisionConfig` — `train.accelerator.fsdp_config.mixed_precision`
@@ -267,7 +268,8 @@ NPU validation runs at two times:
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
-| moe_load_balance_monitor_interval | `int` | `0` | Log a globally reduced MoE expert-load heatmap every N steps. `0` disables monitoring. |
+| moe_load_balance_monitor_interval | `int` | `0` | Log MoE load metrics every N steps. Counts are reduced over the DP+SP/FSDP group that owns distinct token slices; replicated EP siblings are excluded so they do not duplicate counts. `0` disables monitoring. |
+| moe_ep_load_balance | `MoEEPBalanceConfig` | — | Opt-in temporary expert-replica load balancing for validated Qwen3.5-MoE fused EP configurations. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
@@ -416,6 +418,15 @@ validation instead of applying ChunkMBS to multiple stacks.
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable ChunkMBS for packed-sequence decoder layers listed in `model._no_split_modules`. |
 | chunk_mbs | `int` | `1` | Number of packed samples per layer chunk. |
+
+### MoEEPBalanceConfig
+
+`train.moe_ep_load_balance.*` — Per-forward temporary expert replicas for Qwen3.5-MoE expert parallelism. The feature is disabled by default and does not add model parameters, optimizer state, or checkpoint keys. Enabling it currently requires FSDP2, resolved `train.accelerator.dp_replicate_size == 1` (no HSDP), `train.accelerator.ep_outside=false`, both FSDP CPU offload and activation offload disabled, no checkpoint resume (`train.checkpoint.load_path=null`), `train.accelerator.ep_size > 1`, full (non-LoRA) training, and `model.ops_implementation.moe_implementation` equal to `fused_triton` on CUDA or `fused_npu` on Ascend NPU. Ordinary checkpoint saving and gradient checkpointing remain allowed. The Qwen3.5 expert count must be divisible by the EP size, and `max_replicas_per_rank` cannot exceed the number of original expert rows owned by one EP rank. Unsupported configurations fail validation rather than falling back to eager MoE.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enabled | `bool` | `False` | Enable actual-token planning, temporary expert-weight replication, physical-alias dispatch, and owner-gradient return for compatible Qwen3.5-MoE fused EP layers. |
+| max_replicas_per_rank | `int` | `1` | Fixed temporary replica slots per EP rank. Must be positive when enabled and no greater than `num_experts / ep_size`. |
 
 ### AcceleratorConfig
 

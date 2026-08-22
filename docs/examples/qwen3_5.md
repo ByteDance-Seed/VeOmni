@@ -233,6 +233,143 @@ The config sets `ulysses_size: 4`, so the world size must be a multiple of 4. To
 sequence parallelism, override `--train.accelerator.ulysses_size 1`; the attention kernels adapt
 on their own.
 
+## Qwen3.5-MoE EP load-balance experiments
+
+Temporary expert replicas are opt-in. The AscendC recipe declares the safe defaults explicitly (`moe_load_balance_monitor_interval: 0`, `moe_ep_load_balance.enabled: false`, and `max_replicas_per_rank: 1`) and retains its original topology. Enabled mode currently fail-fast requires FSDP2, resolved `dp_replicate_size == 1` (no HSDP), `ep_outside=false`, no FSDP CPU offload, no activation offload, no checkpoint resume, full SFT, and fused MoE. Multi-node and other topologies remain untested. Ordinary checkpoint saving and ordinary gradient checkpointing are still allowed.
+
+The recipe enables profiling by default, so every functional or throughput comparison below overrides `train.profile.enable=false`. Keep the two commands in a pair identical except for feature enablement and output/run labels. Replace the model and dataset paths with immutable local revisions before collecting evidence.
+
+### Functional and precision evidence
+
+Use the monitor for per-step physical-load evidence, keep the profiler off, and run enough steps to inspect a real loss/gradient trajectory. These commands are a reproducible experiment template, not a published accelerator result:
+
+```shell
+CONFIG=configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml
+MODEL=${HOME}/Qwen3.5-35B-A3B
+DATA=./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+
+COMMON=(
+  --model.model_path "$MODEL"
+  --data.train_path "$DATA"
+  --train.accelerator.ulysses_size 1
+  --train.accelerator.ep_size 2
+  --train.profile.enable false
+  --train.moe_load_balance_monitor_interval 1
+  --train.moe_ep_load_balance.max_replicas_per_rank 1
+  --train.checkpoint.save_steps 0
+  --train.checkpoint.save_epochs 0
+  --train.checkpoint.save_hf_weights false
+  --train.max_steps 20
+  --train.seed 0
+)
+
+NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
+  --train.moe_ep_load_balance.enabled false \
+  --train.wandb.name qwen3_5_moe_ep_balance_functional_baseline \
+  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_functional_baseline
+
+NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${COMMON[@]}" \
+  --train.moe_ep_load_balance.enabled true \
+  --train.wandb.name qwen3_5_moe_ep_balance_functional_enabled \
+  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_functional_enabled
+```
+
+The CI E2E uses a smaller, deterministic two-step hotspot and a versioned scalar sink. It requires four compatible CUDA or NPU devices, forces both runs to route to experts `[0, 1]`, compares finite loss and gradient-norm curves with `rtol=atol=0.1`, and checks positive replicas/moved tokens plus non-worsening physical imbalance. Its NPU path selects the three `npu` GatedDeltaNet kernels and requires the `triton` import from `triton-ascend`, without requiring `fla_npu`; its CUDA path rejects ROCm, requires SM70 or newer on all four selected devices, and checks the default Liger dependency. Dedicated GPU and NPU workflow steps select only that exact real-hardware test node and set `VEOMNI_REQUIRE_EP_BALANCE_E2E=1`, so any missing prerequisite fails those jobs without applying strict mode to the module's local-policy gate tests. Ordinary local invocation leaves that variable unset and honestly skips before dataset/checkpoint creation. Forced routing and `CUDA_LAUNCH_BLOCKING=1` make it functional/precision evidence only.
+
+### Steady-state performance evidence
+
+Disable both monitoring and profiling because their synchronization and formatting costs invalidate throughput attribution. Use sufficient warmup and steady steps; this 100-step template reserves the first 20 reporter steps as warmup:
+
+```shell
+CONFIG=configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml
+MODEL=${HOME}/Qwen3.5-35B-A3B
+DATA=./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+
+PERF_COMMON=(
+  --model.model_path "$MODEL"
+  --data.train_path "$DATA"
+  --train.accelerator.ulysses_size 1
+  --train.accelerator.ep_size 2
+  --train.profile.enable false
+  --train.moe_load_balance_monitor_interval 0
+  --train.moe_ep_load_balance.max_replicas_per_rank 1
+  --train.checkpoint.save_steps 0
+  --train.checkpoint.save_epochs 0
+  --train.checkpoint.save_hf_weights false
+  --train.max_steps 100
+  --train.seed 0
+)
+
+NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${PERF_COMMON[@]}" \
+  --train.moe_ep_load_balance.enabled false \
+  --train.wandb.name qwen3_5_moe_ep_balance_perf_baseline \
+  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_perf_baseline
+
+NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${PERF_COMMON[@]}" \
+  --train.moe_ep_load_balance.enabled true \
+  --train.wandb.name qwen3_5_moe_ep_balance_perf_enabled \
+  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_perf_enabled
+```
+
+Performance artifacts must explicitly record `step_time_s` and either `step_tokens` or `tokens_per_second`; peak memory must come from explicit `peak_accelerator_memory_bytes` and `peak_host_memory_bytes` fields. Optional per-step `p2p_bytes` and `p2p_wait_time_s` curves may be added by profiler post-processing or runtime instrumentation, with exactly one value per loss/gradient step. The training commands and comparison reporter do not collect those P2P curves automatically. If either matched run lacks a field, the reporter marks that section unavailable. Do not substitute process/system-wide used memory, inferred communication values, or zero for a missing measurement.
+
+### All-rank profiler diagnosis
+
+Profiler traces diagnose operator/communication behavior but are not used for throughput. Profile every rank so EP sends, receives, and all-to-all work are visible. Run the matched baseline and enabled commands separately to keep trace directories distinct:
+
+```shell
+CONFIG=configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml
+MODEL=${HOME}/Qwen3.5-35B-A3B
+DATA=./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+
+PROFILE_COMMON=(
+  --model.model_path "$MODEL"
+  --data.train_path "$DATA"
+  --train.accelerator.ulysses_size 1
+  --train.accelerator.ep_size 2
+  --train.profile.enable true
+  --train.profile.rank0_only false
+  --train.profile.start_step 20
+  --train.profile.end_step 25
+  --train.moe_load_balance_monitor_interval 0
+  --train.moe_ep_load_balance.max_replicas_per_rank 1
+  --train.checkpoint.save_steps 0
+  --train.checkpoint.save_epochs 0
+  --train.checkpoint.save_hf_weights false
+  --train.max_steps 26
+  --train.seed 0
+)
+
+NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${PROFILE_COMMON[@]}" \
+  --train.moe_ep_load_balance.enabled false \
+  --train.profile.trace_dir ./exp/qwen3_5_moe_ep_balance_profile_baseline/traces \
+  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_profile_baseline
+
+NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py "$CONFIG" "${PROFILE_COMMON[@]}" \
+  --train.moe_ep_load_balance.enabled true \
+  --train.profile.trace_dir ./exp/qwen3_5_moe_ep_balance_profile_enabled/traces \
+  --train.checkpoint.output_dir ./exp/qwen3_5_moe_ep_balance_profile_enabled
+```
+
+### Compare saved artifacts
+
+The standard-library reporter accepts the E2E schema-version-1 envelope, existing flat `log_dict.json`, per-step JSONL, or plain training logs for loss/gradient only:
+
+```shell
+python scripts/profile/compare_moe_ep_load_balance.py \
+  --baseline ./artifacts/baseline.json \
+  --candidate ./artifacts/enabled.json \
+  --warmup-steps 20 \
+  --rtol 0.1 \
+  --atol 0.1 \
+  --relative-error-threshold 0.1 \
+  --epsilon 1e-12 \
+  --json-out ./artifacts/comparison.json \
+  --markdown-out ./artifacts/comparison.md
+```
+
+Precision failure returns a nonzero status after both requested reports are written. Missing performance, P2P, or memory fields produce an explicit `unavailable` section with `null` values; they are not a comparison failure by themselves. See the [design](../design/qwen3_5_moe_ep_load_balance.md) and [evidence report](../performance/qwen3_5_moe_ep_load_balance.md) for formulas, support boundaries, and rollback.
+
 ## ChunkMBS
 
 Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,

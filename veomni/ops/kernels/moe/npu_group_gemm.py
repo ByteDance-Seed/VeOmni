@@ -21,6 +21,8 @@ import torch.nn.functional as F
 import torch_npu
 
 from ....distributed.moe.comm import all_to_all
+from ....distributed.moe.ep_load_balance import ExpertReplicaTransfer, cat_local_and_replica_weights
+from ....distributed.moe.moe_layer import EPMergedFc1GroupGemm, _record_ep_balance, _validate_ep_balance_dispatch
 from ....distributed.moe.moe_utils import sort_chunks_by_idxs
 from ....distributed.parallel_state import get_parallel_state
 from ....utils.device import stream_synchronize
@@ -96,12 +98,28 @@ def npu_ep_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     ep_group: Optional[dist.ProcessGroup] = None,
     swiglu_limit: float | None = None,
+    load_balancer=None,
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
 
     Accepts either split fc1 weights or a merged fc1_1_2_weight tensor.
     Handles alltoall dispatch/combine for expert parallelism.
     """
+    if load_balancer is not None:
+        return _npu_ep_balanced_moe_forward(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_2_weight,
+            ep_group,
+            swiglu_limit,
+            load_balancer,
+        )
+
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
         dispatch_preprocess(selected_experts, num_experts, ep_group)
@@ -138,6 +156,89 @@ def npu_ep_fused_moe_forward(
         ep_group,
     )
     return hidden_states
+
+
+def _npu_ep_balanced_moe_forward(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
+    fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None,
+    ep_group: Optional[dist.ProcessGroup],
+    swiglu_limit: float | None,
+    load_balancer,
+) -> torch.Tensor:
+    if fc1_1_2_weight is None or fc1_1_weight is not None or fc1_2_weight is not None:
+        raise ValueError("NPU EP load balancing requires merged fc1_1_2_weight without split fc1 weights.")
+    if ep_group is None or getattr(load_balancer, "ep_group", None) is not ep_group:
+        raise ValueError(
+            "NPU EP load balancing requires the entry point and load balancer to use the same process group."
+        )
+
+    plan, fc1_weight, fc2_weight, swiglu_limit = _validate_ep_balance_dispatch(
+        EPMergedFc1GroupGemm,
+        num_experts,
+        selected_experts,
+        (fc1_1_2_weight, fc2_weight, swiglu_limit),
+        load_balancer,
+    )
+    _record_ep_balance(load_balancer, plan)
+
+    gate_up_transfer = None
+    down_transfer = None
+    if plan.replicas:
+        gate_up_transfer = ExpertReplicaTransfer.start(fc1_weight, plan, ep_group)
+        down_transfer = ExpertReplicaTransfer.start(fc2_weight, plan, ep_group)
+
+    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    physical_slots_per_rank = plan.tokens_per_local_physical_expert.shape[1]
+    physical_num_experts = plan.ep_size * physical_slots_per_rank if plan.replicas else num_experts
+    hidden_states, unpermute_indices = alltoall_dispatch(
+        hidden_states,
+        plan.selected_physical_experts,
+        plan.input_splits,
+        plan.output_splits,
+        physical_num_experts,
+        plan.tokens_per_local_physical_expert,
+        ep_group,
+    )
+
+    if gate_up_transfer is not None and down_transfer is not None:
+        replica_fc1_weight = gate_up_transfer.wait()
+        replica_fc2_weight = down_transfer.wait()
+        fc1_weight = cat_local_and_replica_weights(fc1_weight, replica_fc1_weight, plan, ep_group)
+        fc2_weight = cat_local_and_replica_weights(fc2_weight, replica_fc2_weight, plan, ep_group)
+
+    tokens_per_local_physical_expert = plan.tokens_per_local_physical_expert.sum(dim=0).to(
+        hidden_states.device,
+        dtype=torch.int64,
+        non_blocking=True,
+    )
+    intermediate_hidden_states = npu_group_gemm(
+        hidden_states,
+        fc1_weight.transpose(1, 2),
+        tokens_per_local_physical_expert,
+    )
+    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
+    hidden_states = npu_group_gemm(
+        intermediate_activations,
+        fc2_weight.transpose(1, 2),
+        tokens_per_local_physical_expert,
+    )
+
+    return alltoall_combine(
+        hidden_states,
+        routing_weights,
+        unpermute_indices,
+        plan.input_splits,
+        plan.output_splits,
+        physical_num_experts,
+        plan.tokens_per_local_physical_expert,
+        ep_group,
+    )
 
 
 def dispatch_preprocess(
@@ -244,7 +345,26 @@ def npu_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    load_balancer=None,
 ):
+    if load_balancer is not None:
+        parallel_state = get_parallel_state()
+        if not parallel_state.ep_enabled:
+            raise ValueError("NPU EP load balancing requires expert parallelism to be enabled.")
+        return npu_ep_fused_moe_forward(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_2_weight,
+            ep_group=parallel_state.ep_group,
+            swiglu_limit=swiglu_limit,
+            load_balancer=load_balancer,
+        )
+
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(
             num_experts,

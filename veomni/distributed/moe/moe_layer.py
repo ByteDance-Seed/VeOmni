@@ -21,6 +21,12 @@ import torch.distributed as dist
 from ...utils.import_utils import is_torch_npu_available
 from ..parallel_state import get_parallel_state
 from .comm import all_to_all
+from .ep_load_balance import (
+    EPBalancePlan,
+    ExpertReplicaTransfer,
+    _validate_executor_plan,
+    cat_local_and_replica_weights,
+)
 from .moe_utils import generate_weights_idx, permute, sort_chunks_by_idxs, unpermute
 
 
@@ -117,6 +123,209 @@ def token_pre_all2all(
     return global_permuted_hidden_states, routing_map, local_input_permutation_mapping, org_hidden_states_shape
 
 
+def _validate_merged_expert_weights(gate_up_proj: Any, down_proj: Any) -> None:
+    error = "EP load balancing requires compatible merged expert weights"
+    if not isinstance(gate_up_proj, torch.Tensor) or gate_up_proj.ndim != 3:
+        raise ValueError(f"{error}: gate_up_proj must be a 3-D tensor.")
+    if not isinstance(down_proj, torch.Tensor) or down_proj.ndim != 3:
+        raise ValueError(f"{error}: down_proj must be a 3-D tensor.")
+    if gate_up_proj.shape[0] != down_proj.shape[0]:
+        raise ValueError(f"{error}: gate_up_proj and down_proj must have the same expert-row count.")
+    if gate_up_proj.shape[1] % 2 != 0:
+        raise ValueError(f"{error}: gate_up_proj.shape[1] must be even.")
+    if gate_up_proj.shape[1] != 2 * down_proj.shape[2]:
+        raise ValueError(f"{error}: gate_up_proj.shape[1] must equal 2 * down_proj.shape[2].")
+    if gate_up_proj.shape[2] != down_proj.shape[1]:
+        raise ValueError(f"{error}: gate_up_proj.shape[2] must equal down_proj.shape[1].")
+    if gate_up_proj.dtype != down_proj.dtype:
+        raise ValueError(f"{error}: gate_up_proj and down_proj must have the same dtype.")
+    if gate_up_proj.device != down_proj.device:
+        raise ValueError(f"{error}: gate_up_proj and down_proj must be on the same device.")
+    if gate_up_proj.layout != torch.strided or down_proj.layout != torch.strided:
+        raise ValueError(f"{error}: gate_up_proj and down_proj must use the dense strided layout.")
+
+
+def _validate_ep_balance_dispatch(
+    ep_class: Callable[..., torch.Tensor],
+    num_experts: int,
+    selected_experts: torch.Tensor,
+    ep_class_args: tuple[Any, ...],
+    load_balancer: Any,
+) -> tuple[EPBalancePlan, torch.Tensor, torch.Tensor, Any]:
+    if ep_class is not EPMergedFc1GroupGemm:
+        raise ValueError("EP load balancing supports only the merged-fc1 EPMergedFc1GroupGemm path.")
+    if len(ep_class_args) != 3:
+        raise ValueError("Balanced merged EP dispatch expects exactly (gate_up_proj, down_proj, swiglu_limit).")
+    gate_up_proj, down_proj, swiglu_limit = ep_class_args
+    _validate_merged_expert_weights(gate_up_proj, down_proj)
+    if not callable(getattr(load_balancer, "build_plan", None)):
+        raise TypeError("load_balancer must expose build_plan(selected_experts).")
+
+    ep_state = get_parallel_state()
+    ep_group = getattr(load_balancer, "ep_group", None)
+    if ep_group is None or ep_group is not ep_state.ep_group:
+        raise ValueError("load_balancer.ep_group must be the active expert-parallel process group.")
+
+    plan = load_balancer.build_plan(selected_experts)
+    if not isinstance(plan, EPBalancePlan):
+        raise TypeError("load_balancer.build_plan must return an EPBalancePlan.")
+    if plan.ep_size <= 1 or num_experts <= 0 or num_experts % plan.ep_size != 0:
+        raise ValueError("The balance plan EP size must be greater than one and divide num_experts.")
+    if plan.num_experts != num_experts:
+        raise ValueError(f"The balance plan has {plan.num_experts} logical experts, expected {num_experts}.")
+    if plan.num_local_experts != num_experts // plan.ep_size:
+        raise ValueError("The balance plan local expert count is inconsistent with its logical expert count.")
+    if tuple(plan.selected_physical_experts.shape) != tuple(selected_experts.shape):
+        raise ValueError("The balance plan physical expert IDs must preserve selected_experts shape.")
+    if plan.selected_physical_experts.device != selected_experts.device:
+        raise ValueError("The balance plan physical expert IDs must stay on the selected_experts device.")
+    if plan.selected_physical_experts.dtype != torch.long:
+        raise TypeError("The balance plan physical expert IDs must use torch.long.")
+
+    physical_slots_per_rank = plan.num_local_experts + (plan.max_replicas_per_rank if plan.replicas else 0)
+    physical_num_experts = plan.ep_size * physical_slots_per_rank if plan.replicas else num_experts
+    physical_ids = plan.selected_physical_experts.reshape(-1)
+    if physical_ids.numel() and (
+        int(physical_ids.min().item()) < 0 or int(physical_ids.max().item()) >= physical_num_experts
+    ):
+        raise ValueError(f"The balance plan physical expert IDs must be in [0, {physical_num_experts}).")
+
+    physical_counts = plan.tokens_per_local_physical_expert
+    expected_counts_shape = (plan.ep_size, physical_slots_per_rank)
+    if tuple(physical_counts.shape) != expected_counts_shape:
+        raise ValueError(
+            "The balance plan physical count matrix has shape "
+            f"{tuple(physical_counts.shape)}, expected {expected_counts_shape}."
+        )
+    if physical_counts.dtype not in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }:
+        raise TypeError("The balance plan physical count matrix must contain integers.")
+    if bool((physical_counts < 0).any()):
+        raise ValueError("The balance plan physical count matrix cannot contain negative values.")
+    if not isinstance(plan.input_splits, tuple) or not isinstance(plan.output_splits, tuple):
+        raise TypeError("The balance plan input and output splits must be exact tuples.")
+    if len(plan.input_splits) != plan.ep_size or len(plan.output_splits) != plan.ep_size:
+        raise ValueError("The balance plan input and output splits must each contain one entry per EP rank.")
+    if any(not isinstance(split, int) or split < 0 for split in (*plan.input_splits, *plan.output_splits)):
+        raise ValueError("The balance plan input and output splits must contain non-negative integers.")
+    if sum(plan.input_splits) != selected_experts.numel():
+        raise ValueError("The balance plan input splits do not conserve local routing occurrences.")
+    if sum(plan.output_splits) != int(physical_counts.sum().item()):
+        raise ValueError("The balance plan output splits do not match its local physical count matrix.")
+    expected_input_splits = tuple(
+        int(value)
+        for value in torch.bincount(physical_ids, minlength=physical_num_experts)
+        .reshape(plan.ep_size, physical_slots_per_rank)
+        .sum(dim=1)
+        .tolist()
+    )
+    expected_output_splits = tuple(int(value) for value in physical_counts.sum(dim=1).tolist())
+    if plan.input_splits != expected_input_splits or plan.output_splits != expected_output_splits:
+        raise ValueError("The balance plan input or output splits do not match its physical routing metadata.")
+    if len(plan.rank_loads_before) != plan.ep_size or len(plan.rank_loads_after) != plan.ep_size:
+        raise ValueError("The balance plan rank-load telemetry must contain one entry per EP rank.")
+
+    # Validate both local weights before starting either P2P stream. In
+    # particular, a malformed down projection must not be discovered after a
+    # gate/up send has already been issued.
+    _validate_executor_plan(gate_up_proj, plan, ep_group)
+    _validate_executor_plan(down_proj, plan, ep_group)
+    return plan, gate_up_proj, down_proj, swiglu_limit
+
+
+def _record_ep_balance(load_balancer: Any, plan: EPBalancePlan) -> None:
+    from ...utils.moe_monitor import get_active_monitor
+
+    monitor = get_active_monitor()
+    record_ep_balance = getattr(monitor, "record_ep_balance", None)
+    if callable(record_ep_balance):
+        record_ep_balance(
+            load_balancer.layer_index,
+            plan.rank_loads_before,
+            plan.rank_loads_after,
+            len(plan.replicas),
+            sum(replica.moved_tokens for replica in plan.replicas),
+        )
+
+
+def _dispatch_to_balanced_ep(
+    ep_class: Callable[..., torch.Tensor],
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    ep_class_args: tuple[Any, ...],
+    load_balancer: Any,
+) -> torch.Tensor:
+    plan, gate_up_proj, down_proj, swiglu_limit = _validate_ep_balance_dispatch(
+        ep_class,
+        num_experts,
+        selected_experts,
+        ep_class_args,
+        load_balancer,
+    )
+    _record_ep_balance(load_balancer, plan)
+
+    ep_group = load_balancer.ep_group
+    gate_up_transfer = None
+    down_transfer = None
+    if plan.replicas:
+        gate_up_transfer = ExpertReplicaTransfer.start(gate_up_proj, plan, ep_group)
+        down_transfer = ExpertReplicaTransfer.start(down_proj, plan, ep_group)
+
+    physical_slots_per_rank = plan.tokens_per_local_physical_expert.shape[1]
+    physical_num_experts = plan.ep_size * physical_slots_per_rank if plan.replicas else num_experts
+    selected_physical_experts = plan.selected_physical_experts
+    expert_mask = torch.nn.functional.one_hot(
+        selected_physical_experts,
+        num_classes=physical_num_experts,
+    ).permute(2, 1, 0)
+    permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
+        hidden_states=hidden_states,
+        expert_mask=expert_mask,
+        num_experts=physical_num_experts,
+        input_splits=plan.input_splits,
+        output_splits=plan.output_splits,
+        num_global_tokens_per_local_expert=plan.tokens_per_local_physical_expert,
+        ep_group=ep_group,
+    )
+
+    if gate_up_transfer is not None and down_transfer is not None:
+        replica_gate_up_proj = gate_up_transfer.wait()
+        replica_down_proj = down_transfer.wait()
+        gate_up_proj = cat_local_and_replica_weights(gate_up_proj, replica_gate_up_proj, plan, ep_group)
+        down_proj = cat_local_and_replica_weights(down_proj, replica_down_proj, plan, ep_group)
+
+    physical_counts = plan.tokens_per_local_physical_expert.sum(dim=0)
+    cumsum = torch.cumsum(physical_counts, dim=0).to(permute_tokens.device)
+    final_permute_tokens = EPMergedFc1GroupGemm.apply(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        swiglu_limit,
+    )
+
+    return tokens_post_all2all(
+        expert_outputs=final_permute_tokens,
+        routing_weights=routing_weights,
+        selected_experts=selected_physical_experts,
+        num_experts=physical_num_experts,
+        input_splits=plan.input_splits,
+        output_splits=plan.output_splits,
+        num_global_tokens_per_local_expert=plan.tokens_per_local_physical_expert,
+        routing_map=routing_map,
+        local_input_permutation_mapping=local_input_permutation_mapping,
+        org_hidden_states_shape=org_hidden_states_shape,
+        ep_group=ep_group,
+    )
+
+
 def dispatch_to_ep_class(
     ep_class: Callable[..., torch.Tensor],
     num_experts: int,
@@ -124,6 +333,7 @@ def dispatch_to_ep_class(
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
     *ep_class_args: Any,
+    load_balancer: Any = None,
 ) -> torch.Tensor:
     """Shared EP MoE plumbing: ``preprocess`` + ``token_pre_all2all`` + ``ep_class.apply`` + ``tokens_post_all2all``.
 
@@ -149,10 +359,24 @@ def dispatch_to_ep_class(
             after ``permute_tokens`` and ``cumsum`` — typically the per-rank
             slice of base weights (and, for LoRA variants, LoRA tensors and
             scales).
+        load_balancer: optional private Qwen3.5 EP controller. When present,
+            dispatch uses its immutable physical-alias plan and accepts only
+            the merged gate/up and down projection argument layout.
 
     Returns:
         ``[B, S, H]`` (or ``[N, H]``) — same shape as ``hidden_states``.
     """
+    if load_balancer is not None:
+        return _dispatch_to_balanced_ep(
+            ep_class,
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            ep_class_args,
+            load_balancer,
+        )
+
     ep_state = get_parallel_state()
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (

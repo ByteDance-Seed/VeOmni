@@ -27,7 +27,14 @@ Single-process tests covering the public surface:
 
 from __future__ import annotations
 
+import sys
+import time
+from types import SimpleNamespace
+
+import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 
 from veomni.utils import moe_monitor
@@ -446,6 +453,503 @@ def test_qwen3_extractor_handles_non_tensor_output():
     assert extract((torch.zeros(1), torch.zeros(1), torch.zeros(1, dtype=torch.float))) is None
     indices = torch.zeros(2, 2, dtype=torch.long)
     assert extract((torch.zeros(1), torch.zeros(1), indices)) is indices
+
+
+def test_qwen3_5_router_reuses_qwen_tuple_extractor():
+    assert ROUTER_EXTRACTORS["Qwen3_5MoeTopKRouter"] is ROUTER_EXTRACTORS["Qwen3MoeTopKRouter"]
+    indices = torch.tensor([[1, 3]], dtype=torch.long)
+    output = (torch.zeros(1, 4), torch.zeros(1, 2), indices)
+    assert ROUTER_EXTRACTORS["Qwen3_5MoeTopKRouter"](output) is indices
+
+
+def _register_router_counts(monitor: MoERouterMonitor, num_layers: int = 1) -> list[nn.Module]:
+    routers = [nn.Identity() for _ in range(num_layers)]
+    for layer_index, router in enumerate(routers):
+        monitor._register_layer(router)
+        monitor.record(router, torch.tensor([[layer_index % monitor.num_experts]], dtype=torch.long))
+    return routers
+
+
+@pytest.mark.parametrize(
+    ("args", "match"),
+    [
+        ((-1, (1, 1), (1, 1), 0, 0), "layer_index"),
+        ((1, (1, 1), (1, 1), 0, 0), "layer_index"),
+        ((0, (1, 1), (2,), 0, 0), "shape"),
+        ((0, (1, -1), (0, 0), 0, 0), "non-negative"),
+        ((0, (2, 0), (1, 0), 0, 0), "conserve"),
+        ((0, (1, 1), (1, 1), -1, 0), "active_replicas"),
+        ((0, (1, 1), (1, 1), 0, -1), "moved_tokens"),
+    ],
+)
+def test_record_ep_balance_validation(args, match):
+    monitor = MoERouterMonitor(num_experts=4)
+    _register_router_counts(monitor)
+    with pytest.raises(ValueError, match=match):
+        monitor.record_ep_balance(*args)
+
+
+def test_record_ep_balance_requires_consistent_rank_width_across_layers():
+    monitor = MoERouterMonitor(num_experts=4)
+    _register_router_counts(monitor, num_layers=2)
+    monitor.record_ep_balance(0, (4, 0), (2, 2), 1, 2)
+    with pytest.raises(ValueError, match="rank.*size"):
+        monitor.record_ep_balance(1, (3, 0, 0), (1, 1, 1), 1, 2)
+
+
+def test_record_ep_balance_respects_pause_and_sticky_disable():
+    monitor = MoERouterMonitor(num_experts=4)
+    _register_router_counts(monitor)
+
+    monitor.pause()
+    monitor.record_ep_balance(-1, (-1,), (2, 3), -1, -1)
+    assert monitor._ep_rank_loads_before == {}
+
+    monitor.resume()
+    monitor.disable()
+    monitor.resume()
+    monitor.record_ep_balance(-1, (-1,), (2, 3), -1, -1)
+    assert monitor._ep_rank_loads_before == {}
+
+
+def test_ep_balance_metrics_accumulate_exact_formulas_keys_and_reset(monkeypatch):
+    monitor = MoERouterMonitor(num_experts=4)
+    _register_router_counts(monitor, num_layers=2)
+    monitor.record_ep_balance(0, (8, 0), (4, 4), 1, 4)
+    monitor.record_ep_balance(0, (2, 2), (1, 3), 2, 1)
+    monitor.record_ep_balance(1, (0, 0), (0, 0), 0, 0)
+
+    heatmap_calls = []
+
+    def fake_rank_heatmap(matrix, stage):
+        heatmap_calls.append((matrix.clone(), stage))
+        return f"{stage}-image"
+
+    monkeypatch.setattr(monitor, "build_ep_rank_heatmap_image", fake_rank_heatmap, raising=False)
+    metrics = monitor.compute_metrics(current_step=7)
+
+    required = {
+        "moe/ep_rank_load_before_heatmap",
+        "moe/ep_rank_load_after_heatmap",
+        "moe/ep_rank_imbalance_before/layer_0",
+        "moe/ep_rank_imbalance_before/layer_1",
+        "moe/ep_rank_imbalance_before/max",
+        "moe/ep_rank_imbalance_before/avg",
+        "moe/ep_rank_imbalance_after/layer_0",
+        "moe/ep_rank_imbalance_after/layer_1",
+        "moe/ep_rank_imbalance_after/max",
+        "moe/ep_rank_imbalance_after/avg",
+        "moe/ep_active_replicas/layer_0",
+        "moe/ep_active_replicas/sum",
+        "moe/ep_moved_tokens/layer_0",
+        "moe/ep_moved_tokens/sum",
+        "moe/ep_moved_token_fraction/layer_0",
+        "moe/ep_moved_token_fraction/layer_1",
+        "moe/ep_moved_token_fraction/max",
+        "moe/ep_moved_token_fraction/avg",
+    }
+    assert required <= metrics.keys()
+    assert metrics["moe/ep_rank_load_before_heatmap"] == "before-image"
+    assert metrics["moe/ep_rank_load_after_heatmap"] == "after-image"
+    assert [stage for _, stage in heatmap_calls] == ["before", "after"]
+    assert torch.equal(heatmap_calls[0][0], torch.tensor([[10, 2], [0, 0]]))
+    assert torch.equal(heatmap_calls[1][0], torch.tensor([[5, 7], [0, 0]]))
+
+    assert metrics["moe/ep_rank_imbalance_before/layer_0"] == pytest.approx(2 / 3)
+    assert metrics["moe/ep_rank_imbalance_before/layer_1"] == 0.0
+    assert metrics["moe/ep_rank_imbalance_before/max"] == pytest.approx(2 / 3)
+    assert metrics["moe/ep_rank_imbalance_before/avg"] == pytest.approx(1 / 3)
+    assert metrics["moe/ep_rank_imbalance_after/layer_0"] == pytest.approx(1 / 6)
+    assert metrics["moe/ep_rank_imbalance_after/layer_1"] == 0.0
+    assert metrics["moe/ep_active_replicas/layer_0"] == 3
+    assert metrics["moe/ep_active_replicas/sum"] == 3
+    assert metrics["moe/ep_moved_tokens/layer_0"] == 5
+    assert metrics["moe/ep_moved_tokens/sum"] == 5
+    assert metrics["moe/ep_moved_token_fraction/layer_0"] == pytest.approx(5 / 12)
+    assert metrics["moe/ep_moved_token_fraction/layer_1"] == 0.0
+    assert metrics["moe/ep_moved_token_fraction/avg"] == pytest.approx(5 / 24)
+
+    assert monitor._ep_rank_loads_before == {}
+    assert monitor._ep_rank_loads_after == {}
+    assert monitor._ep_stats == {}
+    second_interval = monitor.compute_metrics(current_step=8)
+    assert not any("/ep_" in key for key in second_interval)
+
+
+def test_ep_balance_accumulates_on_corresponding_router_count_device():
+    monitor = MoERouterMonitor(num_experts=4)
+    routers = _register_router_counts(monitor)
+    count_device = monitor._counts[id(routers[0])].device
+    monitor.record_ep_balance(0, (4, 0), (2, 2), 1, 2)
+    assert monitor._ep_rank_loads_before[0].device == count_device
+    assert monitor._ep_rank_loads_after[0].device == count_device
+    assert monitor._ep_stats[0].device == count_device
+
+
+def _two_rank_ep_monitor_worker(rank: int, world_size: int, rendezvous: str) -> None:
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
+    try:
+        monitor = MoERouterMonitor(num_experts=4, dp_group=dist.group.WORLD)
+        _register_router_counts(monitor)
+        if rank == 0:
+            monitor.record_ep_balance(0, (4, 0), (2, 2), 1, 2)
+        else:
+            monitor.record_ep_balance(0, (0, 6), (3, 3), 2, 3)
+
+        metrics = monitor.compute_metrics(current_step=3, format_only_on=rank == 0)
+        if rank == 0:
+            assert metrics["moe/ep_rank_imbalance_before/layer_0"] == pytest.approx(0.2)
+            assert metrics["moe/ep_rank_imbalance_after/layer_0"] == 0.0
+            assert metrics["moe/ep_active_replicas/sum"] == 3
+            assert metrics["moe/ep_moved_tokens/sum"] == 5
+            assert metrics["moe/ep_moved_token_fraction/avg"] == pytest.approx(0.5)
+        else:
+            assert metrics == {}
+        assert monitor._ep_rank_loads_before == {}
+        assert monitor._ep_rank_loads_after == {}
+        assert monitor._ep_stats == {}
+    finally:
+        set_active_monitor(None)
+        dist.destroy_process_group()
+
+
+def test_ep_balance_real_world2_gloo_dp_reduction_and_reset(tmp_path):
+    rendezvous = f"file://{tmp_path / 'moe-monitor-world2'}"
+    mp.spawn(_two_rank_ep_monitor_worker, args=(2, rendezvous), nprocs=2, join=True)
+
+
+def _asymmetric_ep_monitor_worker(rank: int, world_size: int, rendezvous: str) -> None:
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
+    try:
+        monitor = MoERouterMonitor(num_experts=4, dp_group=dist.group.WORLD)
+        _register_router_counts(monitor)
+        if rank == 0:
+            monitor.record_ep_balance(0, (4, 0), (2, 2), 1, 2)
+
+        metrics = monitor.compute_metrics(current_step=3, format_only_on=rank == 0)
+        if rank == 0:
+            assert metrics["moe/ep_rank_imbalance_before/layer_0"] == 1.0
+            assert metrics["moe/ep_rank_imbalance_after/layer_0"] == 0.0
+            assert metrics["moe/ep_active_replicas/sum"] == 1
+            assert metrics["moe/ep_moved_tokens/sum"] == 2
+            assert metrics["moe/ep_moved_token_fraction/avg"] == pytest.approx(0.5)
+        else:
+            assert metrics == {}
+        assert monitor._ep_rank_loads_before == {}
+        assert monitor._ep_rank_loads_after == {}
+        assert monitor._ep_stats == {}
+    finally:
+        set_active_monitor(None)
+        dist.destroy_process_group()
+
+
+def test_ep_balance_real_world2_asymmetric_record_uses_matching_collectives(tmp_path):
+    rendezvous = f"file://{tmp_path / 'moe-monitor-asymmetric-world2'}"
+    process_context = mp.spawn(
+        _asymmetric_ep_monitor_worker,
+        args=(2, rendezvous),
+        nprocs=2,
+        join=False,
+    )
+    deadline = time.monotonic() + 30
+    try:
+        while not process_context.join(timeout=0.5):
+            if time.monotonic() >= deadline:
+                pytest.fail("Asymmetric physical telemetry caused mismatched collectives.")
+    finally:
+        for process in process_context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
+
+def test_metric_format_failure_preserves_interval_for_exact_retry(monkeypatch):
+    monitor = MoERouterMonitor(num_experts=4)
+    routers = _register_router_counts(monitor)
+    monitor.record_ep_balance(0, (4, 0), (2, 2), 1, 2)
+    logical_before = monitor._counts[id(routers[0])].clone()
+    physical_before = monitor._ep_rank_loads_before[0].clone()
+    physical_after = monitor._ep_rank_loads_after[0].clone()
+    stats_before = monitor._ep_stats[0].clone()
+
+    def fail_heatmap(*args, **kwargs):
+        raise RuntimeError("injected format failure")
+
+    monkeypatch.setattr(monitor, "build_heatmap_image", fail_heatmap)
+    with pytest.raises(RuntimeError, match="injected format failure"):
+        monitor.compute_metrics(current_step=4)
+
+    assert torch.equal(monitor._counts[id(routers[0])], logical_before)
+    assert torch.equal(monitor._ep_rank_loads_before[0], physical_before)
+    assert torch.equal(monitor._ep_rank_loads_after[0], physical_after)
+    assert torch.equal(monitor._ep_stats[0], stats_before)
+    assert monitor._accumulate_start_step == 0
+    assert monitor._last_step_range == (0, 0)
+
+    monkeypatch.setattr(monitor, "build_heatmap_image", lambda *args, **kwargs: "logical-image")
+    monkeypatch.setattr(
+        monitor,
+        "build_ep_rank_heatmap_image",
+        lambda matrix, stage: f"{stage}-image",
+    )
+    metrics = monitor.compute_metrics(current_step=4)
+    assert metrics["moe/ep_moved_tokens/sum"] == 2
+    assert metrics["moe/ep_total_routed_tokens/sum"] == 4
+    assert monitor._counts[id(routers[0])].sum().item() == 0
+    assert monitor._ep_rank_loads_before == {}
+    assert monitor._ep_rank_loads_after == {}
+    assert monitor._ep_stats == {}
+    assert monitor._accumulate_start_step == 5
+    assert monitor._last_step_range == (0, 4)
+
+
+def _coordinated_host_transfer_failure_worker(rank: int, world_size: int, rendezvous: str) -> None:
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
+    original_tensor_cpu = torch.Tensor.cpu
+    try:
+        monitor = MoERouterMonitor(num_experts=4, dp_group=dist.group.WORLD)
+        routers = _register_router_counts(monitor)
+        if rank == 0:
+            monitor.record_ep_balance(0, (4, 0), (2, 2), 1, 2)
+        logical_before = monitor._counts[id(routers[0])].clone()
+        ep_before = {layer: value.clone() for layer, value in monitor._ep_rank_loads_before.items()}
+        ep_after = {layer: value.clone() for layer, value in monitor._ep_rank_loads_after.items()}
+        stats_before = {layer: value.clone() for layer, value in monitor._ep_stats.items()}
+
+        if rank == 0:
+            cpu_calls = 0
+
+            def fail_second_host_transfer(tensor, *args, **kwargs):
+                nonlocal cpu_calls
+                cpu_calls += 1
+                if cpu_calls == 2:
+                    raise RuntimeError("injected formatter host transfer failure")
+                return original_tensor_cpu(tensor, *args, **kwargs)
+
+            torch.Tensor.cpu = fail_second_host_transfer
+
+        expected_error = "injected formatter host transfer failure" if rank == 0 else r"another DP\+SP/FSDP"
+        with pytest.raises(RuntimeError, match=expected_error):
+            monitor.compute_metrics(current_step=6, format_only_on=rank == 0)
+        torch.Tensor.cpu = original_tensor_cpu
+
+        assert torch.equal(monitor._counts[id(routers[0])], logical_before)
+        assert monitor._ep_rank_loads_before.keys() == ep_before.keys()
+        assert monitor._ep_rank_loads_after.keys() == ep_after.keys()
+        assert monitor._ep_stats.keys() == stats_before.keys()
+        for layer, value in ep_before.items():
+            assert torch.equal(monitor._ep_rank_loads_before[layer], value)
+            assert torch.equal(monitor._ep_rank_loads_after[layer], ep_after[layer])
+            assert torch.equal(monitor._ep_stats[layer], stats_before[layer])
+        assert monitor._accumulate_start_step == 0
+        assert monitor._last_step_range == (0, 0)
+
+        metrics = monitor.compute_metrics(current_step=6, format_only_on=rank == 0)
+        if rank == 0:
+            assert metrics["moe/ep_moved_tokens/sum"] == 2
+            assert metrics["moe/ep_total_routed_tokens/sum"] == 4
+            assert metrics["moe/ep_moved_token_fraction/avg"] == pytest.approx(0.5)
+        else:
+            assert metrics == {}
+        assert monitor._counts[id(routers[0])].sum().item() == 0
+        assert monitor._ep_rank_loads_before == {}
+        assert monitor._ep_rank_loads_after == {}
+        assert monitor._ep_stats == {}
+        assert monitor._accumulate_start_step == 7
+        assert monitor._last_step_range == (0, 6)
+    finally:
+        torch.Tensor.cpu = original_tensor_cpu
+        set_active_monitor(None)
+        dist.destroy_process_group()
+
+
+def test_real_world2_formatter_host_transfer_failure_is_coordinated_and_retryable(tmp_path):
+    rendezvous = f"file://{tmp_path / 'moe-monitor-host-failure-world2'}"
+    process_context = mp.spawn(
+        _coordinated_host_transfer_failure_worker,
+        args=(2, rendezvous),
+        nprocs=2,
+        join=False,
+    )
+    deadline = time.monotonic() + 30
+    try:
+        while not process_context.join(timeout=0.5):
+            if time.monotonic() >= deadline:
+                pytest.fail("Formatter host-transfer failure was not coordinated with non-formatting peers.")
+    finally:
+        for process in process_context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
+
+def _patch_callback_base_init(monkeypatch):
+    from veomni.trainer.callbacks.base import Callback
+
+    def fake_init(callback, trainer):
+        callback.trainer = trainer
+        callback.parallel_state = trainer.parallel_state
+
+    monkeypatch.setattr(Callback, "__init__", fake_init)
+
+
+def _monitor_callback_trainer(*, config, wandb_enabled=False, global_rank=0):
+    return SimpleNamespace(
+        args=SimpleNamespace(
+            train=SimpleNamespace(
+                moe_load_balance_monitor_interval=2,
+                global_rank=global_rank,
+                wandb=SimpleNamespace(enable=wandb_enabled),
+            )
+        ),
+        model_config=config,
+        parallel_state=SimpleNamespace(ep_enabled=True, ep_size=2, fsdp_group=None),
+        step_env_metrics={"environment/tokens": 10},
+        model=nn.Identity(),
+    )
+
+
+def test_monitor_callback_resolves_nested_qwen3_5_text_config(monkeypatch):
+    from veomni.trainer.callbacks.trace_callback import MoERouterMonitorCallback
+
+    _patch_callback_base_init(monkeypatch)
+    trainer = _monitor_callback_trainer(config=SimpleNamespace(text_config=SimpleNamespace(num_experts=8)))
+    callback = MoERouterMonitorCallback(trainer)
+    try:
+        assert callback.monitor is not None
+        assert callback.monitor.num_experts == 8
+    finally:
+        callback.on_train_end(SimpleNamespace())
+
+
+def test_monitor_callback_collects_without_wandb_and_propagates_only_scalars(monkeypatch):
+    from veomni.trainer.callbacks.trace_callback import MoERouterMonitorCallback
+
+    trainer = _monitor_callback_trainer(config=SimpleNamespace(num_experts=4), wandb_enabled=False)
+    callback = MoERouterMonitorCallback.__new__(MoERouterMonitorCallback)
+    callback.trainer = trainer
+    calls = []
+
+    class FakeMonitor:
+        _last_step_range = (0, 2)
+
+        def compute_metrics(self, current_step, format_only_on):
+            calls.append((current_step, format_only_on))
+            return {
+                "moe/ep_rank_imbalance_before/avg": 0.5,
+                "moe/ep_rank_load_before_heatmap": object(),
+            }
+
+    callback.monitor = FakeMonitor()
+    callback.on_step_end(SimpleNamespace(global_step=2))
+    assert calls == [(2, True)]
+    assert trainer.step_env_metrics == {
+        "environment/tokens": 10,
+        "moe/ep_rank_imbalance_before/avg": 0.5,
+    }
+
+
+def test_monitor_callback_nonzero_rank_collects_and_resets_without_formatting():
+    from veomni.trainer.callbacks.trace_callback import MoERouterMonitorCallback
+
+    trainer = _monitor_callback_trainer(
+        config=SimpleNamespace(num_experts=4),
+        wandb_enabled=False,
+        global_rank=1,
+    )
+    callback = MoERouterMonitorCallback.__new__(MoERouterMonitorCallback)
+    callback.trainer = trainer
+    calls = []
+
+    class FakeMonitor:
+        def compute_metrics(self, current_step, format_only_on):
+            calls.append((current_step, format_only_on))
+            return {}
+
+    callback.monitor = FakeMonitor()
+    callback.on_step_end(SimpleNamespace(global_step=2))
+    assert calls == [(2, False)]
+
+
+def test_monitor_callback_wandb_directly_logs_only_heatmaps_and_handles_missing_logical_keys(monkeypatch):
+    from veomni.trainer.callbacks.trace_callback import MoERouterMonitorCallback
+
+    trainer = _monitor_callback_trainer(config=SimpleNamespace(num_experts=4), wandb_enabled=True)
+    callback = MoERouterMonitorCallback.__new__(MoERouterMonitorCallback)
+    callback.trainer = trainer
+    image = object()
+
+    class FakeMonitor:
+        _last_step_range = (1, 2)
+
+        def compute_metrics(self, current_step, format_only_on):
+            return {
+                "moe/ep_rank_imbalance_before/avg": 0.5,
+                "moe/ep_rank_load_before_heatmap": image,
+            }
+
+    logged = []
+    fake_wandb = SimpleNamespace(
+        Image=lambda value, caption: (value, caption),
+        log=lambda payload, step, commit: logged.append((payload, step, commit)),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    callback.monitor = FakeMonitor()
+    callback.on_step_end(SimpleNamespace(global_step=2))
+
+    assert trainer.step_env_metrics["moe/ep_rank_imbalance_before/avg"] == 0.5
+    assert logged == [
+        (
+            {"moe/ep_rank_load_before_heatmap": (image, "Steps 1-2")},
+            2,
+            False,
+        )
+    ]
+
+
+def test_monitor_callback_on_train_end_always_clears_singleton():
+    from veomni.trainer.callbacks.trace_callback import MoERouterMonitorCallback
+
+    stale_monitor = MoERouterMonitor(num_experts=4)
+    set_active_monitor(stale_monitor)
+    callback = MoERouterMonitorCallback.__new__(MoERouterMonitorCallback)
+    callback.monitor = None
+    try:
+        callback.on_train_end(SimpleNamespace())
+        assert get_active_monitor() is None
+    finally:
+        set_active_monitor(None)
+
+
+def test_base_trainer_orders_monitor_after_metric_producers_before_wandb(monkeypatch):
+    import veomni.trainer.base as trainer_base
+
+    class FakeCallback:
+        def __init__(self, name):
+            self.name = name
+
+    callback_names = {
+        "EnvironMeterCallback": "environment",
+        "TqdmCallback": "tqdm",
+        "WandbTraceCallback": "wandb",
+        "ProfileTraceCallback": "profile",
+        "CheckpointerCallback": "checkpointer",
+        "HuggingfaceCkptCallback": "hf_checkpoint",
+        "HFLoraCkptCallback": "hf_lora_checkpoint",
+        "EvaluateCallback": "evaluate",
+        "MoERouterMonitorCallback": "moe_monitor",
+        "ChannelLossCallback": "channel_loss",
+    }
+    for symbol, name in callback_names.items():
+        monkeypatch.setattr(trainer_base, symbol, lambda trainer, name=name: FakeCallback(name))
+
+    trainer = trainer_base.BaseTrainer.__new__(trainer_base.BaseTrainer)
+    trainer.args = SimpleNamespace(model=SimpleNamespace(lora_config={}))
+    trainer._init_callbacks()
+    order = [callback.name for callback in trainer._callbacks]
+    assert order.index("environment") < order.index("moe_monitor")
+    assert order.index("channel_loss") < order.index("moe_monitor")
+    assert order.index("moe_monitor") < order.index("wandb")
 
 
 def test_module_dunder_safety():
