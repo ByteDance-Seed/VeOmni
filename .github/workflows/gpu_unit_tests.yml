@@ -202,9 +202,12 @@ jobs:
         #   - moe_lora_ep2: EP=1 vs EP=2 trainer-driven integration + per-step loss/grad_norm alignment
         #   - moe_lora_ep_sharded_stream_load: PEFT ep_sharded_stream_load vs broadcast, bit-exact
         #     post-load LoRA weights (independent + shared) on a fused-base Qwen3-MoE at EP=2
+        #   - wan_lora_projection_dtype: CPU-only guard that Wan's three projection-dtype reads
+        #     resolve for a LoRA-wrapped `LoraLinear` (no `.weight`) as well as a plain `nn.Linear`
         # Order: cheap unit tests first to fail fast, trainer/ep2 last (multi-subprocess, ~5-10 min each).
         run: |
           uv run --frozen pytest -s -x tests/lora/test_target_mapping.py
+          uv run --frozen pytest -s -x tests/lora/test_wan_lora_projection_dtype.py
           uv run --frozen pytest -s -x tests/lora/test_veomni_lora_moe_native.py
           uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py
