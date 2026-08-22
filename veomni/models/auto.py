@@ -140,6 +140,8 @@ def build_foundation_model(
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
             "veomni_flash_attention_4_with_sp",
+            "aiter",
+            "veomni_flash_attention_aiter_with_sp",
             "native-sparse",
         ]
     ] = None,
@@ -250,6 +252,7 @@ def build_foundation_model(
         "veomni_flash_attention_2_with_sp",
         "veomni_flash_attention_3_with_sp",
         "veomni_flash_attention_4_with_sp",
+        "veomni_flash_attention_aiter_with_sp",
     ):
         logger.warning_rank0(
             f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use a veomni_*_with_sp attention implementation for SP."
