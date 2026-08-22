@@ -317,3 +317,7 @@ Qwen3.5 is a hybrid model alternating between softmax and linear attention layer
 
 For detailed implementation notes, see the
 [Ulysses documentation](../key_features/ulysses.md#-linear-attention-ulysses-gateddeltanet).
+For Ascend 910B4 Triton code generation, export TRITON_ASCEND_ARCH=Ascend910B4
+before the first Triton import. The NPU CI regression step sets this variable
+explicitly; on a non-910B4 runner the regression test skips after checking the
+runtime device name.
