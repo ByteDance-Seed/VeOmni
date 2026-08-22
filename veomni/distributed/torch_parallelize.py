@@ -35,7 +35,7 @@ from .chunk_mbs import apply_chunk_mbs
 from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
-from .utils import sort_fqn_by_submodule_first
+from .utils import check_fqn_match, sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
@@ -103,23 +103,27 @@ def _move_buffers_to_device(model: nn.Module, device: str) -> None:
 
 
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
-    """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``."""
-    parallel_plan = getattr(model, "get_parallel_plan", None)
-    if parallel_plan is None:
-        return False
-    plan = parallel_plan()
+    """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``.
+
+    Runs after :meth:`ParallelPlan.apply`, so dim 0 is already the EP-local
+    expert count.
+    """
+    plan = get_runtime_parallel_plan(model)
     if plan is None or plan.extra_parallel_plan is None:
         return False
     para_plan = plan.extra_parallel_plan.get(para_name)
     if not para_plan:
         return False
 
-    for fqn in para_plan.keys():
-        param = dict(model.named_parameters()).get(fqn)
-        if param is None:
-            continue
+    # Plan keys are FQN patterns ("model.layers.*.mlp.experts.down_proj"), so
+    # they have to be matched against real parameter names, never looked up.
+    matched = 0
+    for fqn, param in model.named_parameters():
         if param.ndim < 1:
             continue
+        if not any(check_fqn_match(pattern, fqn) for pattern in para_plan):
+            continue
+        matched += 1
         local_n = param.shape[0]
         if local_n % ep_fsdp_size != 0:
             logger.warning_rank0(
@@ -127,6 +131,13 @@ def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, 
                 f"divisible by ep_fsdp_size={ep_fsdp_size}; cannot use Shard(0)."
             )
             return False
+
+    if matched == 0:
+        logger.warning_rank0(
+            f"[muon_expert_zero_comm] no parameter matched the {para_name!r} plan patterns "
+            f"{sorted(para_plan)}; cannot verify dim-0 divisibility."
+        )
+        return False
     return True
 
 

@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from veomni.optim import muon as muon_impl
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
@@ -37,7 +37,7 @@ from veomni.optim.muon import (  # noqa: E402
     DEFAULT_NS_COEFFICIENTS,
     DEFAULT_NS_STEPS,
     DistributedMuon,
-    _fsdp_all2all_fast_path_eligible,
+    _fsdp_all2all_submesh,
     _shard_row_sizes,
     batched_gram_newton_schulz,
     batched_newton_schulz,
@@ -165,25 +165,61 @@ class TestParamShapeEligibility:
                 DistributedMuon([p], lr=1e-3)
 
 
+class _FakeMesh:
+    """DeviceMesh stand-in exposing only what submesh resolution touches."""
+
+    def __init__(self, sizes, dim_names):
+        self._sizes = sizes
+        self.ndim = len(sizes)
+        self.mesh_dim_names = dim_names
+        self.sliced_with = None
+
+    def size(self, dim):
+        return self._sizes[dim]
+
+    def __getitem__(self, name):
+        self.sliced_with = name
+        return _FakeMesh((self._sizes[self.mesh_dim_names.index(name)],), (name,))
+
+
 class TestFsdpAllToAllEligibility:
     def test_empty_rank_shards_remain_all_to_all_eligible(self):
         world_size = 32
         param = SimpleNamespace(
-            device_mesh=SimpleNamespace(ndim=1, size=lambda dim: world_size),
+            device_mesh=_FakeMesh((world_size,), ("dp_shard",)),
             placements=(Shard(0),),
             shape=(24, 16384),
         )
 
         assert _shard_row_sizes(param.shape[0], world_size) == [1] * 24 + [0] * 8
-        assert _fsdp_all2all_fast_path_eligible(param)
+        assert _fsdp_all2all_submesh(param) is not None
+
+    def test_hsdp_mesh_resolves_to_the_shard_dim(self):
+        """HSDP params are (Replicate(), Shard(0)); the path runs on dp_shard_sp."""
+        mesh = _FakeMesh((2, 8), ("dp_replicate", "dp_shard_sp"))
+        param = SimpleNamespace(device_mesh=mesh, placements=(Replicate(), Shard(0)))
+
+        submesh = _fsdp_all2all_submesh(param)
+
+        assert mesh.sliced_with == "dp_shard_sp"
+        assert submesh.ndim == 1
+        assert submesh.size(0) == 8
+
+    def test_pending_reduction_is_not_eligible(self):
+        """A Partial() dim owes a reduction, so the gather cannot be skipped."""
+        mesh = _FakeMesh((2, 8), ("dp_replicate", "dp_shard_sp"))
+        param = SimpleNamespace(device_mesh=mesh, placements=(Partial(), Shard(0)))
+
+        assert _fsdp_all2all_submesh(param) is None
+        assert mesh.sliced_with is None
 
     def test_bucket_key_separates_local_dtypes(self):
         mesh = object()
         fp32 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.float32))
         bf16 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.bfloat16))
-        bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update: update.device_mesh)
+        bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update, mesh: mesh)
 
-        assert bucket_key(fp32) != bucket_key(bf16)
+        assert bucket_key(fp32, mesh) != bucket_key(bf16, mesh)
 
 
 class TestIntermediateLifetime:
