@@ -577,7 +577,6 @@ class JanusChatTemplate(ChatmlTemplate):
         self.image_pad = "<image_placeholder>"
         self.image_start_tag = "<begin_of_image>"
         self.image_end_tag = "<end_of_image>"
-        self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
         self.image_start_id = self.tokenizer.convert_tokens_to_ids(self.image_start_tag)
         self.use_system_prompt = use_system_prompt
         self.system_prompt = (
@@ -586,6 +585,9 @@ class JanusChatTemplate(ChatmlTemplate):
             "and assist the user with a variety of tasks using natural language."
         )
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.image_pad]})
+        # Resolve the image placeholder id AFTER registering it as a special
+        # token; before that, convert_tokens_to_ids returns the unk id.
+        self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_pad)
         self.sep1 = "\n\n"
         self.sep2 = "<｜end▁of▁sentence｜>"  # eos
         self.eos = self.tokenizer.encode(self.sep2, add_special_tokens=False)
