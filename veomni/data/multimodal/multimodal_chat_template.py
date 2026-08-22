@@ -112,7 +112,9 @@ class Qwen2VLPretrainTemplate(Qwen2VLTemplate):  # For Omni Only
             loss_mask = message["loss_mask"]
             if content_str == "":  # eval
                 break
-            if role == "user" and data_type == "t2i" and self._unconditioned_generation:  # unconditioned generation
+            if (
+                message["role"] == "user" and data_type == "t2i" and self._unconditioned_generation
+            ):  # unconditioned generation
                 input_ids += [self.tokenizer.pad_token_id] * len(content_ids)
             else:
                 input_ids += content_ids
@@ -836,7 +838,9 @@ class LlamaPretrainTemplate(MultimodalChatTemplate):  # For Omni Only
             loss_mask = message["loss_mask"]
             if content_str == "":  # eval
                 break
-            if role == "user" and data_type == "t2i" and self._unconditioned_generation:  # unconditioned generation
+            if (
+                message["role"] == "user" and data_type == "t2i" and self._unconditioned_generation
+            ):  # unconditioned generation
                 input_ids += [self.pad_token_id] * len(content_ids)
             else:
                 input_ids += content_ids
