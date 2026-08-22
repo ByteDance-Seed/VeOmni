@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 import torch
 import wandb
@@ -42,6 +42,7 @@ MAX_PIXELS = 768 * 28 * 28
 @dataclass
 class MyDataArguments(DataArguments):
     supports_torch_compile = False
+    data_modality: ClassVar[Literal["text", "multimodal", "diffusion"]] = "multimodal"
     max_image_nums: Optional[int] = field(
         default=None,
         metadata={"help": "The max number of images in the sample."},
@@ -93,6 +94,33 @@ class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
+
+
+def _build_train_dataloader(args: Arguments, train_dataset: Any, collate_fn_kwargs: Dict[str, Any]):
+    return build_dataloader(
+        dataloader_type=args.data.dataloader.type,
+        dataset=train_dataset,
+        micro_batch_size=args.train.micro_batch_size,
+        global_batch_size=args.train.global_batch_size,
+        dataloader_batch_size=args.train.dataloader_batch_size,
+        max_seq_len=args.data.max_seq_len,
+        train_steps=args.train_steps,
+        dyn_bsz=args.train.dyn_bsz,
+        dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+        dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+        dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
+        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
+        dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+        dyn_bsz_buffer_policy=args.data.dyn_bsz_buffer_policy,
+        data_modality=args.data.data_modality,
+        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
+        num_workers=args.data.dataloader.num_workers,
+        drop_last=args.data.dataloader.drop_last,
+        pin_memory=args.data.dataloader.pin_memory,
+        prefetch_factor=args.data.dataloader.prefetch_factor,
+        seed=args.train.seed,
+        collate_fn_kwargs=collate_fn_kwargs,
+    )
 
 
 def main():
@@ -202,27 +230,7 @@ def main():
         "data_collate_info": data_collate_info,
     }
 
-    train_dataloader = build_dataloader(
-        dataloader_type=args.data.dataloader.type,
-        dataset=train_dataset,
-        micro_batch_size=args.train.micro_batch_size,
-        global_batch_size=args.train.global_batch_size,
-        dataloader_batch_size=args.train.dataloader_batch_size,
-        max_seq_len=args.data.max_seq_len,
-        train_steps=args.train_steps,
-        dyn_bsz=args.train.dyn_bsz,
-        dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
-        dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
-        bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-        dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
-        bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-        num_workers=args.data.dataloader.num_workers,
-        drop_last=args.data.dataloader.drop_last,
-        pin_memory=args.data.dataloader.pin_memory,
-        prefetch_factor=args.data.dataloader.prefetch_factor,
-        seed=args.train.seed,
-        collate_fn_kwargs=collate_fn_kwargs,
-    )
+    train_dataloader = _build_train_dataloader(args, train_dataset, collate_fn_kwargs)
 
     if args.train.freeze_encoder:
         if args.train.freeze_encoder_all:

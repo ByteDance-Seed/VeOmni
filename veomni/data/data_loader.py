@@ -43,9 +43,73 @@ from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 DATALOADER_REGISTRY = Registry("dataloader")
 logger = logging.get_logger(__name__)
 
+_CONTEXT_AWARE_DYN_BSZ_BUFFER_SIZES = {
+    512 * 1024: 24,
+    1024 * 1024: 24,
+}
+
+
+def resolve_dyn_bsz_buffer_size(
+    buffer_size: int,
+    buffer_policy: Literal["fixed", "context_aware"],
+    max_seq_len: int,
+    micro_batch_size: int,
+    runtime: Literal["main", "worker"],
+    count_mode: Literal["total", "effective"],
+    data_modality: Literal["text", "multimodal", "diffusion"],
+) -> int:
+    if buffer_policy == "fixed":
+        return buffer_size
+
+    if buffer_policy != "context_aware":
+        raise ValueError(f"Unknown dyn_bsz_buffer_policy: {buffer_policy}.")
+
+    if runtime != "main":
+        raise ValueError("dyn_bsz_buffer_policy='context_aware' is only supported with dyn_bsz_runtime='main'.")
+    if count_mode != "total":
+        raise ValueError("dyn_bsz_buffer_policy='context_aware' is only supported with dyn_bsz_count_mode='total'.")
+    if data_modality != "text":
+        raise ValueError("dyn_bsz_buffer_policy='context_aware' is only supported for text data.")
+    if micro_batch_size != 1:
+        raise ValueError("dyn_bsz_buffer_policy='context_aware' is only supported with micro_batch_size=1.")
+
+    try:
+        return _CONTEXT_AWARE_DYN_BSZ_BUFFER_SIZES[max_seq_len]
+    except KeyError as exc:
+        supported_lengths = ", ".join(str(length) for length in _CONTEXT_AWARE_DYN_BSZ_BUFFER_SIZES)
+        raise ValueError(
+            "dyn_bsz_buffer_policy='context_aware' supports max_seq_len values "
+            f"[{supported_lengths}], got {max_seq_len}. Set dyn_bsz_buffer_policy='fixed' and choose "
+            "dyn_bsz_buffer_size explicitly for other token budgets."
+        ) from exc
+
 
 def build_dataloader(dataloader_type: str, **kwargs):
-    return DATALOADER_REGISTRY[dataloader_type](**kwargs)
+    builder = DATALOADER_REGISTRY[dataloader_type]
+    if kwargs.get("dyn_bsz", False) and kwargs.get("dyn_bsz_buffer_policy", "fixed") == "context_aware":
+        required_arguments = ("max_seq_len", "micro_batch_size")
+        missing_arguments = [argument for argument in required_arguments if argument not in kwargs]
+        if missing_arguments:
+            missing = ", ".join(missing_arguments)
+            raise ValueError(
+                "dyn_bsz_buffer_policy='context_aware' requires explicit max_seq_len and micro_batch_size; "
+                f"missing: {missing}."
+            )
+
+        # The native builder owns validation and resolution because it can also
+        # be called directly. Resolve before dispatch only for external builders
+        # so every path performs the policy conversion exactly once.
+        if builder is not build_native_dataloader:
+            kwargs["dyn_bsz_buffer_size"] = resolve_dyn_bsz_buffer_size(
+                buffer_size=kwargs.get("dyn_bsz_buffer_size", 200),
+                buffer_policy=kwargs.get("dyn_bsz_buffer_policy", "fixed"),
+                max_seq_len=kwargs["max_seq_len"],
+                micro_batch_size=kwargs["micro_batch_size"],
+                runtime=kwargs.get("dyn_bsz_runtime", "main"),
+                count_mode=kwargs.get("dyn_bsz_count_mode", "total"),
+                data_modality=kwargs.get("data_modality", "text"),
+            )
+    return builder(**kwargs)
 
 
 class DistributedDataloader(StatefulDataLoader):
@@ -82,6 +146,8 @@ def build_native_dataloader(
     dyn_bsz_physical_overflow_ratio: float = 1.5,
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
+    dyn_bsz_buffer_policy: Literal["fixed", "context_aware"] = "fixed",
+    data_modality: Literal["text", "multimodal", "diffusion"] = "text",
     num_workers: int = 8,
     worker_num_threads: Optional[int] = None,
     drop_last: bool = True,
@@ -145,6 +211,15 @@ def build_native_dataloader(
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
+
+        dyn_bsz_buffer_policy: ``"fixed"`` preserves ``dyn_bsz_buffer_size``. The
+            opt-in ``"context_aware"`` policy selects a validated buffer size from
+            ``max_seq_len``. It is supported only for text data with main-process
+            dynamic batching, total-token counting, and ``micro_batch_size=1``.
+            The selected value is a per-data-parallel-rank minimum candidate count,
+            not a global count or a hard buffer capacity.
+        data_modality: Coarse data modality used to fail closed when an opt-in
+            batching policy has not been validated for multimodal or diffusion data.
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
@@ -162,6 +237,15 @@ def build_native_dataloader(
 
     if dyn_bsz:
         batching_token_len = micro_batch_size * max_seq_len
+        resolved_dyn_bsz_buffer_size = resolve_dyn_bsz_buffer_size(
+            buffer_size=dyn_bsz_buffer_size,
+            buffer_policy=dyn_bsz_buffer_policy,
+            max_seq_len=max_seq_len,
+            micro_batch_size=micro_batch_size,
+            runtime=dyn_bsz_runtime,
+            count_mode=dyn_bsz_count_mode,
+            data_modality=data_modality,
+        )
         bsz_warmup_steps = int(train_steps * bsz_warmup_ratio)
 
         logger.info_rank0(
@@ -172,7 +256,9 @@ def build_native_dataloader(
             f"global_batch_size: {global_batch_size}, micro_batch_size: {micro_batch_size}, "
             f"num_micro_batch: {num_micro_batch}.\n"
             f"train_steps: {train_steps}, bsz_warmup_steps: {bsz_warmup_steps}, "
-            f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
+            f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}.\n"
+            f"dyn_bsz_buffer_policy: {dyn_bsz_buffer_policy}, "
+            f"dyn_bsz_buffer_size: {resolved_dyn_bsz_buffer_size}."
         )
         dyn_bsz_collate_fn = collate_fn
         dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
@@ -189,7 +275,7 @@ def build_native_dataloader(
         if dyn_bsz_runtime == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=batching_token_len,
-                buffer_size=dyn_bsz_buffer_size,
+                buffer_size=resolved_dyn_bsz_buffer_size,
                 bsz_warmup_steps=bsz_warmup_steps,
                 bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
                 get_length_fn=dyn_bsz_length_fn,
@@ -213,7 +299,7 @@ def build_native_dataloader(
             dataset = DynamicBatchingSizeDataset(
                 dataset=dataset,
                 micro_batch_seq_length=batching_token_len,
-                ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
+                ready_for_micro_batch_threshold=resolved_dyn_bsz_buffer_size,
                 get_length_fn=dyn_bsz_length_fn,
                 physical_token_cap=physical_token_cap,
                 get_physical_length_fn=dyn_bsz_physical_length_fn,

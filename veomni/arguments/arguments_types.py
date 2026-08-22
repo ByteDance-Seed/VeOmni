@@ -16,7 +16,7 @@ import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import ClassVar, Dict, List, Literal, Optional
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -1422,6 +1422,7 @@ class DataArguments:
     """data.* — Dataset paths, tokenization, and batching."""
 
     supports_torch_compile = True
+    data_modality: ClassVar[Literal["text", "multimodal", "diffusion"]] = "text"
 
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
@@ -1459,6 +1460,17 @@ class DataArguments:
     dyn_bsz_buffer_size: int = field(
         default=200,
         metadata={"help": "Buffer size for dynamic batch size."},
+    )
+    dyn_bsz_buffer_policy: Literal["fixed", "context_aware"] = field(
+        default="fixed",
+        metadata={
+            "help": (
+                "Dynamic-batching buffer policy. 'fixed' uses dyn_bsz_buffer_size; "
+                "'context_aware' selects a validated value for 512K or 1M text contexts with "
+                "main-process, total-token, micro-batch-size-one batching. The value is a "
+                "per-data-parallel-rank minimum candidate count."
+            )
+        },
     )
     text_keys: str = field(
         default=None,
