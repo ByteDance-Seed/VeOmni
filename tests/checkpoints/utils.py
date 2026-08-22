@@ -64,6 +64,7 @@ def get_checkpoint_test_command(
     ep_size,
     save_hf_weights=False,
     dp_replicate_size=None,
+    full_determinism=False,
 ):
     config_path = MODEL_CONFIGS[model_name]["config_path"]
     tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
@@ -104,6 +105,12 @@ def get_checkpoint_test_command(
         "--train.checkpoint.save_async True",
         f"--train.checkpoint.save_hf_weights {save_hf_weights}",
     ]
+    # Full determinism is only needed by the HSDP + HF-safetensors case (NPU
+    # replica fp32->bf16 casts must be bit-exact, see #919). Leaving it off by
+    # default keeps the default config (enable_full_determinism: false) covered
+    # and avoids the deterministic-algorithms slowdown on GPU CI.
+    if full_determinism:
+        params.append("--train.enable_full_determinism True")
     # HSDP: split the FSDP dim into (dp_replicate, dp_shard). dp_shard is
     # inferred as dp_size // dp_replicate_size by the argument resolver, and the
     # expert mesh becomes 3D (ep_replicate, ep_fsdp, ep), exercising the
