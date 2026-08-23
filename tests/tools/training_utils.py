@@ -43,12 +43,11 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rotary_pos_emb_implementation": "eager",
     },
     "deepseek_v4": {
-        # DeepSeek-V4 attention is eager-only and its clamped SwiGLU requires
-        # swiglu_limit support that the NPU fused-MoE kernel does not yet have.
-        # The rotary pin is mandatory rather than a preference: V4 has no NPU
-        # patchgen config and device_patch.py disables the npu rotary backend.
+        # DeepSeek-V4 attention, RMSNorm, and partial RoPE remain eager-only on NPU.
+        # The generic NPU rotary backend is incompatible with V4's partial layout.
+        # Routed experts use fused_npu, whose Ascend Triton activation preserves
+        # the model's swiglu_limit clamp.
         "attn_implementation": "eager",
-        "moe_implementation": "eager",
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },

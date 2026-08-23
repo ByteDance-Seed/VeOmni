@@ -17,7 +17,6 @@ from typing import List, Optional
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import torch_npu
 
 from ....distributed.moe.comm import all_to_all
@@ -28,21 +27,15 @@ from ._kernels.kernel.npu_group_gemm import npu_group_gemm
 
 
 def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
-    """gpt-oss-style clamped SwiGLU (DeepSeek-V4).
+    """Run DeepSeek-V4's clamp-aware SwiGLU as one Ascend Triton op."""
+    try:
+        from ._kernels.kernel.npu_clamped_swiglu import npu_triton_clamped_swiglu
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("triton"):
+            raise
+        raise RuntimeError("DeepSeek-V4 fused_npu clamped SwiGLU requires triton-ascend") from exc
 
-    ``torch_npu.npu_swiglu`` is a fused kernel with no clamp support, so this
-    manual (unfused) path is only taken when ``swiglu_limit`` is set -- today
-    that is exclusively DeepSeek-V4's ``PatchedDeepseekV4Experts`` (see
-    ``deepseek_v4_gpu_patch_gen_config.py``). Chunk convention and clamp
-    bounds mirror that class's eager ``_apply_gate`` exactly: first half of
-    the last dim is ``gate`` (clamped to ``max=limit``), second half is ``up``
-    (clamped to ``[-limit, limit]``), activation is SiLU (DeepSeek-V4's
-    ``config.hidden_act``).
-    """
-    gate, up = x.chunk(2, dim=-1)
-    gate = gate.clamp(max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    return F.silu(gate) * up
+    return npu_triton_clamped_swiglu(x, limit)
 
 
 def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:

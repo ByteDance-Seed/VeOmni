@@ -391,11 +391,12 @@ SM90+ `tilelang` indexer and attention implementations. Its MoE path
 uses the independent `moe_implementation` selection and therefore defaults to
 `fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
-directly to `fused_moe_forward(...)` and forwards `swiglu_limit` so backends
-that implement the clamp preserve V4's clamped SwiGLU pre-activation semantics.
-Clamp-aware fused V4 support is GPU-only today (`fused_triton` / `fused_quack`);
-selecting `fused_npu` for a V4 model raises because the NPU fused MoE kernel
-does not yet implement `swiglu_limit`.
+directly to `fused_moe_forward(...)` and forwards `swiglu_limit` so every
+supported fused backend preserves V4's clamped SwiGLU pre-activation semantics.
+On Ascend, `fused_npu` keeps the existing `torch_npu.npu_swiglu` path when no
+limit is configured and uses a forward/backward `triton-ascend` kernel for the
+clamped DeepSeek-V4 path. The import stays lazy, so other NPU MoE models do not
+gain a Triton dependency.
 
 ### Key files
 
