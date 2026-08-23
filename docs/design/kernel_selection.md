@@ -189,7 +189,7 @@ The `npu` chunk-loss binds only to `ForCausalLM` and
 `labels[..., 1:]` shift (incompatible with token-level classification
 labels).
 
-Selecting `liger_kernel` requires that the model's forward pass pass
+Selecting `liger_kernel` requires that the model's forward pass provide
 `hidden_states=` and `weights=self.lm_head.weight` through
 `self.loss_function(...)` — the Liger fused linear+CE kernel does the
 projection itself and has no full logits tensor to fall back on. VeOmni's

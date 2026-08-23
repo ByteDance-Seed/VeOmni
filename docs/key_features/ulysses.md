@@ -2,7 +2,7 @@
 
 ## Table of Contents
 
-- [VeOmni Long-Sequence Training Using Ulysses](#veomni-long-sequence-training-using-ulysses)
+- [Long-Sequence Training Using Ulysses](#long-sequence-training-using-ulysses)
   - [Table of Contents](#table-of-contents)
   - [📚 Overview](#-overview)
   - [🚀 Quick Start](#-quick-start)
@@ -10,8 +10,8 @@
     - [What is all\_to\_all?](#what-is-all_to_all)
     - [DeepSpeed-Ulysses](#deepspeed-ulysses)
     - [Communication Analysis](#communication-analysis)
-  - [⚙️ Core API](#️-core-api)
-  - [🛠️ Support Ulysses for a New Model](#️-support-ulysses-for-a-new-model)
+  - [⚙️ Core API](#-core-api)
+  - [🛠️ Support Ulysses for a New Model](#-support-ulysses-for-a-new-model)
   - [🧩 Implementation Details: Data Pipeline and Model Interaction](#-implementation-details-data-pipeline-and-model-interaction)
   - [🔧 Linear Attention Ulysses (GatedDeltaNet)](#-linear-attention-ulysses-gateddeltanet)
 
@@ -30,10 +30,10 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen25_vl/qwen25_vl.yaml \
     --train.accelerator.ulysses_size 4
 ```
 
-Currently, we have supported Ulysses on the following models:
+VeOmni currently supports Ulysses on the following models:
 
 Language models:
-- LlaMa
+- LLaMA
 - Qwen2.5
 - Qwen3.5 (hybrid softmax + linear attention, requires transformers v5)
 
@@ -42,25 +42,25 @@ Multimodal models:
 - Qwen2.5-VL
 
 ## 🔍 Dive into Ulysses Sequence Parallelism
-Sequence Parallel (SP) serves as a prevalent strategy to handle long sequences that exceed the memory limit of a single GPU. Ulysses use all-to-all collective communication operations to implement SP with attention.
+Sequence Parallel (SP) is a common strategy for handling sequences that exceed the memory limit of a single GPU. Ulysses uses all-to-all collective communication operations to implement SP for attention.
 
 ### What is all_to_all?
 
-Suppose we have P GPUs and a sequence whose shape is [S, H], where N denotes the sequence length and d represents the hidden size (head num \* head dim). Each GPU initially holds the sequence's [S/P, H] partition. After performing an all_to_all communication, each GPU will get a head-splitting sequence whose shape is [S, H/P]. An illustration figure when P = 4 is as follows:
+Suppose we have P GPUs and a sequence whose shape is [S, H], where S denotes the sequence length and H represents the hidden size (number of heads \* head dimension). Each GPU initially holds an [S/P, H] partition. After an all_to_all operation, each GPU holds a head-partitioned sequence whose shape is [S, H/P]. The following figure illustrates the case where P = 4:
 
 ![all_to_all communication](../assets/all_2_all.jpg)
 
 ### DeepSpeed-Ulysses
-We use the all_to_all based sequence parallelism which is proposed by DeepSpeed, named DeepSpeed-Ulysses.
+We use the all-to-all-based sequence parallelism proposed by DeepSpeed, named DeepSpeed-Ulysses.
 
 ![DeepSpeed-Ulysses](../assets/ulysses.png)
 
 (Image source: [DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models](https://arxiv.org/abs/2309.14509))
 
-The figure above shows the overall architecture of DeepSpeed-Ulysses. It only introduces two extra all_to_all communications in the attention module while it does not modify other parts such as normalization and MLP. The input sequence is first evenly divided across the GPUs. The first all_to_all communication gathers the query, key, and value ([S/P, H]) along the sequence dimension and scatters the sequence in the head dimension ([S, H/P]). After the attention part, another all_to_all is performed to transfer the attention output ([S, H/P]) from head-sliced back to sequence-sliced ([S/P, H]). DeepSpeed-Ulysses is attention agnostic since it gathers the whole sequence dimension during attention computation. Thus, it can be easily used with FlashAttention. However, it is constrained by the number of attention heads since the sp size should be divided evenly by head_num. Note that DeepSpeed-Ulysses does not impact the memory consumed by the model states. To support large sequence-length training with a large language model, DeepSpeed-Ulysses can be integrated with ZeRO and FSDP.
+The figure above shows the overall architecture of DeepSpeed-Ulysses. It introduces only two additional all_to_all communications in the attention module and does not modify other components such as normalization and MLP. The input sequence is first divided evenly across the GPUs. The first all_to_all communication gathers the query, key, and value ([S/P, H]) along the sequence dimension and scatters them along the head dimension ([S, H/P]). After attention, another all_to_all transfers the output ([S, H/P]) from head-partitioned form back to sequence-partitioned form ([S/P, H]). DeepSpeed-Ulysses is attention-agnostic because it gathers the entire sequence during attention computation, so it can be used with FlashAttention. However, the number of query heads must be divisible by the Ulysses parallel size; grouped-query attention has additional key/value head constraints. DeepSpeed-Ulysses does not affect memory consumed by model states. For long-sequence training with a large language model, it can be combined with ZeRO or FSDP.
 
 ### Communication Analysis
-The communication volume transmitted per link for an all-to-all for aggregate message of size M over P GPUs can be estimated as $M(P-1)/P^2$. For a transformer model with hidden size H, the sequence length of S, and parallelism degree of P, and let $\mu = (P-1)/P$. DeepSpeed-Ulysses performs all-to-all for the QKV projections with an aggregate message size of $3SH$ before the attention computation, which introduces $3SH\mu/P$ communication volume; and another all-to-all for output context projection with a size Nh for each transformer layer, which introduces $SH\mu/P$ communication volume. Therefore, DeepSpeed sequence parallelism incurs an aggregate communication volume per link of $4SH\mu/P = 4M(P-1)/P^2$.
+The communication volume transmitted per link for an all-to-all operation with an aggregate message of size M over P GPUs can be estimated as $M(P-1)/P^2$. For a transformer model with hidden size H, sequence length S, and parallelism degree P, let $\mu = (P-1)/P$. Before attention, DeepSpeed-Ulysses performs an all-to-all for the QKV projections with an aggregate message size of $3SH$, introducing a communication volume of $3SH\mu/P$. Each transformer layer performs another all-to-all for the output context projection with an aggregate message size of $SH$, introducing $SH\mu/P$. Therefore, DeepSpeed sequence parallelism incurs an aggregate communication volume per link of $4SH\mu/P = 4M(P-1)/P^2$.
 
 ## ⚙️ Core API
 

@@ -682,8 +682,7 @@ diffusers `transformer/config.json` with the VeOmni additions:
   "_class_name": "YourDiffusersTransformerModel",
   "model_type": "YourTransformerModel",
   "condition_model_type": "YourConditionModel",
-  "num_layers": 28,
-  ...
+  "num_layers": 28
 }
 ```
 

@@ -69,7 +69,7 @@ a sound effect, narration over a silent clip, …), use the existing
 
 ```json
 {
-  "videos": [{"frames": [...], "audio": "<wav-bytes>"}],
+  "videos": [{"frames": ["<frame-0>", "<frame-1>"], "audio": "<wav-bytes>"}],
   "audios": ["<voice_query.wav>"],
   "conversations": [
     {"from": "human", "value": "<video>\nDescribe this. Also listen: <audio>"},
@@ -203,7 +203,7 @@ A self-contained smoke test ships at
 3. *(Optional, gated on `QWEN3_OMNI_MODEL_PATH`)* The full
    `process_sample_qwen_omni` pipeline produces an `input_ids` whose
    `<|video_pad|>` and `<|audio_pad|>` token runs are **interleaved** (the
-   standard Qwen3-Omni omni layout), and `video_grid_thw` matches the
+   standard Qwen3-Omni layout), and `video_grid_thw` matches the
    sampled frame count.
 
 Run:

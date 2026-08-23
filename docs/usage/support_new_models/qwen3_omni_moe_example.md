@@ -385,7 +385,7 @@ Add a toy `config.json` (and `preprocessor_config.json` for multimodal) to `test
 
 For omni-modal models, copy `preprocessor_config.json` from the real model as-is — feature extractor parameters (mel bins, sample rate, patch size) are not reducible.
 
-Reference: [tests/toy_config/qwen3omni_toy/](../../../tests/toy_config/qwen3omni_toy/)
+Reference: [tests/toy_config/qwen3omni_toy/config.json](../../../tests/toy_config/qwen3omni_toy/config.json)
 
 #### Dummy Dataset
 

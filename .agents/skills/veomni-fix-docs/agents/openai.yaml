@@ -1,0 +1,4 @@
+interface:
+  display_name: "VeOmni Documentation Fixer"
+  short_description: "Scan and correct VeOmni documentation errors"
+  default_prompt: "Use $veomni-fix-docs to scan VeOmni documentation and fix verified errors."
