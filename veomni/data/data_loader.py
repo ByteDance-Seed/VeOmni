@@ -215,6 +215,13 @@ def build_native_dataloader(
         cp_size = int(getattr(parallel_state, "cp_size", 1))
         debug_sample_alignment = _debug_physical_length_multiple()
         if debug_sample_alignment is not None:
+            ulysses_size = int(getattr(parallel_state, "ulysses_size", parallel_state.sp_size))
+            cp_sample_multiple = 2 * cp_size * ulysses_size
+            if cp_size > 1 and debug_sample_alignment % cp_sample_multiple:
+                raise ValueError(
+                    "VEOMNI_DYN_BSZ_SAMPLE_ALIGNMENT must be divisible by the CP physical sample alignment "
+                    f"{cp_sample_multiple}, got {debug_sample_alignment}"
+                )
             if physical_token_cap is None:
                 physical_token_cap = batching_token_len
             dyn_bsz_physical_length_fn = partial(

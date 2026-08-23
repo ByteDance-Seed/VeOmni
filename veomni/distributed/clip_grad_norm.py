@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
 
+from ..utils.device import get_device_type
 from .fsdp2 import clip_grad_norm as fsdp2_clip_grad_norm
 from .fsdp2.clip_grad_norm import _fsdp_grad_norm_reduce_groups
 from .parallel_state import get_parallel_state
@@ -25,6 +26,7 @@ _GRAD_PARITY_TRACE_GROUPS = (
     "gdn_other",
     "self_attn",
     "router",
+    "mlp_nonrouter",
     "other_norms",
     "embeddings",
     "dense_other",
@@ -68,6 +70,8 @@ def _dense_grad_trace_category(name: str) -> str:
         return "self_attn"
     if ".mlp.gate." in name or ".router." in name:
         return "router"
+    if ".mlp." in name or name.startswith("mlp."):
+        return "mlp_nonrouter"
     if "norm" in name:
         return "other_norms"
     if "embed_tokens" in name or "lm_head" in name:
@@ -94,13 +98,14 @@ def _collect_gdn_grad_parity_trace(model: Any) -> dict[str, Any]:
 
     named: list[tuple[str, torch.Tensor]] = []
     live_gdn = 0
+    misplaced_gdn = 0
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
         gdn_group = _gdn_grad_trace_group(name)
         is_non_extra = non_extra_ids is None or id(param) in non_extra_ids
         if gdn_group is not None and (id(param) in extra_ids or not is_non_extra):
-            raise RuntimeError(f"GDN gradient trace expected a non-extra FSDP parameter, got {name!r}")
+            misplaced_gdn += 1
         if not is_non_extra:
             continue
         grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
@@ -109,13 +114,11 @@ def _collect_gdn_grad_parity_trace(model: Any) -> dict[str, Any]:
         named.append((name, grad.detach()))
         live_gdn += int(gdn_group is not None)
 
-    if live_gdn == 0:
-        raise RuntimeError("GDN gradient trace found no live '.linear_attn.' gradients")
-
-    reference = named[0][1]
-    device = reference.device
-    sum_stats = torch.zeros((len(_GRAD_PARITY_TRACE_GROUPS), 3), device=device, dtype=torch.float32)
+    device = named[0][1].device if named else torch.device(get_device_type())
+    sum_stats = torch.zeros((len(_GRAD_PARITY_TRACE_GROUPS), 2), device=device, dtype=torch.float32)
+    counts = torch.zeros(len(_GRAD_PARITY_TRACE_GROUPS), device=device, dtype=torch.int64)
     max_abs = torch.zeros(len(_GRAD_PARITY_TRACE_GROUPS), device=device, dtype=torch.float32)
+    status = torch.tensor((misplaced_gdn, live_gdn), device=device, dtype=torch.int64)
     group_indices = {group: index for index, group in enumerate(_GRAD_PARITY_TRACE_GROUPS)}
     for name, grad in named:
         norm_sq = torch.linalg.vector_norm(grad, ord=2, dtype=torch.float32).square()
@@ -129,19 +132,29 @@ def _collect_gdn_grad_parity_trace(model: Any) -> dict[str, Any]:
             index = group_indices[group]
             sum_stats[index, 0].add_(norm_sq)
             sum_stats[index, 1].add_(signed_sum)
-            sum_stats[index, 2].add_(float(grad.numel()))
+            counts[index].add_(grad.numel())
             max_abs[index] = torch.maximum(max_abs[index], local_abs_max)
 
     for _, group in _fsdp_grad_norm_reduce_groups(get_parallel_state()):
         if group is not None:
             dist.all_reduce(sum_stats, op=dist.ReduceOp.SUM, group=group)
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
             dist.all_reduce(max_abs, op=dist.ReduceOp.MAX, group=group)
+            dist.all_reduce(status, op=dist.ReduceOp.SUM, group=group)
+
+    # Fail only after every rank has executed the same collectives.  A
+    # rank-local exception here would strand peers in the first all-reduce.
+    if int(status[0].item()) != 0:
+        raise RuntimeError("GDN gradient trace expected all GDN parameters in the non-extra FSDP bucket")
+    if int(status[1].item()) == 0:
+        raise RuntimeError("GDN gradient trace found no live '.linear_attn.' gradients")
 
     sum_stats_cpu = sum_stats.cpu()
+    counts_cpu = counts.cpu()
     max_abs_cpu = max_abs.cpu()
     metrics: dict[str, dict[str, float | int]] = {}
     for index, group in enumerate(_GRAD_PARITY_TRACE_GROUPS):
-        count = int(sum_stats_cpu[index, 2].item())
+        count = int(counts_cpu[index].item())
         if count == 0:
             continue
         metrics[group] = {

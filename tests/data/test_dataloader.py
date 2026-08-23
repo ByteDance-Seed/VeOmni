@@ -294,6 +294,41 @@ def test_debug_sample_alignment_rejects_invalid_values(monkeypatch, value):
         m_dl._debug_physical_length_multiple()
 
 
+def test_debug_sample_alignment_rejects_alignment_smaller_than_cp_padding(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=8, cp_size=4, ulysses_size=2)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+    monkeypatch.setenv("VEOMNI_DYN_BSZ_SAMPLE_ALIGNMENT", "8")
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=32),
+        seed=0,
+    )
+
+    with pytest.raises(ValueError, match="divisible by the CP physical sample alignment 16"):
+        build_dataloader(
+            "native",
+            dataset=dataset,
+            micro_batch_size=1,
+            global_batch_size=2,
+            dataloader_batch_size=1,
+            max_seq_len=32,
+            train_steps=1,
+            num_workers=0,
+            dyn_bsz=True,
+            dyn_bsz_runtime="main",
+            dyn_bsz_count_mode="total",
+            dyn_bsz_buffer_size=1,
+            drop_last=True,
+            prefetch_factor=None,
+            seed=0,
+        )
+
+
 def test_build_dataloader_suppresses_persistent_workers_with_zero_workers(monkeypatch, dummy_dataset_ci):
     import veomni.data.data_loader as m_dl
     import veomni.data.dataset as m_ds
