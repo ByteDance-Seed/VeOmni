@@ -118,7 +118,13 @@ jobs:
           fi
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra gpu --group dev
+          # The L20 runner is SM89, while MagiAttention requires SM90+.
+          # Keep contract tests but skip unsupported source builds.
+          uv sync --frozen --extra gpu --group dev \
+            --no-install-package magi-attention \
+            --no-install-package create-block-mask-cuda \
+            --no-install-package flash-attn-cute \
+            --no-install-package magi-to-hstu-cuda
       - name: Run parallel tests
         # TODO: run all tests under tests/parallel/ulysses after we verify
         #       tests/parallel/ulysses/test_ulysses_async.py still works
@@ -134,6 +140,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
+          uv run --frozen pytest -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -s -x tests/models/test_models_logits_equal_v5.py
           uv run --frozen pytest -s -x tests/models/test_model_forward_no_implicit_sync.py
@@ -160,9 +167,10 @@ jobs:
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
-      - name: Run distributed tests (dummy_forward)
+      - name: Run distributed tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
+          uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -s -x tests/data

@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 from types import SimpleNamespace
 
@@ -29,6 +30,8 @@ from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqe
 from veomni.models.transformers.masking_utils import create_causal_mask
 from veomni.ops.kernels.attention import flash as flash_backend
 from veomni.ops.kernels.attention import flex as flex_backend
+from veomni.ops.kernels.attention import magi as magi_backend
+from veomni.ops.kernels.attention.magi import _fa4_cuda as magi_fa4_backend
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
@@ -182,6 +185,54 @@ class _FakeFlexAttentionModule(nn.Module):
         self.config = SimpleNamespace(_attn_implementation="flex_attention")
 
 
+class _FakeMagiAttentionModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(_attn_implementation="veomni_magi_attention_with_sp")
+
+
+_MAGI_PACKAGE_AVAILABLE = importlib.util.find_spec("magi_attention") is not None
+
+
+def _build_magi_mask(mask_case: str, sequence_length: int, device: torch.device):
+    if mask_case in {"causal", "full"}:
+        ranges = torch.tensor([[0, sequence_length]], device=device, dtype=torch.int32)
+        attn_type_map = torch.tensor([1], device=device, dtype=torch.int32) if mask_case == "causal" else None
+        return magi_backend.MagiAttentionMask(ranges, ranges.clone(), attn_type_map)
+
+    if mask_case != "bagel_mixed":
+        raise ValueError(f"Unsupported mask case: {mask_case}")
+
+    modes = ("causal", "noise", "full", "causal")
+    quarter = sequence_length // 4
+    splits = (quarter, quarter, quarter, sequence_length - 3 * quarter)
+    q_ranges = []
+    k_ranges = []
+    attn_types = []
+    clean_spans = []
+    span_start = 0
+    for length, mode in zip(splits, modes, strict=True):
+        span_end = span_start + length
+        for clean_start, clean_end in clean_spans:
+            q_ranges.append([span_start, span_end])
+            k_ranges.append([clean_start, clean_end])
+            attn_types.append(0)
+
+        q_ranges.append([span_start, span_end])
+        k_ranges.append([span_start, span_end])
+        attn_types.append(1 if mode == "causal" else 0)
+
+        if mode != "noise":
+            clean_spans.append((span_start, span_end))
+        span_start = span_end
+
+    return magi_backend.MagiAttentionMask(
+        q_ranges=torch.tensor(q_ranges, device=device, dtype=torch.int32),
+        k_ranges=torch.tensor(k_ranges, device=device, dtype=torch.int32),
+        attn_type_map=torch.tensor(attn_types, device=device, dtype=torch.int32),
+    )
+
+
 def _sdpa_flash_oracle(query, key, value, attention_mask, **kwargs):
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         output = F.scaled_dot_product_attention(
@@ -197,8 +248,8 @@ def _sdpa_flash_oracle(query, key, value, attention_mask, **kwargs):
 
 
 class AttentionBackendSequenceParallelTest(SequenceParallelTest):
-    def _build_qkv(self, *, sequence_length, head_dim, dtype, seed):
-        group = self._get_process_group()
+    def _build_qkv(self, *, sequence_length, head_dim, dtype, seed, group=None):
+        group = self._get_process_group() if group is None else group
         rank = dist.get_rank(group)
         world_size = dist.get_world_size(group)
         device = torch.device(get_device_type(), rank)
@@ -383,6 +434,81 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             self._assert_qkv_gradients(local, baseline)
         finally:
             flex_backend.get_parallel_state = original_get_parallel_state
+
+    @pytest.mark.skipif(
+        not IS_CUDA_AVAILABLE or not _MAGI_PACKAGE_AVAILABLE or get_torch_device().device_count() < 2,
+        reason="MagiAttention Ulysses parity requires at least 2 supported CUDA devices",
+    )
+    def test_magi_wrapper_matches_non_sp_oracle(self):
+        group = self._get_process_group()
+        rank = dist.get_rank(group)
+        device = torch.device(get_device_type(), rank)
+        kernel_mode = magi_fa4_backend._get_magi_kernel_mode(device)
+        if kernel_mode == magi_fa4_backend._MAGI_KERNEL_UNSUPPORTED:
+            self.skipTest("MagiAttention does not support this GPU architecture")
+        try:
+            magi_fa4_backend._prepare_default_magi_kernel(device)
+        except (ImportError, RuntimeError) as error:
+            self.skipTest(str(error))
+
+        original_get_parallel_state = magi_backend.get_parallel_state
+        try:
+            dtype = torch.bfloat16
+            for mask_idx, mask_case in enumerate(("causal", "full", "bagel_mixed")):
+                group, world_size, device, local_slice, baseline, local, output_gradient = self._build_qkv(
+                    sequence_length=128,
+                    head_dim=64,
+                    dtype=dtype,
+                    seed=9320 + mask_idx,
+                    group=group,
+                )
+                attention_mask = _build_magi_mask(mask_case, 128, device)
+                module = _FakeMagiAttentionModule().to(device)
+
+                magi_backend.get_parallel_state = lambda: SimpleNamespace(
+                    cp_size=1,
+                    ulysses_enabled=False,
+                )
+                baseline_output, baseline_lse = magi_backend.magi_attention_forward(
+                    module,
+                    *baseline,
+                    attention_mask,
+                )
+
+                magi_backend.get_parallel_state = lambda group=group, world_size=world_size: SimpleNamespace(
+                    cp_size=1,
+                    ulysses_enabled=True,
+                    ulysses_group=group,
+                    ulysses_size=world_size,
+                )
+                local_output, local_lse = magi_backend.magi_attention_forward(
+                    module,
+                    *local,
+                    attention_mask,
+                )
+                assert baseline_lse is not None
+                assert local_lse is not None
+
+                torch.testing.assert_close(
+                    sync_tensor(local_output, dim=1),
+                    baseline_output,
+                    rtol=3e-2,
+                    atol=3e-2,
+                    msg=lambda message, dtype=dtype, mask_case=mask_case: (f"{dtype=} {mask_case=} output: {message}"),
+                )
+                torch.testing.assert_close(
+                    sync_tensor(local_lse, dim=2),
+                    baseline_lse,
+                    rtol=3e-2,
+                    atol=3e-2,
+                    msg=lambda message, dtype=dtype, mask_case=mask_case: (f"{dtype=} {mask_case=} LSE: {message}"),
+                )
+
+                baseline_output.backward(output_gradient)
+                local_output.backward(output_gradient[:, local_slice].contiguous())
+                self._assert_qkv_gradients(local, baseline)
+        finally:
+            magi_backend.get_parallel_state = original_get_parallel_state
 
 
 if __name__ == "__main__":

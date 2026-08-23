@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
@@ -150,6 +151,7 @@ def main(
         compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
+    return res
 
 
 _DEFAULT_RTOL = 1e-1
@@ -591,6 +593,44 @@ def test_qwen3vl_parallel_align(
         max_sp_size=max_sp_size,
         train_path=request.getfixturevalue(dataset_fixture),
         extra_args=_QWEN3_VL_CHUNK_MBS_TRAINING_ARGS if chunk_mbs_enabled else None,
+    )
+
+
+def test_qwen3vl_lora_smoke(dummy_qwen3vl_dataset, tmp_path):
+    lora_config_path = tmp_path / "qwen3vl_lora_smoke.yaml"
+    lora_config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "lora_config": {
+                        "rank": 4,
+                        "alpha": 8,
+                        "lora_modules": ["q_proj", "qkv"],
+                    }
+                }
+            }
+        )
+    )
+    results = main(
+        task_name="train_vlm_test",
+        model_name="qwen3vl",
+        config_path="./tests/toy_config/qwen3vl_toy",
+        is_moe=False,
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        train_path=dummy_qwen3vl_dataset,
+        max_sp_size=1,
+        compare_alignment=False,
+        extra_args=[
+            str(lora_config_path),
+            "--train.freeze_vit=True",
+        ],
+    )
+    assert results and all(results.values())
+    assert all(
+        values and torch.isfinite(torch.tensor(values)).all()
+        for result in results.values()
+        for values in result.values()
     )
 
 
