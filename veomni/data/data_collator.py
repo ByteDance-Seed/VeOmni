@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -45,6 +48,23 @@ MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 logger = logging.get_logger(__name__)
 
 _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
+_PARITY_TRACE_KEYS = ("input_ids", "labels", "position_ids", "attention_mask", "ds_idx", "source_id")
+
+
+def _data_parity_trace_limit() -> int:
+    raw = os.environ.get("VEOMNI_DATA_PARITY_TRACE_MICROBATCHES", "0")
+    if not raw.isdecimal():
+        raise ValueError("VEOMNI_DATA_PARITY_TRACE_MICROBATCHES must be a non-negative base-10 integer")
+    return int(raw)
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    host = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(host.dtype).encode())
+    digest.update(json.dumps(list(host.shape), separators=(",", ":")).encode())
+    digest.update(host.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def add_flash_attention_kwargs_from_position_ids(
@@ -331,8 +351,28 @@ class SequenceParallelCollator(DataCollator):
         self.cp_rank = int(getattr(parallel_state, "cp_rank", 0)) if self.cp_size > 1 else 0
         self.ulysses_size = int(getattr(parallel_state, "ulysses_size", self.sp_size))
         self.ulysses_rank = int(getattr(parallel_state, "ulysses_rank", self.sp_rank)) if self.ulysses_size > 1 else 0
+        self.dp_rank = int(getattr(parallel_state, "dp_rank", 0))
+        self._data_parity_trace_limit = _data_parity_trace_limit()
+        self._data_parity_trace_index = 0
         if self.cp_size > 1 and self.metadata_collate_func is not None:
             raise NotImplementedError("Context parallelism currently supports text-only packed batches.")
+
+    def _trace_unsharded_batch(self, batch: Dict[str, Any]) -> None:
+        if self.sp_rank != 0 or self._data_parity_trace_index >= self._data_parity_trace_limit:
+            return
+        tensors = {key: value for key in _PARITY_TRACE_KEYS if isinstance((value := batch.get(key)), torch.Tensor)}
+        labels = tensors.get("labels")
+        payload = {
+            "dp_rank": self.dp_rank,
+            "microbatch_index": self._data_parity_trace_index,
+            "tensor_sha256": {key: _tensor_sha256(value) for key, value in tensors.items()},
+            "tensor_shapes": {key: list(value.shape) for key, value in tensors.items()},
+            "valid_label_tokens": int((labels != IGNORE_INDEX).sum()) if labels is not None else None,
+        }
+        combined = hashlib.sha256(json.dumps(payload["tensor_sha256"], sort_keys=True).encode()).hexdigest()
+        payload["combined_sha256"] = combined
+        print("VEOMNI_DATA_PARITY_TRACE", json.dumps(payload, sort_keys=True), flush=True)
+        self._data_parity_trace_index += 1
 
     def sp_slice(self, key: str, feature: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if isinstance(feature, list):
@@ -381,6 +421,10 @@ class SequenceParallelCollator(DataCollator):
             labels = batch["labels"][..., 1:].contiguous()
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
             batch["labels"] = labels
+
+        # Trace before any SP/CP padding or slicing.  It is opt-in, emits only
+        # hashes/counts, and therefore proves data parity without logging text.
+        self._trace_unsharded_batch(batch)
 
         linear_attn_tail_padding_length = int(batch.pop(_LINEAR_ATTN_TAIL_PADDING_LENGTH, 0))
 

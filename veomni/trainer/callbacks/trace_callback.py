@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import time
 from typing import TYPE_CHECKING, Any, Dict, List
 
@@ -209,6 +210,7 @@ class EnvironMeterCallback(Callback):
     def on_step_end(
         self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
     ) -> None:
+        args: "VeOmniArguments" = self.trainer.args
         delta_time = time.time() - self.start_time
         step_env_metrics = self.trainer.environ_meter.step(
             delta_time,
@@ -231,6 +233,20 @@ class EnvironMeterCallback(Callback):
         if self.trainer.lr_scheduler is not None:
             lr = max(self.trainer.lr_scheduler.get_last_lr())
             step_train_metrics["training/lr"] = lr
+
+        grad_parity_trace = getattr(self.trainer.model, "_veomni_grad_parity_trace", None)
+        if grad_parity_trace is not None:
+            delattr(self.trainer.model, "_veomni_grad_parity_trace")
+            grad_parity_trace.update(
+                {
+                    "global_step": state.global_step,
+                    "training_metrics": {
+                        key.removeprefix("training/"): float(value) for key, value in step_train_metrics.items()
+                    },
+                }
+            )
+            if args.train.global_rank == 0:
+                print("VEOMNI_GRAD_PARITY_TRACE", json.dumps(grad_parity_trace, sort_keys=True), flush=True)
 
         step_env_metrics.update(step_train_metrics)
 

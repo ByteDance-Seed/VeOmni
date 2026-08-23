@@ -243,6 +243,57 @@ def test_build_dataloader_dyn_bsz_physical_overflow_ratio(monkeypatch, dummy_dat
     assert dl.batching_strategy.physical_token_cap == 40
 
 
+@pytest.mark.parametrize(("cp_size", "ulysses_size"), [(1, 4), (2, 2)])
+def test_debug_sample_alignment_makes_cp_and_non_cp_use_one_physical_policy(
+    monkeypatch, dummy_dataset_ci, cp_size, ulysses_size
+):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=4, cp_size=cp_size, ulysses_size=ulysses_size)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+    monkeypatch.setenv("VEOMNI_DYN_BSZ_SAMPLE_ALIGNMENT", "16")
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=32),
+        seed=0,
+    )
+    dl = build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=1,
+        global_batch_size=2,
+        dataloader_batch_size=1,
+        max_seq_len=32,
+        train_steps=1,
+        num_workers=0,
+        dyn_bsz=True,
+        dyn_bsz_runtime="main",
+        dyn_bsz_count_mode="total",
+        dyn_bsz_buffer_size=1,
+        drop_last=True,
+        prefetch_factor=None,
+        seed=0,
+    )
+
+    physical_length_fn = dl.batching_strategy.buffer._get_physical_length_fn
+    assert dl.batching_strategy.physical_token_cap == 32
+    assert physical_length_fn({"attention_mask": torch.ones(1, dtype=torch.long)}) == 16
+    assert physical_length_fn({"attention_mask": torch.ones(17, dtype=torch.long)}) == 32
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "4.0", "true"])
+def test_debug_sample_alignment_rejects_invalid_values(monkeypatch, value):
+    import veomni.data.data_loader as m_dl
+
+    monkeypatch.setenv("VEOMNI_DYN_BSZ_SAMPLE_ALIGNMENT", value)
+    with pytest.raises(ValueError, match="must be a positive base-10 integer"):
+        m_dl._debug_physical_length_multiple()
+
+
 def test_build_dataloader_suppresses_persistent_workers_with_zero_workers(monkeypatch, dummy_dataset_ci):
     import veomni.data.data_loader as m_dl
     import veomni.data.dataset as m_ds

@@ -14,6 +14,7 @@
 
 
 import math
+import os
 from functools import partial
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -49,6 +50,24 @@ def _get_context_parallel_physical_length(sample: Dict[str, Any], *, multiple: i
     """Return the post-collation token count for one CP-packed sample."""
     raw_length = get_length_by_attention_mask_fn(sample)
     return ((raw_length + multiple - 1) // multiple) * multiple
+
+
+def _debug_physical_length_multiple() -> int | None:
+    """Return an opt-in common sample alignment for controlled parity runs.
+
+    Context parallelism pads each packed sample independently, whereas the
+    CP-disabled path normally budgets the unrounded logical length.  That is
+    the right throughput policy for each route, but it can make a same-seed
+    algorithm A/B consume different samples.  This debug-only override lets
+    all compared routes use one physical-length policy without changing model
+    inputs, labels, or the default dataloader behavior.
+    """
+    raw = os.environ.get("VEOMNI_DYN_BSZ_SAMPLE_ALIGNMENT")
+    if raw is None:
+        return None
+    if not raw.isdecimal() or int(raw) <= 0:
+        raise ValueError("VEOMNI_DYN_BSZ_SAMPLE_ALIGNMENT must be a positive base-10 integer")
+    return int(raw)
 
 
 def build_dataloader(dataloader_type: str, **kwargs):
@@ -194,7 +213,19 @@ def build_native_dataloader(
             physical_token_cap = None
             dyn_bsz_physical_length_fn = None
         cp_size = int(getattr(parallel_state, "cp_size", 1))
-        if cp_size > 1:
+        debug_sample_alignment = _debug_physical_length_multiple()
+        if debug_sample_alignment is not None:
+            if physical_token_cap is None:
+                physical_token_cap = batching_token_len
+            dyn_bsz_physical_length_fn = partial(
+                _get_context_parallel_physical_length,
+                multiple=debug_sample_alignment,
+            )
+            logger.warning_rank0(
+                "Use debug dynamic-batching sample alignment --> "
+                f"VEOMNI_DYN_BSZ_SAMPLE_ALIGNMENT={debug_sample_alignment}."
+            )
+        elif cp_size > 1:
             ulysses_size = int(getattr(parallel_state, "ulysses_size", parallel_state.sp_size))
             cp_sample_multiple = 2 * cp_size * ulysses_size
             if physical_token_cap is None:
