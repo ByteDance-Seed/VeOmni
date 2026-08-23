@@ -598,12 +598,19 @@ def prefix_merge_initial_state(
         raise ValueError(f"cp_rank {cp_rank} out of range for cp_size {cp_size}")
     if kvk != k_dim + v_dim:
         raise ValueError(f"hm last dim {kvk} != K+V ({k_dim}+{v_dim})")
-    s = torch.zeros(num_seqs, num_heads, k_dim, v_dim, device=ag_hm.device, dtype=torch.float32)
-    if int(cp_rank) == 0:
-        return s
-    for r in range(int(cp_rank)):
-        he, M = unpack_affine_hm(ag_hm[r], v_dim=v_dim)
-        s = torch.einsum("nhki,nhiv->nhkv", M, s) + he
+    # INV-7 locks the *arithmetic* as well as the buffer dtype.  This helper is
+    # called from the model's mixed-precision autocast region; without the
+    # explicit guard, einsum silently computes the affine prefix in bf16 and
+    # merely casts the result back to fp32 when adding ``he``.  The resulting
+    # recurrent-state error compounds across CP ranks and changes both model
+    # loss and the KCP VJP despite every stored tensor reporting fp32.
+    with torch.autocast(device_type=ag_hm.device.type, enabled=False):
+        s = torch.zeros(num_seqs, num_heads, k_dim, v_dim, device=ag_hm.device, dtype=torch.float32)
+        if int(cp_rank) == 0:
+            return s
+        for r in range(int(cp_rank)):
+            he, M = unpack_affine_hm(ag_hm[r], v_dim=v_dim)
+            s = torch.einsum("nhki,nhiv->nhkv", M, s) + he
     return s
 
 

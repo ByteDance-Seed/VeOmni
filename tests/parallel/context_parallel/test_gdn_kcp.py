@@ -11,6 +11,7 @@ from veomni.distributed.context_parallel.gdn_kcp import (
     local_affine_summary,
     local_affine_summary_fused_torch,
     local_affine_summary_recurrent,
+    pack_affine_hm,
     prefix_merge_initial_state,
     resolve_local_affine_impl,
 )
@@ -458,6 +459,29 @@ def test_prefix_merge_composes_rank_affine_transforms():
     torch.testing.assert_close(rank0, torch.tensor([[[[0.0]]]]))
     torch.testing.assert_close(rank1, torch.tensor([[[[2.0]]]]))
     torch.testing.assert_close(rank2, torch.tensor([[[[19.0]]]]))
+
+
+def test_prefix_merge_keeps_fp32_output_and_vjp_under_active_autocast():
+    torch.manual_seed(20260823)
+    cp_size, num_seqs, num_heads, key_dim, value_dim = 4, 1, 2, 16, 16
+    he = torch.randn(cp_size, num_seqs, num_heads, key_dim, value_dim) * 0.01
+    eye = torch.eye(key_dim).view(1, 1, 1, key_dim, key_dim)
+    matrix = eye + torch.randn(cp_size, num_seqs, num_heads, key_dim, key_dim) * 0.001
+    base = pack_affine_hm(he.float(), matrix.float())
+    upstream = torch.randn(num_seqs, num_heads, key_dim, value_dim)
+
+    oracle_hm = base.detach().clone().requires_grad_(True)
+    oracle = prefix_merge_initial_state(oracle_hm, cp_rank=3, v_dim=value_dim)
+    oracle_grad = torch.autograd.grad(oracle, oracle_hm, upstream)[0]
+
+    candidate_hm = base.detach().clone().requires_grad_(True)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        candidate = prefix_merge_initial_state(candidate_hm, cp_rank=3, v_dim=value_dim)
+    candidate_grad = torch.autograd.grad(candidate, candidate_hm, upstream)[0]
+
+    assert candidate.dtype == torch.float32
+    torch.testing.assert_close(candidate, oracle, rtol=0, atol=0)
+    torch.testing.assert_close(candidate_grad, oracle_grad, rtol=0, atol=0)
 
 
 def test_runtime_identity_seals_lossless_layout_and_ttx_backend():
