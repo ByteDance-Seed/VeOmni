@@ -31,6 +31,38 @@ from veomni.ops.kernels.gdn_kcp_affine_ttx import (
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
+@pytest.mark.parametrize(("raw", "expected"), [(None, 128), ("128", 128), ("256", 256)])
+def test_ttx_backward_chunk_contract(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("VEOMNI_GDN_AFFINE_BWD_CHUNK", raising=False)
+    else:
+        monkeypatch.setenv("VEOMNI_GDN_AFFINE_BWD_CHUNK", raw)
+    assert ttx_bwd_module._bwd_chunk() == expected
+
+
+@pytest.mark.parametrize("raw", ["", "64", "512", "abc", "128.0"])
+def test_ttx_backward_chunk_contract_rejects_unsupported_values(monkeypatch, raw):
+    monkeypatch.setenv("VEOMNI_GDN_AFFINE_BWD_CHUNK", raw)
+    with pytest.raises(ValueError, match="must be 128 or 256"):
+        ttx_bwd_module._bwd_chunk()
+
+
+@pytest.mark.parametrize(("raw", "expected"), [(None, 8), ("8", 8), ("32", 32)])
+def test_ttx_backward_replay_column_tile_contract(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("VEOMNI_GDN_AFFINE_REPLAY_COLUMN_TILE", raising=False)
+    else:
+        monkeypatch.setenv("VEOMNI_GDN_AFFINE_REPLAY_COLUMN_TILE", raw)
+    assert ttx_bwd_module._fwd_coltile_bc() == expected
+
+
+@pytest.mark.parametrize("raw", ["", "4", "16", "64", "abc", "8.0"])
+def test_ttx_backward_replay_column_tile_contract_rejects_unsupported_values(monkeypatch, raw):
+    monkeypatch.setenv("VEOMNI_GDN_AFFINE_REPLAY_COLUMN_TILE", raw)
+    with pytest.raises(ValueError, match="must be 8 or 32"):
+        ttx_bwd_module._fwd_coltile_bc()
+
+
 def test_all_gather_affine_hm_propagates_zero_grad_through_participation_token_cp1():
     source = torch.tensor(3.0, requires_grad=True)
     participation = source * 0

@@ -21,6 +21,7 @@ details and cannot be selected by production configuration.
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -84,11 +85,25 @@ def _resolve_segment_bounds(
 
 
 def _bwd_chunk() -> int:
-    return 128
+    raw = os.environ.get("VEOMNI_GDN_AFFINE_BWD_CHUNK", "128").strip()
+    try:
+        chunk = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"VEOMNI_GDN_AFFINE_BWD_CHUNK must be 128 or 256, got {raw!r}") from exc
+    if chunk not in (128, 256):
+        raise ValueError(f"VEOMNI_GDN_AFFINE_BWD_CHUNK must be 128 or 256, got {chunk}")
+    return chunk
 
 
 def _fwd_coltile_bc() -> int:
-    return 8
+    raw = os.environ.get("VEOMNI_GDN_AFFINE_REPLAY_COLUMN_TILE", "8").strip()
+    try:
+        column_tile = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"VEOMNI_GDN_AFFINE_REPLAY_COLUMN_TILE must be 8 or 32, got {raw!r}") from exc
+    if column_tile not in (8, 32):
+        raise ValueError(f"VEOMNI_GDN_AFFINE_REPLAY_COLUMN_TILE must be 8 or 32, got {column_tile}")
+    return column_tile
 
 
 if _TRITON_OK:
