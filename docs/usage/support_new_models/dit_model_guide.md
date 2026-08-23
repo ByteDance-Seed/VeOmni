@@ -677,15 +677,16 @@ train:
 And create `configs/model_configs/your_model/your_model.json` mirroring the
 diffusers `transformer/config.json` with the VeOmni additions:
 
-```json5
+```json
 {
   "_class_name": "YourDiffusersTransformerModel",
   "model_type": "YourTransformerModel",
   "condition_model_type": "YourConditionModel",
-  "num_layers": 28,
-  // Copy the remaining fields from the Diffusers transformer config.
+  "num_layers": 28
 }
 ```
+
+Copy the remaining fields from the Diffusers transformer config into the same JSON object.
 
 ---
 

@@ -12,7 +12,6 @@ docutils==0.22.4
 idna==3.18
 imagesize==2.0.0
 Jinja2==3.1.6
-Markdown==3.10.2
 markdown-it-py==4.2.0
 MarkupSafe==3.0.3
 mdit-py-plugins==0.6.1
@@ -28,7 +27,6 @@ soupsieve==2.9.1
 sphinxcontrib-applehelp==2.0.0
 sphinxcontrib-devhelp==2.0.0
 sphinxcontrib-htmlhelp==2.1.0
-sphinxcontrib-jquery==4.1
 sphinxcontrib-jsmath==1.0.1
 sphinxcontrib-qthelp==2.0.0
 sphinxcontrib-serializinghtml==2.0.0
