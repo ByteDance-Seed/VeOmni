@@ -4,7 +4,7 @@ VeOmni uses [uv](https://docs.astral.sh/uv/) for dependency management. This doc
 
 ## uv Version
 
-`pyproject.toml` declares a **range** (`>=0.9.8,<0.12`); the Dockerfiles and
+`pyproject.toml` declares a **range** (`>=0.9.8,<0.13`); the Dockerfiles and
 CI install a concrete pin and use `--locked` / `--frozen` for reproducibility.
 **Every concrete uv pin must stay inside the pyproject range.**
 

@@ -71,7 +71,7 @@ Domain knowledge that agents should read before making changes:
 
 | File | Content |
 |------|---------|
-| `constraints.md` | 22 hard constraints — violating any one causes bugs or crashes |
+| `constraints.md` | Hard constraints whose violation causes bugs or crashes |
 | `architecture.md` | Module map, trainer hierarchy, data flow, model loading flow, test mapping |
 | `multimodal_metadata.md` | Canonical multimodal metadata keys and ownership boundaries |
 | `uv.md` | Dependency management architecture (uv, extras, lockfile, torch sources) |

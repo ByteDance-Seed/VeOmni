@@ -111,8 +111,13 @@ def compress_packed_windows(
         window_kv = current_kv
         window_gate = current_gate
 
+    # `sum` follows autocast's fp32_set_opt_dtype policy, so an implicit `dtype`
+    # silently returns fp32 under autocast and leaks out through `kv_norm` into
+    # the bf16-only TileLang kernels. Accumulate in fp32 explicitly, cast back.
     compressed = kv_norm(
-        (window_kv * window_gate.softmax(dim=1, dtype=torch.float32).to(window_kv.dtype)).sum(dim=1)
+        (window_kv * window_gate.softmax(dim=1, dtype=torch.float32).to(window_kv.dtype))
+        .sum(dim=1, dtype=torch.float32)
+        .to(window_kv.dtype)
     ).unsqueeze(0)
     window_positions = position_ids[0, window_starts]
     cos, sin = rotary_emb(
