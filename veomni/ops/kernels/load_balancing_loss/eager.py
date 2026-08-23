@@ -23,6 +23,50 @@ testing.
 from typing import Optional, Union
 
 import torch
+import torch.distributed as dist
+
+
+class _DifferentiableAllReduceSum(torch.autograd.Function):
+    """Sum a tensor across ``group`` with the matching autograd collective.
+
+    Every sequence-parallel rank consumes the same global auxiliary loss.  The
+    backward therefore has to sum the loss gradient from every rank before the
+    later FSDP gradient average.  An in-place, non-autograd ``all_reduce`` here
+    would under-scale the router gradient by the sequence-parallel world size.
+    """
+
+    @staticmethod
+    def forward(ctx, value: torch.Tensor, group) -> torch.Tensor:
+        ctx.group = group
+        result = value.clone()
+        dist.all_reduce(result, group=group)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input = grad_output.contiguous().clone()
+        dist.all_reduce(grad_input, group=ctx.group)
+        return grad_input, None
+
+
+def _global_sequence_parallel_stats(
+    expert_count: torch.Tensor,
+    router_prob_sum: torch.Tensor,
+    total_weight: torch.Tensor,
+    group,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reduce the sufficient statistics for the nonlinear MoE aux loss."""
+    if group is None or not dist.is_available() or not dist.is_initialized():
+        return expert_count, router_prob_sum, total_weight
+    if dist.get_world_size(group) == 1:
+        return expert_count, router_prob_sum, total_weight
+
+    global_expert_count = expert_count.detach().clone()
+    global_total_weight = total_weight.detach().clone()
+    dist.all_reduce(global_expert_count, group=group)
+    dist.all_reduce(global_total_weight, group=group)
+    global_router_prob_sum = _DifferentiableAllReduceSum.apply(router_prob_sum, group)
+    return global_expert_count, global_router_prob_sum, global_total_weight
 
 
 def load_balancing_loss_pytorch(
@@ -30,6 +74,7 @@ def load_balancing_loss_pytorch(
     num_experts: Optional[int] = None,
     top_k: int = 2,
     attention_mask: Optional[torch.Tensor] = None,
+    group=None,
 ) -> Union[torch.Tensor, int]:
     """Pure-PyTorch load balancing loss for Mixture-of-Experts models.
 
@@ -60,6 +105,10 @@ def load_balancing_loss_pytorch(
             and the router probability sum. Named ``attention_mask`` (rather
             than ``loss_mask``) for compatibility with the HuggingFace
             ``load_balancing_loss_func`` API.
+        group: Optional unified sequence-parallel process group.  When its
+            world size is greater than one, the expert counts, router
+            probability sums, and token count are reduced before evaluating
+            the nonlinear auxiliary loss.
 
     Returns:
         Scalar float32 loss tensor, or ``0`` when *gate_logits* is ``None``
@@ -106,6 +155,13 @@ def load_balancing_loss_pytorch(
             expert_count.scatter_add_(0, flat_selected, ones)
 
             total_weight = total_weight + layer_logits.shape[0]
+
+    expert_count, router_prob_sum, total_weight = _global_sequence_parallel_stats(
+        expert_count,
+        router_prob_sum,
+        total_weight,
+        group,
+    )
 
     if total_weight == 0:
         return torch.tensor(0.0, device=compute_device)

@@ -85,9 +85,18 @@ config = PatchConfig(
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
+config.add_import("os", is_from_import=False)
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import(
+    "veomni.distributed.sequence_parallel.comm",
+    names=["get_unified_sequence_parallel_group"],
+)
+config.add_import(
+    "veomni.ops.kernels.load_balancing_loss.eager",
+    names=["load_balancing_loss_pytorch"],
+)
 config.add_import(
     "veomni.ops.kernels.attention._replicated_dummy",
     names=[
@@ -123,12 +132,22 @@ config.add_import(
 )
 config.add_import(
     "veomni.distributed.context_parallel.gdn_kcp",
-    names=["kcp_plan_requires_affine_scan", "prepare_kcp_ttx_warmup", "resolve_kcp_initial_state"],
+    names=[
+        "get_kcp_affine_backend_identity",
+        "kcp_plan_requires_affine_scan",
+        "prepare_kcp_affine_summary",
+        "resolve_kcp_initial_state",
+    ],
 )
 config.add_import("veomni.distributed.context_parallel.gdn_runtime", names=["make_gdn_cp_runtime_observer"])
 config.add_import(
     "veomni.ops.kernels.gated_delta_rule.backend_adapter",
-    names=["call_chunk_gated_delta_rule", "prepare_gated_delta_rule_qk", "requires_chunked_varlen_metadata"],
+    names=[
+        "call_chunk_gated_delta_rule",
+        "prepare_gated_delta_rule_qk",
+        "requires_chunked_varlen_metadata",
+        "resolve_kcp_affine_implementation",
+    ],
 )
 config.add_import(
     "veomni.distributed.context_parallel.packed_sharding",

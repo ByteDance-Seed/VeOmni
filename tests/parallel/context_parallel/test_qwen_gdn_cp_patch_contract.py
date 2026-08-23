@@ -76,7 +76,11 @@ def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
     block = _function_block(source, "qwen3_5_gated_deltanet_forward_patched")
     assert '("state_passing_lossless", "kcp")' in block
     assert "resolve_kcp_initial_state(" in block
-    assert 'affine_impl="ttx_bc8_m1"' in block
+    assert "cu_seqlens_list=aligned_host_cu" in block
+    assert "kcp_affine_impl = resolve_kcp_affine_implementation(backend_impl)" in block
+    assert "kcp_affine_backend = get_kcp_affine_backend_identity(kcp_affine_impl)" in block
+    assert "affine_impl=kcp_affine_impl" in block
+    assert 'affine_impl="ttx_bc8_m1"' not in block
     assert block.index("physical_to_owned(") < block.index("resolve_kcp_initial_state(")
     assert block.index("align_gdn_varlen_chunks(") < block.index("prepare_gated_delta_rule_qk(")
     assert block.index("prepare_gated_delta_rule_qk(") < block.index("resolve_kcp_initial_state(")
@@ -117,6 +121,23 @@ def test_npu_gdn_mojo_routes_share_external_qk_norm(relative_path: str):
 def test_moe_npu_patchgen_imports_shared_external_qk_norm_contract():
     source = (ROOT / "veomni/models/transformers/qwen3_5_moe/qwen3_5_moe_npu_patch_gen_config.py").read_text()
     assert '"prepare_gated_delta_rule_qk"' in source
+    assert '"resolve_kcp_affine_implementation"' in source
+    assert '"prepare_kcp_affine_summary"' in source
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "veomni/models/transformers/qwen3_5/generated/patched_modeling_qwen3_5_npu.py",
+        "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
+    ],
+)
+def test_generated_npu_kcp_affine_tracks_the_selected_gdr_backend(relative_path: str):
+    source = (ROOT / relative_path).read_text()
+    assert "kcp_affine_impl = resolve_kcp_affine_implementation(backend_impl)" in source
+    assert "affine_impl=kcp_affine_impl" in source
+    assert "prepare_kcp_affine_summary(" in source
+    assert 'affine_impl="ttx_bc8_m1"' not in source
 
 
 @pytest.mark.parametrize(
@@ -495,7 +516,12 @@ def test_dummy_checkpoint_helper_eval_path_preserves_module_hooks():
 def test_qwen35_moe_aux_loss_consumes_rank_local_router_mask(relative_path: str):
     source = (ROOT / relative_path).read_text()
     assert source.count('router_attention_mask = kwargs.pop("router_attention_mask", attention_mask)') == 2
-    assert source.count("                router_attention_mask,\n") == 4
+    # Each of the two LM forwards now has three correctness-preserving paths:
+    # unified-SP global sufficient statistics, configured VeOmni backend, and
+    # the single-rank Transformers fallback.  All must consume the rank-local
+    # router mask produced before decoder dispatch.
+    assert source.count("                router_attention_mask,\n") == 6
+    assert source.count("                    group=sp_group,\n") == 2
 
 
 @pytest.mark.parametrize(

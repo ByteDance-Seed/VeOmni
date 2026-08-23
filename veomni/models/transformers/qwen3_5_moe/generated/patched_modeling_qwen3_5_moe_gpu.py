@@ -57,6 +57,7 @@
 # ==============================================================================
 
 import itertools
+import os
 from collections.abc import Callable
 
 # Additional imports for patches
@@ -122,6 +123,7 @@ from veomni.distributed.context_parallel.packed_sharding import (
 )
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
+from veomni.distributed.sequence_parallel.comm import get_unified_sequence_parallel_group
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.ops.kernels.attention._replicated_dummy import (
     _DUMMY_SP_TOKEN,
@@ -130,6 +132,7 @@ from veomni.ops.kernels.attention._replicated_dummy import (
     is_replicated_dummy_sequence_parallel,
     reject_public_sequence_parallel_bypass,
 )
+from veomni.ops.kernels.load_balancing_loss.eager import load_balancing_loss_pytorch
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
@@ -3050,7 +3053,20 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         aux_loss = None
         if output_router_logits:
             # Modification: OpSlot guard for load-balancing loss.
-            if veomni_load_balancing_loss.use_non_eager_impl:
+            sp_group = get_unified_sequence_parallel_group()
+            if sp_group is not None and dist.get_world_size(sp_group) > 1:
+                # The Switch-style aux objective is nonlinear in expert counts and
+                # router-probability sums.  Computing it independently on each
+                # sequence shard makes the objective topology-dependent.  Reduce
+                # the sufficient statistics over Ulysses x CP instead.
+                aux_loss = load_balancing_loss_pytorch(
+                    outputs.router_logits,
+                    self.config.num_experts,
+                    self.config.num_experts_per_tok,
+                    router_attention_mask,
+                    group=sp_group,
+                )
+            elif veomni_load_balancing_loss.use_non_eager_impl:
                 aux_loss = veomni_load_balancing_loss(
                     outputs.router_logits,
                     self.config.num_experts,
@@ -3065,7 +3081,20 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
                     router_attention_mask,
                 )
             if labels is not None:
-                loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
+                text_ce = loss
+                aux_contribution = self.config.router_aux_loss_coef * aux_loss.to(loss.device)
+                loss = loss + aux_contribution
+                if os.environ.get("VEOMNI_MOE_AUX_TRACE") == "1":
+                    print(
+                        "VEOMNI_MOE_AUX_TRACE"
+                        f" rank={dist.get_rank() if dist.is_initialized() else 0}"
+                        f" text_ce={float(text_ce.detach().float())}"
+                        f" aux_global={float(aux_loss.detach().float())}"
+                        f" coef={self.config.router_aux_loss_coef}"
+                        f" aux_contribution={float(aux_contribution.detach().float())}"
+                        f" total={float(loss.detach().float())}",
+                        flush=True,
+                    )
 
         return MoeCausalLMOutputWithLogProbs(
             loss=loss,
@@ -3204,7 +3233,16 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         aux_loss = None
         if kwargs.get("output_router_logits", False):
             # Modification: OpSlot guard for load-balancing loss.
-            if veomni_load_balancing_loss.use_non_eager_impl:
+            sp_group = get_unified_sequence_parallel_group()
+            if sp_group is not None and dist.get_world_size(sp_group) > 1:
+                aux_loss = load_balancing_loss_pytorch(
+                    outputs.router_logits,
+                    self.config.text_config.num_experts,
+                    self.config.text_config.num_experts_per_tok,
+                    router_attention_mask,
+                    group=sp_group,
+                )
+            elif veomni_load_balancing_loss.use_non_eager_impl:
                 aux_loss = veomni_load_balancing_loss(
                     outputs.router_logits,
                     self.config.text_config.num_experts,
@@ -3219,7 +3257,20 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
                     router_attention_mask,
                 )
             if labels is not None:
-                loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+                text_ce = loss
+                aux_contribution = self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+                loss = loss + aux_contribution
+                if os.environ.get("VEOMNI_MOE_AUX_TRACE") == "1":
+                    print(
+                        "VEOMNI_MOE_AUX_TRACE"
+                        f" rank={dist.get_rank() if dist.is_initialized() else 0}"
+                        f" text_ce={float(text_ce.detach().float())}"
+                        f" aux_global={float(aux_loss.detach().float())}"
+                        f" coef={self.config.text_config.router_aux_loss_coef}"
+                        f" aux_contribution={float(aux_contribution.detach().float())}"
+                        f" total={float(loss.detach().float())}",
+                        flush=True,
+                    )
 
         return Qwen3_5MoeCausalLMOutputWithLogProbs(
             loss=loss,

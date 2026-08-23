@@ -497,6 +497,28 @@ def test_runtime_identity_seals_lossless_layout_and_ttx_backend():
     assert snapshot.as_dict()["balanced"] is True
 
 
+@pytest.mark.parametrize(
+    "affine_backend",
+    ["", "ttx", "external:", "external:mojo", "external::identity", "external:mojo:", "external:mojo:bad identity"],
+)
+def test_runtime_identity_rejects_malformed_kcp_affine_backend(affine_backend):
+    global_plan = build_gdn_lossless_plan([256], cp_size=4, ulysses_size=1)
+    runtime = GdnLosslessRuntimePlan(global_plan=global_plan, local=global_plan.rank_plan(2))
+    with pytest.raises(ValueError, match="external:<provider>:<identity>"):
+        make_gdn_cp_runtime_observer("kcp", plan=runtime, affine_backend=affine_backend)
+
+
+def test_runtime_identity_accepts_attested_external_kcp_affine_backend():
+    global_plan = build_gdn_lossless_plan([256], cp_size=4, ulysses_size=1)
+    runtime = GdnLosslessRuntimePlan(global_plan=global_plan, local=global_plan.rank_plan(2))
+    observer = make_gdn_cp_runtime_observer(
+        "kcp",
+        plan=runtime,
+        affine_backend="external:mojo:opset:source-set-sha256:0123456789abcdef",
+    )
+    assert observer.snapshot().identity.affine_backend == ("external:mojo:opset:source-set-sha256:0123456789abcdef")
+
+
 def test_affine_collective_bytes_do_not_depend_on_sequence_length():
     expected = 8 * 2 * 4 * (3 + 4) * 4
     assert assert_kcp_comm_bytes_independent_of_seq(cp_size=8, num_heads=2, k_dim=4, v_dim=3) == expected

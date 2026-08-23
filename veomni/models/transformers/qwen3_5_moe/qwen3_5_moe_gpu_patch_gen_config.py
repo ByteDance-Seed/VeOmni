@@ -24,6 +24,7 @@ Patches applied:
 4. Fused loss + aux_loss in ForConditionalGeneration.
 """
 
+import os
 from copy import copy
 from dataclasses import dataclass
 from functools import partial
@@ -82,9 +83,18 @@ config = PatchConfig(
 
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
+config.add_import("os", is_from_import=False)
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import(
+    "veomni.distributed.sequence_parallel.comm",
+    names=["get_unified_sequence_parallel_group"],
+)
+config.add_import(
+    "veomni.ops.kernels.load_balancing_loss.eager",
+    names=["load_balancing_loss_pytorch"],
+)
 config.add_import(
     "veomni.ops.kernels.attention._replicated_dummy",
     names=[
@@ -189,6 +199,8 @@ gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
 gather_outputs = None
 slice_input_tensor = None
+load_balancing_loss_pytorch = None
+get_unified_sequence_parallel_group = None
 veomni_rms_norm_gated = None  # OpSlot, declared in post-import block above
 veomni_causal_conv1d = None  # OpSlot, declared in post-import block above
 veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block above
@@ -996,7 +1008,20 @@ def qwen3_5_moe_forcausallm_forward_patched(
     aux_loss = None
     if output_router_logits:
         # Modification: OpSlot guard for load-balancing loss.
-        if veomni_load_balancing_loss.use_non_eager_impl:
+        sp_group = get_unified_sequence_parallel_group()
+        if sp_group is not None and dist.get_world_size(sp_group) > 1:
+            # The Switch-style aux objective is nonlinear in expert counts and
+            # router-probability sums.  Computing it independently on each
+            # sequence shard makes the objective topology-dependent.  Reduce
+            # the sufficient statistics over Ulysses x CP instead.
+            aux_loss = load_balancing_loss_pytorch(
+                outputs.router_logits,
+                self.config.num_experts,
+                self.config.num_experts_per_tok,
+                router_attention_mask,
+                group=sp_group,
+            )
+        elif veomni_load_balancing_loss.use_non_eager_impl:
             aux_loss = veomni_load_balancing_loss(
                 outputs.router_logits,
                 self.config.num_experts,
@@ -1011,7 +1036,20 @@ def qwen3_5_moe_forcausallm_forward_patched(
                 router_attention_mask,
             )
         if labels is not None:
-            loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
+            text_ce = loss
+            aux_contribution = self.config.router_aux_loss_coef * aux_loss.to(loss.device)
+            loss = loss + aux_contribution
+            if os.environ.get("VEOMNI_MOE_AUX_TRACE") == "1":
+                print(
+                    "VEOMNI_MOE_AUX_TRACE"
+                    f" rank={dist.get_rank() if dist.is_initialized() else 0}"
+                    f" text_ce={float(text_ce.detach().float())}"
+                    f" aux_global={float(aux_loss.detach().float())}"
+                    f" coef={self.config.router_aux_loss_coef}"
+                    f" aux_contribution={float(aux_contribution.detach().float())}"
+                    f" total={float(loss.detach().float())}",
+                    flush=True,
+                )
 
     return MoeCausalLMOutputWithLogProbs(
         loss=loss,
@@ -1105,7 +1143,16 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     aux_loss = None
     if kwargs.get("output_router_logits", False):
         # Modification: OpSlot guard for load-balancing loss.
-        if veomni_load_balancing_loss.use_non_eager_impl:
+        sp_group = get_unified_sequence_parallel_group()
+        if sp_group is not None and dist.get_world_size(sp_group) > 1:
+            aux_loss = load_balancing_loss_pytorch(
+                outputs.router_logits,
+                self.config.text_config.num_experts,
+                self.config.text_config.num_experts_per_tok,
+                router_attention_mask,
+                group=sp_group,
+            )
+        elif veomni_load_balancing_loss.use_non_eager_impl:
             aux_loss = veomni_load_balancing_loss(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
@@ -1120,7 +1167,20 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
                 router_attention_mask,
             )
         if labels is not None:
-            loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+            text_ce = loss
+            aux_contribution = self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+            loss = loss + aux_contribution
+            if os.environ.get("VEOMNI_MOE_AUX_TRACE") == "1":
+                print(
+                    "VEOMNI_MOE_AUX_TRACE"
+                    f" rank={dist.get_rank() if dist.is_initialized() else 0}"
+                    f" text_ce={float(text_ce.detach().float())}"
+                    f" aux_global={float(aux_loss.detach().float())}"
+                    f" coef={self.config.text_config.router_aux_loss_coef}"
+                    f" aux_contribution={float(aux_contribution.detach().float())}"
+                    f" total={float(loss.detach().float())}",
+                    flush=True,
+                )
 
     return Qwen3_5MoeCausalLMOutputWithLogProbs(
         loss=loss,

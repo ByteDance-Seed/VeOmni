@@ -22,6 +22,7 @@ logging or metrics stack.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
 
 
 GdnCpImplementation = Literal["state_passing_lossless", "kcp"]
+
+_EXTERNAL_AFFINE_BACKEND = re.compile(r"external:[A-Za-z0-9_.-]+:[^\s:][^\s]*\Z")
 
 
 class GdnCpOperation(str, Enum):
@@ -72,7 +75,13 @@ class GdnCpRuntimeIdentity:
         if self.cp_size < 1 or not 0 <= self.cp_rank < self.cp_size:
             raise ValueError(f"invalid CP identity: size={self.cp_size}, rank={self.cp_rank}")
         if self.implementation == "kcp" and self.affine_backend != "ttx_bc8_m1":
-            raise ValueError("KCP runtime identity requires affine_backend='ttx_bc8_m1'")
+            if (
+                not isinstance(self.affine_backend, str)
+                or _EXTERNAL_AFFINE_BACKEND.fullmatch(self.affine_backend) is None
+            ):
+                raise ValueError(
+                    "KCP runtime identity requires affine_backend='ttx_bc8_m1' or 'external:<provider>:<identity>'"
+                )
         if self.implementation == "state_passing_lossless" and self.affine_backend is not None:
             raise ValueError("state_passing_lossless does not have an affine backend")
 
@@ -195,6 +204,7 @@ def make_gdn_cp_runtime_observer(
     implementation: GdnCpImplementation,
     *,
     plan: GdnLosslessRuntimePlan,
+    affine_backend: str | None = None,
 ) -> GdnCpRuntimeObserver:
     """Create an observer bound to the validated ownership plan."""
     identity = GdnCpRuntimeIdentity(
@@ -202,7 +212,9 @@ def make_gdn_cp_runtime_observer(
         ownership_plan_hash=plan.plan_hash,
         cp_size=plan.cp_size,
         cp_rank=plan.cp_rank,
-        affine_backend="ttx_bc8_m1" if implementation == "kcp" else None,
+        affine_backend=("ttx_bc8_m1" if affine_backend is None else affine_backend)
+        if implementation == "kcp"
+        else None,
     )
     return GdnCpRuntimeObserver(identity)
 

@@ -38,6 +38,7 @@ references; production dispatch never silently falls back to them.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -375,9 +376,29 @@ def resolve_local_affine_impl(name: Optional[str] = None) -> str:
         return "fused_torch"
     if key in ("ttx", "npu", "ttx_bc8_m1"):
         return "ttx"
+    if key.startswith("external:") and key.removeprefix("external:"):
+        return key
     raise ValueError(
-        f"Unknown KCP affine implementation {name!r}. Expected 'ttx_bc8_m1', 'torch_reference', or 'eager'."
+        f"Unknown KCP affine implementation {name!r}. Expected 'ttx_bc8_m1', 'external:<provider>', "
+        "'torch_reference', or 'eager'."
     )
+
+
+def get_kcp_affine_backend_identity(affine_impl: str) -> str:
+    """Return the immutable runtime identity for one affine selector."""
+
+    kind = resolve_local_affine_impl(affine_impl)
+    if kind == "ttx":
+        return "ttx_bc8_m1"
+    if kind.startswith("external:"):
+        from veomni.ops.kernels.gated_delta_rule.affine_provider import (
+            get_external_kcp_affine_summary_identity,
+        )
+
+        implementation = kind.removeprefix("external:")
+        identity = get_external_kcp_affine_summary_identity(implementation)
+        return f"external:{implementation}:{identity}"
+    return kind
 
 
 def local_affine_summary(
@@ -387,6 +408,7 @@ def local_affine_summary(
     beta: Tensor,
     *,
     cu_seqlens: Optional[Tensor] = None,
+    cu_seqlens_list: Sequence[int] | None = None,
     use_qk_l2norm: bool = True,
     eps: float = 1e-6,
     impl: Optional[str] = None,
@@ -428,6 +450,22 @@ def local_affine_summary(
                 f"KCP ttx_bc8_m1 failed; refusing a silent torch fallback. {type(exc).__name__}: {exc}"
             ) from exc
         return ensure_affine_hm_fp32(hm, where="ttx_local_affine_summary")
+    if kind.startswith("external:"):
+        from veomni.ops.kernels.gated_delta_rule.affine_provider import external_kcp_affine_summary
+
+        implementation = kind.removeprefix("external:")
+        hm = external_kcp_affine_summary(
+            key,
+            value,
+            g,
+            beta,
+            implementation=implementation,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_list=cu_seqlens_list,
+            use_qk_l2norm=use_qk_l2norm,
+            eps=eps,
+        )
+        return ensure_affine_hm_fp32(hm, where=f"external_kcp_affine_summary[{implementation}]")
     raise AssertionError(f"unreachable KCP affine implementation {kind!r}")
 
 
@@ -443,6 +481,13 @@ def _validate_local_affine_preflight(
     """Run rank-local, side-effect-free validation before the readiness collective."""
 
     kind = resolve_local_affine_impl(affine_impl)
+    if kind.startswith("external:"):
+        from veomni.ops.kernels.gated_delta_rule.affine_provider import (
+            get_external_kcp_affine_summary_identity,
+        )
+
+        get_external_kcp_affine_summary_identity(kind.removeprefix("external:"))
+        return
     if kind != "ttx":
         return
     from veomni.ops.kernels.gdn_kcp_affine_ttx import (
@@ -505,6 +550,66 @@ def prepare_kcp_ttx_warmup(
     if int(status.item()) != 0:
         detail = f" local_error={type(local_error).__name__}: {local_error}" if local_error else ""
         raise RuntimeError(f"coordinated KCP TTX warmup failed on at least one CP rank.{detail}")
+
+
+def prepare_kcp_affine_summary(
+    affine_impl: str,
+    *,
+    device: torch.device,
+    num_heads: int,
+    key_dim: int,
+    value_dim: int,
+    key_dtype: torch.dtype,
+    value_dtype: torch.dtype,
+    g_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    cp_group: ProcessGroup,
+    reference: Tensor,
+) -> None:
+    """Prepare the selected affine provider before decoder checkpointing."""
+
+    kind = resolve_local_affine_impl(affine_impl)
+    if kind == "ttx":
+        prepare_kcp_ttx_warmup(
+            device=device,
+            num_heads=num_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            key_dtype=key_dtype,
+            value_dtype=value_dtype,
+            g_dtype=g_dtype,
+            beta_dtype=beta_dtype,
+            cp_group=cp_group,
+            reference=reference,
+        )
+        return
+    if not kind.startswith("external:"):
+        return
+
+    from veomni.ops.kernels.gated_delta_rule.affine_provider import prepare_external_kcp_affine_summary
+
+    local_error: Exception | None = None
+    try:
+        prepare_external_kcp_affine_summary(
+            kind.removeprefix("external:"),
+            device=device,
+            num_heads=num_heads,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            key_dtype=key_dtype,
+            value_dtype=value_dtype,
+            g_dtype=g_dtype,
+            beta_dtype=beta_dtype,
+        )
+    except Exception as exc:
+        local_error = exc
+
+    status = torch.tensor([int(local_error is not None)], device=reference.device, dtype=torch.int32)
+    if int(dist.get_world_size(group=cp_group)) > 1:
+        dist.all_reduce(status, op=dist.ReduceOp.MAX, group=cp_group)
+    if int(status.item()) != 0:
+        detail = f" local_error={type(local_error).__name__}: {local_error}" if local_error else ""
+        raise RuntimeError(f"coordinated KCP external affine preparation failed on at least one CP rank.{detail}")
 
 
 def _coordinate_local_affine_readiness(
@@ -807,6 +912,7 @@ def resolve_kcp_initial_state(
     cp_group: ProcessGroup,
     plan: GdnLosslessRuntimePlan,
     cu_seqlens: Optional[Tensor] = None,
+    cu_seqlens_list: Sequence[int] | None = None,
     use_qk_l2norm: bool = True,
     affine_impl: str = "ttx_bc8_m1",
     extra_participation: Tensor | None = None,
@@ -839,18 +945,19 @@ def resolve_kcp_initial_state(
 
     def build_local_summary() -> tuple[Tensor, Tensor, int, int, bool]:
         affine_kind = resolve_local_affine_impl(affine_impl)
-        if observer is not None and affine_kind != "ttx":
+        if observer is not None and affine_kind not in ("ttx",) and not affine_kind.startswith("external:"):
             raise ValueError(
-                "A production KCP runtime observer may only attest the ttx_bc8_m1 backend; "
+                "A production KCP runtime observer may only attest an optimized or external affine backend; "
                 f"got affine_impl={affine_impl!r}"
             )
         if observer is not None:
+            affine_backend = get_kcp_affine_backend_identity(affine_impl)
             expected_identity = GdnCpRuntimeIdentity(
                 implementation="kcp",
                 ownership_plan_hash=plan.plan_hash,
                 cp_size=cp_size,
                 cp_rank=cp_rank,
-                affine_backend="ttx_bc8_m1",
+                affine_backend=affine_backend,
             )
             if observer.identity != expected_identity:
                 raise ValueError("KCP runtime observer identity does not match the live ownership plan")
@@ -891,6 +998,7 @@ def resolve_kcp_initial_state(
                 g,
                 beta,
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_list=cu_seqlens_list,
                 use_qk_l2norm=use_qk_l2norm,
                 impl=affine_impl,
             )
@@ -965,6 +1073,7 @@ __all__ = [
     "assert_kcp_cp_group_identity",
     "attach_zero_valued_dep",
     "ensure_affine_hm_fp32",
+    "get_kcp_affine_backend_identity",
     "kcp_plan_requires_affine_scan",
     "kcp_zero_participation_token",
     "local_affine_summary",
@@ -972,6 +1081,7 @@ __all__ = [
     "local_affine_summary_fused_torch",
     "local_affine_summary_recurrent",
     "pack_affine_hm",
+    "prepare_kcp_affine_summary",
     "prepare_kcp_ttx_warmup",
     "prefix_merge_initial_state",
     "resolve_kcp_initial_state",

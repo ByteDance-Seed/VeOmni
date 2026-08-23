@@ -61,6 +61,7 @@
 # ==============================================================================
 
 import itertools
+import os
 from collections.abc import Callable
 
 # Additional imports for patches
@@ -105,8 +106,9 @@ from transformers.utils.generic import (
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.distributed.context_parallel.gdn_kcp import (
+    get_kcp_affine_backend_identity,
     kcp_plan_requires_affine_scan,
-    prepare_kcp_ttx_warmup,
+    prepare_kcp_affine_summary,
     resolve_kcp_initial_state,
 )
 from veomni.distributed.context_parallel.gdn_lossless import (
@@ -132,6 +134,7 @@ from veomni.distributed.context_parallel.packed_sharding import (
 )
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
+from veomni.distributed.sequence_parallel.comm import get_unified_sequence_parallel_group
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.ops.kernels.attention._replicated_dummy import (
     _DUMMY_SP_TOKEN,
@@ -144,7 +147,9 @@ from veomni.ops.kernels.gated_delta_rule.backend_adapter import (
     call_chunk_gated_delta_rule,
     prepare_gated_delta_rule_qk,
     requires_chunked_varlen_metadata,
+    resolve_kcp_affine_implementation,
 )
+from veomni.ops.kernels.load_balancing_loss.eager import load_balancing_loss_pytorch
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
@@ -705,6 +710,12 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         gdn_lossless_plan = None
         gdn_cp_observer = None
         ulysses_local_cu = None
+        backend_impl = self._veomni_chunk_gated_delta_rule_impl
+        kcp_affine_impl = None
+        kcp_affine_backend = None
+        if self.gdn_context_parallel_implementation == "kcp":
+            kcp_affine_impl = resolve_kcp_affine_implementation(backend_impl)
+            kcp_affine_backend = get_kcp_affine_backend_identity(kcp_affine_impl)
         if cp_enabled:
             if batch_size != 1 or cu_seq_lens_q is None:
                 raise RuntimeError("Lossless GDN CP requires a packed batch of size one and global valid cu_seqlens.")
@@ -738,6 +749,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 gdn_lossless_plan.plan_hash,
                 gdn_lossless_plan.cp_size,
                 gdn_lossless_plan.cp_rank,
+                kcp_affine_backend,
             )
             live_identity = None
             if observer is not None:
@@ -747,11 +759,13 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     identity.ownership_plan_hash,
                     identity.cp_size,
                     identity.cp_rank,
+                    identity.affine_backend,
                 )
             if live_identity != expected_identity:
                 observer = make_gdn_cp_runtime_observer(
                     self.gdn_context_parallel_implementation,
                     plan=gdn_lossless_plan,
+                    affine_backend=kcp_affine_backend,
                 )
                 self.gdn_cp_runtime_evidence = observer
             gdn_cp_observer = observer
@@ -959,7 +973,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     gdn_core_cu,
                     cu_seqlens_list=gdn_lossless_plan.owned_cu_seqlens,
                 )
-                backend_impl = self._veomni_chunk_gated_delta_rule_impl
                 if gdn_lossless_plan.local.owned_token_count == 0:
                     # Empty owners still participate in KCP/state communication,
                     # but the external Mojo norm has no rows to launch.  Keep the
@@ -987,8 +1000,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                         plan=gdn_lossless_plan,
                         cp_group=parallel_state.cp_group,
                         cu_seqlens=aligned_cu,
+                        cu_seqlens_list=aligned_host_cu,
                         use_qk_l2norm=False,
-                        affine_impl="ttx_bc8_m1",
+                        affine_impl=kcp_affine_impl,
                         extra_participation=make_state_participation(query_gdr),
                         coordinate_readiness=needs_affine_readiness,
                         observer=gdn_cp_observer,
@@ -2432,9 +2446,13 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
                     key_value_dtype,
                     torch.float32,
                     beta_dtype,
+                    get_kcp_affine_backend_identity(
+                        resolve_kcp_affine_implementation(first_gdn._veomni_chunk_gated_delta_rule_impl)
+                    ),
                 )
-                if getattr(self, "_gdn_kcp_ttx_warmup_signature", None) != warmup_signature:
-                    prepare_kcp_ttx_warmup(
+                if getattr(self, "_gdn_kcp_affine_warmup_signature", None) != warmup_signature:
+                    prepare_kcp_affine_summary(
+                        resolve_kcp_affine_implementation(first_gdn._veomni_chunk_gated_delta_rule_impl),
                         device=inputs_embeds.device,
                         num_heads=int(num_v_heads),
                         key_dim=int(self.config.linear_key_head_dim),
@@ -2446,7 +2464,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
                         cp_group=parallel_state.cp_group,
                         reference=inputs_embeds,
                     )
-                    self._gdn_kcp_ttx_warmup_signature = warmup_signature
+                    self._gdn_kcp_affine_warmup_signature = warmup_signature
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -3246,7 +3264,20 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         aux_loss = None
         if output_router_logits:
             # Modification: OpSlot guard for load-balancing loss.
-            if veomni_load_balancing_loss.use_non_eager_impl:
+            sp_group = get_unified_sequence_parallel_group()
+            if sp_group is not None and dist.get_world_size(sp_group) > 1:
+                # The Switch-style aux objective is nonlinear in expert counts and
+                # router-probability sums.  Computing it independently on each
+                # sequence shard makes the objective topology-dependent.  Reduce
+                # the sufficient statistics over Ulysses x CP instead.
+                aux_loss = load_balancing_loss_pytorch(
+                    outputs.router_logits,
+                    self.config.num_experts,
+                    self.config.num_experts_per_tok,
+                    router_attention_mask,
+                    group=sp_group,
+                )
+            elif veomni_load_balancing_loss.use_non_eager_impl:
                 aux_loss = veomni_load_balancing_loss(
                     outputs.router_logits,
                     self.config.num_experts,
@@ -3261,7 +3292,20 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
                     router_attention_mask,
                 )
             if labels is not None:
-                loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
+                text_ce = loss
+                aux_contribution = self.config.router_aux_loss_coef * aux_loss.to(loss.device)
+                loss = loss + aux_contribution
+                if os.environ.get("VEOMNI_MOE_AUX_TRACE") == "1":
+                    print(
+                        "VEOMNI_MOE_AUX_TRACE"
+                        f" rank={dist.get_rank() if dist.is_initialized() else 0}"
+                        f" text_ce={float(text_ce.detach().float())}"
+                        f" aux_global={float(aux_loss.detach().float())}"
+                        f" coef={self.config.router_aux_loss_coef}"
+                        f" aux_contribution={float(aux_contribution.detach().float())}"
+                        f" total={float(loss.detach().float())}",
+                        flush=True,
+                    )
 
         return MoeCausalLMOutputWithLogProbs(
             loss=loss,
@@ -3400,7 +3444,16 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         aux_loss = None
         if kwargs.get("output_router_logits", False):
             # Modification: OpSlot guard for load-balancing loss.
-            if veomni_load_balancing_loss.use_non_eager_impl:
+            sp_group = get_unified_sequence_parallel_group()
+            if sp_group is not None and dist.get_world_size(sp_group) > 1:
+                aux_loss = load_balancing_loss_pytorch(
+                    outputs.router_logits,
+                    self.config.text_config.num_experts,
+                    self.config.text_config.num_experts_per_tok,
+                    router_attention_mask,
+                    group=sp_group,
+                )
+            elif veomni_load_balancing_loss.use_non_eager_impl:
                 aux_loss = veomni_load_balancing_loss(
                     outputs.router_logits,
                     self.config.text_config.num_experts,
@@ -3415,7 +3468,20 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
                     router_attention_mask,
                 )
             if labels is not None:
-                loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+                text_ce = loss
+                aux_contribution = self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+                loss = loss + aux_contribution
+                if os.environ.get("VEOMNI_MOE_AUX_TRACE") == "1":
+                    print(
+                        "VEOMNI_MOE_AUX_TRACE"
+                        f" rank={dist.get_rank() if dist.is_initialized() else 0}"
+                        f" text_ce={float(text_ce.detach().float())}"
+                        f" aux_global={float(aux_loss.detach().float())}"
+                        f" coef={self.config.text_config.router_aux_loss_coef}"
+                        f" aux_contribution={float(aux_contribution.detach().float())}"
+                        f" total={float(loss.detach().float())}",
+                        flush=True,
+                    )
 
         return Qwen3_5MoeCausalLMOutputWithLogProbs(
             loss=loss,

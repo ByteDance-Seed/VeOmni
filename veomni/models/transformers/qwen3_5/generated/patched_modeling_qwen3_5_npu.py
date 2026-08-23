@@ -99,8 +99,9 @@ from transformers.utils.generic import (
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.distributed.context_parallel.gdn_kcp import (
+    get_kcp_affine_backend_identity,
     kcp_plan_requires_affine_scan,
-    prepare_kcp_ttx_warmup,
+    prepare_kcp_affine_summary,
     resolve_kcp_initial_state,
 )
 from veomni.distributed.context_parallel.gdn_lossless import (
@@ -138,6 +139,7 @@ from veomni.ops.kernels.gated_delta_rule.backend_adapter import (
     call_chunk_gated_delta_rule,
     prepare_gated_delta_rule_qk,
     requires_chunked_varlen_metadata,
+    resolve_kcp_affine_implementation,
 )
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
@@ -698,6 +700,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         gdn_lossless_plan = None
         gdn_cp_observer = None
         ulysses_local_cu = None
+        backend_impl = self._veomni_chunk_gated_delta_rule_impl
+        kcp_affine_impl = None
+        kcp_affine_backend = None
+        if self.gdn_context_parallel_implementation == "kcp":
+            kcp_affine_impl = resolve_kcp_affine_implementation(backend_impl)
+            kcp_affine_backend = get_kcp_affine_backend_identity(kcp_affine_impl)
         if cp_enabled:
             if batch_size != 1 or cu_seq_lens_q is None:
                 raise RuntimeError("Lossless GDN CP requires a packed batch of size one and global valid cu_seqlens.")
@@ -731,6 +739,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 gdn_lossless_plan.plan_hash,
                 gdn_lossless_plan.cp_size,
                 gdn_lossless_plan.cp_rank,
+                kcp_affine_backend,
             )
             live_identity = None
             if observer is not None:
@@ -740,11 +749,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     identity.ownership_plan_hash,
                     identity.cp_size,
                     identity.cp_rank,
+                    identity.affine_backend,
                 )
             if live_identity != expected_identity:
                 observer = make_gdn_cp_runtime_observer(
                     self.gdn_context_parallel_implementation,
                     plan=gdn_lossless_plan,
+                    affine_backend=kcp_affine_backend,
                 )
                 self.gdn_cp_runtime_evidence = observer
             gdn_cp_observer = observer
@@ -952,7 +963,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     gdn_core_cu,
                     cu_seqlens_list=gdn_lossless_plan.owned_cu_seqlens,
                 )
-                backend_impl = self._veomni_chunk_gated_delta_rule_impl
                 if gdn_lossless_plan.local.owned_token_count == 0:
                     # Empty owners still participate in KCP/state communication,
                     # but the external Mojo norm has no rows to launch.  Keep the
@@ -980,8 +990,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         plan=gdn_lossless_plan,
                         cp_group=parallel_state.cp_group,
                         cu_seqlens=aligned_cu,
+                        cu_seqlens_list=aligned_host_cu,
                         use_qk_l2norm=False,
-                        affine_impl="ttx_bc8_m1",
+                        affine_impl=kcp_affine_impl,
                         extra_participation=make_state_participation(query_gdr),
                         coordinate_readiness=needs_affine_readiness,
                         observer=gdn_cp_observer,
@@ -2233,9 +2244,13 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                     key_value_dtype,
                     torch.float32,
                     beta_dtype,
+                    get_kcp_affine_backend_identity(
+                        resolve_kcp_affine_implementation(first_gdn._veomni_chunk_gated_delta_rule_impl)
+                    ),
                 )
-                if getattr(self, "_gdn_kcp_ttx_warmup_signature", None) != warmup_signature:
-                    prepare_kcp_ttx_warmup(
+                if getattr(self, "_gdn_kcp_affine_warmup_signature", None) != warmup_signature:
+                    prepare_kcp_affine_summary(
+                        resolve_kcp_affine_implementation(first_gdn._veomni_chunk_gated_delta_rule_impl),
                         device=inputs_embeds.device,
                         num_heads=int(num_v_heads),
                         key_dim=int(self.config.linear_key_head_dim),
@@ -2247,7 +2262,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                         cp_group=parallel_state.cp_group,
                         reference=inputs_embeds,
                     )
-                    self._gdn_kcp_ttx_warmup_signature = warmup_signature
+                    self._gdn_kcp_affine_warmup_signature = warmup_signature
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

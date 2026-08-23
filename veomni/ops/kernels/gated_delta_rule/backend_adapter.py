@@ -41,13 +41,18 @@ class GatedDeltaRuleMetadataCapabilities:
     accepts_cu_seqlens_list: bool = False
     accepts_chunk_indices: bool = False
     requires_external_qk_l2norm: bool = False
+    requires_external_kcp_affine: bool = False
 
 
 _CAPABILITIES = {
     # The internal Mojo ABI predates the precomputed host/chunk metadata.  A
     # device CU tensor is the canonical representation and is sufficient for
     # its varlen kernel; passing the newer keywords raises TypeError there.
-    "mojo": GatedDeltaRuleMetadataCapabilities("mojo", requires_external_qk_l2norm=True),
+    "mojo": GatedDeltaRuleMetadataCapabilities(
+        "mojo",
+        requires_external_qk_l2norm=True,
+        requires_external_kcp_affine=True,
+    ),
     # FLA/FlashQLA expose the historical cu_seqlens-only ABI as well.
     "fla": GatedDeltaRuleMetadataCapabilities("fla"),
     "flash_qla": GatedDeltaRuleMetadataCapabilities("flash_qla"),
@@ -77,6 +82,20 @@ def requires_chunked_varlen_metadata(implementation: str) -> bool:
     """Whether a provider needs the host/chunk precomputed varlen plan."""
 
     return get_gated_delta_rule_metadata_capabilities(implementation).accepts_chunk_indices
+
+
+def requires_external_kcp_affine(implementation: str) -> bool:
+    """Whether KCP must use the runtime-owned affine matching this backend."""
+
+    return get_gated_delta_rule_metadata_capabilities(implementation).requires_external_kcp_affine
+
+
+def resolve_kcp_affine_implementation(implementation: str) -> str:
+    """Resolve the affine recurrence that must match a concrete GDR backend."""
+
+    if requires_external_kcp_affine(implementation):
+        return f"external:{implementation}"
+    return "ttx_bc8_m1"
 
 
 def prepare_gated_delta_rule_qk(
@@ -248,5 +267,7 @@ __all__ = [
     "call_chunk_gated_delta_rule",
     "get_gated_delta_rule_metadata_capabilities",
     "prepare_gated_delta_rule_qk",
+    "resolve_kcp_affine_implementation",
     "requires_chunked_varlen_metadata",
+    "requires_external_kcp_affine",
 ]
