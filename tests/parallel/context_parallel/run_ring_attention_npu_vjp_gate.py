@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare the two-rank NPU Ring-attention VJP with monolithic fusion attention."""
+"""Compare distributed NPU Ring-attention VJP with monolithic fusion attention."""
 
 from __future__ import annotations
 
@@ -53,8 +53,8 @@ def main():  # noqa: C901 - an executable diagnostic is clearest as one closed r
     world = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    if world != 2:
-        raise RuntimeError(f"gate requires WORLD_SIZE=2, got {world}")
+    if world < 2 or world & (world - 1):
+        raise RuntimeError(f"gate requires a power-of-two WORLD_SIZE >= 2, got {world}")
     if args.seq_len % 16 or args.q_heads % args.kv_heads:
         raise ValueError("seq_len must be divisible by 16 and q_heads by kv_heads")
     torch.npu.set_device(local_rank)
@@ -157,6 +157,7 @@ def main():  # noqa: C901 - an executable diagnostic is clearest as one closed r
             local_cu = partition.local_cu_seqlens
 
         local_query, local_key, local_value = (tensor.detach().requires_grad_(True) for tensor in local[:3])
+        input_snapshots = tuple(tensor.detach().clone() for tensor in (local_query, local_key, local_value))
         output = ringattn_context_parallel(
             local_query,
             local_key,
@@ -170,6 +171,10 @@ def main():  # noqa: C901 - an executable diagnostic is clearest as one closed r
         )
         torch.autograd.backward(output, local[3])
         torch.npu.synchronize()
+        input_immutable = all(
+            torch.equal(actual.detach(), before)
+            for actual, before in zip((local_query, local_key, local_value), input_snapshots)
+        )
         report = {
             metric_name: metrics(actual, reference_tensor)
             for metric_name, actual, reference_tensor in zip(
@@ -178,7 +183,7 @@ def main():  # noqa: C901 - an executable diagnostic is clearest as one closed r
                 local_expected,
             )
         }
-        local_ok = all(
+        local_ok = input_immutable and all(
             item["finite"] and item["nl2"] <= args.nl2_limit and item["bad_frac"] <= args.bad_frac_limit
             for item in report.values()
         )
@@ -186,7 +191,16 @@ def main():  # noqa: C901 - an executable diagnostic is clearest as one closed r
         dist.all_reduce(ok, op=dist.ReduceOp.MIN)
         print(
             "AI4SE_RING_NPU_VJP_CASE",
-            json.dumps({"case": name, "rank": rank, "ok": bool(ok.item()), "metrics": report}, sort_keys=True),
+            json.dumps(
+                {
+                    "case": name,
+                    "rank": rank,
+                    "ok": bool(ok.item()),
+                    "input_immutable": input_immutable,
+                    "metrics": report,
+                },
+                sort_keys=True,
+            ),
             flush=True,
         )
         if not ok.item():

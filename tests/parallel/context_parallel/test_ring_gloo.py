@@ -95,6 +95,7 @@ def _run_ring_oracle(rank: int, world_size: int, port: int) -> None:
         packed_value = (
             apply_packed_context_parallel_partition(global_value, partition, dim=2).detach().requires_grad_()
         )
+        packed_inputs = tuple(tensor.detach().clone() for tensor in (packed_query, packed_key, packed_value))
         packed_dout = apply_packed_context_parallel_partition(global_dout, partition, dim=2)
         packed_output = ringattn_context_parallel(
             packed_query,
@@ -107,6 +108,8 @@ def _run_ring_oracle(rank: int, world_size: int, port: int) -> None:
             backend="torch",
             cu_seqlens=partition.local_cu_seqlens,
         )
+        for actual, before in zip((packed_query, packed_key, packed_value), packed_inputs):
+            torch.testing.assert_close(actual, before, atol=0, rtol=0)
         gathered_packed = [torch.empty_like(packed_output) for _ in range(world_size)]
         dist.all_gather(gathered_packed, packed_output.detach())
         restored_packed = torch.empty_like(global_query)
@@ -131,6 +134,8 @@ def _run_ring_oracle(rank: int, world_size: int, port: int) -> None:
         torch.testing.assert_close(restored_packed, packed_oracle, atol=1e-6, rtol=1e-4)
 
         (packed_output * packed_dout).sum().backward()
+        for actual, before in zip((packed_query, packed_key, packed_value), packed_inputs):
+            torch.testing.assert_close(actual, before, atol=0, rtol=0)
         (packed_oracle * global_dout).sum().backward()
         for actual, expected_global in (
             (packed_query.grad, packed_oracle_query.grad),

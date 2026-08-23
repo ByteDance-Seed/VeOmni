@@ -232,7 +232,13 @@ class AttentionWithCp(torch.autograd.Function):
         v = as_balanced_halves(value)
 
         ring = RingP2P(cp_global_ranks, cp_group, overlap_group)
-        cur_kv = [k, v]
+        # ``RingP2P`` alternates its current and receive buffers.  The receive
+        # side must therefore never alias the owner-local inputs: for CP>=4 the
+        # second receive would otherwise copy a remote block into ``k``/``v``.
+        # Besides corrupting the owner payload needed by backward, saving those
+        # no-grad views trips PyTorch's view/in-place version check for packed
+        # calls.  Keep all communication in private scratch storage instead.
+        cur_kv = [k.clone(), v.clone()]
         next_kv = [torch.empty_like(k), torch.empty_like(v)]
 
         attn_out = softmax_max = softmax_sum = None
@@ -271,7 +277,9 @@ class AttentionWithCp(torch.autograd.Function):
         # Save only the owner-local K/V. Backward re-circulates K/V together
         # with their accumulated gradients, so retained activation memory stays
         # O(local sequence) rather than silently growing to O(global sequence).
-        ctx.save_for_backward(q, k, v, attn_out, softmax_max, softmax_sum)
+        # Save the Function inputs, not views created while custom forward runs
+        # under no_grad.  Backward reconstructs the balanced views locally.
+        ctx.save_for_backward(query, key, value, attn_out, softmax_max, softmax_sum)
         ctx.num_heads = num_heads
         ctx.softmax_scale = float(softmax_scale)
         ctx.backend = backend
@@ -284,13 +292,16 @@ class AttentionWithCp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: Tensor):
-        q, local_k, local_v, attn_out, softmax_max, softmax_sum = ctx.saved_tensors
+        local_query, local_key, local_value, attn_out, softmax_max, softmax_sum = ctx.saved_tensors
         cp_size = ctx.cp_size
         rank = ctx.rank
         backend = ctx.backend
         softmax_scale = ctx.softmax_scale
         num_heads = ctx.num_heads
 
+        q = as_balanced_halves(local_query)
+        local_k = as_balanced_halves(local_key)
+        local_v = as_balanced_halves(local_value)
         dout_h = as_balanced_halves(dout)
         attn_out_h = as_balanced_halves(attn_out)
         softmax_max_h = as_balanced_halves(softmax_max)
@@ -300,7 +311,10 @@ class AttentionWithCp(torch.autograd.Function):
         # adds its query-side VJP to the traveling dK/dV; after exactly one
         # cycle every owner receives its local K/V gradients from all queries.
         backward_ring = RingP2P(ctx.cp_global_ranks, ctx.cp_group, ctx.overlap_group)
-        cur_payload = [local_k, local_v, torch.zeros_like(local_k), torch.zeros_like(local_v)]
+        # As in forward, owner-local saved tensors are read-only.  CP>=4 reuses
+        # the first payload as a receive target on a later iteration, so rotate
+        # private K/V copies together with their accumulated gradients.
+        cur_payload = [local_k.clone(), local_v.clone(), torch.zeros_like(local_k), torch.zeros_like(local_v)]
         next_payload = [torch.empty_like(item) for item in cur_payload]
 
         dq = torch.zeros_like(q)
