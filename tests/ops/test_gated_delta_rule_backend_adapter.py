@@ -6,7 +6,12 @@ import torch
 from veomni.ops.kernels.gated_delta_rule.backend_adapter import (
     build_gated_delta_rule_metadata_kwargs,
     call_chunk_gated_delta_rule,
+    prepare_gated_delta_rule_qk,
     requires_chunked_varlen_metadata,
+)
+from veomni.ops.kernels.gated_delta_rule.normalization import (
+    get_external_gated_delta_rule_l2norm_identity,
+    register_external_gated_delta_rule_l2norm,
 )
 
 
@@ -215,3 +220,139 @@ def test_chunk_metadata_key_sets_must_match():
             chunk_indices=values["chunk_indices"],
             chunk_indices_list=values["chunk_indices_list"],
         )
+
+
+def test_mojo_qk_norm_fails_closed_without_external_provider(monkeypatch):
+    monkeypatch.setattr(
+        "veomni.ops.kernels.gated_delta_rule.normalization._EXTERNAL_L2NORM_PROVIDERS",
+        {},
+    )
+    values = _inputs()
+    with pytest.raises(RuntimeError, match="external L2Norm provider is not registered"):
+        get_external_gated_delta_rule_l2norm_identity("mojo")
+    with pytest.raises(RuntimeError, match="external L2Norm provider is not registered"):
+        prepare_gated_delta_rule_qk(values["query"], values["key"], implementation="mojo")
+
+
+def test_mojo_qk_norm_uses_registered_provider_once_per_tensor_and_disables_kernel_norm(monkeypatch):
+    monkeypatch.setattr(
+        "veomni.ops.kernels.gated_delta_rule.normalization._EXTERNAL_L2NORM_PROVIDERS",
+        {},
+    )
+    calls = []
+
+    def exact_provider(tensor, *, eps):
+        calls.append((tensor, eps))
+        return tensor + 3
+
+    register_external_gated_delta_rule_l2norm("mojo", exact_provider, identity="test.mojo.l2norm.v1")
+    values = _inputs()
+    query, key, use_kernel_norm = prepare_gated_delta_rule_qk(values["query"], values["key"], implementation="mojo")
+
+    assert calls == [(values["query"], 1e-6), (values["key"], 1e-6)]
+    assert torch.equal(query, values["query"] + 3)
+    assert torch.equal(key, values["key"] + 3)
+    assert not use_kernel_norm
+
+
+def test_mojo_external_norm_preserves_exact_custom_vjp_for_disabled_state_and_kcp(monkeypatch):
+    monkeypatch.setattr(
+        "veomni.ops.kernels.gated_delta_rule.normalization._EXTERNAL_L2NORM_PROVIDERS",
+        {},
+    )
+
+    class ExactNorm(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, tensor):
+            return tensor * 2
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            # Deliberately differs from the derivative of ``tensor * 2``.  The
+            # adapter must preserve the provider's custom backward rather than
+            # rebuild normalization with Open-VeOmni tensor expressions.
+            return grad_output * 7
+
+    def exact_provider(tensor, *, eps):
+        assert eps == 1e-6
+        return ExactNorm.apply(tensor)
+
+    register_external_gated_delta_rule_l2norm("mojo", exact_provider, identity="test.mojo.custom-vjp")
+    results = []
+    base_query = torch.randn(2, 4)
+    base_key = torch.randn(2, 4)
+    for force_external in (False, True):
+        query = base_query.clone().requires_grad_()
+        key = base_key.clone().requires_grad_()
+        norm_query, norm_key, use_kernel_norm = prepare_gated_delta_rule_qk(
+            query,
+            key,
+            implementation="mojo",
+            force_external=force_external,
+        )
+        (norm_query.sum() + norm_key.sum()).backward()
+        results.append((norm_query.detach(), norm_key.detach(), query.grad, key.grad, use_kernel_norm))
+
+    for norm_query, norm_key, query_grad, key_grad, use_kernel_norm in results:
+        assert not use_kernel_norm
+        assert torch.equal(query_grad, torch.full_like(query_grad, 7))
+        assert torch.equal(key_grad, torch.full_like(key_grad, 7))
+        assert torch.isfinite(norm_query).all()
+        assert torch.isfinite(norm_key).all()
+    for left, right in zip(results[0][:4], results[1][:4]):
+        assert torch.equal(left, right)
+
+
+def test_external_provider_registration_is_idempotent_but_rejects_identity_drift(monkeypatch):
+    monkeypatch.setattr(
+        "veomni.ops.kernels.gated_delta_rule.normalization._EXTERNAL_L2NORM_PROVIDERS",
+        {},
+    )
+
+    def provider(tensor, *, eps):
+        return tensor
+
+    register_external_gated_delta_rule_l2norm("mojo", provider, identity="test.mojo.l2norm.v1")
+    register_external_gated_delta_rule_l2norm("mojo", provider, identity="test.mojo.l2norm.v1")
+    assert get_external_gated_delta_rule_l2norm_identity("mojo") == "test.mojo.l2norm.v1"
+    with pytest.raises(RuntimeError, match="already registered with a different identity"):
+        register_external_gated_delta_rule_l2norm("mojo", provider, identity="test.mojo.l2norm.v2")
+
+    def other_provider(tensor, *, eps):
+        return tensor
+
+    with pytest.raises(RuntimeError, match="identity is already bound to a different callable"):
+        register_external_gated_delta_rule_l2norm("mojo", other_provider, identity="test.mojo.l2norm.v1")
+
+
+def test_external_provider_output_contract_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        "veomni.ops.kernels.gated_delta_rule.normalization._EXTERNAL_L2NORM_PROVIDERS",
+        {},
+    )
+
+    def wrong_dtype(tensor, *, eps):
+        return tensor.double()
+
+    register_external_gated_delta_rule_l2norm("mojo", wrong_dtype, identity="test.mojo.bad-dtype")
+    values = _inputs()
+    with pytest.raises(RuntimeError, match="changed the tensor contract"):
+        prepare_gated_delta_rule_qk(values["query"], values["key"], implementation="mojo")
+
+
+def test_kcp_forces_shared_external_norm_for_open_provider():
+    values = _inputs()
+    query, key, use_kernel_norm = prepare_gated_delta_rule_qk(
+        values["query"], values["key"], implementation="npu", force_external=True
+    )
+    assert torch.equal(query, values["query"])
+    assert torch.equal(key, values["key"])
+    assert not use_kernel_norm
+
+
+def test_non_mojo_default_keeps_backend_internal_norm():
+    values = _inputs()
+    query, key, use_kernel_norm = prepare_gated_delta_rule_qk(values["query"], values["key"], implementation="npu")
+    assert query is values["query"]
+    assert key is values["key"]
+    assert use_kernel_norm

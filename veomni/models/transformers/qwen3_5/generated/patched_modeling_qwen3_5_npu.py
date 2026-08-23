@@ -136,9 +136,9 @@ from veomni.ops.kernels.attention._replicated_dummy import (
 )
 from veomni.ops.kernels.gated_delta_rule.backend_adapter import (
     call_chunk_gated_delta_rule,
+    prepare_gated_delta_rule_qk,
     requires_chunked_varlen_metadata,
 )
-from veomni.ops.kernels.gated_delta_rule.normalization import producer_dtype_l2norm
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
@@ -952,12 +952,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     gdn_core_cu,
                     cu_seqlens_list=gdn_lossless_plan.owned_cu_seqlens,
                 )
+                backend_impl = self._veomni_chunk_gated_delta_rule_impl
+                if gdn_lossless_plan.local.owned_token_count == 0:
+                    # Empty owners still participate in KCP/state communication,
+                    # but the external Mojo norm has no rows to launch.  Keep the
+                    # tensors untouched and make the later kernel flag explicit.
+                    use_qk_l2norm_in_kernel = False
+                else:
+                    query_gdr, key_gdr, use_qk_l2norm_in_kernel = prepare_gated_delta_rule_qk(
+                        query_gdr,
+                        key_gdr,
+                        implementation=backend_impl,
+                        force_external=self.gdn_context_parallel_implementation == "kcp",
+                    )
                 if self.gdn_context_parallel_implementation == "kcp":
                     # KCP's affine pre-scan and the local GDR core must consume the
-                    # exact same producer-dtype normalized key. Normalizing once
-                    # here also gives both paths one shared autograd edge.
-                    query_gdr = producer_dtype_l2norm(query_gdr)
-                    key_gdr = producer_dtype_l2norm(key_gdr)
+                    # exact same backend-normalized key. Normalizing once here also
+                    # gives both paths one shared autograd edge.
                     needs_affine_readiness = not getattr(
                         self, "_gdn_kcp_affine_ready", False
                     ) and kcp_plan_requires_affine_scan(gdn_lossless_plan)
@@ -996,7 +1007,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         # edges without changing the empty numerical output.
                         core_attn_out = attach_state_dependency(core_attn_out, initial_state)
                 else:
-                    backend_impl = self._veomni_chunk_gated_delta_rule_impl
                     if requires_chunked_varlen_metadata(backend_impl):
                         # The original precomputed metadata describes the physical
                         # input. Build the owned/chunk-aligned metadata from host CU
@@ -1038,7 +1048,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         beta=beta_gdr,
                         initial_state=initial_state,
                         output_final_state=self.gdn_context_parallel_implementation == "state_passing_lossless",
-                        use_qk_l2norm_in_kernel=self.gdn_context_parallel_implementation != "kcp",
+                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                         cu_seqlens=aligned_cu.npu(),
                         cu_seqlens_list=aligned_cu_list,
                         chunk_indices=aligned_chunk_indices,
@@ -1057,20 +1067,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     core_attn_out = attach_state_dependency(core_attn_out, final_state)
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
-                core_attn_out, last_recurrent_state = call_chunk_gated_delta_rule(
-                    self.chunk_gated_delta_rule,
+                backend_impl = self._veomni_chunk_gated_delta_rule_impl
+                query_gdr, key_gdr, use_qk_l2norm_in_kernel = prepare_gated_delta_rule_qk(
                     query,
                     key,
+                    implementation=backend_impl,
+                )
+                core_attn_out, last_recurrent_state = call_chunk_gated_delta_rule(
+                    self.chunk_gated_delta_rule,
+                    query_gdr,
+                    key_gdr,
                     value,
-                    implementation=self._veomni_chunk_gated_delta_rule_impl,
-                    metadata_is_canonical=not requires_chunked_varlen_metadata(
-                        self._veomni_chunk_gated_delta_rule_impl
-                    ),
+                    implementation=backend_impl,
+                    metadata_is_canonical=not requires_chunked_varlen_metadata(backend_impl),
                     g=g,
                     beta=beta,
                     initial_state=None,
                     output_final_state=cache_params is not None,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                     cu_seqlens=cu_seq_lens_q.npu(),
                     cu_seqlens_list=cu_seqlens_list,
                     chunk_indices=chunk_indices,

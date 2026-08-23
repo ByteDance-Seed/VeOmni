@@ -29,6 +29,8 @@ from typing import Any, Callable
 
 import torch
 
+from .normalization import external_gated_delta_rule_l2norm, producer_dtype_l2norm
+
 
 @dataclass(frozen=True)
 class GatedDeltaRuleMetadataCapabilities:
@@ -38,13 +40,14 @@ class GatedDeltaRuleMetadataCapabilities:
     accepts_cu_seqlens: bool = True
     accepts_cu_seqlens_list: bool = False
     accepts_chunk_indices: bool = False
+    requires_external_qk_l2norm: bool = False
 
 
 _CAPABILITIES = {
     # The internal Mojo ABI predates the precomputed host/chunk metadata.  A
     # device CU tensor is the canonical representation and is sufficient for
     # its varlen kernel; passing the newer keywords raises TypeError there.
-    "mojo": GatedDeltaRuleMetadataCapabilities("mojo"),
+    "mojo": GatedDeltaRuleMetadataCapabilities("mojo", requires_external_qk_l2norm=True),
     # FLA/FlashQLA expose the historical cu_seqlens-only ABI as well.
     "fla": GatedDeltaRuleMetadataCapabilities("fla"),
     "flash_qla": GatedDeltaRuleMetadataCapabilities("flash_qla"),
@@ -74,6 +77,38 @@ def requires_chunked_varlen_metadata(implementation: str) -> bool:
     """Whether a provider needs the host/chunk precomputed varlen plan."""
 
     return get_gated_delta_rule_metadata_capabilities(implementation).accepts_chunk_indices
+
+
+def prepare_gated_delta_rule_qk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    *,
+    implementation: str,
+    force_external: bool = False,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Select one exact Q/K normalization path for the provider.
+
+    Out-of-tree providers such as Mojo register their matching autograd norm at
+    runtime; Open-VeOmni never imports those private packages.  KCP also forces
+    normalization outside the local kernel so its affine prefix scan and the
+    local GDR core consume the same tensor and autograd edge.  Built-in
+    providers use the historical producer expression for that KCP-only case.
+
+    Returns normalized ``(query, key)`` and the flag to pass as
+    ``use_qk_l2norm_in_kernel``.
+    """
+
+    capabilities = get_gated_delta_rule_metadata_capabilities(implementation)
+    if capabilities.requires_external_qk_l2norm:
+        query = external_gated_delta_rule_l2norm(query, implementation=implementation, eps=eps)
+        key = external_gated_delta_rule_l2norm(key, implementation=implementation, eps=eps)
+        return query, key, False
+    if force_external:
+        query = producer_dtype_l2norm(query, eps=eps)
+        key = producer_dtype_l2norm(key, eps=eps)
+        return query, key, False
+    return query, key, True
 
 
 def _validate_cu_metadata(
@@ -212,5 +247,6 @@ __all__ = [
     "build_gated_delta_rule_metadata_kwargs",
     "call_chunk_gated_delta_rule",
     "get_gated_delta_rule_metadata_capabilities",
+    "prepare_gated_delta_rule_qk",
     "requires_chunked_varlen_metadata",
 ]

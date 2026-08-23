@@ -78,13 +78,16 @@ def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
     assert "resolve_kcp_initial_state(" in block
     assert 'affine_impl="ttx_bc8_m1"' in block
     assert block.index("physical_to_owned(") < block.index("resolve_kcp_initial_state(")
-    assert block.index('self.gdn_context_parallel_implementation == "kcp"') < block.index(
-        "producer_dtype_l2norm(key_gdr)"
-    )
-    assert block.index("align_gdn_varlen_chunks(") < block.index("producer_dtype_l2norm(key_gdr)")
-    assert block.index("producer_dtype_l2norm(key_gdr)") < block.index("resolve_kcp_initial_state(")
+    assert block.index("align_gdn_varlen_chunks(") < block.index("prepare_gated_delta_rule_qk(")
+    assert block.index("prepare_gated_delta_rule_qk(") < block.index("resolve_kcp_initial_state(")
+    empty_owner_guard = "if gdn_lossless_plan.local.owned_token_count == 0:"
+    assert block.index(empty_owner_guard) < block.index("prepare_gated_delta_rule_qk(")
+    empty_owner_block = block[block.index(empty_owner_guard) : block.index("else:", block.index(empty_owner_guard))]
+    assert "use_qk_l2norm_in_kernel = False" in empty_owner_block
+    assert "prepare_gated_delta_rule_qk(" not in empty_owner_block
+    assert 'force_external=self.gdn_context_parallel_implementation == "kcp"' in block
     assert "use_qk_l2norm=False" in block
-    assert 'use_qk_l2norm_in_kernel=self.gdn_context_parallel_implementation != "kcp"' in block
+    assert "use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel" in block
     assert "extra_participation=make_state_participation(query_gdr)" in block
     readiness_guard = 'not getattr(\n                    self, "_gdn_kcp_affine_ready", False\n                )'
     assert readiness_guard in block
@@ -94,6 +97,26 @@ def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
     assert block.count("attach_state_dependency(core_attn_out, initial_state)") == 1
     assert "gdn_cp_runtime_evidence" in block
     assert "observer=gdn_cp_observer" in block
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "veomni/models/transformers/qwen3_5/qwen3_5_npu_patch_gen_config.py",
+        "veomni/models/transformers/qwen3_5/generated/patched_modeling_qwen3_5_npu.py",
+        "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
+    ],
+)
+def test_npu_gdn_mojo_routes_share_external_qk_norm(relative_path: str):
+    source = (ROOT / relative_path).read_text()
+    assert source.count("prepare_gated_delta_rule_qk(") == 2
+    assert "producer_dtype_l2norm(query_gdr)" not in source
+    assert 'use_qk_l2norm_in_kernel=self.gdn_context_parallel_implementation != "kcp"' not in source
+
+
+def test_moe_npu_patchgen_imports_shared_external_qk_norm_contract():
+    source = (ROOT / "veomni/models/transformers/qwen3_5_moe/qwen3_5_moe_npu_patch_gen_config.py").read_text()
+    assert '"prepare_gated_delta_rule_qk"' in source
 
 
 @pytest.mark.parametrize(

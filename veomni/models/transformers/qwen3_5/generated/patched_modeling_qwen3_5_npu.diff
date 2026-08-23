@@ -188,9 +188,9 @@
 +)
 +from veomni.ops.kernels.gated_delta_rule.backend_adapter import (
 +    call_chunk_gated_delta_rule,
++    prepare_gated_delta_rule_qk,
 +    requires_chunked_varlen_metadata,
 +)
-+from veomni.ops.kernels.gated_delta_rule.normalization import producer_dtype_l2norm
 +from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +from veomni.utils.device import get_device_id
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
@@ -516,7 +516,7 @@
 
          z = self.in_proj_z(hidden_states)
          z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-@@ -466,61 +776,307 @@
+@@ -466,61 +776,321 @@
          b = self.in_proj_b(hidden_states)
          a = self.in_proj_a(hidden_states)
 
@@ -731,12 +731,23 @@
 +                    gdn_core_cu,
 +                    cu_seqlens_list=gdn_lossless_plan.owned_cu_seqlens,
 +                )
++                backend_impl = self._veomni_chunk_gated_delta_rule_impl
++                if gdn_lossless_plan.local.owned_token_count == 0:
++                    # Empty owners still participate in KCP/state communication,
++                    # but the external Mojo norm has no rows to launch.  Keep the
++                    # tensors untouched and make the later kernel flag explicit.
++                    use_qk_l2norm_in_kernel = False
++                else:
++                    query_gdr, key_gdr, use_qk_l2norm_in_kernel = prepare_gated_delta_rule_qk(
++                        query_gdr,
++                        key_gdr,
++                        implementation=backend_impl,
++                        force_external=self.gdn_context_parallel_implementation == "kcp",
++                    )
 +                if self.gdn_context_parallel_implementation == "kcp":
 +                    # KCP's affine pre-scan and the local GDR core must consume the
-+                    # exact same producer-dtype normalized key. Normalizing once
-+                    # here also gives both paths one shared autograd edge.
-+                    query_gdr = producer_dtype_l2norm(query_gdr)
-+                    key_gdr = producer_dtype_l2norm(key_gdr)
++                    # exact same backend-normalized key. Normalizing once here also
++                    # gives both paths one shared autograd edge.
 +                    needs_affine_readiness = not getattr(
 +                        self, "_gdn_kcp_affine_ready", False
 +                    ) and kcp_plan_requires_affine_scan(gdn_lossless_plan)
@@ -775,7 +786,6 @@
 +                        # edges without changing the empty numerical output.
 +                        core_attn_out = attach_state_dependency(core_attn_out, initial_state)
 +                else:
-+                    backend_impl = self._veomni_chunk_gated_delta_rule_impl
 +                    if requires_chunked_varlen_metadata(backend_impl):
 +                        # The original precomputed metadata describes the physical
 +                        # input. Build the owned/chunk-aligned metadata from host CU
@@ -817,7 +827,7 @@
 +                        beta=beta_gdr,
 +                        initial_state=initial_state,
 +                        output_final_state=self.gdn_context_parallel_implementation == "state_passing_lossless",
-+                        use_qk_l2norm_in_kernel=self.gdn_context_parallel_implementation != "kcp",
++                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
 +                        cu_seqlens=aligned_cu.npu(),
 +                        cu_seqlens_list=aligned_cu_list,
 +                        chunk_indices=aligned_chunk_indices,
@@ -836,20 +846,24 @@
 +                    core_attn_out = attach_state_dependency(core_attn_out, final_state)
 +            else:
 +                # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
-+                core_attn_out, last_recurrent_state = call_chunk_gated_delta_rule(
-+                    self.chunk_gated_delta_rule,
++                backend_impl = self._veomni_chunk_gated_delta_rule_impl
++                query_gdr, key_gdr, use_qk_l2norm_in_kernel = prepare_gated_delta_rule_qk(
 +                    query,
 +                    key,
++                    implementation=backend_impl,
++                )
++                core_attn_out, last_recurrent_state = call_chunk_gated_delta_rule(
++                    self.chunk_gated_delta_rule,
++                    query_gdr,
++                    key_gdr,
 +                    value,
-+                    implementation=self._veomni_chunk_gated_delta_rule_impl,
-+                    metadata_is_canonical=not requires_chunked_varlen_metadata(
-+                        self._veomni_chunk_gated_delta_rule_impl
-+                    ),
++                    implementation=backend_impl,
++                    metadata_is_canonical=not requires_chunked_varlen_metadata(backend_impl),
 +                    g=g,
 +                    beta=beta,
 +                    initial_state=None,
 +                    output_final_state=cache_params is not None,
-+                    use_qk_l2norm_in_kernel=True,
++                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
 +                    cu_seqlens=cu_seq_lens_q.npu(),
 +                    cu_seqlens_list=cu_seqlens_list,
 +                    chunk_indices=chunk_indices,
@@ -859,7 +873,7 @@
              core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                  query,
                  key,
-@@ -531,23 +1087,32 @@
+@@ -531,23 +1101,32 @@
                  output_final_state=cache_params is not None,
                  use_qk_l2norm_in_kernel=True,
              )
@@ -906,7 +920,7 @@
 
          # reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-@@ -558,6 +1123,20 @@
+@@ -558,6 +1137,20 @@
          output = self.out_proj(core_attn_out)
          return output
 
@@ -927,7 +941,7 @@
 
  def rotate_half(x):
      """Rotates half the hidden dims of the input."""
-@@ -566,27 +1145,14 @@
+@@ -566,27 +1159,14 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -962,7 +976,7 @@
      cos = cos.unsqueeze(unsqueeze_dim)
      sin = sin.unsqueeze(unsqueeze_dim)
 
-@@ -734,6 +1300,12 @@
+@@ -734,6 +1314,12 @@
          return down_proj
 
 
@@ -975,7 +989,7 @@
  class Qwen3_5RMSNorm(nn.Module):
      def __init__(self, dim: int, eps: float = 1e-6):
          super().__init__()
-@@ -743,7 +1315,16 @@
+@@ -743,7 +1329,16 @@
      def _norm(self, x):
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
@@ -992,7 +1006,7 @@
          output = self._norm(x.float())
          # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
          # See https://github.com/huggingface/transformers/pull/29402
-@@ -752,6 +1333,12 @@
+@@ -752,6 +1347,12 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.eps}"
@@ -1005,7 +1019,7 @@
 
 
  class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
-@@ -767,6 +1354,7 @@
+@@ -767,6 +1368,7 @@
          self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
          self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -1013,7 +1027,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -774,19 +1362,39 @@
+@@ -774,19 +1376,39 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -1055,7 +1069,7 @@
              )
          elif self.layer_type == "full_attention":
              # Self Attention
-@@ -795,6 +1403,7 @@
+@@ -795,6 +1417,7 @@
                  attention_mask=attention_mask,
                  position_ids=position_ids,
                  past_key_values=past_key_values,
@@ -1063,7 +1077,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -806,7 +1415,6 @@
+@@ -806,7 +1429,6 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          hidden_states = residual + hidden_states
@@ -1071,7 +1085,7 @@
          return hidden_states
 
 
-@@ -888,9 +1496,16 @@
+@@ -888,9 +1510,16 @@
          return x
 
 
@@ -1088,7 +1102,7 @@
      orig_q_dtype = q.dtype
      orig_k_dtype = k.dtype
      q, k = q.float(), k.float()
-@@ -1019,6 +1634,12 @@
+@@ -1019,6 +1648,12 @@
          return hidden_states
 
 
@@ -1101,7 +1115,7 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      input_modalities = ("image", "video")
-@@ -1054,28 +1675,127 @@
+@@ -1054,28 +1689,127 @@
 
          self.post_init()
 
@@ -1249,7 +1263,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1090,39 +1810,221 @@
+@@ -1090,39 +1824,221 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1489,7 +1503,7 @@
          )
 
 
-@@ -1150,6 +2052,12 @@
+@@ -1150,6 +2066,12 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1502,7 +1516,7 @@
  class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5TextConfig
 
-@@ -1165,6 +2073,7 @@
+@@ -1165,6 +2087,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1510,7 +1524,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1177,7 +2086,7 @@
+@@ -1177,7 +2100,7 @@
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1519,7 +1533,7 @@
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-@@ -1209,6 +2118,122 @@
+@@ -1209,6 +2132,122 @@
              position_ids=text_position_ids,
          )
          linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
@@ -1642,7 +1656,7 @@
 
          hidden_states = inputs_embeds
          position_embeddings = self.rotary_emb(hidden_states, position_ids)
-@@ -1233,19 +2258,42 @@
+@@ -1233,19 +2272,42 @@
              past_key_values=past_key_values,
          )
 
@@ -1696,7 +1710,7 @@
 
 
  @auto_docstring
-@@ -1441,64 +2489,43 @@
+@@ -1441,64 +2503,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1786,7 +1800,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1564,13 +2591,18 @@
+@@ -1564,13 +2605,18 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1805,7 +1819,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1578,29 +2610,170 @@
+@@ -1578,29 +2624,170 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1986,7 +2000,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1610,6 +2783,18 @@
+@@ -1610,6 +2797,18 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -2005,7 +2019,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1617,6 +2802,7 @@
+@@ -1617,6 +2816,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2013,7 +2027,7 @@
              **kwargs,
          )
 
-@@ -1624,6 +2810,12 @@
+@@ -1624,6 +2824,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -2026,7 +2040,7 @@
 
 
  @auto_docstring
-@@ -1654,10 +2846,13 @@
+@@ -1654,10 +2860,13 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -2040,7 +2054,7 @@
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
              config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-@@ -1679,6 +2874,10 @@
+@@ -1679,6 +2888,10 @@
          >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
          "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
          ```"""
@@ -2051,7 +2065,7 @@
          outputs: BaseModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1686,21 +2885,50 @@
+@@ -1686,21 +2899,50 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -2106,7 +2120,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1740,6 +2968,31 @@
+@@ -1740,6 +2982,31 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -2138,7 +2152,7 @@
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
      # Reference: fix gemma3 grad acc #37208
-@@ -1796,57 +3049,11 @@
+@@ -1796,57 +3063,11 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2199,7 +2213,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1857,27 +3064,54 @@
+@@ -1857,27 +3078,54 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2260,7 +2274,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2103,6 +3337,24 @@
+@@ -2103,6 +3351,24 @@
 
          return input_ids, model_kwargs
 

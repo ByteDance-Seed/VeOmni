@@ -127,12 +127,8 @@ config.add_import(
 )
 config.add_import("veomni.distributed.context_parallel.gdn_runtime", names=["make_gdn_cp_runtime_observer"])
 config.add_import(
-    "veomni.ops.kernels.gated_delta_rule.normalization",
-    names=["producer_dtype_l2norm"],
-)
-config.add_import(
     "veomni.ops.kernels.gated_delta_rule.backend_adapter",
-    names=["call_chunk_gated_delta_rule", "requires_chunked_varlen_metadata"],
+    names=["call_chunk_gated_delta_rule", "prepare_gated_delta_rule_qk", "requires_chunked_varlen_metadata"],
 )
 config.add_import(
     "veomni.distributed.context_parallel.packed_sharding",
