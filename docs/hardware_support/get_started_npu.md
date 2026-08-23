@@ -82,8 +82,8 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 |---|---|---|---|---|---|---|
 | [Qwen3](../examples/qwen3.md) | 8B | ✅ | ✅ | | ✅ | |
 | | 30B | ✅ | ✅ | ✅ | ✅ | |
-| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | Requires explicit GatedDeltaNet NPU kernels; CI validates the dense toy config with VLM E2E and text FSDP equivalence |
-| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Requires explicit GatedDeltaNet NPU kernels; CI validates the MoE toy config with VLM E2E and text FSDP equivalence |
+| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | Supported on non-arch35 Ascend NPUs only; `Ascend910_95`/`Ascend950` are excluded because the vendored `causal_conv1d` is unsupported. CI validates the dense toy config with VLM E2E and text FSDP equivalence |
+| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Supported on non-arch35 Ascend NPUs only; `Ascend910_95`/`Ascend950` are excluded because the vendored `causal_conv1d` is unsupported. CI validates the MoE toy config with VLM E2E and text FSDP equivalence |
 | [Qwen3-VL](../examples/qwen3_vl.md) | 8B | ✅ | ✅ | | ✅ | |
 | | 30B | ✅ | ✅ | ✅ | ✅ | |
 | [Wan2.1](../examples/wan2.1.md) | 1.3B | ✅ | ✅ | | ✅ | Prototype |

@@ -277,11 +277,6 @@ class TestNPURmsNormGated:
         assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
 
 
-# ---------------------------------------------------------------------------
-# Qwen3.5 varlen GatedDeltaNet tests
-# ---------------------------------------------------------------------------
-
-
 class TestNPUGatedDeltaNetVarlen:
     """Validate packed-sequence NPU kernels against segmented eager references."""
 
