@@ -1365,6 +1365,277 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, model_type,
         torch.testing.assert_close(chunked_param_grads[name], baseline_grad, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("return_dict", [True, False])
+def test_apply_chunk_mbs_preserves_qwen3_vl_moe_router_output_contract(monkeypatch, return_dict):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+    from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_gpu import (
+        Qwen3VLMoeTextConfig,
+        Qwen3VLMoeTextModel,
+    )
+
+    class Qwen3VLMoeForConditionalGeneration(nn.Module):
+        _no_split_modules = ["Qwen3VLMoeTextDecoderLayer"]
+
+        def __init__(self, config):
+            super().__init__()
+            self.config = types.SimpleNamespace(text_config=config)
+            self.model = nn.Module()
+            self.model.language_model = Qwen3VLMoeTextModel(config)
+            self.forward_output_router_logits = None
+
+        def forward(self, *args, **kwargs):
+            self.forward_output_router_logits = kwargs.get("output_router_logits")
+            return self.model.language_model(*args, **kwargs)
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+
+    config = Qwen3VLMoeTextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=24,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+        attention_dropout=0.0,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        rope_theta=10000,
+        num_experts=4,
+        num_experts_per_tok=2,
+        decoder_sparse_step=2,
+        mlp_only_layers=[2],
+        output_router_logits=True,
+        use_cache=False,
+    )
+    config._attn_implementation = "eager"
+
+    torch.manual_seed(0)
+    baseline_model = Qwen3VLMoeForConditionalGeneration(config)
+    chunked_model = Qwen3VLMoeForConditionalGeneration(copy.deepcopy(config))
+    chunked_model.load_state_dict(baseline_model.state_dict())
+    apply_chunk_mbs(chunked_model, _config(chunk_mbs=2))
+
+    cu_seq_lens = torch.tensor([0, 3, 5, 9], dtype=torch.int32)
+    ranges = build_chunk_mbs_ranges({"cu_seq_lens_q": cu_seq_lens, "cu_seq_lens_k": cu_seq_lens}, _config(chunk_mbs=2))
+    assert ranges is not None and len(ranges) == 2
+    hidden_states = torch.randn(1, 9, config.hidden_size)
+    position_ids = torch.arange(9).view(1, 9)
+    forward_kwargs = {
+        "position_ids": position_ids,
+        "attention_mask": _packed_causal_attention_mask(cu_seq_lens, hidden_states.dtype),
+        "use_cache": False,
+        "return_dict": return_dict,
+        "cu_seq_lens_q": cu_seq_lens,
+        "cu_seq_lens_k": cu_seq_lens,
+        "max_length_q": 4,
+        "max_length_k": 4,
+    }
+    baseline_hidden = hidden_states.detach().clone().requires_grad_()
+    baseline_outputs = baseline_model(inputs_embeds=baseline_hidden, **forward_kwargs)
+    baseline_last_hidden = baseline_outputs.last_hidden_state if return_dict else baseline_outputs[0]
+    baseline_router_logits = baseline_outputs.router_logits if return_dict else baseline_outputs[-1]
+    baseline_loss = baseline_last_hidden.float().square().mean() + sum(
+        router_logits.float().square().mean() for router_logits in baseline_router_logits
+    )
+    baseline_loss.backward()
+
+    chunked_hidden = hidden_states.detach().clone().requires_grad_()
+    with chunk_mbs_context(ranges):
+        chunked_outputs = chunked_model(inputs_embeds=chunked_hidden, **forward_kwargs)
+        chunked_last_hidden = chunked_outputs.last_hidden_state if return_dict else chunked_outputs[0]
+        chunked_router_logits = chunked_outputs.router_logits if return_dict else chunked_outputs[-1]
+        chunked_loss = chunked_last_hidden.float().square().mean() + sum(
+            router_logits.float().square().mean() for router_logits in chunked_router_logits
+        )
+        chunked_loss.backward()
+
+    assert baseline_model.forward_output_router_logits is None
+    assert chunked_model.forward_output_router_logits is True
+    assert len(baseline_router_logits) == len(chunked_router_logits) == 2
+    for baseline_layer_router_logits, chunked_layer_router_logits in zip(
+        baseline_router_logits, chunked_router_logits
+    ):
+        assert chunked_layer_router_logits.shape == (hidden_states.shape[1], config.num_experts)
+        torch.testing.assert_close(chunked_layer_router_logits, baseline_layer_router_logits, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(chunked_last_hidden, baseline_last_hidden, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(chunked_hidden.grad, baseline_hidden.grad, rtol=1e-5, atol=1e-5)
+    for (baseline_name, baseline_param), (chunked_name, chunked_param) in zip(
+        baseline_model.named_parameters(), chunked_model.named_parameters()
+    ):
+        assert chunked_name == baseline_name
+        torch.testing.assert_close(chunked_param.grad, baseline_param.grad, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("chunked_router_flag", "return_dict"),
+    [
+        pytest.param("omitted", True, id="config-default-return-dict"),
+        pytest.param(None, False, id="explicit-none-return-tuple"),
+        pytest.param(False, True, id="explicit-false"),
+    ],
+)
+def test_apply_chunk_mbs_preserves_qwen3_vl_moe_aux_loss(monkeypatch, chunked_router_flag, return_dict):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+    from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_gpu import (
+        Qwen3VLMoeConfig,
+        Qwen3VLMoeForConditionalGeneration,
+        Qwen3VLMoeTextConfig,
+        Qwen3VLMoeVisionConfig,
+    )
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+
+    text_config = Qwen3VLMoeTextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=24,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+        attention_dropout=0.0,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        num_experts=4,
+        num_experts_per_tok=2,
+        decoder_sparse_step=2,
+        mlp_only_layers=[2],
+        output_router_logits=True,
+        router_aux_loss_coef=0.01,
+        use_cache=False,
+        tie_word_embeddings=False,
+    )
+    text_config._attn_implementation = "eager"
+    vision_config = Qwen3VLMoeVisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=4,
+        in_channels=3,
+        patch_size=2,
+        spatial_merge_size=1,
+        temporal_patch_size=1,
+        out_hidden_size=16,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
+    )
+    config = Qwen3VLMoeConfig(
+        text_config=text_config,
+        vision_config=vision_config,
+        tie_word_embeddings=False,
+    )
+    config._attn_implementation = "eager"
+    config.text_config._attn_implementation = "eager"
+
+    def test_loss_function(logits, labels, **_kwargs):
+        shifted_logits = logits[:, :-1].reshape(-1, logits.shape[-1])
+        shifted_labels = labels[:, 1:].reshape(-1)
+        return nn.functional.cross_entropy(shifted_logits, shifted_labels), None, None
+
+    torch.manual_seed(0)
+    baseline_model = Qwen3VLMoeForConditionalGeneration(config)
+    chunked_model = Qwen3VLMoeForConditionalGeneration(copy.deepcopy(config))
+    chunked_model.load_state_dict(baseline_model.state_dict())
+    for model in (baseline_model, chunked_model):
+        model._loss_function = test_loss_function
+        for layer in model.model.language_model.layers:
+            for parameter in layer.self_attn.parameters():
+                parameter.data.zero_()
+    apply_chunk_mbs(chunked_model, _config(chunk_mbs=2))
+
+    cu_seq_lens = torch.tensor([0, 3, 5, 9], dtype=torch.int32)
+    ranges = build_chunk_mbs_ranges({"cu_seq_lens_q": cu_seq_lens, "cu_seq_lens_k": cu_seq_lens}, _config(chunk_mbs=2))
+    assert ranges is not None and len(ranges) == 2
+    hidden_states = torch.randn(1, 9, config.text_config.hidden_size)
+    labels = torch.randint(0, config.text_config.vocab_size, (1, 9))
+    text_position_ids = torch.arange(9).view(1, 9)
+    position_ids = text_position_ids.view(1, 1, 9).expand(4, 1, 9)
+    common_kwargs = {
+        "labels": labels,
+        "position_ids": position_ids,
+        "attention_mask": torch.ones(1, 9, dtype=torch.long),
+        "use_cache": False,
+        "return_dict": return_dict,
+        "cu_seq_lens_q": cu_seq_lens,
+        "cu_seq_lens_k": cu_seq_lens,
+        "max_length_q": 4,
+        "max_length_k": 4,
+        "image_mask": torch.zeros(1, 9, dtype=torch.bool),
+        "video_mask": torch.zeros(1, 9, dtype=torch.bool),
+    }
+    expected_router_logits = chunked_router_flag is not False
+    baseline_hidden = hidden_states.detach().clone().requires_grad_()
+    baseline_outputs = baseline_model(
+        inputs_embeds=baseline_hidden,
+        output_router_logits=expected_router_logits,
+        **common_kwargs,
+    )
+    chunked_kwargs = dict(common_kwargs)
+    if chunked_router_flag != "omitted":
+        chunked_kwargs["output_router_logits"] = chunked_router_flag
+    chunked_hidden = hidden_states.detach().clone().requires_grad_()
+    with chunk_mbs_context(ranges):
+        chunked_outputs = chunked_model(inputs_embeds=chunked_hidden, **chunked_kwargs)
+
+    if return_dict:
+        baseline_loss, baseline_logits = baseline_outputs.loss, baseline_outputs.logits
+        chunked_loss, chunked_logits = chunked_outputs.loss, chunked_outputs.logits
+        baseline_router_logits, baseline_aux_loss = baseline_outputs.router_logits, baseline_outputs.aux_loss
+        chunked_router_logits, chunked_aux_loss = chunked_outputs.router_logits, chunked_outputs.aux_loss
+    elif expected_router_logits:
+        baseline_loss, baseline_logits, baseline_router_logits, baseline_aux_loss = baseline_outputs
+        chunked_loss, chunked_logits, chunked_router_logits, chunked_aux_loss = chunked_outputs
+    else:
+        baseline_loss, baseline_logits = baseline_outputs
+        chunked_loss, chunked_logits = chunked_outputs
+        baseline_router_logits = chunked_router_logits = None
+        baseline_aux_loss = chunked_aux_loss = None
+
+    torch.testing.assert_close(chunked_loss, baseline_loss, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(chunked_logits, baseline_logits, rtol=1e-5, atol=1e-5)
+    if expected_router_logits:
+        assert len(baseline_router_logits) == len(chunked_router_logits) == 2
+        for baseline_layer_router_logits, chunked_layer_router_logits in zip(
+            baseline_router_logits, chunked_router_logits
+        ):
+            assert chunked_layer_router_logits.shape == (hidden_states.shape[1], config.text_config.num_experts)
+            torch.testing.assert_close(chunked_layer_router_logits, baseline_layer_router_logits, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(chunked_aux_loss, baseline_aux_loss, rtol=1e-5, atol=1e-5)
+    else:
+        assert chunked_router_logits is baseline_router_logits is None
+        assert chunked_aux_loss is baseline_aux_loss is None
+
+    baseline_loss.backward()
+    chunked_loss.backward()
+    router_grad_names = []
+    for (baseline_name, baseline_param), (chunked_name, chunked_param) in zip(
+        baseline_model.named_parameters(), chunked_model.named_parameters()
+    ):
+        assert chunked_name == baseline_name
+        assert (chunked_param.grad is None) == (baseline_param.grad is None)
+        if baseline_param.grad is not None:
+            torch.testing.assert_close(chunked_param.grad, baseline_param.grad, rtol=1e-5, atol=1e-5)
+        if ".mlp.gate.weight" in baseline_name:
+            router_grad_names.append(baseline_name)
+            assert baseline_param.grad is not None
+    assert len(router_grad_names) == 2
+
+
 @pytest.mark.parametrize("layer_type", ["full_attention", "linear_attention"])
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_apply_chunk_mbs_matches_qwen3_5_decoder_layer(monkeypatch, layer_type, use_checkpoint):

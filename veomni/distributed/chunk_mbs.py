@@ -70,6 +70,8 @@ _sp_chunk_context: ContextVar[Optional[_SPChunkContext]] = ContextVar("sp_chunk_
 _QWEN3_VL_DECODER_CLASSES = {"Qwen3VLTextDecoderLayer", "Qwen3VLMoeTextDecoderLayer"}
 _QWEN3_VL_MOE_DECODER_CLASS = "Qwen3VLMoeTextDecoderLayer"
 _QWEN3_VL_MOE_ROUTER_CLASS = "Qwen3VLMoeTextTopKRouter"
+_QWEN3_VL_MOE_TEXT_MODEL_CLASS = "Qwen3VLMoeTextModel"
+_QWEN3_VL_MOE_CAUSAL_LM_CLASS = "Qwen3VLMoeForConditionalGeneration"
 
 
 @contextmanager
@@ -271,8 +273,11 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
             f"got incompatible modules {incompatible_modules!r}."
         )
 
-    if parallel_state.sp_enabled and target_classes == {_QWEN3_VL_MOE_DECODER_CLASS}:
-        _wrap_qwen3_vl_moe_routers([module for _, module in target_modules])
+    if target_classes == {_QWEN3_VL_MOE_DECODER_CLASS}:
+        routers = _find_qwen3_vl_moe_routers([module for _, module in target_modules])
+        if parallel_state.sp_enabled:
+            _wrap_qwen3_vl_moe_routers(routers)
+        _wrap_qwen3_vl_moe_output_contract(model, len(routers))
 
     for fqn, module in target_modules:
         _wrap_module_forward(module)
@@ -331,14 +336,18 @@ def _wrap_module_forward(module: nn.Module) -> None:
     module._chunk_mbs_wrapped = True
 
 
-def _wrap_qwen3_vl_moe_routers(target_modules: list[nn.Module]) -> None:
+def _find_qwen3_vl_moe_routers(target_modules: list[nn.Module]) -> list[nn.Module]:
     routers = {
         id(submodule): submodule
         for module in target_modules
         for submodule in module.modules()
         if submodule.__class__.__name__ == _QWEN3_VL_MOE_ROUTER_CLASS
     }
-    for router in routers.values():
+    return list(routers.values())
+
+
+def _wrap_qwen3_vl_moe_routers(routers: list[nn.Module]) -> None:
+    for router in routers:
         if getattr(router, "_chunk_mbs_wrapped", False):
             continue
         orig_forward = router.forward
@@ -358,6 +367,73 @@ def _wrap_qwen3_vl_moe_routers(target_modules: list[nn.Module]) -> None:
 
         router.forward = wrapped_forward
         router._chunk_mbs_wrapped = True
+
+
+def _wrap_qwen3_vl_moe_output_contract(model: nn.Module, num_sparse_layers: int) -> None:
+    if num_sparse_layers < 1:
+        return
+
+    for module in model.modules():
+        if module.__class__.__name__ == _QWEN3_VL_MOE_CAUSAL_LM_CLASS and not getattr(
+            module, "_chunk_mbs_router_flag_wrapped", False
+        ):
+            orig_forward = module.forward
+
+            @wraps(orig_forward)
+            def wrapped_causal_lm_forward(*args, __orig_forward=orig_forward, __module=module, **kwargs):
+                if kwargs.get("output_router_logits") is None:
+                    text_config = getattr(__module.config, "text_config", __module.config)
+                    kwargs["output_router_logits"] = getattr(text_config, "output_router_logits", False)
+                return __orig_forward(*args, **kwargs)
+
+            module.forward = wrapped_causal_lm_forward
+            module._chunk_mbs_router_flag_wrapped = True
+
+        if module.__class__.__name__ == _QWEN3_VL_MOE_TEXT_MODEL_CLASS and not getattr(
+            module, "_chunk_mbs_router_outputs_wrapped", False
+        ):
+            orig_forward = module.forward
+
+            @wraps(orig_forward)
+            def wrapped_text_model_forward(*args, __orig_forward=orig_forward, __module=module, **kwargs):
+                outputs = __orig_forward(*args, **kwargs)
+                if not _chunk_mbs_ranges.get():
+                    return outputs
+                output_router_logits = kwargs.get("output_router_logits")
+                if output_router_logits is None:
+                    output_router_logits = getattr(__module.config, "output_router_logits", False)
+                if not output_router_logits:
+                    return outputs
+                if isinstance(outputs, tuple):
+                    router_logits = outputs[-1]
+                    return (*outputs[:-1], _merge_chunked_router_logits(router_logits, num_sparse_layers))
+                router_logits = outputs.router_logits
+                if router_logits is not None:
+                    outputs.router_logits = _merge_chunked_router_logits(router_logits, num_sparse_layers)
+                return outputs
+
+            module.forward = wrapped_text_model_forward
+            module._chunk_mbs_router_outputs_wrapped = True
+
+
+def _merge_chunked_router_logits(
+    router_logits: tuple[torch.Tensor, ...], num_sparse_layers: int
+) -> tuple[torch.Tensor, ...]:
+    if not isinstance(router_logits, tuple):
+        raise TypeError("ChunkMBS expects captured Qwen3-VL-MoE router logits to be a tuple.")
+    if len(router_logits) % num_sparse_layers != 0:
+        raise RuntimeError(
+            "ChunkMBS captured router logits cannot be grouped by sparse layer: "
+            f"{len(router_logits)} outputs for {num_sparse_layers} layers."
+        )
+
+    chunks_per_layer = len(router_logits) // num_sparse_layers
+    if chunks_per_layer <= 1:
+        return router_logits
+    return tuple(
+        torch.cat(router_logits[layer_idx * chunks_per_layer : (layer_idx + 1) * chunks_per_layer], dim=0)
+        for layer_idx in range(num_sparse_layers)
+    )
 
 
 def _wrap_gradient_checkpointing_func(module: nn.Module) -> None:
