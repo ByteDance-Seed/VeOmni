@@ -126,6 +126,15 @@ def v4_lighting_indexer(
         raise ValueError(f"DeepSeek V4 TileLang indexer requires a head count divisible by 8 and <= 64, got {heads}.")
     if index_q.shape[-1] < 32:
         raise ValueError(f"DeepSeek V4 TileLang indexer requires head dim >= 32, got {index_q.shape[-1]}.")
+    # The kernels are compiled for bf16 q/k. Callers run under autocast, whose
+    # fp32 op policy (sum, rsqrt, ...) can silently promote an upstream tensor,
+    # so reject the mismatch here instead of feeding the kernel garbage.
+    if index_q.dtype is not torch.bfloat16 or index_k.dtype is not torch.bfloat16:
+        raise ValueError(
+            f"DeepSeek V4 TileLang indexer requires bfloat16 q/k, got q={index_q.dtype}, k={index_k.dtype}"
+        )
+    if weights.dtype is not torch.float32:
+        raise ValueError(f"DeepSeek V4 TileLang indexer requires float32 weights, got {weights.dtype}")
     return V4IndexerFunction.apply(
         index_q,
         index_k,
