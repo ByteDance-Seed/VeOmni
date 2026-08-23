@@ -1061,13 +1061,15 @@ class OpsImplementationConfig:
         default="liger_kernel",
         metadata={
             "help": "RMSNorm. 'liger_kernel' (default, GPU) | 'npu' | "
-            "'triton' (DeepSeek-V3 batch-invariant; GPU only) | 'eager'."
+            "'triton' (DeepSeek-V3 batch-invariant; GPU only) | "
+            "'nabla' (single-kernel Triton fwd+bwd; GPU only) | 'eager'."
         },
     )
     swiglu_mlp_implementation: str = field(
         default="liger_kernel",
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (default, GPU) | 'eager'. No NPU backend — NPU users must set 'eager'."
+            "help": "SwiGLU MLP. 'liger_kernel' (default, GPU) | "
+            "'nabla' (Triton fwd+bwd SiLU-mul core; GPU only) | 'eager'. No NPU backend — NPU users must set 'eager'."
         },
     )
     rotary_pos_emb_implementation: str = field(
