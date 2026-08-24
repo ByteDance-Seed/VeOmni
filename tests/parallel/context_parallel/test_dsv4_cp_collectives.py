@@ -89,7 +89,7 @@ def _run(rank: int, world_size: int, init_file: str) -> None:
     dist.destroy_process_group()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < CP_SIZE, reason="needs 4 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < CP_SIZE, reason="needs 4 devices")
 def test_cp_collectives():
     # A bare ``tempfile.NamedTemporaryFile`` races with the ``file://`` init
     # method: PyTorch's file store itself removes the file once every rank has
