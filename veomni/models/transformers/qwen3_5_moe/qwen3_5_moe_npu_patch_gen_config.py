@@ -123,7 +123,7 @@ config.add_import(
         "make_state_participation",
         "make_state_template",
         "owned_to_physical",
-        "physical_to_owned",
+        "physical_to_owned_grouped",
         "receive_initial_state",
         "send_final_state",
         "trim_conv_halo",

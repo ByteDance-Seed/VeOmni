@@ -6,6 +6,7 @@ import torch
 from veomni.distributed.context_parallel.gdn_lossless import (
     align_gdn_varlen_chunks,
     aligned_gdn_cu_seqlens,
+    attach_state_dependency,
     make_state_participation,
     make_state_template,
     unpad_gdn_varlen_output,
@@ -173,3 +174,28 @@ def test_chunk_alignment_preserves_state_inputs_and_unpads_outputs():
     participation.backward()
     assert query.grad is not None
     torch.testing.assert_close(query.grad, torch.zeros_like(query), rtol=0, atol=0)
+
+
+def test_state_dependency_aliases_output_and_preserves_zero_state_gradient():
+    output = torch.randn(4, 8, requires_grad=True)
+    state = torch.randn(2, 3, 4, requires_grad=True)
+
+    attached = attach_state_dependency(output, state)
+
+    assert attached.untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
+    attached.square().sum().backward()
+    torch.testing.assert_close(output.grad, 2 * output.detach())
+    torch.testing.assert_close(state.grad, torch.zeros_like(state), rtol=0, atol=0)
+
+
+def test_state_template_uses_shape_only_scalar_storage():
+    query = torch.randn(1, 16, 2, 4)
+    value = torch.randn(1, 16, 2, 8)
+    cu_seqlens = torch.tensor([0, 7, 16], dtype=torch.int32)
+
+    template = make_state_template(query, value, cu_seqlens)
+
+    assert template.shape == (2, 2, 4, 8)
+    assert template.dtype == torch.float32
+    assert template.untyped_storage().nbytes() == torch.tensor(0, dtype=torch.float32).element_size()
+    torch.testing.assert_close(template, torch.zeros_like(template), rtol=0, atol=0)

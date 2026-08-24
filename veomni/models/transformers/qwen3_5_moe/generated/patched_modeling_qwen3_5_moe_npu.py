@@ -120,7 +120,7 @@ from veomni.distributed.context_parallel.gdn_lossless import (
     make_state_participation,
     make_state_template,
     owned_to_physical,
-    physical_to_owned,
+    physical_to_owned_grouped,
     receive_initial_state,
     send_final_state,
     trim_conv_halo,
@@ -859,18 +859,16 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         gdn_core_cu = cu_seq_lens_q
         if cp_enabled:
-            mixed_qkv = physical_to_owned(
-                mixed_qkv,
+            # These projections share the same token ownership plan and dtype.
+            # Route them in one packed all-to-all instead of paying three
+            # collective launches in forward and three inverse launches in
+            # backward.  Packing changes neither wire bytes nor tensor values.
+            mixed_qkv, b, a = physical_to_owned_grouped(
+                (mixed_qkv, b, a),
                 plan=gdn_lossless_plan,
                 cp_group=parallel_state.cp_group,
                 sequence_dim=1,
                 observer=gdn_cp_observer,
-            )
-            b = physical_to_owned(
-                b, plan=gdn_lossless_plan, cp_group=parallel_state.cp_group, sequence_dim=1, observer=gdn_cp_observer
-            )
-            a = physical_to_owned(
-                a, plan=gdn_lossless_plan, cp_group=parallel_state.cp_group, sequence_dim=1, observer=gdn_cp_observer
             )
             gdn_core_cu = mixed_qkv.new_tensor(gdn_lossless_plan.owned_cu_seqlens, dtype=torch.int32)
 

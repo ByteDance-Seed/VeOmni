@@ -132,6 +132,41 @@ def _copy_to_buffer(flat: Tensor, spans: Sequence[GdnCopySpan], rows: int, *, ze
     return output
 
 
+def _copy_group_to_buffer(
+    flats: Sequence[Tensor],
+    spans: Sequence[GdnCopySpan],
+    rows: int,
+    *,
+    zero_fill: bool,
+) -> Tensor:
+    """Pack equal-layout tensors into one row-routed wire buffer."""
+    if not flats:
+        raise ValueError("grouped GDN repartition requires at least one tensor")
+    widths = tuple(int(flat.size(1)) for flat in flats)
+    total_width = sum(widths)
+    output = flats[0].new_zeros((rows, total_width)) if zero_fill else flats[0].new_empty((rows, total_width))
+    feature_offset = 0
+    for flat, width in zip(flats, widths):
+        feature_slice = output.narrow(1, feature_offset, width)
+        for span in spans:
+            feature_slice.narrow(0, span.destination_start, span.length).copy_(
+                flat.narrow(0, span.source_start, span.length)
+            )
+        feature_offset += width
+    return output
+
+
+def _split_group_buffer(buffer: Tensor, widths: Sequence[int]) -> tuple[Tensor, ...]:
+    outputs: list[Tensor] = []
+    offset = 0
+    for width in widths:
+        outputs.append(buffer.narrow(1, offset, width))
+        offset += width
+    if offset != int(buffer.size(1)):
+        raise RuntimeError(f"grouped feature widths cover {offset}, expected {buffer.size(1)}")
+    return tuple(outputs)
+
+
 def _all_to_all(
     send: Tensor,
     *,
@@ -159,7 +194,9 @@ def _physical_to_owned_flat(flat: Tensor, plan: GdnLosslessRuntimePlan, group: P
         output_splits=local.forward_output_splits,
         group=group,
     )
-    return _copy_to_buffer(receive, local.forward_unpack_spans, local.owned_token_count, zero_fill=True)
+    # Plan validation proves that forward-unpack destinations cover every owned
+    # row exactly once, so pre-zeroing this full activation is redundant.
+    return _copy_to_buffer(receive, local.forward_unpack_spans, local.owned_token_count, zero_fill=False)
 
 
 def _owned_to_physical_flat(flat: Tensor, plan: GdnLosslessRuntimePlan, group: ProcessGroup) -> Tensor:
@@ -172,6 +209,139 @@ def _owned_to_physical_flat(flat: Tensor, plan: GdnLosslessRuntimePlan, group: P
         group=group,
     )
     return _copy_to_buffer(receive, local.inverse_unpack_spans, local.source_token_count, zero_fill=True)
+
+
+def _route_grouped_flat(
+    flats: Sequence[Tensor],
+    plan: GdnLosslessRuntimePlan,
+    group: ProcessGroup,
+    *,
+    physical_to_owned_route: bool,
+) -> tuple[Tensor, ...]:
+    local = plan.local
+    widths = tuple(int(flat.size(1)) for flat in flats)
+    if physical_to_owned_route:
+        pack_spans = local.forward_pack_spans
+        unpack_spans = local.forward_unpack_spans
+        input_splits = local.forward_input_splits
+        output_splits = local.forward_output_splits
+        output_rows = local.owned_token_count
+        zero_fill = False
+    else:
+        pack_spans = local.inverse_pack_spans
+        unpack_spans = local.inverse_unpack_spans
+        input_splits = local.inverse_input_splits
+        output_splits = local.inverse_output_splits
+        output_rows = local.source_token_count
+        # The inverse route deliberately omits physical ring padding.
+        zero_fill = True
+    send = _copy_group_to_buffer(flats, pack_spans, sum(input_splits), zero_fill=False)
+    receive = _all_to_all(send, input_splits=input_splits, output_splits=output_splits, group=group)
+    output = _copy_group_to_buffer((receive,), unpack_spans, output_rows, zero_fill=zero_fill)
+    return _split_group_buffer(output, widths)
+
+
+def _flatten_routing_group(
+    tensors: Sequence[Tensor],
+    sequence_dim: int,
+) -> tuple[tuple[Tensor, ...], tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    if not tensors:
+        raise ValueError("grouped GDN repartition requires at least one tensor")
+    first = tensors[0]
+    flats: list[Tensor] = []
+    dimensions: list[int] = []
+    feature_shapes: list[tuple[int, ...]] = []
+    expected_rows: int | None = None
+    for index, tensor in enumerate(tensors):
+        if tensor.device != first.device or tensor.dtype != first.dtype:
+            raise ValueError(
+                "grouped GDN repartition requires tensors with one dtype and device; "
+                f"tensor 0 is {first.dtype}/{first.device}, tensor {index} is {tensor.dtype}/{tensor.device}"
+            )
+        flat, normalized_dim, feature_shape = _flatten_sequence(tensor, sequence_dim)
+        rows = int(flat.size(0))
+        if expected_rows is None:
+            expected_rows = rows
+        elif rows != expected_rows:
+            raise ValueError(
+                f"grouped GDN repartition row mismatch: tensor 0 has {expected_rows}, tensor {index} has {rows}"
+            )
+        flats.append(flat)
+        dimensions.append(normalized_dim)
+        feature_shapes.append(feature_shape)
+    return tuple(flats), tuple(dimensions), tuple(feature_shapes)
+
+
+class _GroupedOwnershipRoute(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, *args: Any) -> tuple[Tensor, ...]:
+        if len(args) < 6:
+            raise ValueError("grouped GDN repartition requires tensors and routing metadata")
+        tensors = args[:-5]
+        plan, group, sequence_dim, observer, physical_to_owned_route = args[-5:]
+        _assert_live_plan(plan, group)
+        flats, dimensions, feature_shapes = _flatten_routing_group(tensors, sequence_dim)
+        expected_rows = plan.local.source_token_count if physical_to_owned_route else plan.local.owned_token_count
+        if int(flats[0].size(0)) != expected_rows:
+            layout = "physical" if physical_to_owned_route else "owned"
+            raise ValueError(f"grouped {layout} rows {flats[0].size(0)} do not match plan rows {expected_rows}")
+        ctx.plan = plan
+        ctx.group = group
+        ctx.dimensions = dimensions
+        ctx.feature_shapes = feature_shapes
+        ctx.observer = observer
+        ctx.physical_to_owned_route = physical_to_owned_route
+        if observer is not None:
+            observer.enter(GdnCpOperation.OWNERSHIP_A2A, GdnCpPhase.FORWARD)
+        try:
+            output_flats = _route_grouped_flat(
+                flats,
+                plan,
+                group,
+                physical_to_owned_route=physical_to_owned_route,
+            )
+        except Exception:
+            if observer is not None:
+                observer.error(GdnCpOperation.OWNERSHIP_A2A, GdnCpPhase.FORWARD)
+            raise
+        if observer is not None:
+            observer.exit(GdnCpOperation.OWNERSHIP_A2A, GdnCpPhase.FORWARD)
+        return tuple(
+            _restore_sequence(output, dimension, feature_shape)
+            for output, dimension, feature_shape in zip(output_flats, dimensions, feature_shapes)
+        )
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor) -> tuple[Any, ...]:
+        flats = tuple(
+            _flatten_sequence(grad_output.contiguous(), dimension)[0]
+            for grad_output, dimension in zip(grad_outputs, ctx.dimensions)
+        )
+        expected_rows = (
+            ctx.plan.local.owned_token_count if ctx.physical_to_owned_route else ctx.plan.local.source_token_count
+        )
+        if int(flats[0].size(0)) != expected_rows:
+            raise ValueError(f"grouped gradient rows {flats[0].size(0)} do not match plan rows {expected_rows}")
+        if ctx.observer is not None:
+            ctx.observer.enter(GdnCpOperation.OWNERSHIP_A2A, GdnCpPhase.BACKWARD)
+        try:
+            grad_flats = _route_grouped_flat(
+                flats,
+                ctx.plan,
+                ctx.group,
+                physical_to_owned_route=not ctx.physical_to_owned_route,
+            )
+        except Exception:
+            if ctx.observer is not None:
+                ctx.observer.error(GdnCpOperation.OWNERSHIP_A2A, GdnCpPhase.BACKWARD)
+            raise
+        if ctx.observer is not None:
+            ctx.observer.exit(GdnCpOperation.OWNERSHIP_A2A, GdnCpPhase.BACKWARD)
+        grad_inputs = tuple(
+            _restore_sequence(grad, dimension, feature_shape)
+            for grad, dimension, feature_shape in zip(grad_flats, ctx.dimensions, ctx.feature_shapes)
+        )
+        return (*grad_inputs, None, None, None, None, None)
 
 
 class _PhysicalToOwned(torch.autograd.Function):
@@ -296,6 +466,36 @@ def owned_to_physical(
     return _OwnedToPhysical.apply(tensor, plan, cp_group, sequence_dim, observer)
 
 
+def physical_to_owned_grouped(
+    tensors: Sequence[Tensor],
+    *,
+    plan: GdnLosslessRuntimePlan,
+    cp_group: ProcessGroup,
+    sequence_dim: int = 1,
+    observer: GdnCpRuntimeObserver | None = None,
+) -> tuple[Tensor, ...]:
+    """Route equal-layout tensors to native-chunk owners with one all-to-all.
+
+    The tensors may have different feature shapes, but must share dtype,
+    device, and sequence length. Their features are packed into one wire
+    buffer, then split after the ownership route. Backward performs one inverse
+    route for the complete group.
+    """
+    return _GroupedOwnershipRoute.apply(*tuple(tensors), plan, cp_group, sequence_dim, observer, True)
+
+
+def owned_to_physical_grouped(
+    tensors: Sequence[Tensor],
+    *,
+    plan: GdnLosslessRuntimePlan,
+    cp_group: ProcessGroup,
+    sequence_dim: int = 1,
+    observer: GdnCpRuntimeObserver | None = None,
+) -> tuple[Tensor, ...]:
+    """Return a tensor group to physical layout with one inverse all-to-all."""
+    return _GroupedOwnershipRoute.apply(*tuple(tensors), plan, cp_group, sequence_dim, observer, False)
+
+
 def _group_global_rank(group: ProcessGroup, local_rank: int) -> int:
     ranks = dist.get_process_group_ranks(group)
     if not 0 <= local_rank < len(ranks):
@@ -334,7 +534,10 @@ class _StateReceive(torch.autograd.Function):
                 raise
             if observer is not None:
                 observer.exit(GdnCpOperation.STATE_P2P_RECV, GdnCpPhase.FORWARD, peer_rank=predecessor)
-        return output + participation.sum().to(dtype=output.dtype) * 0
+        # ``participation`` is already an input to this autograd Function and
+        # its zero gradient is returned explicitly below. A numerical ``+ 0``
+        # would only allocate and launch over the full recurrent state.
+        return output
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[None, Tensor, None, None, None]:
@@ -420,6 +623,10 @@ def receive_initial_state(
         observer,
     )
     active_non_bos = [sample.is_active and not sample.is_bos_owner for sample in plan.local.samples]
+    # No predecessor means ``received`` is already exactly zero. Conversely,
+    # the common non-BOS owner case needs no per-layer mask allocation/kernel.
+    if plan.local.predecessor_rank is None or all(active_non_bos):
+        return received
     mask_shape = (len(active_non_bos),) + (1,) * (received.ndim - 1)
     mask = received.new_tensor(active_non_bos, dtype=received.dtype).reshape(mask_shape)
     return received * mask
@@ -441,11 +648,25 @@ def send_final_state(
     return _StateSend.apply(state, plan.local.successor_rank, cp_group, observer)
 
 
-def attach_state_dependency(output: Tensor, state: Tensor) -> Tensor:
-    """Keep state-transfer backward live without changing numerical output."""
-    if state.numel() == 0:
+class _AttachStateDependency(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, output: Tensor, state: Tensor) -> Tensor:
+        ctx.state_shape = tuple(state.shape)
+        ctx.state_dtype = state.dtype
+        ctx.state_device = state.device
         return output
-    return output + state[(0,) * state.ndim].to(dtype=output.dtype) * 0
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, Tensor]:
+        state_grad = torch.zeros(ctx.state_shape, dtype=ctx.state_dtype, device=ctx.state_device)
+        return grad_output, state_grad
+
+
+def attach_state_dependency(output: Tensor, state: Tensor) -> Tensor:
+    """Keep state-transfer backward live without a forward copy or kernel."""
+    if state.numel() == 0 or not torch.is_grad_enabled() or not state.requires_grad:
+        return output
+    return _AttachStateDependency.apply(output, state)
 
 
 def make_state_participation(*tensors: Tensor) -> Tensor:
@@ -461,19 +682,20 @@ def make_state_participation(*tensors: Tensor) -> Tensor:
 
 
 def make_state_template(query: Tensor, value: Tensor, cu_seqlens: Tensor) -> Tensor:
-    """Allocate the fp32 recurrent-state layout expected by GDN kernels."""
+    """Return an O(1)-storage fp32 shape template for state receive buffers."""
     if query.ndim != 4 or value.ndim != 4:
         raise ValueError("query and value must have [B, T, H, D] layout")
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 1:
         raise ValueError("cu_seqlens must be a non-empty one-dimensional tensor")
-    return torch.zeros(
+    shape = (
         int(cu_seqlens.numel() - 1),
         int(query.size(2)),
         int(query.size(3)),
         int(value.size(3)),
-        device=query.device,
-        dtype=torch.float32,
     )
+    # Values are never consumed: _StateReceive allocates the actual empty/zero
+    # state buffer. An expanded scalar keeps only shape/device/dtype metadata.
+    return torch.zeros((), device=query.device, dtype=torch.float32).expand(shape)
 
 
 def aligned_gdn_cu_seqlens(cu_seqlens: Sequence[int], *, chunk_size: int = 32) -> list[int]:
@@ -775,7 +997,9 @@ __all__ = [
     "make_state_participation",
     "make_state_template",
     "owned_to_physical",
+    "owned_to_physical_grouped",
     "physical_to_owned",
+    "physical_to_owned_grouped",
     "receive_initial_state",
     "send_final_state",
     "trim_conv_halo",

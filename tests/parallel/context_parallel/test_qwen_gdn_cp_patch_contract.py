@@ -81,7 +81,9 @@ def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
     assert "kcp_affine_backend = get_kcp_affine_backend_identity(kcp_affine_impl)" in block
     assert "affine_impl=kcp_affine_impl" in block
     assert 'affine_impl="ttx_bc8_m1"' not in block
-    assert block.index("physical_to_owned(") < block.index("resolve_kcp_initial_state(")
+    assert block.index("physical_to_owned_grouped(") < block.index("resolve_kcp_initial_state(")
+    assert block.count("physical_to_owned_grouped(") == 1
+    assert "mixed_qkv, b, a = physical_to_owned_grouped(" in block
     assert block.index("align_gdn_varlen_chunks(") < block.index("prepare_gated_delta_rule_qk(")
     assert block.index("prepare_gated_delta_rule_qk(") < block.index("resolve_kcp_initial_state(")
     empty_owner_guard = "if gdn_lossless_plan.local.owned_token_count == 0:"

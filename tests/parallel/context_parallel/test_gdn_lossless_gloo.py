@@ -13,7 +13,9 @@ from veomni.distributed.context_parallel.gdn_lossless import (
     make_state_participation,
     make_state_template,
     owned_to_physical,
+    owned_to_physical_grouped,
     physical_to_owned,
+    physical_to_owned_grouped,
     receive_initial_state,
     send_final_state,
     trim_conv_halo,
@@ -181,6 +183,57 @@ def _run_empty_owner_state_backward(rank: int, world_size: int, port: int) -> No
         dist.destroy_process_group()
 
 
+def _run_grouped_ownership_contract(rank: int, world_size: int, port: int) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        plan = compile_gdn_lossless_runtime_plan([65, 128], cp_group=dist.group.WORLD, ulysses_size=2)
+        observer = make_gdn_cp_runtime_observer("state_passing_lossless", plan=plan)
+        first = _physical_values(plan.global_plan, rank).requires_grad_()
+        second = torch.cat((first.detach() + 10, first.detach() + 20), dim=1).requires_grad_()
+
+        owned_first, owned_second = physical_to_owned_grouped(
+            (first, second),
+            plan=plan,
+            cp_group=dist.group.WORLD,
+            sequence_dim=0,
+            observer=observer,
+        )
+        restored_first, restored_second = owned_to_physical_grouped(
+            (owned_first * 2, owned_second * 3),
+            plan=plan,
+            cp_group=dist.group.WORLD,
+            sequence_dim=0,
+            observer=observer,
+        )
+
+        valid = first.detach() != 0
+        torch.testing.assert_close(restored_first, torch.where(valid, first.detach() * 2, 0), rtol=0, atol=0)
+        torch.testing.assert_close(restored_second, torch.where(valid, second.detach() * 3, 0), rtol=0, atol=0)
+        (restored_first.sum() + restored_second.sum()).backward()
+        torch.testing.assert_close(
+            first.grad,
+            torch.where(valid, torch.full_like(first, 2), torch.zeros_like(first)),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            second.grad,
+            torch.where(valid, torch.full_like(second, 3), torch.zeros_like(second)),
+            rtol=0,
+            atol=0,
+        )
+
+        ownership = [event for event in observer.snapshot().events if event.operation == "ownership_a2a"]
+        assert {(event.phase, event.enter, event.exit, event.error) for event in ownership} == {
+            ("forward", 2, 2, 0),
+            ("backward", 2, 2, 0),
+        }
+    finally:
+        dist.destroy_process_group()
+
+
 def test_gloo_repartition_state_and_halo_autograd():
     world_size = 2
     mp.spawn(_run_gloo_contract, args=(world_size, _free_port()), nprocs=world_size, join=True)
@@ -189,3 +242,8 @@ def test_gloo_repartition_state_and_halo_autograd():
 def test_state_passing_empty_owner_preserves_all_input_a2a_backwards():
     world_size = 2
     mp.spawn(_run_empty_owner_state_backward, args=(world_size, _free_port()), nprocs=world_size, join=True)
+
+
+def test_grouped_ownership_routes_multiple_tensors_with_one_collective_each_way():
+    world_size = 2
+    mp.spawn(_run_grouped_ownership_contract, args=(world_size, _free_port()), nprocs=world_size, join=True)
