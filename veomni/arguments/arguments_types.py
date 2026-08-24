@@ -16,7 +16,7 @@ import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -111,6 +111,10 @@ class OptimizerConfig:
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
+    )
+    betas: Tuple[float, float] = field(
+        default=(0.9, 0.95),
+        metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
