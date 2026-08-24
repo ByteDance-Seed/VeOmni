@@ -98,7 +98,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    matrix = yaml.safe_load(MATRIX_FILE.read_text())
+    matrix = yaml.safe_load(MATRIX_FILE.read_text(encoding="utf-8"))
     defaults = matrix.get("defaults", {}) or {}
     images = matrix.get("images", []) or []
     extras_presets = matrix.get("uv_extras_presets", {}) or {}
@@ -119,7 +119,7 @@ def main() -> int:
         rel = out_path.relative_to(REPO_ROOT)
 
         if args.check:
-            current = out_path.read_text() if out_path.exists() else ""
+            current = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
             if current != rendered:
                 drift.append(rel)
                 print(f"drift: {rel}", file=sys.stderr)
@@ -127,7 +127,7 @@ def main() -> int:
                 print(f"ok:    {rel}")
         else:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(rendered)
+            out_path.write_text(rendered, encoding="utf-8")
             print(f"wrote: {rel}")
 
     if args.check and drift:
