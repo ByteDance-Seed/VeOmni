@@ -171,7 +171,6 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
           uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
-          uv run --frozen pytest -s -x tests/distributed/test_extra_parallel_dim0_divisibility.py
       - name: Run data tests
         run: |
           uv run --frozen pytest -s -x tests/data
@@ -185,6 +184,7 @@ jobs:
       - name: Run Muon optimizer tests
         run: |
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
+          uv run --frozen pytest -s -x tests/distributed/test_muon_zero_comm_shard.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
           uv run --frozen pytest -s -x tests/optim/test_optimizer_vlm_param_groups.py
