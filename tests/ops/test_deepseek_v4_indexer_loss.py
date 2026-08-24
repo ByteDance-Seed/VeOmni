@@ -290,6 +290,23 @@ def test_target_kernel_rejects_non_bfloat16_inputs():
         sparse_mqa_target_fwd_interface(q, kv.to(torch.float16), topk, lse)
 
 
+def test_target_kernel_rejects_empty_kv():
+    """The gather clamps candidate rows into ``[0, S_kv - 1]``, so an empty kv
+    would clamp to row 0 of a tensor with no rows -- an out-of-bounds device read
+    that the candidate mask cannot prevent, since it only zeroes the score after
+    the gather. ``sparse_mqa_fwd_interface`` guards this; mirror it here."""
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
+
+    q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(1, 0, 64, device=DEVICE, dtype=torch.bfloat16)
+    topk = torch.zeros(1, 2, 64, device=DEVICE, dtype=torch.int32)
+    lse = torch.zeros(1, 2, 16, device=DEVICE, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="at least one row"):
+        sparse_mqa_target_fwd_interface(q, kv, topk, lse)
+
+
 def test_target_kernel_emits_no_unexpected_warnings():
     """Pin the warning set, so a newly introduced warning is a failure rather than
     an unexplained bump in pytest's summary count.

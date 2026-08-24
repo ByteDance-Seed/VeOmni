@@ -196,6 +196,12 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None, block_
         raise RuntimeError(f"target kernel requires heads <= 64 so one block owns the head sum, got {heads}")
     if kv.shape[-1] != dim:
         raise RuntimeError(f"kv head dim {kv.shape[-1]} does not match q head dim {dim}")
+    # The gather clamps candidate rows into [0, S_kv - 1], which needs a row to
+    # exist: with S_kv == 0 the clamp target becomes -1 and the outer max pulls it
+    # back to row 0 of an empty tensor, an out-of-bounds device read. The candidate
+    # mask only zeroes the score afterwards, so it cannot prevent the gather.
+    if kv.shape[1] == 0:
+        raise RuntimeError("target kernel requires kv to have at least one row")
     if lse.shape != (batch, seq_len, heads):
         raise RuntimeError(f"lse must be [B, S, H], got {tuple(lse.shape)}")
     topk = topk_idxs.shape[-1]
