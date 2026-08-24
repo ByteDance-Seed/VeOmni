@@ -145,6 +145,17 @@ class DiTDataArguments(DataArguments):
         default=True,
         metadata={"help": "Whether or not to shuffle the dataset."},
     )
+    data_transform: Optional[str] = field(
+        default="dit_online",
+        metadata={
+            "help": "Override the DATA_TRANSFORM_REGISTRY transform name. "
+            "When None, DiTTrainer picks dit_offline/dit_online by training_task."
+        },
+    )
+    log_sample: bool = field(
+        default=True,
+        metadata={"help": "Whether to print the first micro batch example to the log."},
+    )
 
 
 @dataclass
@@ -191,6 +202,7 @@ class DiTTrainer:
         # ``base._setup`` registers ParallelState; DiT then recomputes
         # dataloader_batch_size from ``dp_size``.
         self._setup()
+        self.base.LOG_SAMPLE = args.data.log_sample
 
         # All build steps read the current ParallelState via ``get_parallel_state()``
         # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
@@ -322,11 +334,12 @@ class DiTTrainer:
 
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
+        logger.info(f"args.data.data_transform: {args.data.data_transform}, training_task: {self.training_task}")
         if self.training_task == "offline_training":
             self.base.data_transform = build_data_transform("dit_offline")
         else:
             self.base.data_transform = build_data_transform(
-                "dit_online",
+                args.data.data_transform,
                 **args.data.mm_configs,
             )
 

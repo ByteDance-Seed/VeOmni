@@ -246,11 +246,11 @@ VeOmni offers unified multimodal transform functions in [veomni/data/data_transf
 
 Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
 ```python
-from veomni.data import build_data_transform, build_multimodal_chat_template
+from veomni.data import build_chat_template, build_data_transform
 from veomni.models import build_processor
 
 processor = build_processor(args.model.tokenizer_path)
-chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
+chat_template = build_chat_template(args.data.chat_template, processor)
 position_id_func = model.get_position_id_func()
 transform = build_data_transform(
     model.config.model_type,
@@ -271,8 +271,8 @@ Multimodal dataset transform follows the similar pipeline:
 
 
 ### Chat Template
-VeOmni default supports several chat template(source code: [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) for text-only model and [veomni/data/multimodal/multimodal_chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/multimodal_chat_template.py) for multimodal model):
-you can add your custom chat template by implementing the `ChatTemplate` class.
+VeOmni default supports several chat templates, text-only and multimodal alike, all registered in [veomni/data/chat_template.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/chat_template.py) and built by name through the single `build_chat_template` entrypoint.
+You can add your custom chat template by implementing the `ChatTemplate` class — or `MultimodalChatTemplate` if it needs the per-modality token counts. A `ChatTemplate` is built from a tokenizer; a `MultimodalChatTemplate` is built from the processor instead, since laying out placeholders also needs the grid parameters the processor used.
 **Custom Template Implementation**:  
 ```python
 from veomni.data.chat_template import ChatTemplate
@@ -412,7 +412,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_ns_coefficients` | `[3.4445, -4.7750, 2.0315]` | Quintic NS polynomial coefficients (a, b, c). |
 | `muon_eps` | `1e-7` | Numerical-stability epsilon for the spectral-norm normalization. |
 | `muon_adjust_lr_fn` | `match_rms_adamw` | Per-matrix LR adjustment. `original` follows Keller Jordan; `match_rms_adamw` matches the RMS of an AdamW update so AdamW-tuned hyperparams transfer. |
-| `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and falls back to the dim-1 + all-to-all-gather path. |
+| `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires the model's ExtraParallel plan to declare a 3D expert stack sliced on dim 0, and every parameter it covers (2D per-expert biases included) to satisfy `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and falls back to the dim-1 + all-to-all-gather path. Non-expert ExtraParallels such as `emb` keep their default layout. |
 | `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
 | `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
 | `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
@@ -486,7 +486,8 @@ For MoE training under FSDP2+EP, the Muon flow auto-classifies each parameter in
 | Param layout | Path | Comm at Muon time |
 |--------------|------|-------------------|
 | plain `Tensor` / replicated `DTensor` | `local` | none |
-| 2D `DTensor` with a `Shard` | `fsdp_gather_2d` | one all-gather over the FSDP mesh |
+| 2D `DTensor` with `Shard(0)` | `fsdp_gather_2d` | one all-to-all over the shard mesh; under HSDP the replicated dims are skipped, so only the shard dim communicates |
+| 2D `DTensor` with any other `Shard` layout | `fsdp_gather_2d` | one all-gather over the FSDP mesh |
 | 3D `DTensor` with `Shard(0)` (zero-comm backend) | `moe_local_3d` | none — batched NS runs on `_local_tensor` |
 | 3D `DTensor` with `Shard(d>0)` (default backend) | `moe_gather_3d` | one all-to-all-gather over the `ep_fsdp` mesh |
 
