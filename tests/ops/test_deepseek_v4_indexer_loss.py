@@ -17,8 +17,10 @@ import warnings
 import pytest
 import torch
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
+
+DEVICE = get_device_type()
 
 # Warnings this module tolerates, matched as substrings of the warning message.
 # Everything else fails test_target_kernel_emits_no_unexpected_warnings, so a new
@@ -160,7 +162,7 @@ def test_target_kernel_matches_reference(heads, c):
 
     torch.manual_seed(0)
     b, s, d, w = 2, 8, 64, 64
-    device = "cuda"
+    device = DEVICE
     q = torch.randn(b, s, heads, d, device=device, dtype=torch.bfloat16)
     kv = torch.randn(b, 256, d, device=device, dtype=torch.bfloat16)
     sink = torch.randn(heads, device=device, dtype=torch.float32)
@@ -197,10 +199,10 @@ def test_target_kernel_zeroes_invalid_slots():
 
     torch.manual_seed(2)
     b, s, heads, d, w, c = 1, 4, 16, 64, 64, 64
-    q = torch.randn(b, s, heads, d, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(b, 256, d, device="cuda", dtype=torch.bfloat16)
-    sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
-    topk = torch.randint(0, 256, (b, s, w + c), device="cuda", dtype=torch.int32)
+    q = torch.randn(b, s, heads, d, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(b, 256, d, device=DEVICE, dtype=torch.bfloat16)
+    sink = torch.zeros(heads, device=DEVICE, dtype=torch.float32)
+    topk = torch.randint(0, 256, (b, s, w + c), device=DEVICE, dtype=torch.int32)
     topk[:, :, w + 3] = -1
     scale = d**-0.5
 
@@ -221,10 +223,10 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
 
     torch.manual_seed(4)
     b, s, heads, d, w, c = 1, 4, 16, 64, 64, 64
-    q = torch.randn(b, s, heads, d, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(b, 256, d, device="cuda", dtype=torch.bfloat16)
-    sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
-    topk = torch.randint(0, 256, (b, s, w + c), device="cuda", dtype=torch.int32)
+    q = torch.randn(b, s, heads, d, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(b, 256, d, device=DEVICE, dtype=torch.bfloat16)
+    sink = torch.zeros(heads, device=DEVICE, dtype=torch.float32)
+    topk = torch.randint(0, 256, (b, s, w + c), device=DEVICE, dtype=torch.int32)
     topk[0, 0, w:] = -1  # query 0 keeps a valid window and loses every compressed slot
     scale = d**-0.5
 
@@ -237,7 +239,7 @@ def test_target_kernel_all_invalid_compressed_row_is_zero():
     assert not torch.isnan(normalised).any()
     # Still local: the queries with valid compressed slots are unaffected.
     assert (raw[0, 1:] > 0).any()
-    assert torch.allclose(normalised[0, 1:].sum(-1), torch.ones(s - 1, device="cuda"), atol=1e-5)
+    assert torch.allclose(normalised[0, 1:].sum(-1), torch.ones(s - 1, device=DEVICE), atol=1e-5)
     # And the reference agrees on the same input, so the contract is one contract.
     assert (reference_compressed_target(q, kv, sink, topk, w, scale)[0, 0] == 0).all()
 
@@ -246,10 +248,10 @@ def test_target_kernel_rejects_more_than_64_heads():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
 
-    q = torch.randn(1, 2, 128, 64, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(1, 128, 64, device="cuda", dtype=torch.bfloat16)
-    topk = torch.zeros(1, 2, 64, device="cuda", dtype=torch.int32)
-    lse = torch.zeros(1, 2, 128, device="cuda", dtype=torch.float32)
+    q = torch.randn(1, 2, 128, 64, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(1, 128, 64, device=DEVICE, dtype=torch.bfloat16)
+    topk = torch.zeros(1, 2, 64, device=DEVICE, dtype=torch.int32)
+    lse = torch.zeros(1, 2, 128, device=DEVICE, dtype=torch.float32)
     # Matching on "64" alone would also be satisfied by the head-multiple assert
     # or by any message that happens to mention a shape of 64.
     with pytest.raises(RuntimeError, match="one block owns the head sum"):
@@ -277,10 +279,10 @@ def test_target_kernel_rejects_non_bfloat16_inputs():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_target import sparse_mqa_target_fwd_interface
 
-    q = torch.randn(1, 2, 16, 64, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(1, 128, 64, device="cuda", dtype=torch.bfloat16)
-    topk = torch.zeros(1, 2, 64, device="cuda", dtype=torch.int32)
-    lse = torch.zeros(1, 2, 16, device="cuda", dtype=torch.float32)
+    q = torch.randn(1, 2, 16, 64, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(1, 128, 64, device=DEVICE, dtype=torch.bfloat16)
+    topk = torch.zeros(1, 2, 64, device=DEVICE, dtype=torch.int32)
+    lse = torch.zeros(1, 2, 16, device=DEVICE, dtype=torch.float32)
 
     with pytest.raises(RuntimeError, match="bfloat16-only, got q"):
         sparse_mqa_target_fwd_interface(q.to(torch.float16), kv, topk, lse)
@@ -302,10 +304,10 @@ def test_target_kernel_emits_no_unexpected_warnings():
 
     torch.manual_seed(5)
     b, s, heads, d, w, c = 1, 2, 32, 64, 64, 64
-    q = torch.randn(b, s, heads, d, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(b, 256, d, device="cuda", dtype=torch.bfloat16)
-    sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
-    topk = torch.randint(0, 256, (b, s, w + c), device="cuda", dtype=torch.int32)
+    q = torch.randn(b, s, heads, d, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(b, 256, d, device=DEVICE, dtype=torch.bfloat16)
+    sink = torch.zeros(heads, device=DEVICE, dtype=torch.float32)
+    topk = torch.randint(0, 256, (b, s, w + c), device=DEVICE, dtype=torch.int32)
     scale = d**-0.5
 
     with warnings.catch_warnings(record=True) as caught:
@@ -327,10 +329,10 @@ def test_sparse_attn_returns_non_differentiable_lse():
 
     torch.manual_seed(3)
     b, s, heads, d = 1, 8, 16, 64
-    q = torch.randn(b, s, heads, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    kv = torch.randn(b, 128, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    sink = torch.randn(heads, device="cuda", dtype=torch.float32, requires_grad=True)
-    topk = torch.randint(0, 128, (b, s, 64), device="cuda", dtype=torch.int32)
+    q = torch.randn(b, s, heads, d, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(b, 128, d, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    sink = torch.randn(heads, device=DEVICE, dtype=torch.float32, requires_grad=True)
+    topk = torch.randint(0, 128, (b, s, 64), device=DEVICE, dtype=torch.int32)
 
     out_only = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5)
     out, lse = sparse_attn_tilelang(q, kv, sink, topk, d**-0.5, return_lse=True)
