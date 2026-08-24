@@ -21,6 +21,20 @@ def test_accelerator_context_parallel_alone_is_accepted(monkeypatch):
     assert args.accelerator.dp_size == 1
 
 
+@pytest.mark.parametrize("cp_size", [0, -1], ids=["zero", "negative"])
+def test_accelerator_non_positive_context_parallel_size_is_rejected(monkeypatch, cp_size):
+    """Neither non-positive value can reach the topology arithmetic.
+
+    ``cp_size=0`` would make the world-size modulo raise ZeroDivisionError, and
+    ``cp_size=-1`` would derive ``dp_size=-1`` and ``dp_shard_size=-1`` -- exactly
+    the combination that then passes ``ParallelState``'s product check, since the
+    negatives cancel.
+    """
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    with pytest.raises(ValueError, match="cp_size must be a positive integer"):
+        TrainingArguments(accelerator=AcceleratorConfig(cp_size=cp_size))
+
+
 def test_accelerator_hybrid_context_and_ulysses_is_rejected(monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "4")
     with pytest.raises(NotImplementedError, match="ulysses_size"):

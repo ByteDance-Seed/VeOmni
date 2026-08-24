@@ -78,6 +78,14 @@ class ParallelState:
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
+        # The product check below cannot catch a negative cp_size on its own: a
+        # caller passing dp_size=-1 alongside cp_size=-1 lands on a product of +1,
+        # so an invalid topology would be admitted with CP reported as disabled.
+        # TrainingArguments validates this too, but a ParallelState can be built
+        # directly, which is how a per-module state under use_parallel_state is made.
+        if self.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+
         if self.cp_size > 1 and self.ulysses_size > 1:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "

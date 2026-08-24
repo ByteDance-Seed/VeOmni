@@ -802,6 +802,15 @@ class TrainingArguments:
     def _validate_accelerator(self):
         acc = self.accelerator
 
+        # Ahead of the topology arithmetic below, which cannot defend itself: a
+        # cp_size of 0 makes the modulo raise ZeroDivisionError instead of naming
+        # the constraint, and a negative one derives a negative dp_size that then
+        # passes ParallelState's product check, because the two negatives cancel.
+        # Unlike dp_replicate_size / dp_shard_size, where non-positive means
+        # "derive it", cp_size is always an explicit divisor of the world size.
+        if acc.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer; got {acc.cp_size}.")
+
         if self.world_size % (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size) != 0:
             raise ValueError(
                 f"World size should be a multiple of pp_size: {acc.pp_size}, "
