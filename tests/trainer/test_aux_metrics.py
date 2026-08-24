@@ -136,6 +136,21 @@ def test_absent_aux_metrics_add_no_keys(identity_loss, aux_metrics):
     assert list(loss_dict) == ["foundation_loss"]
 
 
+def test_aux_metric_colliding_with_a_loss_key_is_rejected(identity_loss):
+    """A shadowed loss name is the one failure mode the merge cannot report honestly.
+
+    ``dict.update`` would overwrite the loss entry. The backward scalar stays
+    correct — it is summed before the merge — so nothing diverges; the damage is
+    that callbacks then publish the auxiliary value as ``training/foundation_loss``,
+    a loss curve that silently reads someone else's number.
+    """
+    trainer = _bare_trainer()
+    outputs = _Output(torch.tensor(2.0, requires_grad=True), {"foundation_loss": torch.tensor(1000.0)})
+
+    with pytest.raises(ValueError, match="collide with loss keys"):
+        BaseTrainer.postforward(trainer, outputs, {})
+
+
 def _accumulating_trainer(outputs, recorded):
     """A ``BaseTrainer`` reduced to the parts ``train_step`` touches.
 

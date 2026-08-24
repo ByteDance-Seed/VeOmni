@@ -91,6 +91,36 @@ The `forward_backward_step` allows for customization of the forward and backward
 - `preforward`: Moves data to the correct device.
 - `postforward`: Computes the final loss from model outputs.
 
+### Auxiliary Metrics (`outputs.aux_metrics`)
+
+A forward can report diagnostics alongside the losses by returning an
+`aux_metrics` dict on its model output. `postforward` merges it into `loss_dict`
+*after* summing the backward scalar, so an auxiliary value is logged but never
+becomes part of the objective. `EnvironMeterCallback` then publishes each entry
+as `training/<key>`, which is the name that reaches wandb.
+
+The contract:
+
+- **Values are detached scalar tensors.** `postforward` calls `.detach()` on the
+  way in, so a metric that still carries a graph does not keep it alive for the
+  step. Anything reported must reduce to a scalar, since the reporting path only
+  ever calls `.item()` on it.
+- **Reported as the mean over the step's micro batches.** Losses may be summed
+  across micro batches because `mean_global_loss` has already scaled each by its
+  share of the step's tokens; an auxiliary metric gets no such scaling, so
+  `postforward` divides by `num_micro_batches` instead. Emit a key on every micro
+  batch of a step, or on none — a key present in only some micro batches is
+  averaged over all of them.
+- **Loss names are reserved.** A key that collides with one already in
+  `loss_dict` raises `ValueError`. Without that check `dict.update` would shadow
+  the loss entry, and callbacks would report the auxiliary value under
+  `training/<loss name>` while the backward scalar stayed correct.
+- **No `*_loss` suffix is needed.** That convention is required only by
+  `mean_global_loss`, which runs before the merge and never sees an auxiliary key.
+
+Most model outputs have no such field; `postforward` reads it with `getattr`, so
+models that do not report metrics are unaffected.
+
 ## Callbacks
 
 The Trainer uses a callback system to decouple logging, checkpointing, and evaluation from the core training loop.

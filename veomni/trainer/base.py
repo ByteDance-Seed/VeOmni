@@ -718,6 +718,17 @@ class BaseTrainer(Stateful, ABC):
             # ``on_step_begin`` sets the count; the default covers callers that reach
             # a single forward without a step, such as tests.
             num_micro_batches = getattr(self, "num_micro_batches", 1)
+            # A bare ``update`` would let an aux key shadow a loss of the same name.
+            # The backward scalar is already summed above so it would stay correct,
+            # but callbacks read ``loss_dict``, so they would report the auxiliary
+            # value under ``training/<loss name>`` -- a silently wrong loss curve.
+            collisions = sorted(aux_metrics.keys() & loss_dict.keys())
+            if collisions:
+                raise ValueError(
+                    f"aux_metrics keys {collisions} collide with loss keys "
+                    f"{sorted(loss_dict.keys())}. Loss names are reserved: rename the "
+                    "auxiliary metric so callbacks cannot report it as a loss."
+                )
             loss_dict.update({key: value.detach() / num_micro_batches for key, value in aux_metrics.items()})
         return loss, loss_dict
 
