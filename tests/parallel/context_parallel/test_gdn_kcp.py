@@ -20,7 +20,9 @@ from veomni.distributed.context_parallel.gdn_ownership import build_gdn_lossless
 from veomni.distributed.context_parallel.gdn_runtime import make_gdn_cp_runtime_observer
 from veomni.ops.kernels.gated_delta_rule.normalization import producer_dtype_l2norm
 from veomni.ops.kernels.gdn_kcp_affine_ttx import (
+    _CU_HOST_POINTS_CACHE,
     TTX_BC8_M1_CONFIG,
+    _cached_host_cu_points,
     _prepare_ttx_forward_operands,
     _TtxLocalAffineSummaryFn,
     ttx_bc8_m1_torch_reference,
@@ -29,6 +31,7 @@ from veomni.ops.kernels.gdn_kcp_affine_ttx import (
     validate_ttx_bc8_m1_cu_seqlens,
     validate_ttx_bc8_m1_shape,
 )
+from veomni.ops.kernels.gdn_kcp_affine_ttx_bwd import _prepare_ttx_backward_operands
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -192,6 +195,46 @@ def test_ttx_forward_cu_contract_accepts_empty_segments_and_rejects_nonpacked_ba
         )
 
 
+def test_ttx_forward_canonical_host_cu_avoids_device_value_sync(monkeypatch):
+    def fail_device_value_sync(*args, **kwargs):
+        raise AssertionError("canonical host CU validation must not materialize device values")
+
+    cu_marker = torch.tensor([99, -7, 123], dtype=torch.int32)
+    monkeypatch.setattr(torch.Tensor, "cpu", fail_device_value_sync)
+    monkeypatch.setattr(torch.Tensor, "tolist", fail_device_value_sync)
+    monkeypatch.setattr(torch.Tensor, "item", fail_device_value_sync)
+
+    points = validate_ttx_bc8_m1_cu_seqlens(
+        cu_marker,
+        batch_size=1,
+        token_count=4,
+        cu_seqlens_list=(0, 0, 4),
+    )
+
+    assert points == (0, 0, 4)
+
+
+@pytest.mark.parametrize(
+    ("cu_marker", "host_points", "message"),
+    [
+        (torch.tensor([0, 2, 4], dtype=torch.int32), (0, 4), "boundary count mismatch"),
+        (torch.tensor([0, 2, 4], dtype=torch.int32), (0, 3, 2), "nondecreasing"),
+        (torch.tensor([0, 2, 4], dtype=torch.int32), (0, 2, 3), "end at T=4"),
+        (torch.tensor([0, 2, 4], dtype=torch.int32), (0, 2.0, 4), "exact integers"),
+        (torch.tensor([0, 2, 4], dtype=torch.int32), (0, True, 4), "exact integers"),
+    ],
+)
+def test_ttx_forward_canonical_host_cu_rejects_malformed_metadata(cu_marker, host_points, message):
+    error = TypeError if "exact integers" in message else ValueError
+    with pytest.raises(error, match=message):
+        validate_ttx_bc8_m1_cu_seqlens(
+            cu_marker,
+            batch_size=1,
+            token_count=4,
+            cu_seqlens_list=host_points,
+        )
+
+
 def test_ttx_custom_function_rejects_invalid_cu_before_forward_kernel(monkeypatch):
     launched = False
 
@@ -209,11 +252,58 @@ def test_ttx_custom_function_rejects_invalid_cu_before_forward_kernel(monkeypatc
             g,
             beta,
             torch.tensor([0, 3], dtype=torch.int32),
-            torch.tensor(0.0),
-            torch.tensor(1e-6),
-            torch.tensor(1.0),
+            (0, 3),
+            1e-6,
         )
     assert not launched
+
+
+def test_ttx_cu_host_points_cache_reuses_identity_and_invalidates_on_mutation(monkeypatch):
+    _CU_HOST_POINTS_CACHE.clear()
+    transfers = []
+
+    def record_transfer(cu_seqlens):
+        transfers.append(cu_seqlens._version)
+        return tuple(int(point) for point in cu_seqlens.tolist())
+
+    monkeypatch.setattr(ttx_module, "_copy_cu_points_to_host", record_transfer)
+    cu_seqlens = torch.tensor([0, 0, 4], dtype=torch.int32)
+
+    first = _cached_host_cu_points(cu_seqlens)
+    second = _cached_host_cu_points(cu_seqlens)
+    cu_seqlens[1] = 2
+    third = _cached_host_cu_points(cu_seqlens)
+
+    assert first is second
+    assert first == (0, 0, 4)
+    assert third == (0, 2, 4)
+    assert transfers == [0, 1]
+
+
+def test_ttx_custom_function_uses_python_metadata_without_tensor_scalar_sync(monkeypatch):
+    def fail_scalar_sync(*args, **kwargs):
+        raise AssertionError("custom Function must not materialize Tensor metadata on the host")
+
+    def fake_ttx_forward(key, value, g, beta, **kwargs):
+        assert kwargs["cu_seqlens"] is cu_marker
+        assert kwargs["eps"] == 1e-6
+        return key.float()
+
+    def fake_ttx_backward(key, value, g, beta, grad_hm, **kwargs):
+        assert kwargs["cu_pts"] == (0, 3)
+        assert kwargs["eps"] == 1e-6
+        return grad_hm.to(key.dtype), torch.zeros_like(value), torch.zeros_like(g), torch.zeros_like(beta)
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_scalar_sync)
+    monkeypatch.setattr(torch.Tensor, "tolist", fail_scalar_sync)
+    monkeypatch.setattr(torch.Tensor, "cpu", fail_scalar_sync)
+    monkeypatch.setattr(ttx_module, "_ttx_local_affine_summary_fwd", fake_ttx_forward)
+    monkeypatch.setattr(ttx_bwd_module, "ttx_local_affine_analytical_bwd", fake_ttx_backward)
+    key, value, g, beta = [tensor.requires_grad_(True) for tensor in _inputs(tokens=3)]
+    cu_marker = torch.tensor([11, 19], dtype=torch.int32)
+
+    result = _TtxLocalAffineSummaryFn.apply(key, value, g, beta, cu_marker, (0, 3), 1e-6)
+    torch.autograd.grad(result, (key, value, g, beta), torch.ones_like(result))
 
 
 def test_ttx_operand_contract_preserves_fp32_decay_and_producer_dtypes():
@@ -257,6 +347,24 @@ def test_ttx_operand_contract_preserves_fp32_decay_and_producer_dtypes():
 def test_ttx_operand_contract_rejects_internal_normalization():
     with pytest.raises(ValueError, match="must be pre-normalized"):
         _prepare_ttx_forward_operands(*_inputs(tokens=3), use_qk_l2norm=True, eps=1e-6)
+
+
+def test_ttx_backward_operands_preserve_storage_dtypes_and_make_contiguous_views():
+    key, value, g, beta = _inputs(tokens=4)
+    key = key.to(torch.bfloat16).transpose(1, 2)
+    value = value.to(torch.bfloat16).transpose(1, 2)
+    g = g.transpose(1, 2)
+    beta = beta.to(torch.bfloat16).transpose(1, 2)
+
+    prepared = _prepare_ttx_backward_operands(key, value, g, beta)
+
+    assert [tensor.dtype for tensor in prepared] == [
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+    ]
+    assert all(tensor.is_contiguous() for tensor in prepared)
 
 
 def test_producer_dtype_l2norm_matches_npu_gdr_literal_and_not_fp32_rewrite():
@@ -347,10 +455,9 @@ def test_ttx_bf16_production_custom_function_consumes_shared_normalized_key(monk
         value,
         g,
         beta,
-        torch.empty(0, dtype=torch.int32),
-        torch.tensor(0.0),
-        torch.tensor(1e-6),
-        torch.tensor(0.0),
+        None,
+        None,
+        1e-6,
     )
     oracle = producer_dtype_l2norm(oracle_key).float()
     upstream = torch.randn_like(candidate)

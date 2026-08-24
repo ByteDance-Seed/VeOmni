@@ -84,6 +84,20 @@ def _resolve_segment_bounds(
     return pts[:-1], pts[1:]
 
 
+def _prepare_ttx_backward_operands(
+    key: Tensor,
+    value: Tensor,
+    g: Tensor,
+    beta: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Keep producer storage dtypes; Triton promotes each load to fp32."""
+    if not all(operand.is_floating_point() for operand in (key, value, g, beta)):
+        raise TypeError("key/value/g/beta must be floating-point tensors")
+    if any(operand.device != key.device for operand in (value, g, beta)):
+        raise ValueError("key/value/g/beta must be on the same device")
+    return key.contiguous(), value.contiguous(), g.contiguous(), beta.contiguous()
+
+
 def _bwd_chunk() -> int:
     raw = os.environ.get("VEOMNI_GDN_AFFINE_BWD_CHUNK", "128").strip()
     try:
@@ -1038,6 +1052,40 @@ if _TRITON_OK:
 
         tl.store(dM_ptrs, dM_ub, mask=mask_c[None, :])
 
+    @triton.jit
+    def _affine_bwd_reduce_partials_kernel(
+        dk_partial_ptr,
+        dg_partial_ptr,
+        db_partial_ptr,
+        grad_k_ptr,
+        grad_g_ptr,
+        grad_b_ptr,
+        t0_abs,
+        H: tl.constexpr,
+        K: tl.constexpr,
+        NT: tl.constexpr,
+        BT: tl.constexpr,
+        BK: tl.constexpr,
+    ):
+        """Reduce column-tile VJPs in fixed ascending order and store once."""
+        ti = tl.program_id(0)
+        i_h = tl.program_id(1)
+        offs_k = tl.arange(0, BK)
+        mask_k = offs_k < K
+        dk = tl.zeros([BK], dtype=tl.float32)
+        dg = tl.zeros([1], dtype=tl.float32)
+        db = tl.zeros([1], dtype=tl.float32)
+        for i_tile in range(0, NT):
+            partial_offset = (i_tile * BT + ti) * H + i_h
+            dk += tl.load(dk_partial_ptr + partial_offset * K + offs_k, mask=mask_k, other=0.0)
+            dg += tl.load(dg_partial_ptr + partial_offset)
+            db += tl.load(db_partial_ptr + partial_offset)
+
+        output_offset = (t0_abs + ti) * H + i_h
+        tl.store(grad_k_ptr + output_offset * K + offs_k, dk, mask=mask_k)
+        tl.store(grad_g_ptr + output_offset, dg)
+        tl.store(grad_b_ptr + output_offset, db)
+
 
 def _triton_analytical_bwd(
     key: Tensor,
@@ -1057,10 +1105,7 @@ def _triton_analytical_bwd(
     if use_qk_l2norm:
         key = key * torch.rsqrt(key.pow(2).sum(dim=-1, keepdim=True) + eps)
 
-    k_c = key.contiguous().float()
-    v_c = value.contiguous().float()
-    g_c = g.contiguous().float()
-    b_c = beta.contiguous().float()
+    k_c, v_c, g_c, b_c = _prepare_ttx_backward_operands(key, value, g, beta)
 
     bsz, t_total, H, K = int(k_c.shape[0]), int(k_c.shape[1]), int(k_c.shape[2]), int(k_c.shape[3])
     V = int(v_c.shape[-1])
@@ -1079,10 +1124,10 @@ def _triton_analytical_bwd(
     else:
         k_flat, v_flat, g_flat, b_flat = k_c[0], v_c[0], g_c[0], b_c[0]
 
-    grad_k = torch.zeros_like(k_flat)
-    grad_v = torch.zeros_like(v_flat)
-    grad_g = torch.zeros_like(g_flat)
-    grad_b = torch.zeros_like(b_flat)
+    grad_k = torch.zeros(k_flat.shape, device=device, dtype=torch.float32)
+    grad_v = torch.zeros(v_flat.shape, device=device, dtype=torch.float32)
+    grad_g = torch.zeros(g_flat.shape, device=device, dtype=torch.float32)
+    grad_b = torch.zeros(b_flat.shape, device=device, dtype=torch.float32)
 
     max_t = max((e - s) for s, e in zip(starts, ends)) if starts else 0
     n_ck_max = (max_t + bt - 1) // bt if max_t else 0
@@ -1236,10 +1281,7 @@ def _triton_chunk_analytical_bwd(
     if use_qk_l2norm:
         key = key * torch.rsqrt(key.pow(2).sum(dim=-1, keepdim=True) + eps)
 
-    k_c = key.contiguous().float()
-    v_c = value.contiguous().float()
-    g_c = g.contiguous().float()
-    b_c = beta.contiguous().float()
+    k_c, v_c, g_c, b_c = _prepare_ttx_backward_operands(key, value, g, beta)
 
     bsz, t_total, H, K = int(k_c.shape[0]), int(k_c.shape[1]), int(k_c.shape[2]), int(k_c.shape[3])
     V = int(v_c.shape[-1])
@@ -1272,10 +1314,10 @@ def _triton_chunk_analytical_bwd(
     if tuple(grad_hm.shape) != expected_grad_shape:
         raise ValueError(f"grad_hm must be [N,H,K,V+K]={expected_grad_shape}, got {tuple(grad_hm.shape)}")
 
-    grad_k = torch.zeros_like(k_flat)
-    grad_v = torch.zeros_like(v_flat)
-    grad_g = torch.zeros_like(g_flat)
-    grad_b = torch.zeros_like(b_flat)
+    grad_k = torch.zeros(k_flat.shape, device=device, dtype=torch.float32)
+    grad_v = torch.zeros(v_flat.shape, device=device, dtype=torch.float32)
+    grad_g = torch.zeros(g_flat.shape, device=device, dtype=torch.float32)
+    grad_b = torch.zeros(b_flat.shape, device=device, dtype=torch.float32)
 
     max_t = max((e - s) for s, e in zip(starts, ends)) if starts else 0
     n_ck_max = (max_t + bt - 1) // bt if max_t else 0
@@ -1397,10 +1439,20 @@ def _triton_chunk_analytical_bwd(
                 BT=bt,
                 TILE_OFFSET=nt_he,
             )
-            grad_slice = slice(int(t0_abs), int(t0_abs + clen))
-            grad_k[grad_slice].copy_(dk_partial[:, :clen].sum(dim=0))
-            grad_g[grad_slice].copy_(dg_partial[:, :clen].sum(dim=0))
-            grad_b[grad_slice].copy_(db_partial[:, :clen].sum(dim=0))
+            _affine_bwd_reduce_partials_kernel[(clen, H)](
+                dk_partial,
+                dg_partial,
+                db_partial,
+                grad_k,
+                grad_g,
+                grad_b,
+                int(t0_abs),
+                H=H,
+                K=K,
+                NT=nt,
+                BT=bt,
+                BK=K,
+            )
         else:
             _affine_bwd_chunk_kernel[(H,)](
                 k_flat,

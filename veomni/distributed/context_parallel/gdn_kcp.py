@@ -442,6 +442,7 @@ def local_affine_summary(
                 g,
                 beta,
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_list=cu_seqlens_list,
                 use_qk_l2norm=use_qk_l2norm,
                 eps=eps,
             )
@@ -825,19 +826,30 @@ class _KcpAllGatherHm(torch.autograd.Function):
         send = local_hm + participate.to(device=local_hm.device, dtype=local_hm.dtype) * 0
         if int(cp_size) <= 1:
             return send.unsqueeze(0)
-        gathered = [torch.empty_like(send) for _ in range(int(cp_size))]
+        # ``all_gather_into_tensor`` writes the concatenated payload directly
+        # into its final storage.  The list-based API needs ``cp_size``
+        # temporary tensors and a second full-size allocation for
+        # ``torch.stack``; that allocator traffic is paid by every GDN layer
+        # and is especially visible under activation checkpoint recompute.
+        # KCP summaries have the same shape on every CP rank, so the equal-size
+        # concatenated contract is exact here.
+        gathered = torch.empty(
+            (int(cp_size) * int(send.shape[0]),) + tuple(send.shape[1:]),
+            dtype=send.dtype,
+            device=send.device,
+        )
         if observer is not None:
             observer.observe_cp_ranks(range(int(cp_size)))
             observer.enter(GdnCpOperation.KCP_AFFINE_AG, GdnCpPhase.FORWARD)
         try:
-            dist.all_gather(gathered, send.contiguous(), group=group)
+            dist.all_gather_into_tensor(gathered, send.contiguous(), group=group)
         except Exception:
             if observer is not None:
                 observer.error(GdnCpOperation.KCP_AFFINE_AG, GdnCpPhase.FORWARD)
             raise
         if observer is not None:
             observer.exit(GdnCpOperation.KCP_AFFINE_AG, GdnCpPhase.FORWARD)
-        return torch.stack(gathered, dim=0)
+        return gathered.view((int(cp_size),) + tuple(send.shape))
 
     @staticmethod
     def backward(ctx: Any, grad_ag: Tensor) -> Tuple[Tensor, Optional[Tensor], None, None, None, None]:
@@ -1044,9 +1056,17 @@ def resolve_kcp_initial_state(
     )
     s_init = prefix_merge_initial_state(ag_hm, cp_rank=cp_rank, v_dim=v_dim)
     active_non_bos = [sample.is_active and not sample.is_bos_owner for sample in plan.local.samples]
-    mask_shape = (n,) + (1,) * (s_init.ndim - 1)
-    mask = s_init.new_tensor(active_non_bos, dtype=s_init.dtype).reshape(mask_shape)
-    s_init = s_init * mask
+    # The usual single-sample route is uniform on a rank: rank 0 is BOS and
+    # successor ranks are all active.  Avoid allocating a device mask and
+    # launching a pointwise multiply in the all-active case.  Mixed packed
+    # ownership retains the exact elementwise mask semantics.
+    if not all(active_non_bos):
+        if any(active_non_bos):
+            mask_shape = (n,) + (1,) * (s_init.ndim - 1)
+            mask = s_init.new_tensor(active_non_bos, dtype=s_init.dtype).reshape(mask_shape)
+            s_init = s_init * mask
+        else:
+            s_init = s_init * 0
 
     # BOS and inactive masks would otherwise drop the AG edge on some ranks.
     s_init = attach_zero_valued_dep(s_init, ag_hm)

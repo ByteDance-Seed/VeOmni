@@ -31,7 +31,9 @@ BC8/M1 backward contract and never falls back to a torch implementation.
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
+from operator import index
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -66,6 +68,58 @@ class TtxBc8M1Config:
 
 
 TTX_BC8_M1_CONFIG = TtxBc8M1Config()
+
+
+# The same packed CU tensor is shared by every GDN layer in one model forward.
+# Cache its immutable host representation by Tensor identity and version so the
+# custom autograd Function never introduces a per-layer device-to-host sync.
+_CU_HOST_POINTS_CACHE: dict[int, tuple[weakref.ReferenceType, int, Tuple[int, ...]]] = {}
+
+
+def _copy_cu_points_to_host(cu_seqlens: Tensor) -> Tuple[int, ...]:
+    """Materialize packed boundaries once for one live metadata Tensor."""
+    return tuple(int(point) for point in cu_seqlens.detach().cpu().tolist())
+
+
+def _cached_host_cu_points(cu_seqlens: Tensor) -> Tuple[int, ...]:
+    """Return versioned immutable host boundaries without per-layer D2H sync."""
+    try:
+        version = int(cu_seqlens._version)
+    except RuntimeError:
+        # Inference tensors do not expose a version counter. They are not the
+        # production training path, so fail safe by avoiding a stale cache.
+        return _copy_cu_points_to_host(cu_seqlens)
+
+    identity = id(cu_seqlens)
+    cached = _CU_HOST_POINTS_CACHE.get(identity)
+    if cached is not None and cached[0]() is cu_seqlens and cached[1] == version:
+        return cached[2]
+
+    points = _copy_cu_points_to_host(cu_seqlens)
+
+    def remove_dead_tensor(reference, *, tensor_id=identity):
+        current = _CU_HOST_POINTS_CACHE.get(tensor_id)
+        if current is not None and current[0] is reference:
+            _CU_HOST_POINTS_CACHE.pop(tensor_id, None)
+
+    reference = weakref.ref(cu_seqlens, remove_dead_tensor)
+    _CU_HOST_POINTS_CACHE[identity] = (reference, version, points)
+    return points
+
+
+def _normalize_host_cu_points(cu_seqlens_list: Sequence[int]) -> Tuple[int, ...]:
+    """Copy canonical host boundaries without accepting lossy coercions."""
+    if isinstance(cu_seqlens_list, Tensor):
+        raise TypeError("canonical host cu_seqlens_list must be a Python integer sequence, not a Tensor")
+    points = []
+    for point in cu_seqlens_list:
+        if isinstance(point, bool) or isinstance(point, Tensor):
+            raise TypeError("canonical host cu_seqlens_list entries must be exact integers")
+        try:
+            points.append(index(point))
+        except TypeError as exc:
+            raise TypeError("canonical host cu_seqlens_list entries must be exact integers") from exc
+    return tuple(points)
 
 
 def validate_ttx_bc8_m1_contract() -> TtxBc8M1Config:
@@ -104,20 +158,39 @@ def validate_ttx_bc8_m1_cu_seqlens(
     *,
     batch_size: int,
     token_count: int,
-) -> None:
+    cu_seqlens_list: Optional[Sequence[int]] = None,
+) -> Tuple[int, ...]:
     """Validate packed CU boundaries before any TTX kernel can consume them."""
     if batch_size != 1:
         raise ValueError("ttx_bc8_m1 varlen affine summary expects batch=1 packed layout")
     if isinstance(cu_seqlens, Tensor):
-        points = [int(point) for point in cu_seqlens.detach().cpu().tolist()]
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2 or cu_seqlens.dtype != torch.int32:
+            raise ValueError("ttx_bc8_m1 cu_seqlens must be a 1D int32 tensor with at least two boundaries")
+        if cu_seqlens.device.type not in {"cpu", "npu"}:
+            raise ValueError("ttx_bc8_m1 cu_seqlens must be a host or same-runtime NPU tensor")
+        if cu_seqlens_list is None:
+            # Public callers without canonical host metadata retain a safe,
+            # versioned fallback.  The model path always supplies the host
+            # list and therefore never synchronizes this device tensor.
+            points = _cached_host_cu_points(cu_seqlens)
+        else:
+            points = _normalize_host_cu_points(cu_seqlens_list)
+            if cu_seqlens.numel() != len(points):
+                raise ValueError(
+                    "ttx_bc8_m1 device/host cu_seqlens boundary count mismatch: "
+                    f"device={cu_seqlens.numel()} host={len(points)}"
+                )
     else:
-        points = [int(point) for point in cu_seqlens]
+        if cu_seqlens_list is not None:
+            raise ValueError("cu_seqlens_list is only valid with a cu_seqlens Tensor")
+        points = _normalize_host_cu_points(cu_seqlens)
     if not points or points[0] != 0:
         raise ValueError(f"ttx_bc8_m1 cu_seqlens must start at 0, got {points[:3]}")
     if any(right < left for left, right in zip(points, points[1:])):
         raise ValueError(f"ttx_bc8_m1 cu_seqlens must be nondecreasing, got {points}")
     if points[-1] != token_count:
         raise ValueError(f"ttx_bc8_m1 cu_seqlens must end at T={token_count}, got {points[-3:]}")
+    return points
 
 
 def validate_ttx_bc8_m1_inputs(
@@ -716,26 +789,25 @@ class _TtxLocalAffineSummaryFn(torch.autograd.Function):
         value: Tensor,
         g: Tensor,
         beta: Tensor,
-        cu_marker: Tensor,
-        use_qk_l2norm_f: Tensor,
-        eps_f: Tensor,
-        has_cu_f: Tensor,
+        cu_marker: Optional[Tensor],
+        cu_pts: Optional[Tuple[int, ...]],
+        eps: float,
     ) -> Tensor:
-        # Host scalars once in forward — never re-.item() in backward (M1).
-        if bool(use_qk_l2norm_f.item()):
-            raise RuntimeError("TTX normalization must run through producer_dtype_l2norm before the custom Function")
         ctx.use_qk_l2norm = False
-        ctx.eps = float(eps_f.item())
-        ctx.has_cu = bool(has_cu_f.item())
+        ctx.eps = float(eps)
+        ctx.has_cu = cu_marker is not None
         cu_seqlens = cu_marker if ctx.has_cu else None
-        # Precompute host cu boundaries once; analytical bwd reuses without D2H.
-        ctx.cu_pts = [int(x) for x in cu_marker.detach().cpu().tolist()] if ctx.has_cu else None
-        if ctx.cu_pts is not None:
-            validate_ttx_bc8_m1_cu_seqlens(
-                ctx.cu_pts,
+        if ctx.has_cu != (cu_pts is not None):
+            raise ValueError("TTX cu_seqlens tensor and immutable host points must be provided together")
+        if cu_pts is not None:
+            ctx.cu_pts = validate_ttx_bc8_m1_cu_seqlens(
+                cu_marker,
                 batch_size=int(key.shape[0]),
                 token_count=int(key.shape[1]),
+                cu_seqlens_list=cu_pts,
             )
+        else:
+            ctx.cu_pts = None
         key_operand, value_operand, g_operand, beta_operand, _key_rstd, _normalized_key_fp32 = (
             _prepare_ttx_forward_operands(
                 key,
@@ -755,7 +827,6 @@ class _TtxLocalAffineSummaryFn(torch.autograd.Function):
             g_operand,
             beta_operand,
             cu_marker,
-            has_cu_f,
         )
         with torch.no_grad():
             hm = _ttx_local_affine_summary_fwd(
@@ -777,9 +848,7 @@ class _TtxLocalAffineSummaryFn(torch.autograd.Function):
             g_operand,
             beta_operand,
             cu_marker,
-            _has_cu_f,
         ) = ctx.saved_tensors
-        # M1: use ctx.has_cu — do not sync via has_cu_f.item() again.
         cu_seqlens = cu_marker if ctx.has_cu else None
         cu_pts = getattr(ctx, "cu_pts", None)
         from veomni.ops.kernels.gdn_kcp_affine_ttx_bwd import ttx_local_affine_analytical_bwd
@@ -795,7 +864,7 @@ class _TtxLocalAffineSummaryFn(torch.autograd.Function):
             use_qk_l2norm=False,
             eps=ctx.eps,
         )
-        return gk, gv, gg, gb, None, None, None, None
+        return gk, gv, gg, gb, None, None, None
 
 
 def ttx_local_affine_summary(
@@ -805,6 +874,7 @@ def ttx_local_affine_summary(
     beta: Tensor,
     *,
     cu_seqlens: Optional[Tensor] = None,
+    cu_seqlens_list: Optional[Sequence[int]] = None,
     use_qk_l2norm: bool = True,
     eps: float = 1e-6,
 ) -> Tensor:
@@ -813,20 +883,22 @@ def ttx_local_affine_summary(
     if any(operand.device != key.device for operand in operands[1:]) or key.device.type != "npu":
         raise RuntimeError("KCP ttx_bc8_m1 autograd requires key/value/g/beta on one Ascend NPU device")
     validate_ttx_bc8_m1_inputs(key, value, g, beta, cu_seqlens=cu_seqlens)
+    if cu_seqlens is None:
+        if cu_seqlens_list is not None:
+            raise ValueError("cu_seqlens_list requires a cu_seqlens Tensor")
+        cu_pts = None
+    else:
+        cu_pts = validate_ttx_bc8_m1_cu_seqlens(
+            cu_seqlens,
+            batch_size=int(key.shape[0]),
+            token_count=int(key.shape[1]),
+            cu_seqlens_list=cu_seqlens_list,
+        )
     if use_qk_l2norm:
         # Normalize outside the custom Function so KCP and the local GDR core
         # can share the producer-dtype expression and its exact autograd graph.
         key = producer_dtype_l2norm(key, eps=eps)
-    # Sentinel tensors so ``apply`` never sees Python None / bool / float.
-    if cu_seqlens is None:
-        cu_marker = key.new_empty(0, dtype=torch.int32)
-        has_cu_f = key.new_zeros((), dtype=torch.float32)
-    else:
-        cu_marker = cu_seqlens
-        has_cu_f = key.new_ones((), dtype=torch.float32)
-    use_f = key.new_zeros(())
-    eps_f = key.new_tensor(float(eps))
-    return _TtxLocalAffineSummaryFn.apply(key, value, g, beta, cu_marker, use_f, eps_f, has_cu_f)
+    return _TtxLocalAffineSummaryFn.apply(key, value, g, beta, cu_seqlens, cu_pts, float(eps))
 
 
 _TTX_FORWARD_BACKWARD_WARMUP_CACHE: set[tuple] = set()
