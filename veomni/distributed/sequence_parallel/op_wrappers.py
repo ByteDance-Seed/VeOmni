@@ -82,9 +82,6 @@ def _batch_dims(tensor: Tensor) -> tuple[int, ...]:
     return tuple(range(tensor.ndim - 1))
 
 
-# ── RMSNorm ──────────────────────────────────────────────────────────────────
-
-
 @dataclass(frozen=True)
 class _EagerRMSMetadata:
     empty: bool
@@ -252,9 +249,6 @@ def _build_rms_norm(variant: str, impl_name: str) -> OpWrapper:
     raise KeyError(f"No async RMSNorm wrapper for impl={impl_name!r}, variant={variant!r}")
 
 
-# ── RoPE, packed [tokens, heads, head_dim], cos/sin [tokens, head_dim] ────────
-
-
 def _rotate_half(x: Tensor) -> Tensor:
     first, second = x.chunk(2, dim=-1)
     return torch.cat((-second, first), dim=-1)
@@ -365,8 +359,10 @@ _BUILDERS: dict[str, Callable[[str, str], OpWrapper]] = {
     "rotary_pos_emb": _build_rotary,
 }
 
-
-# ── Op wrapper factories ─────────────────────────────────────────────────────
+_SUPPORTED_IMPLEMENTATIONS: dict[str, frozenset[str]] = {
+    "rms_norm": frozenset({"eager", "liger_kernel", "npu"}),
+    "rotary_pos_emb": frozenset({"eager", "liger_kernel", "npu"}),
+}
 
 _DEFAULT_VARIANTS: dict[str, str] = {
     "rms_norm": "standard",
@@ -401,6 +397,11 @@ def get_op_wrapper(op_name: str, variant: str | None = None) -> OpWrapper:
     spec = (op_name, variant) if variant is not None else op_name
     op_name, variant = _normalize_spec(spec)
     impl_name = _impl_name(op_name)
+    supported = _SUPPORTED_IMPLEMENTATIONS[op_name]
+    if impl_name not in supported:
+        raise KeyError(
+            f"Async Ulysses has no {op_name} wrapper for implementation {impl_name!r}. Supported: {sorted(supported)}."
+        )
     key = (op_name, variant, impl_name)
     wrapper = _WRAPPERS.get(key)
     if wrapper is None:

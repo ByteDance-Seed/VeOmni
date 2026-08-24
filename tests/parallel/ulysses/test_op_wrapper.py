@@ -310,6 +310,14 @@ def test_get_op_wrapper_rejects_unknown_op() -> None:
 
 
 def test_unknown_implementation_raises() -> None:
-    with pytest.raises(KeyError, match="No async RMSNorm wrapper"):
-        _set_ops(rms_norm="not_a_backend")
+    _set_ops(rms_norm="not_a_backend")
+    with pytest.raises(KeyError, match="Supported: \\['eager', 'liger_kernel', 'npu'\\]"):
         get_op_wrapper("rms_norm")
+
+
+def test_triton_implementation_raises() -> None:
+    _set_ops(rms_norm="triton", rotary_pos_emb="triton")
+    with pytest.raises(KeyError, match="implementation 'triton'"):
+        get_op_wrapper("rms_norm")
+    with pytest.raises(KeyError, match="implementation 'triton'"):
+        get_op_wrapper("rotary_pos_emb")
