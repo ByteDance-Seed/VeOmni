@@ -45,6 +45,14 @@ _PARALLEL_STATE_CACHE: Dict[tuple, "ParallelState"] = {}
 _PARALLEL_STATE_REGISTRY: Dict[str, "ParallelState"] = {}
 
 
+def _validate_context_parallel_device(*, cp_size: int, device_type: str) -> None:
+    if cp_size > 1 and device_type not in {"cpu", "npu"}:
+        raise NotImplementedError(
+            "Lossless GDN context parallelism is supported on Ascend NPU only; "
+            "CPU is reserved for correctness oracles."
+        )
+
+
 def requires_mesh(fn: Callable) -> Callable:
     @wraps(fn)
     def _inner(self: "ParallelState", *args, **kwargs):
@@ -64,11 +72,15 @@ class ParallelState:
     tp_size: int = 1
     pp_size: int = 1
     cp_size: int = 1
+    gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless"] = "disabled"
     ulysses_size: int = 1
     dp_mode: Literal["ddp", "fsdp2"] = "fsdp2"
     device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
+    # Ascend DeviceMesh may not expose a named flattened group through the
+    # root mesh. Retain the explicit CP×Ulysses mesh returned by ``_flatten``.
+    _sp_mesh: Optional["DeviceMesh"] = field(default=None, repr=False, compare=False)
     extra_parallel_names: Tuple[str] = ("ep",)
     extra_parallel_sizes: Dict[str, int] = field(default_factory=lambda: {"ep": 1})
     extra_parallel_fsdp_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
@@ -78,8 +90,17 @@ class ParallelState:
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
-        if self.cp_size > 1:
-            raise NotImplementedError("Ring attention is not supported yet.")
+        enabled_gdn_cp = {"state_passing_lossless"}
+        if self.cp_size > 1 and self.gdn_context_parallel_implementation not in enabled_gdn_cp:
+            raise ValueError(
+                "cp_size > 1 requires an explicit supported GDN context-parallel implementation; "
+                "generic Ring CP is not enabled as a production topology."
+            )
+        if self.cp_size == 1 and self.gdn_context_parallel_implementation in enabled_gdn_cp:
+            raise ValueError(
+                f"gdn_context_parallel_implementation={self.gdn_context_parallel_implementation!r} requires cp_size > 1"
+            )
+        _validate_context_parallel_device(cp_size=self.cp_size, device_type=self.device_type)
 
         if self.pp_size * self.dp_size * self.cp_size * self.ulysses_size * self.tp_size != self.world_size:
             raise ValueError("The product of parallel sizes should be equal to the world size.")
@@ -362,16 +383,34 @@ class ParallelState:
     # ------------------------------ SP ------------------------------ #
     @property
     def sp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None and self.sp_enabled:
+        if self.device_mesh is None or not self.sp_enabled:
+            return None
+        if self._sp_mesh is not None:
+            return self._sp_mesh.get_group()
+        try:
             return self.device_mesh.get_group("sp")
-
+        except (KeyError, RuntimeError):
+            pass
+        if self.cp_enabled and not self.ulysses_enabled:
+            return self.device_mesh.get_group("cp")
+        if self.ulysses_enabled and not self.cp_enabled:
+            return self.device_mesh.get_group("ulysses")
         return None
 
     @property
     def sp_rank(self) -> int:
-        if self.device_mesh is not None and self.sp_enabled:
+        if self.device_mesh is None or not self.sp_enabled:
+            return -1
+        if self._sp_mesh is not None:
+            return self._sp_mesh.get_local_rank()
+        try:
             return self.device_mesh.get_local_rank("sp")
-
+        except (KeyError, RuntimeError):
+            pass
+        if self.cp_enabled and not self.ulysses_enabled:
+            return self.device_mesh.get_local_rank("cp")
+        if self.ulysses_enabled and not self.cp_enabled:
+            return self.device_mesh.get_local_rank("ulysses")
         return -1
 
     @property
@@ -448,6 +487,7 @@ def init_parallel_state(
     tp_size: int = 1,
     pp_size: int = 1,
     cp_size: int = 1,
+    gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless"] = "disabled",
     ulysses_size: int = 1,
     dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
@@ -478,6 +518,9 @@ def init_parallel_state(
 
     if device_type is None:
         device_type = get_device_type()
+    # Reject unsupported hardware before ``init_device_mesh`` creates any
+    # process groups or collectives.
+    _validate_context_parallel_device(cp_size=cp_size, device_type=device_type)
 
     # Set dp_shard_size to dp_size if dp_shard_size and dp_replicate_size are not set when dp enabled
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
@@ -506,6 +549,7 @@ def init_parallel_state(
         tp_size,
         pp_size,
         cp_size,
+        gdn_context_parallel_implementation,
         ulysses_size,
         dp_mode,
         device_type,
@@ -544,9 +588,11 @@ def init_parallel_state(
 
     mesh_shape = []
     mesh_dim_names = []
+    # CP is the outer sequence dimension and Ulysses is the inner head
+    # dimension. This keeps ``sp_rank = cp_rank * ulysses_size + ulysses_rank``.
     for d, dim_name in zip(
-        [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
-        ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
+        [pp_size, dp_replicate_size, dp_shard_size, cp_size, ulysses_size, tp_size],
+        ["pp", "dp_replicate", "dp_shard", "cp", "ulysses", "tp"],
     ):
         if d > 1 or dim_name in ["dp_shard"]:
             mesh_shape.append(d)
@@ -574,14 +620,14 @@ def init_parallel_state(
         dp_mesh_dim_names.append("dp_shard")
         dp_shard_sp_mesh_dim_names.append("dp_shard")
         dp_sp_mesh_dim_names.append("dp_shard")
-    if ulysses_size > 1:
-        dp_shard_sp_mesh_dim_names.append("ulysses")
-        sp_mesh_dim_names.append("ulysses")
-        dp_sp_mesh_dim_names.append("ulysses")
     if cp_size > 1:
         dp_shard_sp_mesh_dim_names.append("cp")
         sp_mesh_dim_names.append("cp")
         dp_sp_mesh_dim_names.append("cp")
+    if ulysses_size > 1:
+        dp_shard_sp_mesh_dim_names.append("ulysses")
+        sp_mesh_dim_names.append("ulysses")
+        dp_sp_mesh_dim_names.append("ulysses")
 
     if dp_mesh_dim_names != []:
         device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
@@ -592,8 +638,9 @@ def init_parallel_state(
     if dp_sp_mesh_dim_names != []:
         device_mesh[tuple(dp_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_sp")
 
+    sp_mesh = None
     if sp_mesh_dim_names != []:
-        device_mesh[tuple(sp_mesh_dim_names)]._flatten(mesh_dim_name="sp")
+        sp_mesh = device_mesh[tuple(sp_mesh_dim_names)]._flatten(mesh_dim_name="sp")
 
     for para_size, para_outside, para_name in zip(
         extra_parallel_sizes, extra_parallel_placement_innermost, extra_parallel_names
@@ -637,11 +684,13 @@ def init_parallel_state(
         tp_size=tp_size,
         pp_size=pp_size,
         cp_size=cp_size,
+        gdn_context_parallel_implementation=gdn_context_parallel_implementation,
         ulysses_size=ulysses_size,
         dp_mode=dp_mode,
         device_type=device_type,
         include_sp_in_fsdp=include_sp_in_fsdp,
         device_mesh=device_mesh,
+        _sp_mesh=sp_mesh,
         extra_parallel_names=extra_parallel_names,
         extra_parallel_sizes=dict(zip(extra_parallel_names, extra_parallel_sizes)),
         extra_parallel_fsdp_device_mesh=extra_parallel_fsdp_device_mesh,
