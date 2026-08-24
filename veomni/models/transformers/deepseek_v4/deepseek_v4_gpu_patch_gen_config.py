@@ -1083,6 +1083,24 @@ def deepseek_v4_model_forward_patched(
             and inputs_embeds.dtype == torch.bfloat16
             and inputs_embeds.is_cuda
         )
+        # Dropping the mask is only sound if it masked nothing out. The check on
+        # ``boundaries`` above already establishes that every position belongs to
+        # some sequence, so a zero here contradicts the caller's own cu-seqlens --
+        # but ``build_packed_sparse_attention_indices`` rebuilds candidates from
+        # ``position_ids`` alone, so an unnoticed zero would silently make a padded
+        # token attendable and move the loss. VeOmni's collator guarantees all-ones
+        # on this path (see ``data_collator.py``: SP slices ``input_ids`` but keeps
+        # the full mask), yet this is a public entry point, so verify rather than
+        # trust. Reading the mask costs one device sync on a branch that already
+        # pays for ``cu_seq_lens_q.cpu()`` a few lines up, so this adds no new
+        # class of stall.
+        if mask_free_sparse and isinstance(attention_mask, torch.Tensor) and not bool(attention_mask.all()):
+            raise ValueError(
+                "DeepSeek V4 packed attention received an attention_mask with masked-out "
+                "positions alongside cu_seq_lens_q that span the full sequence. Express "
+                "padding through cu_seq_lens_q, which the sparse path reads, instead of a "
+                "dense mask, which it drops."
+            )
         # Metadata is indexed by global positions / cu-seqlens; under SP the
         # collator already provides full-sequence cu-seqlens while local embeds
         # are only one shard, so materialize a full-length reference tensor.

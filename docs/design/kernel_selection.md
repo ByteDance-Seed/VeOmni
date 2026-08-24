@@ -274,8 +274,10 @@ only difference is the kernel callable on the other side of the registry.
 
 Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, DeepSeek-V4, Llama,
 Seed-OSS. DeepSeek-V4 supports weighted and unweighted RMSNorm plus a
-clamp-preserving Liger silu*mul path for shared experts; its partial
-interleaved RoPE remains eager-only.
+clamp-preserving Liger silu*mul path for shared experts. Its partial
+interleaved RoPE has no Liger equivalent, so `liger_kernel` is rejected for
+`rotary_pos_emb_implementation` on that model; the supported values are
+`triton` (the fused kernel above) and `eager`.
 
 ### Key files
 
