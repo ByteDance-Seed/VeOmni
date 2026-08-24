@@ -413,6 +413,7 @@ def deepseek_v4_hca_compressor_forward_patched(
             position_ids,
             rate_metadata,
             overlap=False,
+            apply_rope=apply_rotary_pos_emb,
         )
         if compressed.shape[1] == 0:
             anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
@@ -504,6 +505,7 @@ def deepseek_v4_csa_compressor_forward_patched(
             position_ids,
             rate_metadata,
             overlap=True,
+            apply_rope=apply_rotary_pos_emb,
         )
         # The indexer submodule is intentionally NOT anchored here: its outputs
         # are non-differentiable top-k indices, so its params already receive no
