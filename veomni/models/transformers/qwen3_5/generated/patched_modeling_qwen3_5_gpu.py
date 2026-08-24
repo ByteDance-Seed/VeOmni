@@ -20,7 +20,7 @@
 #    - method_override: Qwen3_5TextModel._update_linear_attn_mask
 #      Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.
 #    - method_override: Qwen3_5TextModel.forward
-#      Expose the MTP head's inputs (inputs_embeds / position_embeddings / masks) via mtp_context
+#      Expose the MTP head's inputs on demand via mtp_context
 #    - method_override: Qwen3_5DecoderLayer.forward
 #      Extract and pass cu_seq_lens_q for varlen linear attention in Qwen3_5DecoderLayer.forward
 #    - method_override: Qwen3_5Model.get_image_features
@@ -152,6 +152,7 @@ _VEOMNI_VISION_ATTENTION_PATCHED = True
 # ======================================================================
 
 
+# ── MTP (multi-token prediction) ─────────────────────────────────────────────
 def _mtp_loss_weight(text_config):
     """Resolve the MTP loss weight, or None when MTP is disabled."""
     weight = getattr(text_config, "mtp_loss_weight", None)
@@ -165,10 +166,57 @@ def _mtp_loss_weight(text_config):
     return weight
 
 
-def make_mtp_labels(feature):
-    """Create depth-1 MTP labels before samples are packed."""
+def make_mtp_labels(feature, num_depths=1):
+    """Create one future-token target row per MTP depth before packing."""
     labels = feature["labels"]
-    feature["mtp_labels"] = F.pad(labels, (0, 2), value=IGNORE_INDEX)[..., 2:].contiguous()  # noqa: F821
+    feature["mtp_labels"] = torch.stack(
+        [
+            F.pad(labels, (0, depth + 2), value=IGNORE_INDEX)[..., depth + 2 :].contiguous()  # noqa: F821
+            for depth in range(num_depths)
+        ],
+        dim=-2,
+    )
+
+
+def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size, **kwargs):
+    """Compute one token-normalized loss over all MTP depths."""
+    if mtp_labels.ndim != 3:
+        raise ValueError(
+            f"MTP labels must have shape [batch, depth, sequence]; got mtp_labels.shape={tuple(mtp_labels.shape)}."
+        )
+    if len(hidden_states) != mtp_labels.shape[1]:
+        raise ValueError(
+            "MTP hidden-state depth must match the label depth; "
+            f"got {len(hidden_states)} hidden-state row(s) and {mtp_labels.shape[1]} label row(s)."
+        )
+
+    batch_size, num_depths, sequence_length = mtp_labels.shape
+    stacked_hidden_states = torch.stack(hidden_states, dim=1)
+    flat_hidden_states = stacked_hidden_states.reshape(batch_size * num_depths, sequence_length, -1)
+    flat_labels = mtp_labels.reshape(batch_size * num_depths, sequence_length)
+
+    valid_target_count = (flat_labels != IGNORE_INDEX).sum()  # noqa: F821
+    has_valid_target = valid_target_count > 0
+    safe_labels = flat_labels.clone()
+    safe_labels.reshape(-1)[0] = torch.where(
+        has_valid_target,
+        safe_labels.reshape(-1)[0],
+        safe_labels.new_zeros(()),
+    )
+
+    loss_kwargs = dict(kwargs)
+    loss_kwargs.pop("shift_labels", None)
+    loss_kwargs["num_items_in_batch"] = valid_target_count.clamp_min(1)
+    mtp_loss, _, _ = mtp_loss_fn(
+        logits=None,
+        labels=safe_labels,
+        vocab_size=vocab_size,
+        hidden_states=flat_hidden_states,
+        weights=weights,
+        shift_labels=safe_labels,
+        **loss_kwargs,
+    )
+    return mtp_loss * has_valid_target.to(mtp_loss.dtype)
 
 
 def mm_token_type_ids_from_input_ids(input_ids, config):
@@ -1192,22 +1240,23 @@ class Qwen3_5MTP(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
-        """Predict the next-token hidden states from shifted embeddings and trunk states."""
+    ) -> tuple[torch.Tensor, ...]:
+        """Return one recurrently teacher-forced hidden-state row per MTP depth."""
         assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False), (
-            "Qwen3.5 MTP is training-only in VeOmni; speculative decoding runs in the inference engine."
+            "Qwen3.5 MTP only supports full-sequence objective computation; cached decoding runs in the "
+            "inference engine."
         )
 
-        shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, 1))[:, 1:, :]
-
-        hidden_states = self.fc(
-            torch.cat(
-                [self.pre_fc_norm_embedding(shifted_embeds), self.pre_fc_norm_hidden(hidden_states)],
-                dim=-1,
+        depth_hidden_states = []
+        for depth, decoder_layer in enumerate(self.layers):
+            shift = depth + 1
+            shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, shift))[:, shift:, :]
+            hidden_states = self.fc(
+                torch.cat(
+                    [self.pre_fc_norm_embedding(shifted_embeds), self.pre_fc_norm_hidden(hidden_states)],
+                    dim=-1,
+                )
             )
-        )
-
-        for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -1217,8 +1266,10 @@ class Qwen3_5MTP(nn.Module):
                 use_cache=False,
                 **kwargs,
             )
+            hidden_states = self.norm(hidden_states)
+            depth_hidden_states.append(hidden_states)
 
-        return self.norm(hidden_states)
+        return tuple(depth_hidden_states)
 
 
 class Qwen3_5PreTrainedModel(PreTrainedModel):
@@ -1841,7 +1892,7 @@ class Qwen3_5ModelOutputWithPast(ModelOutput):
 class Qwen3_5MTPContextOutput(Qwen3_5ModelOutputWithPast):
     r"""
     mtp_context (`dict`, *optional*):
-        Inputs retained for the MTP head while training.
+        Inputs retained when the outer model requests an MTP objective.
     """
 
     mtp_context: dict | None = None
@@ -1879,21 +1930,13 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
+        return_mtp_context: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Qwen3_5ModelOutputWithPast:
         """Run the text backbone and expose the inputs required by the MTP head.
 
         Args:
-            input_ids: Token IDs when embeddings are not provided.
-            attention_mask: Attention or padding mask for decoder layers.
-            position_ids: Text and multimodal rotary position IDs.
-            past_key_values: Optional generation cache.
-            inputs_embeds: Precomputed token embeddings.
-            use_cache: Whether to populate the generation cache.
-            kwargs: Additional transformer arguments forwarded to decoder layers.
-
-        Returns:
-            Text model outputs including the context needed by the MTP head.
+            return_mtp_context (`bool`, *optional*): Whether to retain the backbone inputs required by the MTP objective.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1945,7 +1988,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         hidden_states = self.norm(hidden_states)
 
         mtp_context = None
-        if self.training and _mtp_loss_weight(self.config) is not None:  # noqa: F821 defined via add_helper
+        if return_mtp_context:
             mtp_context = {
                 "inputs_embeds": inputs_embeds,
                 "position_embeddings": position_embeddings,
@@ -2714,7 +2757,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
 
         self.mtp = None
         mtp_loss_weight = _mtp_loss_weight(config.text_config)  # noqa: F821 defined via add_helper
-        self.model.language_model._veomni_mtp_enabled = mtp_loss_weight is not None
         if mtp_loss_weight is not None:
             parallel_state = get_parallel_state()
             assert not parallel_state.sp_enabled, (
@@ -2778,6 +2820,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5CausalLMOutputWithLogProbs:
         """Run conditional generation and combine foundation and weighted MTP losses."""
+        requires_mtp_context = self.mtp is not None and labels is not None
+        if requires_mtp_context and mtp_labels is None:
+            raise ValueError("Qwen3.5 MTP loss requires `mtp_labels` when `labels` are provided.")
+
+        model_kwargs = dict(kwargs)
+        model_kwargs["return_mtp_context"] = requires_mtp_context
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -2789,7 +2837,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
-            **kwargs,
+            **model_kwargs,
         )
 
         hidden_states = outputs[0]
@@ -2829,18 +2877,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             logits = self.lm_head(hidden_states)
 
         loss_dict = None
-        if self.mtp is not None and labels is not None:
-            if mtp_labels is None:
-                raise ValueError(
-                    "Qwen3.5 MTP training requires tasks/train_text.py; this trainer did not provide `mtp_labels`."
-                )
+        if requires_mtp_context:
             mtp_context = getattr(outputs, "mtp_context", None)
             if mtp_context is None:
-                raise ValueError(
-                    "MTP is enabled but the language model returned no `mtp_context`. It is only populated "
-                    "while training — Qwen3.5 MTP is training-only in VeOmni."
-                )
-            mtp_hidden = self.mtp(
+                raise RuntimeError("Qwen3.5 MTP context was requested but the language model did not return it.")
+            mtp_hidden_states = self.mtp(
                 hidden_states=outputs[0],
                 inputs_embeds=mtp_context["inputs_embeds"],
                 position_embeddings=mtp_context["position_embeddings"],
@@ -2852,13 +2893,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 max_length_k=kwargs.get("max_length_k"),
             )
             mtp_loss_fn = veomni_causal_lm_loss if veomni_causal_lm_loss.use_non_eager_impl else self.loss_function
-            mtp_loss, _, _ = mtp_loss_fn(
-                logits=None,
-                labels=labels,
-                vocab_size=self.config.text_config.vocab_size,
-                hidden_states=mtp_hidden,
+            mtp_loss = compute_mtp_loss(  # noqa: F821 defined via add_helper
+                mtp_loss_fn,
+                mtp_hidden_states,
+                mtp_labels,
                 weights=self.lm_head.weight,
-                shift_labels=mtp_labels,
+                vocab_size=self.config.text_config.vocab_size,
+                **kwargs,
             )
             weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821 defined via add_helper
             loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
@@ -3107,7 +3148,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         """Return the per-sample MTP label builder when the head is enabled."""
         if self.mtp is None:
             return None
-        return make_mtp_labels  # noqa: F821 defined via add_helper
+        return partial(make_mtp_labels, num_depths=len(self.mtp.layers))  # noqa: F821 defined via add_helper
 
     def get_position_id_func(self):
         fake_config = copy(self.config)

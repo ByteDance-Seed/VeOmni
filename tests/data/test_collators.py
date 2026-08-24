@@ -201,13 +201,13 @@ def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, fe
 
 
 def _mtp_labels_hook(feature):
-    """Derive depth-1 MTP labels for one unpacked sample."""
     labels = feature["labels"]
-    feature["mtp_labels"] = torch.nn.functional.pad(labels, (0, 2), value=IGNORE_INDEX)[..., 2:].contiguous()
+    feature["mtp_labels"] = torch.stack(
+        [torch.nn.functional.pad(labels, (0, shift), value=IGNORE_INDEX)[..., shift:].contiguous() for shift in (2, 3)]
+    )
 
 
 def test_sample_collate_func_runs_before_packing(monkeypatch):
-    """Verify model sample hooks run before packing and preserve label alignment."""
     import veomni.data.data_collator as m
 
     monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
@@ -231,15 +231,22 @@ def test_sample_collate_func_runs_before_packing(monkeypatch):
     )
     out = collator([{k: v.clone() for k, v in f.items()} for f in features])
 
-    expected = torch.tensor([[13, 14, IGNORE_INDEX, IGNORE_INDEX, 23, IGNORE_INDEX, IGNORE_INDEX]], dtype=torch.long)
+    expected = torch.tensor(
+        [
+            [
+                [13, 14, IGNORE_INDEX, IGNORE_INDEX, 23, IGNORE_INDEX, IGNORE_INDEX],
+                [14, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+            ]
+        ],
+        dtype=torch.long,
+    )
     assert torch.equal(out["mtp_labels"], expected)
-    assert out["mtp_labels"].shape == out["labels"].shape
+    assert out["mtp_labels"].shape == (out["labels"].shape[0], 2, out["labels"].shape[-1])
 
-    assert 21 not in out["mtp_labels"].tolist()[0][:4]
+    assert 21 not in out["mtp_labels"].tolist()[0][0][:4]
 
 
 def test_no_sample_collate_func_leaves_batch_unchanged(monkeypatch):
-    """Verify MainCollator does not add model-specific fields without a hook."""
     import veomni.data.data_collator as m
 
     monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))

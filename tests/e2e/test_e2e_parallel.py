@@ -58,7 +58,6 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
 
 
 def _materialize_weights_dir(config_path: str, output_path: str) -> Path:
-    """Materialize deterministic toy weights for parallel-alignment runs."""
     # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
     # across pytest invocations *and* across GPU architectures (L20 in CI vs A100
     # locally). Without this, the four sub-runs (sp/ep grid) shared weights within
@@ -90,7 +89,6 @@ def main(
     compare_alignment: bool = True,
     extra_args: list[str] | None = None,
 ):
-    """Run the requested model across the supported SP and EP configurations."""
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
 

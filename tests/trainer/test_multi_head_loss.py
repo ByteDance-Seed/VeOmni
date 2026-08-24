@@ -28,7 +28,6 @@ class _OutputWithLossDict(CausalLMOutputWithPast):
 
 
 def test_dict_in_loss_field_is_destroyed_by_model_output():
-    """Document why a loss dictionary cannot be stored in ModelOutput.loss."""
     losses = {"foundation_loss": torch.tensor(1.0), "mtp_loss": torch.tensor(0.5)}
 
     out = CausalLMOutputWithPast(loss=losses)
@@ -39,7 +38,6 @@ def test_dict_in_loss_field_is_destroyed_by_model_output():
 
 
 def test_loss_dict_field_survives_with_all_other_fields_none():
-    """Verify a dedicated loss_dict field survives ModelOutput initialization."""
     foundation = torch.tensor(1.0)
     out = _OutputWithLossDict(
         loss=foundation,
@@ -52,7 +50,6 @@ def test_loss_dict_field_survives_with_all_other_fields_none():
 
 
 def test_loss_dict_tensors_stay_in_the_pytree():
-    """Verify loss_dict tensors remain visible to PyTorch pytree traversal."""
     from torch.utils._pytree import tree_flatten
 
     mtp = torch.tensor(0.5, requires_grad=True)
@@ -63,7 +60,6 @@ def test_loss_dict_tensors_stay_in_the_pytree():
 
 
 def test_postforward_prefers_loss_dict_over_loss():
-    """Verify postforward composes all named head losses when loss_dict exists."""
     from veomni.trainer.base import BaseTrainer
 
     foundation = torch.tensor(2.0)
@@ -83,7 +79,6 @@ def test_postforward_prefers_loss_dict_over_loss():
 
 
 def test_postforward_falls_back_to_plain_loss_tensor():
-    """Verify postforward preserves the single-loss compatibility path."""
     from veomni.trainer.base import BaseTrainer
 
     out = CausalLMOutputWithPast(loss=torch.tensor(2.0), logits=torch.zeros(1))
@@ -100,7 +95,6 @@ def test_postforward_falls_back_to_plain_loss_tensor():
 
 
 def test_model_output_subclass_field_order_is_still_loss_first():
-    """Verify the custom output preserves the base ModelOutput field contract."""
     from dataclasses import fields
 
     assert fields(_OutputWithLossDict)[0].name == "loss"
@@ -108,12 +102,10 @@ def test_model_output_subclass_field_order_is_still_loss_first():
 
 
 def test_text_trainer_builds_model_sample_collator(monkeypatch):
-    """Verify TextTrainer wires model-provided sample collation hooks."""
     import veomni.data.data_collator as data_collator
     from veomni.trainer.text_trainer import TextTrainer
 
     def sample_hook(feature):
-        """Return a sample unchanged for collator wiring verification."""
         return feature
 
     model = SimpleNamespace(

@@ -66,6 +66,8 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     _mtp_loss_weight,
     _Qwen3_5MoeFakeForPosID,
     collate_multimodal_metadata,
+    compute_mtp_loss,
+    compute_mtp_router_aux_loss,
     get_position_id,
     make_mtp_labels,
     mm_token_type_ids_from_input_ids,
@@ -276,6 +278,8 @@ config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast", Qwen3_5MoeCausalLMOu
 config.add_helper_after("Qwen3_5MoeDecoderLayer", Qwen3_5MoeMTP)
 config.add_helper_after("Qwen3_5MoeModelOutputWithPast", Qwen3_5MoeMTPContextOutput)
 config.add_helper(_mtp_loss_weight)
+config.add_helper(compute_mtp_loss)
+config.add_helper(compute_mtp_router_aux_loss)
 config.add_helper(make_mtp_labels)
 
 
@@ -370,6 +374,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     cache_position: torch.LongTensor | None = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> torch.FloatTensor:
+    return_router_logits = kwargs.pop("return_router_logits", False)
     residual = hidden_states
 
     hidden_states = self.input_layernorm(hidden_states)
@@ -417,9 +422,12 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = self.mlp(hidden_states)
     # For the MoE layers, we need to unpack
+    router_logits = None
     if isinstance(hidden_states, tuple):
-        hidden_states, _ = hidden_states
+        hidden_states, router_logits = hidden_states
     hidden_states = residual + hidden_states
+    if return_router_logits:
+        return hidden_states, router_logits
     return hidden_states
 
 

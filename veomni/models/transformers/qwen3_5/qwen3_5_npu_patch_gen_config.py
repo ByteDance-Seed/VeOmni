@@ -44,6 +44,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     _mtp_loss_weight,
     _Qwen3_5FakeForPosID,
     collate_multimodal_metadata,
+    compute_mtp_loss,
     get_position_id,
     make_mtp_labels,
     mm_token_type_ids_from_input_ids,
@@ -181,6 +182,7 @@ config.add_helper(_Qwen3_5FakeForPosID)
 
 # MTP helpers shared with the GPU patch.
 config.add_helper(_mtp_loss_weight)
+config.add_helper(compute_mtp_loss)
 config.add_helper(make_mtp_labels)
 config.add_helper_after("Qwen3_5DecoderLayer", Qwen3_5MTP)
 config.add_helper_after("Qwen3_5ModelOutputWithPast", Qwen3_5MTPContextOutput)
@@ -530,21 +532,13 @@ def qwen3_5_text_model_forward_patched(
     past_key_values: Cache | None = None,
     inputs_embeds: torch.FloatTensor | None = None,
     use_cache: bool | None = None,
+    return_mtp_context: bool = False,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5ModelOutputWithPast:
     """Run the NPU text backbone and expose precomputed MTP and varlen context.
 
     Args:
-        input_ids: Token IDs when embeddings are not provided.
-        attention_mask: Attention or padding mask used to derive varlen metadata.
-        position_ids: Text and multimodal rotary position IDs.
-        past_key_values: Optional generation cache.
-        inputs_embeds: Precomputed token embeddings.
-        use_cache: Whether to populate the generation cache.
-        kwargs: Additional transformer arguments forwarded to decoder layers.
-
-    Returns:
-        Text model outputs including MTP context and reused NPU varlen metadata.
+        return_mtp_context (`bool`, *optional*): Whether to retain the backbone inputs required by the MTP objective.
     """
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -618,7 +612,7 @@ def qwen3_5_text_model_forward_patched(
     hidden_states = self.norm(hidden_states)
 
     mtp_context = None
-    if self.training and getattr(self, "_veomni_mtp_enabled", False):
+    if return_mtp_context:
         mtp_context = {
             "inputs_embeds": inputs_embeds,
             "position_embeddings": position_embeddings,

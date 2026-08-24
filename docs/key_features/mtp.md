@@ -18,13 +18,15 @@
 
 ## 📚 Overview
 
-Multi-token prediction trains an auxiliary head to predict token `i+2` alongside the
-main head's `i+1`, which is what an inference engine later uses as the draft model
-for speculative decoding. Qwen3.5 checkpoints ship pretrained MTP weights (15
-tensors under the `mtp.` prefix), but upstream `transformers` 5.9.0 has no MTP
-module — only `_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`. Before this
-feature those tensors were loaded and discarded, so continued training silently
-degraded the MTP head relative to the trunk.
+Multi-token prediction trains recurrent auxiliary depths alongside the main head.
+At sequence position `i`, the main head predicts token `i+1`, MTP depth 0 predicts
+`i+2`, depth 1 predicts `i+3`, and so on. An inference engine later executes the
+same depth-specific layers one speculative step at a time as its draft model.
+Qwen3.5 checkpoints ship pretrained MTP weights under the `mtp.` prefix, but
+upstream `transformers` 5.9.0 has no MTP module — only
+`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`. Before this feature those
+tensors were loaded and discarded, so continued training silently degraded the
+MTP head relative to the trunk.
 
 Currently supported through `tasks/train_text.py`: **Qwen3.5 dense**
 (`Qwen3_5ForConditionalGeneration`) and **Qwen3.5 MoE**
@@ -84,13 +86,17 @@ inference implementation (`vllm/model_executor/models/qwen3_5_mtp.py`), which is
 deployment contract:
 
 ```text
-e_shift[i] = inputs_embeds[i+1]                       # tail slot zero-filled
-h = fc(cat([pre_fc_norm_embedding(e_shift),
-            pre_fc_norm_hidden(trunk_hidden)], dim=-1))
-h = mtp.layers(h, ...)                                # full_attention decoder layers
-mtp_hidden = mtp.norm(h)
-logits = lm_head(mtp_hidden)                          # shared with the main head
-loss   = CE(logits, labels[i+2])
+h[-1] = trunk_hidden
+for depth in range(mtp_num_hidden_layers):
+    e_shift[depth, i] = inputs_embeds[i + depth + 1]  # tail slots zero-filled
+    h[depth] = fc(cat([pre_fc_norm_embedding(e_shift[depth]),
+                       pre_fc_norm_hidden(h[depth - 1])], dim=-1))
+    h[depth] = mtp.layers[depth](h[depth], ...)       # one layer for this depth
+    h[depth] = mtp.norm(h[depth])
+    target[depth, i] = labels[i + depth + 2]
+
+logits = lm_head(stack(h))                            # shared with the main head
+loss   = CE(logits, stack(target))                    # mean over valid depth tokens
 ```
 
 Three details are load-bearing and easy to get backwards. Each was verified
@@ -101,11 +107,19 @@ the method):
 |---|---|---|
 | `fc` input order | **embedding first**, `cat([emb, hidden])` | Multiplies the hidden state by `fc.weight`'s embedding half. Loss jumps to ~9x — above `ln(vocab_size)`, i.e. worse than uniform. |
 | Which trunk hidden state | **post**-final-norm (the trunk's returned `last_hidden_state`) | `pre_fc_norm_hidden` was trained on the normed distribution; loss rises ~1.3x. |
-| positions / rotary | **not shifted** — reuse the trunk's `position_embeddings` | Megatron-style MTP does roll `position_ids`; vLLM's Qwen3.5 path does not. Copying that would desynchronize from inference. |
+| positions / rotary | **not shifted inside the parallel training row** — reuse the trunk's `position_embeddings` at every depth | Rolling the already-packed training positions would desynchronize the pretrained one-depth Qwen3.5 contract. |
 
 The head shares `embed_tokens` and `lm_head` with the main model: the released
 checkpoints carry neither `mtp.embed_tokens` nor `mtp.lm_head`, and
 `mtp_use_dedicated_embeddings` is `False` (asserted at construction).
+
+For Qwen3.5-MoE, enabling `output_router_logits` applies one load-balancing
+auxiliary loss across both trunk routers and every MTP depth. Trunk router rows
+use the regular attention mask; MTP depth `d` uses
+`mtp_labels[:, d] != IGNORE_INDEX`, so shifted tail positions and masked targets
+do not affect expert-balancing statistics. The combined auxiliary term is
+controlled by `router_aux_loss_coef`; `mtp_loss_weight` continues to scale only
+the MTP cross-entropy contribution.
 
 ## ⚙️ Plumbing
 
@@ -113,23 +127,28 @@ checkpoints carry neither `mtp.embed_tokens` nor `mtp.lm_head`, and
 
 `ForCausalLMLoss` shifts labels by one internally when SP is disabled
 (`veomni/ops/kernels/cross_entropy/__init__.py`), so position `i` of the main head
-predicts `labels[i+1]`. The MTP head needs `labels[i+2]`, supplied as an explicit
-`shift_labels=` argument that bypasses the internal shift.
+predicts `labels[i+1]`. MTP depth `d` instead needs `labels[i+d+2]`. The collator
+therefore builds `mtp_labels` with shape `[batch, depth, sequence]`, and the model
+supplies it as an explicit `shift_labels=` argument that bypasses the internal
+shift.
 
 The row is built by a **per-sample** collator hook
 (`Qwen3_5ForConditionalGeneration.get_sample_collate_func` →
 `SampleFieldsCollator`), which runs after `PrecomputePositionIDsCollator` and
 *before* `PackingCollator`. That ordering is the whole point: shifting by two inside
 an already-packed row would pull the next sample's first tokens into the tail of the
-current one. Doing it per sample makes that impossible by construction, so no
-`cu_seq_lens` boundary arithmetic is needed.
+current one. Doing every depth shift per sample makes that impossible by
+construction, so no `cu_seq_lens` boundary arithmetic is needed.
 
 `mtp_labels` is registered via `get_extra_collate_infos()` as
-`(-1, True, IGNORE_INDEX, 1)`. Registration matters beyond SP: `pad_to_length` pads
-every `pack_dim == -1` key with its `sp_pad_value`, so an unregistered row would be
-left short. Registration also makes `count_loss_token` emit `mtp_tokens` for free
-(it derives `{prefix}_tokens` from any `*_labels` key), which is what
-`mean_global_loss` normalizes the MTP loss by.
+`(-1, True, IGNORE_INDEX, 1)`. The depth dimension is retained while samples are
+concatenated along the final sequence dimension. Registration matters beyond SP:
+`pad_to_length` pads every `pack_dim == -1` key with its `sp_pad_value`, so an
+unregistered row would be left short. Registration also makes `count_loss_token`
+emit `mtp_tokens` for free (it derives `{prefix}_tokens` from any `*_labels` key).
+The model flattens batch and depth for one fused loss call, so `mtp_tokens` is the
+exact denominator across all valid depth targets, including under gradient
+accumulation.
 
 `TextTrainer._build_collate_fn` resolves `get_extra_collate_infos` and
 `get_sample_collate_func` for text training. Other trainer-specific collators are
@@ -159,8 +178,9 @@ out through an added `mtp_context` field (`Qwen3_5MTPContextOutput`).
 
 Recomputing them one level up would re-embed `input_ids` *without* the scattered
 vision features — silently wrong for multimodal batches. `mtp_context` is populated
-only while training and only when MTP is enabled, so inference and MTP-off runs
-allocate nothing extra.
+only when an enabled MTP head is asked to compute a labeled objective, including
+both training and evaluation. Label-free inference and MTP-off runs allocate
+nothing extra.
 
 ## 💾 Checkpoints
 
@@ -188,8 +208,10 @@ the optimizer param groups change shape too. Enable MTP from step 0 off HF weigh
 
 ## 📉 Cost
 
-MTP adds one decoder layer and a second projection through the shared `lm_head`.
-Lowering `mtp_loss_weight` changes the objective but does not reduce this compute.
+MTP adds `mtp_num_hidden_layers` recurrent decoder layers and one shared-head
+projection per depth. The depth rows are batched into one loss-kernel call, but the
+projection FLOPs still scale linearly with the number of depths. Lowering
+`mtp_loss_weight` changes the objective but does not reduce this compute.
 
 On Qwen3.5-35B-A3B with 16 Ascend ranks, EP16, sequence length 1024 and one MTP
 layer, a warm-cache 20-step comparison measured 3.36s without MTP and 3.49s with

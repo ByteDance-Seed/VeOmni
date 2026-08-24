@@ -38,7 +38,6 @@ def test_chunk_loss_reuses_valid_token_denominator(monkeypatch):
 
 
 def test_chunk_loss_honors_explicit_shift_labels(monkeypatch):
-    """Verify chunk loss uses explicit shifted labels without shifting hidden states."""
     monkeypatch.setattr(chunk_loss_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
 
     hidden_states = torch.randn(1, 3, 4)
