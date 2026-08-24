@@ -25,7 +25,6 @@ Phase 6: Test                          -> pending
    - Vision-Language -> `veomni/models/transformers/<model_name>/` + `veomni/data/multimodal/`
    - MoE model -> additional `veomni/distributed/moe/` integration
    - Diffusion model -> `veomni/models/diffusers/<model_name>/`
-   - Omni model -> `veomni/models/seed_omni/`
 
 3. **Check existing similar models**: Find the closest existing model in `veomni/models/transformers/` and use it as a reference. E.g., if adding a new Qwen variant, reference `qwen3/` or `qwen3_vl/`.
 

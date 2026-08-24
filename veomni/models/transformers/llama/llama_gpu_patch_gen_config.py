@@ -21,7 +21,8 @@ Patches:
 - OpSlot guards for RMSNorm, SwiGLU MLP, RoPE, and (sequence-classification +
   causal) cross-entropy loss. Each guard falls through to the original HF eager
   code when no fused kernel is bound, so the generated file is safe to import
-  even when ``_bind_veomni_ops()`` does not run (e.g. seed_omni wrappers).
+  even when ``_bind_veomni_ops()`` does not run (e.g. the module is imported
+  outside VeOmni's model build path).
 - ``LlamaForCausalLM.forward`` returns the unified
   ``CausalLMOutputWithLogProbs`` dataclass so callers can surface per-token
   log-probs / entropy alongside the loss.
