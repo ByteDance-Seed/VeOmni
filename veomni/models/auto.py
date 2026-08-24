@@ -25,7 +25,7 @@ from transformers import (
 )
 
 from ..arguments.arguments_types import OpsImplementationConfig
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from ..ops.dispatch import OpsConfigSlot, OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
@@ -55,6 +55,15 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
 
     A no-op when context parallelism is off, which is every other configuration.
     """
+    # ``build_foundation_model`` runs this for every model, including in processes
+    # that never installed a parallel state -- tests that spawn a multi-rank world
+    # and build a model directly do exactly that. Asking ``get_parallel_state``
+    # there would *construct* a default single-process state, whose ``dp_size=1``
+    # contradicts the real world size and raises on the topology check. No state
+    # installed means no context parallelism to gate.
+    if not is_parallel_state_initialized():
+        return
+
     if not get_parallel_state().cp_enabled:
         return
 

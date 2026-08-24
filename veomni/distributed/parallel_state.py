@@ -711,6 +711,19 @@ def use_parallel_state(parallel_state: Union[str, "ParallelState"]):
         set_parallel_state(old)
 
 
+def is_parallel_state_initialized() -> bool:
+    """Whether a ``ParallelState`` has been installed as the global state.
+
+    ``get_parallel_state`` falls back to *constructing* a default single-process
+    state, and that default raises when the process is in fact part of a
+    multi-rank world, since ``dp_size=1`` then contradicts the real world size.
+    Callers that only want to ask *whether* a form of parallelism is on -- rather
+    than use it -- should check this first, so that an uninitialized process
+    answers "off" instead of raising.
+    """
+    return _PARALLEL_STATE is not None
+
+
 def get_parallel_state() -> "ParallelState":
     """
     Returns global parallel state.

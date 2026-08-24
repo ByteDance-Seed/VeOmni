@@ -63,6 +63,10 @@ def _build(config_path: str, cp_enabled: bool, loader: _StubLoader) -> None:
     ops_config = SimpleNamespace(attn_implementation="eager")
     with (
         patch("veomni.models.auto.get_parallel_state", return_value=parallel_state),
+        # The gate asks this first, so that an uninitialized process answers "CP
+        # off" rather than constructing a state. Stubbing a state means one is
+        # installed as far as these tests are concerned.
+        patch("veomni.models.auto.is_parallel_state_initialized", return_value=True),
         patch("veomni.models.auto.get_loader", return_value=loader),
         patch("veomni.ops.config.singleton.get_ops_config", return_value=ops_config),
     ):
@@ -94,3 +98,25 @@ def test_without_context_parallel_any_model_type_is_admitted():
     loader = _StubLoader()
     _build("tests/toy_config/qwen3_toy", cp_enabled=False, loader=loader)
     assert loader.calls == 1
+
+
+def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
+    """The gate must not *construct* a parallel state just to ask about CP.
+
+    Every test above patches ``get_parallel_state``, which hides what the real one
+    does when nothing installed a state: it builds a default single-process
+    ``ParallelState``, whose ``dp_size=1`` contradicts a multi-rank world and
+    raises on the topology product check. Since the gate runs for every model,
+    that turned any multi-rank process which builds a model without installing a
+    state into a hard failure -- as ``tests/lora/test_moe_lora_ep2.py`` did,
+    spawning two ranks and calling ``build_foundation_model`` directly.
+    """
+    from veomni.distributed import parallel_state as parallel_state_module
+    from veomni.models.auto import check_context_parallel_supported
+
+    monkeypatch.setattr(parallel_state_module, "_PARALLEL_STATE", None)
+    # A real two-rank world, which is what makes the default state invalid.
+    monkeypatch.setattr(parallel_state_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state_module.dist, "get_world_size", lambda: 2)
+
+    check_context_parallel_supported(build_config("tests/toy_config/qwen3_toy"))
