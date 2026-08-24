@@ -189,6 +189,7 @@ jobs:
       - name: Run Muon optimizer tests
         run: |
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
+          uv run --frozen pytest -s -x tests/distributed/test_muon_zero_comm_shard.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
           uv run --frozen pytest -s -x tests/optim/test_optimizer_vlm_param_groups.py

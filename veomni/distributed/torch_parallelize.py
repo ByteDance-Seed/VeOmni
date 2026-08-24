@@ -32,10 +32,10 @@ from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .chunk_mbs import apply_chunk_mbs
-from .parallel_plan import get_runtime_parallel_plan
+from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
-from .utils import sort_fqn_by_submodule_first
+from .utils import check_fqn_match, sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
@@ -166,31 +166,71 @@ def _move_buffers_to_device(model: nn.Module, device: str) -> None:
                 module._buffers[name] = buffer.to(device)
 
 
-def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
-    """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``."""
-    parallel_plan = getattr(model, "get_parallel_plan", None)
-    if parallel_plan is None:
+def _can_shard_extra_parallel_dim0(
+    model: "nn.Module",
+    parallel_plan: Optional["ParallelPlan"],
+    para_name: str,
+    para_fsdp_size: int,
+) -> bool:
+    """Return whether ``para_name``'s weights may take FSDP ``Shard(0)`` for Muon.
+
+    Zero communication is only reachable for a 3D expert stack that
+    ``ParallelPlan`` already slices on dim 0, since that is the sole layout
+    ``DistributedMuon`` classifies as ``moe_local_3d``. So the group needs at
+    least one such stack; a group of only 2D weights (an ``emb`` plan) would
+    gain nothing and must keep the default hidden-dim split. Plans that slice a
+    dim other than 0 are rejected outright — dim-0 FSDP sharding would not line
+    up with them.
+
+    Every matched param, 2D biases included, still has to divide the FSDP mesh
+    on dim 0, because ``shard_placement_fn`` applies one dim to the whole
+    wrapped module.
+
+    Plan keys are glob patterns such as ``model.layers.*.mlp.experts.gate_up_proj``,
+    so they only resolve through ``check_fqn_match``. The plan must be the runtime
+    one (``get_runtime_parallel_plan``) for PEFT-prefixed FQNs to match.
+    """
+    if parallel_plan is None or not parallel_plan.extra_parallel_plan:
         return False
-    plan = parallel_plan()
-    if plan is None or plan.extra_parallel_plan is None:
-        return False
-    para_plan = plan.extra_parallel_plan.get(para_name)
+    para_plan = parallel_plan.extra_parallel_plan.get(para_name)
     if not para_plan:
         return False
 
-    for fqn in para_plan.keys():
-        param = dict(model.named_parameters()).get(fqn)
-        if param is None:
-            continue
-        if param.ndim < 1:
-            continue
-        local_n = param.shape[0]
-        if local_n % ep_fsdp_size != 0:
-            logger.warning_rank0(
-                f"[muon_expert_zero_comm] param {fqn!r} dim-0 ({local_n}) is not "
-                f"divisible by ep_fsdp_size={ep_fsdp_size}; cannot use Shard(0)."
-            )
-            return False
+    matched = 0
+    expert_stacks = 0
+    for fqn, param in model.named_parameters():
+        for fqn_pattern, shard in para_plan.items():
+            if not check_fqn_match(fqn_pattern, fqn):
+                continue
+            matched += 1
+            if shard.dim != 0:
+                logger.warning_rank0(
+                    f"[muon_expert_zero_comm] {para_name}: {fqn!r} is sliced on dim {shard.dim}; "
+                    "Shard(0) only lines up with a dim-0 plan."
+                )
+                return False
+            # ParallelPlan.apply already cut dim 0 down to the local expert count.
+            if param.shape[0] % para_fsdp_size != 0:
+                logger.warning_rank0(
+                    f"[muon_expert_zero_comm] {para_name}: {fqn!r} dim-0 ({param.shape[0]}) is not "
+                    f"divisible by {para_name}_fsdp size {para_fsdp_size}."
+                )
+                return False
+            if param.ndim == 3:
+                expert_stacks += 1
+            break
+
+    if matched == 0:
+        logger.warning_rank0(
+            f"[muon_expert_zero_comm] {para_name}: no parameter matched the plan patterns {sorted(para_plan)}."
+        )
+        return False
+    if expert_stacks == 0:
+        logger.warning_rank0(
+            f"[muon_expert_zero_comm] {para_name}: the plan holds no 3D expert stack, "
+            "so there is no zero-communication path to enable."
+        )
+        return False
     return True
 
 
@@ -290,6 +330,7 @@ def parallelize_model_fsdp2(
             logger.info_rank0(f"{para} Map: {_extra_parallel_map[para]}")
 
     else:
+        parallel_plan = None
         fqn2spec_info = None
         _extra_parallel_mesh = None
         _extra_parallel_map = None
@@ -420,21 +461,21 @@ def parallelize_model_fsdp2(
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
             shard_dim_for_para = 1
             # Muon zero-comm needs whole experts per rank; otherwise keep the
-            # default hidden-dim sharding.
-            if muon_expert_zero_comm:
-                ep_fsdp_size = para_mesh["ep_fsdp"].size()
-                divisible = _check_extra_parallel_dim0_divisibility(model, para, ep_fsdp_size)
-                if divisible:
+            # default hidden-dim sharding. A para this model's plan does not
+            # declare wraps nothing here, so leave it out of the report.
+            declared = parallel_plan is not None and para in (parallel_plan.extra_parallel_plan or {})
+            if muon_expert_zero_comm and declared:
+                para_fsdp_size = para_mesh[f"{para}_fsdp"].size()
+                if _can_shard_extra_parallel_dim0(model, parallel_plan, para, para_fsdp_size):
                     shard_dim_for_para = 0
                     logger.info_rank0(
                         f"[muon_expert_zero_comm] {para}: enabling Shard(0) for "
-                        f"the FSDP step (ep_fsdp_size={ep_fsdp_size}); Muon will "
+                        f"the FSDP step ({para}_fsdp size={para_fsdp_size}); Muon will "
                         "run batched NS locally with zero communication."
                     )
                 else:
                     logger.warning_rank0(
-                        f"[muon_expert_zero_comm] {para}: divisibility check failed "
-                        f"(ep_fsdp_size={ep_fsdp_size}); falling back to default "
+                        f"[muon_expert_zero_comm] {para}: falling back to the default "
                         "Shard(1) layout (Muon will use the all-to-all-gather path)."
                     )
             para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
