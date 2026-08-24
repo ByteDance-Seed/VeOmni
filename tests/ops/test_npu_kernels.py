@@ -106,11 +106,6 @@ def _eager_clamped_swiglu(x, limit):
     return torch.nn.functional.silu(gate) * up
 
 
-# ---------------------------------------------------------------------------
-# Ascend Triton clamped SwiGLU tests (DeepSeek-V4 fused MoE activation)
-# ---------------------------------------------------------------------------
-
-
 class TestNPUClampedSwiGLU:
     def test_production_swiglu_dispatches_by_limit(self, monkeypatch):
         import importlib
