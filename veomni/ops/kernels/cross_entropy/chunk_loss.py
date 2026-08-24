@@ -37,6 +37,7 @@ import torch.nn.functional as F
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
+from ....utils.loss_observer import get_chunk_loss_consumer
 from .eager import eager_cross_entropy
 
 
@@ -62,17 +63,33 @@ class ChunkLoss(torch.autograd.Function):
         grad_inputs_chunks = torch.split(grad_inputs, chunk_size, dim=1)
 
         hidden_states_chunks = torch.split(hidden_states, chunk_size, dim=1)
+        observer = get_chunk_loss_consumer()
+        observed_loss_chunks: list[torch.Tensor] = []
 
         for i in range(len(hidden_states_chunks)):
             hidden_states_chunk = hidden_states_chunks[i]
             grad_inputs_chunk = grad_inputs_chunks[i]
-            (chunk_grad_input, chunk_grad_weight), (chunk_loss, _) = torch.func.grad_and_value(
+            (chunk_grad_input, chunk_grad_weight), (chunk_loss, chunk_logits) = torch.func.grad_and_value(
                 loss_forward, argnums=(0, 1), has_aux=True
             )(hidden_states_chunk, head_weight, None, **loss_kwargs_chunks[i])
+
+            if observer is not None:
+                chunk_labels = loss_kwargs_chunks[i]["labels"]
+                with torch.no_grad():
+                    per_token_loss = F.cross_entropy(
+                        chunk_logits,
+                        chunk_labels.reshape(-1).to(chunk_logits.device),
+                        ignore_index=loss_kwargs_chunks[i]["ignore_index"],
+                        reduction="none",
+                    )
+                observed_loss_chunks.append(per_token_loss.reshape(chunk_labels.shape).detach())
 
             accumulated_loss.add_(chunk_loss)
             grad_inputs_chunk.copy_(chunk_grad_input)
             grad_weight.add_(chunk_grad_weight)
+
+        if observer is not None and observed_loss_chunks:
+            observer(torch.cat(observed_loss_chunks, dim=-1))
 
         ctx.save_for_backward(grad_inputs, grad_weight)
         return accumulated_loss
