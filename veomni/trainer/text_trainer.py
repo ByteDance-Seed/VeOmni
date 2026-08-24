@@ -29,7 +29,7 @@ from ..models import build_tokenizer
 from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
-from .base import BaseTrainer, VeOmniIter
+from .base import BaseTrainer
 
 
 logger = helper.create_logger(__name__)
@@ -174,9 +174,7 @@ class TextTrainer:
             self.on_epoch_begin()
 
             # Create a batch generator
-            self.base.data_iterator = VeOmniIter(
-                self.base.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
-            )
+            self.base.data_iterator = self.base._create_data_iterator()
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
@@ -189,13 +187,8 @@ class TextTrainer:
 
             self.base.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-            if args.data.dataloader.use_background_prefetcher:
-                self.base.data_iterator.stop()
 
         self.on_train_end()
-
-        if args.data.dataloader.use_background_prefetcher:
-            self.base.data_iterator.stop()
 
         synchronize()
 

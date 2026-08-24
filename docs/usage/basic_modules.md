@@ -312,11 +312,25 @@ train_dataloader = build_dataloader(
     drop_last=args.data.dataloader.drop_last,  # dataloader drop last
     pin_memory=args.data.dataloader.pin_memory,  # dataloader pin memory
     prefetch_factor=args.data.dataloader.prefetch_factor, # dataloader prefetch factor
+    infinity=args.data.dataloader.infinity, # restart DataLoader iteration after exhaustion in worker-side dynamic batching
+    infinity_padding=args.data.dataloader.infinity_padding, # pad exhausted ranks in worker-side dynamic batching
     seed=args.train.seed, # random seed
     build_collate_fn=True,
     collate_fn_kwargs=collate_fn_kwargs, # kwargs for collate_fn
 )
 ```
+
+When worker-side dynamic batching is configured with
+`data.dataloader.infinity=True`, `DistributedDataloader` restarts its underlying
+iteration after it is exhausted. The restart does not advance the dataset epoch or
+call `set_epoch()`, so epoch-seeded shufflers repeat the same permutation.
+
+When `data.dataloader.infinity_padding=True`, `DistributedDataloader` forwards batches
+from its underlying iteration unchanged. Once the iteration is exhausted, that rank
+emits padding batches for the remaining requested steps. Padding batches contribute
+zero loss and are excluded from loss weighting.
+`infinity` and `infinity_padding` are mutually exclusive.
+Worker-side dynamic batching cannot be combined with background prefetching.
 
 ### Collate Function
 VeOmni default supports a unified collate function for all tasks (text task, multimodal task, omni task, etc.) (source code: [veomni/data/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_collator.py)). The `MainCollator` handles: packing sequences, precompute position_ids & cu_seqlens & max_seqlens, and sequence parallel slice.

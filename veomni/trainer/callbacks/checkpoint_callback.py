@@ -101,7 +101,7 @@ class CheckpointerCallback(Callback):
 
         self.trainer.environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
         torch.set_rng_state(state["extra_state"]["torch_rng_state"])
-        if self.trainer.start_step == 0:
+        if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
             # If resume at the end of epoch, clear resume state and prefetch data
             iter(self.trainer.train_dataloader)
 
