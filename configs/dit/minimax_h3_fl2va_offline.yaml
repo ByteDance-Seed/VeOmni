@@ -47,10 +47,9 @@ data:
   train_path: output/minimax_h3_fl2va_embedding
   data_type: diffusion
   source_name: minimax_h3
-  data_transform: dit_offline
+  data_transform: minimax_h3_offline
   datasets_type: minimax_h3_offline
   log_sample: false
-  shuffle: false
   text_keys: text
   mm_configs:
     repeat: 100
@@ -74,9 +73,6 @@ train:
 
   num_train_epochs: 1
   max_steps: 20
-
-  enable_full_determinism: true
-  enable_batch_invariant_mode: true
 
   gradient_checkpointing:
     enable: true

@@ -11,7 +11,7 @@ from .core import attention_forward, gradient_checkpoint_forward
 
 
 if IS_NPU_AVAILABLE:
-    from torch_npu import npu_rotary_mul
+    from torch_npu import npu_rms_norm, npu_rotary_mul
 
 
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -46,7 +46,14 @@ def unpack_audio(rows: torch.Tensor, audio_channel: int, steps: int, latent_dim:
     return rows.reshape(audio_channel, steps, latent_dim).permute(0, 2, 1).contiguous()
 
 
+class _ASCEND_RMSNorm(nn.RMSNorm):
+    def forward(self, x):
+        return npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
+
+
 def _norm(size: int, *, eps: float) -> nn.RMSNorm:
+    if IS_NPU_AVAILABLE:
+        return _ASCEND_RMSNorm(size, eps=eps)
     return nn.RMSNorm(size, eps=eps)
 
 
