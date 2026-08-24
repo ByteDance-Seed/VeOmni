@@ -484,7 +484,8 @@ For MoE training under FSDP2+EP, the Muon flow auto-classifies each parameter in
 | Param layout | Path | Comm at Muon time |
 |--------------|------|-------------------|
 | plain `Tensor` / replicated `DTensor` | `local` | none |
-| 2D `DTensor` with a `Shard` | `fsdp_gather_2d` | one all-gather over the FSDP mesh |
+| 2D `DTensor` with `Shard(0)` | `fsdp_gather_2d` | one all-to-all over the shard mesh; under HSDP the replicated dims are skipped, so only the shard dim communicates |
+| 2D `DTensor` with any other `Shard` layout | `fsdp_gather_2d` | one all-gather over the FSDP mesh |
 | 3D `DTensor` with `Shard(0)` (zero-comm backend) | `moe_local_3d` | none — batched NS runs on `_local_tensor` |
 | 3D `DTensor` with `Shard(d>0)` (default backend) | `moe_gather_3d` | one all-to-all-gather over the `ep_fsdp` mesh |
 
