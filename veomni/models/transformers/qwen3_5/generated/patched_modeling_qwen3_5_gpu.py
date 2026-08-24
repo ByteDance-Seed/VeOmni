@@ -1828,23 +1828,22 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             past_key_values=past_key_values,
         )
 
-    def _update_linear_attn_mask(self, attention_mask, cache_position):
+    def _update_linear_attn_mask(self, attention_mask, past_key_values):
         """
         Build the attention mask passed to the linear-attention (gated DeltaNet) layers.
 
         Upstream returns ``None`` — disabling the per-token zeroing in ``apply_mask_to_padding_states``
-        — when ``cache_position[0] > 0`` (a cached forward) or ``torch.all(attention_mask == 1)`` (the
-        batch has no padding). Both predicates read a 0-D GPU tensor and force an implicit ``.item()``
-        / host-device sync on *every* forward, which serialises the host against the device in
-        VeOmni's otherwise sync-free training step.
+        — when ``past_key_values.has_previous_state()`` is true (a cached forward) or
+        ``torch.all(attention_mask == 1)`` (the batch has no padding). The latter reads a 0-D GPU
+        tensor and forces an implicit ``.item()`` / host-device sync on *every* forward, which
+        serialises the host against the device in VeOmni's otherwise sync-free training step.
 
         We keep the cached-forward branch — it is a correctness guard, not just an optimization:
         ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
         cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
         only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
-        a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
-        ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
-        than reading ``cache_position[0]``, so no sync.
+        a 1-token decode step). ``has_previous_state()`` only reads host-side Cache metadata, so this
+        branch was never the sync source.
 
         The all-ones short-circuit is the one we drop: returning the all-ones mask makes
         ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
@@ -1854,8 +1853,8 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         if attention_mask is None:
             return None
         # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
-        # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
-        if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
+        # apply_mask_to_padding_states, and upstream returns None here. Metadata-only check, no sync.
+        if past_key_values is not None and past_key_values.has_previous_state():
             return None
         return attention_mask
 
