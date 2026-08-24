@@ -81,9 +81,14 @@ class VLMTrainingArguments(TrainingArguments):
 @dataclass
 class VLMMDataArguments(DataArguments):
     supports_torch_compile = True
+    # Free-form bag splatted into ``build_data_transform``: holds both
+    # understanding-family kwargs (``max_pixels``, ...) and generation-task kwargs
+    # (``resolution``, ``prompt_dropout_prob``, ...). Each registered transform picks
+    # the keys it knows via typed kwargs and absorbs the rest in its ``**kwargs``
+    # sink, so no typed schema lives in the shared trainer.
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
-        metadata={"help": "Config for multimodal input."},
+        metadata={"help": "Config for multimodal input (understanding + generation)."},
     )
 
 
@@ -239,7 +244,11 @@ class VLMTrainer:
     def _build_model_assets(self):
         args: VeOmniVLMArguments = self.base.args
         self.base.processor = build_processor(args.model.tokenizer_path, max_pixels=MAX_PIXELS)
-        if self.base.model_config.model_type not in ("qwen2_5_omni", "qwen3_omni_moe"):
+        if self.base.model_config.model_type not in (
+            "qwen2_5_omni",
+            "qwen3_omni_moe",
+            "hunyuan_image_3_moe",
+        ):
             self.base.chat_template = build_multimodal_chat_template(
                 args.data.chat_template, self.base.processor.tokenizer
             )

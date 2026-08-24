@@ -116,6 +116,27 @@ Due to today's PyTorch DTensor limitation, we need to separate optimizers for ex
 
 These consequences like the parallelization method, are transparent to the end users and do not need additional efforts to configure.
 
+### Keeping Selected Params Out of FSDP
+
+Some models embed a submodule that must **not** be sharded and must **not** be mixed-precision-cast — e.g. a frozen VAE encoder that must stay replicated FP32 on every rank because BF16 perturbs the online latents by 4–6%. FSDP2's root `fully_shard` accepts `ignored_params=...`, but only the *root* call honors it; a param inside a submodule wrapped earlier in `parallelize_model_fsdp2` is already sharded and cannot be "un-ignored" retroactively.
+
+VeOmni exposes this through two orthogonal hooks:
+
+1. **`ParallelPlan.fsdp_ignored_param_fqn_patterns`** — a list of FQN glob patterns; every parameter whose fully qualified name matches any pattern is passed to the root `fully_shard` as `ignored_params`. This is the **authoritative declaration** of what stays out of FSDP; nothing else on the model changes this set. Example (HunyuanImage 3):
+
+    ```python
+    return ParallelPlan(
+        extra_parallel_plan={"ep": {...}},
+        fsdp_ignored_param_fqn_patterns=["vae.*"],
+    )
+    ```
+
+    `parallelize_model_fsdp2` asserts every matched param lives outside every already-sharded parent — otherwise it raises `ValueError` naming both the FQN and the matched pattern, and asks the model author to narrow the pattern or move the subtree out of `basic_modules` / `no_split_modules`.
+
+2. **`model.apply_pre_fsdp_dtype_policy(self) -> None`** — an *optional* method that mutates parameter dtype in place, invoked **unconditionally** by `parallelize_model_fsdp2` right before the root `fully_shard` while params are still on `meta`. Use it when the ignored subtree must load from disk in a specific dtype (e.g. `self.vae.float()`) — FSDP2 latches mixed-precision the first time it sees the module, so this cast has to precede the root shard. No return value; the ignored-params set stays purely declarative on `ParallelPlan`.
+
+Neither hook is required; a model with no `ParallelPlan.fsdp_ignored_param_fqn_patterns` and no `apply_pre_fsdp_dtype_policy` gets the default all-params-sharded behavior.
+
 ## PyTorch Distributed Checkpoint (DCP) Support
 
 > File: veomni/checkpoint/checkpointer.py

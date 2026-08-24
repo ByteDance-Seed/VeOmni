@@ -600,3 +600,92 @@ class TestDeepseekV4Flops:
         compressed_flops, _ = VeomniFlopsCounter(compressed_config).estimate_flops(batch_seqlens, delta_time=1.0)
 
         assert compressed_flops < baseline_flops
+
+
+@pytest.fixture
+def hunyuan_image_3_real_base_config():
+    """The real HunyuanImage-3 Base geometry (83B total / ~12.2B active per token)."""
+    return SimpleNamespace(
+        model_type="hunyuan_image_3_moe",
+        hidden_size=4096,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        attention_head_dim=128,
+        num_experts=64,
+        moe_topk=8,
+        moe_intermediate_size=3072,
+        vocab_size=133120,
+        component_policy={"lm_head": "absent"},
+    )
+
+
+class TestHunyuanImage3Flops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
+    def test_matches_hand_derived_active_params(self, hunyuan_image_3_real_base_config):
+        """Pin the counter against the hand-derived closed form for HI3 Base.
+
+        ``6 * active_params * tokens`` (~12.2B active params/token) plus a
+        ``12 * S**2 * H * L`` attention term. If the counter drifts from it,
+        every reported MFU number for this model silently shifts.
+        """
+        counter = VeomniFlopsCounter(hunyuan_image_3_real_base_config)
+        seq_len, global_batch_size = 4138, 16
+        batch_seqlens = [seq_len] * global_batch_size
+
+        flops, _ = counter.estimate_flops(batch_seqlens, delta_time=1.0)
+
+        active_params = 12.222201856e9  # 32 layers x (router + 9 experts + QKVO)
+        tokens = seq_len * global_batch_size
+        expected = 6 * active_params * tokens + 12 * tokens * seq_len * 4096 * 32
+        assert flops * 1e12 == pytest.approx(expected, rel=1e-12)
+
+    def test_absent_lm_head_is_not_counted(self, hunyuan_image_3_real_base_config):
+        """T2I never builds ``lm_head``; billing its 133k-vocab matmul inflates MFU."""
+        counter = VeomniFlopsCounter(hunyuan_image_3_real_base_config)
+        with_head_config = deepcopy(hunyuan_image_3_real_base_config)
+        with_head_config.component_policy = {"lm_head": "trainable"}
+        with_head_counter = VeomniFlopsCounter(with_head_config)
+
+        batch_seqlens = [4138]
+        flops, _ = counter.estimate_flops(batch_seqlens, delta_time=1.0)
+        with_head_flops, _ = with_head_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert with_head_flops > flops
+        lm_head_flops = 6 * 133120 * 4096 * 4138
+        assert (with_head_flops - flops) * 1e12 == pytest.approx(lm_head_flops, rel=1e-12)
+
+    def test_shared_expert_count_is_read_from_config(self, hunyuan_image_3_real_base_config):
+        """``num_shared_expert`` defaults to 1 but is a real config knob. Hardcoding
+        the 1 gives a variant the wrong denominator, which surfaces as an
+        unexplained MFU shift rather than a failure."""
+        counter = VeomniFlopsCounter(hunyuan_image_3_real_base_config)
+        two_shared_config = deepcopy(hunyuan_image_3_real_base_config)
+        two_shared_config.num_shared_expert = 2
+        two_shared_counter = VeomniFlopsCounter(two_shared_config)
+
+        batch_seqlens = [4138]
+        flops, _ = counter.estimate_flops(batch_seqlens, delta_time=1.0)
+        two_shared_flops, _ = two_shared_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+
+        # One extra shared expert on every layer: +1 SwiGLU (3 matmuls) x 32 layers.
+        one_expert_flops = 6 * (4096 * 3072 * 3) * 32 * 4138
+        assert (two_shared_flops - flops) * 1e12 == pytest.approx(one_expert_flops, rel=1e-12)
+
+    def test_per_layer_shared_expert_list_is_summed(self, hunyuan_image_3_real_base_config):
+        """``configuration_hunyuan_image_3`` normalizes the knob into a per-layer
+        list, so a heterogeneous stack must be summed rather than sampled at index 0."""
+        heterogeneous_config = deepcopy(hunyuan_image_3_real_base_config)
+        # Half the layers carry no shared MLP at all.
+        heterogeneous_config.num_shared_expert = [1] * 16 + [0] * 16
+        uniform_config = deepcopy(hunyuan_image_3_real_base_config)
+        uniform_config.num_shared_expert = [1] * 32
+
+        batch_seqlens = [4138]
+        hetero_flops, _ = VeomniFlopsCounter(heterogeneous_config).estimate_flops(batch_seqlens, delta_time=1.0)
+        uniform_flops, _ = VeomniFlopsCounter(uniform_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        # 16 layers lose one SwiGLU each; reading only element 0 would report no change.
+        missing_flops = 6 * (4096 * 3072 * 3) * 16 * 4138
+        assert (uniform_flops - hetero_flops) * 1e12 == pytest.approx(missing_flops, rel=1e-12)

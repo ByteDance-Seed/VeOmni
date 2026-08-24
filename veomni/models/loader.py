@@ -16,6 +16,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_loader/loader.py
 
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 from transformers import (
@@ -48,6 +49,11 @@ from .module_utils import init_empty_weights, load_model_weights
 
 MODELING_REGISTRY = Registry("Modeling")
 MODEL_CONFIG_REGISTRY = Registry("ModelConfig")
+# Keyed by processor **class name** (matches HF ``type(processor).__name__``).
+# The key normally comes from whatever ``AutoProcessor.from_pretrained`` returned; when
+# that yields nothing usable (see ``get_model_processor``) it falls back to
+# ``config.processor_class``, declared either by the checkpoint's ``config.json`` or as
+# a class attribute on the VeOmni config registered in ``MODEL_CONFIG_REGISTRY``.
 MODEL_PROCESSOR_REGISTRY = Registry("ModelProcessor")
 
 logger = logging.get_logger(__name__)
@@ -96,6 +102,25 @@ def get_model_config(config_path: str, **kwargs):
             return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
 
 
+def _veomni_processor_class_name(processor_path: str, **kwargs) -> Optional[str]:
+    """Name of the VeOmni-registered processor for a checkpoint, or ``None``.
+
+    Read from ``config.processor_class`` -- advertised by the checkpoint's own
+    ``config.json``, or defaulted as a class attribute on the VeOmni config subclass
+    registered in ``MODEL_CONFIG_REGISTRY``. ``None`` lets callers keep what they have.
+    """
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(processor_path, **kwargs)
+    except Exception:
+        return None
+
+    processor_class_name = config_dict.get("processor_class")
+    model_type = config_dict.get("model_type")
+    if not processor_class_name and model_type in MODEL_CONFIG_REGISTRY.valid_keys():
+        processor_class_name = getattr(MODEL_CONFIG_REGISTRY[model_type](), "processor_class", None)
+    return processor_class_name if processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys() else None
+
+
 def get_model_processor(processor_path: str, **kwargs):
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
@@ -105,6 +130,14 @@ def get_model_processor(processor_path: str, **kwargs):
         try:  # first load from hf, then replace with veomni
             processor = AutoProcessor.from_pretrained(processor_path, **kwargs)
             processor_class_name = getattr(type(processor), "__name__", None)
+            if processor_class_name not in MODEL_PROCESSOR_REGISTRY.valid_keys():
+                # AutoProcessor can succeed but *degrade*: transformers >= 5.9 returns
+                # the bare tokenizer (5.8 raised) for a checkpoint that ships no
+                # ``preprocessor_config.json`` and no ``AutoProcessor`` auto_map entry.
+                # Accepting it drops the model's image branch and only blows up much
+                # later inside a dataloader worker, so prefer the override the config
+                # advertises; ``None`` leaves the HF object untouched.
+                processor_class_name = _veomni_processor_class_name(processor_path, **kwargs) or processor_class_name
             if processor_class_name in MODEL_PROCESSOR_REGISTRY.valid_keys():
                 kwargs.pop("trust_remote_code", None)
                 processor = MODEL_PROCESSOR_REGISTRY[processor_class_name]().from_pretrained(processor_path, **kwargs)
@@ -117,11 +150,24 @@ def get_model_processor(processor_path: str, **kwargs):
                     f"[PROCESSOR] Loading {processor_class_name} from Huggingface as no customized processor registered."
                 )
                 return processor
-        except Exception:  # load from veomni
+        except Exception as autoprocessor_error:  # load from veomni
+            # Models that need no rescue simply don't set ``processor_class``, so this
+            # falls through to the legacy ``PROCESSOR_NAME`` path below.
+            processor_class_name = _veomni_processor_class_name(processor_path, **kwargs)
+            if processor_class_name:
+                kwargs.pop("trust_remote_code", None)
+                logger.info_rank0(f"[PROCESSOR] Loading {processor_class_name} from VeOmni MODEL_PROCESSOR_REGISTRY.")
+                return MODEL_PROCESSOR_REGISTRY[processor_class_name]().from_pretrained(processor_path, **kwargs)
+
+            # Legacy ``processor_config.json`` + processor_class name path.
             from transformers.processing_utils import ProcessorMixin
             from transformers.utils import PROCESSOR_NAME, cached_file
 
-            processor_config_file = cached_file(processor_path, PROCESSOR_NAME)
+            try:
+                processor_config_file = cached_file(processor_path, PROCESSOR_NAME)
+            except Exception as legacy_error:
+                # Preserve the AutoProcessor failure -- it's the more useful signal.
+                raise autoprocessor_error from legacy_error
             config_dict, _ = ProcessorMixin.get_processor_dict(processor_config_file, **kwargs)
             processor_class_name = config_dict["processor_class"]
             logger.info_rank0(f"[PROCESSOR] Loading {processor_class_name} from custom processor.")

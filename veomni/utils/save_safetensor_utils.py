@@ -16,7 +16,7 @@ import gc
 import os
 import shutil
 import time
-from typing import Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -33,6 +33,25 @@ from veomni.utils.import_utils import is_torch_version_greater_than
 logger = helper.create_logger(__name__)
 
 
+def drop_non_tensor_entries(state_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    """Drop the ``_extra_state`` entries ``nn.Module.get_extra_state`` injects.
+
+    A module that overrides ``get_extra_state`` (HunyuanImage 3 stores its
+    flow-matching generator that way) contributes a ``*._extra_state`` key whose
+    value is an arbitrary Python object, not a tensor. That is fine for DCP but
+    fatal for the HF safetensors path, where every value gets ``.dtype`` /
+    ``.numel()`` called on it. Extra state is training-only bookkeeping and has
+    no place in an exported HF checkpoint, so drop it here.
+    """
+    kept = {}
+    for key, value in state_dict.items():
+        if isinstance(value, torch.Tensor):
+            kept[key] = value
+        else:
+            logger.info_rank0(f"Skipping non-tensor state dict entry for HF export: {key}")
+    return kept
+
+
 @torch.no_grad()
 def get_model_save_state(
     model: torch.nn.Module,
@@ -42,14 +61,16 @@ def get_model_save_state(
     """Build a flat state dict suitable for HuggingFace safetensors saving.
 
     1. Extracts a flat state dict via ``ModelState`` (FQNs match HF weight_map keys).
-    2. Casts float32 tensors to bfloat16 on copies (original model dtypes are preserved).
-    3. Filters out tied weights not present in ``fqn_to_index_mapping``.
+    2. Drops non-tensor ``_extra_state`` entries (training-only bookkeeping).
+    3. Casts float32 tensors to bfloat16 on copies (original model dtypes are preserved).
+    4. Filters out tied weights not present in ``fqn_to_index_mapping``.
     """
     from veomni.checkpoint.dcp_checkpointer import ModelState
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
     save_state = ModelState(model, parallel_state=parallel_state).state_dict()
+    save_state = drop_non_tensor_entries(save_state)
 
     # Convert float32 tensors to bfloat16 on a copy of the state dict,
     # so the original model parameters remain unchanged.
@@ -162,6 +183,7 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
+    model_state_dict = drop_non_tensor_entries(model_state_dict)
     save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 

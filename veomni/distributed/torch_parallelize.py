@@ -102,6 +102,43 @@ def _move_buffers_to_device(model: nn.Module, device: str) -> None:
                 module._buffers[name] = buffer.to(device)
 
 
+def _assert_ignored_params_not_in_sharded_submodules(model: "nn.Module", ignored_params) -> None:
+    """Reject ignored params that a nested ``fully_shard`` already claimed.
+
+    ``ignored_params`` is only honored by the outermost ``fully_shard``, so a param
+    inside a submodule wrapped earlier in ``parallelize_model_fsdp2`` would still be
+    sharded / mixed-precision-cast despite being declared ignored. Fail loudly here
+    rather than silently violating that contract.
+
+    ``ignored_params`` may be either a set of params (legacy shape) or a
+    ``{param: "<fqn> (matched by pattern ...)"}`` mapping from
+    ``ParallelPlan.get_fsdp_ignored_params``; the mapping form lets this error
+    name the matched pattern.
+    """
+    if not ignored_params:
+        return
+    pattern_label = ignored_params if isinstance(ignored_params, dict) else {}
+    ignored_ids = {id(p) for p in ignored_params}
+    for module_fqn, submodule in model.named_modules():
+        if not isinstance(submodule, FSDPModule):
+            continue
+        if submodule is model:  # root itself is not wrapped yet at call time
+            continue
+        for param_name, param in submodule.named_parameters():
+            if id(param) in ignored_ids:
+                full_fqn = f"{module_fqn}.{param_name}" if module_fqn else param_name
+                label = pattern_label.get(param, full_fqn)
+                raise ValueError(
+                    f"ParallelPlan.fsdp_ignored_param_fqn_patterns matched param {label} "
+                    f"but that param lives inside submodule {module_fqn!r} which was already "
+                    f"wrapped by fully_shard earlier in parallelize_model_fsdp2. "
+                    "``ignored_params`` is only honored by the *root* fully_shard call, so this "
+                    "param would still be sharded / mixed-precision-cast. Move the ignored "
+                    "subtree out of every sharded parent (basic_modules / no_split_modules), or "
+                    "narrow the ignore pattern."
+                )
+
+
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
     """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``.
 
@@ -477,7 +514,33 @@ def parallelize_model_fsdp2(
     # to a freed buffer. Decoder layers reshard normally (their calls
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
-    fully_shard(model, **root_fsdp_kwargs)
+    # Params a model wants kept out of FSDP entirely (unsharded, not
+    # mixed-precision-cast) -- e.g. a frozen FP32 VAE encoder that must stay
+    # replicated FP32 on every rank. Declared via
+    # ``ParallelPlan.fsdp_ignored_param_fqn_patterns``; only the *root* fully_shard
+    # honors ``ignored_params``, hence the assert below.
+    root_ignored_params = None
+    plan_from_hook = getattr(model, "get_parallel_plan", None)
+    plan_obj = plan_from_hook() if plan_from_hook is not None else None
+    if plan_obj is not None:
+        root_ignored_params = plan_obj.get_fsdp_ignored_params(model)
+    # Separate, explicit contract for models that need to MUTATE param dtype before
+    # the root ``fully_shard`` reads it (e.g. cast a frozen VAE to FP32 while still
+    # on meta so the disk FP32 weights load without a BF16 round-trip). Invoked
+    # unconditionally, no return value -- the set of ignored params stays purely
+    # declarative on ``ParallelPlan``. This ordering (dtype policy before shard) is
+    # the whole reason the hook exists: FSDP2 latches mixed-precision the first
+    # time it sees the module.
+    dtype_policy = getattr(model, "apply_pre_fsdp_dtype_policy", None)
+    if dtype_policy is not None:
+        dtype_policy()
+    if root_ignored_params:
+        _assert_ignored_params_not_in_sharded_submodules(model, root_ignored_params)
+    # ``fully_shard`` wants a plain iterable of Parameters; unwrap the pattern-labelled
+    # mapping from ``get_fsdp_ignored_params`` (kept as a dict so the assert above can
+    # name the matched pattern).
+    fully_shard_ignored = set(root_ignored_params) if root_ignored_params else None
+    fully_shard(model, **root_fsdp_kwargs, ignored_params=fully_shard_ignored)
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
