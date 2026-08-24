@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+from .gdn_headwise import (
+    GdnHeadwiseLayout,
+    compile_gdn_headwise_layout,
+    prepare_gdn_headwise_inputs,
+    restore_gdn_headwise_output,
+)
 from .gdn_kcp import (
     all_gather_affine_hm,
     assert_kcp_comm_bytes_independent_of_seq,
@@ -76,6 +82,7 @@ from .ring_attention import (
 
 __all__ = [
     "GDN_NATIVE_CHUNK_SIZE",
+    "GdnHeadwiseLayout",
     "GdnCpEventCount",
     "GdnCpOperation",
     "GdnCpPhase",
@@ -97,6 +104,7 @@ __all__ = [
     "build_gdn_lossless_plan",
     "build_packed_context_parallel_partition",
     "compile_gdn_lossless_runtime_plan",
+    "compile_gdn_headwise_layout",
     "dense_causal_attention",
     "exchange_conv_halo",
     "make_state_participation",
@@ -107,11 +115,13 @@ __all__ = [
     "padded_sample_lengths",
     "physical_to_owned",
     "prefix_merge_initial_state",
+    "prepare_gdn_headwise_inputs",
     "receive_initial_state",
     "reorder_sample_major_to_ulysses_rank_major",
     "reorder_ulysses_rank_major_to_sample_major",
     "ringattn_context_parallel",
     "resolve_kcp_initial_state",
+    "restore_gdn_headwise_output",
     "send_final_state",
     "simulate_packed_ring_causal_attention",
     "simulate_ring_causal_attention",

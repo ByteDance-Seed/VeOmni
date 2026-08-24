@@ -74,7 +74,12 @@ def test_gpu_gdn_runtime_rejects_ascend_only_kcp():
 def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
     source = (ROOT / "veomni/models/transformers/qwen3_5/qwen3_5_npu_patch_gen_config.py").read_text()
     block = _function_block(source, "qwen3_5_gated_deltanet_forward_patched")
-    assert '("state_passing_lossless", "kcp")' in block
+    selector_start = block.index("if cp_enabled and self.gdn_context_parallel_implementation not in (")
+    selector_end = block.index("):", selector_start)
+    selector_block = block[selector_start:selector_end]
+    assert '"state_passing_lossless"' in selector_block
+    assert '"kcp"' in selector_block
+    assert '"headwise_lossless"' in selector_block
     assert "resolve_kcp_initial_state(" in block
     assert "cu_seqlens_list=aligned_host_cu" in block
     assert "kcp_affine_impl = resolve_kcp_affine_implementation(backend_impl)" in block
@@ -84,11 +89,16 @@ def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
     assert block.index("physical_to_owned_grouped(") < block.index("resolve_kcp_initial_state(")
     assert block.count("physical_to_owned_grouped(") == 1
     assert "mixed_qkv, b, a = physical_to_owned_grouped(" in block
-    assert block.index("align_gdn_varlen_chunks(") < block.index("prepare_gated_delta_rule_qk(")
-    assert block.index("prepare_gated_delta_rule_qk(") < block.index("resolve_kcp_initial_state(")
+    ownership_block = block[block.index("elif cp_enabled:") :]
+    assert ownership_block.index("align_gdn_varlen_chunks(") < ownership_block.index("prepare_gated_delta_rule_qk(")
+    assert ownership_block.index("prepare_gated_delta_rule_qk(") < ownership_block.index("resolve_kcp_initial_state(")
     empty_owner_guard = "if gdn_lossless_plan.local.owned_token_count == 0:"
-    assert block.index(empty_owner_guard) < block.index("prepare_gated_delta_rule_qk(")
-    empty_owner_block = block[block.index(empty_owner_guard) : block.index("else:", block.index(empty_owner_guard))]
+    assert ownership_block.index(empty_owner_guard) < ownership_block.index("prepare_gated_delta_rule_qk(")
+    empty_owner_block = ownership_block[
+        ownership_block.index(empty_owner_guard) : ownership_block.index(
+            "else:", ownership_block.index(empty_owner_guard)
+        )
+    ]
     assert "use_qk_l2norm_in_kernel = False" in empty_owner_block
     assert "prepare_gated_delta_rule_qk(" not in empty_owner_block
     assert 'force_external=self.gdn_context_parallel_implementation == "kcp"' in block
@@ -115,9 +125,39 @@ def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
 )
 def test_npu_gdn_mojo_routes_share_external_qk_norm(relative_path: str):
     source = (ROOT / relative_path).read_text()
-    assert source.count("prepare_gated_delta_rule_qk(") == 2
+    assert source.count("prepare_gated_delta_rule_qk(") == 3
+    headwise_start = source.index("elif headwise_enabled:")
+    ownership_start = source.index("elif cp_enabled:", headwise_start)
+    headwise_block = source[headwise_start:ownership_start]
+    assert headwise_block.count("prepare_gated_delta_rule_qk(") == 1
     assert "producer_dtype_l2norm(query_gdr)" not in source
     assert 'use_qk_l2norm_in_kernel=self.gdn_context_parallel_implementation != "kcp"' not in source
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "veomni/models/transformers/qwen3_5/qwen3_5_npu_patch_gen_config.py",
+        "veomni/models/transformers/qwen3_5/generated/patched_modeling_qwen3_5_npu.py",
+        "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
+    ],
+)
+def test_npu_headwise_uses_cp_major_ulysses_inner_flat_rank(relative_path: str):
+    source = (ROOT / relative_path).read_text()
+    rank_contract_start = source.index("expected_sp_size = parallel_state.cp_size * parallel_state.ulysses_size")
+    prepare_start = source.index("prepare_gdn_headwise_inputs(", rank_contract_start)
+    rank_contract = source[rank_contract_start:prepare_start]
+    compact_rank_contract = " ".join(rank_contract.split())
+
+    assert (
+        "expected_sp_rank = parallel_state.cp_rank * parallel_state.ulysses_size + "
+        "( parallel_state.ulysses_rank if parallel_state.ulysses_enabled else 0 )"
+    ) in compact_rank_contract
+    assert "sp_size != expected_sp_size" in rank_contract
+    assert "gdn_headwise_layout.world_size != expected_sp_size" in rank_contract
+    assert "head_parallel_rank != expected_sp_rank" in rank_contract
+    assert "gdn_headwise_layout.rank != expected_sp_rank" in rank_contract
+    assert "headwise_lossless requires CP-major/Ulysses-inner flattened SP rank order" in rank_contract
 
 
 def test_moe_npu_patchgen_imports_shared_external_qk_norm_contract():
@@ -523,7 +563,7 @@ def test_qwen35_moe_aux_loss_consumes_rank_local_router_mask(relative_path: str)
     # the single-rank Transformers fallback.  All must consume the rank-local
     # router mask produced before decoder dispatch.
     assert source.count("                router_attention_mask,\n") == 6
-    assert source.count("                    group=sp_group,\n") == 2
+    assert source.count("                    router_attention_mask,\n                    group=sp_group,\n") == 2
 
 
 @pytest.mark.parametrize(

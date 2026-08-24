@@ -113,6 +113,14 @@ config.add_import(
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
 config.add_import(
+    "veomni.distributed.context_parallel.gdn_headwise",
+    names=[
+        "compile_gdn_headwise_layout",
+        "prepare_gdn_headwise_inputs",
+        "restore_gdn_headwise_output",
+    ],
+)
+config.add_import(
     "veomni.distributed.context_parallel.gdn_lossless",
     names=[
         "align_gdn_varlen_chunks",

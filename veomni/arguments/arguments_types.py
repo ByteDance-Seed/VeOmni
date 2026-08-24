@@ -1127,15 +1127,19 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless", "kcp"] = field(
-        default="disabled",
-        metadata={
-            "help": "Context-parallel algorithm selector. 'disabled' (default) uses generic Ring/Hybrid CP for "
-            "non-GDN causal models and rejects CP at Qwen3.5 GDN model binding; "
-            "'state_passing_lossless' uses native-chunk ownership, reversible all-to-all, and recurrent-state/halo "
-            "autograd across context-parallel ranks; 'kcp' reuses the same lossless ownership/halo layout and "
-            "replaces recurrent-state P2P with the fixed-size TTX BC8/M1 affine-prefix collective on Ascend."
-        },
+    gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless", "kcp", "headwise_lossless"] = (
+        field(
+            default="disabled",
+            metadata={
+                "help": "Context-parallel algorithm selector. 'disabled' (default) uses generic Ring/Hybrid CP for "
+                "non-GDN causal models and rejects CP at Qwen3.5 GDN model binding; "
+                "'state_passing_lossless' uses native-chunk ownership, reversible all-to-all, and recurrent-state/halo "
+                "autograd across context-parallel ranks; 'kcp' reuses the same lossless ownership/halo layout and "
+                "replaces recurrent-state P2P with the fixed-size TTX BC8/M1 affine-prefix collective on Ascend; "
+                "'headwise_lossless' gathers each packed sequence once over the flattened CP x Ulysses group and "
+                "shards GDN heads without recurrent-state communication."
+            },
+        )
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
         default="eager",
@@ -1154,7 +1158,7 @@ class OpsImplementationConfig:
     )
 
     def __post_init__(self):
-        allowed_gdn_cp = {"disabled", "kcp", "state_passing_lossless"}
+        allowed_gdn_cp = {"disabled", "kcp", "state_passing_lossless", "headwise_lossless"}
         if self.gdn_context_parallel_implementation not in allowed_gdn_cp:
             raise ValueError(
                 "gdn_context_parallel_implementation must be one of "
@@ -1539,7 +1543,7 @@ def validate_context_parallel_config(
     selector for non-GDN causal models. Qwen3.5 GDN is never allowed to
     silently fall back to Ring: it must select an explicit lossless selector.
     """
-    enabled_gdn_cp = {"kcp", "state_passing_lossless"}
+    enabled_gdn_cp = {"kcp", "state_passing_lossless", "headwise_lossless"}
     supported_cp = enabled_gdn_cp | {"disabled"}
     if implementation not in supported_cp:
         raise ValueError(
@@ -1565,7 +1569,7 @@ def validate_context_parallel_config(
     if implementation == "disabled" and model_type in _GDN_CP_MODEL_TYPES:
         raise ValueError(
             "Qwen3.5 GDN context parallelism requires explicit "
-            "gdn_context_parallel_implementation='state_passing_lossless' or 'kcp'."
+            "gdn_context_parallel_implementation='state_passing_lossless', 'kcp', or 'headwise_lossless'."
         )
     if implementation in enabled_gdn_cp and model_type not in _GDN_CP_MODEL_TYPES:
         raise ValueError(
