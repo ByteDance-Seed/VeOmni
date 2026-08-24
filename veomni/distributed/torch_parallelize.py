@@ -711,7 +711,14 @@ def build_parallelize_model(
         else:
             if compile_config.enable:
                 raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
-            model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+            # Use fsdp_group (the flattened dp_sp mesh group), not dp_group: Ulysses/CP sequence
+            # parallelism shrinks dp_group down to a single rank once it absorbs the whole world,
+            # making DDP's gradient all-reduce a silent no-op while each rank still only holds the
+            # gradient for its own local sequence shard. fsdp_group spans every rank sharing this
+            # sequence (same group FSDP2's reduce-scatter and every trainer's loss/grad-norm
+            # all-reduce already use — see e.g. train_omni_model.py, clip_grad_norm.py), so the
+            # mean-reduce here correctly recombines the sharded gradients.
+            model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.fsdp_group)
     elif compile_config.enable:
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
 
