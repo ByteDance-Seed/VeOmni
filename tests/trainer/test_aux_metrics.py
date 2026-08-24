@@ -68,7 +68,7 @@ def identity_loss(monkeypatch):
     monkeypatch.setattr(
         base_trainer_module,
         "mean_global_loss",
-        lambda losses, micro_batch_token_len, micro_batches_token_len: {"foundation_loss": losses},
+        lambda losses, *token_len_args: {"foundation_loss": losses},
     )
 
 
@@ -155,6 +155,7 @@ def _accumulating_trainer(outputs, recorded):
                 dp_replicate_size=1,
                 fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=True),
             ),
+            sync_each_train_step=False,
         )
     )
     trainer._callbacks = []
@@ -188,6 +189,10 @@ def run_train_step(request, monkeypatch):
     monkeypatch.setattr(module, "synchronize", lambda: None)
     monkeypatch.setattr(module, "use_parallel_state", lambda name: nullcontext())
     monkeypatch.setattr(module, "veomni_clip_grad_norm", lambda *args, **kwargs: 0.0)
+    # Single process: the all-reduce over the step's token denominators is the identity.
+    monkeypatch.setattr(
+        module, "reduce_global_loss_token", lambda token_len: {key: value.item() for key, value in token_len.items()}
+    )
     # VLMTrainer's loop does not mark compile steps.
     monkeypatch.setattr(module, "mark_compile_step_begin", lambda *args, **kwargs: None, raising=False)
 
@@ -252,8 +257,10 @@ def test_environ_meter_prefixes_aux_metric_without_a_loss_suffix(monkeypatch):
     callback = object.__new__(trace_callback_module.EnvironMeterCallback)
     callback.parallel_state = SimpleNamespace(fsdp_group=None)
     callback.start_time = time.time()
+    callback.lora_config = None
+    callback.freeze_vit = None
     callback.trainer = SimpleNamespace(
-        environ_meter=SimpleNamespace(step=lambda delta_time, global_step: {}),
+        environ_meter=SimpleNamespace(step=lambda delta_time, global_step, **kwargs: {}),
         lr_scheduler=None,
     )
 
