@@ -34,7 +34,7 @@ from ..utils import helper
 from ..utils.device import get_device_type, synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs
+from .base import BaseTrainer, VeOmniIter
 
 
 logger = helper.create_logger(__name__)
@@ -315,7 +315,7 @@ class VLMTrainer:
             param_groups=param_groups,
             no_decay_modules=args.model.optimizer.no_decay_modules,
             no_decay_params=args.model.optimizer.no_decay_params,
-            muon_kwargs=_collect_muon_kwargs(args.model.optimizer),
+            optimizer_config=args.model.optimizer,
         )
 
     def on_train_begin(self):

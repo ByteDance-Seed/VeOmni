@@ -1,0 +1,120 @@
+FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-ubuntu22.04-py3.11
+
+# Set default pip index
+ARG PIP_INDEX=https://pypi.org/simple
+
+# Define environments
+ENV MAX_JOBS=16
+ENV PIP_ROOT_USER_ACTION=ignore
+ENV OMP_NUM_THREADS=4
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+
+RUN echo "Setting timezone to CST (China Standard Time)..." && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone
+
+# aarch64 base uses ports.ubuntu.com/ubuntu-ports, which is unreachable on some
+# restricted networks. Override with a reachable mirror, e.g.
+#   --build-arg APT_SOURCE=http://mirrors.huaweicloud.com/ubuntu-ports/
+# Guarded so the default is a no-op. ubuntu 22.04 uses the line-format
+# /etc/apt/sources.list (not the deb822 format of 24.04+); the regex rewrites the
+# host before /ubuntu-ports regardless of what the base preconfigured.
+ARG APT_SOURCE=http://ports.ubuntu.com/ubuntu-ports/
+RUN if [ "${APT_SOURCE}" != "http://ports.ubuntu.com/ubuntu-ports/" ]; then \
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
+    sed -E -i "s#https?://[^[:space:]]+/ubuntu-ports/?#${APT_SOURCE}#g" /etc/apt/sources.list; \
+    fi
+
+RUN apt-get update -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc g++ cmake libnuma-dev sudo wget git curl jq vim build-essential ssh ca-certificates ffmpeg pkg-config gawk && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
+    pip install --upgrade pip setuptools packaging && \
+    pip cache purge
+
+RUN chmod +x /usr/bin/make /usr/bin/gmake /usr/bin/cc /usr/bin/c++
+
+RUN pip install --upgrade pip setuptools packaging --no-cache-dir --progress-bar off && \
+    pip cache purge
+
+RUN pip config set global.index-url "${PIP_INDEX}" && \
+    pip config set global.no-cache-dir "true" && \
+    pip config --user set global.progress_bar off && \
+    python -m pip install --upgrade pip
+
+RUN pip3 install --no-cache-dir -U pip setuptools requests
+
+WORKDIR /app
+
+COPY . .
+
+# pyproject.toml pins transformers==5.9.0 in the transformers-stable uv default
+# group. pip install -e does not install uv dependency groups, so pin and verify it here.
+RUN pip install -e ".[npu_aarch64]" "transformers==5.9.0" && \
+    python -c "import transformers; assert transformers.__version__ == '5.9.0'"
+
+# Align the parquet/data stack with the uv lockfile. pip install -e (unlike x86's
+# uv sync --locked) ignores the lockfile and floats pyarrow/pandas to latest; pyarrow
+# 25 / pandas 3.x SEGFAULT reading parquet on aarch64 (datasets is pinned to 2.21, which
+# targets the older pyarrow ABI). Pin to the versions the x86 lockfile uses.
+RUN pip install "pyarrow==21.0.0" "pandas==2.3.2"
+
+# ============================================================================
+# GDN / fla_npu (AscendC fused ops) — ported from Dockerfile.ascend_9.0.0_a2.x86.
+# The aarch64 A3 image build is CI-validated, and GDN runtime behavior was validated
+# on physical A3 hardware. Differences vs x86: pip not uv, runs as root (.run writes
+# the CANN opp dir directly, no sudo), no venv, and the A3 SOC target below.
+# ============================================================================
+
+# fla_npu's check_npu_env maps torch 2.10.0 -> torch_npu 2.10.0.post2 (npu_aarch64
+# extra pins plain 2.10.0). pybind11 is needed by the fla_npu torch-binding build.
+RUN pip install torch-npu==2.10.0.post2 pybind11
+
+# triton-ascend patches triton's libtriton.so with the ascend backend. Both packages ship
+# that shared .so (triton-ascend's is patched, community triton's is vanilla), and whoever
+# writes it LAST wins — so install triton FIRST then triton-ascend SEPARATELY so the patched
+# .so lands last (see the x86 Dockerfile comment for the full story). The trailing import
+# verifies the patch stuck.
+# aarch64 triton-ascend 3.2.1 requires triton==3.5.0 (x86's is 3.2.0) — an arch-specific
+# dep, confirmed via `pip install triton-ascend==3.2.1 --dry-run` on an aarch64 host.
+# Install the pinned wheel directly from Huawei Cloud so only triton-ascend uses
+# that source; its dependencies continue to resolve from the configured PIP_INDEX.
+RUN (pip uninstall -y triton triton-ascend || true) && \
+    pip install triton==3.5.0 && \
+    pip install \
+        "https://mirrors.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" && \
+    echo "Verifying triton-ascend patched libtriton.so ..." && \
+    python -c "from triton._C.libtriton import ascend"
+
+# ONE RUN so the CANN env from set_env.sh persists. The ascend910_93 SOC target was
+# validated by building and running GDN on physical A3 hardware (x86/a2 uses ascend910b).
+# torch binding wheel is force-reinstalled with --no-deps (else pip pulls a CUDA torch).
+RUN git clone https://github.com/flashserve/flash-linear-attention-npu /tmp/fla-npu && \
+    cd /tmp/fla-npu && git checkout c2e3d83f && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    python scripts/check_npu_env.py --build-only && \
+    bash build.sh --soc=ascend910_93 --pkg --vendor_name=fla_npu && \
+    bash build_out/*.run --quiet && \
+    cd torch_custom/fla_npu && bash build.sh && \
+    pip install --no-deps --force-reinstall dist/*.whl && \
+    cd / && rm -rf /tmp/fla-npu
+
+RUN git clone https://github.com/meta-pytorch/torchcodec.git
+
+WORKDIR /app/torchcodec
+
+RUN git checkout v0.5.0
+
+ENV CANN_PATH=/usr/local/Ascend
+
+RUN cp ../docs/get_started/installation/install_torchcodec_Ascend.sh .
+
+RUN chmod +x install_torchcodec_Ascend.sh
+
+RUN bash install_torchcodec_Ascend.sh ${CANN_PATH}/ascend-toolkit/set_env.sh
+
+WORKDIR /app
+
+CMD ["/bin/bash"]

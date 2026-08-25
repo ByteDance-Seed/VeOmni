@@ -317,6 +317,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
 | grad_clip_scope | `Literal["per_module", "global"]` | `"per_module"` | Which parameters `max_grad_norm` is computed over. `"per_module"` clips each module against its own norm; `"global"` would clip every module against one norm taken across all of them, but is not implemented yet and raises `NotImplementedError`. A single-model job has one module, so the two agree and only an omni model would see a difference. |
+| betas | `Tuple[float, float]` | `(0.9, 0.95)` | AdamW betas (`beta1`, `beta2`). |
 | muon_lr | `Optional[float]` | `None` | Learning rate for Muon-managed 2-D/3-D weights. Unset: inherits `lr` under `match_rms_adamw`, else `25×lr` under `original`. |
 | muon_momentum | `float` | `0.95` | Momentum factor for Muon. |
 | muon_nesterov | `bool` | `True` | Enable Nesterov momentum for Muon. |
