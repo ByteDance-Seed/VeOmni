@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from veomni.optim import muon as muon_impl
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
@@ -37,7 +37,7 @@ from veomni.optim.muon import (  # noqa: E402
     DEFAULT_NS_COEFFICIENTS,
     DEFAULT_NS_STEPS,
     DistributedMuon,
-    _fsdp_all2all_fast_path_eligible,
+    _fsdp_all2all_submesh,
     _shard_row_sizes,
     batched_gram_newton_schulz,
     batched_newton_schulz,
@@ -165,25 +165,61 @@ class TestParamShapeEligibility:
                 DistributedMuon([p], lr=1e-3)
 
 
+class _FakeMesh:
+    """DeviceMesh stand-in exposing only what submesh resolution touches."""
+
+    def __init__(self, sizes, dim_names):
+        self._sizes = sizes
+        self.ndim = len(sizes)
+        self.mesh_dim_names = dim_names
+        self.sliced_with = None
+
+    def size(self, dim):
+        return self._sizes[dim]
+
+    def __getitem__(self, name):
+        self.sliced_with = name
+        return _FakeMesh((self._sizes[self.mesh_dim_names.index(name)],), (name,))
+
+
 class TestFsdpAllToAllEligibility:
     def test_empty_rank_shards_remain_all_to_all_eligible(self):
         world_size = 32
         param = SimpleNamespace(
-            device_mesh=SimpleNamespace(ndim=1, size=lambda dim: world_size),
+            device_mesh=_FakeMesh((world_size,), ("dp_shard",)),
             placements=(Shard(0),),
             shape=(24, 16384),
         )
 
         assert _shard_row_sizes(param.shape[0], world_size) == [1] * 24 + [0] * 8
-        assert _fsdp_all2all_fast_path_eligible(param)
+        assert _fsdp_all2all_submesh(param) is not None
+
+    def test_hsdp_mesh_resolves_to_the_shard_dim(self):
+        """HSDP params are (Replicate(), Shard(0)); the path runs on dp_shard_sp."""
+        mesh = _FakeMesh((2, 8), ("dp_replicate", "dp_shard_sp"))
+        param = SimpleNamespace(device_mesh=mesh, placements=(Replicate(), Shard(0)))
+
+        submesh = _fsdp_all2all_submesh(param)
+
+        assert mesh.sliced_with == "dp_shard_sp"
+        assert submesh.ndim == 1
+        assert submesh.size(0) == 8
+
+    def test_pending_reduction_is_not_eligible(self):
+        """A Partial() dim owes a reduction, so the gather cannot be skipped."""
+        mesh = _FakeMesh((2, 8), ("dp_replicate", "dp_shard_sp"))
+        param = SimpleNamespace(device_mesh=mesh, placements=(Partial(), Shard(0)))
+
+        assert _fsdp_all2all_submesh(param) is None
+        assert mesh.sliced_with is None
 
     def test_bucket_key_separates_local_dtypes(self):
         mesh = object()
         fp32 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.float32))
         bf16 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.bfloat16))
-        bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update: update.device_mesh)
+        bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update, mesh: mesh)
 
-        assert bucket_key(fp32) != bucket_key(bf16)
+        assert bucket_key(fp32, mesh) != bucket_key(bf16, mesh)
 
 
 class TestIntermediateLifetime:
@@ -507,6 +543,102 @@ class TestMuonLrResolution:
         )
         muon_opt = opt.optimizers_dict["muon"]
         assert muon_opt.param_groups[0]["lr"] == pytest.approx(3e-3)
+
+
+class TestMuonKwargsFromOptimizerConfig:
+    """``build_optimizer`` reads Muon knobs off ``OptimizerConfig`` itself.
+
+    Trainers used to unpack the ``muon_*`` fields and pre-resolve the Muon LR
+    before calling ``build_optimizer``. These tests pin the equivalent results
+    now that the whole config is handed over instead.
+    """
+
+    def _muon_config(self, **overrides):
+        from veomni.arguments import OptimizerConfig
+
+        kwargs = {"type": "muon", "lr": 1e-4, "muon_ns_implementation": "std"}
+        kwargs.update(overrides)
+        return OptimizerConfig(**kwargs)
+
+    def _build(self, optimizer_config, **kwargs):
+        from veomni.optim import build_optimizer
+
+        kwargs.setdefault("lr", optimizer_config.lr)
+        kwargs.setdefault("weight_decay", optimizer_config.weight_decay)
+        return build_optimizer(
+            _toy_model(),
+            optimizer_type=optimizer_config.type,
+            optimizer_config=optimizer_config,
+            **kwargs,
+        )
+
+    def test_unset_muon_lr_inherits_the_adamw_lr_under_match_rms(self):
+        # match_rms_adamw is also the builder's fallback default, so pin a knob
+        # that is not (ns_steps) to prove the config was actually consulted.
+        config = self._muon_config(muon_adjust_lr_fn="match_rms_adamw", muon_ns_steps=3)
+        group = self._build(config, lr=7e-4).optimizers_dict["muon"].param_groups[0]
+        assert group["lr"] == pytest.approx(7e-4)
+        assert group["ns_steps"] == 3
+
+    def test_unset_muon_lr_is_25x_the_adamw_lr_under_original(self):
+        config = self._muon_config(muon_adjust_lr_fn="original")
+        opt = self._build(config)
+        assert opt.optimizers_dict["muon"].param_groups[0]["lr"] == pytest.approx(2.5e-3)
+
+    def test_explicit_muon_lr_wins_over_inheritance(self):
+        config = self._muon_config(muon_lr=3e-3)
+        opt = self._build(config)
+        assert opt.optimizers_dict["muon"].param_groups[0]["lr"] == pytest.approx(3e-3)
+
+    def test_muon_lr_survives_yaml_exponent_literals(self):
+        # PyYAML resolves "3e-3" to a str, and OptimizerConfig does not coerce.
+        config = self._muon_config(muon_lr="3e-3")
+        group = self._build(config).optimizers_dict["muon"].param_groups[0]
+        assert isinstance(group["lr"], float)
+        assert group["lr"] == pytest.approx(3e-3)
+
+    def test_non_lr_muon_knobs_reach_the_optimizer(self):
+        config = self._muon_config(
+            muon_momentum=0.8,
+            muon_nesterov=False,
+            muon_weight_decay=0.05,
+            muon_ns_steps=3,
+            muon_eps=1e-5,
+            muon_ns_coefficients=[3.0, -4.0, 2.0],
+        )
+        group = self._build(config).optimizers_dict["muon"].param_groups[0]
+        assert group["momentum"] == pytest.approx(0.8)
+        assert group["nesterov"] is False
+        assert group["weight_decay"] == pytest.approx(0.05)
+        assert group["ns_steps"] == 3
+        assert group["eps"] == pytest.approx(1e-5)
+        assert tuple(group["ns_coefficients"]) == (3.0, -4.0, 2.0)
+
+    def test_muon_and_adamw_groups_keep_separate_weight_decay(self):
+        config = self._muon_config(muon_lr=3e-3, weight_decay=0.02, muon_weight_decay=0.05)
+        opt = self._build(config)
+        assert opt.optimizers_dict["muon"].param_groups[0]["weight_decay"] == pytest.approx(0.05)
+        adamw_groups = opt.optimizers_dict["adamw"].param_groups
+        assert max(group["weight_decay"] for group in adamw_groups) == pytest.approx(0.02)
+
+    def test_explicit_muon_kwargs_override_the_config_key_by_key(self):
+        config = self._muon_config(muon_lr=3e-3, muon_momentum=0.8)
+        opt = self._build(config, muon_kwargs={"lr": 7e-3})
+        group = opt.optimizers_dict["muon"].param_groups[0]
+        assert group["lr"] == pytest.approx(7e-3)
+        # Overriding the LR must not reset the knobs the config supplied.
+        assert group["momentum"] == pytest.approx(0.8)
+
+    def test_empty_muon_kwargs_does_not_discard_the_config(self):
+        config = self._muon_config(muon_lr=3e-3, muon_momentum=0.8)
+        group = self._build(config, muon_kwargs={}).optimizers_dict["muon"].param_groups[0]
+        assert group["lr"] == pytest.approx(3e-3)
+        assert group["momentum"] == pytest.approx(0.8)
+
+    def test_head_group_size_reaches_the_builder(self):
+        config = self._muon_config(muon_head_group_size=2)  # no muon_head_split_modules
+        with pytest.raises(ValueError, match="muon_head_split_modules"):
+            self._build(config)
 
 
 class TestHeadSplitInference:
