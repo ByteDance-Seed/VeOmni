@@ -35,14 +35,24 @@ def _all_gather(
     x: Tensor,
     group: dist.ProcessGroup,
 ):
-    device = x.device
-    dtype = x.dtype
+    """All-gather ``x`` over ``group``, returning the per-rank tensors and their shapes.
+
+    Shards may differ in length, but every rank must pass the same number of
+    dimensions. Shapes are exchanged first and read back to the host with a single
+    ``tolist()``: materializing them as ``torch.Size`` from per-rank device tensors
+    instead costs one device-to-host sync per dimension per rank, and with a gather in
+    every layer that drains the device queue thousands of times per step. Shapes are
+    returned as plain ints for the same reason.
+    """
     group = get_ulysses_sequence_parallel_group() if group is None else group
     sp_world_size = dist.get_world_size(group)
-    x_size = torch.tensor(x.size()).to(device)
-    size_list = [torch.zeros(x_size.size(), dtype=torch.int64, device=device) for i in range(sp_world_size)]
-    dist.all_gather(size_list, x_size, group=group)
-    tensor_list = [torch.zeros(torch.Size(size_list[i]), dtype=dtype, device=device) for i in range(sp_world_size)]
+    ndim = x.dim()
+    x_size = torch.tensor(x.size(), dtype=torch.int64, device=x.device)
+    all_sizes = torch.empty(sp_world_size * ndim, dtype=torch.int64, device=x.device)
+    dist.all_gather_into_tensor(all_sizes, x_size, group=group)
+    flat_sizes = all_sizes.tolist()
+    size_list = [flat_sizes[i * ndim : (i + 1) * ndim] for i in range(sp_world_size)]
+    tensor_list = [torch.empty(size, dtype=x.dtype, device=x.device) for size in size_list]
     dist.all_gather(tensor_list, x, group=group)
     return tensor_list, size_list
 
@@ -103,8 +113,11 @@ def _all_to_all_single(
             .contiguous()
         )
 
+    # Materialize the input before allocating with empty_like: otherwise the output
+    # can inherit a non-contiguous stride that NCCL all_to_all_single rejects.
+    x = x.contiguous()
     output = torch.empty_like(x)
-    comm = dist.all_to_all_single(output, x.contiguous(), group=group, async_op=async_op)
+    comm = dist.all_to_all_single(output, x, group=group, async_op=async_op)
 
     if async_op:
 
@@ -198,8 +211,7 @@ class _Gather(torch.autograd.Function):
         seq_world_size = dist.get_world_size(group)
         ctx.seq_world_size = seq_world_size
         output, size_list = _all_gather(local_input.contiguous(), group=ctx.group)
-        dim_size_list = [size_list[i][dim].item() for i in range(seq_world_size)]
-        ctx.dim_size_list = dim_size_list
+        ctx.dim_size_list = [size[dim] for size in size_list]
         return torch.cat(output, dim=dim)
 
     @staticmethod

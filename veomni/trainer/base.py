@@ -66,6 +66,7 @@ from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
+from ..utils.checkpoint_utils import should_skip_hf_weight_load
 from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -73,7 +74,7 @@ from ..utils.device import (
     is_nccl_backend,
     synchronize,
 )
-from ..utils.loss_utils import count_loss_token, mean_global_loss
+from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     ChannelLossCallback,
@@ -91,6 +92,15 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+def _has_trainable_lora_parameters(module: torch.nn.Module | None) -> bool:
+    if module is None:
+        return False
+    return any(
+        param.requires_grad and ({"lora_A", "lora_B"} & set(name.split(".")))
+        for name, param in module.named_parameters()
+    )
 
 
 class BackgroundPrefetcher:
@@ -196,20 +206,6 @@ class VeOmniIter:
         if hasattr(self.dataloader, "state_dict"):
             return self.dataloader.state_dict()
         return {}
-
-
-def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
-    """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
-    return {
-        "lr": optimizer_cfg.muon_lr,
-        "momentum": optimizer_cfg.muon_momentum,
-        "nesterov": optimizer_cfg.muon_nesterov,
-        "weight_decay": optimizer_cfg.muon_weight_decay,
-        "ns_steps": optimizer_cfg.muon_ns_steps,
-        "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
-        "eps": optimizer_cfg.muon_eps,
-        "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
-    }
 
 
 class BaseTrainer(Stateful, ABC):
@@ -438,6 +434,11 @@ class BaseTrainer(Stateful, ABC):
             logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
             self.model = VeOmniLoraModel(self.model, cfg)
 
+        if not _has_trainable_lora_parameters(self.model):
+            raise ValueError(
+                "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
+            )
+
     def _freeze_model_module(self):
         self._setup_lora()
         pretty_print_trainable_parameters(self.model)
@@ -524,11 +525,25 @@ class BaseTrainer(Stateful, ABC):
         if args.train.chunk_mbs_config.enable:
             kwargs["chunk_mbs_config"] = args.train.chunk_mbs_config
 
+        # A full non-LoRA resume already contains model weights. Skip the HF
+        # materialization pass to avoid a second peak (HF load then checkpoint
+        # overwrite) that can OOM large MoE jobs. LoRA resumes still need the HF base.
+        skip_hf_weight_load = should_skip_hf_weight_load(
+            args.train.checkpoint.load_path,
+            args.model.lora_config,
+        )
+        if skip_hf_weight_load:
+            logger.info_rank0(
+                f"Checkpoint resume enabled (load_path={args.train.checkpoint.load_path}); "
+                "skipping HF weight materialization before checkpoint restore."
+            )
+
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
+            should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
@@ -556,12 +571,13 @@ class BaseTrainer(Stateful, ABC):
         self.optimizer = build_optimizer(
             self.model,
             lr=args.train.optimizer.lr,
+            betas=args.train.optimizer.betas,
             weight_decay=args.train.optimizer.weight_decay,
             fused=True,
             optimizer_type=args.train.optimizer.type,
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
-            muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
+            optimizer_config=args.train.optimizer,
         )
 
     def _build_lr_scheduler(self):
@@ -678,7 +694,10 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            outputs.loss,
+            self.micro_batch_token_len,
+            self.micro_batches_token_len,
+            getattr(self, "global_micro_batches_token_len", None),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
@@ -750,6 +769,10 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_requires_all_reduce(True)
 
+    def sync_before_train_step(self):
+        if self.args.train.sync_each_train_step:
+            synchronize()
+
     def train_step(
         self,
         data_iterator: Any,
@@ -762,13 +785,14 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
-        synchronize()
+        self.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
         # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)
+        self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):

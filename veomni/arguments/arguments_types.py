@@ -16,13 +16,28 @@ import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
 
 
 logger = logging.get_logger(__name__)
+
+
+def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
+    """Copy an ``hdfs://`` path to a local cache and return the local path.
+
+    Non-HDFS paths (local filesystem, HF hub ids, hdfs-fuse mounts) are returned
+    unchanged. Concurrent processes on the same node are serialized by the file
+    lock inside ``copy_to_local``, so the download happens only once per node.
+    """
+    from ..utils.fs import copy_to_local, is_non_local
+
+    if path is None or not is_non_local(path):
+        return path
+
+    return copy_to_local(path.rstrip("/"), verbose=True)
 
 
 # ================================ Training Arguments ======================================
@@ -97,13 +112,19 @@ class OptimizerConfig:
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
     )
+    betas: Tuple[float, float] = field(
+        default=(0.9, 0.95),
+        metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
+    )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
-    muon_lr: float = field(
-        default=2e-2,
+    muon_lr: Optional[float] = field(
+        default=None,
         metadata={
             "help": (
                 "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
-                "Per Moonlight, ~25x the AdamW lr is a common starting point."
+                "If unset: inherits train.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
+                "(default); uses 25x train.optimizer.lr when muon_adjust_lr_fn=original "
+                "(Moonlight-style starting point)."
             )
         },
     )
@@ -141,6 +162,28 @@ class OptimizerConfig:
             )
         },
     )
+    muon_head_group_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Attention heads per Newton-Schulz block for head-split Muon. "
+                "0 (default) orthogonalizes each projection as a single matrix; 1 is fully per-head; "
+                "g > 1 puts g heads in each block. Any value >= 1 also requires "
+                "muon_head_split_modules."
+            )
+        },
+    )
+    muon_head_split_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Leaf module names to head-split, matched exactly against the children of an "
+                "attention module, e.g. ['q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
+                "['q_proj', 'k_proj', 'v_proj'] for GQA. Required whenever "
+                "muon_head_group_size >= 1; see docs/usage/basic_modules.md."
+            )
+        },
+    )
     muon_expert_zero_comm: bool = field(
         default=False,
         metadata={
@@ -148,6 +191,28 @@ class OptimizerConfig:
                 "Use whole-expert Shard(0) for Muon under FSDP+ExtraParallel when "
                 "(num_experts/ep_size) %% ep_fsdp_size == 0; otherwise fall back "
                 "to the default hidden-dim sharding path."
+            )
+        },
+    )
+    muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
+        default="gram_quack",
+        metadata={
+            "help": (
+                "Newton-Schulz implementation used by Muon. "
+                "'std': torch.optim.Muon-compatible Newton-Schulz; "
+                "'gram': pure-PyTorch Dao-AILab Gram Newton-Schulz; "
+                "'gram_quack' (default): Dao-AILab Gram-NS with quack CuTeDSL GEMM kernels "
+                "(Hopper/Blackwell). If quack/package is missing, falls back to gram."
+            )
+        },
+    )
+    muon_gram_ns_reset_iterations: List[int] = field(
+        default_factory=lambda: [2],
+        metadata={
+            "help": (
+                "Restart indices for Gram Newton-Schulz (applied immediately before "
+                "those iteration indices). Default [2] matches Dao-AILab guidance "
+                "for 5-step schedules."
             )
         },
     )
@@ -598,7 +663,7 @@ class TorchCompileConfig:
 
     enable: bool = field(
         default=False,
-        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
+        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
     )
     backend: Optional[str] = field(
         default="inductor",
@@ -683,10 +748,10 @@ class TrainingArguments:
             )
         },
     )
-    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
+    init_device: Literal["cuda", "meta", "npu"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
@@ -708,6 +773,15 @@ class TrainingArguments:
     enable_batch_invariant_mode: bool = field(
         default=False,
         metadata={"help": "Enable batch invariant mode."},
+    )
+    sync_each_train_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Synchronize the accelerator before each training step's forward/backward work. "
+                "Disable to allow asynchronous dataloader and H2D work to overlap with the next step."
+            )
+        },
     )
     empty_cache_steps: int = field(
         default=500,
@@ -818,18 +892,16 @@ class TrainingArguments:
             )
 
         # init method constraints
-        assert acc.ep_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
         else:
-            if self.broadcast_model_weights_from_rank0:
-                logger.warning_rank0(
-                    "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "
-                    "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
-                    f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
-                )
+            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+            # CPU-resident module, and only rank0 would hold weights anyway. Fail
+            # here so every rank stops at parse time, rather than let rank0 die in
+            # DDP's constructor while the others block in its first collective.
+            assert self.init_device != "cpu", (
+                "init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
+            )
 
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
@@ -991,6 +1063,8 @@ class OpsImplementationConfig:
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
+            "magi_attention",
             "native-sparse",
         ]
     ] = field(
@@ -1079,6 +1153,8 @@ class OpsImplementationConfig:
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
+            "delegates heavy GDN compute to torch.ops.npu.*). "
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
@@ -1104,6 +1180,8 @@ class OpsImplementationConfig:
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
+                "flex_attention": "veomni_flex_attention_with_sp",
+                "magi_attention": "veomni_magi_attention_with_sp",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
@@ -1225,30 +1303,6 @@ class ModelArguments:
             "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
         },
     )
-    foundation: Dict[str, str] = field(
-        default_factory=dict,
-        metadata={"help": "Foundation model extra config."},
-    )
-    encoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal encoder config and weights."},
-    )
-    decoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal decoder config and weights."},
-    )
-    input_encoder: Literal["encoder", "decoder"] = field(
-        default="encoder",
-        metadata={"help": "Use encoder to encode input images or use decoder.encoder to encode input images."},
-    )
-    output_encoder: Literal["encoder", "decoder"] = field(
-        default="decoder",
-        metadata={"help": "Use encoder to encode output images or use decoder.encoder to encode output images."},
-    )
-    encode_target: bool = field(
-        default=False,
-        metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
-    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -1262,6 +1316,12 @@ class ModelArguments:
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
             raise ValueError("`config_path` must be specified when `model_path` is None.")
+
+        # Download HDFS-hosted paths to a local cache before resolving defaults so
+        # that all downstream loaders (config/tokenizer/safetensors) see local paths.
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.config_path = _resolve_hdfs_path(self.config_path)
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
 
         if self.config_path is None:
             self.config_path = self.model_path
@@ -1285,32 +1345,6 @@ class ModelArguments:
             logger.warning_rank0(
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
             )
-
-        suppoerted_encoder_types = ["image", "video", "audio"]
-        for encoder_type, encoder_args in self.encoders.items():
-            if encoder_type not in suppoerted_encoder_types:
-                raise ValueError(
-                    f"Unsupported encoder type: {encoder_type}. Should be one of {suppoerted_encoder_types}."
-                )
-
-            if encoder_args.get("config_path") is None and encoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if encoder_args.get("config_path") is None:
-                encoder_args["config_path"] = encoder_args["model_path"]
-
-        supported_decoder_types = ["image"]
-        for decoder_type, decoder_args in self.decoders.items():
-            if decoder_type not in supported_decoder_types:
-                raise ValueError(
-                    f"Unsupported decoder type: {decoder_type}. Should be one of {supported_decoder_types}."
-                )
-
-            if decoder_args.get("config_path") is None and decoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if decoder_args.get("config_path") is None:
-                decoder_args["config_path"] = decoder_args["model_path"]
 
 
 # ================================ Data Arguments ======================================
@@ -1340,6 +1374,14 @@ class DataloaderConfig:
     prefetch_factor: int = field(
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},
+    )
+    persistent_workers: bool = field(
+        default=False,
+        metadata={"help": "Keep DataLoader worker processes alive between iterator recreations."},
+    )
+    in_order: bool = field(
+        default=True,
+        metadata={"help": "Return worker-loaded batches in first-in, first-out order."},
     )
     drop_last: bool = field(
         default=True,
@@ -1482,12 +1524,12 @@ class VeOmniArguments:
                 )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text trainers only. "
-                    "Multimodal/DiT/Omni data pipelines do not implement pad_to_length for static packed shapes yet."
+                    "train.torch_compile.enable is not supported by this data pipeline. "
+                    "The pipeline must implement pad_to_length for static packed shapes."
                 )
             if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports text data only; "
+                    "train.torch_compile.enable currently supports packed language-model data types only; "
                     f"got data.data_type={self.data.data_type!r}."
                 )
             if not self.train.dyn_bsz or not self.train.pad_to_length:
@@ -1558,5 +1600,7 @@ class InferArguments:
     )
 
     def __post_init__(self):
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path

@@ -154,12 +154,15 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -v -s -x tests/parallel/test_chunk_mbs.py
+          uv run --frozen pytest -v -s -x tests/parallel/test_ddp_sp_grad_sync.py
+          uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
+          uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
@@ -173,6 +176,7 @@ jobs:
       - name: Run checkpoint callback unit tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_checkpoint_callback.py
+          uv run --frozen pytest -v -s -x tests/checkpoints/test_dcp_checkpointer.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_trainer_saveload.py

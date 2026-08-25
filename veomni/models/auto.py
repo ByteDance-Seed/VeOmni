@@ -107,6 +107,17 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     return bool(bound)
 
 
+def _validate_attention_parallelism(attn_implementation: Optional[str]) -> None:
+    if attn_implementation not in ("magi_attention", "veomni_magi_attention_with_sp"):
+        return
+
+    cp_size = get_parallel_state().cp_size
+    if cp_size != 1:
+        raise ValueError(
+            f"MagiAttention currently requires context parallel size 1 (cp_size == 1), got cp_size={cp_size}."
+        )
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
@@ -122,6 +133,10 @@ def build_foundation_model(
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
+            "magi_attention",
+            "veomni_flex_attention_with_sp",
+            "veomni_magi_attention_with_sp",
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
             "veomni_flash_attention_4_with_sp",
@@ -152,8 +167,9 @@ def build_foundation_model(
     from ..ops.config.singleton import get_ops_config
 
     if ops_implementation is not None:
-        apply_ops_config(ops_implementation)
         attn_implementation = ops_implementation.attn_implementation
+        _validate_attention_parallelism(attn_implementation)
+        apply_ops_config(ops_implementation)
     else:
         installed = get_ops_config()
         if installed is None:
@@ -171,6 +187,7 @@ def build_foundation_model(
         # variant the user selected.
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation
+        _validate_attention_parallelism(attn_implementation)
 
     if config_kwargs is None:
         config_kwargs = {}
@@ -228,12 +245,14 @@ def build_foundation_model(
     }
 
     if attn_implementation not in (
+        "veomni_flex_attention_with_sp",
+        "veomni_magi_attention_with_sp",
         "veomni_flash_attention_2_with_sp",
         "veomni_flash_attention_3_with_sp",
         "veomni_flash_attention_4_with_sp",
     ):
         logger.warning_rank0(
-            f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use veomni_flash_attention_2_with_sp or veomni_flash_attention_3_with_sp for SP."
+            f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use a veomni_*_with_sp attention implementation for SP."
         )
 
     if (init_device == "cpu" and get_parallel_state().global_rank != 0) or init_device == "meta":

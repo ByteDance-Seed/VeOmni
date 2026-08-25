@@ -1347,6 +1347,39 @@ def post_process_after_weight_loading(
             raise RuntimeError("Failed to tie input/output embeddings") from e
 
 
+def _normalize_save_dtype(save_dtype: Optional[Union[str, "torch.dtype"]]) -> Optional["torch.dtype"]:
+    if isinstance(save_dtype, str):
+        try:
+            save_dtype = getattr(torch, save_dtype)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown save dtype: {save_dtype}") from exc
+
+    if save_dtype is not None and not isinstance(save_dtype, torch.dtype):
+        raise TypeError(f"save_dtype must be a torch.dtype, string, or None, got {type(save_dtype).__name__}")
+    if save_dtype is not None and not save_dtype.is_floating_point:
+        raise ValueError(f"save_dtype must be floating-point, got {save_dtype}")
+    return save_dtype
+
+
+def _resolve_save_dtype(tensor: "torch.Tensor", save_dtype: Optional["torch.dtype"]) -> "torch.dtype":
+    if save_dtype is None or not tensor.is_floating_point():
+        return tensor.dtype
+    return save_dtype
+
+
+def _get_tensor_save_size(tensor: "torch.Tensor", dtype: "torch.dtype", safe_serialization: bool) -> int:
+    if safe_serialization:
+        try:
+            element_size = get_dtype_size(dtype)
+        except KeyError as exc:
+            raise ValueError(f"Unsupported dtype for safetensors serialization: {dtype}") from exc
+    elif dtype == tensor.dtype:
+        element_size = tensor.element_size()
+    else:
+        element_size = torch.empty((), dtype=dtype).element_size()
+    return tensor.numel() * element_size
+
+
 def _get_shard_info(
     state_dict: Dict[str, "torch.Tensor"],
     save_dtype: Optional[Union[str, "torch.dtype"]],
@@ -1356,16 +1389,12 @@ def _get_shard_info(
     """
     Gets the shard information, should be executed at rank 0.
     """
+    save_dtype = _normalize_save_dtype(save_dtype)
     current_size, total_size = 0, 0
     current_shard, shard_list = [], []
     for name, tensor in state_dict.items():
-        if isinstance(save_dtype, str):
-            dtype = getattr(torch, save_dtype)
-        elif isinstance(save_dtype, torch.dtype):
-            dtype = save_dtype
-        else:
-            dtype = tensor.dtype
-        tensor_size = tensor.numel() * get_dtype_size(dtype)  # dtensor's numel == tensor's numel
+        dtype = _resolve_save_dtype(tensor, save_dtype)
+        tensor_size = _get_tensor_save_size(tensor, dtype, safe_serialization)
         if current_size != 0 and current_size + tensor_size > shard_size:
             total_size += current_size
             shard_list.append(current_shard)
@@ -1436,6 +1465,7 @@ def save_model_weights(
         hdfs_dir = None
 
     os.makedirs(output_dir, exist_ok=True)
+    save_dtype = _normalize_save_dtype(save_dtype)
     is_sharded, total_size, weight_map = _get_shard_info(state_dict, save_dtype, shard_size, safe_serialization)
     full_state_dict = OrderedDict()
     prev_file_name = None
@@ -1445,8 +1475,9 @@ def save_model_weights(
         else:
             tensor = tensor.data
 
-        if save_dtype:
-            tensor = tensor.to(dtype=getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype)
+        target_dtype = _resolve_save_dtype(tensor, save_dtype)
+        if tensor.dtype != target_dtype:
+            tensor = tensor.to(dtype=target_dtype)
 
         if prev_file_name is not None and weight_map[name] != prev_file_name:
             if global_rank is None or global_rank == 0:

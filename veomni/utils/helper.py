@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from ..distributed.parallel_state import ParallelState
+    from ..lora import VeOmniLoraConfig
 
 
 logger = logging.get_logger(__name__)
@@ -337,8 +338,12 @@ class EnvironMeter:
         # for internal use
         if VALID_CONFIG_TYPE is not None and isinstance(config, VALID_CONFIG_TYPE):
             self.estimate_flops = FlopsCounter(config).estimate_flops
+            self.supports_lora_flops = False
         else:
-            self.estimate_flops = VeomniFlopsCounter(config).estimate_flops
+            flops_counter = VeomniFlopsCounter(config)
+            self.estimate_flops = flops_counter.estimate_flops
+            self.supports_lora_flops = True
+        self._warned_unsupported_lora_flops = False
 
         if self.gc_steps > 0:
             gc.disable()
@@ -372,13 +377,35 @@ class EnvironMeter:
         else:  # dit diffusers model
             self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
 
-    def step(self, delta_time: float, global_step: int) -> Dict[str, Any]:
-        if len(self.images_seqlens) > 0:
-            flops_achieved, flops_promised = self.estimate_flops(
-                self.batch_seqlens, delta_time, images_seqlens=self.images_seqlens
-            )
-        else:
-            flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
+    def step(
+        self,
+        delta_time: float,
+        global_step: int,
+        lora_config: Optional["VeOmniLoraConfig"] = None,
+        freeze_vit: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        flops_kwargs = {}
+        if self.images_seqlens:
+            flops_kwargs["images_seqlens"] = self.images_seqlens
+        lora_flops_unavailable = lora_config is not None and not self.supports_lora_flops
+        if lora_config is not None:
+            if self.supports_lora_flops:
+                flops_kwargs["lora_config"] = lora_config
+            elif not self._warned_unsupported_lora_flops:
+                logger.warning_rank0(
+                    "LoRA FLOPs are unavailable because the configured FLOP counter does not accept "
+                    "VeOmniLoraConfig. Returning zero FLOPs so training can continue."
+                )
+                self._warned_unsupported_lora_flops = True
+        if freeze_vit is not None and self.supports_lora_flops:
+            flops_kwargs["freeze_vit"] = freeze_vit
+        flops_achieved, flops_promised = self.estimate_flops(
+            self.batch_seqlens,
+            delta_time,
+            **flops_kwargs,
+        )
+        if lora_flops_unavailable:
+            flops_achieved = 0
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",

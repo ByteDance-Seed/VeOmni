@@ -113,7 +113,7 @@ An `hdfs://` trace directory is supported in `offline` mode. VeOmni captures loc
 Async analysis can compete with training for host CPU and disk bandwidth, and torch_npu waits for its process pool during interpreter exit. Use `offline` for the lowest training interference or very large traces. If the training process is a multiprocessing daemon, VeOmni logs a warning and safely falls back from `async` to `offline` because torch_npu refuses daemon-process analysis.
 
 
-The current trainer callback and `tasks/omni/train_omni_model.py` support both modes. Deprecated standalone training entrypoints warn and disable NPU profiling because they cannot honor the distributed synchronization contract.
+The current trainer callback supports both modes. SeedOmni V1 and the deprecated standalone training entrypoints were removed; NPU profiling is only supported through the trainer callback path, which honors the distributed synchronization contract.
 
 ## Profiling Analysis Tool - MindStudio Insight
 
