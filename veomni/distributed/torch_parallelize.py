@@ -467,7 +467,7 @@ def parallelize_model_fsdp2(
             async_enabled=parallel_state.async_enabled,
         )
         if compiled_count == 0:
-            raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
+            raise RuntimeError("model.accelerator.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True
         model._veomni_compile_uses_cuda_graphs = compile_config.uses_cuda_graphs()
 
@@ -488,6 +488,7 @@ def parallelize_model_fsdp2(
         fsdp_kwargs["mp_policy"] = mp_policy
     # prepare offload_policy kwargs
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
+    offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
         logger.info_rank0("Enable FSDP2 CPU offload for parameters, gradients, and optimizer states.")
@@ -499,7 +500,6 @@ def parallelize_model_fsdp2(
         # the cgroup during load. ``fsdp_offload_pin_memory=False`` keeps the
         # shards in ordinary pageable anon memory (what a bespoke manual offload
         # does) at the cost of a non-pinned (slightly slower) H2D per layer.
-        offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=offload_pin_memory)
 
     if hasattr(model, "get_ignore_modules_in_mixed_precision"):
@@ -762,15 +762,41 @@ def parallelize_model_ddp(
                 f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
             )
 
-    # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
-    # module's buffer semantics must not change with the ``fsdp_mode`` a config
-    # happened to pick. Nothing is lost: rank0's copy is either identical to the
-    # others or, for dynamic-rope ``inv_freq``, wrong for them. See constraint 7a
-    # in `.agents/knowledge/constraints.md`.
+    # PyTorch DDP rejects modules with zero trainable params. Fully-frozen
+    # encoders (e.g. Seedream offline_cache OE/ViT/VAE under ``no_grad``) still
+    # need the meta→device materialize + weight load above; skip the DDP wrap
+    # and return the bare replica (FSDP2 path already accepts all-frozen).
+    if not any(p.requires_grad for p in model.parameters()):
+        logger.info_rank0(
+            f"Skipping DDP wrap for fully-frozen module {type(model).__name__} (no trainable parameters)."
+        )
+        return model
+
+    # ``broadcast_buffers=False`` to match the FSDP2 path, which is the same
+    # replication story: ``ParallelState.fsdp_mesh`` treats DDP as HSDP with a
+    # single ``dp_replicate`` dim, and ``fully_shard`` syncs no buffers at all
+    # (torch's FSDP has no ``_sync_module_states`` equivalent), so a module's
+    # buffer behaviour must not depend on which ``dp_mode`` the config picked.
+    #
+    # Nothing is lost by not broadcasting. Config-derived buffers are already
+    # per-rank correct: a static rope table is identical everywhere, and
+    # dynamic-rope ``inv_freq`` is recomputed from *this* rank's sequence length,
+    # so pushing rank0's copy would actively corrupt the others. Genuinely
+    # replicated mutable state — ``nn.BatchNorm*`` running stats — is NOT fixed by
+    # this broadcast either: it overwrites every rank with rank0's copy, i.e.
+    # discards the other ranks' statistics, and it would break any module owning
+    # more than one graph node, because ``call_graph_endpoint`` enters the wrapper
+    # once per node and the in-place pre-forward ``copy_`` then hits a buffer the
+    # first node's autograd graph saved for backward (PyTorch #22095 / #66504).
+    # ``SyncBatchNorm`` is the one real fix — it all-reduces the statistics inside
+    # forward — and it works identically under DDP, FSDP2 and HSDP.
+    #
+    # See constraint 7e in `.agents/knowledge/constraints.md`.
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],
         process_group=parallel_state.dp_group,
+        find_unused_parameters=True,
         broadcast_buffers=False,
     )
 
@@ -790,6 +816,10 @@ def build_parallelize_model(
     """Apply parallel strategies to the model.
 
     Args:
+        weights_path: ``None`` for random init, or a single HF snapshot for the
+            whole ``model``. The single-model trainers (BaseTrainer / VLMTrainer
+            / TextTrainer / DiTTrainer) pass ``args.model.model_path``; SeedOmni
+            V2 calls this once per ``ModuleRuntime``, with that module's path.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
@@ -854,7 +884,9 @@ def build_parallelize_model(
             )
         else:
             if compile_config.enable:
-                raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
+                raise RuntimeError(
+                    "model.accelerator.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported."
+                )
             model = parallelize_model_ddp(
                 model=model,
                 weights_path=weights_path,
@@ -862,6 +894,8 @@ def build_parallelize_model(
                 **kwargs,
             )
     elif compile_config.enable:
-        raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable requires FSDP2; compile without FSDP is not supported."
+        )
 
     return model

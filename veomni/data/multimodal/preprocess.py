@@ -373,6 +373,38 @@ def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
+@PREPROCESSOR_REGISTRY.register("veomni_omni_demo")
+def veomni_omni_demo_preprocess(conversations, **kwargs):
+    """Unified SeedOmni V2 demo schema — one shape for every UG scenario.
+
+    Flat chat JSON: each message is
+    ``{"role": <system|user|assistant>, "content": [...]}`` with typed items::
+
+        {"type": "text",  "value": "..."}
+        {"type": "image"}   # placeholder; bytes live in parallel ``images`` list
+
+    Understanding vs generation is encoded by ``role`` (``user`` vs ``assistant``),
+    not by item type.  See ``docs/seed_omni/data_format.md`` for I2T / T2I /
+    interleave (UG) examples.
+    """
+    constructed = []
+    for message in conversations:
+        role = message["role"]
+        turn = [role]
+        for item in message.get("content", []):
+            type_ = item["type"]
+            if type_ == "text":
+                turn.append(("text", item.get("value", "")))
+            elif type_ == "image":
+                turn.append(("image", None))
+            else:
+                raise ValueError(
+                    f"veomni_omni_demo: unsupported content type {type_!r}; expected one of 'text' / 'image'."
+                )
+        constructed.append(turn)
+    return constructed
+
+
 @PREPROCESSOR_REGISTRY.register("qwen_omni_offline_av")
 def qwen_omni_offline_av_preprocess(conversations, **kwargs):
     """Offline-extracted audio-enabled video shape for Qwen-Omni.

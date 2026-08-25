@@ -35,6 +35,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import veomni.trainer.base as trainer_base
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
@@ -150,6 +151,31 @@ def test_base_trainer_rejects_lora_without_trainable_adapters():
 
     with pytest.raises(ValueError, match="no trainable adapters"):
         trainer._setup_lora()
+
+
+def test_base_trainer_warns_instead_of_raising_for_customized_lora(monkeypatch):
+    """A ``customized_setup_lora`` hook owns its own naming, so a missed
+    ``lora_A`` / ``lora_B`` probe must warn rather than abort the run."""
+
+    class CustomLoraModel(Toy):
+        def customized_setup_lora(self, lora_config):
+            self.custom_adapter = nn.Parameter(torch.zeros(1))
+            return self
+
+    warnings_seen: list[str] = []
+    monkeypatch.setattr(
+        trainer_base.logger, "warning_rank0", lambda msg, *args, **kwargs: warnings_seen.append(str(msg))
+    )
+
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.model = CustomLoraModel()
+    trainer.args = SimpleNamespace(model=SimpleNamespace(lora_config={"rank": 8, "alpha": 16}))
+
+    trainer._setup_lora()
+
+    assert isinstance(trainer.model, CustomLoraModel)
+    assert hasattr(trainer.model, "custom_adapter")
+    assert any("customized_setup_lora produced no trainable parameters" in msg for msg in warnings_seen)
 
 
 @pytest.mark.parametrize("is_trainable", [True, False])

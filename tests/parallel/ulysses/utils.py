@@ -15,7 +15,8 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
-from veomni.distributed.sequence_parallel import set_ulysses_sequence_parallel_group
+from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.sequence_parallel import get_ulysses_sequence_parallel_group
 
 
 def sync_tensor(variable, dim=1):
@@ -70,8 +71,12 @@ class SequenceParallelTest(CommonDistributedDataParallelTest, MultiProcessTestCa
         store = self._get_store()
         get_torch_device().set_device(self.rank)
         c10d.init_process_group(get_dist_comm_backend(), store=store, rank=self.rank, world_size=self.world_size)
-        group = c10d.distributed_c10d._get_default_group()
-        set_ulysses_sequence_parallel_group(group)
+        # Build a real ParallelState (Ulysses SP over all ranks) instead of
+        # injecting a raw group: the SP getters resolve from the current state's
+        # device mesh. ``set_parallel_state(None)`` in a test disables SP (the DP
+        # reference path). ``device_type`` defaults to the current accelerator.
+        init_parallel_state(dp_size=1, ulysses_size=self.world_size)
+        group = get_ulysses_sequence_parallel_group()
         self.rank = dist.get_rank(group)
         return group
 

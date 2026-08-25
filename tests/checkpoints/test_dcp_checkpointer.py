@@ -264,6 +264,9 @@ class TestMaterializeAndLoadDispatch:
             should_skip_hf_weight_load=False,
             is_peft_model=False,
             adapter_path=None,
+            cpu_load_param_name=None,
+            max_load_broadcast_size=20.0,
+            fqn_to_index_mapping=None,
             **{"broadcast_from_rank0": False, **flags},
         )
 
@@ -300,6 +303,9 @@ class TestMaterializeAndLoadDispatch:
                 is_peft_model=True,
                 adapter_path=None,
                 broadcast_from_rank0=False,
+                cpu_load_param_name=None,
+                max_load_broadcast_size=20.0,
+                fqn_to_index_mapping=None,
             )
 
     def test_a_buffer_derived_from_a_parameter_is_warned_about_not_preserved(self, monkeypatch):
@@ -830,9 +836,9 @@ class TestGlobalStepInflation:
                     manager="dcp",
                     dcp_save_to_lowest_rank=False,
                 ),
-                accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")),
                 global_rank=0,
             ),
+            model=SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"))),
         )
         mock_build_ckpt.return_value = trainer.checkpointer
         trainer.checkpointer.save_future = None

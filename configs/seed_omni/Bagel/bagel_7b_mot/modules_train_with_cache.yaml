@@ -1,0 +1,23 @@
+bagel_vae:
+  model_path: bagel_vae
+  model_config:
+    support_cache: true
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+bagel_siglip_navit:
+  model_path: bagel_siglip_navit
+bagel_text_encoder:
+  model_path: bagel_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+bagel_flow_connector:
+  model_path: bagel_flow_connector
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+bagel_qwen2_mot:
+  model_path: bagel_qwen2_mot
+  ops_implementation:
+    attn_implementation: flex_attention

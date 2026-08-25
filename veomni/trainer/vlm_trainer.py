@@ -157,8 +157,8 @@ class VLMTrainer:
         self.base.model = build_foundation_model(
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
-            torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=args.train.init_device,
+            torch_dtype="float32" if args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+            init_device=args.model.accelerator.init_device,
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
             ops_implementation=args.model.ops_implementation,
@@ -168,12 +168,15 @@ class VLMTrainer:
 
     def _validate_torch_compile(self):
         args: VeOmniVLMArguments = self.base.args
-        if not args.train.torch_compile.enable:
+        if not args.model.accelerator.torch_compile.enable:
             return
 
-        accelerator = args.train.accelerator
+        accelerator = args.model.accelerator
         compile_config = CompileConfig(
-            **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
+            **{
+                field.name: getattr(args.model.accelerator.torch_compile, field.name)
+                for field in fields(CompileConfig)
+            }
         )
         validate_compile_model(
             self.base.model,
@@ -301,18 +304,19 @@ class VLMTrainer:
         if vit_params:
             param_groups.append({"params": vit_params, "lr": args.train.vit_lr})
         if other_params:
-            param_groups.append({"params": other_params, "lr": args.train.optimizer.lr})
+            param_groups.append({"params": other_params, "lr": args.model.optimizer.lr})
 
         self.base.optimizer = build_optimizer(
             self.base.model,
-            lr=args.train.optimizer.lr,
-            weight_decay=args.train.optimizer.weight_decay,
+            lr=args.model.optimizer.lr,
+            weight_decay=args.model.optimizer.weight_decay,
             fused=True,
-            optimizer_type=args.train.optimizer.type,
+            optimizer_type=args.model.optimizer.type,
             param_groups=param_groups,
-            no_decay_modules=args.train.optimizer.no_decay_modules,
-            no_decay_params=args.train.optimizer.no_decay_params,
-            optimizer_config=args.train.optimizer,
+            no_decay_modules=args.model.optimizer.no_decay_modules,
+            no_decay_params=args.model.optimizer.no_decay_params,
+            betas=args.model.optimizer.betas,
+            optimizer_config=args.model.optimizer,
         )
 
     def on_train_begin(self):
@@ -371,7 +375,7 @@ class VLMTrainer:
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()

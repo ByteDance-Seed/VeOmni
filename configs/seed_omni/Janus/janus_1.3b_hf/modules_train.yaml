@@ -1,0 +1,47 @@
+# Resume training directly from a self-contained omni HF checkpoint (8 GPUs).
+#
+# ``janus_1.3b_hf/base.yaml`` declares no ``model_config`` — the training graph,
+# per-module HF configs, and ``generation_kwargs`` all come from the checkpoint's
+# own ``config.json`` (see ``model_path``). This file only supplies the
+# launcher-side accelerator plan (parallel strategy), which is intentionally
+# *not* part of the checkpoint, per the HF-modeling / VeOmni-runtime split:
+#   janus_siglip / janus_vqvae -> ddp (replicated)
+#   janus_llama                -> fsdp2 (sharded backbone)
+#   janus_text_encoder         -> emb-parallel across 4 ranks (vocab-parallel wte/lm_head)
+#
+# Launch:
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b_hf/base.yaml \
+#     --model.model_config.modules configs/seed_omni/Janus/janus_1.3b_hf/modules_train.yaml \
+#     --train.checkpoint.output_dir outputs/janus_1.3b_hf_resume
+janus_siglip:
+  model_path: janus_siglip
+  accelerator:
+    init_device: cuda # ddp doesn't need meta-init's broadcast dance
+    broadcast_model_weights_from_rank0: false # only meaningful for fsdp2
+    fsdp_config:
+      fsdp_mode: ddp
+
+janus_vqvae:
+  model_path: janus_vqvae
+  ops_implementation:
+    attn_implementation: eager
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+
+janus_text_encoder:
+  model_path: janus_text_encoder
+  accelerator:
+    extra_parallel_sizes: [4]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    gradient_checkpointing:
+      enable: false
+
+janus_llama:
+  model_path: janus_llama
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2

@@ -189,8 +189,8 @@ class DiTTrainer:
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
     def __init__(self, args: VeOmniDiTArguments):
-        if getattr(getattr(args.train, "chunk_mbs_config", None), "enable", False):
-            raise ValueError("train.chunk_mbs_config is not supported by DiTTrainer.")
+        if args.model.accelerator.chunk_mbs_config.enable:
+            raise ValueError("model.accelerator.chunk_mbs_config is not supported by DiTTrainer.")
         if args.train.channel_loss.enable:
             raise ValueError(
                 "train.channel_loss is only supported by causal-LM trainers; DiTTrainer uses diffusion objectives."
@@ -290,8 +290,8 @@ class DiTTrainer:
             self.base.model = build_foundation_model(
                 config_path=args.model.config_path,
                 weights_path=args.model.model_path,
-                torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-                init_device=args.train.init_device,
+                torch_dtype="float32" if args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+                init_device=args.model.accelerator.init_device,
                 ops_implementation=args.model.ops_implementation,
                 config_kwargs=model_config,
             )
@@ -550,7 +550,7 @@ class DiTTrainer:
 
         if self.training_task != "offline_embedding":
             with use_parallel_state("base"):
-                grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+                grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
             self.base.optimizer.step()
             self.base.lr_scheduler.step()
             self.base.optimizer.zero_grad()

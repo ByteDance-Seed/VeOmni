@@ -149,11 +149,38 @@ def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]
     micro_batch.pop("source_name", None)
     micro_batch.pop("cur_token_num", None)
     if isinstance(ds_idx, torch.Tensor):
-        # packed micro batch
+        # packed micro batch (e.g. PackingCollator)
         return ds_idx.tolist()
-    else:
-        # unpacked sample
-        return [ds_idx]
+    if isinstance(ds_idx, list):
+        # SeedOmniCollator gathers per-sample ds_idx into a list
+        return [int(idx) for idx in ds_idx]
+    # single-sample micro batch
+    return [int(ds_idx)]
+
+
+def compute_device_memory_metrics() -> Dict[str, Any]:
+    """Device + host memory metrics, reduced (max) across all ranks.
+
+    Shared by :class:`EnvironMeter` (single model) and
+    :class:`veomni.utils.omni_helper.OmniEnvironMeter` (OmniModel V2) — these are
+    module-agnostic and depend only on the device, so both meters report them
+    identically.
+    """
+    allocated_memory = get_torch_device().max_memory_allocated()
+    reserved_memory = get_torch_device().max_memory_reserved()
+    num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
+    allocated_memory, reserved_memory, num_alloc_retries = all_reduce(
+        (allocated_memory, reserved_memory, num_alloc_retries), op="max"
+    )
+    cpu_memory_info = psutil.virtual_memory()
+    return {
+        "max_memory_allocated(GB)": allocated_memory / (1024**3),
+        "max_memory_reserved(GB)": reserved_memory / (1024**3),
+        "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
+        "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
+        "cpu_memory_usage(%)": cpu_memory_info.percent,
+        "num_alloc_retries": num_alloc_retries,
+    }
 
 
 class EnvironMeter:
@@ -290,17 +317,6 @@ class EnvironMeter:
         self.consume_tokens += batch_tokens
         self.consume_chunks += real_global_batch_size
 
-        # cuda memory
-        allocated_memory = get_torch_device().max_memory_allocated()
-        reserved_memory = get_torch_device().max_memory_reserved()
-        num_alloc_retries = get_torch_device().memory_stats()["num_alloc_retries"]
-        allocated_memory, reserved_memory, num_alloc_retries = all_reduce(
-            (allocated_memory, reserved_memory, num_alloc_retries), op="max"
-        )
-
-        # cpu memory
-        cpu_memory_info = psutil.virtual_memory()
-
         metrics = {
             "flops_achieved(T)": flops_achieved,
             "flops_promised(T)": flops_promised,
@@ -311,13 +327,8 @@ class EnvironMeter:
             "consume_tokens(M)": self.consume_tokens / 1e6,
             "consume_tokens(B)": self.consume_tokens / 1e9,
             "consumed_chunk_num": self.consume_chunks,
-            "max_memory_allocated(GB)": allocated_memory / (1024**3),
-            "max_memory_reserved(GB)": reserved_memory / (1024**3),
-            "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
-            "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
-            "cpu_memory_usage(%)": cpu_memory_info.percent,
-            "num_alloc_retries": num_alloc_retries,
         }
+        metrics.update(compute_device_memory_metrics())
 
         if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))

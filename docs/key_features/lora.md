@@ -386,7 +386,7 @@ LoRA fused pointers are bound by `veomni.ops.kernels.moe.apply_veomni_fused_moe_
 Both `fused_triton` and `fused_npu` support the EP path; `fused_npu` uses the
 Ascend GroupGEMM implementation in `veomni/lora/ops/npu_moe_group_gemm.py`.
 
-When `train.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
+When `model.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
 `ParallelPlan` (`Shard(0)` on `gate_up_proj` / `down_proj`). MoE-LoRA tracks this layout:
 
 - **Independent mode**: LoRA tensors are 3-D `[E, ...]` and are EP-sharded along the
@@ -459,8 +459,8 @@ model:
       - ffn.net.2
 
 train:
-  init_device: meta
   accelerator:
+    init_device: meta
     fsdp_config:
       fsdp_mode: fsdp2
 ```
@@ -479,7 +479,7 @@ bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
     --train.training_task        offline_training \
     --train.global_batch_size    8 \
     --train.micro_batch_size     1 \
-    --train.accelerator.ulysses_size ${SP_SIZE} \
+    --model.accelerator.ulysses_size ${SP_SIZE} \
     --train.checkpoint.output_dir ./exp/wan_lora \
     --train.checkpoint.save_hf_weights true \
     --train.checkpoint.save_epochs 5 \
@@ -516,8 +516,8 @@ model:
       - down_proj
 
 train:
-  init_device: meta          # required for FSDP2
   accelerator:
+    init_device: meta          # required for FSDP2
     fsdp_config:
       fsdp_mode: fsdp2
 ```
@@ -568,8 +568,8 @@ model:
     share_expert_lora: true                            # one LoRA per layer (Mode 2)
 
 train:
-  init_device: meta
   accelerator:
+    init_device: meta
     ulysses_size: 1
     ep_size: 1                          # set >1 to enable EP; also set moe_implementation: fused_triton
     fsdp_config:
@@ -608,7 +608,7 @@ sets `ep_size: 8` and additionally LoRA-wraps DeepSeek's MLA projections
 `lora_modules`.
 
 For the Qwen3.5-MoE-35B Ascend NPU and H200 commands, backend matrix, validation
-method, and measured results, see [Qwen3.5-MoE-35B LoRA practice](../examples/qwen3_5_moe_lora.md).
+method, and measured results, see [Qwen3.5](../examples/qwen3_5.md).
 
 ---
 
@@ -636,8 +636,8 @@ model:
       - net.2
 
 train:
-  init_device: meta
   accelerator:
+    init_device: meta
     fsdp_config:
       fsdp_mode: fsdp2
 ```
