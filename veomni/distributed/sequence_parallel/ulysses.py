@@ -229,6 +229,38 @@ class _Gather(torch.autograd.Function):
         )
 
 
+class _GatherSplitNoSum(torch.autograd.Function):
+    """All-gather + concat over the SP group; backward only slices the incoming
+    full-sequence grad back to this rank's local segment.
+
+    Unlike ``_Gather`` above, the backward does NOT all-reduce. After this
+    gather the full output is replicated on every SP rank and the downstream
+    loss (e.g. the MiniMaxH3 wrapper's MSE reduction over the full output) is
+    identical on all of them, so the incoming grad is already the true full
+    grad — summing it over the group would double it. Parameter gradients are
+    combined by FSDP over the ``dp_shard_sp`` mesh, which spans the Ulysses
+    twins, so each rank only contributes its own rows' grads here.
+    """
+
+    @staticmethod
+    def forward(ctx, group, local_input, dim):
+        ctx.dim = dim
+        ctx.rank = dist.get_rank(group)
+        padded = local_input.contiguous()
+        gathered = [torch.empty_like(padded) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(gathered, padded, group=group)
+        ctx.size_list = [g.shape[dim] for g in gathered]
+        return torch.cat(gathered, dim=dim)
+
+    @staticmethod
+    def backward(ctx, grad_full):
+        return (
+            None,
+            grad_full.split(ctx.size_list, dim=ctx.dim)[ctx.rank].contiguous(),
+            None,
+        )
+
+
 def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: ProcessGroup = None) -> Tensor:
     """
     A func to sync attention result with alltoall in sequence parallel

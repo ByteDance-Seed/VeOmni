@@ -3,8 +3,15 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
+from veomni.distributed.sequence_parallel import (
+    gather_heads_scatter_seq,
+    gather_seq_scatter_heads,
+)
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
+from veomni.distributed.sequence_parallel.ulysses import _GatherSplitNoSum
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .core import attention_forward, gradient_checkpoint_forward
@@ -149,7 +156,7 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
 
-    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None):
+    def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, use_ulysses=False):
         total = x.shape[0]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
@@ -161,7 +168,17 @@ class MiniMaxH3Attention(nn.Module):
         if rope_cos is not None:
             q = _apply_rope(q, rope_cos, rope_sin)
             k = _apply_rope(k, rope_cos, rope_sin)
+        # Ulysses: exchange local seq for half heads; attention runs on the full
+        # sequence with num_heads / sp_size heads, then the output is exchanged
+        # back so the residual / MLP / AdaLN path stays local to this rank's half.
+        sp_group = get_ulysses_sequence_parallel_group() if use_ulysses else None
+        if sp_group is not None:
+            q = gather_seq_scatter_heads(q, seq_dim=0, head_dim=1, group=sp_group)
+            k = gather_seq_scatter_heads(k, seq_dim=0, head_dim=1, group=sp_group)
+            v = gather_seq_scatter_heads(v, seq_dim=0, head_dim=1, group=sp_group)
         out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
+        if sp_group is not None:
+            out = gather_heads_scatter_seq(out, seq_dim=0, head_dim=1, group=sp_group)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -263,12 +280,19 @@ class MiniMaxH3DiTBlock(nn.Module):
             hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM
         )
 
-    def forward(self, x, *, t_emb, combined_indices, rope_cos, rope_sin, cu_seqlens, max_seqlen):
+    def forward(self, x, *, t_emb, combined_indices, rope_cos, rope_sin, cu_seqlens, max_seqlen, use_ulysses=False):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         residual = x
         h = self.norm1(x)
         h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices)
-        h = self.attn(h, rope_cos=rope_cos, rope_sin=rope_sin, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        h = self.attn(
+            h,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            use_ulysses=use_ulysses,
+        )
         x = _modulate_gate(residual, gate_msa, h, combined_indices)
         residual = x
         h = self.norm2(x)
@@ -465,6 +489,14 @@ class MiniMaxH3DiT(nn.Module):
         text_pos = text_pos_info["position_ids"].view(-1).to(torch.long)
         infer_out_pos = img_pos_for_infer_output_info["position_ids"].view(-1).to(torch.long)
 
+        # Ulysses sequence parallel: pad the packed sequence so it splits evenly
+        # across the SP ranks, then each rank processes its own contiguous half.
+        # Attention exchanges local seq for half the heads inside the module; the
+        # residual / MLP / AdaLN path and the output projections stay local.
+        sp_group = get_ulysses_sequence_parallel_group()
+        sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
+        sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
+
         cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
         refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
@@ -478,6 +510,14 @@ class MiniMaxH3DiT(nn.Module):
         if self._block_offload_enabled:
             self._stage_side_modules(device)
 
+        unit = (seq_len + sp_world - 1) // sp_world
+        padded_seq_len = unit * sp_world
+        pad = padded_seq_len - seq_len
+        if pad and sp_world > 1:
+            # Repeat the last (t, h, w) position for the pad rows; they belong to
+            # the pad segment and are masked out by update_mask before the loss.
+            img_position_ids = torch.cat((img_position_ids, img_position_ids[:, -1:, :].expand(-1, pad, -1)), dim=1)
+
         rope_freqs = self.rope(img_position_ids).to(device)
 
         decoder_input, t_emb = self._embed(
@@ -490,9 +530,15 @@ class MiniMaxH3DiT(nn.Module):
             text_pos=text_pos.to(device),
             refiner_cu_seqlens=tuple(refiner_cu.to(device).tolist()),
             refiner_max_seqlen=refiner_max,
-            seq_len=seq_len,
+            seq_len=padded_seq_len,
             device=device,
         )
+
+        if pad and sp_world > 1:
+            # AdaLN modulation indices / output gather positions for the pad
+            # rows: zeros are safe, they are masked out by update_mask.
+            inverse_indices = torch.cat((inverse_indices, inverse_indices.new_zeros(pad)))
+            token_tags = torch.cat((token_tags, token_tags.new_zeros(pad)))
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
@@ -502,11 +548,20 @@ class MiniMaxH3DiT(nn.Module):
         rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
         rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype).unsqueeze(1)
 
+        if sp_world > 1:
+            decoder_input = decoder_input.narrow(0, unit * sp_rank, unit)
+            combined_indices = combined_indices.narrow(0, unit * sp_rank, unit)
+            inverse_indices = inverse_indices.narrow(0, unit * sp_rank, unit)
+            rope_cos = rope_cos.narrow(0, unit * sp_rank, unit)
+            rope_sin = rope_sin.narrow(0, unit * sp_rank, unit)
+
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         # Single device→host sync per forward: segment bounds shared across
         # every block instead of one tolist() per attention module.
         cu_bounds = tuple(cu_seqlens.tolist())
+        if sp_world > 1 and cu_bounds[-1] != padded_seq_len:
+            cu_bounds = cu_bounds[:-1] + (padded_seq_len,)
         block_swap = self._block_swap if self._block_offload_enabled else 0
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:
@@ -529,6 +584,7 @@ class MiniMaxH3DiT(nn.Module):
                 rope_sin=rope_sin,
                 cu_seqlens=cu_bounds,
                 max_seqlen=max_seqlen,
+                use_ulysses=sp_world > 1,
             )
 
         if self._block_offload_enabled:
@@ -536,6 +592,14 @@ class MiniMaxH3DiT(nn.Module):
                 b.to("cpu")
 
         video_logits, audio_logits = self.final_layer(hidden, t_emb=t_emb, inverse_indices=inverse_indices)
+
+        if sp_group is not None:
+            # Rebuild the full packed sequence so the output position
+            # index_select / update_mask below see the original layout. The
+            # backward splits (no all-reduce): the downstream loss is replicated
+            # across the SP ranks, so a sum would double the gradient.
+            video_logits = _GatherSplitNoSum.apply(sp_group, video_logits, 0)
+            audio_logits = _GatherSplitNoSum.apply(sp_group, audio_logits, 0)
 
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))
