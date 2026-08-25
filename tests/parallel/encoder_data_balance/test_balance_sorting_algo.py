@@ -3,6 +3,7 @@ import random
 import torch
 
 from veomni.utils.data_balance.balance_sorting_algo import SORTING_ALGO_FUNC
+from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from veomni.utils.device import get_device_type
 
 
@@ -43,7 +44,7 @@ def check_balance_sorting(rank_table, balanced_data_gt, role="s2"):
 
     # Check whether the load matches the given ground truth
     # Calculate the workload of current rank
-    rank_table_cur_rank_wl = [WORKLOAD_CAL_RULE[role](torch.cat(rt)).sum() for rt in rank_table]
+    rank_table_cur_rank_wl = [WORKLOAD_CAL_RULE[role](rt).sum() for rt in rank_table]
 
     # Since the ground truth is a manually constructed perfectly balanced data distribution,
     # the load on each DP group after applying the reordering algorithm must exactly match that of the ground truth;
@@ -62,3 +63,71 @@ def test_post_mbs_balancing_greedy_without_pad_s2():
     )
 
     check_balance_sorting(rank_table, balanced_fake_data_lengths_per_dp)
+
+
+def _reference_greedy(all_data_lengths, num_replicas, dim):
+    sorted_indices = torch.argsort(all_data_lengths[:, dim].float(), descending=True)
+    sorted_rows = all_data_lengths[sorted_indices]
+    costs = (sorted_rows[:, dim] ** 2).cpu()
+
+    prefill = min(num_replicas, len(sorted_rows))
+    loads = torch.empty(num_replicas, dtype=torch.long)
+    loads[:prefill] = costs[:prefill]
+    buckets = [[sorted_rows[index]] if index < prefill else [] for index in range(num_replicas)]
+    for index, row in enumerate(sorted_rows[prefill:]):
+        target = loads.argmin()
+        buckets[target].append(row)
+        loads[target] += costs[index + prefill]
+    return [torch.stack(bucket) for bucket in buckets]
+
+
+def test_post_mbs_balancing_greedy_matches_tensor_argmin_reference():
+    device = get_device_type()
+    source_rank = torch.arange(32, device=device) % 4
+    source_index = torch.arange(32, device=device)
+    lengths = torch.tensor(
+        [
+            256,
+            9408,
+            784,
+            5120,
+            320,
+            8960,
+            640,
+            3072,
+            1120,
+            8624,
+            768,
+            4096,
+            448,
+            7296,
+            1280,
+            5760,
+            384,
+            9072,
+            1728,
+            3520,
+            2560,
+            4800,
+            640,
+            8160,
+            896,
+            5440,
+            1536,
+            6800,
+            320,
+            9216,
+            2304,
+            784,
+        ],
+        device=device,
+    )
+    all_data_lengths = torch.stack((source_rank, source_index, lengths), dim=1)
+
+    rank_table = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](all_data_lengths, num_replicas=4, dim=2)
+    reference = _reference_greedy(all_data_lengths, num_replicas=4, dim=2)
+
+    assert all(torch.equal(actual, expected) for actual, expected in zip(rank_table, reference))
+    data_list, normalized_table = Qwen3VLEncoderDataBalance.rank_table_mapping(rank_table, dp_rank=2)
+    assert all(torch.equal(actual, expected) for actual, expected in zip(normalized_table, reference))
+    assert all(index.dtype == torch.long for index in data_list)
