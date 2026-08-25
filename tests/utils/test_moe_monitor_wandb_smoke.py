@@ -107,11 +107,11 @@ def test_full_pipeline_through_wandb_offline():
             model.r0.set_next_indices(idx0)
             model.r1.set_next_indices(idx1)
             model(torch.zeros(tokens, 4))
+            monitor.record_ep_balance(0, (14, 2), (8, 8), active_replicas=1, moved_tokens=3)
+            monitor.record_ep_balance(1, (16, 0), (8, 8), active_replicas=1, moved_tokens=8)
 
             metrics = monitor.compute_metrics(current_step=step)
-            wandb_metrics = {
-                k: (wandb.Image(v) if k.endswith("expert_load_heatmap") else v) for k, v in metrics.items()
-            }
+            wandb_metrics = {k: (wandb.Image(v) if k.endswith("_heatmap") else v) for k, v in metrics.items()}
             wandb.log(wandb_metrics, step=step)
 
         # ``wandb.log`` accepted every entry without exception (we got here).
@@ -124,6 +124,11 @@ def test_full_pipeline_through_wandb_offline():
             "moe/avg_vio/max",
             "moe/max_vio/layer_0",
             "moe/max_vio/layer_1",
+            "moe/ep_rank_imbalance_before/avg",
+            "moe/ep_rank_imbalance_after/avg",
+            "moe/ep_active_replicas/sum",
+            "moe/ep_moved_tokens/sum",
+            "moe/ep_moved_token_fraction/avg",
         }
         missing = required_scalars - summary.keys()
         assert not missing, f"missing scalar keys in run.summary: {missing}"
@@ -134,6 +139,11 @@ def test_full_pipeline_through_wandb_offline():
         assert summary["moe/max_vio/max"] == pytest.approx(num_experts - 1)
         # Heatmap key is recorded in summary as a media descriptor.
         assert "moe/expert_load_heatmap" in summary
+        assert "moe/ep_rank_load_before_heatmap" in summary
+        assert "moe/ep_rank_load_after_heatmap" in summary
+        assert summary["moe/ep_rank_imbalance_before/avg"] > summary["moe/ep_rank_imbalance_after/avg"]
+        assert summary["moe/ep_active_replicas/sum"] == 2
+        assert summary["moe/ep_moved_tokens/sum"] == 11
     finally:
         wandb.finish()
         set_active_monitor(None)

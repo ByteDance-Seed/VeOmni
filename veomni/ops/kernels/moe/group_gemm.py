@@ -15,6 +15,7 @@
 import torch
 
 from ....distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, dispatch_to_ep_class
+from ....distributed.moe.moe_layer import _validate_merged_expert_weights
 from ....distributed.parallel_state import get_parallel_state
 from ._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
@@ -530,6 +531,7 @@ def group_gemm_fused_moe_forward(
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    load_balancer=None,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -539,14 +541,22 @@ def group_gemm_fused_moe_forward(
     - Non-EP path: dispatches to ``MergedFc1TritonFusedMoeExpertFunction`` when
       merged weights are provided, or ``TritonFusedMoeExpertFunction`` when split
       weights are provided.  No format conversion is performed.
-    - EP path: always resolves to split format for ``EPGroupGemm``.
+    - EP path: dispatches merged weights to ``EPMergedFc1GroupGemm`` and split
+      weights to ``EPGroupGemm``. Temporary replica balancing is accepted only
+      by the merged path.
 
     ``swiglu_limit``: gpt-oss / DeepSeek-V4 style clamp on the SwiGLU
     pre-activations (``gate.clamp(max=L)``, ``up.clamp(min=-L, max=L)``).
     ``None`` disables the clamp (default, zero overhead — used by every legacy
     MoE model).
     """
-    if get_parallel_state().ep_enabled:
+    ep_enabled = get_parallel_state().ep_enabled
+    if load_balancer is not None:
+        if not ep_enabled or fc1_1_2_weight is None or fc1_1_weight is not None or fc1_2_weight is not None:
+            raise ValueError("EP load balancing requires merged expert weights with expert parallelism enabled.")
+        _validate_merged_expert_weights(fc1_1_2_weight, fc2_weight)
+
+    if ep_enabled:
         if fc1_1_2_weight is not None:
             if fc1_1_weight is not None or fc1_2_weight is not None:
                 raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
@@ -559,6 +569,7 @@ def group_gemm_fused_moe_forward(
                 fc1_1_2_weight,
                 fc2_weight,
                 swiglu_limit,
+                load_balancer=load_balancer,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:

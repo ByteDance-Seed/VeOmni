@@ -31,6 +31,10 @@ train:
     ulysses_size: 4
     fsdp_config:
       fsdp_mode: fsdp2
+  moe_load_balance_monitor_interval: 0
+  moe_ep_load_balance:
+    enabled: false
+    max_replicas_per_rank: 1
   gradient_checkpointing:
     enable_reentrant: false
   wandb:

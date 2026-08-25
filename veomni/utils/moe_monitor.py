@@ -61,6 +61,7 @@ Do not try to recompute the top-k inside this module — the gating math is
 family-specific and prone to drift.
 """
 
+from numbers import Integral
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -115,6 +116,7 @@ def register_router_extractor(class_name: str) -> Callable[[RouterExtractor], Ro
 
 
 @register_router_extractor("Qwen3MoeTopKRouter")
+@register_router_extractor("Qwen3_5MoeTopKRouter")
 @register_router_extractor("Qwen3VLMoeTopKRouter")
 @register_router_extractor("Qwen3OmniMoeTopKRouter")
 def _extract_qwen3_topk(output: Any) -> Optional[torch.Tensor]:
@@ -222,7 +224,7 @@ class MoERouterMonitor:
     """Accumulates per-layer per-expert token counts and produces summary metrics.
 
     Counts accumulate on device. The only CPU-sync points are inside
-    :meth:`compute_metrics` (one all-reduce + one host transfer per interval).
+    :meth:`compute_metrics` (DP+SP/FSDP reductions + host transfer per interval).
     """
 
     def __init__(
@@ -251,6 +253,15 @@ class MoERouterMonitor:
         self._layer_order: List[int] = []
         # Per-module accumulated counts, lazily allocated on first record.
         self._counts: Dict[int, torch.Tensor] = {}
+
+        # Physical EP telemetry is keyed by the stable router-layer index used
+        # by the Qwen3.5 load-balancer attachment. Tensors live on the same
+        # device as the corresponding logical router counts.
+        self._ep_rank_loads_before: Dict[int, torch.Tensor] = {}
+        self._ep_rank_loads_after: Dict[int, torch.Tensor] = {}
+        # Per-layer [active_replicas, moved_tokens, total_routed_tokens].
+        self._ep_stats: Dict[int, torch.Tensor] = {}
+        self._ep_rank_size: Optional[int] = None
 
         # Step range tracking for heatmap captions.
         self._accumulate_start_step: int = 0
@@ -295,6 +306,11 @@ class MoERouterMonitor:
         for mid in self._counts:
             self._counts[mid].zero_()
 
+    def _reset_ep_balance(self) -> None:
+        self._ep_rank_loads_before.clear()
+        self._ep_rank_loads_after.clear()
+        self._ep_stats.clear()
+
     # ---------------------- Recording ----------------------
 
     def record(self, module: nn.Module, router_indices: torch.Tensor) -> None:
@@ -315,6 +331,95 @@ class MoERouterMonitor:
             minlength=self.num_experts,
         )
         self._counts[mid] += counts.detach()
+
+    @staticmethod
+    def _validate_nonnegative_integer(name: str, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer.")
+        return int(value)
+
+    @staticmethod
+    def _normalize_rank_loads(name: str, values: Any) -> tuple[int, ...]:
+        if isinstance(values, torch.Tensor):
+            if values.ndim != 1:
+                raise ValueError(f"{name} must have one-dimensional rank-load shape.")
+            if values.dtype == torch.bool or values.is_floating_point() or values.is_complex():
+                raise ValueError(f"{name} entries must be non-negative integers.")
+            values = values.detach().cpu().tolist()
+        else:
+            try:
+                values = tuple(values)
+            except TypeError as exc:
+                raise ValueError(f"{name} must have one-dimensional rank-load shape.") from exc
+
+        if not values:
+            raise ValueError(f"{name} must contain at least one EP-rank load.")
+        normalized = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                raise ValueError(f"{name} entries must be non-negative integers.")
+            normalized.append(int(value))
+        return tuple(normalized)
+
+    def record_ep_balance(
+        self,
+        layer_index: int,
+        before_rank_loads: Any,
+        after_rank_loads: Any,
+        active_replicas: int,
+        moved_tokens: int,
+    ) -> None:
+        """Accumulate physical EP-rank balance telemetry for one routing plan.
+
+        The caller supplies one before/after load per EP rank. The monitor
+        validates each plan before mutating interval state and deliberately
+        stores the values on the corresponding router-count device.
+        """
+        if self._paused or self._disabled:
+            return
+
+        layer_index = self._validate_nonnegative_integer("layer_index", layer_index)
+        if layer_index >= len(self._layer_order):
+            raise ValueError(
+                f"layer_index {layer_index} does not match an attached router layer "
+                f"(registered layers: {len(self._layer_order)})."
+            )
+        before = self._normalize_rank_loads("before_rank_loads", before_rank_loads)
+        after = self._normalize_rank_loads("after_rank_loads", after_rank_loads)
+        if len(before) != len(after):
+            raise ValueError("before_rank_loads and after_rank_loads must have the same shape.")
+        if sum(before) != sum(after):
+            raise ValueError("before_rank_loads and after_rank_loads must conserve routed tokens.")
+        if self._ep_rank_size is not None and len(before) != self._ep_rank_size:
+            raise ValueError(f"EP rank-load size must remain {self._ep_rank_size} across layers; got {len(before)}.")
+        active_replicas = self._validate_nonnegative_integer("active_replicas", active_replicas)
+        moved_tokens = self._validate_nonnegative_integer("moved_tokens", moved_tokens)
+
+        router_mid = self._layer_order[layer_index]
+        router_counts = self._counts.get(router_mid)
+        if router_counts is None:
+            raise ValueError(
+                f"layer_index {layer_index} has no router counts yet; physical telemetry must follow router recording."
+            )
+
+        device = router_counts.device
+        before_tensor = torch.tensor(before, dtype=torch.long, device=device)
+        after_tensor = torch.tensor(after, dtype=torch.long, device=device)
+        stats_tensor = torch.tensor(
+            (active_replicas, moved_tokens, sum(before)),
+            dtype=torch.long,
+            device=device,
+        )
+        if layer_index in self._ep_rank_loads_before:
+            self._ep_rank_loads_before[layer_index] += before_tensor
+            self._ep_rank_loads_after[layer_index] += after_tensor
+            self._ep_stats[layer_index] += stats_tensor
+        else:
+            self._ep_rank_loads_before[layer_index] = before_tensor
+            self._ep_rank_loads_after[layer_index] = after_tensor
+            self._ep_stats[layer_index] = stats_tensor
+        if self._ep_rank_size is None:
+            self._ep_rank_size = len(before)
 
     # ---------------------- Reduction & metrics ----------------------
 
@@ -345,20 +450,108 @@ class MoERouterMonitor:
             dist.all_reduce(matrix, op=dist.ReduceOp.SUM, group=self.dp_group)
         return matrix
 
+    def _stack_and_reduce_ep_balance(
+        self,
+        num_layers: int,
+        device: torch.device,
+        rank_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        zero_loads = torch.zeros(rank_size, dtype=torch.long, device=device)
+        zero_stats = torch.zeros(3, dtype=torch.long, device=device)
+        before = torch.stack([self._ep_rank_loads_before.get(i, zero_loads) for i in range(num_layers)])
+        after = torch.stack([self._ep_rank_loads_after.get(i, zero_loads) for i in range(num_layers)])
+        stats = torch.stack([self._ep_stats.get(i, zero_stats) for i in range(num_layers)])
+
+        packed = torch.cat((before.reshape(-1), after.reshape(-1), stats.reshape(-1)))
+        if self.dp_group is not None and dist.is_initialized():
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=self.dp_group)
+        before_size = before.numel()
+        after_size = after.numel()
+        before = packed[:before_size].reshape_as(before)
+        after = packed[before_size : before_size + after_size].reshape_as(after)
+        stats = packed[before_size + after_size :].reshape_as(stats)
+        return before, after, stats
+
+    def _resolve_interval_ep_rank_size(self, device: torch.device) -> Optional[int]:
+        local_has_ep = bool(self._ep_rank_loads_before)
+        local_rank_size = self._ep_rank_size if local_has_ep else 0
+        assert local_rank_size is not None
+        metadata = torch.tensor(
+            (int(local_has_ep), local_rank_size, local_rank_size * local_rank_size),
+            dtype=torch.long,
+            device=device,
+        )
+        if self.dp_group is not None and dist.is_initialized():
+            dist.all_reduce(metadata, op=dist.ReduceOp.SUM, group=self.dp_group)
+
+        present_count, rank_size_sum, rank_size_square_sum = (int(value) for value in metadata.tolist())
+        if present_count == 0:
+            return None
+        if rank_size_sum % present_count != 0 or present_count * rank_size_square_sum != rank_size_sum**2:
+            raise ValueError("EP rank-load size must be consistent across the configured DP+SP/FSDP group.")
+        return rank_size_sum // present_count
+
+    def _collect_interval_snapshot(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        torch.device,
+    ]:
+        matrix = self._stack_and_reduce()
+        collective_device = matrix.device
+        if matrix.numel() == 0:
+            return matrix.float(), None, collective_device
+
+        interval_rank_size = self._resolve_interval_ep_rank_size(matrix.device)
+        ep_balance = None
+        if interval_rank_size is not None:
+            # The group-wide metadata agreement above makes every rank enter
+            # this physical collective with the same packed shape. Ranks that
+            # recorded no physical telemetry contribute zero rows.
+            ep_balance = self._stack_and_reduce_ep_balance(
+                matrix.shape[0],
+                matrix.device,
+                interval_rank_size,
+            )
+        return matrix, ep_balance, collective_device
+
+    @staticmethod
+    def _prepare_snapshot_for_format(
+        matrix: torch.Tensor,
+        ep_balance: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> tuple[
+        torch.Tensor,
+        Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ]:
+        matrix = matrix.float().cpu()
+        row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
+        matrix = matrix / row_sums
+        if ep_balance is not None:
+            ep_balance = tuple(value.cpu() for value in ep_balance)
+        return matrix, ep_balance
+
+    def _commit_interval(self, current_step: int) -> None:
+        self._last_step_range = (self._accumulate_start_step, current_step)
+        self._reset_counts()
+        self._reset_ep_balance()
+        self._accumulate_start_step = current_step + 1
+
+    def _format_succeeded_on_group(self, local_success: bool, device: torch.device) -> bool:
+        success = torch.tensor(int(local_success), dtype=torch.long, device=device)
+        if self.dp_group is not None and dist.is_initialized():
+            dist.all_reduce(success, op=dist.ReduceOp.MIN, group=self.dp_group)
+        return bool(success.item())
+
     def get_load_matrix(self, current_step: int = 0) -> torch.Tensor:
         """Return normalized ``[num_moe_layers, num_experts]`` load matrix and reset.
 
         Rows sum to 1.0. Issues one CUDA sync via the host transfer.
         """
-        matrix = self._stack_and_reduce()
-        if matrix.numel() == 0:
-            return matrix.float()
-        matrix = matrix.float().cpu()
-        row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
-        matrix = matrix / row_sums
-        self._last_step_range = (self._accumulate_start_step, current_step)
-        self._reset_counts()
-        self._accumulate_start_step = current_step + 1
+        matrix, ep_balance, _ = self._collect_interval_snapshot()
+        if matrix.numel() != 0:
+            matrix, _ = self._prepare_snapshot_for_format(matrix, ep_balance)
+            self._commit_interval(current_step)
         return matrix
 
     @staticmethod
@@ -381,32 +574,23 @@ class MoERouterMonitor:
             "avg_vio": deviation.abs().mean(dim=1),
         }
 
-    def compute_metrics(
+    @staticmethod
+    def compute_rank_imbalance(rank_load_matrix: torch.Tensor) -> torch.Tensor:
+        """Return exact normalized EP-rank imbalance for every layer row."""
+        rank_load_matrix = rank_load_matrix.float()
+        rank_count = rank_load_matrix.shape[1]
+        totals = rank_load_matrix.sum(dim=1)
+        safe_totals = totals.clamp(min=1.0).unsqueeze(1)
+        imbalance = (rank_count * rank_load_matrix / safe_totals - 1.0).abs().mean(dim=1)
+        return torch.where(totals > 0, imbalance, torch.zeros_like(imbalance))
+
+    def _format_metrics(
         self,
-        current_step: int,
-        prefix: str = "moe",
-        format_only_on: Optional[bool] = None,
+        load_matrix: torch.Tensor,
+        ep_balance: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        prefix: str,
     ) -> Dict[str, Any]:
-        """Produce a backend-agnostic metrics dict for the current interval.
-
-        **Collective**: under EP/DP this calls ``all_reduce``. Every rank in
-        the EP/DP groups must call this method even if only one rank logs the
-        result. Pass ``format_only_on=False`` on non-logging ranks to skip the
-        scalar + heatmap build (still does the collective + reset).
-
-        Returns a dict with:
-
-        - ``{prefix}/expert_load_heatmap``: PIL ``Image`` (when matplotlib is available).
-        - ``{prefix}/{max,min,avg}_vio/layer_{i}``: per-layer scalars.
-        - ``{prefix}/{max,min,avg}_vio/{max,avg}``: across-layer aggregates.
-
-        Returns an empty dict if no data was recorded or ``format_only_on`` is False.
-        """
-        load_matrix = self.get_load_matrix(current_step=current_step)
         num_layers = load_matrix.shape[0]
-        if num_layers == 0 or format_only_on is False:
-            return {}
-
         vio = self.compute_vio(load_matrix)
         max_vio, min_vio, avg_vio = vio["max_vio"], vio["min_vio"], vio["avg_vio"]
 
@@ -422,7 +606,134 @@ class MoERouterMonitor:
         metrics[f"{prefix}/min_vio/avg"] = min_vio.mean().item()
         metrics[f"{prefix}/avg_vio/max"] = avg_vio.max().item()
         metrics[f"{prefix}/avg_vio/avg"] = avg_vio.mean().item()
+
+        if ep_balance is not None:
+            before, after, stats = ep_balance
+            before_imbalance = self.compute_rank_imbalance(before)
+            after_imbalance = self.compute_rank_imbalance(after)
+            active_replicas = stats[:, 0]
+            moved_tokens = stats[:, 1]
+            total_routed_tokens = stats[:, 2]
+            moved_fraction = torch.where(
+                total_routed_tokens > 0,
+                moved_tokens.float() / total_routed_tokens.float().clamp(min=1.0),
+                torch.zeros_like(total_routed_tokens, dtype=torch.float),
+            )
+
+            metrics[f"{prefix}/ep_rank_load_before_heatmap"] = self.build_ep_rank_heatmap_image(before, "before")
+            metrics[f"{prefix}/ep_rank_load_after_heatmap"] = self.build_ep_rank_heatmap_image(after, "after")
+            for i in range(num_layers):
+                metrics[f"{prefix}/ep_rank_imbalance_before/layer_{i}"] = before_imbalance[i].item()
+                metrics[f"{prefix}/ep_rank_imbalance_after/layer_{i}"] = after_imbalance[i].item()
+                metrics[f"{prefix}/ep_active_replicas/layer_{i}"] = active_replicas[i].item()
+                metrics[f"{prefix}/ep_moved_tokens/layer_{i}"] = moved_tokens[i].item()
+                metrics[f"{prefix}/ep_total_routed_tokens/layer_{i}"] = total_routed_tokens[i].item()
+                metrics[f"{prefix}/ep_moved_token_fraction/layer_{i}"] = moved_fraction[i].item()
+
+            for name, values in (
+                ("ep_rank_imbalance_before", before_imbalance),
+                ("ep_rank_imbalance_after", after_imbalance),
+                ("ep_moved_token_fraction", moved_fraction),
+            ):
+                metrics[f"{prefix}/{name}/max"] = values.max().item()
+                metrics[f"{prefix}/{name}/avg"] = values.mean().item()
+            for name, values in (
+                ("ep_active_replicas", active_replicas),
+                ("ep_moved_tokens", moved_tokens),
+                ("ep_total_routed_tokens", total_routed_tokens),
+            ):
+                metrics[f"{prefix}/{name}/sum"] = values.sum().item()
+                metrics[f"{prefix}/{name}/max"] = values.max().item()
+                metrics[f"{prefix}/{name}/avg"] = values.float().mean().item()
         return metrics
+
+    def compute_metrics(
+        self,
+        current_step: int,
+        prefix: str = "moe",
+        format_only_on: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Produce a backend-agnostic metrics dict for the current interval.
+
+        **Collective**: this calls ``all_reduce`` over the configured
+        DP+SP/FSDP group. Every member must call this method even if only one
+        global rank logs the result. Pass ``format_only_on=False`` on
+        non-logging ranks to skip the scalar + heatmap build (the rank still
+        participates in collectives and resets). EP siblings are excluded.
+
+        Returns a dict with:
+
+        - ``{prefix}/expert_load_heatmap``: PIL ``Image`` (when matplotlib is available).
+        - ``{prefix}/{max,min,avg}_vio/layer_{i}``: per-layer scalars.
+        - ``{prefix}/{max,min,avg}_vio/{max,avg}``: across-layer aggregates.
+
+        Returns an empty dict if no data was recorded or ``format_only_on`` is False.
+        """
+        should_format = format_only_on is not False
+        load_matrix, ep_balance, collective_device = self._collect_interval_snapshot()
+        num_layers = load_matrix.shape[0]
+        if num_layers == 0:
+            return {}
+
+        metrics: Dict[str, Any] = {}
+        format_error: Optional[Exception] = None
+        previous_step_range = self._last_step_range
+        if should_format:
+            self._last_step_range = (self._accumulate_start_step, current_step)
+            try:
+                load_matrix, ep_balance = self._prepare_snapshot_for_format(load_matrix, ep_balance)
+                metrics = self._format_metrics(load_matrix, ep_balance, prefix)
+            except Exception as exc:
+                format_error = exc
+                self._last_step_range = previous_step_range
+
+        if self._format_succeeded_on_group(format_error is None, collective_device):
+            self._commit_interval(current_step)
+        else:
+            self._last_step_range = previous_step_range
+            if format_error is not None:
+                raise format_error
+            raise RuntimeError("MoE metric formatting failed on another DP+SP/FSDP group rank.")
+
+        if not should_format:
+            return {}
+        return metrics
+
+    def build_ep_rank_heatmap_image(self, rank_load_matrix: torch.Tensor, stage: str):
+        """Build a before/after PIL heatmap of normalized physical EP-rank load."""
+        import io
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from PIL import Image
+
+        if stage not in ("before", "after"):
+            raise ValueError("stage must be 'before' or 'after'.")
+        row_sums = rank_load_matrix.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+        normalized = rank_load_matrix.float() / row_sums
+        start, end = self._last_step_range
+        stage_title = "Before Temporary Replicas" if stage == "before" else "After Temporary Replicas"
+
+        fig, ax = plt.subplots(
+            figsize=(max(8, rank_load_matrix.shape[1] * 0.8), max(4, rank_load_matrix.shape[0] * 0.2))
+        )
+        im = ax.imshow(normalized.numpy(), aspect="auto", cmap="YlOrRd")
+        ax.set_xlabel("Physical EP Rank")
+        ax.set_ylabel("MoE Layer Index")
+        ax.set_title(f"MoE EP Rank Load {stage_title} (Steps {start}-{end})")
+        fig.colorbar(im, ax=ax, label="Normalized Routed Token Fraction")
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        try:
+            fig.savefig(buf, format="png", dpi=100)
+            plt.close(fig)
+            buf.seek(0)
+            return Image.open(buf).copy()
+        finally:
+            buf.close()
 
     def build_heatmap_image(self, load_matrix: torch.Tensor, caption: Optional[str] = None):
         """Build a PIL ``Image`` of the load matrix.

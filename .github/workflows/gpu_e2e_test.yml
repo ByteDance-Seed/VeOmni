@@ -125,6 +125,22 @@ jobs:
             sleep 3
             nvidia-smi || true
           fi
+      - name: Run Qwen3.5 MoE EP load-balance E2E
+        env:
+          VEOMNI_REQUIRE_EP_BALANCE_E2E: "1"
+        run: |
+          uv run --frozen pytest -s -x tests/e2e/test_qwen3_5_moe_ep_load_balance.py::test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry
+      - name: Free GPUs after MoE EP load-balance E2E
+        if: always()
+        run: |
+          nvidia-smi || true
+          pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale GPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            nvidia-smi || true
+          fi
       - name: Run FSDP equivalence tests
         run: |
           uv run --frozen pytest -s -x tests/distributed/test_fsdp_equivalence.py
