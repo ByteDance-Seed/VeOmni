@@ -140,8 +140,12 @@ uv run --frozen python scripts/ci/install_triton_ascend.py
 
 The helper intentionally supports Linux x86_64 and Python 3.11 only. It installs fixed wheel
 URLs with SHA256 verification without applying the upstream wheel's development-only dependency
-pins. Keep the Qwen3.5 vendored Triton kernels disabled on aarch64 or other Python versions until
-a compatible package set is available and validated.
+pins. On ARM64, do not run this x86 helper: use the GDN-ready
+[A2](../hardware_support/AscendDockerUsage/build_a2_docker.md) or
+[A3](../hardware_support/AscendDockerUsage/build_a3_docker.md) image path. Those images install the
+architecture-specific Triton-Ascend stack and `fla_npu`; the portable `npu_aarch64` extra alone does
+not install either optional runtime. Other unvalidated package combinations should keep the
+Qwen3.5 vendored Triton kernels disabled.
 
 See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,

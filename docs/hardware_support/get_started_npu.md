@@ -68,11 +68,14 @@ The following table shows the supported software versions for VeOmni when runnin
 
 Repository Docker definitions also cover CANN 8.3.RC2. Treat the PyTorch,
 torch_npu, CANN, and `triton-ascend` versions as one compatibility set and
-validate non-CI combinations on the target hardware. Qwen3.5's vendored NPU
-Triton kernels use the fixed Linux x86_64 / Python 3.11 installation in
-`scripts/ci/install_triton_ascend.py`; this is separate from the portable
-`npu` extra because the upstream wheel publishes development-only exact pins
-as runtime dependencies.
+validate non-CI combinations on the target hardware. For Linux x86_64 / Python
+3.11 CI, Qwen3.5's vendored NPU Triton kernels use the fixed installation in
+`scripts/ci/install_triton_ascend.py`. On ARM64, use the GDN-ready
+[A2](AscendDockerUsage/build_a2_docker.md) or
+[A3](AscendDockerUsage/build_a3_docker.md) image path, which installs the
+architecture-specific Triton-Ascend stack. These overlays remain separate from
+the portable `npu` / `npu_aarch64` extras because the upstream wheels publish
+development-only exact pins as runtime dependencies.
 
 ## Supported Models
 
@@ -82,8 +85,8 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 |---|---|---|---|---|---|---|
 | [Qwen3](../examples/qwen3.md) | 8B | ✅ | ✅ | | ✅ | |
 | | 30B | ✅ | ✅ | ✅ | ✅ | |
-| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | Supported on non-arch35 Ascend NPUs only; `Ascend910_95`/`Ascend950` are excluded because the vendored `causal_conv1d` is unsupported. CI validates the dense toy config with VLM E2E and text FSDP equivalence |
-| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Supported on non-arch35 Ascend NPUs only; `Ascend910_95`/`Ascend950` are excluded because the vendored `causal_conv1d` is unsupported. CI validates the MoE toy config with VLM E2E and text FSDP equivalence |
+| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | Supported on non-arch35 A2/A3 NPUs using the x86 CI helper or GDN-ready ARM64 images; `Ascend910_95`/`Ascend950` are excluded because the vendored `causal_conv1d` is unsupported. CI validates the dense toy config with VLM E2E and text FSDP equivalence |
+| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Supported on non-arch35 A2/A3 NPUs using the x86 CI helper or GDN-ready ARM64 images; `Ascend910_95`/`Ascend950` are excluded because the vendored `causal_conv1d` is unsupported. CI validates the MoE toy config with VLM E2E and text FSDP equivalence |
 | [Qwen3-VL](../examples/qwen3_vl.md) | 8B | ✅ | ✅ | | ✅ | |
 | | 30B | ✅ | ✅ | ✅ | ✅ | |
 | [Wan2.1](../examples/wan2.1.md) | 1.3B | ✅ | ✅ | | ✅ | Prototype |

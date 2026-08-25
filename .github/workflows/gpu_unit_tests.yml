@@ -89,6 +89,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Free shared L20 GPU
         # Some prior CI runs on this physical host leak Python/torchrun
         # processes that keep tens of GiB pinned on the GPUs even after

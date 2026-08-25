@@ -24,6 +24,7 @@ jobs:
         with:
           fetch-depth: 0
           path: .
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
