@@ -40,7 +40,6 @@ from ....distributed.torch_compile import CompileConfig
 from ....distributed.torch_parallelize import build_parallelize_model
 from ....models import build_foundation_model
 from ....optim import build_lr_scheduler, build_optimizer
-from ....trainer.base import _collect_muon_kwargs
 from ....utils import helper, logging
 from ....utils.checkpoint_utils import should_skip_hf_weight_load
 from ....utils.device import get_device_type
@@ -452,12 +451,13 @@ class ModuleRuntime:
             self.optimizer = build_optimizer(
                 self.model,
                 lr=opt.lr,
+                betas=opt.betas,
                 weight_decay=opt.weight_decay,
                 fused=True,
                 optimizer_type=opt.type,
                 no_decay_modules=opt.no_decay_modules,
                 no_decay_params=opt.no_decay_params,
-                muon_kwargs=_collect_muon_kwargs(opt),
+                optimizer_config=opt,
             )
 
     def _build_lr_scheduler(self, total_steps: int):
