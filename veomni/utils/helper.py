@@ -176,7 +176,7 @@ def wait_npu_profile_sidecars(profiler, timeout_seconds: float = 300.0) -> None:
     sidecars = tuple(getattr(profiler, "_veomni_npu_sidecars", ()))
     if not sidecars:
         return
-    logger.info(f"Waiting for {len(sidecars)} NPU profile sidecar(s), timeout={timeout_seconds:.1f}s each.")
+    logger.info(f"Waiting for {len(sidecars)} NPU profile sidecar(s), total timeout={timeout_seconds:.1f}s.")
     deadline = time.monotonic() + max(timeout_seconds, 0.0)
     for proc in sidecars:
         started = time.perf_counter()
@@ -184,7 +184,8 @@ def wait_npu_profile_sidecars(profiler, timeout_seconds: float = 300.0) -> None:
             return_code = proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
         except subprocess.TimeoutExpired:
             logger.warning(
-                f"NPU profile sidecar pid={proc.pid} is still running after {timeout_seconds:.1f}s; "
+                f"NPU profile sidecar pid={proc.pid} is still running when the "
+                f"{timeout_seconds:.1f}s total wait budget expired; "
                 "the raw local capture is preserved, but durable copy/upload may still be incomplete."
             )
             continue

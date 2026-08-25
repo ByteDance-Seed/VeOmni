@@ -300,8 +300,9 @@ def test_wait_npu_profile_sidecars_reports_completion_and_timeout(monkeypatch):
 
     helper.wait_npu_profile_sidecars(profiler, timeout_seconds=0.01)
 
+    assert any("total timeout=" in message for message in logs)
     assert any("pid=101 status=completed" in message for message in logs)
-    assert any("pid=102" in warning and "still running" in warning for warning in warnings)
+    assert any("pid=102" in warning and "total wait budget" in warning for warning in warnings)
 
 
 def test_npu_offline_defers_hdfs_copy_to_sidecar(monkeypatch, tmp_path):
@@ -1302,40 +1303,55 @@ def test_profile_callback_rebases_absolute_steps_after_resume(monkeypatch, tmp_p
     assert create_calls[0]["end_step"] == 2
 
 
-def test_base_trainer_preserves_declared_callback_order_for_profile_resume():
+def test_base_trainer_preserves_declared_callback_order_for_profile_resume(monkeypatch):
+    from veomni.trainer import base as base_mod
     from veomni.trainer.base import BaseTrainer
 
     events = []
-    trainer = object.__new__(BaseTrainer)
-    trainer.state = TrainerState(global_step=0)
 
-    class _Callback:
+    class _StubFactory:
         def __init__(self, name):
             self.name = name
 
-        def on_train_begin(self, state):
-            events.append((self.name, state.global_step))
+        def __call__(self, trainer):
+            callback = SimpleNamespace(name=self.name)
 
-    class _CheckpointCallback:
-        def on_train_begin(self, state):
-            events.append(("checkpoint", state.global_step))
-            state.global_step = 4
+            def on_train_begin(state, _name=self.name):
+                events.append((_name, state.global_step))
+                if _name == "checkpointer":
+                    state.global_step = 4
 
-    class _ProfileCallback:
-        def on_train_begin(self, state):
-            events.append(("profile", state.global_step))
+            callback.on_train_begin = on_train_begin
+            return callback
 
-    checkpoint = _CheckpointCallback()
-    profile = _ProfileCallback()
-    before = _Callback("before")
-    after = _Callback("after")
-    trainer.checkpointer_callback = checkpoint
-    trainer.profile_callback = profile
-    trainer._callbacks = [before, checkpoint, profile, after]
+    for class_name, hook_name in (
+        ("EnvironMeterCallback", "environ"),
+        ("TqdmCallback", "tqdm"),
+        ("WandbTraceCallback", "wandb"),
+        ("ProfileTraceCallback", "profile"),
+        ("CheckpointerCallback", "checkpointer"),
+        ("HuggingfaceCkptCallback", "hf"),
+        ("HFLoraCkptCallback", "hf_lora"),
+        ("EvaluateCallback", "evaluate"),
+        ("MoERouterMonitorCallback", "moe"),
+        ("ChannelLossCallback", "channel"),
+    ):
+        monkeypatch.setattr(base_mod, class_name, _StubFactory(hook_name))
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.args = SimpleNamespace(model=SimpleNamespace(lora_config=None))
+    trainer._init_callbacks()
+
+    assert trainer._callbacks.index(trainer.profile_callback) > trainer._callbacks.index(
+        trainer.checkpointer_callback
+    )
+    assert trainer._callbacks[-1] is trainer.profile_callback
 
     trainer.on_train_begin()
 
-    assert events == [("before", 0), ("checkpoint", 0), ("profile", 4), ("after", 4)]
+    names = [name for name, _ in events]
+    assert names.index("profile") > names.index("checkpointer")
+    assert events[names.index("profile")][1] == 4
 
 
 def test_profile_callback_skips_elapsed_window(monkeypatch):
