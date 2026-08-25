@@ -651,7 +651,11 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
 
 @pytest.mark.skipif(
     not dist.is_available() or get_device_type() == "cpu",
-    reason="Distributed FSDP2 weight loading test requires an accelerator",
+    reason=(
+        "FSDP2 weight-loading compares compute-device buffers after torchrun; "
+        "CPU coverage is in test_dcp_checkpointer.py "
+        "(test_cpu_offload_dcp_resume_restores_persistent_and_nonpersistent_buffers)"
+    ),
 )
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: bool) -> None:
@@ -824,7 +828,10 @@ def run_load_weights_test(args: Arguments) -> None:
 
 @pytest.mark.skipif(
     not dist.is_available() or get_device_type() == "cpu",
-    reason="Distributed FSDP2 weight loading test requires an accelerator",
+    reason=(
+        "Issue 637 FSDP2 all-ranks-read path needs an accelerator; "
+        "CPU checkpoint coverage is in test_dcp_checkpointer.py"
+    ),
 )
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
@@ -872,7 +879,11 @@ def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
 
 @pytest.mark.skipif(
     not dist.is_available() or get_device_type() == "cpu",
-    reason="FSDP2 CPU-offload device residency requires an accelerator",
+    reason=(
+        "FSDP2 CPU-offload residency asserts buffers stay on the compute device "
+        "and needs at least two accelerators; CPU alias/resume coverage is in "
+        "test_dcp_checkpointer.py"
+    ),
 )
 def test_fsdp_cpu_offload_training_keeps_buffers_on_compute_device(tmp_path: Path) -> None:
     if get_torch_device().device_count() < 2:

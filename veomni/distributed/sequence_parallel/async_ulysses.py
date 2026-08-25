@@ -352,9 +352,9 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # v projection grad
         grad_v = grad_v.reshape(grad_v.shape[0], grad_v.shape[1], -1)
         grad_v_input = grad_v @ v_weight
-        grad_v_weight = grad_v.transpose(-1, -2) @ hidden_states
-        if v_bias is not None and ctx.needs_input_grad[7]:
-            grad_v_bias = grad_v.sum(0)
+        grad_v_weight = (grad_v.transpose(-1, -2) @ hidden_states).sum(0)
+        if v_bias is not None and ctx.needs_input_grad[8]:
+            grad_v_bias = grad_v.sum((0, 1))
 
         # k grad communication collect
         grad_k = grad_k_res()
@@ -376,9 +376,9 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # k projection grad
         grad_k = grad_k.reshape(grad_k.shape[0], grad_k.shape[1], -1)
         grad_k_input = grad_k @ k_weight
-        grad_k_weight = grad_k.transpose(-1, -2) @ hidden_states
-        if k_bias is not None and ctx.needs_input_grad[5]:
-            grad_k_bias = grad_k.sum(0)
+        grad_k_weight = (grad_k.transpose(-1, -2) @ hidden_states).sum(0)
+        if k_bias is not None and ctx.needs_input_grad[6]:
+            grad_k_bias = grad_k.sum((0, 1))
 
         # q grad communication collect
         grad_q = grad_q_res()
@@ -386,9 +386,9 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # q projection grad
         grad_q = grad_q.reshape(grad_q.shape[0], grad_q.shape[1], -1)
         grad_q_input = grad_q @ q_weight
-        grad_q_weight = grad_q.transpose(-1, -2) @ hidden_states
-        if q_bias is not None and ctx.needs_input_grad[3]:
-            grad_q_bias = grad_q.sum(0)
+        grad_q_weight = (grad_q.transpose(-1, -2) @ hidden_states).sum(0)
+        if q_bias is not None and ctx.needs_input_grad[4]:
+            grad_q_bias = grad_q.sum((0, 1))
 
         # grad
         grad_hidden_states = grad_q_input + grad_k_input + grad_v_input
@@ -484,9 +484,9 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
             grad_o, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
         )
 
-        grad_proj_weight = grad_output[0].transpose(-1, -2) @ (hidden_states)
-        if proj_bias is not None and ctx.needs_input_grad[3]:
-            grad_proj_bias = grad_output[0].sum(0)
+        grad_proj_weight = (grad_output[0].transpose(-1, -2) @ hidden_states).sum(0)
+        if proj_bias is not None and ctx.needs_input_grad[4]:
+            grad_proj_bias = grad_output[0].sum((0, 1))
 
         # output grad communication collect
         grad_o = grad_out_res()

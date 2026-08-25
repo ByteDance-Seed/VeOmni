@@ -28,7 +28,7 @@ To enable users to quickly train models from HuggingFace and flexibly train cust
 Users can directly load models from HuggingFace and start the training process by specifying the model name or model path. Additionally, they can implement their own custom models or enhance existing HuggingFace models with advanced features such as sequence parallelism or expert parallelism. Custom modeling can be implemented in one of the supported modeling paths:
 
 - `veomni/models/transformers/`
-- `veomni/models/seed_omni/`
+- `veomni/models/diffusers/`
 
 
 
@@ -82,7 +82,7 @@ class YourCustomModel(PreTrainedModel):
 ModelClass = YourCustomModel
 ```
 
-Check existing model implementations in the `veomni/models/transformers/` and `veomni/models/seed_omni/` directory for reference.
+Check existing model implementations in the `veomni/models/transformers/` and `veomni/models/diffusers/` directory for reference.
 
 ### 4. Loading Your Model
 

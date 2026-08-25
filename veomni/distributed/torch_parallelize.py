@@ -32,10 +32,10 @@ from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from .checkpoint import CheckpointFunction
 from .chunk_mbs import apply_chunk_mbs
-from .parallel_plan import get_runtime_parallel_plan
+from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
-from .utils import sort_fqn_by_submodule_first
+from .utils import check_fqn_match, sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
@@ -55,10 +55,18 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     breaks aliases. Record every registration before materialization and bind
     each original alias group to one materialized tensor afterwards.
 
-    Distributed checkpoints do not restore groups containing only
-    nonpersistent buffers, so preserve their config-derived values. If a group
-    has any persistent registration, the checkpoint is authoritative and will
-    populate the shared materialized tensor during the subsequent DCP load.
+    ``init_empty_weights()`` patches ``register_parameter`` only, so a
+    meta-initialized model still holds real buffer values -- and ``to_empty()``
+    replaces every one of them with uninitialized memory. Distributed
+    checkpoints do not restore groups containing only nonpersistent buffers, so
+    preserve their config-derived values. If a group has any persistent
+    registration, the checkpoint is authoritative and will populate the shared
+    materialized tensor during the subsequent DCP load.
+
+    HF's ``_init_weights`` recomputes a rope table only for a module that
+    exposes ``original_inv_freq``. Buffers outside that shape -- Gemma3's
+    per-layer-type ``{type}_inv_freq`` and its ``embed_scale`` -- have nothing
+    else to restore them unless they are snapshotted here.
     """
 
     buffer_groups: dict[int, list[tuple[nn.Module, str]]] = {}
@@ -71,18 +79,30 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
             buffer_groups.setdefault(buffer_id, []).append((module, name))
 
     for buffer_id, registrations in buffer_groups.items():
-        if all(name in module._non_persistent_buffers_set for module, name in registrations):
-            module, name = registrations[0]
-            preserved_nonpersistent_buffers[buffer_id] = module._buffers[name].detach().clone()
+        module, name = registrations[0]
+        buffer = module._buffers[name]
+        if not all(name in module._non_persistent_buffers_set for module, name in registrations):
+            continue
+        if buffer.is_meta:
+            # A buffer derived from a parameter (``self.weight.detach()``) is
+            # on meta like the parameter, and holds nothing to copy out of.
+            # No model does this today; say so rather than let ``to_empty()``
+            # leave uninitialized memory behind unannounced.
+            logger.warning_rank0(
+                f"Non-persistent buffer {name!r} on {type(module).__name__} is on meta and cannot be "
+                "preserved across materialization; it will hold uninitialized memory unless init_weights() sets it."
+            )
+            continue
+        preserved_nonpersistent_buffers[buffer_id] = buffer.detach().clone()
 
     model.to_empty(device=device)
 
     for buffer_id, registrations in buffer_groups.items():
-        if buffer_id in preserved_nonpersistent_buffers:
-            canonical_buffer = preserved_nonpersistent_buffers[buffer_id].to(device=device)
-        else:
-            module, name = registrations[0]
-            canonical_buffer = module._buffers[name]
+        module, name = registrations[0]
+        canonical_buffer = module._buffers[name]
+        snapshot = preserved_nonpersistent_buffers.get(buffer_id)
+        if snapshot is not None:
+            canonical_buffer.copy_(snapshot.to(device=canonical_buffer.device, dtype=canonical_buffer.dtype))
         for module, name in registrations:
             module._buffers[name] = canonical_buffer
 
@@ -127,6 +147,130 @@ def _move_model_buffers_to_device(model: nn.Module, device: torch.device) -> tup
     return moved_count, moved_bytes
 
 
+def _has_extra_parallel_plan(model: nn.Module) -> bool:
+    """True when the model's parallel plan declares ExtraParallel-sharded tensors.
+
+    The question both ExtraParallel guards below actually need to ask. A plan is
+    a property of the *model*, unlike ``ParallelState.any_extra_parallel_enabled``,
+    which only says an ep dim exists in the mesh — and a mesh dim is inherited by
+    every sub-module of a SeedOmni V2 config, including the ones that have no
+    experts.
+    """
+    plan = get_runtime_parallel_plan(model)
+    return plan is not None and bool(getattr(plan, "extra_parallel_plan", None))
+
+
+def _materialize_and_load_weights(
+    model: nn.Module,
+    weights_path: Optional[str],
+    materialize_device: str,
+    *,
+    should_skip_hf_weight_load: bool,
+    is_peft_model: bool,
+    adapter_path: Optional[str],
+    broadcast_from_rank0: bool,
+    cpu_load_param_name: Optional[List[str]] = None,
+    max_load_broadcast_size: float = 20.0,
+    fqn_to_index_mapping: Optional[dict] = None,
+    ep_sharded_stream_load: bool = False,
+) -> None:
+    """Move meta-initialized parameters onto a real device and fill them in.
+
+    Shared by the FSDP2 and DDP paths: both build the model on ``meta`` and are
+    the only place that materializes it, so the choice between random init, an
+    HF snapshot and a checkpoint resume has to be made identically for each.
+    """
+    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
+    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
+    # and still need the HF base weights.
+    if should_skip_hf_weight_load and is_peft_model:
+        raise ValueError(
+            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
+            "trainable-only and the frozen base must still be loaded from weights_path."
+        )
+
+    if weights_path is None or should_skip_hf_weight_load:
+        if should_skip_hf_weight_load:
+            logger.info_rank0(
+                "Skipping pretrained weight load for checkpoint resume; "
+                "parameters will be restored from the distributed checkpoint."
+            )
+        # Preserve non-persistent buffers on the random-init path too: HF's
+        # ``_init_weights`` recomputes only rope tables shaped the way it expects,
+        # so the rest would train on whatever ``to_empty()`` left behind.
+        _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        _reset_hf_initialized_flag(model)
+        # Random init is unnecessary when the checkpoint will overwrite every parameter.
+        if not should_skip_hf_weight_load:
+            model.init_weights()
+        return
+
+    from torch.distributed.tensor import distribute_tensor
+
+    logger.info_rank0(f"starting to load model weights from {weights_path}...")
+    if is_peft_model:
+        if adapter_path is not None:
+            logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
+        else:
+            logger.info_rank0("also init peft model lora weights...")
+
+    if broadcast_from_rank0:
+        logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
+        rank0_load_and_broadcast_weights(
+            model,
+            weights_path,
+            materialize_device,
+            dtensor_factory=distribute_tensor,
+            cpu_load_param_name=cpu_load_param_name,
+            max_load_broadcast_size=max_load_broadcast_size,
+            is_peft_model=is_peft_model,
+            adapter_path=adapter_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
+        )
+    else:
+        _dt_local_split = partial(distribute_tensor, src_data_rank=None)
+        if ep_sharded_stream_load and _has_extra_parallel_plan(model):
+            # Opt-in fast/low-memory path for large MoE checkpoints: each rank
+            # reads only its ExtraParallel dim-0 slice of the expert tensors
+            # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
+            # Only valid on the every-rank-reads (non-broadcast) path. An
+            # unsupported *checkpoint* still raises ``NotImplementedError``, which
+            # we surface directly rather than silently falling back -- an opt-in
+            # flag that quietly degrades is hard to reason about.
+            logger.info_rank0(
+                "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
+            )
+            load_model_weights_ep_sharded(
+                model,
+                weights_path,
+                materialize_device,
+                dtensor_factory=_dt_local_split,
+                is_peft_model=is_peft_model,
+                adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+            )
+        else:
+            if ep_sharded_stream_load:
+                # The flag is set once for a whole run, but this helper runs once
+                # per model -- once per OmniModule under SeedOmni V2 -- and a model
+                # with no ExtraParallel plan (vision encoder, VAE, connector) has
+                # no expert tensors to stream. Skipping is not a silent degrade:
+                # there was never a fast path to take here, and refusing instead
+                # would make the flag unusable for any heterogeneous model whose
+                # MoE backbone wants it.
+                logger.info_rank0("Ignoring ep_sharded_stream_load for a model with no ExtraParallel parallel_plan.")
+            logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
+            load_model_weights(
+                model,
+                weights_path,
+                materialize_device,
+                dtensor_factory=_dt_local_split,
+                is_peft_model=is_peft_model,
+                adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+            )
+
+
 def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
     """``fully_shard(..., shard_placement_fn=...)`` hook: shard on a model-chosen
     dimension instead of the FSDP2 default ``Shard(0)``.
@@ -145,31 +289,71 @@ def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
 
 
 
-def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
-    """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``."""
-    parallel_plan = getattr(model, "get_parallel_plan", None)
-    if parallel_plan is None:
+def _can_shard_extra_parallel_dim0(
+    model: "nn.Module",
+    parallel_plan: Optional["ParallelPlan"],
+    para_name: str,
+    para_fsdp_size: int,
+) -> bool:
+    """Return whether ``para_name``'s weights may take FSDP ``Shard(0)`` for Muon.
+
+    Zero communication is only reachable for a 3D expert stack that
+    ``ParallelPlan`` already slices on dim 0, since that is the sole layout
+    ``DistributedMuon`` classifies as ``moe_local_3d``. So the group needs at
+    least one such stack; a group of only 2D weights (an ``emb`` plan) would
+    gain nothing and must keep the default hidden-dim split. Plans that slice a
+    dim other than 0 are rejected outright — dim-0 FSDP sharding would not line
+    up with them.
+
+    Every matched param, 2D biases included, still has to divide the FSDP mesh
+    on dim 0, because ``shard_placement_fn`` applies one dim to the whole
+    wrapped module.
+
+    Plan keys are glob patterns such as ``model.layers.*.mlp.experts.gate_up_proj``,
+    so they only resolve through ``check_fqn_match``. The plan must be the runtime
+    one (``get_runtime_parallel_plan``) for PEFT-prefixed FQNs to match.
+    """
+    if parallel_plan is None or not parallel_plan.extra_parallel_plan:
         return False
-    plan = parallel_plan()
-    if plan is None or plan.extra_parallel_plan is None:
-        return False
-    para_plan = plan.extra_parallel_plan.get(para_name)
+    para_plan = parallel_plan.extra_parallel_plan.get(para_name)
     if not para_plan:
         return False
 
-    for fqn in para_plan.keys():
-        param = dict(model.named_parameters()).get(fqn)
-        if param is None:
-            continue
-        if param.ndim < 1:
-            continue
-        local_n = param.shape[0]
-        if local_n % ep_fsdp_size != 0:
-            logger.warning_rank0(
-                f"[muon_expert_zero_comm] param {fqn!r} dim-0 ({local_n}) is not "
-                f"divisible by ep_fsdp_size={ep_fsdp_size}; cannot use Shard(0)."
-            )
-            return False
+    matched = 0
+    expert_stacks = 0
+    for fqn, param in model.named_parameters():
+        for fqn_pattern, shard in para_plan.items():
+            if not check_fqn_match(fqn_pattern, fqn):
+                continue
+            matched += 1
+            if shard.dim != 0:
+                logger.warning_rank0(
+                    f"[muon_expert_zero_comm] {para_name}: {fqn!r} is sliced on dim {shard.dim}; "
+                    "Shard(0) only lines up with a dim-0 plan."
+                )
+                return False
+            # ParallelPlan.apply already cut dim 0 down to the local expert count.
+            if param.shape[0] % para_fsdp_size != 0:
+                logger.warning_rank0(
+                    f"[muon_expert_zero_comm] {para_name}: {fqn!r} dim-0 ({param.shape[0]}) is not "
+                    f"divisible by {para_name}_fsdp size {para_fsdp_size}."
+                )
+                return False
+            if param.ndim == 3:
+                expert_stacks += 1
+            break
+
+    if matched == 0:
+        logger.warning_rank0(
+            f"[muon_expert_zero_comm] {para_name}: no parameter matched the plan patterns {sorted(para_plan)}."
+        )
+        return False
+    if expert_stacks == 0:
+        logger.warning_rank0(
+            f"[muon_expert_zero_comm] {para_name}: the plan holds no 3D expert stack, "
+            "so there is no zero-communication path to enable."
+        )
+        return False
     return True
 
 
@@ -207,9 +391,6 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
@@ -269,6 +450,7 @@ def parallelize_model_fsdp2(
             logger.info_rank0(f"{para} Map: {_extra_parallel_map[para]}")
 
     else:
+        parallel_plan = None
         fqn2spec_info = None
         _extra_parallel_mesh = None
         _extra_parallel_map = None
@@ -399,21 +581,21 @@ def parallelize_model_fsdp2(
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
             shard_dim_for_para = 1
             # Muon zero-comm needs whole experts per rank; otherwise keep the
-            # default hidden-dim sharding.
-            if muon_expert_zero_comm:
-                ep_fsdp_size = para_mesh["ep_fsdp"].size()
-                divisible = _check_extra_parallel_dim0_divisibility(model, para, ep_fsdp_size)
-                if divisible:
+            # default hidden-dim sharding. A para this model's plan does not
+            # declare wraps nothing here, so leave it out of the report.
+            declared = parallel_plan is not None and para in (parallel_plan.extra_parallel_plan or {})
+            if muon_expert_zero_comm and declared:
+                para_fsdp_size = para_mesh[f"{para}_fsdp"].size()
+                if _can_shard_extra_parallel_dim0(model, parallel_plan, para, para_fsdp_size):
                     shard_dim_for_para = 0
                     logger.info_rank0(
                         f"[muon_expert_zero_comm] {para}: enabling Shard(0) for "
-                        f"the FSDP step (ep_fsdp_size={ep_fsdp_size}); Muon will "
+                        f"the FSDP step ({para}_fsdp size={para_fsdp_size}); Muon will "
                         "run batched NS locally with zero communication."
                     )
                 else:
                     logger.warning_rank0(
-                        f"[muon_expert_zero_comm] {para}: divisibility check failed "
-                        f"(ep_fsdp_size={ep_fsdp_size}); falling back to default "
+                        f"[muon_expert_zero_comm] {para}: falling back to the default "
                         "Shard(1) layout (Muon will use the all-to-all-gather path)."
                     )
             para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
@@ -536,88 +718,19 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
-    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
-    # and still need the HF base weights.
-    is_peft_model = kwargs.pop("is_peft_model", False)
-    adapter_path = kwargs.pop("adapter_path", None)
-    if should_skip_hf_weight_load and is_peft_model:
-        raise ValueError(
-            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
-            "trainable-only and the frozen base must still be loaded from weights_path."
-        )
-
-    if weights_path is None or should_skip_hf_weight_load:
-        if should_skip_hf_weight_load:
-            logger.info_rank0(
-                "Skipping pretrained weight load for checkpoint resume; "
-                "parameters will be restored from the distributed checkpoint."
-            )
-        if should_skip_hf_weight_load:
-            _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
-        else:
-            model.to_empty(device=materialize_device)
-        _reset_hf_initialized_flag(model)
-        # Random init is unnecessary when the checkpoint will overwrite every parameter.
-        if not should_skip_hf_weight_load:
-            model.init_weights()
-    else:
-        from torch.distributed.tensor import distribute_tensor
-
-        logger.info_rank0(f"starting to load model weights from {weights_path}...")
-        if is_peft_model:
-            if adapter_path is not None:
-                logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
-            else:
-                logger.info_rank0("also init peft model lora weights...")
-
-        fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
-        if kwargs.get("broadcast_model_weights_from_rank0"):
-            logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_weights(
-                model,
-                weights_path,
-                materialize_device,
-                dtensor_factory=distribute_tensor,
-                cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
-                max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
-                is_peft_model=is_peft_model,
-                adapter_path=adapter_path,
-                fqn_to_index_mapping=fqn_to_index_mapping,
-            )
-        else:
-            _dt_local_split = partial(distribute_tensor, src_data_rank=None)
-            if kwargs.get("ep_sharded_stream_load"):
-                # Opt-in fast/low-memory path for large MoE checkpoints: each rank
-                # reads only its ExtraParallel dim-0 slice of the expert tensors
-                # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
-                # Only valid on the every-rank-reads (non-broadcast) path. An
-                # unsupported model/checkpoint raises ``NotImplementedError``, which we
-                # surface directly rather than silently falling back -- an opt-in flag
-                # that quietly degrades is hard to reason about, so fail early instead.
-                logger.info_rank0(
-                    "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
-                )
-                load_model_weights_ep_sharded(
-                    model,
-                    weights_path,
-                    materialize_device,
-                    dtensor_factory=_dt_local_split,
-                    is_peft_model=is_peft_model,
-                    adapter_path=adapter_path,
-                    fqn_to_index_mapping=fqn_to_index_mapping,
-                )
-            else:
-                logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-                load_model_weights(
-                    model,
-                    weights_path,
-                    materialize_device,
-                    dtensor_factory=_dt_local_split,
-                    is_peft_model=is_peft_model,
-                    adapter_path=adapter_path,
-                    fqn_to_index_mapping=fqn_to_index_mapping,
-                )
+    _materialize_and_load_weights(
+        model,
+        weights_path,
+        materialize_device,
+        should_skip_hf_weight_load=should_skip_hf_weight_load,
+        is_peft_model=kwargs.pop("is_peft_model", False),
+        adapter_path=kwargs.pop("adapter_path", None),
+        broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+        cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+        max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+        fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
+    )
 
     if materialize_device == "cpu":
         device_type = get_device_type()
@@ -638,6 +751,84 @@ def parallelize_model_fsdp2(
     return model
 
 
+def parallelize_model_ddp(
+    model: "nn.Module",
+    weights_path: Optional[str] = None,
+    should_skip_hf_weight_load: bool = False,
+    **kwargs,
+) -> "nn.Module":
+    """Replicate the model with DDP, materializing it first under meta-init.
+
+    DDP keeps a full replica of plain tensors per rank: it registers gradient
+    hooks and broadcasts rank0's parameters at construction, but it neither
+    materializes meta parameters nor loads weights. Under meta-init nothing else
+    does either — ``build_model`` returns an empty model and ``BaseTrainer`` has
+    no load step of its own — so the wrap used to reach DDP's constructor with
+    meta parameters and die there on ``Tensor.item()``. A model that arrives with
+    real weights already loaded must not be touched here.
+    """
+    parallel_state = get_parallel_state()
+
+    # Only fsdp2 applies the ExtraParallel plan that shards expert weights, so a
+    # DDP module's experts are whole. Refuse rather than load full tensors into a
+    # model whose plan says they are sharded -- until now the meta crash below hid
+    # this combination. Keyed on the model's plan, not on
+    # ``any_extra_parallel_enabled``: a SeedOmni V2 sub-module inherits the global
+    # accelerator's ep dim whether or not it owns any experts, so the mesh alone
+    # would refuse a plan-less DDP vision tower that is perfectly fine.
+    if parallel_state.any_extra_parallel_enabled and _has_extra_parallel_plan(model):
+        raise RuntimeError(
+            "ExtraParallel (ep) requires fsdp_mode='fsdp2'; DDP does not apply the parallel plan that shards experts."
+        )
+
+    # Ask the parameters, not ``init_device``: the flag states an intent a model
+    # builder is free to ignore -- the data tests construct their model eagerly
+    # while the config still says ``meta`` -- and materializing a model that
+    # already holds real weights would discard them, or raise outright on a plain
+    # nn.Module with no ``init_weights``.
+    if any(param.is_meta for param in model.parameters()):
+        _materialize_and_load_weights(
+            model,
+            weights_path,
+            get_device_type(),
+            should_skip_hf_weight_load=should_skip_hf_weight_load,
+            is_peft_model=kwargs.pop("is_peft_model", False),
+            adapter_path=kwargs.pop("adapter_path", None),
+            # The flag was fsdp2-only while DDP loaded nothing at all. Now that
+            # this path loads, it applies verbatim: ``rank0_load_and_broadcast_weights``
+            # broadcasts over the default (world) group from global rank0, and a
+            # DDP replica wants exactly that whole tensor. Honouring it is what
+            # keeps a DDP run off the every-rank-reads path, which the flag
+            # defaults to avoiding.
+            broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+            cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+            max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+            fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+        )
+
+        # Anything the loader left behind would otherwise surface as
+        # ``Tensor.item() cannot be called on meta tensors`` from inside DDP's
+        # constructor, which names neither the parameter nor the cause.
+        unmaterialized = [name for name, param in model.named_parameters() if param.is_meta]
+        if unmaterialized:
+            raise RuntimeError(
+                f"DDP received unmaterialized parameters after loading from {weights_path!r}: "
+                f"{unmaterialized[:5]}{'...' if len(unmaterialized) > 5 else ''}"
+            )
+
+    # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
+    # module's buffer semantics must not change with the ``fsdp_mode`` a config
+    # happened to pick. Nothing is lost: rank0's copy is either identical to the
+    # others or, for dynamic-rope ``inv_freq``, wrong for them. See constraint 7a
+    # in `.agents/knowledge/constraints.md`.
+    return DDP(
+        model,
+        device_ids=[parallel_state.local_rank],
+        process_group=parallel_state.dp_group,
+        broadcast_buffers=False,
+    )
+
+
 def build_parallelize_model(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -656,9 +847,6 @@ def build_parallelize_model(
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
-    if "skip_weights_load" in kwargs:
-        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
-
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
     chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)
@@ -721,7 +909,12 @@ def build_parallelize_model(
         else:
             if compile_config.enable:
                 raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
-            model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+            model = parallelize_model_ddp(
+                model=model,
+                weights_path=weights_path,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
+                **kwargs,
+            )
     elif compile_config.enable:
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
 
