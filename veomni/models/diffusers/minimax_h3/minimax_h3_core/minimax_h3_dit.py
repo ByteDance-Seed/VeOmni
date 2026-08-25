@@ -514,8 +514,9 @@ class MiniMaxH3DiT(nn.Module):
         padded_seq_len = unit * sp_world
         pad = padded_seq_len - seq_len
         if pad and sp_world > 1:
-            # Repeat the last (t, h, w) position for the pad rows; they belong to
-            # the pad segment and are masked out by update_mask before the loss.
+            # Repeat the last (t, h, w) position for the pad rows; they sit
+            # outside every attention segment (cu_bounds stays at seq_len) and
+            # are dropped by the output index_select before the loss.
             img_position_ids = torch.cat((img_position_ids, img_position_ids[:, -1:, :].expand(-1, pad, -1)), dim=1)
 
         rope_freqs = self.rope(img_position_ids).to(device)
@@ -536,7 +537,7 @@ class MiniMaxH3DiT(nn.Module):
 
         if pad and sp_world > 1:
             # AdaLN modulation indices / output gather positions for the pad
-            # rows: zeros are safe, they are masked out by update_mask.
+            # rows: zeros are safe, pad rows are dropped by the index_select.
             inverse_indices = torch.cat((inverse_indices, inverse_indices.new_zeros(pad)))
             token_tags = torch.cat((token_tags, token_tags.new_zeros(pad)))
 
@@ -558,10 +559,12 @@ class MiniMaxH3DiT(nn.Module):
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
         # Single device→host sync per forward: segment bounds shared across
-        # every block instead of one tolist() per attention module.
+        # every block instead of one tolist() per attention module. Bounds stay
+        # at the ORIGINAL seq_len: the per-segment SDPA is non-causal, so an
+        # extended bound would leak pad keys into the last real rows. Pad rows
+        # fall outside every segment and are dropped by the index_select below
+        # (their uninitialized attention output never reaches the loss).
         cu_bounds = tuple(cu_seqlens.tolist())
-        if sp_world > 1 and cu_bounds[-1] != padded_seq_len:
-            cu_bounds = cu_bounds[:-1] + (padded_seq_len,)
         block_swap = self._block_swap if self._block_offload_enabled else 0
         for i, block in enumerate(self.blocks):
             if self._block_offload_enabled:

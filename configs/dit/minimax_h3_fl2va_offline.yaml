@@ -47,7 +47,6 @@ data:
   train_path: output/minimax_h3_fl2va_embedding
   data_type: diffusion
   source_name: minimax_h3
-  data_transform: dit_offline
   datasets_type: minimax_h3_offline
   log_sample: false
   text_keys: text
