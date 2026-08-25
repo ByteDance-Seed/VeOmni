@@ -44,7 +44,7 @@ def check_balance_sorting(rank_table, balanced_data_gt, role="s2"):
 
     # Check whether the load matches the given ground truth
     # Calculate the workload of current rank
-    rank_table_cur_rank_wl = [WORKLOAD_CAL_RULE[role](rt).sum() for rt in rank_table]
+    rank_table_cur_rank_wl = [WORKLOAD_CAL_RULE[role](torch.cat(rt)).sum() for rt in rank_table]
 
     # Since the ground truth is a manually constructed perfectly balanced data distribution,
     # the load on each DP group after applying the reordering algorithm must exactly match that of the ground truth;
@@ -66,19 +66,22 @@ def test_post_mbs_balancing_greedy_without_pad_s2():
 
 
 def _reference_greedy(all_data_lengths, num_replicas, dim):
-    sorted_indices = torch.argsort(all_data_lengths[:, dim].float(), descending=True)
-    sorted_rows = all_data_lengths[sorted_indices]
-    costs = (sorted_rows[:, dim] ** 2).cpu()
+    # Original tensor-argmin implementation, kept as the ground truth for the heap scheduler.
+    sort_indice = torch.argsort(all_data_lengths[:, dim].float(), descending=True)
+    all_data_lengths = all_data_lengths[sort_indice]
+    lengths_per_sequence = (all_data_lengths[:, dim] ** 2).cpu()
 
-    prefill = min(num_replicas, len(sorted_rows))
-    loads = torch.empty(num_replicas, dtype=torch.long)
-    loads[:prefill] = costs[:prefill]
-    buckets = [[sorted_rows[index]] if index < prefill else [] for index in range(num_replicas)]
-    for index, row in enumerate(sorted_rows[prefill:]):
-        target = loads.argmin()
-        buckets[target].append(row)
-        loads[target] += costs[index + prefill]
-    return [torch.stack(bucket) for bucket in buckets]
+    pre_fill_num = min(num_replicas, len(all_data_lengths))
+    dp_group_total_length = torch.empty(num_replicas, dtype=torch.long)
+    dp_group_total_length[:pre_fill_num] = lengths_per_sequence[:pre_fill_num]
+    balanced_image_dp_batch = [[all_data_lengths[i]] if i < pre_fill_num else [] for i in range(num_replicas)]
+
+    for i, sequence_length in enumerate(all_data_lengths[pre_fill_num:]):
+        target_dp_group = dp_group_total_length.argmin()
+        balanced_image_dp_batch[target_dp_group].extend([sequence_length])
+        dp_group_total_length[target_dp_group] += lengths_per_sequence[i + num_replicas]
+
+    return balanced_image_dp_batch
 
 
 def test_post_mbs_balancing_greedy_matches_tensor_argmin_reference():
@@ -127,7 +130,10 @@ def test_post_mbs_balancing_greedy_matches_tensor_argmin_reference():
     rank_table = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](all_data_lengths, num_replicas=4, dim=2)
     reference = _reference_greedy(all_data_lengths, num_replicas=4, dim=2)
 
-    assert all(torch.equal(actual, expected) for actual, expected in zip(rank_table, reference))
+    # The heap scheduler must produce the same per-bucket assignment as the tensor-argmin reference.
+    assert all(
+        torch.equal(torch.stack(actual), torch.stack(expected)) for actual, expected in zip(rank_table, reference)
+    )
     data_list, normalized_table = Qwen3VLEncoderDataBalance.rank_table_mapping(rank_table, dp_rank=2)
-    assert all(torch.equal(actual, expected) for actual, expected in zip(normalized_table, reference))
+    assert all(torch.equal(actual, torch.stack(expected)) for actual, expected in zip(normalized_table, reference))
     assert all(index.dtype == torch.long for index in data_list)

@@ -24,7 +24,7 @@ def post_mbs_balancing_greedy_without_pad(
     all_data_lengths: torch.Tensor,
     num_replicas: int,
     dim: int,
-) -> List[torch.Tensor]:
+) -> List[List[torch.Tensor]]:
     """
     A greedy bin-packing sorting algorithm designed for encoder data balance.
     It initializes a number of bins equal to the dp group size, and iteratively assigns data (sorted in descending order
@@ -41,28 +41,26 @@ def post_mbs_balancing_greedy_without_pad(
         a list that contains ${dp group size} buckets, where each bucket stores the sequence length and coordinate of
         the data assigned to the respective dp rank after balancing
     """
-    # AiCore does not support dtype int32 or int64 for argsort.
-    sorted_indices = torch.argsort(all_data_lengths[:, dim].float(), descending=True)
-    sorted_rows = all_data_lengths[sorted_indices].cpu().tolist()
+    # Note: AiCore does not support dtype int32 or int 64 for argsort
+    sort_indice = torch.argsort(all_data_lengths[:, dim].float(), descending=True)
+    all_data_lengths = all_data_lengths[sort_indice]
+    lengths_per_sequence = (all_data_lengths[:, dim] ** 2).cpu()
 
-    pre_fill_num = min(num_replicas, len(sorted_rows))
-    buckets = [[row] for row in sorted_rows[:pre_fill_num]] + [[] for _ in range(num_replicas - pre_fill_num)]
-    load_heap = [(row[dim] ** 2, rank) for rank, row in enumerate(sorted_rows[:pre_fill_num])]
-    load_heap.extend((0, rank) for rank in range(pre_fill_num, num_replicas))
+    pre_fill_num = min(num_replicas, len(all_data_lengths))
+    balanced_image_dp_batch = [[all_data_lengths[i]] if i < pre_fill_num else [] for i in range(num_replicas)]
+
+    # Use a min-heap keyed on (accumulated load, dp rank) to pick the least-loaded bin in O(log n)
+    # instead of an O(n) argmin scan per assignment. The rank tie-breaker preserves the argmin behavior
+    # of selecting the lowest-index bin when loads are equal.
+    load_heap = [(int(lengths_per_sequence[i]) if i < pre_fill_num else 0, i) for i in range(num_replicas)]
     heapq.heapify(load_heap)
 
-    for row in sorted_rows[pre_fill_num:]:
-        load, target_rank = heapq.heappop(load_heap)
-        buckets[target_rank].append(row)
-        heapq.heappush(load_heap, (load + row[dim] ** 2, target_rank))
+    for i, sequence_lentgh in enumerate(all_data_lengths[pre_fill_num:]):
+        target_load, target_dp_group = heapq.heappop(load_heap)
+        balanced_image_dp_batch[target_dp_group].extend([sequence_lentgh])
+        heapq.heappush(load_heap, (target_load + int(lengths_per_sequence[i + num_replicas]), target_dp_group))
 
-    bucket_sizes = [len(bucket) for bucket in buckets]
-    rank_table = torch.tensor(
-        [row for bucket in buckets for row in bucket],
-        dtype=all_data_lengths.dtype,
-        device=all_data_lengths.device,
-    )
-    return list(rank_table.split(bucket_sizes))
+    return balanced_image_dp_batch
 
 
 SORTING_ALGO_FUNC = {
