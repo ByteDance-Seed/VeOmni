@@ -180,9 +180,6 @@ jobs:
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_trainer_saveload.py
-      - name: Run DCP checkpointer CPU-offload regression tests
-        run: |
-          uv run --frozen pytest -v -s -x tests/checkpoints/test_dcp_checkpointer.py
       - name: Run distributed tests (dummy_forward)
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py

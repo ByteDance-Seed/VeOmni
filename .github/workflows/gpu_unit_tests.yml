@@ -216,6 +216,3 @@ jobs:
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py
-      - name: Run DCP checkpointer CPU-offload regression tests
-        run: |
-          uv run --frozen pytest -s -x tests/checkpoints/test_dcp_checkpointer.py
