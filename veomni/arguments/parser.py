@@ -115,21 +115,6 @@ def _add_arguments_recursive(parser: argparse.ArgumentParser, cls: Type[Any], pr
             parser.add_argument(f"--{arg_name}", **kwargs)
 
 
-# Keys that used to live elsewhere. A config carrying one of these is stale rather
-# than merely wrong, so the error names the new location instead of listing every
-# valid key. There is no compatibility shim: the old key never takes effect.
-_RELOCATED_KEYS = {
-    "train.accelerator": "model.accelerator",
-    "train.optimizer": "model.optimizer",
-    "train.init_device": "model.accelerator.init_device",
-    "train.broadcast_model_weights_from_rank0": "model.accelerator.broadcast_model_weights_from_rank0",
-    "train.ep_sharded_stream_load": "model.accelerator.ep_sharded_stream_load",
-    "train.gradient_checkpointing": "model.accelerator.gradient_checkpointing",
-    "train.torch_compile": "model.accelerator.torch_compile",
-    "train.chunk_mbs_config": "model.accelerator.chunk_mbs_config",
-}
-
-
 def _reject_unknown_keys(cls: Type[Any], config_dict: Dict[str, Any], path: str) -> None:
     """Fail on config keys the dataclass does not declare.
 
@@ -144,11 +129,7 @@ def _reject_unknown_keys(cls: Type[Any], config_dict: Dict[str, Any], path: str)
     problems = []
     for key in unknown:
         dotted = f"{path}.{key}" if path else key
-        moved_to = _RELOCATED_KEYS.get(dotted)
-        if moved_to:
-            problems.append(f"  {dotted} has moved to {moved_to}")
-        else:
-            problems.append(f"  {dotted} is not a field of {cls.__name__} (known: {', '.join(sorted(known))})")
+        problems.append(f"  {dotted} is not a field of {cls.__name__} (known: {', '.join(sorted(known))})")
 
     raise ValueError("Invalid configuration keys:\n" + "\n".join(problems))
 

@@ -34,8 +34,8 @@ sizes, schedules, checkpointing, logging — stays on `train.*`, which is singul
 no matter how many modules the model has.
 
 Unknown keys are rejected. A config carrying a key that no dataclass declares
-fails at parse time rather than being silently dropped, and a key that has moved
-is reported together with its new path.
+fails at parse time rather than being silently dropped. There is no compatibility
+alias.
 
 ---
 

@@ -400,22 +400,16 @@ def test_chunk_mbs_validates_itself():
         "gradient_checkpointing",
         "torch_compile",
         "chunk_mbs_config",
+        "accelerator",
+        "optimizer",
     ],
 )
-def test_parser_points_a_relocated_key_at_its_new_home(key, world_size):
+def test_parser_rejects_a_key_that_used_to_live_on_train(key, world_size):
     world_size(1)
     value = {"enable": True} if key in ("gradient_checkpointing", "torch_compile", "chunk_mbs_config") else "meta"
 
-    with pytest.raises(ValueError, match=rf"train\.{key} has moved to model\.accelerator\.{key}"):
+    with pytest.raises(ValueError, match=rf"train\.{key} is not a field of TrainingArguments"):
         _instantiate_recursive(TrainingArguments, {key: value}, path="train")
-
-
-@pytest.mark.parametrize("block", ["accelerator", "optimizer"])
-def test_parser_points_a_relocated_block_at_model(block, world_size):
-    """The whole block moved, so a config that still nests it under train must say so."""
-    world_size(1)
-    with pytest.raises(ValueError, match=rf"train\.{block} has moved to model\.{block}"):
-        _instantiate_recursive(TrainingArguments, {block: {}}, path="train")
 
 
 def test_parser_rejects_a_key_no_dataclass_declares(world_size):
