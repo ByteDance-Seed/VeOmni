@@ -1134,7 +1134,8 @@ class OpsImplementationConfig:
                 "help": "Context-parallel algorithm selector. 'disabled' (default) uses generic Ring/Hybrid CP for "
                 "non-GDN causal models and rejects CP at Qwen3.5 GDN model binding; "
                 "'state_passing_lossless' uses native-chunk ownership, reversible all-to-all, and recurrent-state/halo "
-                "autograd across context-parallel ranks; 'kcp' reuses the same lossless ownership/halo layout and "
+                "autograd across context-parallel ranks and is the recommended production selector; "
+                "'kcp' is an experimental research selector that reuses the same lossless ownership/halo layout and "
                 "replaces recurrent-state P2P with the fixed-size TTX BC8/M1 affine-prefix collective on Ascend; "
                 "'headwise_lossless' gathers each packed sequence once over the flattened CP x Ulysses group and "
                 "shards GDN heads without recurrent-state communication."
@@ -1163,6 +1164,12 @@ class OpsImplementationConfig:
             raise ValueError(
                 "gdn_context_parallel_implementation must be one of "
                 f"{sorted(allowed_gdn_cp)}, got {self.gdn_context_parallel_implementation!r}."
+            )
+        if self.gdn_context_parallel_implementation == "kcp":
+            logger.warning_rank0(
+                "gdn_context_parallel_implementation='kcp' is experimental and is not recommended for production "
+                "recipes. Use 'state_passing_lossless' unless you are running an explicit KCP correctness/performance "
+                "experiment."
             )
         if (
             self.gdn_context_parallel_implementation in {"kcp", "state_passing_lossless"}

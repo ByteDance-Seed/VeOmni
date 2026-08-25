@@ -20,6 +20,20 @@ def test_gdn_cp_selector_rejects_unknown_value():
         OpsImplementationConfig(gdn_context_parallel_implementation="experimental")
 
 
+def test_kcp_selector_warns_that_it_is_experimental(monkeypatch):
+    messages = []
+    monkeypatch.setattr(arguments_types.logger, "warning_rank0", messages.append)
+
+    OpsImplementationConfig(
+        gdn_context_parallel_implementation="kcp",
+        load_balancing_loss_implementation="eager",
+    )
+
+    assert len(messages) == 1
+    assert "experimental" in messages[0]
+    assert "state_passing_lossless" in messages[0]
+
+
 @pytest.mark.parametrize("implementation", ["state_passing_lossless", "kcp"])
 def test_lossless_gdn_cp_rejects_ascendc_without_initial_state_gradient(implementation):
     with pytest.raises(ValueError, match="does not implement that gradient"):

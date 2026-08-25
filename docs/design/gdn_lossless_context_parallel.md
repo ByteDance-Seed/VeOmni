@@ -18,12 +18,15 @@ model:
 ```
 
 `state_passing_lossless` sends the recurrent state between consecutive native
-chunk owners. On Ascend, `kcp` keeps the same physical↔owned sparse-packed
+chunk owners and is the recommended production route. On Ascend, the
+experimental `kcp` selector keeps the same physical↔owned sparse-packed
 all-to-all and halo route, but replaces recurrent-state P2P with an fp32 affine
 summary all-gather and prefix composition. Its local pre-scan is the fixed TTX
 BC8/M1 backend (forward column tile 32, backward time tile 128, replay column
 tile 8); there are no environment-variable backend overrides or silent torch
-fallbacks. GPU model paths reject `kcp` explicitly.
+fallbacks. Production recipes do not select `kcp`; it must first pass the NPU
+forward/VJP parity gate and beat `state_passing_lossless` end to end. GPU model
+paths reject `kcp` explicitly.
 
 `headwise_lossless` is the communication-throughput candidate for hybrid
 CP×Ulysses. Full-attention layers retain their physical Ring/Hybrid layout;
@@ -87,8 +90,9 @@ communication instead of risking a collective hang.
 - recurrent-state and halo P2P preserve cross-rank backward edges;
 - Ring forward and `dq/dk/dv` match a dense packed causal oracle;
 - unknown selectors/backends and unsupported hardware paths fail closed;
-- KCP local affine summaries match the portable recurrence, and distributed
-  CP2/4/8/16 prefix full gradients match a monolithic CPU oracle;
+- the portable KCP reference matches the monolithic CPU recurrence and
+  distributed CP2/4/8/16 prefix gradients; a hardware TTX backend must
+  separately pass the NPU forward/VJP parity gate before production promotion;
 - headwise packed/GQA forward and full VJP match a monolithic oracle, including
   empty segments, hybrid Ulysses×CP rank order, and non-reentrant checkpointing;
 - `gdn_cp_runtime_evidence.snapshot()` returns a public typed identity and
