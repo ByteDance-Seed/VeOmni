@@ -7,19 +7,95 @@ in-tree bugs — they become regression guards once the fix lands.
 """
 
 import inspect
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.distributed.fsdp import fully_shard
 
 from veomni.distributed import torch_parallelize
+from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model, parallelize_model_fsdp2
 from veomni.models.module_utils import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
+
+
+def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
+    """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
+    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(os.environ.get("_TEST_MASTER_PORT", "0"))
+    device_type = get_device_type()
+    backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+    device = torch.device("cpu" if device_type == "cpu" else f"{device_type}:{rank}")
+    if device_type != "cpu":
+        get_torch_device().set_device(device)
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+
+    try:
+        init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
+        mesh = get_parallel_state().dp_shard_mesh
+
+        def build_model_and_optimizer():
+            model = nn.Sequential(nn.Linear(4, 4, bias=True), nn.Linear(4, 4, bias=True)).to(device)
+            for layer in model:
+                fully_shard(layer, mesh=mesh)
+            fully_shard(model, mesh=mesh)
+            optimizer = MultiOptimizer(
+                model,
+                {
+                    "adamw0": torch.optim.AdamW(model[0].parameters(), lr=1e-3),
+                    "adamw1": torch.optim.AdamW(model[1].parameters(), lr=1e-3),
+                },
+                ["adamw0", "adamw1"],
+            )
+            return model, optimizer
+
+        source_model, source_optimizer = build_model_and_optimizer()
+        x = torch.randn(2, 4, device=device)
+        source_model(x).sum().backward()
+        source_optimizer.step()
+        expected = source_optimizer.state_dict()
+
+        checkpoint_dir = tmp_path / "ckpt"
+        dcp.save(
+            {"model": ModelState(source_model), "optimizer": OptimizerState(source_model, source_optimizer)},
+            checkpoint_id=str(checkpoint_dir),
+        )
+        dist.barrier()
+
+        target_model, target_optimizer = build_model_and_optimizer()
+        dcp.load(
+            {
+                "model": ModelState(target_model),
+                "optimizer": OptimizerState(target_model, target_optimizer, load=True),
+            },
+            checkpoint_id=str(checkpoint_dir),
+        )
+
+        actual = target_optimizer.state_dict()
+        assert expected.keys() == actual.keys()
+        for key in expected:
+            expected_value = expected[key]
+            actual_value = actual[key]
+            if torch.is_tensor(expected_value):
+                torch.testing.assert_close(expected_value, actual_value, atol=0.0, rtol=0.0)
+            else:
+                assert expected_value == actual_value
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +149,100 @@ class TestOptimizerStateNoFill:
 
         with pytest.raises(TypeError, match="fill_missing_optimizer_states"):
             OptimizerState(model, optimizer, fill_missing_optimizer_states=True)
+
+
+class TestMultiOptimizerState:
+    """Non-ExtraParallel MultiOptimizer must use its own DCP protocol."""
+
+    def test_single_process_dcp_roundtrip(self, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.optim.optimizer import MultiOptimizer
+
+        def build_model_and_optimizer():
+            model = nn.Linear(4, 4)
+            optimizer = MultiOptimizer(
+                model,
+                {
+                    "adamw_w": torch.optim.AdamW([model.weight], lr=1e-3),
+                    "adamw_b": torch.optim.AdamW([model.bias], lr=1e-3),
+                },
+                ["adamw_w", "adamw_b"],
+            )
+            return model, optimizer
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        source_model, source_optimizer = build_model_and_optimizer()
+        for param in source_model.parameters():
+            param.grad = torch.randn_like(param)
+        source_optimizer.step()
+        expected = source_optimizer.state_dict()
+        assert any("exp_avg" in key for key in expected)
+        assert any("step" in key for key in expected)
+
+        target_model, target_optimizer = build_model_and_optimizer()
+        dcp.save(
+            {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target_optimizer, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        actual = target_optimizer.state_dict()
+        assert expected.keys() == actual.keys()
+        for key, expected_value in expected.items():
+            actual_value = actual[key]
+            if torch.is_tensor(expected_value):
+                torch.testing.assert_close(expected_value, actual_value, atol=0.0, rtol=0.0)
+            else:
+                assert expected_value == actual_value
+
+    def test_fsdp2_multi_optimizer_roundtrip(self, tmp_path):
+        """Run the MultiOptimizer DCP round-trip across two real FSDP2 ranks."""
+        from tests.tools.launch_utils import find_free_port
+
+        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
+        mp.spawn(_fsdp2_multi_optimizer_worker, args=(2, tmp_path), nprocs=2, join=True)
+
+    def test_multi_optimizer_sparse_state_excludes_synthetic(self, tmp_path):
+        """A fresh sub-optimizer must not have synthetic state materialized in the checkpoint."""
+        from torch.distributed.checkpoint import FileSystemReader
+        from torch.distributed.checkpoint.metadata import Metadata
+
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.optim.optimizer import MultiOptimizer
+
+        model = nn.Linear(4, 4)
+        optimizer = MultiOptimizer(
+            model,
+            {
+                "adamw_w": torch.optim.AdamW([model.weight], lr=1e-3),
+                "adamw_b": torch.optim.AdamW([model.bias], lr=1e-3),
+            },
+            ["adamw_w", "adamw_b"],
+        )
+        # Only bias gets a gradient; the adamw_w sub-optimizer remains empty.
+        model.bias.grad = torch.randn_like(model.bias)
+        optimizer.step()
+        assert optimizer.optimizers_dict["adamw_b"].state
+        assert not optimizer.optimizers_dict["adamw_w"].state
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        dcp.save(
+            {"optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        reader = FileSystemReader(tmp_path)
+        metadata = reader.read_metadata()
+        assert isinstance(metadata, Metadata)
+        keys = list(metadata.state_dict_metadata.keys())
+        state_keys = [k for k in keys if k.startswith("optimizer.state.")]
+        assert any("bias" in k for k in state_keys), f"expected bias state in checkpoint keys: {keys}"
+        assert not any(k.startswith("optimizer.state.weight.") for k in state_keys), (
+            f"synthetic weight state must not be saved: {keys}"
+        )
 
 
 class TestAllowPartialLoad:

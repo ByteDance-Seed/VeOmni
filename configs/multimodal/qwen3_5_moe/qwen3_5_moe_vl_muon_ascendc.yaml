@@ -17,7 +17,7 @@ data:
   data_type: conversation
   chat_template: qwen3vl
   max_seq_len: 16384
-  train_size: 80000000
+  train_size: 160000000
   mm_configs:
     image_max_pixels: 602112 # 28 * 28 * 768
     video_max_pixels: 602112 # 28 * 28 * 768
@@ -28,7 +28,8 @@ data:
 
 train:
   accelerator:
-    ulysses_size: 4
+    ulysses_size: 1
+    ep_size: 4
     fsdp_config:
       fsdp_mode: fsdp2
   gradient_checkpointing:
@@ -36,11 +37,22 @@ train:
   wandb:
     enable: false
     project: VeOmni
-    name: Qwen3.5-35B-A3B-vl-sft
+    name: Qwen3.5-35B-A3B-vl-muon-ascend
   freeze_vit: false
   optimizer:
+    type: muon
     lr: 1.0e-5
+    weight_decay: 0.1
     lr_decay_style: cosine
+    max_grad_norm: 1.0
+    muon_lr: 1.0e-5
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.1
+    muon_ns_steps: 5
+    muon_ns_implementation: gram
+    muon_adjust_lr_fn: match_rms_adamw
+    muon_expert_zero_comm: true
   num_train_epochs: 2
   micro_batch_size: 1
   global_batch_size: 16
@@ -52,6 +64,6 @@ train:
     end_step: 21
     record_shapes: true
   checkpoint:
-    output_dir: Qwen3.5-35B-A3B-vl-sft
+    output_dir: Qwen3.5-35B-A3B-vl-muon-ascend
     manager: dcp
     save_hf_weights: false
