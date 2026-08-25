@@ -132,7 +132,11 @@ from veomni.distributed.context_parallel.packed_sharding import (
 )
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
-from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
+from veomni.distributed.sequence_parallel.ulysses import (
+    gather_heads_scatter_seq,
+    gather_seq_scatter_heads,
+    gather_seq_scatter_heads_grouped,
+)
 from veomni.ops.kernels.attention._replicated_dummy import (
     _DUMMY_SP_TOKEN,
     _call_replicated_dummy_checkpointed_module,
@@ -894,15 +898,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             k_proj = k_proj.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
             v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-            # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
-            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-
             b = b.reshape(batch_size, seq_len, self.num_v_heads)
             a = a.reshape(batch_size, seq_len, self.num_v_heads)
-            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
-            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
+
+            # KCP keeps its ownership/state algorithm unchanged, but transports
+            # all five projections in one dense all_to_all_single. This preserves
+            # the independent Ulysses tensor layout and wire bytes while removing
+            # four collective launches in both forward and backward.
+            if self.gdn_context_parallel_implementation == "kcp":
+                q_proj, k_proj, v_proj, b, a = gather_seq_scatter_heads_grouped(
+                    (q_proj, k_proj, v_proj, b, a),
+                    seq_dim=1,
+                    head_dim=2,
+                    group=ulysses_group,
+                )
+                if not getattr(self, "_gdn_kcp_grouped_ulysses_logged", False):
+                    logger.info(
+                        "VEOMNI_GDN_KCP_RUNTIME grouped_ulysses_a2a=true "
+                        f"ulysses_size={ulysses_size} cp_size={parallel_state.cp_size}"
+                    )
+                    self._gdn_kcp_grouped_ulysses_logged = True
+            else:
+                # All-to-all: gather full sequence, scatter heads ->
+                # [B, S_full, local_heads, head_dim].
+                q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+                k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+                v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+                b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
+                a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
 
             if cp_enabled:
                 q_proj = reorder_ulysses_rank_major_to_sample_major(

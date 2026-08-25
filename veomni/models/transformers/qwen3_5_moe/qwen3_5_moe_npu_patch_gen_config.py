@@ -110,7 +110,7 @@ config.add_import(
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+    names=["gather_seq_scatter_heads", "gather_seq_scatter_heads_grouped", "gather_heads_scatter_seq"],
 )
 config.add_import(
     "veomni.distributed.context_parallel.gdn_headwise",
@@ -224,6 +224,7 @@ config.add_post_import_block(
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 gather_seq_scatter_heads = None
+gather_seq_scatter_heads_grouped = None
 gather_heads_scatter_seq = None
 gather_outputs = None
 slice_input_tensor = None

@@ -32,6 +32,22 @@ def _function_block(source: str, function_name: str) -> str:
     raise AssertionError(f"function {function_name} not found")
 
 
+def _gdn_forward_block(source: str) -> str:
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "qwen3_5_gated_deltanet_forward_patched":
+            if node.end_lineno is None:
+                raise AssertionError("could not determine patched GDN forward source span")
+            return "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
+        if isinstance(node, ast.ClassDef) and node.name.endswith("GatedDeltaNet"):
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef) and child.name == "forward":
+                    if child.end_lineno is None:
+                        raise AssertionError("could not determine generated GDN forward source span")
+                    return "\n".join(source.splitlines()[child.lineno - 1 : child.end_lineno])
+    raise AssertionError("GDN forward function not found")
+
+
 @pytest.mark.parametrize(
     "relative_path",
     [
@@ -113,6 +129,35 @@ def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
     assert block.count("attach_state_dependency(core_attn_out, initial_state)") == 1
     assert "gdn_cp_runtime_evidence" in block
     assert "observer=gdn_cp_observer" in block
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "veomni/models/transformers/qwen3_5/qwen3_5_npu_patch_gen_config.py",
+        "veomni/models/transformers/qwen3_5/generated/patched_modeling_qwen3_5_npu.py",
+        "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
+    ],
+)
+def test_npu_kcp_groups_five_ulysses_inputs_before_ownership(relative_path: str):
+    source = (ROOT / relative_path).read_text()
+    block = _gdn_forward_block(source)
+    grouped_start = block.index('if self.gdn_context_parallel_implementation == "kcp":')
+    grouped_call = block.index("gather_seq_scatter_heads_grouped(", grouped_start)
+    fallback_start = block.index("else:", grouped_call)
+    reorder_start = block.index("reorder_ulysses_rank_major_to_sample_major(", fallback_start)
+    ownership_start = block.index("physical_to_owned_grouped(", reorder_start)
+
+    assert grouped_call < fallback_start < reorder_start < ownership_start
+    grouped_block = block[grouped_start:fallback_start]
+    assert "(q_proj, k_proj, v_proj, b, a)" in grouped_block
+    assert "VEOMNI_GDN_KCP_RUNTIME grouped_ulysses_a2a=true" in grouped_block
+    assert grouped_block.count("gather_seq_scatter_heads_grouped(") == 1
+
+
+def test_moe_npu_patchgen_imports_grouped_ulysses_for_shared_gdn_forward():
+    source = (ROOT / "veomni/models/transformers/qwen3_5_moe/qwen3_5_moe_npu_patch_gen_config.py").read_text()
+    assert '"gather_seq_scatter_heads_grouped"' in source
 
 
 @pytest.mark.parametrize(
