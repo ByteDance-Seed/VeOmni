@@ -457,8 +457,6 @@ model:
       - to_out.0
       - ffn.net.0.proj
       - ffn.net.2
-
-train:
   accelerator:
     init_device: meta
     fsdp_config:
@@ -514,8 +512,6 @@ model:
       - gate_proj
       - up_proj
       - down_proj
-
-train:
   accelerator:
     init_device: meta          # required for FSDP2
     fsdp_config:
@@ -566,8 +562,6 @@ model:
     # gate_proj/up_proj/down_proj auto-map to the fused expert parameters.
     lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
     share_expert_lora: true                            # one LoRA per layer (Mode 2)
-
-train:
   accelerator:
     init_device: meta
     ulysses_size: 1
@@ -634,8 +628,6 @@ model:
       - to_add_out
       - net.0.proj
       - net.2
-
-train:
   accelerator:
     init_device: meta
     fsdp_config:

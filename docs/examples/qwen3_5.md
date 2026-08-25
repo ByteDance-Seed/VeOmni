@@ -240,10 +240,10 @@ then runs each `Qwen3_5DecoderLayer` chunk sequentially while keeping the outer 
 same token ranges are used by both full-attention and GatedDeltaNet layers, so every ChunkMBS cut must be present in
 both cumulative-length tensors; their internal boundaries may differ.
 
-The example config exposes the feature but keeps it disabled by default:
+The shipped configs leave it off. To enable it:
 
 ```yaml
-train:
+model:
   accelerator:
     chunk_mbs_config:
       enable: true

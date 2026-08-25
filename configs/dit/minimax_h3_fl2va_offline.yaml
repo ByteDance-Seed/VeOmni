@@ -40,6 +40,28 @@ model:
     moe_implementation: eager
     load_balancing_loss_implementation: eager
 
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    betas: [0.9, 0.999]
+    lr_decay_style: linear
+    lr_min: 1.0e-5
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+
 # -----------------------------------------------------------------------------
 # Data
 # -----------------------------------------------------------------------------
@@ -68,33 +90,10 @@ train:
   micro_batch_size: 1
   dyn_bsz: false
 
-  init_device: meta
   seed: 42
 
   num_train_epochs: 1
   max_steps: 20
-
-  gradient_checkpointing:
-    enable: true
-
-  optimizer:
-    type: adamw
-    lr: 1.0e-5
-    betas: [0.9, 0.999]
-    lr_decay_style: linear
-    lr_min: 1.0e-5
-    lr_warmup_ratio: 0.0
-    weight_decay: 0.01
-
-  accelerator:
-    ulysses_size: 1
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: true
-        param_dtype: bfloat16
-        reduce_dtype: float32
-        cast_forward_inputs: false
 
   checkpoint:
     output_dir: output/minimax_h3_fl2va_offline

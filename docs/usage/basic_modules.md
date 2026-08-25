@@ -431,7 +431,7 @@ default would quietly change the update math for every model whose attention use
 the same names:
 
 ```yaml
-train:
+model:
   optimizer:
     type: muon
     muon_head_group_size: 1            # heads per block
