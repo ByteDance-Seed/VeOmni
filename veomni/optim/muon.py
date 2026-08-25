@@ -31,7 +31,6 @@ import torch.nn as nn
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.optim.optimizer import Optimizer
-from torch.profiler import record_function
 
 from ..utils import logging
 from ..utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
@@ -1087,8 +1086,7 @@ class DistributedMuon(Optimizer):
         if kind == _KIND_MOE_LOCAL_3D:
             assert isinstance(update, DTensor)
             local = update._local_tensor
-            with record_function("Muon/EP/newton_schulz"):
-                local_ortho = _ns(local)
+            local_ortho = _ns(local)
             return DTensor.from_local(
                 local_ortho,
                 device_mesh=update.device_mesh,
@@ -1097,9 +1095,6 @@ class DistributedMuon(Optimizer):
             )
 
         if kind == _KIND_MOE_GATHER_3D:
-            with record_function("Muon/EP/gather"):
-                full_update = _full_grad(update)
-            with record_function("Muon/EP/newton_schulz"):
-                return _ns(full_update)
+            return _ns(_full_grad(update))
 
         raise ValueError(f"Unknown DistributedMuon kind: {kind!r}")
