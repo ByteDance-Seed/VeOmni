@@ -150,7 +150,7 @@ class ModuleRuntime:
             self._build_parallelized_model()
             if not for_inference:
                 self._scope_recompute_to_parallel_state()
-            if not for_inference and self.has_trainable_parameters:
+            if not for_inference:
                 self._build_optimizer()
             if not for_inference:
                 self._init_checkpoint()
@@ -445,7 +445,10 @@ class ModuleRuntime:
         Scoped to this module's own ParallelState: a distributed optimizer (e.g.
         Muon) reads ``get_parallel_state()`` at build time, so it must resolve to
         this module's mesh, not the orchestrator's.
+        A no-op for a fully-frozen module (no trainable params).
         """
+        if not self.has_trainable_parameters:
+            return
         with self._scoped():
             opt = self.args.optimizer
             self.optimizer = build_optimizer(
