@@ -292,6 +292,83 @@ def test_build_dataloader_native_override_resolves_before_external_dispatch():
 
 
 @pytest.mark.parametrize("missing_argument", ["max_seq_len", "micro_batch_size"])
+def test_build_dataloader_rejects_context_aware_when_dyn_bsz_disabled():
+    with pytest.raises(ValueError, match="requires dyn_bsz=True"):
+        build_dataloader(
+            dataloader_type="native",
+            dyn_bsz=False,
+            dyn_bsz_buffer_policy="context_aware",
+            max_seq_len=1024 * 1024,
+            micro_batch_size=1,
+        )
+
+
+def test_build_native_dataloader_rejects_context_aware_when_dyn_bsz_disabled():
+    from veomni.data.data_loader import build_native_dataloader
+
+    with pytest.raises(ValueError, match="requires dyn_bsz=True"):
+        build_native_dataloader(
+            dataset=[{"input_ids": [1]}],
+            micro_batch_size=1,
+            global_batch_size=1,
+            dataloader_batch_size=1,
+            max_seq_len=1024 * 1024,
+            train_steps=1,
+            dyn_bsz=False,
+            dyn_bsz_buffer_policy="context_aware",
+        )
+
+
+def test_dit_trainer_rejects_context_aware_after_setup_disables_dyn_bsz(monkeypatch):
+    from veomni.arguments.arguments_types import DataloaderConfig
+    from veomni.trainer.dit_trainer import DiTTrainer
+    import veomni.trainer.dit_trainer as dit_mod
+
+    monkeypatch.setattr(
+        dit_mod,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, sp_rank=0, dp_size=1),
+    )
+    trainer = DiTTrainer.__new__(DiTTrainer)
+    trainer.base = types.SimpleNamespace(
+        train_dataset=object(),
+        args=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                dataloader=DataloaderConfig(
+                    type="native",
+                    num_workers=0,
+                    drop_last=True,
+                    pin_memory=False,
+                    prefetch_factor=2,
+                ),
+                max_seq_len=1024 * 1024,
+                dyn_bsz_buffer_size=200,
+                dyn_bsz_buffer_policy="context_aware",
+                data_modality="diffusion",
+            ),
+            train=types.SimpleNamespace(
+                micro_batch_size=1,
+                global_batch_size=1,
+                dataloader_batch_size=1,
+                dyn_bsz=True,
+                dyn_bsz_runtime="main",
+                dyn_bsz_count_mode="total",
+                dyn_bsz_physical_overflow_ratio=1.5,
+                bsz_warmup_ratio=0.02,
+                bsz_warmup_init_mbtoken=200,
+                seed=0,
+                checkpoint=types.SimpleNamespace(save_steps=1000),
+            ),
+            train_steps=1,
+        ),
+    )
+    # DiTTrainer._setup forces fixed-batch loading before _build_dataloader.
+    trainer.base.args.train.dyn_bsz = False
+
+    with pytest.raises(ValueError, match="requires dyn_bsz=True"):
+        trainer._build_dataloader()
+
+
 def test_build_dataloader_context_aware_policy_reports_missing_arguments(missing_argument):
     arguments = {
         "dataloader_type": "native",

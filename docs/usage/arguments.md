@@ -210,7 +210,7 @@ NPU validation runs at two times:
 | multisource_datasets_type | `str` | `"interleave"` | Dataset type for multisource training. |
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
-| dyn_bsz_buffer_policy | `Literal["fixed", "context_aware"]` | `"fixed"` | Buffer policy. `fixed` preserves `dyn_bsz_buffer_size`; `context_aware` uses a per-DP-rank minimum of 24 candidates for 512K or 1M text contexts with main-process, total-token, micro-batch-size-one batching. |
+| dyn_bsz_buffer_policy | `Literal["fixed", "context_aware"]` | `"fixed"` | Buffer policy. `fixed` preserves `dyn_bsz_buffer_size`; `context_aware` uses a per-DP-rank minimum of 24 candidates for 512K or 1M text contexts with `dyn_bsz=True`, main-process, total-token, micro-batch-size-one batching. `context_aware` is rejected when dynamic batching is disabled. |
 | text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
 | chat_template | `str` | `"default"` | Chat template name. |
 | max_seq_len | `int` | `2048` | Maximum sequence length. |

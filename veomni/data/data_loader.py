@@ -49,6 +49,14 @@ _CONTEXT_AWARE_DYN_BSZ_BUFFER_SIZES = {
 }
 
 
+def _require_dyn_bsz_for_context_aware_policy(dyn_bsz: bool, dyn_bsz_buffer_policy: str) -> None:
+    if dyn_bsz_buffer_policy == "context_aware" and not dyn_bsz:
+        raise ValueError(
+            "dyn_bsz_buffer_policy='context_aware' requires dyn_bsz=True. "
+            "Set dyn_bsz_buffer_policy='fixed' when dynamic batching is disabled."
+        )
+
+
 def resolve_dyn_bsz_buffer_size(
     buffer_size: int,
     buffer_policy: Literal["fixed", "context_aware"],
@@ -86,6 +94,10 @@ def resolve_dyn_bsz_buffer_size(
 
 def build_dataloader(dataloader_type: str, **kwargs):
     builder = DATALOADER_REGISTRY[dataloader_type]
+    # Native owns default dyn_bsz=True. Reject an explicit disable here so
+    # trainers such as DiT cannot silently ignore an opt-in policy.
+    if kwargs.get("dyn_bsz") is False:
+        _require_dyn_bsz_for_context_aware_policy(False, kwargs.get("dyn_bsz_buffer_policy", "fixed"))
     if kwargs.get("dyn_bsz", False) and kwargs.get("dyn_bsz_buffer_policy", "fixed") == "context_aware":
         required_arguments = ("max_seq_len", "micro_batch_size")
         missing_arguments = [argument for argument in required_arguments if argument not in kwargs]
@@ -214,13 +226,16 @@ def build_native_dataloader(
 
         dyn_bsz_buffer_policy: ``"fixed"`` preserves ``dyn_bsz_buffer_size``. The
             opt-in ``"context_aware"`` policy selects a validated buffer size from
-            ``max_seq_len``. It is supported only for text data with main-process
-            dynamic batching, total-token counting, and ``micro_batch_size=1``.
-            The selected value is a per-data-parallel-rank minimum candidate count,
-            not a global count or a hard buffer capacity.
+            ``max_seq_len``. It is supported only for text data with ``dyn_bsz=True``,
+            main-process dynamic batching, total-token counting, and
+            ``micro_batch_size=1``. ``dyn_bsz=False`` plus ``context_aware`` is
+            rejected instead of being silently ignored. The selected value is a
+            per-data-parallel-rank minimum candidate count, not a global count or
+            a hard buffer capacity.
         data_modality: Coarse data modality used to fail closed when an opt-in
             batching policy has not been validated for multimodal or diffusion data.
     """
+    _require_dyn_bsz_for_context_aware_policy(dyn_bsz, dyn_bsz_buffer_policy)
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     parallel_state = get_parallel_state()
