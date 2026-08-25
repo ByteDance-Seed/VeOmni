@@ -110,7 +110,7 @@ class ModuleRuntime:
 
     args: "OmniModuleRuntimeArguments"
     module_name: str
-    model: Any
+    model: Optional[torch.nn.Module]
     model_config: Any
     train: Optional["OmniTrainingArguments"] = None
     optimizer: Optional[Any] = None
@@ -142,8 +142,7 @@ class ModuleRuntime:
         self._setup()
 
         with use_parallel_state(self.module_name):
-            self.model = self._build_module_model()
-            self.model_config = self.model.config
+            self._build_module_model()
             self._load_module_assets()
             if not for_inference:
                 self._freeze_model_module()
@@ -232,7 +231,7 @@ class ModuleRuntime:
         """Meta-init one OmniModule sub-model from its ``config.json``."""
         args = self.args
         logger.info_rank0("Build module model")
-        return build_foundation_model(
+        self.model = build_foundation_model(
             config_path=args.model_path,
             weights_path=args.model_path,
             torch_dtype="float32" if args.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
@@ -240,6 +239,7 @@ class ModuleRuntime:
             ops_implementation=args.ops_implementation,
             config_kwargs=args.model_config,
         )
+        self.model_config = self.model.config
 
     def _setup_module_lora(self, model: torch.nn.Module) -> torch.nn.Module:
         """Wrap ``model`` with VeOmni LoRA when configured."""
