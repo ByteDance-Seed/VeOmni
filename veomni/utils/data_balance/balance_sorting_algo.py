@@ -24,13 +24,19 @@ def post_mbs_balancing_greedy_without_pad(
     all_data_lengths: torch.Tensor,
     num_replicas: int,
     dim: int,
-) -> List[List[torch.Tensor]]:
+) -> List[torch.Tensor]:
     """
     A greedy bin-packing sorting algorithm designed for encoder data balance.
     It initializes a number of bins equal to the dp group size, and iteratively assigns data (sorted in descending order
     based on data length) to the bin with the smallest current load.
 
-    The load of a bin is defined as the sum of the lengths^2 of its elements
+    The load of a bin is defined as the sum of the lengths^2 of its elements.
+
+    The bin with the smallest load is tracked with a min-heap keyed on ``(accumulated_load, dp_rank)``. This costs
+    ``O(log num_replicas)`` per assignment instead of the ``O(num_replicas)`` scan an ``argmin`` would take, and the
+    ``dp_rank`` tie-breaker keeps assignments deterministic by preferring the lowest rank when loads are equal. The
+    greedy scheduling runs on host-side Python scalars, so the sorted rows are materialized on CPU up front and the
+    per-rank buckets are rebuilt into device tensors only once at the end.
 
     Args:
         all_data_lengths: the length information of data gathered from all dp ranks
@@ -38,29 +44,38 @@ def post_mbs_balancing_greedy_without_pad(
         dim: the dimension along with the data in all_data_lengths is used for sorting
 
     Returns:
-        a list that contains ${dp group size} buckets, where each bucket stores the sequence length and coordinate of
-        the data assigned to the respective dp rank after balancing
+        a list of ${dp group size} tensors, where each tensor stores the sequence length and coordinate of the data
+        assigned to the respective dp rank after balancing
     """
-    # Note: AiCore does not support dtype int32 or int 64 for argsort
+    # Note: AiCore does not support dtype int32 or int 64 for argsort. Sort descending by length, then move the rows to
+    # host so the greedy loop below works on cheap Python scalars rather than issuing per-item device ops.
     sort_indice = torch.argsort(all_data_lengths[:, dim].float(), descending=True)
-    all_data_lengths = all_data_lengths[sort_indice]
-    lengths_per_sequence = (all_data_lengths[:, dim] ** 2).cpu()
+    sorted_rows = all_data_lengths[sort_indice].cpu().tolist()
 
-    pre_fill_num = min(num_replicas, len(all_data_lengths))
-    balanced_image_dp_batch = [[all_data_lengths[i]] if i < pre_fill_num else [] for i in range(num_replicas)]
+    # Seed one bin per rank; the largest items pre-fill the first `pre_fill_num` bins so every rank starts non-empty.
+    pre_fill_num = min(num_replicas, len(sorted_rows))
+    buckets = [[row] for row in sorted_rows[:pre_fill_num]]
+    buckets.extend([] for _ in range(num_replicas - pre_fill_num))
 
-    # Use a min-heap keyed on (accumulated load, dp rank) to pick the least-loaded bin in O(log n)
-    # instead of an O(n) argmin scan per assignment. The rank tie-breaker preserves the argmin behavior
-    # of selecting the lowest-index bin when loads are equal.
-    load_heap = [(int(lengths_per_sequence[i]) if i < pre_fill_num else 0, i) for i in range(num_replicas)]
+    load_heap = [(row[dim] ** 2, dp_rank) for dp_rank, row in enumerate(sorted_rows[:pre_fill_num])]
+    load_heap.extend((0, dp_rank) for dp_rank in range(pre_fill_num, num_replicas))
     heapq.heapify(load_heap)
 
-    for i, sequence_lentgh in enumerate(all_data_lengths[pre_fill_num:]):
-        target_load, target_dp_group = heapq.heappop(load_heap)
-        balanced_image_dp_batch[target_dp_group].extend([sequence_lentgh])
-        heapq.heappush(load_heap, (target_load + int(lengths_per_sequence[i + num_replicas]), target_dp_group))
+    # Assign each remaining item to the currently least-loaded rank and push its updated load back onto the heap.
+    for row in sorted_rows[pre_fill_num:]:
+        load, target_dp_rank = heapq.heappop(load_heap)
+        buckets[target_dp_rank].append(row)
+        heapq.heappush(load_heap, (load + row[dim] ** 2, target_dp_rank))
 
-    return balanced_image_dp_batch
+    # Flatten the buckets into a single contiguous tensor and split it back per rank, so the caller receives one device
+    # tensor per rank instead of a list of per-item tensors.
+    bucket_sizes = [len(bucket) for bucket in buckets]
+    rank_table = torch.tensor(
+        [row for bucket in buckets for row in bucket],
+        dtype=all_data_lengths.dtype,
+        device=all_data_lengths.device,
+    )
+    return list(rank_table.split(bucket_sizes))
 
 
 SORTING_ALGO_FUNC = {
