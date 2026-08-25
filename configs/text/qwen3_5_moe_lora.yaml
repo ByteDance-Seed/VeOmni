@@ -1,0 +1,85 @@
+# Qwen3.5-MoE-35B LoRA on eight Ascend NPUs with FSDP2 and expert parallelism.
+# GPU validation uses this same file with the hardware backend overrides shown
+# in docs/examples/qwen3_5_moe_lora.md.
+
+model:
+  model_path: Qwen/Qwen3.5-35B-A3B
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_npu
+    cross_entropy_loss_implementation: chunk_loss
+    rms_norm_implementation: npu
+    rotary_pos_emb_implementation: npu
+    swiglu_mlp_implementation: eager
+    load_balancing_loss_implementation: eager
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu
+  lora_config:
+    rank: 16
+    alpha: 32
+    use_rslora: false
+    lora_modules:
+      # Full-attention projections.
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      # GatedDeltaNet projections.
+      - in_proj_qkv
+      - in_proj_z
+      - in_proj_b
+      - in_proj_a
+      - out_proj
+      # Semantic expert targets, mapped to gate_up_proj/down_proj parameters.
+      - gate_proj
+      - up_proj
+      - down_proj
+    share_expert_lora: true
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 1024
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  accelerator:
+    ulysses_size: 1
+    ep_size: 4
+    fsdp_config:
+      fsdp_mode: fsdp2
+      offload: false
+      mixed_precision:
+        enable: true
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  num_train_epochs: 1
+  max_steps: 500
+  init_device: meta
+  enable_full_determinism: false
+  ep_sharded_stream_load: true
+  broadcast_model_weights_from_rank0: false
+  empty_cache_steps: 100
+  checkpoint:
+    output_dir: Qwen3.5-35B-A3B-lora-tulu
+    manager: dcp
+    save_steps: 100
+    save_epochs: 0
+    save_hf_weights: true
+  wandb:
+    enable: false
+    project: VeOmni
+    name: Qwen3.5-35B-A3B-lora

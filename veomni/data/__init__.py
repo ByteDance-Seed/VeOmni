@@ -22,7 +22,6 @@ from .data_loader import DistributedDataloader, build_dataloader, resolve_dyn_bs
 from .data_transform import DATA_TRANSFORM_REGISTRY, build_data_transform
 from .dataset import build_dataset
 from .dummy_dataset import build_dummy_dataset
-from .multimodal.multimodal_chat_template import build_multimodal_chat_template
 
 
 __all__ = [
@@ -31,7 +30,6 @@ __all__ = [
     "resolve_dyn_bsz_buffer_size",
     "build_data_transform",
     "build_dummy_dataset",
-    "build_multimodal_chat_template",
     "DATA_TRANSFORM_REGISTRY",
     "MainCollator",
     "MakeMicroBatchCollator",

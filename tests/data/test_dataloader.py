@@ -41,25 +41,30 @@ def _context_aware_native_dataloader_kwargs():
     }
 
 
-def test_omni_data_arguments_identify_multimodal_policy_scope():
-    from tasks.omni.train_omni_model import MyDataArguments
+def test_vlm_data_arguments_identify_multimodal_policy_scope():
+    from veomni.trainer.vlm_trainer import VLMMDataArguments
 
-    assert MyDataArguments.data_modality == "multimodal"
+    assert VLMMDataArguments.data_modality == "multimodal"
 
 
-def test_omni_dataloader_forwards_buffer_policy_scope(monkeypatch):
-    import tasks.omni.train_omni_model as omni_train
+def test_base_trainer_forwards_buffer_policy_scope(monkeypatch):
+    from veomni.arguments.arguments_types import DataloaderConfig
+    from veomni.trainer.base import BaseTrainer
+    import veomni.trainer.base as base_mod
 
     captured_kwargs = {}
-    monkeypatch.setattr(omni_train, "build_dataloader", lambda **kwargs: captured_kwargs.update(kwargs))
-    args = types.SimpleNamespace(
+    monkeypatch.setattr(base_mod, "build_dataloader", lambda **kwargs: captured_kwargs.update(kwargs) or object())
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.train_dataset = object()
+    trainer.collate_fn = None
+    trainer.args = types.SimpleNamespace(
         data=types.SimpleNamespace(
-            dataloader=types.SimpleNamespace(
+            dataloader=DataloaderConfig(
                 type="native",
                 num_workers=0,
                 drop_last=True,
                 pin_memory=False,
-                prefetch_factor=None,
+                prefetch_factor=2,
             ),
             max_seq_len=1024 * 1024,
             dyn_bsz_buffer_size=200,
@@ -77,11 +82,12 @@ def test_omni_dataloader_forwards_buffer_policy_scope(monkeypatch):
             bsz_warmup_ratio=0.02,
             bsz_warmup_init_mbtoken=200,
             seed=0,
+            checkpoint=types.SimpleNamespace(save_steps=1000),
         ),
         train_steps=1,
     )
 
-    omni_train._build_train_dataloader(args, object(), {})
+    trainer._build_dataloader()
 
     assert captured_kwargs["dyn_bsz_buffer_policy"] == "context_aware"
     assert captured_kwargs["dyn_bsz_runtime"] == "worker"

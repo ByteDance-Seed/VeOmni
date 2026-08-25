@@ -66,6 +66,7 @@ Title: `[{modules}] {type}: {description}`
 
 - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (the CI source of truth).
 - Breaking: prepend `[BREAKING]`
+- GitHub PRs are also reviewed by CodeRabbit (`.coderabbit.yaml`). On an existing PR, comment `@coderabbitai review` or `@coderabbitai full review`.
 
 ---
 

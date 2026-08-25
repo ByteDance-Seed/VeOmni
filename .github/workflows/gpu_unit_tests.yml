@@ -118,7 +118,13 @@ jobs:
           fi
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra gpu --group dev
+          # The L20 runner is SM89, while MagiAttention requires SM90+.
+          # Keep contract tests but skip unsupported source builds.
+          uv sync --frozen --extra gpu --group dev \
+            --no-install-package magi-attention \
+            --no-install-package create-block-mask-cuda \
+            --no-install-package flash-attn-cute \
+            --no-install-package magi-to-hstu-cuda
       - name: Run parallel tests
         # TODO: run all tests under tests/parallel/ulysses after we verify
         #       tests/parallel/ulysses/test_ulysses_async.py still works
@@ -129,6 +135,8 @@ jobs:
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -s -x tests/parallel/test_chunk_mbs.py
+          uv run --frozen pytest -s -x tests/parallel/test_ddp_sp_grad_sync.py
+          uv run --frozen pytest -s -x tests/parallel/test_parallel_state_registry.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
@@ -158,6 +166,7 @@ jobs:
       - name: Run checkpoint callback unit tests
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py
+          uv run --frozen pytest -s -x tests/checkpoints/test_dcp_checkpointer.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
@@ -178,6 +187,7 @@ jobs:
       - name: Run Muon optimizer tests
         run: |
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
+          uv run --frozen pytest -s -x tests/distributed/test_muon_zero_comm_shard.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
           uv run --frozen pytest -s -x tests/optim/test_optimizer_vlm_param_groups.py
