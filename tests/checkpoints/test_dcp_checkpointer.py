@@ -22,7 +22,11 @@ from torch.distributed.fsdp import fully_shard
 
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
-from veomni.distributed.torch_parallelize import build_parallelize_model, parallelize_model_fsdp2
+from veomni.distributed.torch_parallelize import (
+    build_parallelize_model,
+    parallelize_model_ddp,
+    parallelize_model_fsdp2,
+)
 from veomni.models.module_utils import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
@@ -325,6 +329,7 @@ class TestSkipHfWeightLoadOnResume:
     def test_parallelize_apis_expose_should_skip_hf_weight_load(self):
         assert "should_skip_hf_weight_load" in inspect.signature(build_parallelize_model).parameters
         assert "should_skip_hf_weight_load" in inspect.signature(parallelize_model_fsdp2).parameters
+        assert "should_skip_hf_weight_load" in inspect.signature(parallelize_model_ddp).parameters
 
     def test_build_parallelize_model_forwards_should_skip_hf_weight_load(self, monkeypatch):
         model = MagicMock()
@@ -387,10 +392,299 @@ class TestSkipHfWeightLoadOnResume:
         torch.testing.assert_close(resumed.scale, original.scale, rtol=0, atol=0)
         torch.testing.assert_close(resumed(inputs), expected_output, rtol=0, atol=0)
 
-    @pytest.mark.parametrize("parallelize", [build_parallelize_model, parallelize_model_fsdp2])
-    def test_parallelize_apis_reject_renamed_skip_weights_load(self, parallelize):
-        with pytest.raises(TypeError, match="'skip_weights_load' was renamed to 'should_skip_hf_weight_load'"):
-            parallelize(MagicMock(), skip_weights_load=True)
+
+# ---------------------------------------------------------------------------
+# Materialize + load: one dispatch shared by the fsdp2 and ddp paths
+# ---------------------------------------------------------------------------
+
+
+class TestMaterializeAndLoadDispatch:
+    """The three loaders are mutually exclusive and picked from flags that
+    ``parallelize_model_fsdp2`` reads out of ``**kwargs``, so a typo there would
+    silently pick the wrong one."""
+
+    @pytest.fixture
+    def loaders(self, monkeypatch):
+        loaders = SimpleNamespace(plain=MagicMock(), broadcast=MagicMock(), ep_sharded=MagicMock())
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loaders.plain)
+        monkeypatch.setattr(torch_parallelize, "rank0_load_and_broadcast_weights", loaders.broadcast)
+        monkeypatch.setattr(torch_parallelize, "load_model_weights_ep_sharded", loaders.ep_sharded)
+        return loaders
+
+    @pytest.mark.parametrize(
+        ("flags", "has_plan", "expected"),
+        [
+            ({}, False, "plain"),
+            ({"broadcast_from_rank0": True}, False, "broadcast"),
+            ({"ep_sharded_stream_load": True}, True, "ep_sharded"),
+            # ``ep_sharded_stream_load`` is set once per run but this helper runs
+            # once per model, so a model with no ExtraParallel plan -- every
+            # SeedOmni V2 sub-module that owns no experts -- must fall through to
+            # the loader it would have used anyway, not raise.
+            ({"ep_sharded_stream_load": True}, False, "plain"),
+        ],
+    )
+    def test_dispatches_to_one_loader(self, loaders, monkeypatch, flags, has_plan, expected):
+        monkeypatch.setattr(torch_parallelize, "_has_extra_parallel_plan", lambda model: has_plan)
+
+        torch_parallelize._materialize_and_load_weights(
+            nn.Linear(2, 2),
+            "hf-path",
+            "cpu",
+            should_skip_hf_weight_load=False,
+            is_peft_model=False,
+            adapter_path=None,
+            **{"broadcast_from_rank0": False, **flags},
+        )
+
+        for name in ("plain", "broadcast", "ep_sharded"):
+            assert getattr(loaders, name).called is (name == expected)
+
+    def test_fsdp2_forwards_the_loader_flags(self, loaders, monkeypatch):
+        monkeypatch.setattr(
+            torch_parallelize,
+            "get_parallel_state",
+            lambda: SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None),
+        )
+        monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+        monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
+
+        parallelize_model_fsdp2(
+            nn.Linear(2, 2),
+            weights_path="hf-path",
+            mixed_precision=SimpleNamespace(enable=False),
+            init_device="meta",
+            broadcast_model_weights_from_rank0=True,
+        )
+
+        assert loaders.broadcast.called
+        assert not loaders.plain.called
+
+    def test_resume_is_incompatible_with_peft(self):
+        with pytest.raises(ValueError, match="incompatible with LoRA/PEFT"):
+            torch_parallelize._materialize_and_load_weights(
+                nn.Linear(2, 2),
+                "hf-path",
+                "cpu",
+                should_skip_hf_weight_load=True,
+                is_peft_model=True,
+                adapter_path=None,
+                broadcast_from_rank0=False,
+            )
+
+    def test_a_buffer_derived_from_a_parameter_is_warned_about_not_preserved(self, monkeypatch):
+        """``init_empty_weights`` patches ``register_parameter`` only, so a buffer
+        built from a real tensor stays real -- but one built from a parameter is on
+        meta, holds no data to copy out of, and ends up as whatever ``to_empty()``
+        allocated. No model registers one; the warning is what makes it findable."""
+
+        class _DerivedBufferModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(2))
+                self.register_buffer("from_config", torch.tensor([0.5, 1.5]), persistent=False)
+                self.register_buffer("from_param", self.weight.detach().clone(), persistent=False)
+
+        with init_empty_weights():
+            model = _DerivedBufferModel()
+        assert model.from_param.is_meta and not model.from_config.is_meta
+
+        # Against the logger rather than captured output: veomni's logger sets
+        # propagate=False and binds its own stdout handler, so neither caplog nor
+        # capsys sees the record.
+        warnings = []
+        monkeypatch.setattr(torch_parallelize.logger, "warning_rank0", warnings.append)
+
+        torch_parallelize._to_empty_preserving_nonpersistent_buffers(model, "cpu")
+
+        torch.testing.assert_close(model.from_config, torch.tensor([0.5, 1.5]), rtol=0, atol=0)
+        assert not model.from_param.is_meta
+        assert any("from_param" in message for message in warnings)
+
+
+# ---------------------------------------------------------------------------
+# DDP under meta-init: the wrap materializes and loads the model itself
+# ---------------------------------------------------------------------------
+
+
+class _MetaInitModel(nn.Module):
+    """A model whose ``init_weights`` is observable and whose derived buffer
+    must survive materialization."""
+
+    _no_split_modules = []
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(2, 2))
+        self.register_buffer("scale", torch.tensor([0.25, 2.0]), persistent=False)
+        self.init_weights_calls = 0
+
+    def init_weights(self):
+        self.init_weights_calls += 1
+        with torch.no_grad():
+            self.weight.fill_(3.0)
+
+
+class TestDdpMetaInit:
+    """``init_device`` defaults to ``meta`` and is only asserted for fsdp2, so a
+    ``ddp`` config used to reach DDP's constructor with unmaterialized
+    parameters and fail there on ``Tensor.item()``."""
+
+    @pytest.fixture
+    def wrap_ddp(self, monkeypatch):
+        monkeypatch.setattr(
+            torch_parallelize,
+            "get_parallel_state",
+            lambda: SimpleNamespace(local_rank=0, dp_group=None, any_extra_parallel_enabled=False),
+        )
+        monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
+        monkeypatch.setattr(torch_parallelize, "DDP", lambda model, **kwargs: SimpleNamespace(module=model, **kwargs))
+        return parallelize_model_ddp
+
+    def test_materializes_and_random_inits_without_weights_path(self, wrap_ddp):
+        with init_empty_weights():
+            model = _MetaInitModel()
+        assert model.weight.is_meta
+
+        wrapped = wrap_ddp(model, weights_path=None, init_device="meta")
+
+        assert not wrapped.module.weight.is_meta
+        assert wrapped.module.init_weights_calls == 1
+        assert wrapped.broadcast_buffers is False
+        # A bare to_empty() would leave uninitialized memory here: this buffer is
+        # shaped like the ones HF's _init_weights does not recompute.
+        torch.testing.assert_close(wrapped.module.scale, torch.tensor([0.25, 2.0]), rtol=0, atol=0)
+
+    def test_resume_materializes_without_reading_the_hf_snapshot(self, wrap_ddp, monkeypatch):
+        loader = MagicMock()
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        with init_empty_weights():
+            model = _MetaInitModel()
+
+        wrapped = wrap_ddp(
+            model,
+            weights_path="unused-hf-path",
+            should_skip_hf_weight_load=True,
+            init_device="meta",
+        )
+
+        loader.assert_not_called()
+        assert wrapped.module.init_weights_calls == 0
+        assert not wrapped.module.weight.is_meta
+        # Non-persistent buffers are absent from the DCP state dict, so the
+        # resume cannot restore them and materialization must not drop them.
+        torch.testing.assert_close(wrapped.module.scale, torch.tensor([0.25, 2.0]), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("broadcast", [False, True])
+    def test_honours_broadcast_model_weights_from_rank0(self, wrap_ddp, monkeypatch, broadcast):
+        # A real loader materializes as it fills; the stubs have to as well, or the
+        # meta guard after the load pass fires.
+        materialize = lambda model, *args, **kwargs: model.to_empty(device="cpu")  # noqa: E731
+        loader = MagicMock(side_effect=materialize)
+        broadcast_loader = MagicMock(side_effect=materialize)
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        monkeypatch.setattr(torch_parallelize, "rank0_load_and_broadcast_weights", broadcast_loader)
+        with init_empty_weights():
+            model = _MetaInitModel()
+
+        wrap_ddp(model, weights_path="hf-path", init_device="meta", broadcast_model_weights_from_rank0=broadcast)
+
+        used, unused = (broadcast_loader, loader) if broadcast else (loader, broadcast_loader)
+        assert used.call_args.args[1] == "hf-path"
+        unused.assert_not_called()
+
+    def test_rejects_a_model_whose_plan_shards_experts(self, monkeypatch):
+        # Only the fsdp2 path applies the plan that shards experts, so loading a
+        # sharded-expert config here would quietly produce whole ones.
+        monkeypatch.setattr(
+            torch_parallelize,
+            "get_parallel_state",
+            lambda: SimpleNamespace(local_rank=0, dp_group=None, any_extra_parallel_enabled=True),
+        )
+        monkeypatch.setattr(
+            torch_parallelize,
+            "_has_extra_parallel_plan",
+            lambda model: True,
+        )
+        with pytest.raises(RuntimeError, match="requires fsdp_mode='fsdp2'"):
+            parallelize_model_ddp(nn.Linear(2, 2))
+
+    def test_allows_a_plan_less_model_under_an_inherited_ep_mesh(self, monkeypatch):
+        """An ep dim in the mesh says nothing about *this* model. A SeedOmni V2
+        sub-module inherits the global accelerator's ep size whether or not it owns
+        experts, so refusing on the mesh alone would block a DDP vision tower."""
+        monkeypatch.setattr(
+            torch_parallelize,
+            "get_parallel_state",
+            lambda: SimpleNamespace(local_rank=0, dp_group=None, any_extra_parallel_enabled=True),
+        )
+        monkeypatch.setattr(torch_parallelize, "DDP", lambda module, **kwargs: module)
+
+        assert parallelize_model_ddp(nn.Linear(2, 2)) is not None
+
+    def test_reports_parameters_the_loader_left_on_meta(self, wrap_ddp, monkeypatch):
+        # A loader that fills nothing would otherwise fail inside DDP's
+        # constructor on Tensor.item(), naming neither parameter nor cause.
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", MagicMock())
+        with init_empty_weights():
+            model = _MetaInitModel()
+
+        with pytest.raises(RuntimeError, match="unmaterialized parameters") as excinfo:
+            wrap_ddp(model, weights_path="hf-path", init_device="meta")
+
+        assert "weight" in str(excinfo.value)
+
+    @pytest.mark.parametrize("weights_path", [None, "hf-path"])
+    def test_leaves_a_real_model_alone_when_init_device_says_meta(self, wrap_ddp, monkeypatch, weights_path):
+        """``init_device`` is a request to the model builder, not a fact about the
+        model it returns: tests/data construct theirs eagerly and leave the flag at
+        its ``meta`` default. Materializing that model would re-read the snapshot
+        over weights it already holds, and a plain nn.Module has no
+        ``init_weights`` to fall back on when there is no snapshot."""
+        loader = MagicMock()
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        model = nn.Linear(2, 2)
+        weight = model.weight.detach().clone()
+
+        wrapped = wrap_ddp(model, weights_path=weights_path, init_device="meta")
+
+        loader.assert_not_called()
+        torch.testing.assert_close(wrapped.module.weight, weight, rtol=0, atol=0)
+
+    def test_does_not_reinitialize_a_real_model_that_has_init_weights(self, wrap_ddp, monkeypatch):
+        # The nn.Linear case above fails loudly; a model that does define
+        # init_weights would instead have its weights silently overwritten.
+        loader = MagicMock()
+        monkeypatch.setattr(torch_parallelize, "load_model_weights", loader)
+        model = _MetaInitModel()
+        with torch.no_grad():
+            model.weight.fill_(7.0)
+
+        wrapped = wrap_ddp(model, weights_path="hf-path", init_device="meta")
+
+        loader.assert_not_called()
+        assert wrapped.module.init_weights_calls == 0
+        torch.testing.assert_close(wrapped.module.weight, torch.full((2, 2), 7.0), rtol=0, atol=0)
+
+    def test_build_parallelize_model_forwards_should_skip_hf_weight_load_to_ddp(self, monkeypatch):
+        parallelize_ddp = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr(
+            torch_parallelize,
+            "get_parallel_state",
+            lambda: SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="ddp"),
+        )
+        monkeypatch.setattr(torch_parallelize, "parallelize_model_ddp", parallelize_ddp)
+
+        build_parallelize_model(
+            MagicMock(),
+            mixed_precision=SimpleNamespace(enable=False),
+            enable_gradient_checkpointing=False,
+            should_skip_hf_weight_load=True,
+            init_device="meta",
+        )
+
+        assert parallelize_ddp.call_args.kwargs["should_skip_hf_weight_load"] is True
+        assert parallelize_ddp.call_args.kwargs["init_device"] == "meta"
 
 
 # ---------------------------------------------------------------------------

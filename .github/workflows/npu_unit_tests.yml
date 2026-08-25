@@ -154,6 +154,8 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -v -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -v -s -x tests/parallel/test_chunk_mbs.py
+          uv run --frozen pytest -v -s -x tests/parallel/test_ddp_sp_grad_sync.py
+          uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
@@ -174,6 +176,7 @@ jobs:
       - name: Run checkpoint callback unit tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_checkpoint_callback.py
+          uv run --frozen pytest -v -s -x tests/checkpoints/test_dcp_checkpointer.py
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_trainer_saveload.py
