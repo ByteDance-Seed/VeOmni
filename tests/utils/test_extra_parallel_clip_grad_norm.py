@@ -13,7 +13,7 @@ import torch.nn as nn
 from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
-from veomni.arguments import TrainingArguments, parse_args
+from veomni.arguments import ModelRuntimeArguments, TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import init_parallel_state
@@ -42,6 +42,7 @@ def _torch_npu_version() -> str:
 
 @dataclass
 class Argument:
+    model: "ModelRuntimeArguments" = field(default_factory=ModelRuntimeArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
