@@ -233,30 +233,6 @@ The config sets `ulysses_size: 4`, so the world size must be a multiple of 4. To
 sequence parallelism, override `--model.accelerator.ulysses_size 1`; the attention kernels adapt
 on their own.
 
-## ChunkMBS
-
-Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,
-then runs each `Qwen3_5DecoderLayer` chunk sequentially while keeping the outer FSDP2 layer invocation intact. The
-same token ranges are used by both full-attention and GatedDeltaNet layers, so every ChunkMBS cut must be present in
-both cumulative-length tensors; their internal boundaries may differ.
-
-The shipped configs leave it off. To enable it:
-
-```yaml
-model:
-  accelerator:
-    chunk_mbs_config:
-      enable: true
-      chunk_mbs: 2
-```
-
-`chunk_mbs` is the number of packed samples per layer chunk, not a token count or `train.micro_batch_size`.
-ChunkMBS may be combined with non-reentrant gradient checkpointing. It currently does not support Qwen3.5-MoE,
-Ulysses SP, TP/PP, `torch.compile`, `pad_to_length`, DPO, or RL training. See
-[ChunkMBSConfig](../usage/arguments.md#chunkmbsconfig) for the complete support boundary.
-The model-level automated tests cover decoder routing, metadata slicing, outputs, and gradients on CPU. Real
-FlashAttention, FLA, and NPU fused-kernel execution requires separate accelerator validation.
-
 ## Ulysses Sequence Parallelism
 
 Qwen3.5 supports Ulysses sequence parallelism for both its softmax attention layers and

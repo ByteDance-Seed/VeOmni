@@ -189,8 +189,6 @@ class DiTTrainer:
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
     def __init__(self, args: VeOmniDiTArguments):
-        if args.model.accelerator.chunk_mbs_config.enable:
-            raise ValueError("model.accelerator.chunk_mbs_config is not supported by DiTTrainer.")
         if args.train.channel_loss.enable:
             raise ValueError(
                 "train.channel_loss is only supported by causal-LM trainers; DiTTrainer uses diffusion objectives."
