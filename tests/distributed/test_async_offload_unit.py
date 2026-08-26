@@ -26,10 +26,7 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,
-    OffloadManager,
     PinnedBufferPool,
-    SwapTensor,
-    _unpack_swap_tensor,
     apply_async_activation_offload,
     base_check_fn,
     get_offload_modules,
@@ -313,22 +310,28 @@ def test_async_offload_manager_resets_at_step_boundary():
     reason="CUDA or NPU is required for async D2H/H2D validation",
 )
 def test_unpack_swap_tensor_survives_repeated_access():
+    """PyTorch may unpack the same saved tensor twice (``retain_graph=True``)."""
     device = torch.device(get_device_type())
-    manager = OffloadManager(host_cache_limit_bytes=1 << 20)
-    original = torch.randn(8, 8, device=device)
-    expected = original.detach().cpu().clone()
-    swap = SwapTensor(original, "0_0", manager.host_buffer_pool)
-    swap.launch_d2h(manager.swap_stream)
-    swap.wait_d2h_finished()
-    manager.put("0_0", swap)
 
-    first = _unpack_swap_tensor(manager, swap, prefetch=False)
-    assert not manager.exist("0_0")
-    torch.testing.assert_close(first.cpu(), expected)
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(32, 32)
 
-    second = _unpack_swap_tensor(manager, swap, prefetch=False)
-    torch.testing.assert_close(second.cpu(), expected)
-    assert second.data_ptr() == first.data_ptr()
+        def forward(self, hidden_states):
+            return torch.nn.functional.gelu(self.proj(hidden_states))
+
+    model = nn.Sequential(Block(), Block()).to(device)
+    apply_async_activation_offload(model, ["0", "1"])
+    manager = model[0]._veomni_offload_manager
+    hidden = torch.randn(2, 16, 32, device=device, requires_grad=True)
+    loss = model(hidden).square().mean()
+    assert manager.host_buffer_pool.allocations > 0
+
+    loss.backward(retain_graph=True)
+    assert not manager.items
+    loss.backward()
+    assert not manager.items
 
 
 @pytest.mark.skipif(
@@ -338,6 +341,8 @@ def test_unpack_swap_tensor_survives_repeated_access():
 def test_async_offload_accelerator_gradient_parity_and_peak_memory():
     device_api = get_torch_device()
     device = torch.device(get_device_type())
+    device_api.synchronize()
+    device_api.empty_cache()
 
     class Block(nn.Module):
         def __init__(self):

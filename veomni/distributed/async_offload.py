@@ -64,7 +64,13 @@ def base_check_fn(tensor) -> bool:
     if isinstance(tensor, torch.nn.parameter.Parameter) or tensor._base is not None:
         return False
     storage_nbytes = tensor.untyped_storage().nbytes()
-    if storage_nbytes <= 0 or storage_nbytes != tensor.numel() * tensor.element_size() or not tensor.is_contiguous():
+    tensor_nbytes = tensor.numel() * tensor.element_size()
+    # Expandable CUDA segments (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True)
+    # round device allocations up.  A contiguous tensor with ``_base is None``
+    # still uniquely owns that storage; extra trailing bytes are padding, not a
+    # view, so rejecting ``storage_nbytes != tensor_nbytes`` silently disables
+    # offload on the L20 GPU CI image.
+    if storage_nbytes <= 0 or storage_nbytes < tensor_nbytes or not tensor.is_contiguous():
         return False
     return True
 
@@ -205,9 +211,10 @@ class GetCnt:
 
 class SwapTensor:
     def __init__(self, tensor, key, pool):
+        tensor_nbytes = tensor.numel() * tensor.element_size()
         if (
             tensor._base is not None
-            or tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size()
+            or tensor.untyped_storage().nbytes() < tensor_nbytes
             or not tensor.is_contiguous()
         ):
             raise ValueError("Async activation offload requires a tensor with private, dense storage.")
