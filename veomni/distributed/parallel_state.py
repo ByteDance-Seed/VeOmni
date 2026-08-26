@@ -78,8 +78,20 @@ class ParallelState:
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
-        if self.cp_size > 1:
-            raise NotImplementedError("Ring attention is not supported yet.")
+        # The product check below cannot catch a negative cp_size on its own: a
+        # caller passing dp_size=-1 alongside cp_size=-1 lands on a product of +1,
+        # so an invalid topology would be admitted with CP reported as disabled.
+        # TrainingArguments validates this too, but a ParallelState can be built
+        # directly, which is how a per-module state under use_parallel_state is made.
+        if self.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         if self.pp_size * self.dp_size * self.cp_size * self.ulysses_size * self.tp_size != self.world_size:
             raise ValueError("The product of parallel sizes should be equal to the world size.")
@@ -456,7 +468,7 @@ def init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
-    name: str = "base",
+    name: Optional[str] = "base",
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the
@@ -464,10 +476,17 @@ def init_parallel_state(
 
     If ``name`` is already registered, log a warning and return the existing
     state without building, caching, or overwriting anything.
+
+    ``name=None`` claims no registry key, for a caller that holds the returned
+    state itself rather than looking it up later — it would otherwise have to
+    collide on ``"base"`` with the standalone trainers or invent a key nobody
+    reads. Only the registry is opted out of: the state is still topology-cached
+    and still becomes the ambient global if none is set, so a later named call
+    with the same topology hands back this same object.
     """
     global _PARALLEL_STATE
 
-    if name in _PARALLEL_STATE_REGISTRY:
+    if name is not None and name in _PARALLEL_STATE_REGISTRY:
         logger.warning(
             f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
         )
@@ -524,7 +543,8 @@ def init_parallel_state(
         # never clear the cache), so a same-topology hit may find the global cleared.
         if _PARALLEL_STATE is None:
             _PARALLEL_STATE = cached_state
-        _PARALLEL_STATE_REGISTRY[name] = cached_state
+        if name is not None:
+            _PARALLEL_STATE_REGISTRY[name] = cached_state
         return cached_state
 
     logger.info_rank0(
@@ -652,7 +672,8 @@ def init_parallel_state(
         _PARALLEL_STATE = parallel_state
 
     _PARALLEL_STATE_CACHE[cache_key] = parallel_state
-    _PARALLEL_STATE_REGISTRY[name] = parallel_state
+    if name is not None:
+        _PARALLEL_STATE_REGISTRY[name] = parallel_state
     return parallel_state
 
 
@@ -688,6 +709,19 @@ def use_parallel_state(parallel_state: Union[str, "ParallelState"]):
         yield
     finally:
         set_parallel_state(old)
+
+
+def is_parallel_state_initialized() -> bool:
+    """Whether a ``ParallelState`` has been installed as the global state.
+
+    ``get_parallel_state`` falls back to *constructing* a default single-process
+    state, and that default raises when the process is in fact part of a
+    multi-rank world, since ``dp_size=1`` then contradicts the real world size.
+    Callers that only want to ask *whether* a form of parallelism is on -- rather
+    than use it -- should check this first, so that an uninitialized process
+    answers "off" instead of raising.
+    """
+    return _PARALLEL_STATE is not None
 
 
 def get_parallel_state() -> "ParallelState":

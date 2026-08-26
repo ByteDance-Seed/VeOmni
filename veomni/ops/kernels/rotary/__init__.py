@@ -17,8 +17,8 @@
 Default per-model backends:
     - ``liger_kernel``: ``liger_kernel.transformers.rope.liger_rotary_pos_emb``
     - ``npu``: ``torch_npu.npu_rotary_mul`` via ``veomni.ops.kernels.rotary.npu``
-Models can register a ``triton`` (deterministic bmm / Wan DiT) backend via
-``extra_backends`` in their ``device_patch.py``.
+Models can register a ``triton`` (deterministic bmm / Wan DiT / DeepSeek-V4
+partial-interleaved) backend via ``extra_backends`` in their ``device_patch.py``.
 """
 
 from ...config.registry import BackendSpec, OpScope, OpSpec, register_op
