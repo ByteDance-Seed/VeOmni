@@ -78,8 +78,20 @@ class ParallelState:
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
-        if self.cp_size > 1:
-            raise NotImplementedError("Ring attention is not supported yet.")
+        # The product check below cannot catch a negative cp_size on its own: a
+        # caller passing dp_size=-1 alongside cp_size=-1 lands on a product of +1,
+        # so an invalid topology would be admitted with CP reported as disabled.
+        # TrainingArguments validates this too, but a ParallelState can be built
+        # directly, which is how a per-module state under use_parallel_state is made.
+        if self.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         if self.pp_size * self.dp_size * self.cp_size * self.ulysses_size * self.tp_size != self.world_size:
             raise ValueError("The product of parallel sizes should be equal to the world size.")
@@ -697,6 +709,19 @@ def use_parallel_state(parallel_state: Union[str, "ParallelState"]):
         yield
     finally:
         set_parallel_state(old)
+
+
+def is_parallel_state_initialized() -> bool:
+    """Whether a ``ParallelState`` has been installed as the global state.
+
+    ``get_parallel_state`` falls back to *constructing* a default single-process
+    state, and that default raises when the process is in fact part of a
+    multi-rank world, since ``dp_size=1`` then contradicts the real world size.
+    Callers that only want to ask *whether* a form of parallelism is on -- rather
+    than use it -- should check this first, so that an uninitialized process
+    answers "off" instead of raising.
+    """
+    return _PARALLEL_STATE is not None
 
 
 def get_parallel_state() -> "ParallelState":
