@@ -111,10 +111,19 @@ The contract:
   `postforward` divides by `num_micro_batches` instead. Emit a key on every micro
   batch of a step, or on none — a key present in only some micro batches is
   averaged over all of them.
-- **Loss names are reserved.** A key that collides with one already in
-  `loss_dict` raises `ValueError`. Without that check `dict.update` would shadow
-  the loss entry, and callbacks would report the auxiliary value under
-  `training/<loss name>` while the backward scalar stayed correct.
+- **Names already reported under `training/` are reserved.** A colliding key
+  raises `ValueError`, because every consumer keys on the name alone and both
+  collision directions are silent. Two groups are reserved:
+    - Every key in `loss_dict`, i.e. the losses this step produced. Without the
+      check `dict.update` would shadow the loss entry and callbacks would report
+      the auxiliary value under `training/<loss name>`, while the backward scalar
+      stayed correct.
+    - The names `EnvironMeterCallback` publishes itself, listed in
+      `RESERVED_TRAINING_METRIC_NAMES`: `total_loss`, `avg_effective_len`, and
+      `avg_sample_seq_len` are assigned before the merge, so an auxiliary metric
+      would overwrite them; `grad_norm` and `lr` are assigned after it, so they
+      would overwrite the auxiliary metric and drop it silently. Extend that set
+      when adding a metric to the callback.
 - **No `*_loss` suffix is needed.** That convention is required only by
   `mean_global_loss`, which runs before the merge and never sees an auxiliary key.
 

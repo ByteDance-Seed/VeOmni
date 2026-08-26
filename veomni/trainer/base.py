@@ -76,6 +76,7 @@ from ..utils.device import (
 from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
+    RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
     CheckpointerCallback,
     EnvironMeterCallback,
@@ -718,16 +719,22 @@ class BaseTrainer(Stateful, ABC):
             # ``on_step_begin`` sets the count; the default covers callers that reach
             # a single forward without a step, such as tests.
             num_micro_batches = getattr(self, "num_micro_batches", 1)
-            # A bare ``update`` would let an aux key shadow a loss of the same name.
-            # The backward scalar is already summed above so it would stay correct,
-            # but callbacks read ``loss_dict``, so they would report the auxiliary
-            # value under ``training/<loss name>`` -- a silently wrong loss curve.
-            collisions = sorted(aux_metrics.keys() & loss_dict.keys())
+            # Everything downstream keys on the name alone, so a collision is
+            # silent in both directions. A bare ``update`` would let an aux key
+            # shadow a loss of the same name: the backward scalar is already summed
+            # above so it would stay correct, but callbacks read ``loss_dict`` and
+            # would report the auxiliary value under ``training/<loss name>``. The
+            # reserved names are the same hazard one layer later, in the
+            # ``training/`` namespace that ``EnvironMeterCallback`` publishes into,
+            # where a clash either overwrites a real metric or drops the auxiliary
+            # one -- see ``RESERVED_TRAINING_METRIC_NAMES``.
+            collisions = sorted(aux_metrics.keys() & (loss_dict.keys() | RESERVED_TRAINING_METRIC_NAMES))
             if collisions:
                 raise ValueError(
-                    f"aux_metrics keys {collisions} collide with loss keys "
-                    f"{sorted(loss_dict.keys())}. Loss names are reserved: rename the "
-                    "auxiliary metric so callbacks cannot report it as a loss."
+                    f"aux_metrics keys {collisions} are already reported under "
+                    f"training/. Loss keys {sorted(loss_dict.keys())} and the names "
+                    f"callbacks own {sorted(RESERVED_TRAINING_METRIC_NAMES)} are "
+                    "reserved: rename the auxiliary metric."
                 )
             loss_dict.update({key: value.detach() / num_micro_batches for key, value in aux_metrics.items()})
         return loss, loss_dict

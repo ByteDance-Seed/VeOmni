@@ -39,6 +39,7 @@ import veomni.trainer.text_trainer as text_trainer_module
 import veomni.trainer.vlm_trainer as vlm_trainer_module
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import TrainerState
+from veomni.trainer.callbacks.trace_callback import RESERVED_TRAINING_METRIC_NAMES
 from veomni.trainer.text_trainer import TextTrainer
 from veomni.trainer.vlm_trainer import VLMTrainer
 
@@ -147,7 +148,21 @@ def test_aux_metric_colliding_with_a_loss_key_is_rejected(identity_loss):
     trainer = _bare_trainer()
     outputs = _Output(torch.tensor(2.0, requires_grad=True), {"foundation_loss": torch.tensor(1000.0)})
 
-    with pytest.raises(ValueError, match="collide with loss keys"):
+    with pytest.raises(ValueError, match="already reported under"):
+        BaseTrainer.postforward(trainer, outputs, {})
+
+
+@pytest.mark.parametrize("reserved", sorted(RESERVED_TRAINING_METRIC_NAMES))
+def test_aux_metric_colliding_with_a_callback_owned_name_is_rejected(identity_loss, reserved):
+    """These clash one layer later than a loss key, in the published namespace.
+
+    ``EnvironMeterCallback`` adds them to ``training/`` itself, so they are absent
+    from ``loss_dict`` and the loss-key check alone would let them through.
+    """
+    trainer = _bare_trainer()
+    outputs = _Output(torch.tensor(2.0, requires_grad=True), {reserved: torch.tensor(1000.0)})
+
+    with pytest.raises(ValueError, match="already reported under"):
         BaseTrainer.postforward(trainer, outputs, {})
 
 
@@ -260,6 +275,47 @@ def test_single_micro_batch_reports_the_metric_unscaled(run_train_step, identity
     assert recorded["loss_dict"]["indexer_kl"] == pytest.approx(6.0)
 
 
+def _environ_meter_callback(env_metrics=None, lr=None):
+    """``EnvironMeterCallback`` reduced to what ``on_step_end`` reads."""
+    callback = object.__new__(trace_callback_module.EnvironMeterCallback)
+    callback.parallel_state = SimpleNamespace(fsdp_group=None)
+    callback.start_time = time.time()
+    callback.lora_config = None
+    callback.freeze_vit = None
+    callback.trainer = SimpleNamespace(
+        environ_meter=SimpleNamespace(step=lambda delta_time, global_step, **kwargs: dict(env_metrics or {})),
+        lr_scheduler=None if lr is None else SimpleNamespace(get_last_lr=lambda: [lr]),
+    )
+    return callback
+
+
+def test_reserved_names_match_what_the_callback_publishes_itself(monkeypatch):
+    """Keeps the reserved set from going stale as the callback gains metrics.
+
+    Derives the callback-owned names rather than restating them: every
+    ``training/`` name that did not come from ``loss_dict`` was put there by the
+    callback or by the environ meter it merges, which is exactly the set an
+    auxiliary key must not collide with. Adding a metric to ``on_step_end``
+    without extending ``RESERVED_TRAINING_METRIC_NAMES`` fails here.
+    """
+    monkeypatch.setattr(trace_callback_module, "all_reduce", lambda value, group=None: value)
+    # Mirrors the ``training/``-prefixed keys of ``helper.EnvironMeter.step``. The
+    # unprefixed ones it also emits (mfu, flops, memory) land in another namespace
+    # and cannot collide, so one stands in for all of them.
+    env_metrics = {"training/avg_effective_len": 1.0, "training/avg_sample_seq_len": 2.0, "mfu": 0.5}
+    callback = _environ_meter_callback(env_metrics=env_metrics, lr=3.0)
+    loss_dict = {"foundation_loss": 2.0}
+
+    callback.on_step_end(TrainerState(global_step=1), loss=2.0, loss_dict=loss_dict, grad_norm=0.5)
+
+    published = {
+        key.removeprefix("training/")
+        for key in (*callback.trainer.step_train_metrics, *callback.trainer.step_env_metrics)
+        if key.startswith("training/")
+    }
+    assert published - set(loss_dict) == set(RESERVED_TRAINING_METRIC_NAMES)
+
+
 def test_environ_meter_prefixes_aux_metric_without_a_loss_suffix(monkeypatch):
     """``training/indexer_kl`` is what reaches wandb, and no consumer needs ``*_loss``.
 
@@ -269,15 +325,7 @@ def test_environ_meter_prefixes_aux_metric_without_a_loss_suffix(monkeypatch):
     before the merge and never sees an aux key.
     """
     monkeypatch.setattr(trace_callback_module, "all_reduce", lambda value, group=None: value)
-    callback = object.__new__(trace_callback_module.EnvironMeterCallback)
-    callback.parallel_state = SimpleNamespace(fsdp_group=None)
-    callback.start_time = time.time()
-    callback.lora_config = None
-    callback.freeze_vit = None
-    callback.trainer = SimpleNamespace(
-        environ_meter=SimpleNamespace(step=lambda delta_time, global_step, **kwargs: {}),
-        lr_scheduler=None,
-    )
+    callback = _environ_meter_callback()
 
     callback.on_step_end(
         TrainerState(global_step=1),

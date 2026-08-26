@@ -183,6 +183,30 @@ class ProfileTraceCallback(Callback):
                 self.profiler.stop()
 
 
+# Names ``on_step_end`` below publishes into the ``training/`` namespace itself,
+# rather than taking from ``loss_dict``. A model's ``aux_metrics`` key that matches
+# one of these collides in that namespace even though it does not collide with any
+# loss, so ``BaseTrainer.postforward`` rejects them; keeping the set here means it
+# is updated next to the code that decides the names.
+#
+# Both collision directions are silent, which is why they are worth a guard:
+# ``total_loss`` is assigned *before* ``loss_dict`` is merged, so an auxiliary
+# metric replaces it and ``training/total_loss`` then reports the metric. So do
+# ``avg_effective_len`` and ``avg_sample_seq_len``, which ``EnvironMeter.step``
+# emits already prefixed and which the merge at the end of ``on_step_end`` lets
+# ``training/`` values win over. ``grad_norm`` and ``lr`` are assigned *after* the
+# merge, so they win instead and the auxiliary metric is dropped without a trace.
+RESERVED_TRAINING_METRIC_NAMES = frozenset(
+    {
+        "total_loss",
+        "grad_norm",
+        "lr",
+        "avg_effective_len",
+        "avg_sample_seq_len",
+    }
+)
+
+
 class EnvironMeterCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
