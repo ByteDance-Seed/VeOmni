@@ -16,7 +16,7 @@ import math
 import os
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import ClassVar, Dict, List, Literal, Optional
+from typing import ClassVar, Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -51,8 +51,7 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #       |   └── mixed_precision.* → MixedPrecisionConfig
 #       ├── offload_config.* → OffloadConfig
 #       ├── gradient_checkpointing.*  → GradientCheckpointingConfig
-#       ├── torch_compile.*  → TorchCompileConfig
-#       └── chunk_mbs_config.*   → ChunkMBSConfig
+#       └── torch_compile.*  → TorchCompileConfig
 #   train.*
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
@@ -138,6 +137,10 @@ class OptimizerConfig:
                 "and is not implemented yet."
             )
         },
+    )
+    betas: Tuple[float, float] = field(
+        default=(0.9, 0.95),
+        metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
@@ -429,24 +432,6 @@ class GradientCheckpointingConfig:
 
 
 @dataclass
-class ChunkMBSConfig:
-    """model.accelerator.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
-
-    enable: bool = field(
-        default=False,
-        metadata={"help": "Enable ChunkMBS for packed-sequence decoder layers."},
-    )
-    chunk_mbs: int = field(
-        default=1,
-        metadata={"help": "Number of packed samples per layer chunk."},
-    )
-
-    def __post_init__(self):
-        if self.chunk_mbs < 1:
-            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs}.")
-
-
-@dataclass
 class TorchCompileConfig:
     """model.accelerator.torch_compile.* — Per-block torch.compile options."""
 
@@ -667,7 +652,6 @@ class AcceleratorConfig:
     offload_config: OffloadConfig = field(default_factory=OffloadConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
-    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
 
     def __post_init__(self):
         # although expert parallel and extra parallel are both provided in the arguments,
@@ -1146,7 +1130,8 @@ class OpsImplementationConfig:
         default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
-            "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
+            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
         },
     )
     rotary_pos_emb_vision_implementation: str = field(
@@ -1620,27 +1605,7 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
-        accelerator = self.model.accelerator
-        if accelerator.chunk_mbs_config.enable:
-            if self.train.pad_to_length:
-                raise ValueError(
-                    "model.accelerator.chunk_mbs_config.enable is not supported with train.pad_to_length yet."
-                )
-            if accelerator.gradient_checkpointing.enable and accelerator.gradient_checkpointing.enable_reentrant:
-                raise ValueError(
-                    "model.accelerator.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
-                    "Set model.accelerator.gradient_checkpointing.enable_reentrant=False."
-                )
-            if self.data.data_type == "dpo":
-                raise ValueError("model.accelerator.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
-
-        if accelerator.torch_compile.enable:
-            if accelerator.chunk_mbs_config.enable:
-                raise ValueError(
-                    "model.accelerator.chunk_mbs_config.enable is not supported with "
-                    "model.accelerator.torch_compile.enable yet. "
-                    "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
-                )
+        if self.model.accelerator.torch_compile.enable:
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
                     "model.accelerator.torch_compile.enable is not supported by this data pipeline. "

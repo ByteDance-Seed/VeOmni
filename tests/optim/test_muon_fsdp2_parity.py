@@ -25,6 +25,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
@@ -253,6 +254,90 @@ def _run_dense(hidden: int = 32, intermediate: int = 64, mixed_dtype: bool = Fal
                 msg=f"FSDP2 Muon update for {k!r} diverges from single-device Muon (world_size={world_size}).",
             )
         print(f"[rank0] dense FSDP2 / single-device parity OK across {len(golden)} param(s)")
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _run_dense_hsdp(hidden: int = 32, intermediate: int = 64) -> None:
+    """Same as ``_run_dense`` but on a 2D HSDP mesh.
+
+    Guards the regression where an HSDP ``(dp_replicate, dp_shard)`` mesh made
+    every Muon param fall back to a redundant ``full_tensor()`` all-gather
+    because the all-to-all path only recognised 1D meshes.
+    """
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device_type = get_device_type()
+    get_torch_device().set_device(f"{device_type}:{local_rank}")
+    dist.init_process_group(backend=get_dist_comm_backend())
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(f"{device_type}:{local_rank}")
+
+    assert world_size % 2 == 0, "HSDP parity needs an even world size"
+    shard_size = world_size // 2
+    mesh = init_device_mesh(device_type, (2, shard_size), mesh_dim_names=("dp_replicate", "dp_shard"))
+
+    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate)
+    full_shapes = {fqn: tuple(p.shape) for fqn, p in model.named_parameters() if p.requires_grad}
+    for block in (model.block0, model.block1, model.block2):
+        fully_shard(block, mesh=mesh)
+    fully_shard(model, mesh=mesh)
+    for name, p in model.named_parameters():
+        assert isinstance(p, DTensor), f"expected DTensor for {name}, got {type(p)}"
+        assert p.device_mesh.ndim == 2, f"expected a 2D HSDP mesh for {name}"
+        assert p.placements == (Replicate(), Shard(0)), f"unexpected placements {p.placements} for {name}"
+
+    opt = _dense_muon(model, head_blocks=1)
+    a2a_chunk_sizes = []
+    original_ortho_fsdp_group_all2all = opt._ortho_fsdp_group_all2all
+
+    def checked_ortho_fsdp_group_all2all(updates, sub_mesh, ns_kwargs):
+        # The path must run on the sliced shard dim, not the full HSDP mesh.
+        assert sub_mesh.ndim == 1, f"expected a 1D shard submesh, got ndim={sub_mesh.ndim}"
+        assert sub_mesh.size(0) == shard_size
+        a2a_chunk_sizes.append(len(updates))
+        assert len(updates) <= shard_size
+        return original_ortho_fsdp_group_all2all(updates, sub_mesh, ns_kwargs)
+
+    opt._ortho_fsdp_group_all2all = checked_ortho_fsdp_group_all2all
+
+    gathered_numels = []
+    original_full_tensor = DTensor.full_tensor
+
+    def counting_full_tensor(self, *args, **kwargs):
+        gathered_numels.append(self.numel())
+        return original_full_tensor(self, *args, **kwargs)
+
+    DTensor.full_tensor = counting_full_tensor
+    try:
+        for step in range(2):
+            _make_grads(model, full_shapes, step, device)
+            opt.step()
+            opt.zero_grad()
+    finally:
+        DTensor.full_tensor = original_full_tensor
+
+    assert not gathered_numels, (
+        f"HSDP Muon fell back to full_tensor() for {len(gathered_numels)} update(s); "
+        "the all-to-all path should cover 2D replicate+shard meshes."
+    )
+    assert a2a_chunk_sizes
+    assert sum(a2a_chunk_sizes) == 2 * len(full_shapes)
+
+    hsdp_state = _full_state_dict(model)
+    if rank == 0:
+        golden = _dense_golden_state(full_shapes, hidden=hidden, intermediate=intermediate, mixed_dtype=False)
+        assert set(hsdp_state.keys()) == set(golden.keys())
+        for k, v in golden.items():
+            torch.testing.assert_close(
+                hsdp_state[k],
+                v,
+                atol=1e-4,
+                rtol=1e-4,
+                msg=f"HSDP Muon update for {k!r} diverges from single-device Muon (world_size={world_size}).",
+            )
+        print(f"[rank0] dense HSDP / single-device parity OK across {len(golden)} param(s)")
 
     dist.barrier()
     dist.destroy_process_group()
@@ -503,6 +588,16 @@ def test_dense_empty_shards_4gpu():
 
 
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
+def test_dense_hsdp_4gpu():
+    """HSDP must use the all-to-all path, not a per-param all-gather."""
+    cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="dense_hsdp", use_zero_comm=False)
+    env = os.environ.copy()
+    env.setdefault("NCCL_DEBUG", "WARN")
+    result = subprocess.run(cmd, env=env, check=True)
+    assert result.returncode == 0
+
+
+@pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_dense_mixed_dtype_4gpu():
     cmd = _torchrun_cmd(nproc=4, port=_find_free_port(), mode="dense_mixed_dtype", use_zero_comm=False)
     env = os.environ.copy()
@@ -547,13 +642,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=["dense", "dense_empty", "dense_mixed_dtype", "dense_head_split", "moe"],
+        choices=["dense", "dense_hsdp", "dense_empty", "dense_mixed_dtype", "dense_head_split", "moe"],
         required=True,
     )
     parser.add_argument("--zero-comm", type=int, default=0)
     args = parser.parse_args()
     if args.mode == "dense":
         _run_dense()
+    elif args.mode == "dense_hsdp":
+        _run_dense_hsdp()
     elif args.mode == "dense_empty":
         _run_dense(hidden=2, intermediate=3)
     elif args.mode == "dense_mixed_dtype":

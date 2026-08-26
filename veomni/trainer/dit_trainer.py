@@ -145,6 +145,17 @@ class DiTDataArguments(DataArguments):
         default=True,
         metadata={"help": "Whether or not to shuffle the dataset."},
     )
+    data_transform: Optional[str] = field(
+        default="dit_online",
+        metadata={
+            "help": "Override the DATA_TRANSFORM_REGISTRY transform name. "
+            "When None, DiTTrainer picks dit_offline/dit_online by training_task."
+        },
+    )
+    log_sample: bool = field(
+        default=True,
+        metadata={"help": "Whether to print the first micro batch example to the log."},
+    )
 
 
 @dataclass
@@ -271,8 +282,6 @@ class DiTTrainer:
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
     def __init__(self, args: VeOmniDiTArguments):
-        if args.model.accelerator.chunk_mbs_config.enable:
-            raise ValueError("model.accelerator.chunk_mbs_config is not supported by DiTTrainer.")
         if args.train.channel_loss.enable:
             raise ValueError(
                 "train.channel_loss is only supported by causal-LM trainers; DiTTrainer uses diffusion objectives."
@@ -287,6 +296,7 @@ class DiTTrainer:
         # Builds the condition model and, unless this is an embedding-only run,
         # the DiT itself along with its optimizer.
         self.base.model = self.build_model_runtime()
+        self.base.LOG_SAMPLE = args.data.log_sample
 
         # rewrite _build_data_transform, build data transform for offline or online dit data
         self._build_data_transform()
@@ -356,11 +366,12 @@ class DiTTrainer:
 
     def _build_data_transform(self):
         args: VeOmniDiTArguments = self.base.args
+        logger.info(f"args.data.data_transform: {args.data.data_transform}, training_task: {self.training_task}")
         if self.training_task == "offline_training":
             self.base.data_transform = build_data_transform("dit_offline")
         else:
             self.base.data_transform = build_data_transform(
-                "dit_online",
+                args.data.data_transform,
                 **args.data.mm_configs,
             )
 

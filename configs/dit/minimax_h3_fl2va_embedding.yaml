@@ -1,0 +1,98 @@
+# =============================================================================
+# MiniMax H3 FL2VA offline embedding (pre-compute VAE latents)
+# =============================================================================
+#
+# Entry point: tasks/train_dit.py (plain DiTTrainer; embedding stage picks the transform from data_transform)
+# Usage: bash train.sh tasks/train_dit.py configs/dit/minimax_h3_fl2va_embedding.yaml
+#
+# Encodes raw data → VAE latents + prompt embeddings + packed info → saves parquet.
+# Run BEFORE offline_training. The saved parquet is used as input for offline
+# training (minimax_h3_fl2va_offline.yaml).
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
+model:
+  # DiT model not loaded during embedding (model_path unused)
+  condition_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
+  config_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json
+
+  condition_model_cfg:
+    base_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
+    video_vae_subfolder: video_vae/source
+    skip_encoder_load: false
+    use_keyframe_condition: true
+    keyframe_indices: [0, -1]
+    video_max_frames: 73
+    video_max_resolution: 848
+    sigma_shift_video: 12.0
+    sigma_shift_audio: 3.0
+    imgvid_cond_noise_aug: 0.999
+    audio_cond_noise_aug: 1.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      offload: false
+      mixed_precision:
+        enable: false
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  train_path: dataset/minimax-h3-demo/minimax_h3/MiniMax-H3-FL2VA/metadata.csv
+  data_type: diffusion
+  source_name: minimax_h3
+  data_transform: minimax_h3_online
+  datasets_type: minimax_h3_online
+  log_sample: false
+  shuffle: false
+  text_keys: text
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: false
+  mm_configs:
+    data_dir: dataset/minimax-h3-demo/minimax_h3/MiniMax-H3-FL2VA/
+    fps: 24
+    min_frames: 124
+    max_frames: 124
+    height: 480
+    width: 832
+  offline_embedding_save_dir: output/minimax_h3_fl2va_embedding
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+train:
+  training_task: offline_embedding
+
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  seed: 42
+
+  num_train_epochs: 1
+  # max_steps unset: process all data (set to 0 would clamp train_steps to 0
+  # via VeOmniArguments.train_steps property)
+
+  checkpoint:
+    output_dir: output/minimax_h3_fl2va_embedding
+    save_steps: 0
+    save_hf_weights: false
+
+  wandb:
+    enable: false
+    project: minimax_h3_fl2va

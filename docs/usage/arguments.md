@@ -34,8 +34,8 @@ sizes, schedules, checkpointing, logging — stays on `train.*`, which is singul
 no matter how many modules the model has.
 
 Unknown keys are rejected. A config carrying a key that no dataclass declares
-fails at parse time rather than being silently dropped, and a key that has moved
-is reported together with its new path.
+fails at parse time rather than being silently dropped. There is no compatibility
+alias.
 
 ---
 
@@ -62,7 +62,6 @@ Model architecture, paths, and multimodal encoder / decoder setup.
         * `OffloadConfig` — `model.accelerator.offload_config.*`
         * `GradientCheckpointingConfig` — `model.accelerator.gradient_checkpointing.*`
         * `TorchCompileConfig` — `model.accelerator.torch_compile.*`
-        * `ChunkMBSConfig` — `model.accelerator.chunk_mbs_config.*`
 
 ### VLM Extensions
 
@@ -221,7 +220,7 @@ NPU validation runs at two times:
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend, so a value still equal to the default auto-resolves to `eager` on NPU. |
-| rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
+| rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. DeepSeek-V4 and Wan reject the `liger_kernel` default because their rotary layout is partial / non-standard, and DeepSeek-V4 also rejects `npu`; both raise at model registration, so their configs must pin `triton` or `eager`. |
 | rotary_pos_emb_vision_implementation | `str` | `"eager"` | Vision rotary positional embedding. Known values: `eager`, `npu`. |
 | load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` uses the fused CUDA kernel; `eager` is the pure-PyTorch reference. On NPU, config normalization maps every value equal to the default `triton` (including an explicit YAML value) to `eager`. |
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
@@ -302,7 +301,7 @@ NPU validation runs at two times:
 
 ### TorchCompileConfig
 
-`model.accelerator.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `model.accelerator.torch_compile.dynamic=False`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=False`. Qwen3-VL-MoE, ChunkMBS, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
+`model.accelerator.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `model.accelerator.torch_compile.dynamic=False`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=False`. Qwen3-VL-MoE, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
 
 The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `model.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 
@@ -332,6 +331,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
 | grad_clip_scope | `Literal["per_module", "global"]` | `"per_module"` | Which parameters `max_grad_norm` is computed over. `"per_module"` clips each module against its own norm; `"global"` would clip every module against one norm taken across all of them, but is not implemented yet and raises `NotImplementedError`. A single-model job has one module, so the two agree and only an omni model would see a difference. |
+| betas | `Tuple[float, float]` | `(0.9, 0.95)` | AdamW betas (`beta1`, `beta2`). |
 | muon_lr | `Optional[float]` | `None` | Learning rate for Muon-managed 2-D/3-D weights. Unset: inherits `lr` under `match_rms_adamw`, else `25×lr` under `original`. |
 | muon_momentum | `float` | `0.95` | Momentum factor for Muon. |
 | muon_nesterov | `bool` | `True` | Enable Nesterov momentum for Muon. |
@@ -416,28 +416,6 @@ distinct from the first emission.
 | enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
 | early_stop | `bool` | `True` | Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. PyTorch ignores this option when `enable_reentrant=True`. |
 
-### ChunkMBSConfig
-
-`model.accelerator.chunk_mbs_config.*` — Packed-sequence layer micro-batching settings.
-
-`chunk_mbs` is the number of packed samples per layer chunk. With dynamic batching, the runtime sample
-count is inferred from `cu_seq_lens_q`, so it is independent of `train.micro_batch_size`. Chunks are cut
-only on packed sample boundaries. The current implementation supports trainer-based SFT with packed-sequence
-FlashAttention kwargs using `torch.int32` cumulative lengths, identical query/key metadata, exactly one
-`*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
-`GradientCheckpointingLayer`, and decoder states with shape `[1, sequence, hidden]`. Gradient checkpointing may be
-enabled or disabled; when enabled, it must use the non-reentrant implementation. CPU model-level numerical coverage
-currently includes Qwen3-VL and dense Qwen3.5; accelerator-specific kernels require separate hardware validation. Sequence parallelism,
-tensor parallelism, pipeline parallelism, ExtraParallel/MoE, DiT trainers, RL trainers, DPO, the custom Omni training loop,
-`pad_to_length`, and `torch.compile` are not supported. Chunk boundaries must also align with linear-attention
-cumulative sequence boundaries when that metadata is present. Models with ambiguous decoder classes or stacks fail
-validation instead of applying ChunkMBS to multiple stacks.
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| enable | `bool` | `False` | Enable ChunkMBS for packed-sequence decoder layers listed in `model._no_split_modules`. |
-| chunk_mbs | `int` | `1` | Number of packed samples per layer chunk. |
-
 ### AcceleratorConfig
 
 `model.accelerator.*` — Everything about how one model is placed on the hardware:
@@ -471,7 +449,6 @@ configured and never round-trip through a saved config.
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Activation recomputation settings. |
 | torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
-| chunk_mbs_config | `ChunkMBSConfig` | — | Packed-sequence layer micro-batching settings. |
 
 ### FSDPConfig
 

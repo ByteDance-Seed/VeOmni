@@ -35,7 +35,6 @@ from veomni.arguments import arguments_types
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     BaseModelArguments,
-    ChunkMBSConfig,
     DataArguments,
     FSDPConfig,
     ModelArguments,
@@ -189,7 +188,6 @@ def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
         "ep_sharded_stream_load",
         "gradient_checkpointing",
         "torch_compile",
-        "chunk_mbs_config",
     ],
 )
 def test_moved_knobs_live_on_the_accelerator_and_not_on_training_arguments(name, world_size):
@@ -389,11 +387,6 @@ def test_global_grad_clip_scope_refuses_rather_than_silently_clipping_per_module
         OptimizerConfig(grad_clip_scope="global")
 
 
-def test_chunk_mbs_validates_itself():
-    with pytest.raises(ValueError, match="chunk_mbs must be >= 1"):
-        ChunkMBSConfig(chunk_mbs=0)
-
-
 @pytest.mark.parametrize(
     "key",
     [
@@ -402,23 +395,16 @@ def test_chunk_mbs_validates_itself():
         "ep_sharded_stream_load",
         "gradient_checkpointing",
         "torch_compile",
-        "chunk_mbs_config",
+        "accelerator",
+        "optimizer",
     ],
 )
-def test_parser_points_a_relocated_key_at_its_new_home(key, world_size):
+def test_parser_rejects_a_key_that_used_to_live_on_train(key, world_size):
     world_size(1)
-    value = {"enable": True} if key in ("gradient_checkpointing", "torch_compile", "chunk_mbs_config") else "meta"
+    value = {"enable": True} if key in ("gradient_checkpointing", "torch_compile") else "meta"
 
-    with pytest.raises(ValueError, match=rf"train\.{key} has moved to model\.accelerator\.{key}"):
+    with pytest.raises(ValueError, match=rf"train\.{key} is not a field of TrainingArguments"):
         _instantiate_recursive(TrainingArguments, {key: value}, path="train")
-
-
-@pytest.mark.parametrize("block", ["accelerator", "optimizer"])
-def test_parser_points_a_relocated_block_at_model(block, world_size):
-    """The whole block moved, so a config that still nests it under train must say so."""
-    world_size(1)
-    with pytest.raises(ValueError, match=rf"train\.{block} has moved to model\.{block}"):
-        _instantiate_recursive(TrainingArguments, {block: {}}, path="train")
 
 
 def test_parser_rejects_a_key_no_dataclass_declares(world_size):
@@ -450,7 +436,6 @@ def test_parser_still_accepts_the_new_paths(world_size):
             "accelerator": {
                 "init_device": "meta",
                 "gradient_checkpointing": {"enable": False},
-                "chunk_mbs_config": {"chunk_mbs": 4},
             },
             "optimizer": {"lr": 3.0e-4},
         },
@@ -459,5 +444,4 @@ def test_parser_still_accepts_the_new_paths(world_size):
 
     assert args.accelerator.init_device == "meta"
     assert args.accelerator.gradient_checkpointing.enable is False
-    assert args.accelerator.chunk_mbs_config.chunk_mbs == 4
     assert args.optimizer.lr == pytest.approx(3.0e-4)

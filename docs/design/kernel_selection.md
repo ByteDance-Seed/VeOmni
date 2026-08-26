@@ -21,7 +21,7 @@ selection knob.
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | Vision rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `npu` | `"eager"` | Model registration via ops config singleton |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
@@ -244,7 +244,7 @@ model:
 |-------|---------------|---|
 | `liger_kernel` | `liger_rotary_pos_emb` | `liger-kernel` package |
 | `npu` | `torch_npu.npu_rotary_mul` | `torch_npu` |
-| `triton` | Model-specific Triton kernel registered via `extra_backends` (e.g. DeepSeek-V3 deterministic RoPE) | `triton`, per-model registration |
+| `triton` | Model-specific Triton kernel registered via `extra_backends` (DeepSeek-V3 deterministic RoPE, DeepSeek-V4 fused partial-interleaved RoPE, Wan DiT) | `triton`, per-model registration |
 | `eager` | HuggingFace default (`apply_rotary_pos_emb`) | — |
 
 #### `swiglu_mlp_implementation`
@@ -274,8 +274,10 @@ only difference is the kernel callable on the other side of the registry.
 
 Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, DeepSeek-V4, Llama,
 Seed-OSS. DeepSeek-V4 supports weighted and unweighted RMSNorm plus a
-clamp-preserving Liger silu*mul path for shared experts; its partial
-interleaved RoPE remains eager-only.
+clamp-preserving Liger silu*mul path for shared experts. Its partial
+interleaved RoPE has no Liger equivalent, so `liger_kernel` is rejected for
+`rotary_pos_emb_implementation` on that model; the supported values are
+`triton` (the fused kernel above) and `eager`.
 
 ### Key files
 

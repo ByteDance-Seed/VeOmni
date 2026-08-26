@@ -51,7 +51,6 @@ from ..data import (
 )
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
-from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import (
     clear_parallel_state,
@@ -546,7 +545,6 @@ class BaseTrainer(Stateful, ABC):
                 return {k: _to_device(vv) for k, vv in v.items()}
             return v
 
-        self._chunk_mbs_ranges = build_chunk_mbs_ranges(micro_batch, self.args.model.accelerator.chunk_mbs_config)
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
@@ -580,13 +578,11 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
-            chunk_ranges = getattr(self, "_chunk_mbs_ranges", None)
             channel_forward_context = (
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
             with (
                 use_parallel_state("base"),
-                chunk_mbs_context(chunk_ranges),
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
                 channel_forward_context,
@@ -596,10 +592,8 @@ class BaseTrainer(Stateful, ABC):
             with use_parallel_state("base"):
                 loss, loss_dict = self.postforward(outputs, micro_batch)
 
-            # Backward pass
             with (
                 use_parallel_state("base"),
-                chunk_mbs_context(chunk_ranges),
                 self.model_bwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
             ):

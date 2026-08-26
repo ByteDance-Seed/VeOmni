@@ -290,7 +290,10 @@ class TrainerTest(BaseTrainer):
         self.micro_batches_token_len = count_loss_token(batch)
         self.micro_batch_token_len = count_loss_token(batch)
 
-        if self.model.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"] and get_env("MODELING_BACKEND") == "hf":
+        if (
+            self.model.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]
+            and get_env("MODELING_BACKEND") == "hf"
+        ):
             audio_feature_lengths = batch["audio_feature_lengths"]
             # qwen omni got strange logic in audio_forward
             batch["input_features"] = (

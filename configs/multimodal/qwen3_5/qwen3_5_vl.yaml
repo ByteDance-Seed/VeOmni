@@ -8,9 +8,6 @@ model:
   accelerator:
     gradient_checkpointing:
       enable_reentrant: false
-    chunk_mbs_config:
-      enable: false
-      chunk_mbs: 2
     init_device: meta
     ulysses_size: 1
     fsdp_config:

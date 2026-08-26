@@ -12,7 +12,7 @@ model:
     mhc_implementation: tilelang
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel
-    rotary_pos_emb_implementation: eager
+    rotary_pos_emb_implementation: triton
   optimizer:
     # Muon + AdamW: 2D hidden / 3D expert stacks use Muon; embed/lm_head/norms/bias use AdamW.
     # Switch back with `type: adamw` if needed.

@@ -365,8 +365,6 @@ class VeOmniModelRuntime:
 
         if args.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.fqn_to_index_mapping
-        if args.accelerator.chunk_mbs_config.enable:
-            kwargs["chunk_mbs_config"] = args.accelerator.chunk_mbs_config
 
         skip_hf_weight_load = self.skip_hf_weight_load
         if skip_hf_weight_load:

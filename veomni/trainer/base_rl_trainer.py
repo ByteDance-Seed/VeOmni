@@ -45,15 +45,6 @@ class BaseRLTrainer(BaseTrainer):
         with use_parallel_state("base"):
             self._build_preforward_postforward()
 
-    # ── Trainer distributed setup ────────────────────────────────
-
-    @staticmethod
-    def setup_distributed(args: VeOmniArguments) -> torch.device:
-        if args.model.accelerator.chunk_mbs_config.enable:
-            raise ValueError("ChunkMBS is not supported by RL trainers yet.")
-
-        return BaseTrainer.setup_distributed(args)
-
     # ── Trainer build functions ────────────────────────────────
 
     def _build_preforward_postforward(self):
