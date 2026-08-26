@@ -1,8 +1,9 @@
 """Attention visibility metadata and mask materializers for BAGEL Qwen2-MoT.
 
 `packed_attention_metadata` is the source of truth. `build_mot_block_mask`
-materializes a Flex `BlockMask` for accelerated training. `build_mot_sdpa_mask`
-materializes a dense boolean mask for eager SDPA (``True`` means attend).
+materializes a Flex `BlockMask` for accelerated training. `build_mot_magi_mask`
+materializes MagiAttention ranges. `build_mot_sdpa_mask` materializes a dense
+boolean mask for eager SDPA (``True`` means attend).
 """
 
 from __future__ import annotations
@@ -10,8 +11,12 @@ from __future__ import annotations
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 
+from ......ops.kernels.attention.magi import MagiAttentionMask
+
 
 _MOT_BLOCK_SIZE = 128
+_MAGI_ATTN_FULL = 0
+_MAGI_ATTN_CAUSAL = 1
 
 
 def build_mot_attention_metadata(
@@ -27,8 +32,8 @@ def build_mot_attention_metadata(
     ``noise``). Row 2 identifies noise spans so their keys remain invisible
     outside that same noise span. ``-1`` means that a row does not apply.
 
-    Callers materialize this compact representation either as a Flex
-    ``BlockMask`` or as a dense SDPA mask, without changing the metadata.
+    Callers materialize this compact representation as a Flex ``BlockMask``,
+    MagiAttention ranges, or a dense SDPA mask, without changing the metadata.
     """
     total_length = sum(sum(split_lens) for split_lens in sample_splits)
     metadata = torch.full((3, total_length), -1, device=device, dtype=torch.int32)
@@ -207,6 +212,106 @@ def build_mot_block_mask(packed_attention_metadata: torch.Tensor) -> BlockMask:
     )
 
 
+def _mot_span_mode(full_span_id: int, noise_span_id: int) -> str:
+    if noise_span_id >= 0:
+        return "noise"
+    if full_span_id >= 0:
+        return "full"
+    return "causal"
+
+
+def _iter_mot_spans(packed_attention_metadata: torch.Tensor) -> list[tuple[int, int, int, str]]:
+    """Recover contiguous (start, end, document_id, mode) spans from metadata."""
+    sequence_length = int(packed_attention_metadata.shape[1])
+    document_ids, full_span_ids, noise_span_ids = packed_attention_metadata
+    changed = document_ids.new_ones(sequence_length, dtype=torch.bool)
+    changed[1:] = (
+        (document_ids[1:] != document_ids[:-1])
+        | (full_span_ids[1:] != full_span_ids[:-1])
+        | (noise_span_ids[1:] != noise_span_ids[:-1])
+    )
+    starts = torch.nonzero(changed, as_tuple=False).flatten()
+    ends = torch.cat((starts[1:], starts.new_tensor([sequence_length])))
+    spans: list[tuple[int, int, int, str]] = []
+    for start, end, document_id, full_span_id, noise_span_id in zip(
+        starts.tolist(),
+        ends.tolist(),
+        document_ids[starts].tolist(),
+        full_span_ids[starts].tolist(),
+        noise_span_ids[starts].tolist(),
+        strict=True,
+    ):
+        spans.append((start, end, int(document_id), _mot_span_mode(int(full_span_id), int(noise_span_id))))
+    return spans
+
+
+def _merge_adjacent_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    merged = [ranges[0]]
+    for start, end in ranges[1:]:
+        last_start, last_end = merged[-1]
+        if start == last_end:
+            merged[-1] = (last_start, end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def build_mot_magi_mask(packed_attention_metadata: torch.Tensor) -> MagiAttentionMask:
+    """Build BAGEL's MagiAttention ranges from compact metadata.
+
+    Token visibility is the same as Flex/SDPA:
+    ``same_document & (causal | same_full_span) & ~foreign_noise_key``.
+
+    Each document is encoded as:
+    - a self range per span (causal inside ``causal`` spans, full inside ``full``/``noise``)
+    - full ranges from each query span onto earlier non-noise spans in that document
+
+    Noise keys are omitted from every other span's key ranges. Metadata is
+    already the full packed sequence, including Ulysses padding, so this
+    builder does not rescale ranges by ``ulysses_size``.
+    """
+    _validate_mot_attention_metadata(packed_attention_metadata)
+    sequence_length = int(packed_attention_metadata.shape[1])
+    if sequence_length == 0:
+        raise ValueError("BAGEL Qwen2-MoT attention metadata must contain at least one token.")
+
+    q_ranges: list[tuple[int, int]] = []
+    k_ranges: list[tuple[int, int]] = []
+    attn_types: list[int] = []
+    document_spans: list[tuple[int, int, str]] = []
+    current_document_id: int | None = None
+
+    def flush_document(spans: list[tuple[int, int, str]]) -> None:
+        for query_index, (query_start, query_end, query_mode) in enumerate(spans):
+            earlier_clean = [
+                (key_start, key_end) for key_start, key_end, key_mode in spans[:query_index] if key_mode != "noise"
+            ]
+            for key_start, key_end in _merge_adjacent_ranges(earlier_clean):
+                q_ranges.append((query_start, query_end))
+                k_ranges.append((key_start, key_end))
+                attn_types.append(_MAGI_ATTN_FULL)
+            q_ranges.append((query_start, query_end))
+            k_ranges.append((query_start, query_end))
+            attn_types.append(_MAGI_ATTN_FULL if query_mode != "causal" else _MAGI_ATTN_CAUSAL)
+
+    for start, end, document_id, mode in _iter_mot_spans(packed_attention_metadata):
+        if current_document_id is not None and document_id != current_document_id:
+            flush_document(document_spans)
+            document_spans = []
+        current_document_id = document_id
+        document_spans.append((start, end, mode))
+    flush_document(document_spans)
+
+    device = packed_attention_metadata.device
+    return MagiAttentionMask(
+        q_ranges=torch.tensor(q_ranges, device=device, dtype=torch.int32),
+        k_ranges=torch.tensor(k_ranges, device=device, dtype=torch.int32),
+        attn_type_map=torch.tensor(attn_types, device=device, dtype=torch.int32),
+    )
+
+
 def build_mot_sdpa_mask(packed_attention_metadata: torch.Tensor) -> torch.Tensor:
     """Materialize a dense ``[1, 1, S, S]`` boolean SDPA mask.
 
@@ -231,6 +336,7 @@ def build_mot_sdpa_mask(packed_attention_metadata: torch.Tensor) -> torch.Tensor
 __all__ = [
     "build_mot_attention_metadata",
     "build_mot_block_mask",
+    "build_mot_magi_mask",
     "build_mot_sdpa_mask",
     "pad_mot_attention_metadata",
 ]
