@@ -113,7 +113,7 @@ def test_build_optimizer_skips_empty_vlm_param_groups():
 
 
 def test_vlm_trainer_style_param_groups_skip_empty_vit():
-    """Mirrors VLMTrainer._build_optimizer: only append groups that have
+    """Mirrors VLMModelRuntime.build_optimizer: only append groups that have
     trainable params (freeze_vit -> vit_params == [] must not create a group).
     """
     model = _TinyModel()

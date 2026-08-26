@@ -147,7 +147,7 @@ def _select_yaml_then_build(toy_dir: str):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = build_toy(toy_dir)
-    # Mirror BaseTrainer._setup_lora: map any semantic MoE module names
+    # Mirror BaseTrainer.setup_lora: map any semantic MoE module names
     # (gate_proj / up_proj / down_proj) onto the model's fused expert
     # target_parameters. No-op for configs that already list explicit patterns.
     lora_cfg = resolve_fused_moe_lora_targets(model, lora_cfg)

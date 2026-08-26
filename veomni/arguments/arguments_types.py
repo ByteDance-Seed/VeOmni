@@ -51,8 +51,7 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #       |   └── mixed_precision.* → MixedPrecisionConfig
 #       ├── offload_config.* → OffloadConfig
 #       ├── gradient_checkpointing.*  → GradientCheckpointingConfig
-#       ├── torch_compile.*  → TorchCompileConfig
-#       └── chunk_mbs_config.*   → ChunkMBSConfig
+#       └── torch_compile.*  → TorchCompileConfig
 #   train.*
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
@@ -426,21 +425,35 @@ class GradientCheckpointingConfig:
 
 
 @dataclass
-class ChunkMBSConfig:
-    """model.accelerator.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
+class TorchCompileConfig:
+    """model.accelerator.torch_compile.* — Per-block torch.compile options."""
 
     enable: bool = field(
         default=False,
-        metadata={"help": "Enable ChunkMBS for packed-sequence decoder layers."},
+        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
     )
-    chunk_mbs: int = field(
-        default=1,
-        metadata={"help": "Number of packed samples per layer chunk."},
+    backend: Optional[str] = field(
+        default="inductor",
+        metadata={"help": "Backend passed to torch.compile."},
     )
-
-    def __post_init__(self):
-        if self.chunk_mbs < 1:
-            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs}.")
+    mode: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Mode passed to torch.compile. Leave as None to use the inductor default. "
+                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
+                "model.accelerator.fsdp_config.reshard_after_forward=False."
+            )
+        },
+    )
+    fullgraph: bool = field(
+        default=True,
+        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
+    )
+    dynamic: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    )
 
 
 @dataclass
@@ -548,38 +561,6 @@ class OffloadConfig:
 
 
 @dataclass
-class TorchCompileConfig:
-    """train.torch_compile.* — Per-block torch.compile options."""
-
-    enable: bool = field(
-        default=False,
-        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
-    )
-    backend: Optional[str] = field(
-        default="inductor",
-        metadata={"help": "Backend passed to torch.compile."},
-    )
-    mode: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Mode passed to torch.compile. Leave as None to use the inductor default. "
-                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
-                "train.accelerator.fsdp_config.reshard_after_forward=False."
-            )
-        },
-    )
-    fullgraph: bool = field(
-        default=True,
-        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
-    )
-    dynamic: bool = field(
-        default=False,
-        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
-    )
-
-
-@dataclass
 class AcceleratorConfig:
     """model.accelerator.* — Parallelism and distributed-training topology.
 
@@ -657,7 +638,6 @@ class AcceleratorConfig:
     offload_config: OffloadConfig = field(default_factory=OffloadConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
-    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
 
     def __post_init__(self):
         # although expert parallel and extra parallel are both provided in the arguments,
@@ -1177,7 +1157,8 @@ class OpsImplementationConfig:
         default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
-            "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
+            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
         },
     )
     rotary_pos_emb_vision_implementation: str = field(
@@ -1350,18 +1331,33 @@ class OpsImplementationConfig:
 class BaseModelArguments:
     """Model fields shared by every trainable unit, whole model or single module.
 
-    Deliberately excludes the config/tokenizer/index paths: an omni module is
+    Deliberately excludes the tokenizer and index paths: an omni module is
     addressed by its subfolder inside a composed checkpoint and never carries
     its own tokenizer, so those belong on :class:`ModelArguments` alone.
+    ``config_path`` is here because every unit has to say where its architecture
+    is defined, even when that is just its own subfolder.
     """
 
     model_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
     )
+    config_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
+    )
     model_config: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config to overwrite foundation model config."},
+    )
+    processor_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Kwargs to overwrite the processor/tokenizer config, e.g. "
+                "`size: {shortest_edge: 3136, longest_edge: 602112}` for a Qwen-VL image processor."
+            )
+        },
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
@@ -1380,6 +1376,9 @@ class BaseModelArguments:
         # ``model_path`` that exists on disk before any loader touches it, and a
         # composed model resolves its module subfolders against this root.
         self.model_path = _resolve_hdfs_path(self.model_path)
+        self.config_path = _resolve_hdfs_path(self.config_path)
+        if self.config_path is None:
+            self.config_path = self.model_path
 
     def _safetensor_idx_path(self) -> Optional[str]:
         """Where to read the HF ``weight_map`` from. Overridden to allow an explicit path."""
@@ -1437,10 +1436,6 @@ class ModelRuntimeArguments(BaseModelArguments):
 class ModelArguments(ModelRuntimeArguments):
     """model.* — One composed model, plus the paths its loaders resolve from."""
 
-    config_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
-    )
     tokenizer_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
@@ -1458,12 +1453,9 @@ class ModelArguments(ModelRuntimeArguments):
 
         # Download HDFS-hosted paths to a local cache before resolving defaults so
         # that all downstream loaders (config/tokenizer/safetensors) see local paths.
+        # ``super()`` settles ``config_path``, which the tokenizer then falls back to.
         super().__post_init__()
-        self.config_path = _resolve_hdfs_path(self.config_path)
         self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
-
-        if self.config_path is None:
-            self.config_path = self.model_path
 
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
@@ -1575,9 +1567,16 @@ class DataArguments:
         default=None,
         metadata={"help": "Key to get text from the training data."},
     )
-    chat_template: str = field(
-        default="default",
-        metadata={"help": "Chat template to use."},
+    chat_template: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Chat template used to lay conversations out into training samples. "
+                "Leave unset for data that carries no conversation structure (plaintext, "
+                "diffusion) or for a model that formats prompts through its own processor "
+                "(Qwen-Omni)."
+            )
+        },
     )
     max_seq_len: int = field(
         default=2048,
@@ -1643,27 +1642,7 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
-        accelerator = self.model.accelerator
-        if accelerator.chunk_mbs_config.enable:
-            if self.train.pad_to_length:
-                raise ValueError(
-                    "model.accelerator.chunk_mbs_config.enable is not supported with train.pad_to_length yet."
-                )
-            if accelerator.gradient_checkpointing.enable and accelerator.gradient_checkpointing.enable_reentrant:
-                raise ValueError(
-                    "model.accelerator.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
-                    "Set model.accelerator.gradient_checkpointing.enable_reentrant=False."
-                )
-            if self.data.data_type == "dpo":
-                raise ValueError("model.accelerator.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
-
-        if accelerator.torch_compile.enable:
-            if accelerator.chunk_mbs_config.enable:
-                raise ValueError(
-                    "model.accelerator.chunk_mbs_config.enable is not supported with "
-                    "model.accelerator.torch_compile.enable yet. "
-                    "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
-                )
+        if self.model.accelerator.torch_compile.enable:
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
                     "model.accelerator.torch_compile.enable is not supported by this data pipeline. "

@@ -35,12 +35,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-import veomni.trainer.base as trainer_base
+from tests.tools.training_utils import unbuilt_runtime
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import load_lora_weights
-from veomni.trainer.base import BaseTrainer
 
 
 torch.manual_seed(0)
@@ -142,59 +141,46 @@ def test_only_lora_trainable():
     assert all(".lora_A." in n or ".lora_B." in n for n in trainable)
 
 
-def test_base_trainer_rejects_lora_without_trainable_adapters():
-    trainer = BaseTrainer.__new__(BaseTrainer)
-    trainer.model = Toy()
-    trainer.args = SimpleNamespace(
-        model=SimpleNamespace(lora_config={"rank": 8, "alpha": 16, "lora_modules": ["missing"]})
-    )
+def test_model_runtime_rejects_lora_without_trainable_adapters():
+    runtime = unbuilt_runtime(SimpleNamespace(lora_config={"rank": 8, "alpha": 16, "lora_modules": ["missing"]}))
+    runtime.model = Toy()
 
     with pytest.raises(ValueError, match="no trainable adapters"):
-        trainer._setup_lora()
+        runtime.setup_lora()
 
 
-def test_base_trainer_warns_instead_of_raising_for_customized_lora(monkeypatch):
-    """A ``customized_setup_lora`` hook owns its own naming, so a missed
-    ``lora_A`` / ``lora_B`` probe must warn rather than abort the run."""
+def test_model_runtime_accepts_a_model_that_wraps_its_own_lora():
+    """A model-owned ``setup_lora`` hook owns its own naming, so the runtime's
+    ``lora_A`` / ``lora_B`` probe must not abort the run."""
 
     class CustomLoraModel(Toy):
-        def customized_setup_lora(self, lora_config):
+        def setup_lora(self, lora_config):
             self.custom_adapter = nn.Parameter(torch.zeros(1))
             return self
 
-    warnings_seen: list[str] = []
-    monkeypatch.setattr(
-        trainer_base.logger, "warning_rank0", lambda msg, *args, **kwargs: warnings_seen.append(str(msg))
-    )
+    runtime = unbuilt_runtime(SimpleNamespace(lora_config={"rank": 8, "alpha": 16}))
+    runtime.model = CustomLoraModel()
 
-    trainer = BaseTrainer.__new__(BaseTrainer)
-    trainer.model = CustomLoraModel()
-    trainer.args = SimpleNamespace(model=SimpleNamespace(lora_config={"rank": 8, "alpha": 16}))
+    runtime.setup_lora()
 
-    trainer._setup_lora()
-
-    assert isinstance(trainer.model, CustomLoraModel)
-    assert hasattr(trainer.model, "custom_adapter")
-    assert any("customized_setup_lora produced no trainable parameters" in msg for msg in warnings_seen)
+    assert isinstance(runtime.model, CustomLoraModel)
+    assert hasattr(runtime.model, "custom_adapter")
 
 
 @pytest.mark.parametrize("is_trainable", [True, False])
-def test_base_trainer_validates_resumed_adapter(tmp_path, is_trainable):
+def test_model_runtime_validates_resumed_adapter(tmp_path, is_trainable):
     VeOmniLoraModel(Toy(), _base_config()).save_pretrained(str(tmp_path))
-    trainer = BaseTrainer.__new__(BaseTrainer)
-    trainer.model = Toy()
-    trainer.args = SimpleNamespace(
-        model=SimpleNamespace(
-            lora_config={"lora_adapter": str(tmp_path), "is_trainable": is_trainable},
-        )
+    runtime = unbuilt_runtime(
+        SimpleNamespace(lora_config={"lora_adapter": str(tmp_path), "is_trainable": is_trainable})
     )
+    runtime.model = Toy()
 
     if is_trainable:
-        trainer._setup_lora()
-        assert any(param.requires_grad for param in trainer.model.parameters())
+        runtime.setup_lora()
+        assert any(param.requires_grad for param in runtime.parameters())
     else:
         with pytest.raises(ValueError, match="no trainable adapters"):
-            trainer._setup_lora()
+            runtime.setup_lora()
 
 
 def test_init_is_noop():

@@ -147,7 +147,7 @@ Add `process_sample_your_model()` to [veomni/data/data_transform.py](../../../ve
 
 ### Step 8: Hook into the Trainer
 
-Edit [veomni/trainer/vlm_trainer.py](../../../veomni/trainer/vlm_trainer.py). Add your model type to `build_model_assets`, `build_data_collate_info`, `build_data_transform`, and optionally `freeze_module` / `build_param_groups`.
+Edit [veomni/trainer/vlm_trainer.py](../../../veomni/trainer/vlm_trainer.py). Prefer model hooks (`get_extra_collate_infos`, `get_metadata_collate_func`) and `VLMModelRuntime` overrides (`build_model`, `freeze_model`, `build_optimizer`) over adding a `model_type` branch on the trainer. Wire a new data transform in `_build_data_transform` if the shared registry does not already cover it.
 
 ### Step 9: Add a Config File
 

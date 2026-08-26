@@ -13,10 +13,10 @@ import torch.nn as nn
 from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
-from veomni.arguments import TrainingArguments, parse_args
+from veomni.arguments import ModelRuntimeArguments, TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.utils import helper
@@ -42,6 +42,7 @@ def _torch_npu_version() -> str:
 
 @dataclass
 class Argument:
+    model: "ModelRuntimeArguments" = field(default_factory=ModelRuntimeArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
@@ -126,7 +127,7 @@ def main():
     args = parse_args(Argument)
 
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
         dp_shard_size=args.model.accelerator.dp_shard_size,

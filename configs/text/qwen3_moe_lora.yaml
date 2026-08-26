@@ -3,7 +3,7 @@
 # `Qwen3MoeExperts` stores fused `gate_up_proj` (3D, [num_experts, 2*intermediate, hidden])
 # and `down_proj` (3D, [num_experts, hidden, intermediate]).
 #
-# `lora_config` schema (`veomni/trainer/base.py::_setup_lora`):
+# `lora_config` schema (`veomni/models/model_runtime.py::setup_lora`):
 #   - `lora_modules`         — LoRA targets by module name. `q/k/v/o` etc. install a dense
 #                              `LoraLinear`; the fused-MoE expert names `gate_proj` /
 #                              `up_proj` / `down_proj` are auto-mapped to the experts'

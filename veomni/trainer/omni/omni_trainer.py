@@ -63,10 +63,9 @@ from ...arguments import OmniArguments
 from ...arguments.parser import save_args
 from ...data import SeedOmniCollator, build_dataloader, build_dataset
 from ...data.data_transform import build_data_transform
-from ...distributed.chunk_mbs import build_chunk_mbs_ranges
 from ...distributed.clip_grad_norm import omni_clip_grad_norm
 from ...distributed.offloading import build_activation_offloading_context
-from ...distributed.parallel_state import init_parallel_state
+from ...distributed.parallel_state import init_parallel_state_from_accelerator
 from ...models.seed_omni.accelerator import OmniModelRuntime
 from ...models.seed_omni.accelerator.module_runtime import ModuleRuntime
 from ...models.seed_omni.processing_omni import OmniProcessor
@@ -302,22 +301,7 @@ class OmniTrainer:
 
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
-        acc = args.model.accelerator
-        init_parallel_state(
-            dp_size=acc.dp_size,
-            dp_replicate_size=acc.dp_replicate_size,
-            dp_shard_size=acc.dp_shard_size,
-            tp_size=acc.tp_size,
-            pp_size=acc.pp_size,
-            cp_size=acc.cp_size,
-            ulysses_size=acc.ulysses_size,
-            extra_parallel_sizes=acc.extra_parallel_sizes,
-            extra_parallel_placement_innermost=acc.extra_parallel_placement_innermost,
-            extra_parallel_names=acc.extra_parallel_names,
-            dp_mode=acc.fsdp_config.fsdp_mode,
-            async_enabled=acc.enable_async,
-            name="base",
-        )
+        init_parallel_state_from_accelerator(args.model.accelerator, name="base")
 
         helper.set_seed(args.train.seed, args.train.enable_full_determinism)
         helper.enable_high_precision_for_bf16()
@@ -612,9 +596,6 @@ class OmniTrainer:
                 return {k: _to_device(vv) for k, vv in v.items()}
             return v
 
-        self._chunk_mbs_ranges = build_chunk_mbs_ranges(
-            micro_batch, getattr(self.args.train, "chunk_mbs_config", None)
-        )
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)

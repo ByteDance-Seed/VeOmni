@@ -13,8 +13,6 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 import pytest
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-from transformers.modeling_layers import GradientCheckpointingLayer
 
 
 _real_find_spec = importlib.util.find_spec
@@ -29,7 +27,7 @@ def _find_spec_without_torch_npu(name: str, package: str | None = None) -> Modul
 importlib.util.find_spec = _find_spec_without_torch_npu  # type: ignore[assignment]
 try:
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
-    from veomni.arguments.arguments_types import ChannelLossConfig, ChunkMBSConfig
+    from veomni.arguments.arguments_types import ChannelLossConfig
     from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
         Qwen2_5OmniForConditionalGeneration,
     )
@@ -809,7 +807,6 @@ def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch)
     trainer.state = TrainerState(global_step=1)
     trainer.device = torch.device("cpu")
     trainer.args = SimpleNamespace(
-        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=False))),
         train=SimpleNamespace(
             enable_batch_invariant_mode=False,
             local_rank=0,
@@ -839,7 +836,6 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     trainer.state = TrainerState(global_step=1)
     trainer.device = torch.device("cpu")
     trainer.args = SimpleNamespace(
-        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=False))),
         train=SimpleNamespace(
             channel_loss=cfg,
             enable_batch_invariant_mode=False,
@@ -877,136 +873,6 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     assert trainer.model.weight.grad.item() == 2.0
 
 
-def test_base_forward_backward_composes_channel_loss_and_chunk_mbs_contexts(monkeypatch):
-    import veomni.distributed.chunk_mbs as chunk_mbs
-    import veomni.trainer.base as base_trainer_module
-
-    capture_states = []
-    range_states = []
-    checkpoint_calls = []
-    observation_calls = []
-
-    class CheckpointedDecoderLayer(GradientCheckpointingLayer):
-        def __init__(self, capture_probe):
-            super().__init__()
-            self.proj = torch.nn.Linear(4, 4)
-            self.capture_probe = capture_probe
-
-        def forward(self, hidden_states, **kwargs):
-            capture_states.append(self.capture_probe())
-            range_states.append(chunk_mbs._chunk_mbs_ranges.get())
-            return self.proj(hidden_states)
-
-    class CheckpointedLossModel(torch.nn.Module):
-        _no_split_modules = ["CheckpointedDecoderLayer"]
-
-        def __init__(self, capture_probe):
-            super().__init__()
-            self.layers = torch.nn.ModuleList([CheckpointedDecoderLayer(capture_probe)])
-            self.lm_head = torch.nn.Linear(4, 8, bias=False)
-            self.loss_calls = 0
-
-        def gradient_checkpointing_enable(self, checkpoint_func=None, gradient_checkpointing_kwargs=None):
-            if checkpoint_func is None:
-                checkpoint_func = partial(checkpoint, **(gradient_checkpointing_kwargs or {}))
-            for layer in self.layers:
-                layer.gradient_checkpointing = True
-                layer._gradient_checkpointing_func = checkpoint_func
-
-        def loss_function(self, logits, labels, vocab_size, **kwargs):
-            self.loss_calls += 1
-            return F.cross_entropy(logits[..., :-1, :].flatten(0, 1), labels[..., 1:].flatten())
-
-        def forward(
-            self,
-            x,
-            labels,
-            position_ids,
-            cu_seq_lens_q,
-            cu_seq_lens_k,
-            max_length_q,
-            max_length_k,
-            use_cache=False,
-        ):
-            hidden_states = self.layers[0](
-                x,
-                position_ids=position_ids,
-                cu_seq_lens_q=cu_seq_lens_q,
-                cu_seq_lens_k=cu_seq_lens_k,
-                max_length_q=max_length_q,
-                max_length_k=max_length_k,
-            )
-            logits = self.lm_head(hidden_states)
-            return SimpleNamespace(loss=self.loss_function(logits, labels, logits.shape[-1]))
-
-    trainer = object.__new__(BaseTrainer)
-    trainer.state = TrainerState(global_step=1)
-    trainer.device = torch.device("cpu")
-    trainer.args = SimpleNamespace(
-        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True, chunk_mbs=1))),
-        train=SimpleNamespace(
-            channel_loss=ChannelLossConfig(enable=True, interval=1),
-            enable_batch_invariant_mode=False,
-            local_rank=0,
-        ),
-    )
-    trainer.model = CheckpointedLossModel(lambda: trainer.channel_loss_callback.computer.capture_active)
-    trainer.model.gradient_checkpointing_enable(
-        lambda function, *args, **kwargs: (
-            checkpoint_calls.append(None) or checkpoint(function, *args, use_reentrant=False, **kwargs)
-        )
-    )
-    monkeypatch.setattr(
-        chunk_mbs,
-        "get_parallel_state",
-        lambda: SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
-    )
-    monkeypatch.setattr(base_trainer_module, "use_parallel_state", lambda _: nullcontext())
-    chunk_mbs.apply_chunk_mbs(trainer.model, trainer.args.model.accelerator.chunk_mbs_config)
-    trainer.model_fwd_context = nullcontext()
-    trainer.model_bwd_context = nullcontext()
-    trainer.micro_batch_token_len = 1
-    trainer.micro_batches_token_len = 1
-    trainer.LOG_SAMPLE = False
-    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
-    trainer.channel_loss_callback = ChannelLossCallback(trainer)
-    original_compute_side_channel = trainer.channel_loss_callback.computer.compute_side_channel
-
-    def record_observation(*args, **kwargs):
-        observation_calls.append(None)
-        return original_compute_side_channel(*args, **kwargs)
-
-    monkeypatch.setattr(trainer.channel_loss_callback.computer, "compute_side_channel", record_observation)
-    cu_seq_lens = torch.tensor([0, 2, 4], dtype=torch.int32)
-    micro_batch = {
-        "x": torch.randn(1, 4, 4, requires_grad=True),
-        "labels": torch.tensor([[0, 1, 2, 3]]),
-        "position_ids": torch.tensor([[0, 1, 0, 1]]),
-        "cu_seq_lens_q": cu_seq_lens,
-        "cu_seq_lens_k": cu_seq_lens,
-        "max_length_q": 2,
-        "max_length_k": 2,
-        "ds_idx": torch.tensor([3, 4]),
-        "source_name": ["train/a", "train/b"],
-        "cur_token_num": torch.tensor([2, 2]),
-    }
-
-    try:
-        trainer.channel_loss_callback.on_train_begin(trainer.state)
-        trainer.channel_loss_callback.on_step_begin(trainer.state, micro_batches=[micro_batch])
-        BaseTrainer.forward_backward_step(trainer, micro_batch)
-    finally:
-        trainer.channel_loss_callback.on_train_end(trainer.state)
-
-    assert checkpoint_calls == [None, None]
-    assert capture_states == [True, True, False, False]
-    assert all(ranges == trainer._chunk_mbs_ranges for ranges in range_states)
-    assert observation_calls == [None]
-    assert trainer.model.loss_calls == 1
-    assert set(trainer.channel_loss_callback.computer.step_totals) == {3, 4}
-    assert chunk_mbs._chunk_mbs_ranges.get() is None
-
-
 def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     import veomni.trainer.text_dpo_trainer as text_dpo_module
 
@@ -1040,6 +906,7 @@ def test_dpo_forward_backward_scopes_channel_loss_to_policy_model(monkeypatch):
     base.preforward = preforward
     trainer = object.__new__(TextDPOTrainer)
     trainer.base = base
+    trainer.policy_model = policy_model
     trainer.reference_model = reference_model
     forward_calls = []
 
@@ -1121,20 +988,16 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
         preforward=lambda micro_batch: micro_batch,
     )
     base.channel_loss_callback = ChannelLossCallback(base)
-    step_begin_args = {}
-
-    def on_step_begin(micro_batches=None, **kwargs):
-        step_begin_args["source_repeat"] = kwargs.get("source_repeat", 1)
-        base.channel_loss_callback.on_step_begin(
-            state,
-            micro_batches=micro_batches,
-            **kwargs,
-        )
-
-    base.on_step_begin = on_step_begin
     trainer = object.__new__(TextDPOTrainer)
     trainer.base = base
+    trainer.policy_model = policy_model
     trainer.reference_model = reference_model
+    trainer.state = state
+    trainer.channel_loss_callback = base.channel_loss_callback
+    base._callbacks = [base.channel_loss_callback]
+    base.on_step_begin = lambda micro_batches=None, **kwargs: BaseTrainer.on_step_begin(
+        base, micro_batches=micro_batches, **kwargs
+    )
     trainer.post_forward = SimpleNamespace(compute_seqlens_func=lambda micro_batch: [2, 2, 2, 2])
     trainer.sp_enabled = False
     micro_batch = {
@@ -1148,7 +1011,6 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
     try:
         base.channel_loss_callback.computer.install(policy_model)
         TextDPOTrainer.on_step_begin(trainer, micro_batches=[micro_batch])
-        assert step_begin_args == {"source_repeat": 2}
         assert base.channel_loss_callback.computer._per_mb_source_ids == [[3, 3, 4, 4]]
         TextDPOTrainer.forward_backward_step(trainer, micro_batch)
 
@@ -1166,7 +1028,6 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
 
 def test_dit_rejects_channel_loss_before_initialization():
     args = SimpleNamespace(
-        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=False))),
         train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True)),
     )
     with pytest.raises(ValueError, match="causal-LM trainers"):

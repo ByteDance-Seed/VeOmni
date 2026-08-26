@@ -30,9 +30,9 @@ def _current_state():
     # UNINITIALIZED process resolves to ``None`` — i.e. "no groups" — instead of
     # constructing a default ``ParallelState`` that validates against the
     # distributed world size and raises. Production always initializes via
-    # ``init_parallel_state`` before any SP op runs; this ``None`` path only
+    # ``_init_parallel_state`` before any SP op runs; this ``None`` path only
     # covers pre-init / unit-test code (which builds a real state via
-    # ``init_parallel_state``).
+    # ``_init_parallel_state``).
     from .. import parallel_state
 
     return parallel_state._PARALLEL_STATE
@@ -63,7 +63,7 @@ def get_ulysses_sequence_parallel_group() -> Optional[dist.ProcessGroup]:
     sizes each get their own group with no global key bookkeeping. Resolves from
     the current ``ParallelState``'s device mesh; returns ``None`` when no state is
     current (uninitialized process). Tests that exercise SP collectives build a
-    real state via ``init_parallel_state(dp_size=1, ulysses_size=world_size)``.
+    real state via ``_init_parallel_state(dp_size=1, ulysses_size=world_size)``.
     """
     ps = _current_state()
     return ps.ulysses_group if ps is not None else None

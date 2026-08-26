@@ -33,7 +33,7 @@ import torch.nn as nn
 from ....distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from ....distributed.parallel_state import (
     get_parallel_state_by_name,
-    init_parallel_state,
+    init_parallel_state_from_accelerator,
     use_parallel_state,
 )
 from ....distributed.torch_compile import CompileConfig
@@ -284,8 +284,6 @@ class ModuleRuntime:
 
         if args.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.fqn_to_index_mapping
-        if args.accelerator.chunk_mbs_config.enable:
-            kwargs["chunk_mbs_config"] = args.accelerator.chunk_mbs_config
 
         model = build_parallelize_model(
             model,
@@ -353,25 +351,10 @@ class ModuleRuntime:
         from the orchestrator's ``"base"``), so every scope site re-enters it by
         name via ``use_parallel_state(self.module_name)`` (the registry is the
         single source of truth — the module-trainer keeps no local handle).
-        ``init_parallel_state`` never overwrites the orchestrator's current global
-        state — it only adds to the registry / topology cache.
+        ``init_parallel_state_from_accelerator`` never overwrites the orchestrator's
+        current global state — it only adds to the registry / topology cache.
         """
-        acc = self.args.accelerator
-        init_parallel_state(
-            dp_size=acc.dp_size,
-            dp_replicate_size=acc.dp_replicate_size,
-            dp_shard_size=acc.dp_shard_size,
-            tp_size=acc.tp_size,
-            pp_size=acc.pp_size,
-            cp_size=acc.cp_size,
-            ulysses_size=acc.ulysses_size,
-            extra_parallel_sizes=acc.extra_parallel_sizes,
-            extra_parallel_placement_innermost=acc.extra_parallel_placement_innermost,
-            extra_parallel_names=acc.extra_parallel_names,
-            dp_mode=acc.fsdp_config.fsdp_mode,
-            async_enabled=acc.enable_async,
-            name=self.module_name,
-        )
+        init_parallel_state_from_accelerator(self.args.accelerator, self.module_name)
 
     def _scope_recompute_to_parallel_state(self) -> None:
         """Make gradient-checkpoint recompute re-enter this module's ParallelState.

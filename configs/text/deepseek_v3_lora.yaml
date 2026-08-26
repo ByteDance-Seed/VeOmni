@@ -8,7 +8,7 @@
 # `gate_up_proj` at load time so VeOmni MoE-LoRA wraps the same fused
 # layout it uses for Qwen3-MoE / Qwen3.5-MoE / Qwen3-VL-MoE / Qwen3-Omni-MoE.
 #
-# `lora_config` schema (`veomni/trainer/base.py::_setup_lora`):
+# `lora_config` schema (`veomni/models/model_runtime.py::setup_lora`):
 #   - `lora_modules`         — nn.Linear targets handled by PEFT (q/k/v/o etc.).
 #   - `target_parameters`    — 3D nn.Parameter targets on the experts module.
 #   - `share_expert_lora`    — when True, `target_parameters` are wrapped by VeOmni's

@@ -35,6 +35,7 @@ model:
   optimizer:
     type: adamw
     lr: 1.0e-4
+
   accelerator:
     init_device: meta
     ulysses_size: 1
@@ -45,6 +46,7 @@ model:
       offload: false
       mixed_precision:
         enable: false
+
 # -----------------------------------------------------------------------------
 # Data
 # -----------------------------------------------------------------------------

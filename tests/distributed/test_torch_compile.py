@@ -11,9 +11,7 @@ from torch.utils.checkpoint import checkpoint
 
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
-    ChunkMBSConfig,
     DataArguments,
-    GradientCheckpointingConfig,
     ModelArguments,
     OpsImplementationConfig,
     TrainingArguments,
@@ -431,20 +429,21 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     monkeypatch.setattr("veomni.trainer.vlm_trainer.mark_compile_step_begin", marks.append)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token", lambda _: 1)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.reduce_global_loss_token", lambda token_count: token_count)
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.veomni_clip_grad_norm", lambda *_: torch.tensor(0.0))
 
     trainer = VLMTrainer.__new__(VLMTrainer)
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(model=SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=1.0))),
         state=SimpleNamespace(global_step=0),
-        model=SimpleNamespace(_veomni_compile_uses_cuda_graphs=True),
+        model=SimpleNamespace(
+            _veomni_compile_uses_cuda_graphs=True,
+            clip_grad_norm=lambda: torch.tensor(0.0),
+            optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
+            lr_scheduler=SimpleNamespace(step=lambda: None),
+        ),
         model_reshard=lambda *_: None,
         _configure_hsdp_allreduce=lambda *_: None,
         sync_before_train_step=lambda: None,
         forward_backward_step=lambda _: (torch.tensor(1.0), {}),
-        optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
-        lr_scheduler=SimpleNamespace(step=lambda: None),
         on_step_begin=lambda **_: None,
         on_step_end=lambda **_: None,
     )
@@ -454,34 +453,39 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     assert marks == [True, True]
 
 
-def test_vlm_trainer_rejects_unsupported_compile_model_before_data_setup(monkeypatch):
-    from veomni.trainer.vlm_trainer import VLMTrainer
+def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatch):
+    # The rejection has to land during the model build, which the runtime does on
+    # construction — i.e. before the trainer touches data.
+    from veomni.trainer.vlm_trainer import VLMModelRuntime
 
     calls = []
 
-    def build_unsupported_model(trainer):
+    def build_unsupported_model(runtime):
         calls.append("build_model")
-        trainer.base.model = ToyModel()
-        trainer.base.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
-        trainer.base.model.input_modalities = ("image", "text")
+        runtime.model = ToyModel()
+        runtime.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
+        runtime.model.input_modalities = ("image", "text")
+        runtime.model_config = runtime.model.config
+        runtime._validate_torch_compile()
 
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.BaseTrainer._setup", lambda _: None)
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr(VLMTrainer, "_build_model", build_unsupported_model)
-    monkeypatch.setattr(VLMTrainer, "_freeze_model_module", lambda _: calls.append("freeze_model"))
+    # No mesh is registered here, and none is needed: the rejection happens
+    # before anything reads one. Stubbing ``setup`` alone would leave the
+    # build's own scope looking for a state that was never registered.
+    monkeypatch.setattr(VLMModelRuntime, "setup", lambda _: None)
+    monkeypatch.setattr("veomni.models.model_runtime.use_parallel_state", lambda _name: nullcontext())
+    monkeypatch.setattr(VLMModelRuntime, "build_model", build_unsupported_model)
+    monkeypatch.setattr(VLMModelRuntime, "freeze_model", lambda _: calls.append("freeze_model"))
 
     args = SimpleNamespace(
-        model=SimpleNamespace(
-            accelerator=SimpleNamespace(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True),
-                ulysses_size=1,
-                cp_size=1,
-                enable_async=False,
-            ),
-        )
+        accelerator=SimpleNamespace(
+            torch_compile=ArgumentsTorchCompileConfig(enable=True),
+            ulysses_size=1,
+            cp_size=1,
+            enable_async=False,
+        ),
     )
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
-        VLMTrainer(args)
+        VLMModelRuntime(args, train=SimpleNamespace())
 
     assert calls == ["build_model"]
 
@@ -587,81 +591,6 @@ def test_enable_compile_requires_dynamic_batching():
                 pad_to_length=False,
             ),
         )
-
-
-def test_enable_compile_rejects_chunk_mbs():
-    with pytest.raises(ValueError, match="model.accelerator.chunk_mbs_config.enable is not supported"):
-        VeOmniArguments(
-            model=_model_args(
-                accelerator=AcceleratorConfig(
-                    torch_compile=ArgumentsTorchCompileConfig(enable=True),
-                    chunk_mbs_config=ChunkMBSConfig(enable=True),
-                ),
-            ),
-            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
-            train=TrainingArguments(
-                dyn_bsz=True,
-                pad_to_length=False,
-            ),
-        )
-
-
-def test_chunk_mbs_rejects_static_padding():
-    with pytest.raises(ValueError, match="not supported with train.pad_to_length"):
-        VeOmniArguments(
-            model=_model_args(accelerator=AcceleratorConfig(chunk_mbs_config=ChunkMBSConfig(enable=True))),
-            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
-            train=TrainingArguments(
-                dyn_bsz=True,
-                pad_to_length=True,
-                micro_batch_size=2,
-            ),
-        )
-
-
-def test_chunk_mbs_rejects_reentrant_gradient_checkpointing():
-    with pytest.raises(ValueError, match="requires non-reentrant gradient checkpointing"):
-        VeOmniArguments(
-            model=_model_args(
-                accelerator=AcceleratorConfig(
-                    chunk_mbs_config=ChunkMBSConfig(enable=True),
-                    gradient_checkpointing=GradientCheckpointingConfig(enable_reentrant=True),
-                ),
-            ),
-            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
-            train=TrainingArguments(),
-        )
-
-
-def test_chunk_mbs_rejects_dpo_trainer():
-    with pytest.raises(ValueError, match="not supported by the DPO trainer"):
-        VeOmniArguments(
-            model=_model_args(accelerator=AcceleratorConfig(chunk_mbs_config=ChunkMBSConfig(enable=True))),
-            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8, data_type="dpo"),
-            train=TrainingArguments(),
-        )
-
-
-def test_dpo_trainer_rejects_chunk_mbs_regardless_of_data_type():
-    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
-
-    args = SimpleNamespace(
-        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True)))
-    )
-    with pytest.raises(ValueError, match="not supported by the DPO trainer"):
-        TextDPOTrainer(args)
-
-
-def test_rl_trainer_rejects_chunk_mbs():
-    from veomni.trainer.base_rl_trainer import BaseRLTrainer
-
-    args = SimpleNamespace(
-        model=SimpleNamespace(accelerator=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True)))
-    )
-    trainer = BaseRLTrainer.__new__(BaseRLTrainer)
-    trainer.args = args
-    with pytest.raises(ValueError, match="not supported by RL trainers"):
-        trainer._setup()
 
 
 def test_enable_compile_requires_padding_for_dynamic_batching():

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``init_parallel_state`` registry behaviour, including ``name=None``.
+"""``_init_parallel_state`` registry behaviour, including ``name=None``.
 
 Single-rank gloo, so this runs anywhere. The registry, the topology cache and
 the ambient state are process globals, hence the teardown.
@@ -22,10 +22,10 @@ import pytest
 import torch.distributed as dist
 
 from veomni.distributed.parallel_state import (
+    _init_parallel_state,
     clear_parallel_state,
     get_parallel_state,
     get_parallel_state_by_name,
-    init_parallel_state,
 )
 
 
@@ -43,7 +43,7 @@ def single_rank_group(tmp_path):
 
 
 def test_name_none_claims_no_registry_key(single_rank_group):
-    state = init_parallel_state(dp_size=1, device_type="cpu", name=None)
+    state = _init_parallel_state(dp_size=1, device_type="cpu", name=None)
 
     with pytest.raises(ValueError, match="is not registered"):
         get_parallel_state_by_name("base")
@@ -53,17 +53,17 @@ def test_name_none_claims_no_registry_key(single_rank_group):
 
 
 def test_named_init_still_registers(single_rank_group):
-    state = init_parallel_state(dp_size=1, device_type="cpu", name="vision_tower")
+    state = _init_parallel_state(dp_size=1, device_type="cpu", name="vision_tower")
 
     assert get_parallel_state_by_name("vision_tower") is state
 
 
 def test_a_later_named_init_adopts_the_cached_anonymous_state(single_rank_group):
-    anonymous = init_parallel_state(dp_size=1, device_type="cpu", name=None)
+    anonymous = _init_parallel_state(dp_size=1, device_type="cpu", name=None)
 
     # Same topology, so the cache hits: name=None declines a key for itself, it
     # does not keep the state out of the registry forever.
-    named = init_parallel_state(dp_size=1, device_type="cpu", name="base")
+    named = _init_parallel_state(dp_size=1, device_type="cpu", name="base")
 
     assert named is anonymous
     assert get_parallel_state_by_name("base") is anonymous
