@@ -26,9 +26,9 @@ inference block maps each scenario to a separate generation graph.
 | File | Role |
 |------|------|
 | `base.yaml` | Top-level launcher: model paths, accelerator, data, train, and `infer` block. |
-| `modules_train.yaml` | Per-module training paths. |
-| `modules_infer_eager.yaml` | Single-process inference: every module loads eager. |
-| `modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2. |
+| `modules_train.yaml` | Per-module training paths. `bagel_qwen2_mot` is the accelerated class with `flex_attention`. |
+| `modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses SDPA. |
+| `modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2; MoT uses FlexAttention. |
 | `graph_train.yaml` | Training DAG. |
 | `graph_infer_und.yaml` | Image/text understanding to text. |
 | `graph_infer_gen.yaml` | Text to image generation. |
@@ -78,12 +78,14 @@ sources:
   - /mnt/hdfs/user_dir/dataset/imagenet1k_train
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
   - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
+  - /mnt/hdfs/user_dir/dataset/seed_edit_p23_multi_turn
 names:
   - imagenet1k
   - tulu-3-sft-mixture
   - sharegpt4v_cap_100k
+  - seed_edit_p23_multi_turn
 schedule:
-  - { schedule_type: const, weights: [0.5, 0.2, 0.3] }
+  - { schedule_type: const, weights: [0.4, 0.2, 0.2, 0.2] }
 ```
 
 The Bagel CPU preprocessor routes images by role:
@@ -98,6 +100,9 @@ drive real routing.
 ---
 
 ## 3. Train
+
+Training uses the accelerated Qwen2-MoT class from `modules_train.yaml`. The
+default packed attention backend is FlexAttention.
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
@@ -132,7 +137,56 @@ bash train.sh tasks/omni/train_omni.py \
   --train.wandb.enable false
 ```
 
-### 3.1 Offline VAE posterior cache (two stages)
+### 3.1 Attention backends
+
+`bagel_qwen2_mot` keeps one packed visibility metadata and materializes it as
+Flex, Magi, or SDPA. Visibility is the same in all three:
+`same_document & (causal | same_full_span) & ~foreign_noise_key`. Packed MoT
+training does not use FlashAttention-2.
+
+| Backend | Class | Config | Use |
+|---------|-------|--------|-----|
+| FlexAttention | accelerated | `modules_train.yaml`, `modules_infer_fsdp.yaml` | Default packed training / FSDP inference |
+| MagiAttention | accelerated | CLI override onto `bagel_qwen2_mot` | SM90+ fused training; see nfunc below |
+| SDPA | eager | `modules_infer_eager.yaml` | Single-process inference and the dense-mask oracle |
+
+Leave the YAML on `flex_attention` unless you are opting into Magi. Enable Magi
+from the CLI (the launcher rewrites it to `veomni_magi_attention_with_sp`):
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/base.yaml \
+  --model.model_config.modules.bagel_qwen2_mot.ops_implementation.attn_implementation magi_attention \
+  --train.micro_batch_size 1
+```
+
+Magi requires physical batch size 1, `cp_size == 1`, and NVIDIA SM90 or newer.
+Ulysses still works. On 8 ranks, `--model.accelerator.ulysses_size 4` gives
+`dp_shard=2` and SP4. Packed Magi/Flex is the training (and FSDP prefill) path;
+the denoise loop still uses FlashAttention-2. The Magi adapter contract is in
+[`docs/transformers_v5/veomni_fused_attention.md`](../../transformers_v5/veomni_fused_attention.md).
+
+#### SM90 nfunc vs dataset
+
+On SM90, Magi uses a precompiled CUTLASS overlay. `nfunc` is baked at install
+time: it is the HSTU interval count for the worst query in a sample, not the
+Magi range-list length. The installer default is `1,3,5`. A later exact
+`uv sync` removes the overlay, so rerun the installer before SM90 Magi runs.
+
+Text-only and single-image gen samples are typically `nfunc=1`. Multi-turn
+`seed_edit_p23_multi_turn` punches noise-key holes, so nfunc grows with the
+number of assistant images (about `2G-1`). That mixture needs **nfunc ≥ 11**:
+
+```bash
+bash scripts/kernel/install_magi_sm90.sh --nfunc 1,3,5,7,9,11
+```
+
+If a sample's runtime nfunc is missing from the compiled matrix, the kernel
+fails with `Compile-time kNFunc (...) must match runtime arbitrary_func_num (...)`.
+SM100+ uses CUTE DSL/JIT and compiles unseen nfunc at runtime, so it does not
+need this overlay matrix.
+
+### 3.2 Offline VAE posterior cache (two stages)
 
 Caching is not a special framework mode — it is a different `train_graph` plus a
 different dataset type. A module opts in with `model_config.support_cache: true`,
@@ -260,7 +314,10 @@ YAML.
 ## 6. Contract checks
 
 The Bagel module and graph contracts cover carrier/source routing, generation
-state transitions, packing/cache behavior, and graph config structure:
+state transitions, packing/cache behavior, and graph config structure. Packed
+MoT also compares Flex and Magi against eager SDPA on toy CE / MSE / gradients
+in `tests/seed_omni/bagel/test_bagel_accel_align.py`. Magi cases skip unless the
+SM90 CUTLASS overlay or SM100+ CUTE JIT backend is present.
 
 ```bash
 .venv/bin/python -m pytest -q tests/seed_omni/bagel
