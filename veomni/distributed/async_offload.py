@@ -212,11 +212,7 @@ class GetCnt:
 class SwapTensor:
     def __init__(self, tensor, key, pool):
         tensor_nbytes = tensor.numel() * tensor.element_size()
-        if (
-            tensor._base is not None
-            or tensor.untyped_storage().nbytes() < tensor_nbytes
-            or not tensor.is_contiguous()
-        ):
+        if tensor._base is not None or tensor.untyped_storage().nbytes() < tensor_nbytes or not tensor.is_contiguous():
             raise ValueError("Async activation offload requires a tensor with private, dense storage.")
 
         self.tensor = tensor
