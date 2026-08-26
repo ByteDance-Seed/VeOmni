@@ -208,6 +208,22 @@ class VeOmniIter:
         return {}
 
 
+def mean_aux_metrics(total_aux_metrics: Dict[str, float], num_micro_steps: int) -> Dict[str, float]:
+    """Reduce accumulated ``aux_metrics`` to the mean over a step's micro batches.
+
+    Losses may be summed across micro batches because ``mean_global_loss`` has
+    already weighted each by its share of the step's tokens. An auxiliary metric
+    carries no such weight, so it is averaged instead: for a per-token metric that
+    is the step's per-token mean when the micro batches hold equal token counts,
+    and unlike a token-share weighting it assumes nothing about which denominator
+    the metric used. Shared by the trainers that keep their own accumulation loop
+    so none of them can reduce it differently.
+    """
+    if not total_aux_metrics:
+        return {}
+    return {key: value / num_micro_steps for key, value in total_aux_metrics.items()}
+
+
 class BaseTrainer(Stateful, ABC):
     """
     Base trainer class for distributed model training.
@@ -653,19 +669,14 @@ class BaseTrainer(Stateful, ABC):
             callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None, **kwargs):
-        # Every trainer funnels its step here, including the four that keep their
-        # own copy of the accumulation loop, so this is the one place that sees
-        # the step's micro-batch count for all of them. ``postforward`` needs it
-        # to normalize aux metrics; setting it per-loop instead would let the
-        # next trainer forget and silently report those metrics N times too high.
-        if micro_batches is not None:
-            self.num_micro_batches = len(micro_batches)
         for callback in self._callbacks:
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
         for callback in self._callbacks:
-            callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+            callback.on_step_end(
+                self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics
+            )
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -691,8 +702,17 @@ class BaseTrainer(Stateful, ABC):
 
     def postforward(
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Postprocess model outputs after forward pass."""
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Postprocess model outputs after forward pass.
+
+        Returns the backward scalar, the losses behind it, and any diagnostics the
+        forward asked to have logged. The diagnostics travel in their own dict
+        because ``loss_dict`` carries a reduction contract they do not share:
+        ``mean_global_loss`` has already scaled each loss by its share of the
+        step's tokens, so summing that dict is the last step of a global token
+        mean. A metric folded in would inherit that summation, and anything later
+        taking ``sum(loss_dict.values())`` would train on it.
+        """
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             outputs.loss,
             self.micro_batch_token_len,
@@ -700,35 +720,18 @@ class BaseTrainer(Stateful, ABC):
             getattr(self, "global_micro_batches_token_len", None),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
-        # Diagnostics a forward wants logged next to the losses. Merged *after* the
-        # sum above, because everything in ``loss_dict`` up to that line is the
-        # backward scalar; a metric merged earlier would silently join the objective.
+        aux_metrics: Dict[str, torch.Tensor] = {}
         # ``getattr`` rather than attribute access: most model outputs in the repo
         # have no such field.
-        aux_metrics = getattr(outputs, "aux_metrics", None)
-        if aux_metrics:
-            # ``train_step`` reports the *sum* of the micro-batches' ``loss_dict``
-            # values. The losses may be summed because ``mean_global_loss`` has
-            # already scaled each one by its share of the step's tokens; an aux
-            # metric gets no such scaling, so without the 1/N here it would be
-            # reported ``gradient_accumulation_steps`` times too large. 1/N makes the
-            # reported number the mean of the micro-batch values -- for a per-token
-            # metric such as ``indexer_kl`` that is the step's per-token mean when the
-            # micro-batches carry equal token counts, and unlike a token-share
-            # weighting it assumes nothing about which denominator a metric used.
-            # ``on_step_begin`` sets the count; the default covers callers that reach
-            # a single forward without a step, such as tests.
-            num_micro_batches = getattr(self, "num_micro_batches", 1)
-            # Everything downstream keys on the name alone, so a collision is
-            # silent in both directions. A bare ``update`` would let an aux key
-            # shadow a loss of the same name: the backward scalar is already summed
-            # above so it would stay correct, but callbacks read ``loss_dict`` and
-            # would report the auxiliary value under ``training/<loss name>``. The
-            # reserved names are the same hazard one layer later, in the
-            # ``training/`` namespace that ``EnvironMeterCallback`` publishes into,
-            # where a clash either overwrites a real metric or drops the auxiliary
-            # one -- see ``RESERVED_TRAINING_METRIC_NAMES``.
-            collisions = sorted(aux_metrics.keys() & (loss_dict.keys() | RESERVED_TRAINING_METRIC_NAMES))
+        reported = getattr(outputs, "aux_metrics", None)
+        if reported:
+            # Separate dicts keep a metric out of the objective, but not out of the
+            # ``training/`` namespace that ``EnvironMeterCallback`` publishes both
+            # of them into, where every consumer keys on the name alone. A clash
+            # there is silent in either direction: it overwrites the loss or
+            # callback-owned metric it shadows, or is itself overwritten and never
+            # reported -- see ``RESERVED_TRAINING_METRIC_NAMES``.
+            collisions = sorted(reported.keys() & (loss_dict.keys() | RESERVED_TRAINING_METRIC_NAMES))
             if collisions:
                 raise ValueError(
                     f"aux_metrics keys {collisions} are already reported under "
@@ -736,12 +739,15 @@ class BaseTrainer(Stateful, ABC):
                     f"callbacks own {sorted(RESERVED_TRAINING_METRIC_NAMES)} are "
                     "reserved: rename the auxiliary metric."
                 )
-            loss_dict.update({key: value.detach() / num_micro_batches for key, value in aux_metrics.items()})
-        return loss, loss_dict
+            # Detach here so a metric that still carries a graph cannot keep it
+            # alive for the step; ``train_step`` reduces the values across micro
+            # batches.
+            aux_metrics = {key: value.detach() for key, value in reported.items()}
+        return loss, loss_dict, aux_metrics
 
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
@@ -765,7 +771,7 @@ class BaseTrainer(Stateful, ABC):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
             with use_parallel_state("base"):
-                loss, loss_dict = self.postforward(outputs, micro_batch)
+                loss, loss_dict, aux_metrics = self.postforward(outputs, micro_batch)
 
             with (
                 use_parallel_state("base"),
@@ -775,7 +781,7 @@ class BaseTrainer(Stateful, ABC):
                 loss.backward()
 
             del micro_batch
-            return loss, loss_dict
+            return loss, loss_dict, aux_metrics
 
     def model_reshard(self, micro_step: int, num_micro_steps: int):
         """Reshard model after backward pass."""
@@ -822,6 +828,7 @@ class BaseTrainer(Stateful, ABC):
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
+        total_aux_metrics = defaultdict(float)
 
         # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)
@@ -834,13 +841,16 @@ class BaseTrainer(Stateful, ABC):
             self._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
+            aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
             self.micro_batch_token_len = count_loss_token(micro_batch)
-            loss, loss_dict = self.forward_backward_step(micro_batch)
+            loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
+            for k, v in aux_metrics.items():
+                total_aux_metrics[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         with use_parallel_state("base"):
@@ -851,7 +861,12 @@ class BaseTrainer(Stateful, ABC):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
 
-        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+        self.on_step_end(
+            loss=total_loss,
+            loss_dict=total_loss_dict,
+            grad_norm=grad_norm,
+            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+        )
 
     def destroy_distributed(self):
         if not dist.is_available() or not dist.is_initialized():

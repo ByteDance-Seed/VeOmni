@@ -190,7 +190,7 @@ class ProfileTraceCallback(Callback):
 # is updated next to the code that decides the names.
 #
 # Both collision directions are silent, which is why they are worth a guard:
-# ``total_loss`` is assigned *before* ``loss_dict`` is merged, so an auxiliary
+# ``total_loss`` is assigned *before* the metrics are merged, so an auxiliary
 # metric replaces it and ``training/total_loss`` then reports the metric. So do
 # ``avg_effective_len`` and ``avg_sample_seq_len``, which ``EnvironMeter.step``
 # emits already prefixed and which the merge at the end of ``on_step_end`` lets
@@ -231,7 +231,13 @@ class EnvironMeterCallback(Callback):
         self.start_time = time.time()
 
     def on_step_end(
-        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
+        self,
+        state: TrainerState,
+        loss: float,
+        loss_dict: Dict[str, float],
+        grad_norm: float,
+        aux_metrics: Dict[str, float] = None,
+        **kwargs,
     ) -> None:
         delta_time = time.time() - self.start_time
         step_env_metrics = self.trainer.environ_meter.step(
@@ -245,6 +251,12 @@ class EnvironMeterCallback(Callback):
             "total_loss": loss,
         }
         step_train_metrics.update(loss_dict)
+        # Auxiliary metrics arrive in their own dict -- they are diagnostics, not
+        # part of the objective -- but are published beside the losses, and merged
+        # before the reduction below so they are averaged over the FSDP group too.
+        # ``BaseTrainer.postforward`` has already rejected any name that would
+        # collide here.
+        step_train_metrics.update(aux_metrics or {})
         step_train_metrics["grad_norm"] = grad_norm
 
         # gather training_step_info from all ranks

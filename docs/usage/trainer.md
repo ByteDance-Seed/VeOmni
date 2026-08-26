@@ -72,8 +72,8 @@ def train_step(self, data_iterator):
 
     # Gradient Accumulation Loop
     for micro_step, micro_batch in enumerate(micro_batches):
-        loss, loss_dict = self.forward_backward_step(micro_batch)
-        # ... accumulation ...
+        loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
+        # ... losses summed, aux metrics averaged ...
 
     # Optimization
     grad_norm = veomni_clip_grad_norm(self.model, self.args.train.optimizer.max_grad_norm)
@@ -94,38 +94,46 @@ The `forward_backward_step` allows for customization of the forward and backward
 ### Auxiliary Metrics (`outputs.aux_metrics`)
 
 A forward can report diagnostics alongside the losses by returning an
-`aux_metrics` dict on its model output. `postforward` merges it into `loss_dict`
-*after* summing the backward scalar, so an auxiliary value is logged but never
-becomes part of the objective. `EnvironMeterCallback` then publishes each entry
-as `training/<key>`, which is the name that reaches wandb.
+`aux_metrics` dict on its model output. They travel in their own channel the whole
+way — `postforward` returns `(loss, loss_dict, aux_metrics)`, `train_step` reduces
+the two dicts differently, and `on_step_end` passes `aux_metrics` to callbacks
+beside `grad_norm` — so no summation of losses can reach a metric. It is
+`EnvironMeterCallback` that finally publishes both under the same prefix, as
+`training/<key>`, which is the name that reaches wandb.
+
+Keeping them out of `loss_dict` is the point: every entry there is pre-weighted by
+its share of the step's tokens, so summing the dict is meaningful, and anything
+that sums it — `postforward` building the backward scalar today, any other caller
+tomorrow — would train on a metric folded in.
 
 The contract:
 
 - **Values are detached scalar tensors.** `postforward` calls `.detach()` on the
-  way in, so a metric that still carries a graph does not keep it alive for the
+  way out, so a metric that still carries a graph does not keep it alive for the
   step. Anything reported must reduce to a scalar, since the reporting path only
   ever calls `.item()` on it.
-- **Reported as the mean over the step's micro batches.** Losses may be summed
-  across micro batches because `mean_global_loss` has already scaled each by its
-  share of the step's tokens; an auxiliary metric gets no such scaling, so
-  `postforward` divides by `num_micro_batches` instead. Emit a key on every micro
-  batch of a step, or on none — a key present in only some micro batches is
-  averaged over all of them.
-- **Names already reported under `training/` are reserved.** A colliding key
-  raises `ValueError`, because every consumer keys on the name alone and both
-  collision directions are silent. Two groups are reserved:
-    - Every key in `loss_dict`, i.e. the losses this step produced. Without the
-      check `dict.update` would shadow the loss entry and callbacks would report
-      the auxiliary value under `training/<loss name>`, while the backward scalar
-      stayed correct.
+- **Reported as the mean over the step's micro batches.** Losses are summed across
+  micro batches because `mean_global_loss` has already scaled each by its share of
+  the step's tokens; a metric carries no such scaling, so `train_step` averages it
+  via `mean_aux_metrics` instead. Emit a key on every micro batch of a step, or on
+  none — a key present in only some micro batches is averaged over all of them.
+  Values are also averaged across the FSDP group before they are logged.
+- **Names already reported under `training/` are reserved.** Separate dicts do not
+  separate the published namespace, where every consumer keys on the name alone
+  and both collision directions are silent, so a colliding key raises
+  `ValueError`. Two groups are reserved:
+    - Every key in `loss_dict`, i.e. the losses this step produced. Otherwise the
+      auxiliary value would surface as `training/<loss name>`, a loss curve
+      reading someone else's number, while the backward scalar stayed correct.
     - The names `EnvironMeterCallback` publishes itself, listed in
       `RESERVED_TRAINING_METRIC_NAMES`: `total_loss`, `avg_effective_len`, and
       `avg_sample_seq_len` are assigned before the merge, so an auxiliary metric
       would overwrite them; `grad_norm` and `lr` are assigned after it, so they
       would overwrite the auxiliary metric and drop it silently. Extend that set
       when adding a metric to the callback.
-- **No `*_loss` suffix is needed.** That convention is required only by
-  `mean_global_loss`, which runs before the merge and never sees an auxiliary key.
+- **Do not route metrics through `mean_global_loss`.** It applies token / FSDP /
+  SP scaling for gradients, which is not a logging semantic. That also means the
+  `*_loss` suffix convention it relies on is irrelevant here.
 
 Most model outputs have no such field; `postforward` reads it with `getattr`, so
 models that do not report metrics are unaffected.
