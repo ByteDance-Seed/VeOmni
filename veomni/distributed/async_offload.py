@@ -220,7 +220,7 @@ class SwapTensor:
 
         self.tensor = tensor
         self.size = tensor.size()
-        self.storage_nbytes = tensor.untyped_storage().nbytes()
+        self.stride = tensor.stride()
         self.pool = pool
         self.tensor_cpu, self._host_buffer_key = pool.acquire(tensor)
         self._host_buffer_released = False
@@ -267,10 +267,14 @@ class SwapTensor:
         if self.stat != "d2h":
             return
         get_current_stream().wait_event(self.d2h_event)
-        # Stream wait only orders later GPU work. resize_(0) frees storage on
-        # the host thread, so the D2H copy must be host-complete first.
+        # Stream wait only orders later GPU work. Detaching storage is a host
+        # operation, so the D2H copy must be host-complete first.
         self.d2h_event.synchronize()
-        self.tensor.untyped_storage().resize_(0)
+        # Point this tensor at a fresh empty storage instead of resize_(0).
+        # resize_ would free a StorageImpl that a Tensor.set_() alias can still
+        # hold even when _base is None and storage_offset is 0.
+        placeholder = torch.empty(0, dtype=self.tensor.dtype, device=self.tensor.device)
+        self.tensor.set_(placeholder.untyped_storage())
         self.stat = "host"
 
     def launch_h2d(self, h2d_stream):
@@ -284,8 +288,14 @@ class SwapTensor:
         with torch.no_grad():
             with switch_to_specified_stream(h2d_stream):
                 h2d_stream.wait_event(backward_event)
-                self.tensor.untyped_storage().resize_(self.storage_nbytes)
-                self.tensor.copy_(self.tensor_cpu, non_blocking=True)
+                restored = torch.empty_strided(
+                    self.size,
+                    self.stride,
+                    dtype=self.tensor_cpu.dtype,
+                    device=self.tensor.device,
+                )
+                restored.copy_(self.tensor_cpu, non_blocking=True)
+                self.tensor.set_(restored.untyped_storage(), 0, self.size, self.stride)
                 self.h2d_event.record()
                 self.stat = "h2d"
 

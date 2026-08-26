@@ -26,8 +26,11 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,
+    OffloadManager,
     PinnedBufferPool,
+    SwapTensor,
     _has_private_dense_storage,
+    _unpack_swap_tensor,
     apply_async_activation_offload,
     base_check_fn,
     get_offload_modules,
@@ -245,6 +248,30 @@ def test_private_dense_storage_allows_padded_contiguous_owner():
     assert _has_private_dense_storage(tensor)
     alias = tensor.as_strided((2,), (1,), storage_offset=2)
     assert not _has_private_dense_storage(alias)
+
+
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
+    reason="CUDA or NPU is required for async D2H/H2D validation",
+)
+def test_wait_d2h_finished_preserves_offset_zero_set_alias():
+    device = torch.device(get_device_type())
+    original = torch.randn(8, 8, device=device)
+    original.untyped_storage().resize_(original.untyped_storage().nbytes() * 2)
+    expected = original.detach().cpu().clone()
+    alias = torch.empty_like(original)
+    alias.set_(original.untyped_storage(), 0, original.size(), original.stride())
+    assert alias._base is None
+    assert alias.storage_offset() == 0
+
+    manager = OffloadManager(host_cache_limit_bytes=1 << 20)
+    swap = SwapTensor(original, "0_0", manager.host_buffer_pool)
+    swap.launch_d2h(manager.swap_stream)
+    swap.wait_d2h_finished()
+
+    torch.testing.assert_close(alias.cpu(), expected)
+    restored = _unpack_swap_tensor(manager, swap, prefetch=False)
+    torch.testing.assert_close(restored.cpu(), expected)
 
 
 def test_async_offload_rejects_cpu_tensors():
