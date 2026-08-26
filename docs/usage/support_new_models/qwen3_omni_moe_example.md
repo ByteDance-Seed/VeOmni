@@ -406,7 +406,7 @@ elif task_type == "your_model":
 
 #### Forward/Backward Patch Test
 
-Add to `test_cases` in [tests/models/test_models_patch.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/models/test_models_patch.py):
+Add to `TEST_CASES` in [tests/models/test_models_patch.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/tests/models/test_models_patch.py):
 
 ```python
 pytest.param(
@@ -505,7 +505,7 @@ pytest -s tests/e2e/test_e2e_training.py -k your_model
 | `build_dummy_dataset` entry | `veomni/data/dummy_dataset.py` | Multimodal |
 | `MODEL_TO_DATASET` entry | `tests/models/utils.py` | Level 1 |
 | `parse_token_id_from_config` branch | `tests/models/utils.py` | Omni-modal |
-| `pytest.param` in `test_cases` | `tests/models/test_models_patch.py` | Level 1 |
+| `pytest.param` in `TEST_CASES` | `tests/models/test_models_patch.py` | Level 1 |
 | `pytest.param` in `*_test_cases` | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Dataset fixture | `tests/e2e/test_e2e_parallel.py` | Level 2 |
 | Test function | `tests/e2e/test_e2e_parallel.py` | Level 2 |
