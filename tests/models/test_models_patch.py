@@ -165,9 +165,6 @@ class TrainerTest(BaseTrainer):
     def _init_callbacks(self):
         pass
 
-    def _build_model_assets(self):
-        self.model_assets = []
-
     # Op names whose OpSlot state should match use_liger_kernel.
     _LIGER_OP_NAMES = {"rms_norm", "swiglu_mlp", "apply_rotary_pos_emb", "cross_entropy_loss"}
 
@@ -175,7 +172,7 @@ class TrainerTest(BaseTrainer):
         """Assert OpSlot binding matches use_liger_kernel after model build."""
         from veomni.ops.dispatch import OpSlot
 
-        modeling_module = sys.modules.get(self.model.__class__.__module__)
+        modeling_module = sys.modules.get(self.model.model.__class__.__module__)
         if modeling_module is None:
             return
         for name, obj in vars(modeling_module).items():
@@ -201,7 +198,7 @@ class TrainerTest(BaseTrainer):
 
     def _build_collate_fn(self):
         data_collate_info = {}
-        if self.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        if self.model.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             data_collate_info = {
                 "audio_feature_lengths": (0, False, None, None),
                 "input_features": (0, True, 0, 1),
@@ -223,17 +220,19 @@ class TrainerTest(BaseTrainer):
         # references), and on multi-mode runs over qwen3_5 we accumulate
         # 5+ GiB per mode, eventually OOM'ing on the embedding tensor for the
         # next model build (manifested as ``Process X has 43.80 GiB``).
-        # ``hasattr`` returns True for class-level descriptors that ``delattr``
-        # can't remove (e.g. inherited properties on BaseTrainer), so use the
-        # instance ``__dict__`` directly.
-        for _attr in ("model", "optimizer", "lr_scheduler"):
-            self.__dict__.pop(_attr, None)
+        # Drop the wrapped module and its optimizer state off the runtime rather
+        # than the runtime itself: the next iteration rebuilds through the same
+        # handle, and ``model_config`` recorded by the previous build is what
+        # names the model below.
+        self.model.model = None
+        self.model.optimizer = None
+        self.model.lr_scheduler = None
         _release_device_memory()
 
         set_environ_param(model_mode)
         _apply_patches()
 
-        model_name = self.model_config.model_type
+        model_name = self.model.model_config.model_type
         from .utils import _build_ops_config_for_mode
 
         self.args.model.ops_implementation = _build_ops_config_for_mode(model_mode)
@@ -259,9 +258,9 @@ class TrainerTest(BaseTrainer):
             self.args.model.ops_implementation.rotary_pos_emb_implementation = "eager"
             self.args.model.ops_implementation.cross_entropy_loss_implementation = "eager"
 
-        self.build_model()
+        self.model.build_model()
         self._verify_opslot_state(model_mode)
-        self.build_optimizer()
+        self.model.build_optimizer()
         self.build_lr_scheduler()
         print_device_mem_info(f"[Memory Info] after building model {model_name}:")
 
@@ -275,9 +274,9 @@ class TrainerTest(BaseTrainer):
         # ``test_models_logits_equal.py``.
         self.model.load_state_dict(state_dict)
 
-        if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
+        if self.model.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
             self.model.disable_talker()
-            self.model = self.model.thinker
+            self.model.model = self.model.thinker
 
         print(f"{'-' * 10} {model_name}_{model_mode} {'-' * 10}")
         args: VeOmniArguments = self.args
@@ -291,7 +290,7 @@ class TrainerTest(BaseTrainer):
         self.micro_batches_token_len = count_loss_token(batch)
         self.micro_batch_token_len = count_loss_token(batch)
 
-        if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"] and get_env("MODELING_BACKEND") == "hf":
+        if self.model.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"] and get_env("MODELING_BACKEND") == "hf":
             audio_feature_lengths = batch["audio_feature_lengths"]
             # qwen omni got strange logic in audio_forward
             batch["input_features"] = (
@@ -300,7 +299,7 @@ class TrainerTest(BaseTrainer):
                 .permute(0, 2, 1)
                 .to(dtype=self.model.dtype)
             )
-        elif self.model_config.model_type in ["qwen3_omni_moe"] and get_env("MODELING_BACKEND") == "veomni":
+        elif self.model.model_config.model_type in ["qwen3_omni_moe"] and get_env("MODELING_BACKEND") == "veomni":
             batch["input_features"] = batch["input_features"].to(
                 dtype=self.model.dtype
             )  # qwen3 omni didn't handle dtype in audio_forward
@@ -309,7 +308,7 @@ class TrainerTest(BaseTrainer):
             batch["position_ids"] = batch["position_ids"].transpose(0, 1).contiguous()
 
         loss, loss_dict = super().forward_backward_step(batch)
-        grad_norm = veomni_clip_grad_norm(self.model, args.model.optimizer.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(self.model.model, args.model.optimizer.max_grad_norm)
 
         _release_device_memory()
         print_device_mem_info(f"[Memory Info] after model {model_name} train_one_step:")
@@ -516,10 +515,10 @@ def test_models_patch_fwd_bwd(
     trainer = TrainerTest(hf_model_modes[0], trainer_config)
 
     state_dict = copy.deepcopy(trainer.model.state_dict())
+    model_config = trainer.model.model_config
 
-    del trainer.model, trainer.optimizer, trainer.lr_scheduler
-
-    model_config = trainer.model_config
+    # Release the first build before the loop rebuilds through the same handle.
+    trainer.model.model = None
     # Upstream DeepSeek-V4 eager attention does not consume packed cu-seqlens.
     # Comparing it with VeOmni's boundary-aware packed path on two concatenated
     # samples would therefore compare different attention semantics. Keep this

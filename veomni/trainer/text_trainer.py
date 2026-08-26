@@ -19,12 +19,9 @@ import torch
 
 from ..arguments import VeOmniArguments
 from ..data import (
-    build_chat_template,
     build_data_transform,
 )
-from ..distributed.parallel_state import use_parallel_state
 from ..distributed.torch_compile import mark_compile_step_begin
-from ..models import build_tokenizer
 from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
@@ -43,51 +40,32 @@ class TextTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()  # registers ParallelState("base") before seed
-        # All build steps read the current ParallelState via ``get_parallel_state()``
-        # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
-        # scope the whole build under this trainer's own state. No-op for the
-        # single-model case; keeps each module building over its own mesh once
-        # multiple modules build separately.
-        with use_parallel_state("base"):
-            self.base.build_model()
-            self.base.freeze_model()
+        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
+        self.base.model = self.base.build_model_runtime()
 
-            # rewrite build_model_assets to support chat_template for conversation dataset
-            self._build_model_assets()
+        # rewrite build_data_transform to support conversation dataset
+        self._build_data_transform()
 
-            # rewrite build_data_transform to support conversation dataset
-            self._build_data_transform()
+        self.base._build_dataset()
+        self.base._build_collate_fn()
+        self.base._build_dataloader()
+        self.base.build_lr_scheduler()
+        self.base._build_training_context()
+        self.base._init_callbacks()
 
-            self.base._build_dataset()
-            self.base._build_collate_fn()
-            self.base._build_dataloader()
-            self.base.build_parallelized_model()
-            self.base.build_optimizer()
-            self.base.build_lr_scheduler()
-            self.base._build_training_context()
-            self.base._init_callbacks()
-
-    def _build_model_assets(self):
-        args: VeOmniArguments = self.base.args
-        model_config = self.base.model_config
-        self.base.tokenizer = build_tokenizer(args.model.tokenizer_path)
-        if args.data.data_type == "plaintext":
-            self.base.model_assets = [model_config, self.base.tokenizer]
-            self.base.chat_template = None
-        else:
-            self.base.chat_template = build_chat_template(args.data.chat_template, self.base.tokenizer)
-            self.base.model_assets = [model_config, self.base.chat_template]
+    # ── Trainer build functions ────────────────────────────────
 
     def _build_data_transform(self):
         args: VeOmniArguments = self.base.args
         self.base.data_transform = build_data_transform(
             args.data.data_type,
-            tokenizer=self.base.tokenizer,
-            chat_template=self.base.chat_template,
+            tokenizer=self.base.model.tokenizer,
+            chat_template=self.base.model.chat_template,
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
         )
+
+    # ── Trainer callback hooks ────────────────────────────────
 
     def on_train_begin(self):
         self.base.on_train_begin()
@@ -106,6 +84,8 @@ class TextTrainer:
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    # ── Trainer train step functions ────────────────────────────────
 
     def train_step(
         self,
@@ -143,14 +123,16 @@ class TextTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
-        grad_norm = self.base.clip_grad_norm()
+        grad_norm = self.base.model.clip_grad_norm()
 
         # Optimizer and scheduler step
-        self.base.optimizer.step()
-        self.base.lr_scheduler.step()
-        self.base.optimizer.zero_grad()
+        self.base.model.optimizer.step()
+        self.base.model.lr_scheduler.step()
+        self.base.model.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+
+    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args: VeOmniArguments = self.base.args

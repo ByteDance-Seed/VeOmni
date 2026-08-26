@@ -7,16 +7,15 @@ import yaml
 
 from veomni.lora import LoraLinear, is_veomni_lora_model
 from veomni.models import build_foundation_model
-from veomni.trainer.base import BaseTrainer
 from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
     VLMMDataArguments,
     VLMMModelArguments,
-    VLMTrainer,
+    VLMModelRuntime,
     _get_vlm_visual_module,
 )
 
-from ..tools.training_utils import make_eager_ops_config
+from ..tools.training_utils import make_eager_ops_config, unbuilt_runtime
 
 
 _PRODUCTION_CONFIGS = [
@@ -52,16 +51,14 @@ def _make_args(config_path, lora_config, *, freeze_vit=False, freeze_audio_tower
     return args
 
 
-def _make_trainer(model, args, model_config=None):
-    trainer = VLMTrainer.__new__(VLMTrainer)
-    trainer.base = BaseTrainer.__new__(BaseTrainer)
-    trainer.base.args = args
-    trainer.base.model = model
-    trainer.base.model_config = model_config or model.config
-    return trainer
+def _make_runtime(model, args, model_config=None):
+    runtime = unbuilt_runtime(args.model, cls=VLMModelRuntime, train=args.train)
+    runtime.model = model
+    runtime.model_config = model_config or model.config
+    return runtime
 
 
-def _build_meta_trainer(config_path, lora_config, **freeze_kwargs):
+def _build_meta_runtime(config_path, lora_config, **freeze_kwargs):
     args = _make_args(config_path, lora_config, **freeze_kwargs)
     model = build_foundation_model(
         config_path=config_path,
@@ -70,7 +67,7 @@ def _build_meta_trainer(config_path, lora_config, **freeze_kwargs):
         init_device="meta",
         ops_implementation=args.model.ops_implementation,
     )
-    return _make_trainer(model, args)
+    return _make_runtime(model, args)
 
 
 def _trainable_lora_names(model):
@@ -82,15 +79,16 @@ def _trainable_lora_names(model):
 
 
 def test_vlm_lora_preserves_vision_adapters_when_vit_is_frozen():
-    trainer = _build_meta_trainer(
+    runtime = _build_meta_runtime(
         "tests/toy_config/qwen3vl_toy/config.json",
         {"rank": 4, "alpha": 8, "lora_modules": ["q_proj", "qkv"]},
         freeze_vit=True,
     )
 
-    trainer.freeze_model()
+    runtime.freeze_model()
 
-    model = trainer.base.model
+    # ``is_veomni_lora_model`` is an isinstance check, so unwrap the runtime handle.
+    model = runtime.model
     visual = _get_vlm_visual_module(model)
     visual_lora = [module for module in visual.modules() if isinstance(module, LoraLinear)]
     language_lora = [
@@ -103,28 +101,28 @@ def test_vlm_lora_preserves_vision_adapters_when_vit_is_frozen():
 
 
 def test_llm_only_lora_freezes_entire_vlm_visual_tower():
-    trainer = _build_meta_trainer(
+    runtime = _build_meta_runtime(
         "tests/toy_config/qwen3vl_toy/config.json",
         {"rank": 4, "alpha": 8, "lora_modules": ["q_proj"]},
         freeze_vit=False,
     )
 
-    trainer.freeze_model()
+    runtime.freeze_model()
 
-    visual = _get_vlm_visual_module(trainer.base.model)
+    visual = _get_vlm_visual_module(runtime.model)
     assert all(not param.requires_grad for param in visual.parameters())
 
 
 @pytest.mark.parametrize("yaml_path,config_path", _PRODUCTION_CONFIGS)
 def test_production_multimodal_lora_configs_have_trainable_adapters(yaml_path, config_path):
     lora_config = yaml.safe_load(Path(yaml_path).read_text())["model"]["lora_config"]
-    trainer = _build_meta_trainer(config_path, lora_config)
+    runtime = _build_meta_runtime(config_path, lora_config)
 
-    trainer.freeze_model()
+    runtime.freeze_model()
 
-    assert _trainable_lora_names(trainer.base.model)
-    assert trainer.base.model.base_model.wrapped_dense
-    assert trainer.base.model.base_model.wrapped_moe
+    assert _trainable_lora_names(runtime.model)
+    assert runtime.model.base_model.wrapped_dense
+    assert runtime.model.base_model.wrapped_moe
 
 
 class _FakeOmniModel(torch.nn.Module):
@@ -154,11 +152,11 @@ def test_omni_lora_ignores_tower_freeze_flags():
         freeze_vit=True,
         freeze_audio_tower=True,
     )
-    trainer = _make_trainer(model, args, SimpleNamespace(model_type="qwen3_omni_moe"))
+    runtime = _make_runtime(model, args, SimpleNamespace(model_type="qwen3_omni_moe"))
 
-    trainer.freeze_model()
+    runtime.freeze_model()
 
-    wrapped = trainer.base.model
+    wrapped = runtime.model
     assert any(param.requires_grad for param in wrapped.text_proj.parameters())
     assert any(param.requires_grad for param in wrapped.thinker.visual.proj.parameters())
     assert any(param.requires_grad for param in wrapped.thinker.audio_tower.proj1.parameters())
@@ -173,7 +171,7 @@ def test_omni_lora_ignores_tower_freeze_flags():
     ],
 )
 def test_omni_freeze_vit_without_vision_lora(lora_config, merger_trainable):
-    trainer = _make_trainer(
+    runtime = _make_runtime(
         _FakeOmniModel(),
         _make_args(
             "tests/toy_config/qwen3vl_toy/config.json",
@@ -184,15 +182,15 @@ def test_omni_freeze_vit_without_vision_lora(lora_config, merger_trainable):
         SimpleNamespace(model_type="qwen3_omni_moe"),
     )
 
-    trainer.freeze_model()
+    runtime.freeze_model()
 
-    visual = trainer.base.model.thinker.visual
+    visual = runtime.model.thinker.visual
     assert all(not param.requires_grad for param in visual.proj.parameters())
     assert all(param.requires_grad is merger_trainable for param in visual.merger.parameters())
     assert all(
-        param.requires_grad is merger_trainable for param in trainer.base.model.thinker.audio_tower.proj1.parameters()
+        param.requires_grad is merger_trainable for param in runtime.model.thinker.audio_tower.proj1.parameters()
     )
     if lora_config:
         inputs = torch.randn(1, 4)
         assert not visual.proj(inputs).requires_grad
-        assert not trainer.base.model.thinker.audio_tower.proj1(inputs).requires_grad
+        assert not runtime.model.thinker.audio_tower.proj1(inputs).requires_grad

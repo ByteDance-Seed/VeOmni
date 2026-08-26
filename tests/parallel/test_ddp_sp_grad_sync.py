@@ -80,7 +80,7 @@ def _token_loss(outputs: torch.Tensor) -> torch.Tensor:
 
 def main() -> None:
     from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
-    from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state, init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
     from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.module_utils import init_empty_weights
@@ -102,7 +102,7 @@ def main() -> None:
     assert world_size % sp_size == 0, f"world_size {world_size} must be divisible by ulysses_size {sp_size}"
     dp_size = world_size // sp_size
 
-    init_parallel_state(dp_size=dp_size, ulysses_size=sp_size, dp_mode="ddp")
+    _init_parallel_state(dp_size=dp_size, ulysses_size=sp_size, dp_mode="ddp")
     parallel_state = get_parallel_state()
     assert parallel_state.sp_size == sp_size
     assert dist.get_world_size(parallel_state.dp_group) == dp_size

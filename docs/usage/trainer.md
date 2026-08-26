@@ -77,9 +77,9 @@ def train_step(self, data_iterator):
 
     # Optimization
     grad_norm = veomni_clip_grad_norm(self.model, self.args.model.optimizer.max_grad_norm)
-    self.optimizer.step()
-    self.lr_scheduler.step()
-    self.optimizer.zero_grad()
+    self.model.optimizer.step()
+    self.model.lr_scheduler.step()
+    self.model.optimizer.zero_grad()
 
     self.callbacks.call("on_step_end", self.state, ...)
 ```
@@ -104,8 +104,10 @@ VeOmni includes several built-in callbacks:
 - **[WandbTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Logs metrics to wandb.
 - **[ProfileTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Handles profiling.
 - **[ChannelLossCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/channel_loss_callback.py)**: Logs detached per-channel causal-LM loss metrics when `train.channel_loss.enable=true`.
-- **[CheckpointerCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves training checkpoints.
-- **[HuggingfaceCkptCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves HuggingFace checkpoints.
+- **[ModelDcpCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable model checkpoints.
+- **[ModelHfCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Exports HuggingFace / LoRA weights.
+- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves job-level state (dataloader cursor, rng, meters).
+- **[RootAssetsCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Exports the config / tokenizer sidecars.
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
 
 ### Custom Callbacks
@@ -133,19 +135,20 @@ To implement a specific training task (like VLM training), you should subclass `
 1. **`post_init(self)`**:
    Perform any additional initialization after the base setup.
 
-2. **`build_model_assets(self)`**:
-   Initialize and return auxiliary model components like tokenizers, processors, or chat templates.
+2. **`build_model_runtime(self)`**:
+   Return the runtime that owns this job's model. Auxiliary components — tokenizer, processor, chat template — are built there rather than on the trainer, so override `VeOmniModelRuntime.build_model_assets` on a runtime subclass if a model needs different ones.
    ```python
-   def build_model_assets(self):
-       self.processor = build_processor(self.args.model.tokenizer_path)
-       return [self.processor]
+   def build_model_runtime(self) -> MyModelRuntime:
+       return MyModelRuntime(
+           self.args.model, "base", train=self.args.train, chat_template_name=self.args.data.chat_template
+       )
    ```
 
 3. **`build_data_transform(self)`**:
    Define how raw data samples are processed into model inputs. This is crucial for multimodal tasks where image/video processing is required.
    ```python
    def build_data_transform(self):
-       return partial(process_sample_function, processor=self.processor, ...)
+       return partial(process_sample_function, processor=self.model.processor, ...)
    ```
 
 4. **`build_data_collate_info(self)`**:

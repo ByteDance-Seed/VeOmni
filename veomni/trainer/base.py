@@ -39,28 +39,26 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.optim.lr_scheduler import LRScheduler
-from torch.optim.optimizer import Optimizer
 from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from torch.utils.data import Dataset
-from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
-from ..arguments import ModelArguments, VeOmniArguments, save_args
-from ..checkpoint import CheckpointerBase
+from ..arguments import VeOmniArguments, save_args
 from ..data import (
     DistributedDataloader,
     build_dataloader,
     build_dataset,
 )
-from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import clear_parallel_state, use_parallel_state
+from ..distributed.parallel_state import (
+    clear_parallel_state,
+    init_parallel_state_from_accelerator,
+    use_parallel_state,
+)
 from ..distributed.torch_compile import mark_compile_step_begin
-from ..models import build_tokenizer
 from ..models.model_runtime import VeOmniModelRuntime
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
@@ -74,13 +72,14 @@ from ..utils.device import (
 from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from .callbacks import (
     ChannelLossCallback,
-    CheckpointerCallback,
     EnvironMeterCallback,
     EvaluateCallback,
-    HFLoraCkptCallback,
-    HuggingfaceCkptCallback,
+    GlobalStateCallback,
+    ModelDcpCallback,
+    ModelHfCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
+    RootAssetsCallback,
     TqdmCallback,
     TrainerState,
     WandbTraceCallback,
@@ -195,15 +194,17 @@ class VeOmniIter:
         return {}
 
 
-class BaseTrainer(VeOmniModelRuntime, Stateful, ABC):
+class BaseTrainer(Stateful, ABC):
     """
     Base trainer class for distributed model training.
 
-    Inherits the model-bound half of a training job from
+    Holds the model-bound half of a training job as :attr:`model`, a
     :class:`~veomni.models.model_runtime.VeOmniModelRuntime` (build, freeze /
-    LoRA, parallelize, optimizer, lr-scheduler, gradient clipping, device
-    mesh) and adds the job-bound half on top: distributed init, the data
-    pipeline, the train loop, callbacks and checkpoint orchestration.
+    LoRA, parallelize, optimizer, lr-scheduler, gradient clipping, device mesh,
+    checkpoint I/O), and owns the job-bound half itself: distributed init, the
+    data pipeline, the train loop, callbacks and checkpoint scheduling. The
+    handle forwards the wrapped model's own API, so ``trainer.model.config``
+    and ``trainer.model(**batch)`` read as before.
 
     This class provides the core training infrastructure including:
     - Distributed initialization and parallelism setup
@@ -236,16 +237,7 @@ class BaseTrainer(VeOmniModelRuntime, Stateful, ABC):
     train_dataloader: DistributedDataloader
 
     # Model
-    model: PreTrainedModel = None
-    model_config: PretrainedConfig = PretrainedConfig()
-    tokenizer: PreTrainedTokenizerBase = None
-    processor: ProcessorMixin = None
-    chat_template: ChatTemplate = None
-    model_assets: List[Any] = []
-
-    # Training components
-    optimizer: Optimizer = None
-    lr_scheduler: LRScheduler = None
+    model: VeOmniModelRuntime = None
 
     # Training context
     model_fwd_context: Any
@@ -256,8 +248,7 @@ class BaseTrainer(VeOmniModelRuntime, Stateful, ABC):
     step_env_metrics: Dict[str, Any]  # mfu, flops, tokens, etc
     step_train_metrics: Dict[str, Any]  # loss, grad_norm, lr, etc
 
-    # Checkpointer
-    checkpointer: CheckpointerBase  # see in checkpoint_callback.CheckpointerCallback
+    # Checkpointer — built on the runtime, which owns every model/torch boundary.
 
     # Callback system
     state: TrainerState
@@ -280,107 +271,114 @@ class BaseTrainer(VeOmniModelRuntime, Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
-        # ``VeOmniModelRuntime.__init__`` is deliberately not called: the seams
-        # below read straight off ``self.args``, and every trainer composing a
-        # ``BaseTrainer`` builds it through ``__new__`` without an ``__init__``.
-        # ``_setup`` registers ParallelState ("base") before seed/determinism so
-        # device-mesh process groups are created with default NCCL settings —
-        # matching pre-registry init order (avoids L20 SIGSEGV when
-        # NCCL_DETERMINISTIC=1 is set before mesh construction).
-        self._setup()
-        # Every build step below reads the current ParallelState via
-        # ``get_parallel_state()`` (meta-init, FSDP2/TP/EP wrap + weight load,
-        # EP-/muon-aware optimizer, SP-aware data pipeline). Scope the whole
-        # build under the registered name (a no-op for the single-model case:
-        # the global already equals the registered ``"base"`` state).
-        with use_parallel_state("base"):
-            # build model
-            self.build_model()
-            # freeze module and print trainable parameters
-            self.freeze_model()
-            # build model assets (config, tokenizer, processor, chat_template)
-            self._build_model_assets()
-            # build dataset and dataloader
-            self._build_data_transform()
-            self._build_dataset()
-            self._build_collate_fn()
-            self._build_dataloader()
+        self.device = self.setup_distributed(args)
+        # Builds the model: meta-init, freeze, parallelize and optimizer all run
+        # under the mesh the runtime registered, so nothing below needs a scope.
+        self.model = self.build_model_runtime()
+        # build dataset and dataloader
+        self._build_data_transform()
+        self._build_dataset()
+        self._build_collate_fn()
+        self._build_dataloader()
+        # The dataset fixes train_steps, which the schedule needs.
+        self.build_lr_scheduler()
+        self._build_training_context()
+        self._init_callbacks()
 
-            # Parallelize model
-            self.build_parallelized_model()
-            # Build optimizer and lr scheduler
-            self.build_optimizer()
-            self.build_lr_scheduler()
-            # Build training context
-            self._build_training_context()
-            # Initialize callbacks
-            self._init_callbacks()
+    # ── Trainer distributed setup ────────────────────────────────
 
-    def _setup(self):
+    @staticmethod
+    def setup_distributed(args: VeOmniArguments) -> torch.device:
+        """Init process group, device, seed, and register the job's ParallelState.
+
+        Everything here is job-level and runs before any model exists, so it
+        takes the config rather than a built trainer.
+        """
         # log args
-        logger.info_rank0(json.dumps(asdict(self.args), indent=2))
+        logger.info_rank0(json.dumps(asdict(args), indent=2))
 
         # init distributed environment
-        device_str = f"{get_device_type()}:{self.args.train.local_rank}"
+        device_str = f"{get_device_type()}:{args.train.local_rank}"
         get_torch_device().set_device(device_str)
-        self.device = torch.device(device_str)
+        device = torch.device(device_str)
 
         # Initialize distributed process group
         if not dist.is_initialized():
             dist.init_process_group(backend=get_dist_comm_backend())
 
-        logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
+        logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
         # Register ParallelState before seed/determinism env vars. Mesh creation
         # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
-        self.register_parallel_state("base")
+        init_parallel_state_from_accelerator(args.model.accelerator, name="base")
 
         # Set random seed
-        helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
+        helper.set_seed(args.train.seed, args.train.enable_full_determinism)
 
         # Enable high precision for bf16
         helper.enable_high_precision_for_bf16()
 
         # Enable third party logging
-        if self.args.train.local_rank == 0:
+        if args.train.local_rank == 0:
             helper.enable_third_party_logging()
 
         # Save arguments
-        if self.args.train.global_rank == 0:
-            save_args(self.args, self.args.train.checkpoint.output_dir)
+        if args.train.global_rank == 0:
+            save_args(args, args.train.checkpoint.output_dir)
 
         # Gradient checkpointing debug
-        set_checkpoint_debug_enabled(self.args.model.accelerator.gradient_checkpointing.debug)
+        set_checkpoint_debug_enabled(args.model.accelerator.gradient_checkpointing.debug)
+        return device
 
-    @property
-    def model_args(self) -> ModelArguments:
-        """This trainer's single model — the ``model.*`` section of its arguments."""
-        return self.args.model
+    def destroy_distributed(self):
+        if not dist.is_available() or not dist.is_initialized():
+            return
 
-    @property
-    def runtime_name(self) -> str:
-        """A single-model job registers exactly one ParallelState, named ``"base"``."""
-        return "base"
+        backend = dist.get_backend()
+        helper.empty_cache()
+        dist.barrier()
 
-    @property
-    def checkpoint_load_path(self):
-        return self.args.train.checkpoint.load_path
+        if is_nccl_backend(backend) and os.getenv("VEOMNI_DESTROY_NCCL_ON_EXIT", "0") != "1":
+            logger.info_rank0(
+                "Skipping explicit NCCL process-group destroy on normal trainer exit. "
+                "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
+            )
+            return
 
-    def build_lr_scheduler(self, total_steps: Optional[int] = None):
-        """Schedule over the whole run, derived from the job's dataset-sized step count."""
-        if total_steps is None:
-            total_steps = self.args.train_steps * self.args.train.num_train_epochs
-        super().build_lr_scheduler(total_steps)
+        synchronize()
+        dist.destroy_process_group()
+        clear_parallel_state()
 
-    def _build_model_assets(self):
-        # model assets
-        self.tokenizer = build_tokenizer(self.args.model.tokenizer_path)
-        self.model_assets = [self.model_config, self.tokenizer]
+    # ── Trainer build functions ────────────────────────────────
+
+    def build_model_runtime(self) -> VeOmniModelRuntime:
+        """Build this job's single model, under the ``"base"`` ParallelState.
+
+        Returns it already built — meta-init, freeze, parallelize and optimizer
+        included. A model whose build differs (see :class:`VLMModelRuntime`)
+        overrides that step on a runtime subclass returned from here, rather
+        than resequencing the build from the trainer.
+        """
+        return VeOmniModelRuntime(
+            self.args.model,
+            model_name="base",
+            train=self.args.train,
+            chat_template_name=self.args.data.chat_template,
+        )
+
+    def build_lr_scheduler(self):
+        """Size the run, then let the model schedule over it.
+
+        The step count is job-bound — it needs the dataset length and the epoch
+        count — so the model takes the number rather than deriving it.
+        """
+        self.model.build_lr_scheduler(self.args.train_steps * self.args.train.num_train_epochs)
 
     def _build_data_transform(self):
         self.data_transform = build_data_transform(
             self.args.data.data_type,
-            tokenizer=self.tokenizer,
+            tokenizer=self.model.tokenizer,
+            chat_template=self.model.chat_template,
             max_seq_len=self.args.data.max_seq_len,
             text_keys=self.args.data.text_keys,
         )
@@ -448,11 +446,12 @@ class BaseTrainer(VeOmniModelRuntime, Stateful, ABC):
         self.tqdm_callback = TqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
-        self.checkpointer_callback = CheckpointerCallback(self)
-        if self.args.model.lora_config:
-            self.hf_ckpt_callback = HFLoraCkptCallback(self)
-        else:
-            self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
+        self.root_assets_callback = RootAssetsCallback(self)
+        self.dcp_callback = ModelDcpCallback(self)
+        self.global_state_callback = GlobalStateCallback(self)
+        # One callback, both export formats: a model that trains only adapters
+        # writes the adapter, and the model is what knows.
+        self.hf_ckpt_callback = ModelHfCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.channel_loss_callback = ChannelLossCallback(self)
@@ -471,12 +470,39 @@ class BaseTrainer(VeOmniModelRuntime, Stateful, ABC):
             self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
-            self.checkpointer_callback,
+            self.root_assets_callback,
+            # Weights first, then the cursor: at resume the DCP load frees its
+            # materialization buffers before the dataloader prefetches, and at
+            # save a crash between the two leaves weights whose trainer state is
+            # merely absent, which resumes with a warning.
+            self.dcp_callback,
+            self.global_state_callback,
             self.hf_ckpt_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
         ]
         self.state = TrainerState()
+
+    # ── Trainer checkpoint functions ────────────────────────────────
+
+    def load(self) -> Optional[Dict[str, Any]]:
+        """Resume this job's model, handing back the extra state stored with it.
+
+        The fan-out is the point: a trainer holding a second model (a DPO
+        reference, a distillation teacher) extends this to load both, and the
+        callback that triggers it keeps knowing only *when*.
+        """
+        return self.model.load()
+
+    def save_dcp(self, state: TrainerState) -> None:
+        """Write this job's resumable checkpoint for ``state.global_step``."""
+        self.model.save_dcp(state)
+
+    def save_hf_or_lora(self, state: TrainerState, stage: str = "step_end") -> None:
+        """Export this job's weights in whichever format the model was trained in."""
+        self.model.save_hf_or_lora(state, stage=stage)
+
+    # ── Trainer callback hooks ────────────────────────────────
 
     def on_train_begin(self):
         for callback in self._callbacks:
@@ -501,6 +527,8 @@ class BaseTrainer(VeOmniModelRuntime, Stateful, ABC):
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    # ── Trainer train step functions ────────────────────────────────
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -645,33 +673,16 @@ class BaseTrainer(VeOmniModelRuntime, Stateful, ABC):
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from this model's ParallelState)
-        grad_norm = self.clip_grad_norm()
+        grad_norm = self.model.clip_grad_norm()
 
         # Optimizer and scheduler step
-        self.optimizer.step()
-        self.lr_scheduler.step()
-        self.optimizer.zero_grad()
+        self.model.optimizer.step()
+        self.model.lr_scheduler.step()
+        self.model.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
-    def destroy_distributed(self):
-        if not dist.is_available() or not dist.is_initialized():
-            return
-
-        backend = dist.get_backend()
-        helper.empty_cache()
-        dist.barrier()
-
-        if is_nccl_backend(backend) and os.getenv("VEOMNI_DESTROY_NCCL_ON_EXIT", "0") != "1":
-            logger.info_rank0(
-                "Skipping explicit NCCL process-group destroy on normal trainer exit. "
-                "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
-            )
-            return
-
-        synchronize()
-        dist.destroy_process_group()
-        clear_parallel_state()
+    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args: VeOmniArguments = self.args

@@ -23,13 +23,13 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 from ..arguments import MixedPrecisionConfig, VeOmniArguments
-from ..data import build_chat_template, build_data_transform
+from ..data import build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
-from ..models import build_foundation_model, build_tokenizer
+from ..models import build_foundation_model
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
@@ -142,44 +142,29 @@ class TextDPOTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()  # registers ParallelState("base") before seed
-        # All build steps (policy + reference model, optimizer, SP data pipeline)
-        # read the current ParallelState via ``get_parallel_state()``, so scope the
-        # whole build under this trainer's own state. No-op for the single-model
-        # case; keeps each module building over its own mesh once modules build
-        # separately.
-        with use_parallel_state("base"):
-            self.base.build_model()
-            self.base.freeze_model()
+        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
+        self.base.model = self.base.build_model_runtime()
 
-            self._build_model_assets()
-            self._build_data_transform()
+        self._build_data_transform()
 
-            self.base._build_dataset()
-            self.base._build_collate_fn()
-            self.base._build_dataloader()
-            self._build_postforward()
-            self.base.build_parallelized_model()
-            self.base.build_optimizer()
-            self.base.build_lr_scheduler()
-            self.base._build_training_context()
-            self.base._init_callbacks()
+        self.base._build_dataset()
+        self.base._build_collate_fn()
+        self.base._build_dataloader()
+        self._build_postforward()
+        self.base.build_lr_scheduler()
+        self.base._build_training_context()
+        self.base._init_callbacks()
 
-            self._build_reference_model()
+        self._build_reference_model()
 
-    def _build_model_assets(self):
-        args: VeOmniDPOArguments = self.base.args
-        model_config = self.base.model_config
-        self.base.tokenizer = build_tokenizer(args.model.tokenizer_path)
-        self.base.chat_template = build_chat_template(args.data.chat_template, self.base.tokenizer)
-        self.base.model_assets = [model_config, self.base.chat_template]
+    # ── Trainer build functions ────────────────────────────────
 
     def _build_data_transform(self):
         args: VeOmniDPOArguments = self.base.args
         self.base.data_transform = build_data_transform(
             "dpo",
-            tokenizer=self.base.tokenizer,
-            chat_template=self.base.chat_template,
+            tokenizer=self.base.model.tokenizer,
+            chat_template=self.base.model.chat_template,
             max_seq_len=args.data.max_seq_len,
         )
 
@@ -225,6 +210,30 @@ class TextDPOTrainer:
         )
         self.reference_model.eval()
         helper.print_device_mem_info("VRAM usage after building reference model")
+
+    # ── Trainer callback hooks ────────────────────────────────
+
+    def on_train_begin(self):
+        self.base.on_train_begin()
+
+    def on_train_end(self):
+        self.base.on_train_end()
+
+    def on_epoch_begin(self):
+        self.base.on_epoch_begin()
+
+    def on_epoch_end(self):
+        self.base.on_epoch_end()
+
+    def on_step_begin(self, micro_batches=None):
+        # Each DPO preference pair is packed as two consecutive causal-LM
+        # segments (chosen, rejected) but carries one source metadata entry.
+        self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
+
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    # ── Trainer train step functions ────────────────────────────────
 
     @staticmethod
     def dpo_loss(
@@ -387,26 +396,6 @@ class TextDPOTrainer:
             del micro_batch
             return loss, loss_dict
 
-    def on_train_begin(self):
-        self.base.on_train_begin()
-
-    def on_train_end(self):
-        self.base.on_train_end()
-
-    def on_epoch_begin(self):
-        self.base.on_epoch_begin()
-
-    def on_epoch_end(self):
-        self.base.on_epoch_end()
-
-    def on_step_begin(self, micro_batches=None):
-        # Each DPO preference pair is packed as two consecutive causal-LM
-        # segments (chosen, rejected) but carries one source metadata entry.
-        self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
-
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         self.base.state.global_step += 1
 
@@ -430,13 +419,15 @@ class TextDPOTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        grad_norm = self.base.clip_grad_norm()
+        grad_norm = self.base.model.clip_grad_norm()
 
-        self.base.optimizer.step()
-        self.base.lr_scheduler.step()
-        self.base.optimizer.zero_grad()
+        self.base.model.optimizer.step()
+        self.base.model.lr_scheduler.step()
+        self.base.model.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+
+    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args: VeOmniDPOArguments = self.base.args

@@ -35,11 +35,11 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.tools.training_utils import unbuilt_runtime
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
 from veomni.lora.weight_loading import load_lora_weights
-from veomni.trainer.base import BaseTrainer
 
 
 torch.manual_seed(0)
@@ -141,34 +141,28 @@ def test_only_lora_trainable():
     assert all(".lora_A." in n or ".lora_B." in n for n in trainable)
 
 
-def test_base_trainer_rejects_lora_without_trainable_adapters():
-    trainer = BaseTrainer.__new__(BaseTrainer)
-    trainer.model = Toy()
-    trainer.args = SimpleNamespace(
-        model=SimpleNamespace(lora_config={"rank": 8, "alpha": 16, "lora_modules": ["missing"]})
-    )
+def test_model_runtime_rejects_lora_without_trainable_adapters():
+    runtime = unbuilt_runtime(SimpleNamespace(lora_config={"rank": 8, "alpha": 16, "lora_modules": ["missing"]}))
+    runtime.model = Toy()
 
     with pytest.raises(ValueError, match="no trainable adapters"):
-        trainer.setup_lora()
+        runtime.setup_lora()
 
 
 @pytest.mark.parametrize("is_trainable", [True, False])
-def test_base_trainer_validates_resumed_adapter(tmp_path, is_trainable):
+def test_model_runtime_validates_resumed_adapter(tmp_path, is_trainable):
     VeOmniLoraModel(Toy(), _base_config()).save_pretrained(str(tmp_path))
-    trainer = BaseTrainer.__new__(BaseTrainer)
-    trainer.model = Toy()
-    trainer.args = SimpleNamespace(
-        model=SimpleNamespace(
-            lora_config={"lora_adapter": str(tmp_path), "is_trainable": is_trainable},
-        )
+    runtime = unbuilt_runtime(
+        SimpleNamespace(lora_config={"lora_adapter": str(tmp_path), "is_trainable": is_trainable})
     )
+    runtime.model = Toy()
 
     if is_trainable:
-        trainer.setup_lora()
-        assert any(param.requires_grad for param in trainer.model.parameters())
+        runtime.setup_lora()
+        assert any(param.requires_grad for param in runtime.parameters())
     else:
         with pytest.raises(ValueError, match="no trainable adapters"):
-            trainer.setup_lora()
+            runtime.setup_lora()
 
 
 def test_init_is_noop():

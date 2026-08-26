@@ -19,17 +19,16 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
-from ..data import MainCollator, build_chat_template, build_data_transform
-from ..distributed.parallel_state import get_parallel_state, use_parallel_state
+from ..data import MainCollator, build_data_transform
+from ..distributed.parallel_state import get_parallel_state
 from ..distributed.torch_compile import (
     CompileConfig,
     mark_compile_step_begin,
     validate_compile_model,
     validate_compile_runtime,
 )
-from ..models import build_foundation_model, build_processor
-from ..models.model_runtime import _collect_muon_kwargs
-from ..optim import build_optimizer
+from ..models import build_foundation_model
+from ..models.model_runtime import VeOmniModelRuntime
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
@@ -38,7 +37,6 @@ from .base import BaseTrainer, VeOmniIter
 
 
 logger = helper.create_logger(__name__)
-MAX_PIXELS = 768 * 28 * 28
 
 
 def _get_vlm_visual_module(model):
@@ -108,78 +106,37 @@ class VeOmniVLMArguments(VeOmniArguments):
     train: "VLMTrainingArguments" = field(default_factory=VLMTrainingArguments)
 
 
-class VLMTrainer:
-    def __init__(self, args: VeOmniVLMArguments):
-        # BaseTrainer.__init__ is NOT called here; we call its private
-        # helpers one-by-one so the sequence is explicit.
-        self.base = BaseTrainer.__new__(BaseTrainer)
-        self.base.args = args
+class VLMModelRuntime(VeOmniModelRuntime):
+    """A VLM: encoder-aware build, tower freezing, and a separate ViT learning rate."""
 
-        self.base._setup()  # registers ParallelState("base") before seed
-
-        # All build steps read the current ParallelState via ``get_parallel_state()``
-        # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
-        # scope the whole build under this trainer's own state. No-op for the
-        # single-model case; keeps each module building over its own mesh once
-        # multiple modules build separately.
-        with use_parallel_state("base"):
-            # rewrite build model to support data balancing
-            self.build_model()
-            self._validate_torch_compile()
-
-            # rewrite freeze_model_module to support freeze multimodal encoder, etc.
-            self.freeze_model()
-
-            # rewrite build_model_assets to support chat_template and processor for multimodal datasets
-            self._build_model_assets()
-
-            # rewrite build_data_transform to support multimodal transform
-            self._build_data_transform()
-
-            self.base._build_dataset()
-
-            # rewrite build_collate_fn to support multimodal collate_fn
-            self._build_collate_fn()
-
-            self.base._build_dataloader()
-            self.base.build_parallelized_model()
-
-            # rewrite build_optimizer to support different lr param groups
-            self.build_optimizer()
-
-            self.base.build_lr_scheduler()
-            self.base._build_training_context()
-            self.base._init_callbacks()
+    # ── Model runtime build functions ────────────────────────────────
 
     def build_model(self):
-        args: VeOmniVLMArguments = self.base.args
+        args: VLMMModelArguments = self.args
         logger.info_rank0("Build model")
-        self.base.model = build_foundation_model(
-            config_path=args.model.config_path,
-            weights_path=args.model.model_path,
-            torch_dtype="float32" if args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=args.model.accelerator.init_device,
-            encoder_data_balance=args.model.encoder_data_balance,
-            encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
-            ops_implementation=args.model.ops_implementation,
-            config_kwargs=args.model.model_config,
+        self.model = build_foundation_model(
+            config_path=args.config_path,
+            weights_path=args.model_path,
+            torch_dtype="float32" if args.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+            init_device=args.accelerator.init_device,
+            encoder_data_balance=args.encoder_data_balance,
+            encoder_data_balance_sorting_algo=args.encoder_data_balance_sorting_algo,
+            ops_implementation=args.ops_implementation,
+            config_kwargs=args.model_config,
         )
-        self.base.model_config = self.base.model.config
+        self.model_config = self.model.config
+        self._validate_torch_compile()
 
     def _validate_torch_compile(self):
-        args: VeOmniVLMArguments = self.base.args
-        if not args.model.accelerator.torch_compile.enable:
+        accelerator = self.args.accelerator
+        if not accelerator.torch_compile.enable:
             return
 
-        accelerator = args.model.accelerator
         compile_config = CompileConfig(
-            **{
-                field.name: getattr(args.model.accelerator.torch_compile, field.name)
-                for field in fields(CompileConfig)
-            }
+            **{field.name: getattr(accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
         )
         validate_compile_model(
-            self.base.model,
+            self.model,
             compile_config,
             sequence_parallel_enabled=accelerator.ulysses_size > 1 or accelerator.cp_size > 1,
             async_enabled=accelerator.enable_async,
@@ -195,30 +152,27 @@ class VLMTrainer:
         )
 
     def freeze_model(self):
-        args: VeOmniVLMArguments = self.base.args
-        model_config = self.base.model_config
-        lora_enabled = bool(args.model.lora_config)
-        if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
-            self.base.model.disable_talker()
-
-        # VLMTrainer composes BaseTrainer instead of calling its constructor, so
-        # it must opt into the shared LoRA setup explicitly. The wrapper freezes
-        # all base weights and re-enables only matched adapter parameters.
-        if lora_enabled:
-            self.base.setup_lora()
-
+        train_args: VLMTrainingArguments = self.train
+        model_config = self.model_config
+        lora_enabled = bool(self.args.lora_config)
         is_omni = model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
-        visual = self.base.model.thinker.visual if is_omni else _get_vlm_visual_module(self.base.model)
+        if is_omni:
+            self.model.disable_talker()
+
+        if lora_enabled:
+            self.setup_lora()
+
+        visual = self.model.thinker.visual if is_omni else _get_vlm_visual_module(self.model)
 
         # LoRA setup is authoritative for trainability. It already freezes every
         # untargeted parameter, so the legacy tower flags apply only to full tuning.
         if not lora_enabled:
-            if args.train.freeze_vit:
+            if train_args.freeze_vit:
                 if is_omni:
-                    self.base.model.thinker.visual.requires_grad_(False)
+                    self.model.thinker.visual.requires_grad_(False)
                     # Preserve the existing full-tuning policy: freeze the
                     # visual backbone while continuing to train the merger.
-                    self.base.model.thinker.visual.merger.requires_grad_(True)
+                    self.model.thinker.visual.merger.requires_grad_(True)
                 else:
                     # Resolve both flat and nested visual-module layouts to cover
                     # both the plain `model.visual` shape and Qwen3.5-VL's nested
@@ -227,36 +181,85 @@ class VLMTrainer:
                         raise AttributeError(f"Cannot find visual module for model_type={model_config.model_type}.")
                     visual.requires_grad_(False)
 
-            if args.train.freeze_audio_tower and is_omni:
-                self.base.model.thinker.audio_tower.requires_grad_(False)
+            if train_args.freeze_audio_tower and is_omni:
+                self.model.thinker.audio_tower.requires_grad_(False)
                 # Qwen2.5-Omni uses audio_tower.proj; Qwen3-Omni-MoE uses audio_tower.proj1.
                 audio_proj = (
-                    getattr(self.base.model.thinker.audio_tower, "proj1", None)
-                    or self.base.model.thinker.audio_tower.proj
+                    getattr(self.model.thinker.audio_tower, "proj1", None) or self.model.thinker.audio_tower.proj
                 )
                 audio_proj.requires_grad_(True)
 
-        pretty_print_trainable_parameters(self.base.model)
+        pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
-    def _build_model_assets(self):
-        args: VeOmniVLMArguments = self.base.args
-        self.base.processor = build_processor(args.model.tokenizer_path, max_pixels=MAX_PIXELS)
-        if self.base.model_config.model_type not in ("qwen2_5_omni", "qwen3_omni_moe"):
-            self.base.chat_template = build_chat_template(args.data.chat_template, self.base.processor)
-            self.base.model_assets = [self.base.processor, self.base.chat_template]
-        else:
-            self.base.chat_template = None
-            self.base.model_assets = [self.base.processor]
+    # ── Model runtime optimizer & lr_scheduler build functions ────────────────────────────────
+
+    def build_optimizer(self, param_groups=None):
+        if param_groups is not None:
+            return super().build_optimizer(param_groups=param_groups)
+
+        vit_params, other_params = [], []
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if "visual" in name:
+                    vit_params.append(param)
+                else:
+                    other_params.append(param)
+
+        # Only create groups that have trainable params. An empty visual group
+        # has no optimizer state under DCP and would raise
+        # KeyError: 'betas' on the first step after resume.
+        param_groups = []
+        if vit_params:
+            param_groups.append({"params": vit_params, "lr": self.train.vit_lr})
+        if other_params:
+            param_groups.append({"params": other_params, "lr": self.args.optimizer.lr})
+
+        return super().build_optimizer(param_groups=param_groups)
+
+
+class VLMTrainer:
+    def __init__(self, args: VeOmniVLMArguments):
+        # BaseTrainer.__init__ is NOT called here; we call its private
+        # helpers one-by-one so the sequence is explicit.
+        self.base = BaseTrainer.__new__(BaseTrainer)
+        self.base.args = args
+
+        self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
+        self.base.model = self.build_model_runtime()
+
+        # rewrite build_data_transform to support multimodal transform
+        self._build_data_transform()
+
+        self.base._build_dataset()
+
+        # rewrite build_collate_fn to support multimodal collate_fn
+        self._build_collate_fn()
+
+        self.base._build_dataloader()
+        self.base.build_lr_scheduler()
+        self.base._build_training_context()
+        self.base._init_callbacks()
+
+    # ── Trainer build functions ────────────────────────────────
+
+    def build_model_runtime(self) -> VLMModelRuntime:
+        """Build (and own) this job's VLM. Override to swap in another runtime."""
+        return VLMModelRuntime(
+            self.base.args.model,
+            "base",
+            train=self.base.args.train,
+            chat_template_name=self.base.args.data.chat_template,
+        )
 
     def _build_data_transform(self):
         args: VeOmniVLMArguments = self.base.args
-        model_type = self.base.model_config.model_type
+        model_type = self.base.model.model_config.model_type
 
         self.base.data_transform = build_data_transform(
             model_type,
-            processor=self.base.processor,
-            chat_template=self.base.chat_template,
+            processor=self.base.model.processor,
+            chat_template=self.base.model.chat_template,
             position_id_func=self.base.model.get_position_id_func(),
             **args.data.mm_configs,
         )
@@ -285,38 +288,7 @@ class VLMTrainer:
             metadata_collate_func=metadata_collate_func,
         )
 
-    def build_optimizer(self):
-        args: VeOmniVLMArguments = self.base.args
-
-        vit_params, other_params = [], []
-        for name, param in self.base.model.named_parameters():
-            if param.requires_grad:
-                if "visual" in name:
-                    vit_params.append(param)
-                else:
-                    other_params.append(param)
-
-        # Only create groups that have trainable params. An empty visual group
-        # has no optimizer state under DCP and would raise
-        # KeyError: 'betas' on the first step after resume. VLMRLTrainer
-        # inherits this method, so the guard covers both trainers.
-        param_groups = []
-        if vit_params:
-            param_groups.append({"params": vit_params, "lr": args.train.vit_lr})
-        if other_params:
-            param_groups.append({"params": other_params, "lr": args.model.optimizer.lr})
-
-        self.base.optimizer = build_optimizer(
-            self.base.model,
-            lr=args.model.optimizer.lr,
-            weight_decay=args.model.optimizer.weight_decay,
-            fused=True,
-            optimizer_type=args.model.optimizer.type,
-            param_groups=param_groups,
-            no_decay_modules=args.model.optimizer.no_decay_modules,
-            no_decay_params=args.model.optimizer.no_decay_params,
-            muon_kwargs=_collect_muon_kwargs(args.model.optimizer),
-        )
+    # ── Trainer callback hooks ────────────────────────────────
 
     def on_train_begin(self):
         self.base.on_train_begin()
@@ -335,6 +307,8 @@ class VLMTrainer:
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    # ── Trainer train step functions ────────────────────────────────
 
     def train_step(
         self,
@@ -372,14 +346,16 @@ class VLMTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
-        grad_norm = self.base.clip_grad_norm()
+        grad_norm = self.base.model.clip_grad_norm()
 
         # Optimizer and scheduler step
-        self.base.optimizer.step()
-        self.base.lr_scheduler.step()
-        self.base.optimizer.zero_grad()
+        self.base.model.optimizer.step()
+        self.base.model.lr_scheduler.step()
+        self.base.model.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+
+    # ── Trainer train loop ────────────────────────────────
 
     def train(self):
         args: VeOmniVLMArguments = self.base.args

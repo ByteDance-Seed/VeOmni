@@ -45,13 +45,17 @@ class BaseRLTrainer(BaseTrainer):
         with use_parallel_state("base"):
             self._build_preforward_postforward()
 
-    def _setup(self):
-        if self.args.model.accelerator.chunk_mbs_config.enable:
+    # ── Trainer distributed setup ────────────────────────────────
+
+    @staticmethod
+    def setup_distributed(args: VeOmniArguments) -> torch.device:
+        if args.model.accelerator.chunk_mbs_config.enable:
             raise ValueError("ChunkMBS is not supported by RL trainers yet.")
 
-        super()._setup()
+        return BaseTrainer.setup_distributed(args)
 
-    # post init preforward and postforward hooks
+    # ── Trainer build functions ────────────────────────────────
+
     def _build_preforward_postforward(self):
         """Build preforward and postforward hooks."""
         self.pre_forward = Preforward()
@@ -82,6 +86,8 @@ class BaseRLTrainer(BaseTrainer):
             build_collate_fn=False,
             **dataloader_kwargs,
         )
+
+    # ── Trainer train step functions ────────────────────────────────
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         micro_batch = self.pre_forward(micro_batch)
