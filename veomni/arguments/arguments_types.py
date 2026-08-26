@@ -50,7 +50,6 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #   ├── channel_loss.*       → ChannelLossConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
 #   ├── torch_compile.*      → TorchCompileConfig
-#   ├── chunk_mbs_config.*   → ChunkMBSConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
@@ -399,20 +398,6 @@ class GradientCheckpointingConfig:
 
 
 @dataclass
-class ChunkMBSConfig:
-    """train.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
-
-    enable: bool = field(
-        default=False,
-        metadata={"help": "Enable ChunkMBS for packed-sequence decoder layers."},
-    )
-    chunk_mbs: int = field(
-        default=1,
-        metadata={"help": "Number of packed samples per layer chunk."},
-    )
-
-
-@dataclass
 class MixedPrecisionConfig:
     """train.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
 
@@ -716,10 +701,10 @@ class TrainingArguments:
             )
         },
     )
-    init_device: Literal["cpu", "cuda", "meta", "npu", "mlu"] = field(
+    init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU. 5. `mlu`: Init parameters on Cambricon MLU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
@@ -793,7 +778,6 @@ class TrainingArguments:
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
-    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
@@ -802,8 +786,6 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
-        if self.chunk_mbs_config.chunk_mbs < 1:
-            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs_config.chunk_mbs}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -860,18 +842,16 @@ class TrainingArguments:
             )
 
         # init method constraints
-        assert acc.ep_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
         else:
-            if self.broadcast_model_weights_from_rank0:
-                logger.warning_rank0(
-                    "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "
-                    "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
-                    f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
-                )
+            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+            # CPU-resident module, and only rank0 would hold weights anyway. Fail
+            # here so every rank stops at parse time, rather than let rank0 die in
+            # DDP's constructor while the others block in its first collective.
+            assert self.init_device != "cpu", (
+                "init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
+            )
 
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
@@ -1092,7 +1072,8 @@ class OpsImplementationConfig:
         default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
-            "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
+            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
         },
     )
     rotary_pos_emb_vision_implementation: str = field(
@@ -1544,23 +1525,7 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
-        if self.train.chunk_mbs_config.enable:
-            if self.train.pad_to_length:
-                raise ValueError("train.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
-            if self.train.gradient_checkpointing.enable and self.train.gradient_checkpointing.enable_reentrant:
-                raise ValueError(
-                    "train.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
-                    "Set train.gradient_checkpointing.enable_reentrant=False."
-                )
-            if self.data.data_type == "dpo":
-                raise ValueError("train.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
-
         if self.train.torch_compile.enable:
-            if self.train.chunk_mbs_config.enable:
-                raise ValueError(
-                    "train.chunk_mbs_config.enable is not supported with train.torch_compile.enable yet. "
-                    "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
-                )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
                     "train.torch_compile.enable is not supported by this data pipeline. "
