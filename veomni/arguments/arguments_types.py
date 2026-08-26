@@ -628,7 +628,7 @@ class AcceleratorConfig:
     )
     cp_size: int = field(
         default=1,
-        metadata={"help": "Ring-attn context parallel size."},
+        metadata={"help": "Context parallel size."},
     )
     init_device: Literal["cuda", "meta", "npu"] = field(
         default="meta",
@@ -671,6 +671,15 @@ class AcceleratorConfig:
         self._validate_init_device()
 
     def _resolve_topology(self):
+        # Ahead of the topology arithmetic below, which cannot defend itself: a
+        # cp_size of 0 makes the modulo raise ZeroDivisionError instead of naming
+        # the constraint, and a negative one derives a negative dp_size that then
+        # passes ParallelState's product check, because the two negatives cancel.
+        # Unlike dp_replicate_size / dp_shard_size, where non-positive means
+        # "derive it", cp_size is always an explicit divisor of the world size.
+        if self.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+
         non_dp_size = self.pp_size * self.ulysses_size * self.cp_size * self.tp_size
         if self.world_size % non_dp_size != 0:
             raise ValueError(
@@ -680,7 +689,12 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
-        assert self.cp_size == 1, "Context parallel size not supported yet."
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
 
         self.dp_size = self.world_size // non_dp_size
 
