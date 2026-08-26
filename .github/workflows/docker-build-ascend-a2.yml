@@ -102,6 +102,8 @@ jobs:
   merge-image:
     runs-on: ubuntu-latest
     needs: build-push-digest
+    permissions:
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -125,10 +127,14 @@ jobs:
 
       - name: Compute final tag
         id: version
+        env:
+          BASE_IMAGE_TAG: ${{ steps.base_image.outputs.base_image_tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           # Tag scheme: {version}-cann{CANN}-torch_npu{torch_npu}-{product}-{os}-{python}-veomni
           # e.g. v0.1.11-cann9.1.0-torch_npu2.10.0.post4-910b-ubuntu22.04-py3.12-veomni
-          BASE_TAG="${{ steps.base_image.outputs.base_image_tag }}"
+          BASE_TAG="$BASE_IMAGE_TAG"
           CANN=$(echo "$BASE_TAG" | cut -d'-' -f1)
           PRODUCT=$(echo "$BASE_TAG" | cut -d'-' -f2)
           OS=$(echo "$BASE_TAG" | cut -d'-' -f3)
@@ -136,8 +142,8 @@ jobs:
           TORCH_NPU=$(grep -oE 'torch-npu==[0-9A-Za-z.]+' ./docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post4_910b.x86 | head -1 | cut -d'=' -f3)
           # Release builds use the published release tag. Main and manual builds
           # intentionally republish the latest v* release line (tags are mutable).
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VERSION="${{ github.event.release.tag_name }}"
+          if [ "$EVENT_NAME" = "release" ]; then
+            VERSION="$RELEASE_TAG"
           else
             VERSION=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
           fi
