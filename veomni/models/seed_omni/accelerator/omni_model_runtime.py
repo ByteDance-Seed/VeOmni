@@ -45,6 +45,35 @@ logger = get_logger(__name__)
 _LOSS_KEY = "_loss"
 
 
+def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, "ModuleRuntime"], train: Any = None) -> None:
+    """Fail a LoRA run that adapted no module at all.
+
+    A single module the config did not target is normal — that is how a composed
+    config picks which model to adapt, so ``ModuleRuntime.on_lora_matched_nothing``
+    only logs. But a config that matched *nowhere* would train nothing, and the
+    run would look healthy until the loss failed to move; only the composer can
+    tell the two apart.
+
+    An ``offline_cache`` job is exempt: it freezes every module by design (which
+    is why ``OmniTrainer`` builds its ``MultiOptimizer`` with ``allow_empty``),
+    so "nothing is trainable" there says nothing about the LoRA config — and a
+    cache pass is usually run from the training YAML with only
+    ``--train.train_type`` overridden, carrying its ``lora_config`` along.
+    """
+    if getattr(train, "train_type", None) == "offline_cache":
+        return
+
+    requested = [name for name, runtime in module_runtimes.items() if bool(runtime.args.lora_config)]
+    if not requested:
+        return
+    if any(module_runtimes[name].has_trainable_parameters for name in requested):
+        return
+    raise ValueError(
+        f"LoRA was configured for module(s) {requested} but produced no trainable adapters in any of them. "
+        "Select at least one Linear or MoE target that the module actually declares."
+    )
+
+
 class OmniModelRuntime:
     """VeOmni model handle for one composed :class:`OmniModel`.
 
@@ -116,6 +145,8 @@ class OmniModelRuntime:
             logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
 
         logger.info_rank0(f"OmniModelRuntime: composed OmniModel with {len(modules)} module(s) ({list(modules)}).")
+        if not for_inference:
+            _reject_lora_that_matched_nothing(module_runtimes, train)
         return cls(
             OmniModel(omni_config, modules),
             module_runtimes=module_runtimes,

@@ -399,9 +399,9 @@ class VeOmniModelRuntime:
             return
 
         # Customized LoRA model setup.
-        customized_setup_lora_function = getattr(self.model, "setup_lora", None)
-        if callable(customized_setup_lora_function):
-            customized_lora_model = customized_setup_lora_function(lora_config)
+        model_setup_lora = getattr(self.model, "setup_lora", None)
+        if callable(model_setup_lora):
+            customized_lora_model = model_setup_lora(lora_config)
             if customized_lora_model is not None:
                 self.model = customized_lora_model
                 logger.info_rank0("Setup customized LoRA model.")
@@ -427,9 +427,20 @@ class VeOmniModelRuntime:
             self.model = VeOmniLoraModel(self.model, cfg)
 
         if not _has_trainable_lora_parameters(self.model):
-            raise ValueError(
-                "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
-            )
+            self.on_lora_matched_nothing()
+
+    def on_lora_matched_nothing(self) -> None:
+        """React to a LoRA config that selected none of this model's parameters.
+
+        For a single-model job that is always a misconfiguration — the run would
+        train nothing — so it fails here rather than after the first
+        zero-gradient step. A runtime that is one model *among several* overrides
+        this, because there "no targets in this one" is how a config says which
+        model to adapt.
+        """
+        raise ValueError(
+            "LoRA configuration produced no trainable adapters. Select at least one Linear or MoE target."
+        )
 
     def freeze_model(self) -> None:
         """Let the model freeze itself, apply LoRA, and report what is left trainable.

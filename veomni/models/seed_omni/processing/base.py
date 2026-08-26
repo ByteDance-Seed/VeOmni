@@ -105,7 +105,7 @@ class ModulePreprocessorBase:
         No model instance (weight-free or otherwise) is built or required.
         ``config_overrides`` mirrors the module's YAML ``model_config:`` block
         (the same dict threaded into the live model's ``config_kwargs`` — see
-        ``ModuleRuntime._build_module_model``): a subclass that reads its own
+        ``ModuleRuntime.build_model``): a subclass that reads its own
         ``config.json`` for a behavior-affecting field (e.g. ``enable_image``,
         ``cache_mode``) must apply these on top of the on-disk defaults —
         ``XxxConfig.from_pretrained(module_path, **(config_overrides or {}))`` —

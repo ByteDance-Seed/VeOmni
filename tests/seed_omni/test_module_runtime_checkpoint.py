@@ -2,7 +2,7 @@
 
 A full non-LoRA resume normally skips the initial HF weight materialization to
 avoid a second memory peak. A fully-frozen OmniModule gets no checkpoint manager
-(``ModuleRuntime._init_checkpoint``), so nothing would ever restore its weights —
+(``ModuleRuntime.build_checkpoint``), so nothing would ever restore its weights —
 it has to veto the skip and load the released HF ones.
 """
 
@@ -23,7 +23,7 @@ _RESUME_PATH = "/tmp/checkpoint/global_step_10"
 def _build_module_runtime(model: nn.Module, *, load_path: str | None = _RESUME_PATH) -> ModuleRuntime:
     runtime = ModuleRuntime.__new__(ModuleRuntime)
     runtime.model = model
-    runtime.module_name = "test_module"
+    runtime.model_name = "test_module"
     runtime.args = SimpleNamespace(model_path="/tmp/hf-model", lora_config=None)
     runtime.train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=load_path))
     runtime._has_trainable_parameters = None
@@ -62,8 +62,10 @@ def test_without_resume_path_hf_weights_are_always_loaded() -> None:
 
 def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPatch) -> None:
     parallelize = MagicMock(side_effect=lambda model, **kwargs: model)
+    # ``VeOmniModelRuntime.build_parallelized_model`` imports the builder inside
+    # the call, so the patch has to land on the defining module.
     monkeypatch.setattr(
-        "veomni.models.seed_omni.accelerator.module_runtime.build_parallelize_model",
+        "veomni.distributed.torch_parallelize.build_parallelize_model",
         parallelize,
     )
 
@@ -93,6 +95,6 @@ def test_parallelize_forwards_module_skip_decision(monkeypatch: pytest.MonkeyPat
         ),
     )
 
-    runtime._parallelize_module_model(model)
+    runtime.build_parallelized_model()
 
     assert parallelize.call_args.kwargs["should_skip_hf_weight_load"] is False

@@ -13,7 +13,7 @@ from torch.distributed._tensor import Shard
 
 # Re-export the patched module's OpSlots into THIS module's namespace too.
 # ``build_foundation_model`` (the distributed/FSDP path — ``ModuleRuntime.
-# _build_module_model``) resolves the model class for ``model_type ==
+# build_model``) resolves the model class for ``model_type ==
 # "qwen3_moe_llm"`` via ``OMNI_ACCELERATED_MODEL_REGISTRY``, i.e. THIS
 # accelerated class, and binds OpSlots by walking `sys.modules[model_cls.
 # __module__]` — this file, not ``modeling.py``. ``modeling.py`` already

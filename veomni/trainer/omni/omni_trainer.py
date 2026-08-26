@@ -17,11 +17,12 @@
 Unlike single-model trainers (BaseTrainer / VLMTrainer), OmniModel is a
 *composition* of several independent OmniModule sub-models (Janus: siglip /
 vqvae / text_encoder / llama).  Each sub-model is backed by its **own**
-:class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` — which (by
-composition over a bare ``BaseTrainer``) reuses the base per-model build helpers
-(``_build_model`` / ``_setup_lora`` / ``_build_parallelized_model`` /
-``_build_optimizer`` / ``_build_lr_scheduler``) to give that module its own FSDP2
-unit, optimizer, lr-scheduler, **checkpoint callback** and on-disk snapshot.
+:class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` — a
+:class:`~veomni.models.model_runtime.VeOmniModelRuntime` subclass, so it inherits
+the whole per-model build sequence (``build_model`` / ``setup_lora`` /
+``build_parallelized_model`` / ``build_optimizer`` / ``build_lr_scheduler``) and
+gives that module its own FSDP2 unit, optimizer, lr-scheduler, **checkpoint
+callback** and on-disk snapshot.
 
 :class:`OmniTrainer` then **strings the module-trainers together**: it owns the
 *global* concerns once (distributed ``_setup``, the shared data pipeline, trace
@@ -34,9 +35,9 @@ cascade into every module-trainer so each runs its own checkpoint save/resume.
 Division of labour
 ------------------
 * :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime` (per
-  module): ``_build_model`` → freeze + LoRA inside :class:`ModuleRuntime` →
-  ``_build_parallelized_model`` (FSDP2 wrap + weight load) → ``_init_callbacks``
-  (its own per-module DCP callback).  Optimizer is built inside each
+  module): ``build_model`` → ``freeze_model`` (freeze + LoRA) →
+  ``build_parallelized_model`` (FSDP2 wrap + weight load) → ``build_checkpoint``
+  (its own per-module DCP manager).  Optimizer is built inside each
   :class:`ModuleRuntime` at compose time; lr-scheduler is built in
   :meth:`OmniTrainer._build_multi_lr_scheduler` once ``train_steps`` is known from the dataset.
 * :class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
@@ -369,7 +370,7 @@ class OmniTrainer:
         # resolved `ModuleRuntime.model_config` is sitting in memory — hand that
         # straight to the processor instead of re-reading each module's config.json
         # from disk. Mirrors the per-module load dtype resolved in
-        # ModuleRuntime._build_module_model; a single dtype is fine since these dummies
+        # ModuleRuntime.build_model; a single dtype is fine since these dummies
         # get re-cast to each module's live self.dtype before reaching its forward.
         dummy_dtype = torch.float32 if args.model.accelerator.fsdp_config.mixed_precision.enable else torch.bfloat16
         module_configs = {name: rt.model_config for name, rt in self.model.module_runtimes.items()}
@@ -428,12 +429,12 @@ class OmniTrainer:
     def _build_multi_lr_scheduler(self) -> None:
         """Build per-module lr-schedulers and wrap them in :class:`MultiLRScheduler`.
 
-        ``_build_lr_scheduler`` no-ops for a fully-frozen module, so such modules
+        ``build_lr_scheduler`` no-ops for a fully-frozen module, so such modules
         contribute no entry to the wrapper.
         """
         total_steps = self.args.train_steps * self.args.train.num_train_epochs
         for module_runtime in self.model.module_runtimes.values():
-            module_runtime._build_lr_scheduler(total_steps)
+            module_runtime.build_lr_scheduler(total_steps)
         lr_schedulers = {
             name: module_runtime.lr_scheduler
             for name, module_runtime in self.model.module_runtimes.items()

@@ -40,7 +40,7 @@ veomni/
 │       │   └── visualize.py        Mermaid export for training/generation graphs
 │       └── accelerator/          VeOmni runtime (graph loops + per-module FSDP)
 │           ├── omni_model_runtime.py  OmniModelRuntime (composed graph loops)
-│           ├── module_runtime.py      ModuleRuntime (per sub-module FSDP/opt/ckpt)
+│           ├── module_runtime.py      ModuleRuntime(VeOmniModelRuntime) — per sub-module
 │           ├── executor.py            execute_train_node / execute_generation_node
 │           └── dispatch.py            unwrap FSDP/DDP/LoRA wrappers, call_graph_endpoint
 ├── optim/              Optimizer and LR scheduler construction
@@ -136,7 +136,7 @@ and past construction:
 
 Which preprocessor a model gets follows from what the checkpoint holds, not from a declaration: `build_model_assets` always calls `build_processor`, since `AutoProcessor` falls back to `AutoTokenizer` when a repository has no processor to offer. If a real `ProcessorMixin` comes back, `processor` is set and `tokenizer` is taken from inside it (never loaded twice, so the object the data pipeline reads through is the object exported); otherwise only `tokenizer` is set. `processor is not None` is therefore the job's signal that a model sees more than text. `DiTModelRuntime` overrides this to load neither. A path with no preprocessor to load warns rather than raises — a toy config exercising the loop on synthetic batches has none and never asks for one.
 
-The same method assembles `model_assets`, the sidecars an export writes beside the weights: the config always, plus whatever preprocessor loaded. Caching the list is safe because nothing replaces or rewrites those objects afterwards. This mirrors SeedOmni V2's `ModuleRuntime._load_module_assets`. It also builds `chat_template` when the job named one, because the template is the third thing a model needs before it can read text: the tokenizer says how a string becomes ids, the processor how pixels do, and the template how a *conversation* becomes a training sample — including the assistant-only label mask no jinja can express. A trainer therefore never assembles one; it reads `model.chat_template` the way it reads `model.tokenizer`, and always forwards it to `build_data_transform` (transforms take `**kwargs`, so one that has no use for it ignores it). The job picks *which* one via `data.chat_template` and hands the name to the runtime at construction, since only the runtime holds the preprocessor to build it from. The field defaults to `None`, meaning a config asks for a template by naming one and otherwise gets none — how a plaintext job says its data has no conversation to lay out, and how a Qwen-Omni config says it formats prompts through its processor's own template. Both used to be branches inside a trainer (`data_type == "plaintext"` in `TextTrainer`, a `model_type` hardcode in `VLMTrainer`). A model that loaded no preprocessor (a DiT over latents) warns and leaves it unset rather than failing a build with no use for one.
+The same method assembles `model_assets`, the sidecars an export writes beside the weights: the config always, plus whatever preprocessor loaded. Caching the list is safe because nothing replaces or rewrites those objects afterwards. SeedOmni V2's `ModuleRuntime` overrides this to bind the assets onto the module's model instead, since there the caller is the graph. It also builds `chat_template` when the job named one, because the template is the third thing a model needs before it can read text: the tokenizer says how a string becomes ids, the processor how pixels do, and the template how a *conversation* becomes a training sample — including the assistant-only label mask no jinja can express. A trainer therefore never assembles one; it reads `model.chat_template` the way it reads `model.tokenizer`, and always forwards it to `build_data_transform` (transforms take `**kwargs`, so one that has no use for it ignores it). The job picks *which* one via `data.chat_template` and hands the name to the runtime at construction, since only the runtime holds the preprocessor to build it from. The field defaults to `None`, meaning a config asks for a template by naming one and otherwise gets none — how a plaintext job says its data has no conversation to lay out, and how a Qwen-Omni config says it formats prompts through its processor's own template. Both used to be branches inside a trainer (`data_type == "plaintext"` in `TextTrainer`, a `model_type` hardcode in `VLMTrainer`). A model that loaded no preprocessor (a DiT over latents) warns and leaves it unset rather than failing a build with no use for one.
 
 The template is deliberately absent from `model_assets`, and is never written onto the tokenizer either: it is a choice about the *data*, not a property of the checkpoint, so an export keeps whatever jinja the checkpoint shipped with rather than substituting this job's formatting for what the model's authors published.
 
@@ -186,7 +186,27 @@ OmniInferencer                       -> tasks/omni/infer_omni.py
 └── self.model = OmniModelRuntime (any FSDP2/DDP module) | OmniModel (all eager)
 ```
 
-V2 reuses lower-level libraries (`distributed/`, `optim/`, `models/`, `data/`, `checkpoint/`) but does **not** inherit `BaseTrainer`. Config split:
+V2 reuses lower-level libraries (`distributed/`, `optim/`, `models/`, `data/`, `checkpoint/`) and does **not** inherit `BaseTrainer` — but `ModuleRuntime` **does** subclass `VeOmniModelRuntime`, because a module *is* one model's training unit; the composed-model and job layers are what V2 replaces.
+
+`ModuleRuntime(VeOmniModelRuntime)` inherits the whole build sequence (meta-init, freeze/LoRA, FSDP2/DDP wrap + weight load, optimizer, lr-scheduler, `ParallelState` registration) and overrides only where a *module* differs from a standalone model:
+
+| Override | Why a module differs |
+|----------|----------------------|
+| `build_model` | reads `model_path`, not `config_path` — the latter is inherited from the composed model and points at the Omni root, whose `config.json` is the `OmniConfig` |
+| `build_model_assets` | binds the preprocessor onto the model (`bind_module_assets`), because the graph calls the module; HF export reads it back off the live model |
+| `freeze_model` | heads the base's parameter table and VRAM reading with the module's name — N modules build in sequence, so an unattributed report says nothing about which one moved the number |
+| `build_parallelized_model` | a custom runtime subclass may own the wrap via `customized_build_parallelize_model` (e.g. EP-sharded CPU streaming) |
+| `build_optimizer` / `build_lr_scheduler` | no-op for a fully-frozen module; both scope to the module's own mesh |
+| `build_checkpoint` | per-module `OmniModuleCheckpointManager` under `<save_path>/global_step_N/<module>/`, and **none at all** when frozen — which is why `load` / `save_dcp` / `save_hf_or_lora` tolerate a missing manager |
+| `clip_grad_norm` | returns *this* module's norm (`veomni_omni_module_clip_grad_norm`); the orchestrator combines them |
+| `skip_hf_weight_load` | a frozen module with persistent state has no DCP payload to restore, so it must veto the skip |
+| `on_lora_matched_nothing` | `lora_config` is a `BaseModelArguments` field, so it reaches **every** module — "no targets here" is how a config picks which model to adapt, and the module just stays frozen. A config that matched nowhere is still an error, raised once by the composer (`_reject_lora_that_matched_nothing`, which exempts an `offline_cache` pass since that freezes everything by design) |
+| `save_model_assets` | raises: per-module sidecars go out through `collect_hf_export_assets`, the composed root's through `OmniTrainer.save_model_assets` |
+| `__call__` | a direct forward enters the module's own `ParallelState`, since attention resolves its all-to-all group from the current state; gated on registration like `OmniModelRuntime.module_context`, because an eager-inference module never ran `setup` |
+
+`module_name` is a read-only alias for the base's `model_name`: one identity that is the `ParallelState` registry key, the checkpoint subdir, and the graph node name.
+
+Config split:
 
 | Layer | Config source | Owns |
 |-------|---------------|------|
