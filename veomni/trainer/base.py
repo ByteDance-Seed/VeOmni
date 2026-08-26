@@ -350,8 +350,12 @@ class BaseTrainer(Stateful, ABC):
 
     # ── Trainer build functions ────────────────────────────────
 
-    def build_model_runtime(self) -> VeOmniModelRuntime:
-        """Build this job's single model, under the ``"base"`` ParallelState.
+    def build_model_runtime(self, model_name: str = "base") -> VeOmniModelRuntime:
+        """Build this job's model under ``model_name``'s ParallelState.
+
+        Defaults to ``"base"`` — the single-model name. A trainer that holds
+        more than one model (DPO's policy) passes a distinct name so each
+        runtime registers its own mesh.
 
         Returns it already built — meta-init, freeze, parallelize and optimizer
         included. A model whose build differs (see :class:`VLMModelRuntime`)
@@ -360,7 +364,7 @@ class BaseTrainer(Stateful, ABC):
         """
         return VeOmniModelRuntime(
             self.args.model,
-            model_name="base",
+            model_name=model_name,
             train=self.args.train,
             chat_template_name=self.args.data.chat_template,
         )
@@ -439,21 +443,22 @@ class BaseTrainer(Stateful, ABC):
             self.args.model.accelerator.offload_config.activation_gpu_limit,
         )
 
-    def _init_callbacks(self):
-        """Initialize callbacks."""
-        self.environ_meter_callback = EnvironMeterCallback(self)
-        self.tqdm_callback = TqdmCallback(self)
-        self.wandb_callback = WandbTraceCallback(self)
-        self.profile_callback = ProfileTraceCallback(self)
-        self.root_assets_callback = RootAssetsCallback(self)
-        self.dcp_callback = ModelDcpCallback(self)
-        self.global_state_callback = GlobalStateCallback(self)
+    def _init_callbacks(self, trainer=None):
+        """Initialize callbacks. ``trainer`` is who they bind to; defaults to ``self``."""
+        trainer = self if trainer is None else trainer
+        self.environ_meter_callback = EnvironMeterCallback(trainer)
+        self.tqdm_callback = TqdmCallback(trainer)
+        self.wandb_callback = WandbTraceCallback(trainer)
+        self.profile_callback = ProfileTraceCallback(trainer)
+        self.root_assets_callback = RootAssetsCallback(trainer)
+        self.dcp_callback = ModelDcpCallback(trainer)
+        self.global_state_callback = GlobalStateCallback(trainer)
         # One callback, both export formats: a model that trains only adapters
         # writes the adapter, and the model is what knows.
-        self.hf_ckpt_callback = ModelHfCallback(self)
-        self.evaluate_callback = EvaluateCallback(self)
-        self.moe_monitor_callback = MoERouterMonitorCallback(self)
-        self.channel_loss_callback = ChannelLossCallback(self)
+        self.hf_ckpt_callback = ModelHfCallback(trainer)
+        self.evaluate_callback = EvaluateCallback(trainer)
+        self.moe_monitor_callback = MoERouterMonitorCallback(trainer)
+        self.channel_loss_callback = ChannelLossCallback(trainer)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
         # ChannelLossComputer receives that same cached state. Shared objects
@@ -604,30 +609,32 @@ class BaseTrainer(Stateful, ABC):
             del micro_batch
             return loss, loss_dict
 
-    def model_reshard(self, micro_step: int, num_micro_steps: int):
+    def model_reshard(self, micro_step: int, num_micro_steps: int, model=None):
         """Reshard model after backward pass."""
         args: VeOmniArguments = self.args
+        model = self.model if model is None else model
         if (
             args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
             and not args.model.accelerator.fsdp_config.reshard_after_backward
             and num_micro_steps > 1
         ):
             if micro_step == 0:
-                self.model.set_reshard_after_backward(False)
+                model.set_reshard_after_backward(False)
             elif micro_step == num_micro_steps - 1:
-                self.model.set_reshard_after_backward(True)
+                model.set_reshard_after_backward(True)
 
-    def _configure_hsdp_allreduce(self, micro_step: int, num_micro_steps: int):
+    def _configure_hsdp_allreduce(self, micro_step: int, num_micro_steps: int, model=None):
         args: VeOmniArguments = self.args
+        model = self.model if model is None else model
         if (
             args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
             and args.model.accelerator.dp_replicate_size > 1
             and num_micro_steps > 1
         ):
             if micro_step == 0:
-                self.model.set_requires_all_reduce(False)
+                model.set_requires_all_reduce(False)
             elif micro_step == num_micro_steps - 1:
-                self.model.set_requires_all_reduce(True)
+                model.set_requires_all_reduce(True)
 
     def sync_before_train_step(self):
         if self.args.train.sync_each_train_step:

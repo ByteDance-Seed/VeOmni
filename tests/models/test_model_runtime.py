@@ -198,6 +198,7 @@ class TestHowATrainerHoldsItsModel:
         assert isinstance(runtime, VeOmniModelRuntime)
         assert runtime.args is args.model, "the runtime is handed its own slice, not the job"
         assert runtime.model_name == "base"
+        assert trainer.build_model_runtime("policy").model_name == "policy"
         assert runtime.train is args.train, "and the job-wide half it still needs"
         assert runtime.chat_template_name == "chatml", (
             "including which chat template to build, since only the runtime holds the preprocessor to build it from"

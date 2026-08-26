@@ -12,24 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel
 
-from ..arguments import MixedPrecisionConfig, VeOmniArguments
+from ..arguments import ModelRuntimeArguments, VeOmniArguments
 from ..data import build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
-from ..distributed.torch_parallelize import build_parallelize_model
-from ..models import build_foundation_model
+from ..models.model_runtime import VeOmniModelRuntime
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
@@ -128,20 +127,88 @@ class VeOmniDPOArguments(VeOmniArguments):
     """Root config for DPO training — extends VeOmniArguments with DPO hyperparameters."""
 
     dpo_config: DPOConfig = field(default_factory=DPOConfig)
+    reference_model: Optional[ModelRuntimeArguments] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Model-level args for the frozen DPO reference. "
+                "Omit to reuse `model`. This is a full config, not a partial overlay."
+            )
+        },
+    )
+
+
+class DPOReferenceModelRuntime(VeOmniModelRuntime):
+    """Frozen DPO reference: same model build as the policy, then eval.
+
+    Construction takes this model's *own* arguments, so the reference can
+    load a different checkpoint or accelerator than the policy. Frozen-eval
+    knobs (no LoRA / AMP / recompute / compile) are applied here, not by
+    rewriting the caller's config.
+
+    Init only builds the module. Optimizer, assets, and checkpoint stay
+    uncalled — callbacks only ever fan out to the policy.
+    """
+
+    def __init__(
+        self,
+        args: ModelRuntimeArguments,
+        model_name: str = "reference",
+        *,
+        train,
+        torch_dtype: str = "bfloat16",
+    ):
+        args = copy.deepcopy(args)
+        args.lora_config = {}
+        args.accelerator.fsdp_config.mixed_precision.enable = False
+        args.accelerator.gradient_checkpointing.enable = False
+        args.accelerator.torch_compile.enable = False
+        self.args = args
+        self.model_name = model_name
+        self.train = train
+        self.chat_template_name = None
+        self._torch_dtype = torch_dtype
+        self.setup()
+        with use_parallel_state(self.model_name):
+            self.build_model()
+            self.model.requires_grad_(False)
+            self.build_parallelized_model()
+            self.model.eval()
+
+    @property
+    def skip_hf_weight_load(self) -> bool:
+        """A policy resume does not carry reference weights; always materialize HF."""
+        return False
+
+    def build_model(self) -> None:
+        from ..models.auto import build_foundation_model
+
+        args = self.args
+        logger.info_rank0("Build DPO reference model")
+        self.model = build_foundation_model(
+            config_path=args.config_path,
+            weights_path=args.model_path,
+            torch_dtype=self._torch_dtype,
+            init_device=args.accelerator.init_device,
+            ops_implementation=args.ops_implementation,
+            config_kwargs=args.model_config,
+        )
+        self.model_config = self.model.config
 
 
 class TextDPOTrainer:
     """Text DPO trainer that composes BaseTrainer with DPO-specific logic."""
 
     base: BaseTrainer
-    reference_model: PreTrainedModel
+    policy_model: VeOmniModelRuntime
+    reference_model: DPOReferenceModelRuntime
 
     def __init__(self, args: VeOmniDPOArguments):
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
         self.base.device = self.base.setup_distributed(args)  # registers ParallelState("base") before seed
-        self.base.model = self.base.build_model_runtime()
+        self.policy_model = self.build_policy_model_runtime()
 
         self._build_data_transform()
 
@@ -149,11 +216,28 @@ class TextDPOTrainer:
         self.base._build_collate_fn()
         self.base._build_dataloader()
         self._build_postforward()
-        self.base.build_lr_scheduler()
+        self.policy_model.build_lr_scheduler(args.train_steps * args.train.num_train_epochs)
         self.base._build_training_context()
-        self.base._init_callbacks()
+        self.base._init_callbacks(self)
 
-        self._build_reference_model()
+        self.reference_model = self.build_reference_model_runtime()
+
+    @property
+    def model(self):
+        """Callbacks bind to this trainer and read ``.model`` — that is the policy."""
+        return self.policy_model
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def load(self) -> None:
+        self.policy_model.load()
+
+    def save_dcp(self, state) -> None:
+        self.policy_model.save_dcp(state)
+
+    def save_hf_or_lora(self, state, stage: str = "step_end") -> None:
+        self.policy_model.save_hf_or_lora(state, stage=stage)
 
     # ── Trainer build functions ────────────────────────────────
 
@@ -161,75 +245,36 @@ class TextDPOTrainer:
         args: VeOmniDPOArguments = self.base.args
         self.base.data_transform = build_data_transform(
             "dpo",
-            tokenizer=self.base.model.tokenizer,
-            chat_template=self.base.model.chat_template,
+            tokenizer=self.policy_model.tokenizer,
+            chat_template=self.policy_model.chat_template,
             max_seq_len=args.data.max_seq_len,
         )
 
     def _build_postforward(self):
         self.post_forward = PostCollator()
 
-    def _build_reference_model(self):
-        """Build and freeze a reference model with the same architecture and FSDP sharding."""
+    def build_policy_model_runtime(self) -> VeOmniModelRuntime:
+        """Build the trainable policy under ParallelState ``"policy"``."""
+        return self.base.build_model_runtime(model_name="policy")
+
+    def build_reference_model_runtime(self) -> DPOReferenceModelRuntime:
+        """Build the frozen reference as its own runtime.
+
+        ``reference_model`` is a full model-level config when set; otherwise
+        the policy's ``model`` is reused.
+        """
         args: VeOmniDPOArguments = self.base.args
-        logger.info_rank0("Building frozen reference model for DPO")
-
-        self.reference_model = build_foundation_model(
-            config_path=args.model.config_path,
-            weights_path=args.model.model_path,
+        return DPOReferenceModelRuntime(
+            args.reference_model or args.model,
+            "reference",
+            train=args.train,
             torch_dtype=args.dpo_config.refer_model_precision,
-            init_device=args.model.accelerator.init_device,
-            ops_implementation=args.model.ops_implementation,
         )
-
-        self.reference_model.requires_grad_(False)
-
-        cpu_load_param_name = None
-        if hasattr(self.base.model, "get_parallel_plan"):
-            cpu_load_param_name = getattr(self.base.model.get_parallel_plan(), "cpu_load_param_name", None)
-
-        self.reference_model = build_parallelize_model(
-            self.reference_model,
-            init_device=args.model.accelerator.init_device,
-            weights_path=args.model.model_path,
-            enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward,
-            mixed_precision=MixedPrecisionConfig(enable=False),  # In reference model, we will not use mixed precision
-            enable_gradient_checkpointing=False,
-            basic_modules=list(
-                set(getattr(self.reference_model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
-            ),
-            enable_reentrant=False,
-            enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
-            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
-            fsdp_offload_pin_memory=args.model.accelerator.fsdp_config.offload_pin_memory,
-            broadcast_model_weights_from_rank0=args.model.accelerator.broadcast_model_weights_from_rank0,
-            cpu_load_param_name=cpu_load_param_name,
-            max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
-        )
-        self.reference_model.eval()
-        helper.print_device_mem_info("VRAM usage after building reference model")
-
-    # ── Trainer callback hooks ────────────────────────────────
-
-    def on_train_begin(self):
-        self.base.on_train_begin()
-
-    def on_train_end(self):
-        self.base.on_train_end()
-
-    def on_epoch_begin(self):
-        self.base.on_epoch_begin()
-
-    def on_epoch_end(self):
-        self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches=None):
         # Each DPO preference pair is packed as two consecutive causal-LM
         # segments (chosen, rejected) but carries one source metadata entry.
         self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
-
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     # ── Trainer train step functions ────────────────────────────────
 
@@ -285,6 +330,9 @@ class TextDPOTrainer:
         the future PPO trainer use. Even-indexed sequences are
         chosen; odd are rejected.
 
+        Caller must enter ``use_parallel_state`` for *this* model's
+        mesh so forward and SP gathers resolve the correct groups.
+
         Returns:
             (chosen_logps, rejected_logps) each of shape ``(B,)``.
         """
@@ -295,7 +343,7 @@ class TextDPOTrainer:
         # (actual log-probabilities; sign already flipped). PostCollator
         # only knows about ``outputs.logits``, so we replicate its
         # SP-gather + per-seq split inline against the log_probs field.
-        # Caller must enter ``use_parallel_state("base")`` so model forward and
+        # Caller must enter this model's ``use_parallel_state`` so forward and
         # SP gathers resolve the correct groups.
         log_probs_packed = outputs.fused_linear_aux.log_probs.squeeze(0)  # [packed_L]
         seq_lens = self.post_forward.compute_seqlens_func(micro_batch)
@@ -334,9 +382,9 @@ class TextDPOTrainer:
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        channel_loss_callback = getattr(self.base, "channel_loss_callback", None)
+        channel_loss_callback = getattr(self, "channel_loss_callback", None)
         micro_step_context = (
-            channel_loss_callback.micro_step_context(self.base.state, micro_batch)
+            channel_loss_callback.micro_step_context(self.state, micro_batch)
             if channel_loss_callback is not None
             else nullcontext()
         )
@@ -348,19 +396,21 @@ class TextDPOTrainer:
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
-            with torch.no_grad(), use_parallel_state("base"):
+            reference_name = getattr(self.reference_model, "model_name", "reference")
+            with torch.no_grad(), use_parallel_state(reference_name):
                 ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
             channel_forward_context = (
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
+            policy_name = getattr(self.policy_model, "model_name", "policy")
             with (
-                use_parallel_state("base"),
+                use_parallel_state(policy_name),
                 self.base.model_fwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
                 channel_forward_context,
             ):
-                policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
+                policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy_model, micro_batch)
 
             losses, chosen_rewards, rejected_rewards = self.dpo_loss(
                 policy_chosen_logps,
@@ -385,7 +435,7 @@ class TextDPOTrainer:
             }
 
             with (
-                use_parallel_state("base"),
+                use_parallel_state(policy_name),
                 self.base.model_bwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
             ):
@@ -395,7 +445,7 @@ class TextDPOTrainer:
             return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        self.base.state.global_step += 1
+        self.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
@@ -408,20 +458,20 @@ class TextDPOTrainer:
 
         num_micro_steps = len(micro_batches)
         for micro_step, micro_batch in enumerate(micro_batches):
-            mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
-            self.base.model_reshard(micro_step, num_micro_steps)
-            self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
+            mark_compile_step_begin(getattr(self.policy_model, "_veomni_compile_uses_cuda_graphs", False))
+            self.base.model_reshard(micro_step, num_micro_steps, self.policy_model)
+            self.base._configure_hsdp_allreduce(micro_step, num_micro_steps, self.policy_model)
             loss, loss_dict = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        grad_norm = self.base.model.clip_grad_norm()
+        grad_norm = self.policy_model.clip_grad_norm()
 
-        self.base.model.optimizer.step()
-        self.base.model.lr_scheduler.step()
-        self.base.model.optimizer.zero_grad()
+        self.policy_model.optimizer.step()
+        self.policy_model.lr_scheduler.step()
+        self.policy_model.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
@@ -432,16 +482,16 @@ class TextDPOTrainer:
         self.on_train_begin()
         logger.info(
             f"Rank{args.train.local_rank} Start DPO training. "
-            f"Start step: {self.base.start_step}. "
+            f"Start step: {self.start_step}. "
             f"Train steps: {args.train_steps}. "
-            f"Start epoch: {self.base.start_epoch}. "
+            f"Start epoch: {self.start_epoch}. "
             f"Train epochs: {args.train.num_train_epochs}."
         )
 
-        for epoch in range(self.base.start_epoch, args.train.num_train_epochs):
+        for epoch in range(self.start_epoch, args.train.num_train_epochs):
             if hasattr(self.base.train_dataloader, "set_epoch"):
                 self.base.train_dataloader.set_epoch(epoch)
-            self.base.state.epoch = epoch
+            self.state.epoch = epoch
 
             self.on_epoch_begin()
 
@@ -450,7 +500,7 @@ class TextDPOTrainer:
                 self.base.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
             )
 
-            for _ in range(self.base.start_step, args.train_steps):
+            for _ in range(self.start_step, args.train_steps):
                 try:
                     self.train_step(self.base.data_iterator)
                 except StopIteration:
@@ -459,7 +509,7 @@ class TextDPOTrainer:
 
             self.on_epoch_end()
 
-            self.base.start_step = 0
+            self.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
             if args.data.dataloader.use_background_prefetcher:
                 self.base.data_iterator.stop()
