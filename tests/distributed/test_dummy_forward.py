@@ -135,7 +135,7 @@ def _omni_batch(*, rank, device, dtype, patch_size, is_qwen3_omni=False):
 def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     """Rank 0 gets multimodal data, other ranks get text-only. Verifies no NCCL hang."""
     from veomni import _apply_patches
-    from veomni.distributed.parallel_state import init_parallel_state
+    from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models.auto import build_foundation_model
     from veomni.utils.device import get_device_type
@@ -148,7 +148,7 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     os.environ["NCCL_TIMEOUT"] = "120"
 
     world_size = dist.get_world_size()
-    init_parallel_state(dp_size=world_size, dp_shard_size=world_size, dp_mode="fsdp2")
+    _init_parallel_state(dp_size=world_size, dp_shard_size=world_size, dp_mode="fsdp2")
 
     rank = dist.get_rank()
     device = torch.device(f"{get_device_type()}:{rank}")

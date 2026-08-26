@@ -91,16 +91,17 @@ model:
 
 ---
 
-## 2. LoRA Initialization in BaseTrainer
+## 2. LoRA Initialization in the Model Runtime
 
-LoRA wrapping happens in `BaseTrainer._setup_lora()`, called from `_freeze_model_module()`.
+LoRA wrapping happens in `VeOmniModelRuntime.setup_lora()`, called from `freeze_model()`.
+Every trainer inherits both, so `BaseTrainer.setup_lora()` reaches the same code.
 A single native path wraps the model with `VeOmniLoraModel`, handling dense `nn.Linear`
 LoRA, MoE expert LoRA, and the two combined:
 
 ```python
-# veomni/trainer/base.py
-def _setup_lora(self):
-    lora_config = self.args.model.lora_config
+# veomni/models/model_runtime.py
+def setup_lora(self):
+    lora_config = self.args.lora_config
     if not bool(lora_config):
         return
 
@@ -127,15 +128,9 @@ original model, so every LoRA parameter FQN and every saved adapter key carries 
 `generate` are unchanged. After wrapping, the base model is fully frozen and only the LoRA
 parameters (dense `LoraLinear` and MoE-LoRA, if any) have `requires_grad=True`.
 
-`BaseTrainer._init_callbacks()` automatically selects `HFLoraCkptCallback`
-instead of `HuggingfaceCkptCallback` when `lora_config` is set:
-
-```python
-if self.args.model.lora_config:
-    self.hf_ckpt_callback = HFLoraCkptCallback(self)
-else:
-    self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
-```
+`BaseTrainer._init_callbacks()` registers one `ModelHfCallback` either way. The export format
+is the model's decision, not the callback's: a model that trains only adapters exports the
+adapter, so there is nothing for a LoRA-specific callback to do.
 
 ### 2.1 LoRA MFU and FLOPs accounting
 
@@ -206,7 +201,7 @@ VeOmni LoRA training uses FSDP2 with `init_device: meta`. Weight loading goes th
 1. **Base-model weights**: loaded via `rank0_load_and_broadcast_weights` or
    `load_model_weights` — the standard FSDP2 path, unchanged for LoRA.
 
-2. **Adapter weights** (resume only): `_build_parallelized_model` passes `adapter_path`
+2. **Adapter weights** (resume only): `build_parallelized_model` passes `adapter_path`
    to `build_parallelize_model`, which — for a `VeOmniLoraModel` — calls the native
    `veomni.lora.weight_loading.load_lora_weights` (all-ranks read) or
    `rank0_load_and_broadcast_lora_weights` (rank-0 reads then broadcasts). Both read the
@@ -233,14 +228,18 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 
 ### DCP checkpoint (training state)
 
-`CheckpointerCallback._save_checkpoint` saves the full distributed state (model + optimizer +
-extra state) via PyTorch DCP. For LoRA training this includes both base-model parameters
-**and** adapter parameters; the optimizer state only covers the trainable adapter parameters.
+`ModelDcpCallback` decides *when* to save and calls `trainer.save_dcp`, which fans out to
+`trainer.model.save_dcp` and lands in `ModelCheckpointManager`
+(`veomni/models/checkpoint_manager.py`), which saves the
+full distributed state (model + optimizer + extra state) via PyTorch DCP. For LoRA training
+this includes both base-model parameters **and** adapter parameters; the optimizer state only
+covers the trainable adapter parameters.
 
 ### HF LoRA adapter (inference artifact)
 
-`HFLoraCkptCallback._save_checkpoint` calls `save_lora_adapter_with_dcp`
-(`veomni/utils/save_safetensor_utils.py`), which:
+`ModelHfCallback` drives `trainer.save_hf_or_lora`. The format is the model's decision, not
+the callback's: a model that trains only adapters exports the adapter, via
+`save_lora_adapter_with_dcp` (`veomni/utils/save_safetensor_utils.py`), which:
 
 1. Extracts adapter-only tensors via `veomni.lora.state_dict.get_lora_state_dict`
    (PEFT on-disk key format).
@@ -307,7 +306,7 @@ model:
 The mapping is driven by a per-model `_convert_lora_targets_to_parameters` hook
 (registered in the model's `__init__.py`) plus
 `veomni.lora.resolve_fused_moe_lora_targets`, invoked by
-`BaseTrainer._setup_lora` before the adapter is built. It is a **no-op on dense
+`BaseTrainer.setup_lora` before the adapter is built. It is a **no-op on dense
 models and on models without the hook**, so `gate_proj` / `up_proj` /
 `down_proj` there stay ordinary `nn.Linear` LoRA targets.
 
@@ -652,7 +651,7 @@ bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
     --train.num_train_epochs 3
 ```
 
-`HFLoraCkptCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.{bin,safetensors}}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`).
+`ModelHfCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.{bin,safetensors}}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`).
 
 ---
 

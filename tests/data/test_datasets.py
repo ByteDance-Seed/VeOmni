@@ -14,10 +14,9 @@ import torch
 import yaml
 from tools import resolve_ops_overrides
 from torch.utils.data import DistributedSampler
-from transformers import PretrainedConfig
 from utils import (
     DummyDataset,
-    FakeModel,
+    FakeModelRuntime,
     ShardedMappingDataset,
     compare_global_batch,
     compare_items,
@@ -33,12 +32,11 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks import (
     Callback,
-    CheckpointerCallback,
     EnvironMeterCallback,
+    GlobalStateCallback,
     TrainerState,
 )
 from veomni.utils import helper
-from veomni.utils.device import get_device_type
 from veomni.utils.helper import get_cache_dir
 
 
@@ -57,17 +55,12 @@ class TrainerTest(BaseTrainer):
 
     def _init_callbacks(self):
         self.environ_meter_callback = EnvironMeterCallback(self)
-        self.checkpointer_callback = CheckpointerCallbackTest(self)
+        self.global_state_callback = GlobalStateCallbackTest(self)
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
-    def _build_model(self):
-        # only build fake model
-        self.model = FakeModel().to(get_device_type())
-        self.model_config = PretrainedConfig()
-
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
+    def build_model_runtime(self):
+        return FakeModelRuntime(self.args.model, train=self.args.train)
 
     def _build_data_transform(self):
         args: VeOmniArguments = self.args
@@ -78,33 +71,33 @@ class TrainerTest(BaseTrainer):
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
+        self.global_state_callback.on_train_begin(self.state)
         self.check_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
+        self.global_state_callback.on_train_end(self.state)
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.global_state_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
         self.state.curr_step = 0
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
+        self.global_state_callback.on_epoch_end(self.state)
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.global_state_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.global_state_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(
@@ -127,7 +120,7 @@ class TrainerTest(BaseTrainer):
             super().destroy_distributed()
 
 
-class CheckpointerCallbackTest(CheckpointerCallback):
+class GlobalStateCallbackTest(GlobalStateCallback):
     trainer: TrainerTest
 
     def on_step_end(self, state: TrainerState, **kwargs):
@@ -135,7 +128,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
         if state.epoch == 1 and not self.trainer.is_resume:
-            self._save_checkpoint(state)
+            self.save_global_state(state)
             self.trainer.resume_dcp_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}"
             )
@@ -144,7 +137,7 @@ class CheckpointerCallbackTest(CheckpointerCallback):
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         if self.trainer.is_resume:
-            self._load_checkpoint()
+            self.load_global_state()
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
         pass

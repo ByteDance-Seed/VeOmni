@@ -45,7 +45,8 @@ class BaseRLTrainer(BaseTrainer):
         with use_parallel_state("base"):
             self._build_preforward_postforward()
 
-    # post init preforward and postforward hooks
+    # ── Trainer build functions ────────────────────────────────
+
     def _build_preforward_postforward(self):
         """Build preforward and postforward hooks."""
         self.pre_forward = Preforward()
@@ -76,6 +77,8 @@ class BaseRLTrainer(BaseTrainer):
             build_collate_fn=False,
             **dataloader_kwargs,
         )
+
+    # ── Trainer train step functions ────────────────────────────────
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         micro_batch = self.pre_forward(micro_batch)

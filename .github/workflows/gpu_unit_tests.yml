@@ -143,6 +143,7 @@ jobs:
       - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
+          uv run --frozen pytest -s -x tests/models/test_model_runtime.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -s -x tests/lora/test_vlm_lora.py

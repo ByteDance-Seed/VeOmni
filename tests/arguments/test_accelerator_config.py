@@ -227,15 +227,18 @@ def test_batch_config_follows_a_model_level_ulysses_override(world_size):
 def test_model_runtime_arguments_is_a_standalone_training_unit():
     """What an omni module inherits: model fields + its own accelerator/optimizer.
 
-    Notably without ``config_path``/``tokenizer_path``/``safetensor_idx_path`` — a
-    module is addressed by its subfolder in a composed checkpoint, so inheriting
-    those would hand every module a tokenizer it has no use for.
+    ``config_path`` is among them because every unit has to say where its
+    architecture is defined, even when that is just its own subfolder — the
+    runtime reads it directly rather than asking the job to hand one over.
+    ``tokenizer_path`` and ``safetensor_idx_path`` are not: a module inside a
+    composed checkpoint is addressed by its subfolder, so inheriting those would
+    hand every module a tokenizer it has no use for.
     """
     names = {f.name for f in dataclasses.fields(ModelRuntimeArguments)}
 
-    assert {"model_path", "model_config", "basic_modules", "lora_config", "ops_implementation"} <= names
-    assert {"accelerator", "optimizer"} <= names
-    assert names.isdisjoint({"config_path", "tokenizer_path", "safetensor_idx_path"})
+    assert {"model_path", "config_path", "model_config", "basic_modules", "lora_config"} <= names
+    assert {"processor_config", "ops_implementation", "accelerator", "optimizer"} <= names
+    assert names.isdisjoint({"tokenizer_path", "safetensor_idx_path"})
 
 
 def test_base_localizes_model_path_so_every_subclass_inherits_it(monkeypatch):

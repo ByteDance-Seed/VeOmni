@@ -26,6 +26,8 @@ Images are resized by `smart_resize` to satisfy three constraints simultaneously
 
 The resize preserves aspect ratio: it scales H and W by the same factor, then rounds to `scale_factor` multiples.
 
+`mm_configs` is the only place to set a pixel budget. The HuggingFace processor applies its own cap afterwards, taken from the checkpoint's `preprocessor_config.json`, so a budget written in both places leaves the smaller one silently in charge. Set `scale_factor` to the model's patch alignment (28 for Qwen-VL) so the processor has nothing left to round, and override the checkpoint's cap through `model.processor_config` only when the checkpoint itself is wrong.
+
 **Example config:**
 ```yaml
 data:

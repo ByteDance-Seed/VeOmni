@@ -8,17 +8,16 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
-    CheckpointerCallback,
-    HuggingfaceCkptCallback,
+    ModelDcpCallback,
+    ModelHfCallback,
 )
 
 
 def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
-    """Build a minimal mock trainer for CheckpointerCallback tests."""
+    """Build a minimal mock trainer for ModelDcpCallback tests."""
     checkpoint_cfg = SimpleNamespace(
         save_path=save_path,
         save_steps=5,
@@ -44,115 +43,82 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
 
     trainer = MagicMock()
     trainer.args = args
+    # The trainer fans out to its model handles; these callbacks only decide when.
     trainer.model = MagicMock()
-    trainer.optimizer = MagicMock()
-    trainer.lr_scheduler = MagicMock()
     trainer.train_dataloader = MagicMock()
     trainer.environ_meter = MagicMock()
     trainer.channel_loss_callback = MagicMock()
     trainer.channel_loss_callback.state_dict.return_value = {}
-    trainer.checkpointer = MagicMock()
-    trainer.checkpointer.save_future = None
-    trainer.model_assets = []
 
     return trainer
 
 
-@patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer")
-@patch("veomni.trainer.callbacks.checkpoint_callback.dist")
 @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
-class TestCheckpointerCallbackLastSavedStep:
-    """Tests for CheckpointerCallback._last_saved_step placement."""
+class TestModelDcpCallbackLastSavedStep:
+    """Tests for ModelDcpCallback._last_saved_step placement."""
 
-    def test_last_saved_step_updated_after_successful_save(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_last_saved_step_updated_after_successful_save(self, mock_helper):
         trainer = _make_mock_trainer()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        cb = CheckpointerCallback(trainer)
+        cb = ModelDcpCallback(trainer)
         state = TrainerState(global_step=10)
 
         assert cb._last_saved_step == -1
         cb._save_checkpoint(state)
         assert cb._last_saved_step == 10
 
-    def test_last_saved_step_not_updated_on_save_failure(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_last_saved_step_not_updated_on_save_failure(self, mock_helper):
         trainer = _make_mock_trainer()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        trainer.checkpointer.save.side_effect = RuntimeError("disk full")
-        cb = CheckpointerCallback(trainer)
+        trainer.save_dcp.side_effect = RuntimeError("disk full")
+        cb = ModelDcpCallback(trainer)
         state = TrainerState(global_step=10)
 
         with pytest.raises(RuntimeError, match="disk full"):
             cb._save_checkpoint(state)
         assert cb._last_saved_step == -1
 
-    def test_save_includes_channel_loss_callback_state(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_the_dcp_save_carries_no_job_level_state(self, mock_helper):
+        """Job state has its own writer; a model checkpoint only holds the model.
+
+        With several models in one job there is one dataloader cursor but N of
+        these checkpoints, so a cursor in here would be written N times over.
+        """
         trainer = _make_mock_trainer()
-        trainer.channel_loss_callback.state_dict.return_value = {
-            "source_registry": [(1, "train/a")],
-        }
-        mock_build_ckpt.return_value = trainer.checkpointer
-        cb = CheckpointerCallback(trainer)
+        cb = ModelDcpCallback(trainer)
 
         cb._save_checkpoint(TrainerState(global_step=10))
 
-        checkpoint_state = trainer.checkpointer.save.call_args.args[1]
-        assert checkpoint_state["extra_state"]["channel_loss_callback"] == {"source_registry": [(1, "train/a")]}
+        trainer.save_dcp.assert_called_once()
+        assert trainer.save_dcp.call_args.args == (TrainerState(global_step=10),)
+        assert not trainer.save_dcp.call_args.kwargs
 
-    def test_load_restores_channel_loss_callback_state(self, mock_helper, mock_dist, mock_build_ckpt):
-        trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = "/tmp/test_ckpt/global_step_7"
-        trainer.args.train_steps = 100
-        trainer.state = TrainerState()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        callback_state = {"source_registry": [(1, "train/a")]}
-
-        def load_checkpoint(path, state, **kwargs):
-            state["extra_state"] = {
-                "global_step": 7,
-                "lr_scheduler": {},
-                "train_dataloader": None,
-                "environ_meter": {},
-                "channel_loss_callback": callback_state,
-                "torch_rng_state": torch.get_rng_state(),
-            }
-
-        trainer.checkpointer.load.side_effect = load_checkpoint
-        cb = CheckpointerCallback(trainer)
-
-        cb._load_checkpoint()
-
-        trainer.channel_loss_callback.load_state_dict.assert_called_once_with(callback_state)
-
-    def test_epoch_end_retries_after_failed_save(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_epoch_end_retries_after_failed_save(self, mock_helper):
         """If save fails at step_end, epoch_end should still attempt to save (not skip)."""
         trainer = _make_mock_trainer()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        cb = CheckpointerCallback(trainer)
+        cb = ModelDcpCallback(trainer)
         cb.every_n_steps = 5
         cb.every_n_epochs = 1
 
         state = TrainerState(global_step=5, epoch=0)
 
         # Simulate save failure at step_end
-        trainer.checkpointer.save.side_effect = RuntimeError("disk full")
+        trainer.save_dcp.side_effect = RuntimeError("disk full")
         with pytest.raises(RuntimeError):
             cb.on_step_end(state)
         assert cb._last_saved_step == -1
 
         # Now the disk is available again
-        trainer.checkpointer.save.side_effect = None
-        trainer.checkpointer.save.reset_mock()
+        trainer.save_dcp.side_effect = None
+        trainer.save_dcp.reset_mock()
 
         # epoch_end should NOT skip because _last_saved_step was not updated
         cb.on_epoch_end(state)
-        assert trainer.checkpointer.save.call_count == 1
+        assert trainer.save_dcp.call_count == 1
         assert cb._last_saved_step == 5
 
-    def test_epoch_end_skips_after_successful_step_save(self, mock_helper, mock_dist, mock_build_ckpt):
+    def test_epoch_end_skips_after_successful_step_save(self, mock_helper):
         """If save succeeds at step_end, epoch_end should skip duplicate save."""
         trainer = _make_mock_trainer()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        cb = CheckpointerCallback(trainer)
+        cb = ModelDcpCallback(trainer)
         cb.every_n_steps = 5
         cb.every_n_epochs = 1
 
@@ -161,78 +127,62 @@ class TestCheckpointerCallbackLastSavedStep:
         cb.on_step_end(state)
         assert cb._last_saved_step == 5
 
-        trainer.checkpointer.save.reset_mock()
+        trainer.save_dcp.reset_mock()
         cb.on_epoch_end(state)
         # Should skip — no new save call
-        trainer.checkpointer.save.assert_not_called()
+        trainer.save_dcp.assert_not_called()
 
 
-@patch("veomni.trainer.callbacks.checkpoint_callback.save_hf_safetensor")
-@patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer")
-@patch("veomni.trainer.callbacks.checkpoint_callback.dist")
 @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
-@patch("os.path.exists", return_value=True)
-class TestHuggingfaceCkptCallbackLastSavedStep:
-    """Tests for HuggingfaceCkptCallback._last_saved_step placement."""
+class TestModelHfCallbackLastSavedStep:
+    """Tests for ModelHfCallback._last_saved_step placement."""
 
-    def test_last_saved_step_updated_after_successful_hf_save(
-        self, mock_exists, mock_helper, mock_dist, mock_build_ckpt, mock_save_hf
-    ):
+    def test_last_saved_step_updated_after_successful_hf_save(self, mock_helper):
         trainer = _make_mock_trainer()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        cb = HuggingfaceCkptCallback(trainer)
+        cb = ModelHfCallback(trainer)
         state = TrainerState(global_step=10)
 
         assert cb._last_saved_step == -1
         cb._save_checkpoint(state)
         assert cb._last_saved_step == 10
 
-    def test_last_saved_step_not_updated_on_hf_save_failure(
-        self, mock_exists, mock_helper, mock_dist, mock_build_ckpt, mock_save_hf
-    ):
+    def test_last_saved_step_not_updated_on_hf_save_failure(self, mock_helper):
         trainer = _make_mock_trainer()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        mock_save_hf.side_effect = RuntimeError("conversion failed")
-        cb = HuggingfaceCkptCallback(trainer)
+        trainer.save_hf_or_lora.side_effect = RuntimeError("conversion failed")
+        cb = ModelHfCallback(trainer)
         state = TrainerState(global_step=10)
 
         with pytest.raises(RuntimeError, match="conversion failed"):
             cb._save_checkpoint(state)
         assert cb._last_saved_step == -1
 
-    def test_train_end_retries_after_failed_hf_save(
-        self, mock_exists, mock_helper, mock_dist, mock_build_ckpt, mock_save_hf
-    ):
+    def test_train_end_retries_after_failed_hf_save(self, mock_helper):
         """If HF save fails at step_end, train_end should still attempt to save."""
         trainer = _make_mock_trainer()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        cb = HuggingfaceCkptCallback(trainer)
+        cb = ModelHfCallback(trainer)
         cb.every_n_steps = 5
 
         state = TrainerState(global_step=5, epoch=0)
 
         # Simulate HF save failure at step_end
-        mock_save_hf.side_effect = RuntimeError("conversion failed")
+        trainer.save_hf_or_lora.side_effect = RuntimeError("conversion failed")
         with pytest.raises(RuntimeError):
             cb.on_step_end(state)
         assert cb._last_saved_step == -1
 
         # Now the save works
-        mock_save_hf.side_effect = None
-        mock_save_hf.reset_mock()
+        trainer.save_hf_or_lora.side_effect = None
+        trainer.save_hf_or_lora.reset_mock()
 
         # train_end should NOT skip because _last_saved_step was not updated
         cb.on_train_end(state)
-        assert mock_save_hf.call_count == 1
+        assert trainer.save_hf_or_lora.call_count == 1
         assert cb._last_saved_step == 5
 
-    def test_train_end_skips_after_successful_step_save(
-        self, mock_exists, mock_helper, mock_dist, mock_build_ckpt, mock_save_hf
-    ):
+    def test_train_end_skips_after_successful_step_save(self, mock_helper):
         """If HF save succeeds at step_end, train_end should skip."""
         trainer = _make_mock_trainer()
-        mock_build_ckpt.return_value = trainer.checkpointer
-        cb = HuggingfaceCkptCallback(trainer)
+        cb = ModelHfCallback(trainer)
         cb.every_n_steps = 5
 
         state = TrainerState(global_step=5, epoch=0)
@@ -240,6 +190,6 @@ class TestHuggingfaceCkptCallbackLastSavedStep:
         cb.on_step_end(state)
         assert cb._last_saved_step == 5
 
-        mock_save_hf.reset_mock()
+        trainer.save_hf_or_lora.reset_mock()
         cb.on_train_end(state)
-        mock_save_hf.assert_not_called()
+        trainer.save_hf_or_lora.assert_not_called()

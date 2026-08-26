@@ -1318,18 +1318,33 @@ class OpsImplementationConfig:
 class BaseModelArguments:
     """Model fields shared by every trainable unit, whole model or single module.
 
-    Deliberately excludes the config/tokenizer/index paths: an omni module is
+    Deliberately excludes the tokenizer and index paths: an omni module is
     addressed by its subfolder inside a composed checkpoint and never carries
     its own tokenizer, so those belong on :class:`ModelArguments` alone.
+    ``config_path`` is here because every unit has to say where its architecture
+    is defined, even when that is just its own subfolder.
     """
 
     model_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
     )
+    config_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
+    )
     model_config: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config to overwrite foundation model config."},
+    )
+    processor_config: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Kwargs to overwrite the processor/tokenizer config, e.g. "
+                "`size: {shortest_edge: 3136, longest_edge: 602112}` for a Qwen-VL image processor."
+            )
+        },
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
@@ -1348,6 +1363,9 @@ class BaseModelArguments:
         # ``model_path`` that exists on disk before any loader touches it, and a
         # composed model resolves its module subfolders against this root.
         self.model_path = _resolve_hdfs_path(self.model_path)
+        self.config_path = _resolve_hdfs_path(self.config_path)
+        if self.config_path is None:
+            self.config_path = self.model_path
 
     def _safetensor_idx_path(self) -> Optional[str]:
         """Where to read the HF ``weight_map`` from. Overridden to allow an explicit path."""
@@ -1405,10 +1423,6 @@ class ModelRuntimeArguments(BaseModelArguments):
 class ModelArguments(ModelRuntimeArguments):
     """model.* — One composed model, plus the paths its loaders resolve from."""
 
-    config_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
-    )
     tokenizer_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
@@ -1426,12 +1440,9 @@ class ModelArguments(ModelRuntimeArguments):
 
         # Download HDFS-hosted paths to a local cache before resolving defaults so
         # that all downstream loaders (config/tokenizer/safetensors) see local paths.
+        # ``super()`` settles ``config_path``, which the tokenizer then falls back to.
         super().__post_init__()
-        self.config_path = _resolve_hdfs_path(self.config_path)
         self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
-
-        if self.config_path is None:
-            self.config_path = self.model_path
 
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
@@ -1538,9 +1549,16 @@ class DataArguments:
         default=None,
         metadata={"help": "Key to get text from the training data."},
     )
-    chat_template: str = field(
-        default="default",
-        metadata={"help": "Chat template to use."},
+    chat_template: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Chat template used to lay conversations out into training samples. "
+                "Leave unset for data that carries no conversation structure (plaintext, "
+                "diffusion) or for a model that formats prompts through its own processor "
+                "(Qwen-Omni)."
+            )
+        },
     )
     max_seq_len: int = field(
         default=2048,

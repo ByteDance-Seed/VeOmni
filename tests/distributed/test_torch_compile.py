@@ -429,20 +429,21 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     monkeypatch.setattr("veomni.trainer.vlm_trainer.mark_compile_step_begin", marks.append)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.count_loss_token", lambda _: 1)
     monkeypatch.setattr("veomni.trainer.vlm_trainer.reduce_global_loss_token", lambda token_count: token_count)
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.veomni_clip_grad_norm", lambda *_: torch.tensor(0.0))
 
     trainer = VLMTrainer.__new__(VLMTrainer)
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(model=SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=1.0))),
         state=SimpleNamespace(global_step=0),
-        model=SimpleNamespace(_veomni_compile_uses_cuda_graphs=True),
+        model=SimpleNamespace(
+            _veomni_compile_uses_cuda_graphs=True,
+            clip_grad_norm=lambda: torch.tensor(0.0),
+            optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
+            lr_scheduler=SimpleNamespace(step=lambda: None),
+        ),
         model_reshard=lambda *_: None,
         _configure_hsdp_allreduce=lambda *_: None,
         sync_before_train_step=lambda: None,
         forward_backward_step=lambda _: (torch.tensor(1.0), {}),
-        optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
-        lr_scheduler=SimpleNamespace(step=lambda: None),
         on_step_begin=lambda **_: None,
         on_step_end=lambda **_: None,
     )
@@ -452,34 +453,39 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     assert marks == [True, True]
 
 
-def test_vlm_trainer_rejects_unsupported_compile_model_before_data_setup(monkeypatch):
-    from veomni.trainer.vlm_trainer import VLMTrainer
+def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatch):
+    # The rejection has to land during the model build, which the runtime does on
+    # construction — i.e. before the trainer touches data.
+    from veomni.trainer.vlm_trainer import VLMModelRuntime
 
     calls = []
 
-    def build_unsupported_model(trainer):
+    def build_unsupported_model(runtime):
         calls.append("build_model")
-        trainer.base.model = ToyModel()
-        trainer.base.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
-        trainer.base.model.input_modalities = ("image", "text")
+        runtime.model = ToyModel()
+        runtime.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
+        runtime.model.input_modalities = ("image", "text")
+        runtime.model_config = runtime.model.config
+        runtime._validate_torch_compile()
 
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.BaseTrainer._setup", lambda _: None)
-    monkeypatch.setattr("veomni.trainer.vlm_trainer.use_parallel_state", lambda _: nullcontext())
-    monkeypatch.setattr(VLMTrainer, "_build_model", build_unsupported_model)
-    monkeypatch.setattr(VLMTrainer, "_freeze_model_module", lambda _: calls.append("freeze_model"))
+    # No mesh is registered here, and none is needed: the rejection happens
+    # before anything reads one. Stubbing ``setup`` alone would leave the
+    # build's own scope looking for a state that was never registered.
+    monkeypatch.setattr(VLMModelRuntime, "setup", lambda _: None)
+    monkeypatch.setattr("veomni.models.model_runtime.use_parallel_state", lambda _name: nullcontext())
+    monkeypatch.setattr(VLMModelRuntime, "build_model", build_unsupported_model)
+    monkeypatch.setattr(VLMModelRuntime, "freeze_model", lambda _: calls.append("freeze_model"))
 
     args = SimpleNamespace(
-        model=SimpleNamespace(
-            accelerator=SimpleNamespace(
-                torch_compile=ArgumentsTorchCompileConfig(enable=True),
-                ulysses_size=1,
-                cp_size=1,
-                enable_async=False,
-            ),
-        )
+        accelerator=SimpleNamespace(
+            torch_compile=ArgumentsTorchCompileConfig(enable=True),
+            ulysses_size=1,
+            cp_size=1,
+            enable_async=False,
+        ),
     )
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
-        VLMTrainer(args)
+        VLMModelRuntime(args, train=SimpleNamespace())
 
     assert calls == ["build_model"]
 

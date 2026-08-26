@@ -61,13 +61,6 @@ class ChatTemplate(ABC):
     def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
         self.tokenizer = tokenizer
 
-    def save_pretrained(self, output_dir: str) -> None:
-        self.tokenizer.chat_template = self.get_jinja_template()
-        try:
-            self.tokenizer.save_pretrained(output_dir)
-        except Exception:
-            logger.warning("Failed to save tokenizer.")
-
     @abstractmethod
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         """
@@ -75,12 +68,17 @@ class ChatTemplate(ABC):
         """
         ...
 
-    @abstractmethod
     def get_jinja_template(self) -> str:
+        """This template's layout expressed as jinja, for whoever wants to serialise it.
+
+        Optional, and read by nothing in the training or export path: training
+        lays out tokens through :meth:`encode_messages`, and an export keeps the
+        jinja the checkpoint shipped with rather than substituting a job's
+        formatting choice. A layout that jinja cannot express — image
+        placeholders sized from the processor's grid parameters — says so by
+        leaving this alone.
         """
-        Gets the jinja template for the chat template.
-        """
-        ...
+        return ""
 
 
 @CHAT_TEMPLATE_REGISTRY.register("default")
@@ -308,9 +306,6 @@ class MultimodalChatTemplate(ChatTemplate):
         """
         Encodes messages to a dictionary of input_ids, attention_mask, labels, and mm with mm_seqlens.
         """
-
-    def get_jinja_template(self) -> str:
-        return ""
 
 
 class Qwen2VLTemplate(MultimodalChatTemplate):

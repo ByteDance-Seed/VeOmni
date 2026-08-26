@@ -23,11 +23,10 @@ import yaml
 from tools import resolve_ops_overrides
 from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
-from transformers import PretrainedConfig
 from utils import (
     DummyDataset,
-    FakeModel,
-    StepAwareResumeCheckpointerCallback,
+    FakeModelRuntime,
+    StepAwareResumeGlobalStateCallback,
     compare_global_batch,
     compare_metrics,
     mock_empty_cache,
@@ -42,7 +41,6 @@ from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, TrainerState
 from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
-from veomni.utils.device import get_device_type
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.helper import get_cache_dir
 
@@ -97,8 +95,8 @@ class TrainerTest(BaseTrainer):
     multisource_names = ["dataset_a", "dataset_b"]
     multisource_weights = [0.5, 0.5]
 
-    def _setup(self):
-        self.device, _ = setup_test_distributed(self.args)
+    def setup_distributed(self, args):
+        device, _ = setup_test_distributed(args)
 
         self.multisource_datasets = [DummyDataset(size=100, dataset_name=name) for name in self.multisource_names]
         self.multisource_paths = [dataset.save_path for dataset in self.multisource_datasets]
@@ -135,16 +133,10 @@ class TrainerTest(BaseTrainer):
         shuffle_field._field_type = dataclasses._FIELD
         self.args.data.__dataclass_fields__["shuffle"] = shuffle_field
         self.args.data.shuffle = False
+        return device
 
-    def _freeze_model_module(self):
-        pass
-
-    def _build_model(self):
-        self.model = FakeModel().to(get_device_type())
-        self.model_config = PretrainedConfig()
-
-    def _build_model_assets(self):
-        self.model_assets = [self.model_config]
+    def build_model_runtime(self):
+        return FakeModelRuntime(self.args.model, train=self.args.train)
 
     def _build_data_transform(self):
         self.data_transform = partial(_convert_list_to_tensor_fn, max_seq_len=self.args.data.max_seq_len)
@@ -198,14 +190,8 @@ class TrainerTest(BaseTrainer):
             prefetch_factor=args.data.dataloader.prefetch_factor,
         )
 
-    def _build_parallelized_model(self):
-        self.model.train()
-
-    def _build_optimizer(self):
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.model.optimizer.lr)
-
-    def _build_lr_scheduler(self):
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.0)
+    def build_lr_scheduler(self):
+        self.model.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.model.optimizer, lambda _: 1.0)
 
     def _build_training_context(self):
         self.model_fwd_context = nullcontext()
@@ -213,40 +199,40 @@ class TrainerTest(BaseTrainer):
 
     def _init_callbacks(self):
         self.environ_meter_callback = EnvironMeterCallbackTest(self)
-        self.checkpointer_callback = StepAwareResumeCheckpointerCallback(self)
+        self.global_state_callback = StepAwareResumeGlobalStateCallback(self)
         self.check_callback = CheckCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self):
         self.environ_meter_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
+        self.global_state_callback.on_train_begin(self.state)
         self.check_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
+        self.global_state_callback.on_train_end(self.state)
         self.check_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.state.curr_step = self.start_step - 1
         self.environ_meter_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
+        self.global_state_callback.on_epoch_begin(self.state)
         self.check_callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
         self.environ_meter_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
+        self.global_state_callback.on_epoch_end(self.state)
         self.check_callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         # we need to put the check callback before environ meter callback because the later one will remove 'ds_idx' and 'source_name' from it
         self.check_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.global_state_callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs) -> None:
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.global_state_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.check_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
@@ -272,7 +258,7 @@ class EnvironMeterCallbackTest(Callback):
         super().__init__(trainer)
         args = self.trainer.args
         self.trainer.environ_meter = helper.EnvironMeter(
-            config=trainer.model_config,
+            config=trainer.model.model_config,
             global_batch_size=args.train.global_batch_size,
             empty_cache_steps=args.train.empty_cache_steps,
             enable_multisource=args.data.enable_multisource,
@@ -303,7 +289,7 @@ class EnvironMeterCallbackTest(Callback):
             f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
             for k, v in step_train_metrics.items()
         }
-        step_train_metrics["training/lr"] = max(self.trainer.lr_scheduler.get_last_lr())
+        step_train_metrics["training/lr"] = max(self.trainer.model.lr_scheduler.get_last_lr())
 
         step_env_metrics.update(step_train_metrics)
         self.trainer.step_train_metrics = step_train_metrics

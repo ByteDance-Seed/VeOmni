@@ -117,6 +117,7 @@ DPO-specific hyperparameters, accessed via `dpo_config.*`.
 Root config: `VeOmniDPOArguments` (extends `VeOmniArguments`).
 
 * `DPOConfig` — `dpo_config.*`
+* `reference_model` — optional `ModelRuntimeArguments` for the frozen reference. Omit to reuse `model`. This is a full config (same shape as `model`), not a partial overlay.
 
 ---
 
@@ -149,6 +150,7 @@ Root config — assembles `model`, `data`, and `train`.
 | config_path | `Optional[str]` | `None` | Path to the model HuggingFace config (e.g. `config.json`). Defaults to `model_path`. |
 | model_path | `Optional[str]` | `None` | Path to the pre-trained model weights. If unset, random init is used. |
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
+| processor_config | `Optional[Dict]` | `{}` | Kwargs used to override the loaded processor / tokenizer config. See below. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
@@ -156,6 +158,20 @@ Root config — assembles `model`, `data`, and `train`.
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
+
+`processor_config` is to the preprocessor what `model_config` is to the architecture: its keys are forwarded to `AutoProcessor.from_pretrained`, overriding what the checkpoint ships. Leave it empty and the repository's own `preprocessor_config.json` is authoritative.
+
+Use it only for something the repository genuinely gets wrong for your run. Image resolution is **not** such a case — resize through `data.mm_configs` (`image_max_pixels`, `video_max_pixels`, `scale_factor`, ...), which caps the pixels before the processor ever sees them. Setting a pixel budget in both places gives you two caps whose minimum wins, which is how the budget written in a config ends up silently ignored.
+
+```yaml
+model:
+  processor_config:
+    size:
+      shortest_edge: 3136
+      longest_edge: 602112
+```
+
+> Do not use the legacy `max_pixels` / `min_pixels` keys. Transformers v5 accepts them only for backward compatibility and maps them onto `size`, mutating the image-processor class attribute in place — every processor of that class built later in the same process inherits the value.
 
 ### OpsImplementationConfig
 
@@ -231,7 +247,7 @@ NPU validation runs at two times:
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
 | text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
-| chat_template | `str` | `"default"` | Chat template name. |
+| chat_template | `Optional[str]` | `None` | Chat template used to lay conversations out into training samples. Leave unset for data with no conversation structure (plaintext, diffusion) or for a model that formats prompts through its own processor (Qwen-Omni). |
 | max_seq_len | `int` | `2048` | Maximum sequence length. |
 | silent_exception | `bool` | `False` | Whether to ignore exceptions when loading data. |
 | dataloader | `DataloaderConfig` | — | DataLoader construction parameters. |
@@ -582,3 +598,10 @@ derived argument groups below.
 | loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
+
+`reference_model.*` — optional full `ModelRuntimeArguments` for the frozen reference. Omit the block to reuse `model`. To use a different checkpoint, set the whole model-level block (paths and any accelerator that should differ):
+
+```yaml
+reference_model:
+  model_path: ./sft-checkpoint
+```

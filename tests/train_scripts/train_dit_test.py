@@ -7,7 +7,7 @@ import torch
 
 from veomni.arguments import parse_args
 from veomni.trainer.callbacks import Callback, TrainerState
-from veomni.trainer.dit_trainer import DiTTrainer, VeOmniDiTArguments
+from veomni.trainer.dit_trainer import DiTModelRuntime, DiTTrainer, VeOmniDiTArguments
 
 
 os.environ["NCCL_DEBUG"] = "OFF"
@@ -43,6 +43,16 @@ class LogDictSaveCallback(Callback):
                 json.dump(self.log_dict, f, indent=4)
 
 
+class TestDiTModelRuntime(DiTModelRuntime):
+    """No condition model needed – data arrives in model-ready format."""
+
+    def _build_condition_model(self, condition_model_type: str) -> None:
+        self.condition_model = None
+
+    def freeze_model(self) -> None:
+        pass
+
+
 class TestDiTTrainer(DiTTrainer):
     """DiTTrainer subclass for SP-alignment testing.
 
@@ -56,17 +66,8 @@ class TestDiTTrainer(DiTTrainer):
         super().__init__(args)
         self.base._log_callback = LogDictSaveCallback(self.base)
 
-    # ------------------------------------------------------------------
-    # No condition model needed – data arrives in model-ready format.
-    # ------------------------------------------------------------------
-    def _build_condition_model(self, condition_model_type: str) -> None:
-        self.condition_model = None
-
-    def _freeze_model_module(self) -> None:
-        self.base.lora = False
-
-    def _build_model_assets(self) -> None:
-        self.base.model_assets = [self.base.model.config]
+    def build_model_runtime(self) -> TestDiTModelRuntime:
+        return TestDiTModelRuntime(self.base.args.model, "base", train=self.base.args.train)
 
     def _build_data_transform(self) -> None:
         self.base.data_transform = process_dummy_example

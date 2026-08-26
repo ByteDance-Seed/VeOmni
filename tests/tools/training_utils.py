@@ -190,6 +190,26 @@ def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImp
     return OpsImplementationConfig(**merged)
 
 
+def unbuilt_runtime(args, *, cls=None, name: str = "base", train=None):
+    """A runtime holding only its config, for tests about seams rather than models.
+
+    Constructing one normally builds the model it wraps — the whole point of the
+    class — so a test that wants to inspect a config seam, or to drop a fake
+    module in by hand, has to bypass the constructor. ``args`` is this model's
+    own arguments, exactly as the constructor takes them; ``train`` is required
+    of a real runtime but optional here, since a seam that reads no job-wide
+    setting has no use for it.
+    """
+    from veomni.models.model_runtime import VeOmniModelRuntime
+
+    cls = cls or VeOmniModelRuntime
+    runtime = cls.__new__(cls)
+    runtime.args = args
+    runtime.model_name = name
+    runtime.train = train
+    return runtime
+
+
 def release_device_memory():
     """Synchronize GPU, run garbage collection, and empty CUDA cache."""
     from veomni.utils.device import empty_cache, synchronize

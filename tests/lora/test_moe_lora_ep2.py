@@ -203,7 +203,7 @@ def _parse_ep_slices(stdout: str) -> tuple[set, dict[str, tuple[int, int, int]]]
 
 
 def _load_adapter(adapter_dir: str) -> dict[str, torch.Tensor]:
-    """Load the consolidated ``adapter_model.safetensors`` written by HFLoraCkptCallback.
+    """Load the consolidated ``adapter_model.safetensors`` written by ModelHfCallback.
 
     ``save_lora_adapter_with_dcp`` consolidates on rank 0 with
     ``safe_serialization=True``, so the adapter is always safetensors
@@ -227,7 +227,7 @@ def _make_seeder_yaml(base_yaml: str, dest: str, *, max_steps: int, dcp_save_ste
         will load. Validates EP=2 -> full-shape gather path
         (``save_lora_adapter_with_dcp`` -> DCP consolidation).
       * **DCP shards** at step ``dcp_save_steps`` (and
-        ``max_steps`` -- ``CheckpointerCallback`` always saves the
+        ``max_steps`` -- ``ModelDcpCallback`` always saves the
         final step). The intermediate one is the resume target for
         the DCP round-trip subprocess.
 
@@ -301,7 +301,7 @@ def _make_dcp_resume_yaml(base_yaml: str, dcp_path: str, dest: str, *, max_steps
 
     The DCP resumer continues from the seeder's intermediate DCP
     checkpoint (``<seeder>/checkpoints/global_step_<dcp_save_steps>``)
-    and runs to ``max_steps`` -- ``CheckpointerCallback._load_checkpoint``
+    and runs to ``max_steps`` -- ``ModelDcpCallback._load_checkpoint``
     bumps ``global_step`` to the resumed value and the trainer
     continues the remaining ``max_steps - dcp_save_steps`` steps. We
     then compare the resumer's per-step trajectory against the
@@ -556,11 +556,11 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
        (or replicated for Shared mode), forward/backward go through
        the fused EP-aware kernel, and the two save callbacks fire:
 
-         * ``HFLoraCkptCallback`` at step ``_ALIGN_MAX_STEPS`` calls
+         * ``ModelHfCallback`` at step ``_ALIGN_MAX_STEPS`` calls
            ``save_lora_adapter_with_dcp`` which uses DCP to gather
            the EP shards back into the full ``[E, r, H]`` tensor on
            rank 0 before writing ``adapter_model.safetensors``.
-         * ``CheckpointerCallback`` at steps
+         * ``ModelDcpCallback`` at steps
            ``_DCP_SAVE_STEP`` (intermediate) and
            ``_ALIGN_MAX_STEPS`` writes sharded DCP shards
            (model + optimizer + RNG + dataloader cursor).
@@ -586,7 +586,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     4. **DCP resumer (EP=2)**. Loads the seeder's intermediate DCP
        shard at step ``_DCP_SAVE_STEP`` via
        ``train.checkpoint.load_path`` ->
-       ``CheckpointerCallback._load_checkpoint`` (which restores
+       ``ModelDcpCallback._load_checkpoint`` (which restores
        model + optimizer + RNG + dataloader cursor and bumps
        ``global_step``). Continues to ``_ALIGN_MAX_STEPS`` -- so it
        takes ``_ALIGN_MAX_STEPS - _DCP_SAVE_STEP`` more optimizer
