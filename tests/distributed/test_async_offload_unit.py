@@ -27,6 +27,7 @@ from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,
     PinnedBufferPool,
+    _has_private_dense_storage,
     apply_async_activation_offload,
     base_check_fn,
     get_offload_modules,
@@ -232,8 +233,18 @@ def test_async_offload_rejects_tensor_views_with_shared_storage():
     base = torch.arange(8.0)
     view = base[2:6]
 
+    assert not _has_private_dense_storage(view)
     assert not base_check_fn(view)
     torch.testing.assert_close(base, torch.arange(8.0))
+
+
+def test_private_dense_storage_allows_padded_contiguous_owner():
+    tensor = torch.arange(4.0)
+    tensor.untyped_storage().resize_(tensor.untyped_storage().nbytes() * 2)
+
+    assert _has_private_dense_storage(tensor)
+    alias = tensor.as_strided((2,), (1,), storage_offset=2)
+    assert not _has_private_dense_storage(alias)
 
 
 def test_async_offload_rejects_cpu_tensors():

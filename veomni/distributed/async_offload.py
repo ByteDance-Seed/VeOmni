@@ -58,21 +58,25 @@ def _is_active_accelerator_tensor(tensor) -> bool:
     return (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and tensor.device.type == get_device_type()
 
 
-def base_check_fn(tensor) -> bool:
-    if not _is_active_accelerator_tensor(tensor):
-        return False
+def _has_private_dense_storage(tensor) -> bool:
+    """Return whether ``tensor`` uniquely owns contiguous, possibly padded storage.
+
+    Expandable CUDA segments can make ``storage.nbytes()`` larger than the
+    logical tensor.  That padding is safe to swap only when this tensor is not
+    a view (``_base is None``) and starts at storage offset 0.  A non-zero
+    offset means another live tensor owns the prefix of the same storage.
+    """
     if isinstance(tensor, torch.nn.parameter.Parameter) or tensor._base is not None:
+        return False
+    if tensor.storage_offset() != 0 or not tensor.is_contiguous():
         return False
     storage_nbytes = tensor.untyped_storage().nbytes()
     tensor_nbytes = tensor.numel() * tensor.element_size()
-    # Expandable CUDA segments (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True)
-    # round device allocations up.  A contiguous tensor with ``_base is None``
-    # still uniquely owns that storage; extra trailing bytes are padding, not a
-    # view, so rejecting ``storage_nbytes != tensor_nbytes`` silently disables
-    # offload on the L20 GPU CI image.
-    if storage_nbytes <= 0 or storage_nbytes < tensor_nbytes or not tensor.is_contiguous():
-        return False
-    return True
+    return storage_nbytes > 0 and storage_nbytes >= tensor_nbytes
+
+
+def base_check_fn(tensor) -> bool:
+    return _is_active_accelerator_tensor(tensor) and _has_private_dense_storage(tensor)
 
 
 class PinnedBufferPool:
@@ -211,8 +215,7 @@ class GetCnt:
 
 class SwapTensor:
     def __init__(self, tensor, key, pool):
-        tensor_nbytes = tensor.numel() * tensor.element_size()
-        if tensor._base is not None or tensor.untyped_storage().nbytes() < tensor_nbytes or not tensor.is_contiguous():
+        if not _has_private_dense_storage(tensor):
             raise ValueError("Async activation offload requires a tensor with private, dense storage.")
 
         self.tensor = tensor
@@ -264,6 +267,9 @@ class SwapTensor:
         if self.stat != "d2h":
             return
         get_current_stream().wait_event(self.d2h_event)
+        # Stream wait only orders later GPU work. resize_(0) frees storage on
+        # the host thread, so the D2H copy must be host-complete first.
+        self.d2h_event.synchronize()
         self.tensor.untyped_storage().resize_(0)
         self.stat = "host"
 
