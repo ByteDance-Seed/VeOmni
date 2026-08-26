@@ -247,7 +247,7 @@ class _LogDictSaveCallback(Callback):
         self, state: TrainerState, loss: float, loss_dict: dict[str, float], grad_norm: float, **kwargs
     ) -> None:
         # ``loss`` is already a Python float (``total_loss += loss.item()``).
-        # ``grad_norm`` comes from ``veomni_clip_grad_norm`` and is a
+        # ``grad_norm`` comes from ``VeOmniModelRuntime.clip_grad_norm`` and is a
         # ``Tensor`` -- coerce so the json dump succeeds.
         self.log_dict["loss"].append(self._dp_avg(loss))
         self.log_dict["grad_norm"].append(float(grad_norm) if grad_norm is not None else 0.0)

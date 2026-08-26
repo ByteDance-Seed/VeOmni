@@ -7,7 +7,7 @@ This document details the Trainer system in VeOmni. While [Basic Modules](./basi
 The [`BaseTrainer`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/base.py) class is the foundation for all training tasks in VeOmni. It handles:
 
 - **Distributed Setup**: Initializes process groups and parallel states (DP, TP, EP, etc.).
-- **Component Construction**: Builds the model, optimizer, scheduler, and dataloaders using the configuration.
+- **Component Construction**: Builds a [`VeOmniModelRuntime`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/model_runtime.py) (model, freeze/LoRA, parallelize, optimizer, preprocessor) and the dataloaders.
 - **Training Loop**: Implements the standard training loop with gradient accumulation.
 - **State Management**: Handles checkpointing and resuming training.
 - **Extensibility**: Provides hooks and a callback system for customization.
@@ -15,10 +15,9 @@ The [`BaseTrainer`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/tr
 ### Core Attributes
 
 - `args`: Global arguments containing model, data, and training configurations.
-- `model`: The parallelized model (wrapped with FSDP/DDP).
-- `optimizer` & `lr_scheduler`: The optimizer and learning rate scheduler.
+- `model`: A `VeOmniModelRuntime`. The wrapped `nn.Module` is `trainer.model.model`; module APIs (`config`, `parameters()`, `trainer.model(**batch)`) still forward. Optimizer, lr-scheduler, tokenizer, processor, and `model_assets` live on the runtime (`trainer.model.optimizer`, …).
 - `train_dataloader`: The distributed dataloader.
-- `callbacks`: A handler for managing registered callbacks.
+- `state`: The `TrainerState` cursor dispatched to callbacks.
 
 ## Training Loop
 
@@ -37,19 +36,18 @@ The `train()` method is the entry point for training. It:
 
 ```python
 def train(self):
-    # ... setup ...
-    self.callbacks.call("on_train_begin", self.state)
+    self.on_train_begin()
 
     for epoch in range(self.start_epoch, args.train.num_train_epochs):
-        self.callbacks.call("on_epoch_begin", self.state)
+        self.on_epoch_begin()
 
-        data_iterator = iter(self.train_dataloader)
+        data_iterator = VeOmniIter(self.train_dataloader, ...)
         for _ in range(self.start_step, args.train_steps):
             self.train_step(data_iterator)
 
-        self.callbacks.call("on_epoch_end", self.state)
+        self.on_epoch_end()
 
-    self.callbacks.call("on_train_end", self.state)
+    self.on_train_end()
 ```
 
 ### The `train_step` Method
@@ -66,22 +64,19 @@ The `train_step()` method handles a single global training step, including gradi
 
 ```python
 def train_step(self, data_iterator):
-    # ...
     micro_batches: List[Dict[str, Any]] = next(data_iterator)
-    self.callbacks.call("on_step_begin", self.state, micro_batches=micro_batches)
+    self.on_step_begin(micro_batches=micro_batches)
 
-    # Gradient Accumulation Loop
     for micro_step, micro_batch in enumerate(micro_batches):
         loss, loss_dict = self.forward_backward_step(micro_batch)
         # ... accumulation ...
 
-    # Optimization
-    grad_norm = veomni_clip_grad_norm(self.model, self.args.model.optimizer.max_grad_norm)
+    grad_norm = self.model.clip_grad_norm()
     self.model.optimizer.step()
     self.model.lr_scheduler.step()
     self.model.optimizer.zero_grad()
 
-    self.callbacks.call("on_step_end", self.state, ...)
+    self.on_step_end(loss=..., loss_dict=..., grad_norm=grad_norm)
 ```
 
 ### Forward and Backward
@@ -112,7 +107,7 @@ VeOmni includes several built-in callbacks:
 
 ### Custom Callbacks
 
-You can create custom callbacks by inheriting from [`Callback`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/base.py) and registering them with `trainer.add_callback`.
+You can create custom callbacks by inheriting from [`Callback`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/base.py) and appending them to `trainer._callbacks` after `_init_callbacks()`.
 
 ```python
 from veomni.trainer.callbacks import Callback
@@ -122,20 +117,17 @@ class MyCustomCallback(Callback):
         if state.global_step % 100 == 0:
             print(f"Step {state.global_step}: Custom action executed.")
 
-# In your trainer
-trainer.add_callback(MyCustomCallback(trainer))
+# After BaseTrainer._init_callbacks()
+trainer._callbacks.append(MyCustomCallback(trainer))
 ```
 
 ## Customizing the Trainer
 
-To implement a specific training task (like VLM training), you should subclass `BaseTrainer` and override specific methods. The [`VLMTrainer`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py) serves as an excellent example.
+To implement a specific training task (like VLM training), compose a `BaseTrainer` and override the step that differs. Model-bound differences belong on a `VeOmniModelRuntime` subclass, not on the trainer. [`VLMTrainer`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py) is the in-tree example.
 
 ### Key Methods to Override
 
-1. **`post_init(self)`**:
-   Perform any additional initialization after the base setup.
-
-2. **`build_model_runtime(self)`**:
+1. **`build_model_runtime(self)`**:
    Return the runtime that owns this job's model. Auxiliary components — tokenizer, processor, chat template — are built there rather than on the trainer, so override `VeOmniModelRuntime.build_model_assets` on a runtime subclass if a model needs different ones.
    ```python
    def build_model_runtime(self) -> MyModelRuntime:
@@ -144,37 +136,20 @@ To implement a specific training task (like VLM training), you should subclass `
        )
    ```
 
-3. **`build_data_transform(self)`**:
-   Define how raw data samples are processed into model inputs. This is crucial for multimodal tasks where image/video processing is required.
+2. **`VeOmniModelRuntime.freeze_model` / `build_optimizer`**:
+   Freeze towers or split parameter groups on the runtime. `VLMModelRuntime` freezes ViT / audio and gives visual params a separate `vit_lr`.
+
+3. **`_build_data_transform(self)`**:
+   Define how raw data samples are processed into model inputs. Read the preprocessor off the runtime.
    ```python
-   def build_data_transform(self):
-       return partial(process_sample_function, processor=self.model.processor, ...)
+   def _build_data_transform(self):
+       self.data_transform = build_data_transform(
+           model_type, processor=self.model.processor, chat_template=self.model.chat_template, ...
+       )
    ```
 
-4. **`build_data_collate_info(self)`**:
-   Provide configuration for the data collator, such as which dimensions to pack or pad.
-   ```python
-   def build_data_collate_info(self):
-       return {"input_features": (0, True, 0, 1)} # Example for VLM
-   ```
-
-5. **`freeze_module(self)`**:
-   Freeze specific parts of the model (e.g., the vision encoder in a VLM).
-   ```python
-   def freeze_module(self):
-       if self.args.train.freeze_vit:
-           self.model.visual.requires_grad_(False)
-   ```
-
-6. **`build_param_groups(self)`**:
-   Define parameter groups for the optimizer, useful for setting different learning rates for different components.
-   ```python
-   def build_param_groups(self):
-       return [
-           {"params": vit_params, "lr": self.args.train.vit_lr},
-           {"params": other_params, "lr": self.args.model.optimizer.lr}
-       ]
-   ```
+4. **`_build_collate_fn(self)`**:
+   Wire extra collate rules. Prefer model hooks (`get_extra_collate_infos`, `get_metadata_collate_func`) over a trainer-side `model_type` switch.
 
 ### Extending Arguments
 

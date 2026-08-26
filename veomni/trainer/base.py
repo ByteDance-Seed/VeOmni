@@ -34,7 +34,7 @@ from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -484,14 +484,16 @@ class BaseTrainer(Stateful, ABC):
 
     # ── Trainer checkpoint functions ────────────────────────────────
 
-    def load(self) -> Optional[Dict[str, Any]]:
-        """Resume this job's model, handing back the extra state stored with it.
+    def load(self) -> None:
+        """Resume this job's model.
 
         The fan-out is the point: a trainer holding a second model (a DPO
         reference, a distillation teacher) extends this to load both, and the
-        callback that triggers it keeps knowing only *when*.
+        callback that triggers it keeps knowing only *when*. Extra state is
+        restored inside the checkpoint manager; job cursor lives on
+        ``GlobalStateCallback``.
         """
-        return self.model.load()
+        self.model.load()
 
     def save_dcp(self, state: TrainerState) -> None:
         """Write this job's resumable checkpoint for ``state.global_step``."""

@@ -437,13 +437,13 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
         model=SimpleNamespace(
             _veomni_compile_uses_cuda_graphs=True,
             clip_grad_norm=lambda: torch.tensor(0.0),
+            optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
+            lr_scheduler=SimpleNamespace(step=lambda: None),
         ),
         model_reshard=lambda *_: None,
         _configure_hsdp_allreduce=lambda *_: None,
         sync_before_train_step=lambda: None,
         forward_backward_step=lambda _: (torch.tensor(1.0), {}),
-        optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
-        lr_scheduler=SimpleNamespace(step=lambda: None),
         on_step_begin=lambda **_: None,
         on_step_end=lambda **_: None,
     )

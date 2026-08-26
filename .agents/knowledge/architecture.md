@@ -156,15 +156,16 @@ YAML Config -> VeOmniArguments -> Trainer
                                     │
                     ┌───────────────┼───────────────┐
                     v               v               v
-              build_model()   build_dataloader()  build_optimizer()
+         build_model_runtime()  build_dataloader()  build_lr_scheduler()
                     │               │               │
                     v               v               v
-              HF Model +      Dataset +         Optimizer +
-              VeOmni Patch     Collator          LR Scheduler
+              VeOmniModelRuntime  Dataset +     Runtime.lr_scheduler
+              (build/freeze/      Collator      (needs train_steps)
+               parallelize/opt)
                     │               │               │
                     v               v               v
-              Parallelize     Dynamic Batch     Grad Clip
-              (FSDP2)         + Data Transform  (fsdp2/clip_grad_norm)
+              FSDP2 wrap      Dynamic Batch     Runtime.clip_grad_norm()
+                              + Data Transform
                     │               │               │
                     └───────────────┼───────────────┘
                                     v

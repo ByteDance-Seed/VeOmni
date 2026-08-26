@@ -20,7 +20,6 @@ from veomni.arguments import (
     TrainingArguments,
 )
 from veomni.data.data_collator import MainCollator
-from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
 from veomni.utils.env import get_env
@@ -279,7 +278,6 @@ class TrainerTest(BaseTrainer):
             self.model.model = self.model.thinker
 
         print(f"{'-' * 10} {model_name}_{model_mode} {'-' * 10}")
-        args: VeOmniArguments = self.args
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
@@ -311,7 +309,7 @@ class TrainerTest(BaseTrainer):
             batch["position_ids"] = batch["position_ids"].transpose(0, 1).contiguous()
 
         loss, loss_dict = super().forward_backward_step(batch)
-        grad_norm = veomni_clip_grad_norm(self.model.model, args.model.optimizer.max_grad_norm)
+        grad_norm = self.model.clip_grad_norm()
 
         _release_device_memory()
         print_device_mem_info(f"[Memory Info] after model {model_name} train_one_step:")

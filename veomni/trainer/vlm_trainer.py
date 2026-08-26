@@ -345,7 +345,7 @@ class VLMTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
+        # Gradient clipping (reads FSDP/EP groups from this model's ParallelState)
         grad_norm = self.base.model.clip_grad_norm()
 
         # Optimizer and scheduler step

@@ -509,7 +509,7 @@ lr_scheduler = build_lr_scheduler(
 
 
 ## Train Loop
-After the parallel_state, model, optimizer, and dataloader are initialized, you can start the training loop.
+After the parallel_state, model, optimizer, and dataloader are initialized, you can start the training loop. The supported path is [`BaseTrainer`](./trainer.md), which owns this loop and reads optimizer / clip / preprocessor off `trainer.model` (`VeOmniModelRuntime`). The snippet below is the same shape, written out by hand:
 
 ```python
 for epoch in range(args.train.num_train_epochs):

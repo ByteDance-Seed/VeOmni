@@ -185,8 +185,8 @@ class TextDPOTrainer:
         self.reference_model.requires_grad_(False)
 
         cpu_load_param_name = None
-        if hasattr(self.model, "get_parallel_plan"):
-            cpu_load_param_name = getattr(self.model.get_parallel_plan(), "cpu_load_param_name", None)
+        if hasattr(self.base.model, "get_parallel_plan"):
+            cpu_load_param_name = getattr(self.base.model.get_parallel_plan(), "cpu_load_param_name", None)
 
         self.reference_model = build_parallelize_model(
             self.reference_model,
