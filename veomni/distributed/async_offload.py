@@ -348,6 +348,34 @@ class OffloadManager:
             self.items.pop(key)
 
 
+def _unpack_swap_tensor(manager, swap_tensor, *, prefetch: bool) -> torch.Tensor:
+    """Restore an offloaded activation.
+
+    PyTorch may invoke the unpack hook more than once for the same packed
+    object (``retain_graph=True``, ``create_graph=True``, or repeated saved-
+    tensor access).  The first call moves the tensor back to device and
+    drops the manager key; later calls must still return the restored tensor
+    without treating a missing key as an error.
+    """
+    if isinstance(swap_tensor, torch.Tensor):
+        return swap_tensor
+
+    d2h_stream = manager.swap_stream
+    h2d_stream = manager.swap_stream
+    swap_tensor.launch_h2d(h2d_stream)
+
+    get_current_stream().wait_event(swap_tensor.h2d_event)
+    swap_tensor.release_host_buffer()
+    swap_tensor.stat = "device"
+
+    if manager.exist(swap_tensor.key):
+        manager.clear(swap_tensor.key)
+        if prefetch:
+            block_idx, _tensor_idx = swap_tensor.key.split("_")
+            manager.prefetch_get(int(block_idx), h2d_stream, d2h_stream)
+    return swap_tensor.tensor
+
+
 def reset_async_activation_offload(model):
     """Reset all async-offload managers attached to ``model``.
 
@@ -401,23 +429,7 @@ class async_save_on_cpu(saved_tensors_hooks):
             return swap_tensor
 
         def _unpack_from_cpu(swap_tensor) -> torch.Tensor:
-            if isinstance(swap_tensor, torch.Tensor):
-                return swap_tensor
-
-            d2h_stream = manager.swap_stream
-            h2d_stream = manager.swap_stream
-            swap_tensor.launch_h2d(h2d_stream)
-
-            get_current_stream().wait_event(swap_tensor.h2d_event)
-            swap_tensor.release_host_buffer()
-            swap_tensor.stat = "device"
-
-            block_idx, tensor_idx = swap_tensor.key.split("_")
-            manager.clear(swap_tensor.key)
-
-            if prefetch:
-                manager.prefetch_get(int(block_idx), h2d_stream, d2h_stream)
-            return swap_tensor.tensor
+            return _unpack_swap_tensor(manager, swap_tensor, prefetch=prefetch)
 
         super().__init__(_pack_to_cpu, _unpack_from_cpu)
 

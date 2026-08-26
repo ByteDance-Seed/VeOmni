@@ -26,7 +26,10 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from veomni.arguments.arguments_types import OffloadConfig
 from veomni.distributed.async_offload import (
     GetCnt,
+    OffloadManager,
     PinnedBufferPool,
+    SwapTensor,
+    _unpack_swap_tensor,
     apply_async_activation_offload,
     base_check_fn,
     get_offload_modules,
@@ -303,6 +306,29 @@ def test_async_offload_manager_resets_at_step_boundary():
     assert not manager.items
     assert manager.getcnt._block_idx == -1
     assert manager.getcnt._block_tensor_nums == {}
+
+
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
+    reason="CUDA or NPU is required for async D2H/H2D validation",
+)
+def test_unpack_swap_tensor_survives_repeated_access():
+    device = torch.device(get_device_type())
+    manager = OffloadManager(host_cache_limit_bytes=1 << 20)
+    original = torch.randn(8, 8, device=device)
+    expected = original.detach().cpu().clone()
+    swap = SwapTensor(original, "0_0", manager.host_buffer_pool)
+    swap.launch_d2h(manager.swap_stream)
+    swap.wait_d2h_finished()
+    manager.put("0_0", swap)
+
+    first = _unpack_swap_tensor(manager, swap, prefetch=False)
+    assert not manager.exist("0_0")
+    torch.testing.assert_close(first.cpu(), expected)
+
+    second = _unpack_swap_tensor(manager, swap, prefetch=False)
+    torch.testing.assert_close(second.cpu(), expected)
+    assert second.data_ptr() == first.data_ptr()
 
 
 @pytest.mark.skipif(
