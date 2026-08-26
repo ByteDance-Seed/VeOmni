@@ -236,16 +236,23 @@ class _NpuRMSNorm:
 
 
 def _build_rms_norm(variant: str, impl_name: str) -> OpWrapper:
+    if variant == "qwen3_5":
+        offset, casting_mode = 1.0, "gemma"
+    elif variant == "standard":
+        offset, casting_mode = 0.0, "llama"
+    else:
+        raise KeyError(
+            f"Async Ulysses has no rms_norm wrapper for variant {variant!r}. Supported: ['qwen3_5', 'standard']."
+        )
+
     if impl_name == "eager":
-        return _EagerRMSNorm(offset=1.0 if variant == "qwen3_5" else 0.0)
+        return _EagerRMSNorm(offset=offset)
     if impl_name == "liger_kernel":
-        if variant == "qwen3_5":
-            return _LigerRMSNorm(offset=1.0, casting_mode="gemma")
-        return _LigerRMSNorm(offset=0.0, casting_mode="llama")
+        return _LigerRMSNorm(offset=offset, casting_mode=casting_mode)
     if impl_name == "npu":
         if not IS_NPU_AVAILABLE:
             raise RuntimeError("rms_norm implementation 'npu' requires an NPU device.")
-        return _NpuRMSNorm(offset=1.0 if variant == "qwen3_5" else 0.0)
+        return _NpuRMSNorm(offset=offset)
     raise KeyError(f"No async RMSNorm wrapper for impl={impl_name!r}, variant={variant!r}")
 
 
@@ -364,6 +371,11 @@ _SUPPORTED_IMPLEMENTATIONS: dict[str, frozenset[str]] = {
     "rotary_pos_emb": frozenset({"eager", "liger_kernel", "npu"}),
 }
 
+_SUPPORTED_VARIANTS: dict[str, frozenset[str]] = {
+    "rms_norm": frozenset({"standard", "qwen3_5"}),
+    "rotary_pos_emb": frozenset({"full"}),
+}
+
 _DEFAULT_VARIANTS: dict[str, str] = {
     "rms_norm": "standard",
     "rotary_pos_emb": "full",
@@ -397,10 +409,16 @@ def get_op_wrapper(op_name: str, variant: str | None = None) -> OpWrapper:
     spec = (op_name, variant) if variant is not None else op_name
     op_name, variant = _normalize_spec(spec)
     impl_name = _impl_name(op_name)
-    supported = _SUPPORTED_IMPLEMENTATIONS[op_name]
-    if impl_name not in supported:
+    supported_impls = _SUPPORTED_IMPLEMENTATIONS[op_name]
+    if impl_name not in supported_impls:
         raise KeyError(
-            f"Async Ulysses has no {op_name} wrapper for implementation {impl_name!r}. Supported: {sorted(supported)}."
+            f"Async Ulysses has no {op_name} wrapper for implementation {impl_name!r}. "
+            f"Supported: {sorted(supported_impls)}."
+        )
+    supported_variants = _SUPPORTED_VARIANTS[op_name]
+    if variant not in supported_variants:
+        raise KeyError(
+            f"Async Ulysses has no {op_name} wrapper for variant {variant!r}. Supported: {sorted(supported_variants)}."
         )
     key = (op_name, variant, impl_name)
     wrapper = _WRAPPERS.get(key)

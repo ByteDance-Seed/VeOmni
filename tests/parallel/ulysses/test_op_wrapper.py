@@ -321,3 +321,16 @@ def test_triton_implementation_raises() -> None:
         get_op_wrapper("rms_norm")
     with pytest.raises(KeyError, match="implementation 'triton'"):
         get_op_wrapper("rotary_pos_emb")
+
+
+def test_get_op_wrapper_accepts_supported_variants() -> None:
+    assert isinstance(get_op_wrapper("rms_norm", "standard"), _EagerRMSNorm)
+    assert isinstance(get_op_wrapper("rms_norm", "qwen3_5"), _EagerRMSNorm)
+    assert isinstance(get_op_wrapper("rotary_pos_emb", "full"), _EagerRotary)
+
+
+def test_unknown_variant_raises() -> None:
+    with pytest.raises(KeyError, match="variant 'unweighted'"):
+        get_op_wrapper("rms_norm", "unweighted")
+    with pytest.raises(KeyError, match="variant 'half'"):
+        get_op_wrapper("rotary_pos_emb", "half")
