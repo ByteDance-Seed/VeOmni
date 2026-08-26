@@ -824,7 +824,7 @@ def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch)
         train=SimpleNamespace(
             enable_batch_invariant_mode=False,
             local_rank=0,
-        )
+        ),
     )
     trainer.model = _TinyLossModel()
     trainer.model_fwd_context = nullcontext()
@@ -852,7 +852,7 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
             channel_loss=cfg,
             enable_batch_invariant_mode=False,
             local_rank=0,
-        )
+        ),
     )
     trainer.model = _TinyLossModel()
     trainer.model_fwd_context = nullcontext()
@@ -1039,7 +1039,9 @@ def test_dpo_channel_loss_emits_policy_totals(monkeypatch):
 
 
 def test_dit_rejects_channel_loss_before_initialization():
-    args = SimpleNamespace(train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True)))
+    args = SimpleNamespace(
+        train=SimpleNamespace(channel_loss=ChannelLossConfig(enable=True)),
+    )
     with pytest.raises(ValueError, match="causal-LM trainers"):
         DiTTrainer(args)
 

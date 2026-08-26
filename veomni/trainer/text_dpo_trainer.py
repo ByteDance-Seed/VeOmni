@@ -194,7 +194,7 @@ class TextDPOTrainer:
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
             torch_dtype=args.dpo_config.refer_model_precision,
-            init_device=args.train.init_device,
+            init_device=args.model.accelerator.init_device,
             ops_implementation=args.model.ops_implementation,
         )
 
@@ -206,20 +206,21 @@ class TextDPOTrainer:
 
         self.reference_model = build_parallelize_model(
             self.reference_model,
-            init_device=args.train.init_device,
+            init_device=args.model.accelerator.init_device,
             weights_path=args.model.model_path,
-            enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
+            enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=MixedPrecisionConfig(enable=False),  # In reference model, we will not use mixed precision
             enable_gradient_checkpointing=False,
             basic_modules=list(
                 set(getattr(self.reference_model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),
             enable_reentrant=False,
-            enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-            enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
-            broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
+            enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
+            enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
+            fsdp_offload_pin_memory=args.model.accelerator.fsdp_config.offload_pin_memory,
+            broadcast_model_weights_from_rank0=args.model.accelerator.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
-            max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+            max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
         )
         self.reference_model.eval()
         helper.print_device_mem_info("VRAM usage after building reference model")
@@ -430,7 +431,7 @@ class TextDPOTrainer:
                 total_loss_dict[k] += v.item()
 
         with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
 
         self.base.optimizer.step()
         self.base.lr_scheduler.step()

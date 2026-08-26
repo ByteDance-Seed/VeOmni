@@ -154,6 +154,20 @@ model:
     skip_encoder_load: true                 # must be true: do not load VAE/TextEncoder
     video_max_frames: 120
     video_max_resolution: 832
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    max_grad_norm: 1.0e9
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true                            # turning this off OOMs when memory is tight
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
 
 data:
   train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
@@ -167,21 +181,7 @@ train:
   training_task: offline_training
   global_batch_size: 8
   micro_batch_size: 1
-  init_device: meta
   max_steps: 30
-  gradient_checkpointing:
-    enable: true                            # turning this off OOMs when memory is tight
-  optimizer:
-    type: adamw
-    lr: 1.0e-5
-    max_grad_norm: 1.0e9
-  accelerator:
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: true
-        param_dtype: bfloat16
-        reduce_dtype: float32
   checkpoint:
     output_dir: output/minimax_h3_fl2va_offline
     save_steps: 10

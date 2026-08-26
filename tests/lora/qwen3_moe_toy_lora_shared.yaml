@@ -29,6 +29,10 @@ model:
       - model.layers.*.mlp.experts.gate_up_proj
       - model.layers.*.mlp.experts.down_proj
     share_expert_lora: true
+  accelerator:
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
 
 data:
   train_path: dummy
@@ -36,10 +40,6 @@ data:
 
 train:
   seed: 42
-  accelerator:
-    fsdp_config:
-      fsdp_mode: fsdp2
-  init_device: meta
   global_batch_size: 4
   micro_batch_size: 1
   max_steps: 4

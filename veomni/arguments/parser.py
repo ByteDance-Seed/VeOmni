@@ -115,13 +115,34 @@ def _add_arguments_recursive(parser: argparse.ArgumentParser, cls: Type[Any], pr
             parser.add_argument(f"--{arg_name}", **kwargs)
 
 
-def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
+def _reject_unknown_keys(cls: Type[Any], config_dict: Dict[str, Any], path: str) -> None:
+    """Fail on config keys the dataclass does not declare.
+
+    Silently dropping them is how a moved knob keeps its old default while the
+    config still looks like it sets something.
+    """
+    known = {field_info.name for field_info in dataclasses.fields(cls)}
+    unknown = [key for key in config_dict if key not in known]
+    if not unknown:
+        return
+
+    problems = []
+    for key in unknown:
+        dotted = f"{path}.{key}" if path else key
+        problems.append(f"  {dotted} is not a field of {cls.__name__} (known: {', '.join(sorted(known))})")
+
+    raise ValueError("Invalid configuration keys:\n" + "\n".join(problems))
+
+
+def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any], path: str = "") -> T:
     """
     Recursively convert a dictionary into Dataclass instances.
     This triggers __post_init__ validation at every level.
     """
     if not is_dataclass(cls):
         return config_dict
+
+    _reject_unknown_keys(cls, config_dict, path)
 
     try:
         type_hints = get_type_hints(cls)
@@ -150,7 +171,8 @@ def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
 
         # If the field expects a Dataclass and we have a dict, recurse
         if is_dataclass(field_type) and isinstance(raw_value, dict):
-            field_values[field_name] = _instantiate_recursive(field_type, raw_value)
+            child_path = f"{path}.{field_name}" if path else field_name
+            field_values[field_name] = _instantiate_recursive(field_type, raw_value, child_path)
         else:
             field_values[field_name] = raw_value
 
