@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 from tqdm import trange
 
@@ -207,7 +207,7 @@ class EnvironMeterCallback(Callback):
         self.start_time = time.time()
 
     def on_step_end(
-        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
+        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: Union[float, "torch.Tensor"], **kwargs
     ) -> None:
         delta_time = time.time() - self.start_time
         step_env_metrics = self.trainer.environ_meter.step(

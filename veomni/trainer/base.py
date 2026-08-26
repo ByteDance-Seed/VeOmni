@@ -559,6 +559,10 @@ class BaseTrainer(Stateful, ABC):
         if args.train.chunk_mbs_config.enable:
             kwargs["chunk_mbs_config"] = args.train.chunk_mbs_config
 
+        kwargs["enable_async_activation_offload"] = (
+            args.train.accelerator.offload_config.enable_async_activation_offload
+        )
+
         # A full non-LoRA resume already contains model weights. Skip the HF
         # materialization pass to avoid a second peak (HF load then checkpoint
         # overwrite) that can OOM large MoE jobs. LoRA resumes still need the HF base.
@@ -629,10 +633,29 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_training_context(self):
         """Build training context for distributed training."""
+        offload_config = self.args.train.accelerator.offload_config
+
+        # Async activation offload uses a global saved_tensors_hooks context
+        # that wraps the entire forward pass, correctly intercepting tensors
+        # saved by checkpoint's _NoopSaveInputs (non-reentrant) or
+        # CheckpointFunction (reentrant) before run_function is entered.
+        if offload_config.enable_async_activation_offload:
+            from ..distributed.async_offloading import (
+                build_async_activation_offloading_context,
+                register_delayed_release_hooks,
+            )
+
+            self.model_fwd_context, self.model_bwd_context = build_async_activation_offloading_context(
+                enable_async_activation_offload=True,
+            )
+            
+            register_delayed_release_hooks(self.model, self.model_fwd_context)
+            return
+
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
-            self.args.train.accelerator.offload_config.enable_activation,
+            offload_config.enable_activation,
             self.args.train.gradient_checkpointing.enable,
-            self.args.train.accelerator.offload_config.activation_gpu_limit,
+            offload_config.activation_gpu_limit,
         )
 
     def _init_callbacks(self):

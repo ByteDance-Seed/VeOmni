@@ -138,6 +138,7 @@ def parallelize_model_fsdp2(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    enable_gradient_checkpointing: bool = False,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
@@ -469,9 +470,8 @@ def parallelize_model_fsdp2(
     fully_shard(model, **root_fsdp_kwargs)
 
     # configure manual prefetching when needed
-    need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
-    ) and kwargs.pop("enable_forward_prefetch", True)
+    enable_forward_prefetch = kwargs.pop("enable_forward_prefetch", True)
+    need_manual_prefetch = enable_forward_prefetch and len(layer_pairs_list) > 0
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
         next_blocks = blocks[1:] + [None]
@@ -650,6 +650,11 @@ def build_parallelize_model(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
 
+    # Async activation offload is handled by a global saved_tensors_hooks
+    # context in BaseTrainer._build_training_context (not per-module patching).
+    # Pop the kwarg so it is not passed to downstream functions.
+    kwargs.pop("enable_async_activation_offload", None)
+
     if chunk_mbs_config is not None and chunk_mbs_config.enable:
         model = apply_chunk_mbs(model, chunk_mbs_config)
 
@@ -671,6 +676,7 @@ def build_parallelize_model(
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 compile_config=compile_config,
+                enable_gradient_checkpointing=enable_gradient_checkpointing,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
             )

@@ -1016,7 +1016,7 @@ class ChannelLossCallback(Callback):
         state: TrainerState,
         loss: float,
         loss_dict: dict[str, float],
-        grad_norm: float,
+        grad_norm: float | torch.Tensor,
         **kwargs: Any,
     ) -> None:
         if not self._collect_step:
