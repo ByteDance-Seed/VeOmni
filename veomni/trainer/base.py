@@ -57,7 +57,6 @@ from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.async_offload import apply_async_activation_offload, reset_async_activation_offload
-from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
@@ -207,40 +206,6 @@ class VeOmniIter:
         if hasattr(self.dataloader, "state_dict"):
             return self.dataloader.state_dict()
         return {}
-
-
-def _resolve_muon_lr(optimizer_cfg) -> float:
-    """Resolve Muon LR, inheriting AdamW lr under match_rms_adamw when unset."""
-    if optimizer_cfg.muon_lr is not None:
-        return float(optimizer_cfg.muon_lr)
-    adamw_lr = float(optimizer_cfg.lr)
-    if optimizer_cfg.muon_adjust_lr_fn == "match_rms_adamw":
-        return adamw_lr
-    # original: Moonlight-style ~25x AdamW lr starting point
-    return 25.0 * adamw_lr
-
-
-def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
-    """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
-    return {
-        "lr": _resolve_muon_lr(optimizer_cfg),
-        "momentum": optimizer_cfg.muon_momentum,
-        "nesterov": optimizer_cfg.muon_nesterov,
-        "weight_decay": optimizer_cfg.muon_weight_decay,
-        "ns_steps": optimizer_cfg.muon_ns_steps,
-        "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
-        "eps": optimizer_cfg.muon_eps,
-        "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
-        "ns_implementation": optimizer_cfg.muon_ns_implementation,
-        "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
-        # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
-        "head_group_size": int(optimizer_cfg.muon_head_group_size),
-        "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
-        # Surface for startup summary only; not a DistributedMuon ctor kwarg.
-        "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
-        "adamw_lr": float(optimizer_cfg.lr),
-        "muon_lr_explicit": optimizer_cfg.muon_lr is not None,
-    }
 
 
 class BaseTrainer(Stateful, ABC):
@@ -571,8 +536,6 @@ class BaseTrainer(Stateful, ABC):
 
         if args.model.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
-        if args.train.chunk_mbs_config.enable:
-            kwargs["chunk_mbs_config"] = args.train.chunk_mbs_config
 
         # A full non-LoRA resume already contains model weights. Skip the HF
         # materialization pass to avoid a second peak (HF load then checkpoint
@@ -620,12 +583,13 @@ class BaseTrainer(Stateful, ABC):
         self.optimizer = build_optimizer(
             self.model,
             lr=args.train.optimizer.lr,
+            betas=args.train.optimizer.betas,
             weight_decay=args.train.optimizer.weight_decay,
             fused=True,
             optimizer_type=args.train.optimizer.type,
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
-            muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
+            optimizer_config=args.train.optimizer,
         )
 
     def _build_lr_scheduler(self):
@@ -737,8 +701,6 @@ class BaseTrainer(Stateful, ABC):
                 return {k: _to_device(vv) for k, vv in v.items()}
             return v
 
-        chunk_mbs_config = getattr(self.args.train, "chunk_mbs_config", None)
-        self._chunk_mbs_ranges = build_chunk_mbs_ranges(micro_batch, chunk_mbs_config)
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
@@ -772,13 +734,11 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
-            chunk_ranges = getattr(self, "_chunk_mbs_ranges", None)
             channel_forward_context = (
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
             with (
                 use_parallel_state("base"),
-                chunk_mbs_context(chunk_ranges),
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
                 channel_forward_context,
@@ -788,10 +748,8 @@ class BaseTrainer(Stateful, ABC):
             with use_parallel_state("base"):
                 loss, loss_dict = self.postforward(outputs, micro_batch)
 
-            # Backward pass
             with (
                 use_parallel_state("base"),
-                chunk_mbs_context(chunk_ranges),
                 self.model_bwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
             ):

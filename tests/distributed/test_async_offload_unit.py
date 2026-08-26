@@ -385,7 +385,6 @@ def _run_async_offload_base_trainer_fsdp2_gc():
     import torch.distributed as dist
 
     from veomni.arguments import (
-        ChunkMBSConfig,
         FSDPConfig,
         GradientCheckpointingConfig,
         MixedPrecisionConfig,
@@ -422,7 +421,6 @@ def _run_async_offload_base_trainer_fsdp2_gc():
                 fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
             ),
             optimizer=OptimizerConfig(),
-            chunk_mbs_config=ChunkMBSConfig(enable=False),
             checkpoint=SimpleNamespace(load_path=None),
             init_device="meta",
             gradient_checkpointing=GradientCheckpointingConfig(enable=True),

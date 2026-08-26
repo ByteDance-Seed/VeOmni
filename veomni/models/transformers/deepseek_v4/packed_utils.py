@@ -14,8 +14,9 @@
 
 """Packed-sequence helpers for DeepSeek V4 compressed attention."""
 
+from typing import Callable, NamedTuple
+
 import torch
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb
 
 
 def build_packed_compression_metadata(
@@ -80,6 +81,7 @@ def compress_packed_windows(
     packed_metadata: dict[str, torch.Tensor],
     *,
     overlap: bool,
+    apply_rope: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
     """Compress complete windows without crossing packed sequence boundaries.
 
@@ -87,6 +89,12 @@ def compress_packed_windows(
     and resets ``position_ids`` to zero at each sequence boundary. Selecting
     window ends from local positions keeps incomplete tails out of the next
     sequence and lets every operation stay on device.
+
+    ``apply_rope`` is injected so callers in the generated modeling pass their
+    module-global ``apply_rotary_pos_emb``, which ``device_patch.py`` may have
+    swapped for the fused Triton backend. It is required rather than defaulted
+    to the eager reference: a defaulted call site would silently keep eager
+    while every other one is fused, which no test would catch.
     """
     if kv.shape[0] != 1:
         raise ValueError(f"Packed DeepSeek V4 compression expects batch size 1, got {kv.shape[0]}")
@@ -111,8 +119,13 @@ def compress_packed_windows(
         window_kv = current_kv
         window_gate = current_gate
 
+    # `sum` follows autocast's fp32_set_opt_dtype policy, so an implicit `dtype`
+    # silently returns fp32 under autocast and leaks out through `kv_norm` into
+    # the bf16-only TileLang kernels. Accumulate in fp32 explicitly, cast back.
     compressed = kv_norm(
-        (window_kv * window_gate.softmax(dim=1, dtype=torch.float32).to(window_kv.dtype)).sum(dim=1)
+        (window_kv * window_gate.softmax(dim=1, dtype=torch.float32).to(window_kv.dtype))
+        .sum(dim=1, dtype=torch.float32)
+        .to(window_kv.dtype)
     ).unsqueeze(0)
     window_positions = position_ids[0, window_starts]
     cos, sin = rotary_emb(
@@ -120,7 +133,7 @@ def compress_packed_windows(
         position_ids=window_positions.unsqueeze(0),
         layer_type=rope_layer_type,
     )
-    return apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+    return apply_rope(compressed.unsqueeze(1), cos, sin).squeeze(1)
 
 
 def packed_compressed_causal_ranges(
@@ -135,6 +148,21 @@ def packed_compressed_block_bias(
 ) -> torch.Tensor:
     """Build a block-diagonal causal mask for packed compressed entries."""
     return packed_metadata["block_bias"]
+
+
+def scatter_topk_block_bias(
+    compressed_kv: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+) -> torch.Tensor:
+    """Re-encode an indexer selection as an additive ``[B, 1, S, C]`` block bias."""
+    compressed_len = compressed_kv.shape[2]
+    valid = top_k_indices >= 0
+    safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
+    block_bias = compressed_kv.new_full((batch_size, 1, seq_len, compressed_len + 1), float("-inf"))
+    block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
+    return block_bias[..., :compressed_len]
 
 
 def build_sparse_attention_indices(
@@ -173,6 +201,91 @@ def build_sparse_attention_indices(
         compressed_indices + seq_len,
         torch.full_like(compressed_indices, -1),
     )
+    return torch.cat((sliding_indices, compressed_indices), dim=-1).contiguous()
+
+
+class CompressedCandidates(NamedTuple):
+    """How a compressor exposes its visible compressed entries to the index builder.
+
+    Indexer-driven compressors select an explicit per-query set and already mark
+    misses with ``-1``; the heavily-compressed path instead stays a contiguous
+    ``[range_start, range_end)`` causal interval. At most one of the two is set.
+    """
+
+    topk_indices: torch.Tensor | None = None
+    range_starts: torch.Tensor | None = None
+    range_ends: torch.Tensor | None = None
+
+
+def _broadcast_query_ranges(bound: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
+    """Normalize a per-query range bound to ``[batch, seq_len]``."""
+    if bound.ndim == 1:
+        bound = bound.unsqueeze(0)
+    if bound.shape[-1] != seq_len:
+        raise ValueError(f"Compressed range bounds must cover {seq_len} queries; got {tuple(bound.shape)}")
+    return bound.expand(batch_size, -1).to(torch.int32)
+
+
+def build_packed_sparse_attention_indices(
+    *,
+    position_ids: torch.Tensor,
+    sliding_window: int,
+    compressed_len: int,
+    candidates: CompressedCandidates | None,
+) -> torch.Tensor:
+    """Build fully validated sparse candidates without materializing a dense mask.
+
+    The dense path derives validity by scanning an ``[B, 1, S, S + C]`` additive
+    mask, which costs O(S^2) memory and bandwidth on every layer. Every constraint
+    that mask encodes is already available in closed form:
+
+    * sliding causality and packed-sample isolation collapse into the single test
+      ``offset <= position_ids[q]``. ``position_ids`` restarts at zero on each
+      packed sample, so ``q - position_ids[q]`` is that sample's first token and
+      any larger offset would reach into the previous sample.
+    * compressed entries are either an explicit indexer selection that already
+      marks misses with ``-1``, or a contiguous ``[range_start, range_end)``
+      interval computed from the same metadata that built the block bias.
+
+    Callers must guarantee the padding mask is all ones over the packed length,
+    which the FlashAttention varlen collator does by construction -- boundaries
+    travel through ``position_ids`` and ``cu_seq_lens`` instead.
+    """
+    if position_ids.ndim != 2:
+        raise ValueError(f"Packed sparse indices need [batch, seq_len] position ids; got {position_ids.ndim} dims")
+
+    batch_size, seq_len = position_ids.shape
+    device = position_ids.device
+    sliding_width = min(sliding_window, seq_len)
+    positions = position_ids.to(torch.int32)
+    query_indices = torch.arange(seq_len, device=device, dtype=torch.int32)
+    window_offsets = torch.arange(sliding_width - 1, -1, -1, device=device, dtype=torch.int32)
+
+    sliding_indices = (query_indices[None, :, None] - window_offsets[None, None, :]).expand(batch_size, -1, -1)
+    sliding_indices = sliding_indices.masked_fill(window_offsets[None, None, :] > positions[:, :, None], -1)
+
+    if compressed_len == 0 or candidates is None:
+        return sliding_indices.contiguous()
+
+    if candidates.topk_indices is not None:
+        compressed_indices = candidates.topk_indices.to(device=device, dtype=torch.int32)
+        if compressed_indices.shape[:2] != (batch_size, seq_len):
+            raise ValueError(
+                "Compressed sparse indices must match the attention batch and sequence dimensions; "
+                f"got {tuple(compressed_indices.shape)} for batch={batch_size}, seq_len={seq_len}"
+            )
+        compressed_indices = torch.where(compressed_indices >= 0, compressed_indices + seq_len, -1)
+    elif candidates.range_starts is not None and candidates.range_ends is not None:
+        starts = _broadcast_query_ranges(candidates.range_starts, batch_size, seq_len)
+        ends = _broadcast_query_ranges(candidates.range_ends, batch_size, seq_len)
+        entry_indices = torch.arange(compressed_len, device=device, dtype=torch.int32)
+        visible = (entry_indices[None, None, :] >= starts[:, :, None]) & (
+            entry_indices[None, None, :] < ends[:, :, None]
+        )
+        compressed_indices = torch.where(visible, entry_indices[None, None, :] + seq_len, -1)
+    else:
+        return sliding_indices.contiguous()
+
     return torch.cat((sliding_indices, compressed_indices), dim=-1).contiguous()
 
 
@@ -221,11 +334,14 @@ def isolate_packed_causal_mask_(
 
 
 __all__ = [
-    "build_sparse_attention_indices",
+    "CompressedCandidates",
     "build_packed_compression_metadata",
+    "build_packed_sparse_attention_indices",
+    "build_sparse_attention_indices",
     "compress_packed_windows",
     "isolate_packed_causal_mask_",
     "mask_sparse_attention_indices",
     "packed_compressed_block_bias",
     "packed_compressed_causal_ranges",
+    "scatter_topk_block_bias",
 ]

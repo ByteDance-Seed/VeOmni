@@ -23,8 +23,7 @@ veomni/
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
 │   ├── transformers/   Per-model patches (one subpackage per model family)
-│   ├── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
-│   └── seed_omni/      Omni-model architecture (encoder-foundation-decoder)
+│   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW
@@ -202,6 +201,5 @@ Distributed tests (`tests/parallel/`, `tests/e2e/`) may require multiple GPUs an
 | VLM SFT | `tasks/train_vlm.py` | `VLMTrainer` |
 | VLM RL | `tasks/train_vlm_rl.py` | `BaseRLTrainer` |
 | DiT | `tasks/train_dit.py` | `DitTrainer` |
-| Omni | `tasks/omni/train_omni_model.py` | Custom |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |

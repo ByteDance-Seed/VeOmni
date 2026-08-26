@@ -17,7 +17,7 @@ import os
 import sys
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -53,7 +53,6 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #   ├── channel_loss.*       → ChannelLossConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
 #   ├── torch_compile.*      → TorchCompileConfig
-#   ├── chunk_mbs_config.*   → ChunkMBSConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
@@ -114,6 +113,10 @@ class OptimizerConfig:
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
+    )
+    betas: Tuple[float, float] = field(
+        default=(0.9, 0.95),
+        metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
@@ -394,20 +397,6 @@ class GradientCheckpointingConfig:
                 "PyTorch ignores this option when enable_reentrant=True."
             )
         },
-    )
-
-
-@dataclass
-class ChunkMBSConfig:
-    """train.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
-
-    enable: bool = field(
-        default=False,
-        metadata={"help": "Enable ChunkMBS for packed-sequence decoder layers."},
-    )
-    chunk_mbs: int = field(
-        default=1,
-        metadata={"help": "Number of packed samples per layer chunk."},
     )
 
 
@@ -764,10 +753,10 @@ class TrainingArguments:
             )
         },
     )
-    init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
+    init_device: Literal["cuda", "meta", "npu"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta (required for FSDP2). 4. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
@@ -841,7 +830,6 @@ class TrainingArguments:
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
-    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
@@ -850,8 +838,6 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
-        if self.chunk_mbs_config.chunk_mbs < 1:
-            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs_config.chunk_mbs}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -908,18 +894,16 @@ class TrainingArguments:
             )
 
         # init method constraints
-        assert acc.ep_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
         if acc.fsdp_config.fsdp_mode == "fsdp2":
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
         else:
-            if self.broadcast_model_weights_from_rank0:
-                logger.warning_rank0(
-                    "Ignoring train.broadcast_model_weights_from_rank0=True because it is only "
-                    "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
-                    f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
-                )
+            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+            # CPU-resident module, and only rank0 would hold weights anyway. Fail
+            # here so every rank stops at parse time, rather than let rank0 die in
+            # DDP's constructor while the others block in its first collective.
+            assert self.init_device != "cpu", (
+                "init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
+            )
 
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
@@ -1082,6 +1066,7 @@ class OpsImplementationConfig:
             "flash_attention_3",
             "flash_attention_4",
             "flex_attention",
+            "magi_attention",
             "native-sparse",
         ]
     ] = field(
@@ -1125,7 +1110,8 @@ class OpsImplementationConfig:
         default="liger_kernel",
         metadata={
             "help": "Rotary positional embedding. 'liger_kernel' (default, GPU) | "
-            "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
+            "'npu' | 'triton' (per-model: DeepSeek-V3 deterministic, "
+            "DeepSeek-V4 fused partial-interleaved, Wan; GPU only) | 'eager'."
         },
     )
     rotary_pos_emb_vision_implementation: str = field(
@@ -1198,6 +1184,7 @@ class OpsImplementationConfig:
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
                 "flex_attention": "veomni_flex_attention_with_sp",
+                "magi_attention": "veomni_magi_attention_with_sp",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
@@ -1319,30 +1306,6 @@ class ModelArguments:
             "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
         },
     )
-    foundation: Dict[str, str] = field(
-        default_factory=dict,
-        metadata={"help": "Foundation model extra config."},
-    )
-    encoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal encoder config and weights."},
-    )
-    decoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal decoder config and weights."},
-    )
-    input_encoder: Literal["encoder", "decoder"] = field(
-        default="encoder",
-        metadata={"help": "Use encoder to encode input images or use decoder.encoder to encode input images."},
-    )
-    output_encoder: Literal["encoder", "decoder"] = field(
-        default="decoder",
-        metadata={"help": "Use encoder to encode output images or use decoder.encoder to encode output images."},
-    )
-    encode_target: bool = field(
-        default=False,
-        metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
-    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -1362,10 +1325,6 @@ class ModelArguments:
         self.model_path = _resolve_hdfs_path(self.model_path)
         self.config_path = _resolve_hdfs_path(self.config_path)
         self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
-        for sub_args in (*self.encoders.values(), *self.decoders.values()):
-            for key in ("model_path", "config_path", "tokenizer_path"):
-                if sub_args.get(key) is not None:
-                    sub_args[key] = _resolve_hdfs_path(sub_args[key])
 
         if self.config_path is None:
             self.config_path = self.model_path
@@ -1389,32 +1348,6 @@ class ModelArguments:
             logger.warning_rank0(
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
             )
-
-        suppoerted_encoder_types = ["image", "video", "audio"]
-        for encoder_type, encoder_args in self.encoders.items():
-            if encoder_type not in suppoerted_encoder_types:
-                raise ValueError(
-                    f"Unsupported encoder type: {encoder_type}. Should be one of {suppoerted_encoder_types}."
-                )
-
-            if encoder_args.get("config_path") is None and encoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if encoder_args.get("config_path") is None:
-                encoder_args["config_path"] = encoder_args["model_path"]
-
-        supported_decoder_types = ["image"]
-        for decoder_type, decoder_args in self.decoders.items():
-            if decoder_type not in supported_decoder_types:
-                raise ValueError(
-                    f"Unsupported decoder type: {decoder_type}. Should be one of {supported_decoder_types}."
-                )
-
-            if decoder_args.get("config_path") is None and decoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if decoder_args.get("config_path") is None:
-                decoder_args["config_path"] = decoder_args["model_path"]
 
 
 # ================================ Data Arguments ======================================
@@ -1575,23 +1508,7 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
-        if self.train.chunk_mbs_config.enable:
-            if self.train.pad_to_length:
-                raise ValueError("train.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
-            if self.train.gradient_checkpointing.enable and self.train.gradient_checkpointing.enable_reentrant:
-                raise ValueError(
-                    "train.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
-                    "Set train.gradient_checkpointing.enable_reentrant=False."
-                )
-            if self.data.data_type == "dpo":
-                raise ValueError("train.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
-
         if self.train.torch_compile.enable:
-            if self.train.chunk_mbs_config.enable:
-                raise ValueError(
-                    "train.chunk_mbs_config.enable is not supported with train.torch_compile.enable yet. "
-                    "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
-                )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
                     "train.torch_compile.enable is not supported by this data pipeline. "

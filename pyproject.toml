@@ -58,14 +58,17 @@ gpu = [
   "nvidia-cudnn-frontend>=1.24.0",
   "cuda-python==13.0.3",
   # See `[tool.uv.sources]` — FA2 is x86_64-only; FA3 and FlashMLA support
-  # x86_64/aarch64. flash-qla source-builds from git.
+  # x86_64/aarch64.
   "flash-attn; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn-3; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
   "flash-mla; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
   # 4.0.0b16 is available from PyPI; newer fa4-v4.0.0.beta17 is tag-only
   # and not yet published as a package release.
   "flash-attn-4==4.0.0b16",
-  "flash-qla",
+  # PyPI release rather than a git rev: 0.1.2 is a pure-Python wheel whose static
+  # metadata (tilelang==0.1.9, apache-tvm-ffi==0.1.9) already matches the pins
+  # below, so it needs no source build and no dependency-metadata override.
+  "flash-qla==0.1.2",
   "liger-kernel",
   "flash-linear-attention",
   "quack-kernels[cu13]==0.5.0",
@@ -88,6 +91,13 @@ gpu = [
   "peft==0.18.1",
   "megatron-energon>=7.2.1",
   "hf_transfer",
+  # MagiAttention 1.1.1 imports debugpy unconditionally from
+  # magi_attention.utils.debug but omits it from package metadata.
+  "debugpy",
+  "create-block-mask-cuda==0.1; sys_platform == 'linux'",
+  "flash-attn-cute==0.0.2; sys_platform == 'linux'",
+  "magi-to-hstu-cuda==0.1; sys_platform == 'linux'",
+  "magi-attention==1.1.1; sys_platform == 'linux'",
 ]
 
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
@@ -164,7 +174,7 @@ transformers-stable = [
 # is preserved because docker/CI install a concrete pin and use --locked /
 # --frozen. Concrete pins (docker/, .github/workflows/check_patchgen.yml)
 # must stay inside this range.
-required-version = ">=0.9.8,<0.12"
+required-version = ">=0.9.8,<0.13"
 
 default-groups = ["transformers-stable"]
 
@@ -183,8 +193,8 @@ override-dependencies = [
     "torchaudio==2.10.0+cpu; (extra == 'npu')",
     "torchvision==0.25.0+cpu; (extra == 'npu')",
     "torchcodec==0.10.0; (extra == 'npu')",
-    # FlashQLA's setup metadata pins TileLang 0.1.8, while TileKernels 1.0.0
-    # requires >=0.1.9. Both backends are validated against this shared pin.
+    # TileKernels 1.0.0 requires TileLang >=0.1.9; FlashQLA 0.1.2 pins ==0.1.9.
+    # Kept as an explicit floor so both backends stay on the validated version.
     "tilelang==0.1.9; (extra == 'gpu')",
 ]
 
@@ -198,6 +208,14 @@ conflicts = [
 
 [tool.uv.sources]
 patchgen = { path = "patchgen-pkg", editable = true }
+magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
+# MagiAttention upstream designates this contributor-maintained support branch
+# for its arbitrary-mask FA4 packages and SM90 ffa-fa3 overlay. Dao-AILab does
+# not publish equivalent packages.
+# Keep the immutable shared revision until an organization-owned source exists.
+create-block-mask-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/create_block_mask" }
+flash-attn-cute = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "flash_attn" }
+magi-to-hstu-cuda = { git = "https://github.com/demonatic/flash-attention.git", rev = "ee1d15159cda6f3f97bfab9e487da146a8254970", subdirectory = "csrc/utils/magi_to_hstu" }
 # Direct wheel URLs for gpu — pytorch index sometimes resolves cu128_full wheels
 # that drop nvidia-* deps and confuse uv into uninstalling them. Update both
 # Python versions and architectures when bumping torch.
@@ -242,10 +260,6 @@ flash-mla = [
   { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
   { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
 ]
-# Strictly newer than v0.1.0 — picks up fixes for backward gradient count (#10),
-# auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13).
-flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6ef4858b5446e05bd461d9658d877e548182dbcb" }
-
 # Pinned wheels avoid FFmpeg build dep in CI. x86_64: 3.11 → 14.4.0,
 # 3.12 → 14.2.0. aarch64: 14.2.0 for both (14.4.0 has no aarch64 wheel).
 av = [
@@ -265,25 +279,49 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu/"
 explicit = true
 
-# Static metadata bypasses the build hook during resolution. flash-qla has no
-# pyproject.toml, so without explicit `version` uv runs its setup.py on a
-# fresh (unseeded) venv and crashes with `ModuleNotFoundError: No module
-# named 'setuptools'`. The `requires-dist` mirrors flash-qla's own
-# install_requires — flash_qla/__init__.py top-level imports tilelang
-# (which itself transitively requires apache-tvm-ffi), so any code that
-# imports flash_qla (including VeOmni's lazy factory in
-# veomni/ops/kernels/gated_delta_rule) needs them present, not just users
-# who opt into the kernel at runtime.
-# Version: flash_qla setup.py = "0.1.0".
+# The Magi packages below intentionally use empty static runtime metadata.
+# Their companion extensions declare no runtime requirements upstream, while
+# MagiAttention omits project dependencies and keeps a separate requirements
+# file that targets CUDA 12 NVSHMEM and an older Quack release. VeOmni skips
+# the communication extension and supplies the CUDA 13-compatible runtime
+# closure explicitly through the complete gpu extra: torch, CUTLASS DSL,
+# Quack, the three companion packages, and the otherwise undeclared debugpy.
+# Re-audit those direct dependencies whenever the pinned revisions change.
 [[tool.uv.dependency-metadata]]
-name = "flash-qla"
-version = "0.1.0"
-requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
+name = "magi-attention"
+version = "1.1.1"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "create-block-mask-cuda"
+version = "0.1"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn-cute"
+version = "0.0.2"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "magi-to-hstu-cuda"
+version = "0.1"
+requires-dist = []
 
 # Seeds the build env (uv-created venvs are not seeded by default).
 [tool.uv.extra-build-dependencies]
+create-block-mask-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
 flash-attn-4 = ["setuptools", "wheel", "packaging", "ninja", "torch"]
-flash-qla = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+flash-attn-cute = ["setuptools", "wheel"]
+magi-attention = ["setuptools>=78.1.1", "wheel", "packaging>=24.2", "ninja", "torch", "versioningit"]
+magi-to-hstu-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+# SM90 uses the separately installed CUTLASS FFA overlay, while SM100+ uses
+# CUTE DSL/JIT. Build their shared extensions for both architectures; CP
+# communication remains outside the CP1 scope.
+magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
+create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "90,100" }
+magi-to-hstu-cuda = { MAX_JOBS = "8" }
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}
