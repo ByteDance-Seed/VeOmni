@@ -32,6 +32,19 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
 
 
+def _use_full_float32_matmuls() -> None:
+    """Keep float32 matmuls off the TF32 path so the tolerances here mean something.
+
+    Every check below compares a sharded float32 result against a single-rank
+    float32 baseline at ``atol=rtol=1e-4``. TF32 keeps 10 mantissa bits, which
+    leaves the two sides ~1e-3 apart on the parameter gradients -- an order of
+    magnitude past that tolerance -- and Ampere-and-later devices take the TF32
+    path by default. Each rank is a spawned process, so this has to be set per
+    worker rather than once at import.
+    """
+    torch.set_float32_matmul_precision("highest")
+
+
 def _broadcast_module(module: torch.nn.Module) -> None:
     for param in module.parameters():
         dist.broadcast(param.data, src=0)
@@ -120,6 +133,7 @@ def _init_cp_attention(
     layer_idx: int = 0,
     batch_size: int = 1,
     sample_slices=None,
+    dtype: torch.dtype = torch.float32,
 ):
     """Enter the process group, build the shared layer, and return the fixture.
 
@@ -135,9 +149,14 @@ def _init_cp_attention(
     the packed kwargs go only to the compressor -- so they are not passed, and
     what the case then covers is the mask narrowing at ``query_offset`` and a
     sliding window reaching back across a shard edge inside one sample.
+
+    ``dtype`` is float32 for the parity cases, which need the headroom to compare
+    against a single-rank baseline at ``1e-4``. Only the compact-candidate case
+    overrides it, because that path is gated on bfloat16.
     """
     device_type = get_device_type()
     get_torch_device().set_device(rank)
+    _use_full_float32_matmuls()
     dist.init_process_group(
         backend=get_dist_comm_backend(),
         init_method=f"file://{init_file}",
@@ -157,7 +176,7 @@ def _init_cp_attention(
     # Layer 0 is HCA and layer 3 is CSA on the toy config, which has no
     # sliding-only layer type, so drop the compressor the way the Ulysses test
     # does to reach pure sliding MQA.
-    layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device_type, dtype=torch.float32)
+    layer = dsv4.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device_type, dtype=dtype)
     if not with_compressor:
         layer.compressor = None
     else:
@@ -165,16 +184,14 @@ def _init_cp_attention(
     _broadcast_module(layer)
     layer.train()
 
-    full_hidden = torch.randn(batch_size, seq_len, config.hidden_size, device=device_type, dtype=torch.float32)
+    full_hidden = torch.randn(batch_size, seq_len, config.hidden_size, device=device_type, dtype=dtype)
     dist.broadcast(full_hidden, src=0)
     if sample_slices is None:
         full_position_ids = torch.arange(seq_len, device=device_type).view(1, -1)
-        full_mask = _build_causal_mask(seq_len, config.sliding_window, device_type, torch.float32)
+        full_mask = _build_causal_mask(seq_len, config.sliding_window, device_type, dtype)
     else:
         full_position_ids = _packed_position_ids(sample_slices, device_type)
-        full_mask = _build_packed_causal_mask(
-            seq_len, config.sliding_window, sample_slices, device_type, torch.float32
-        )
+        full_mask = _build_packed_causal_mask(seq_len, config.sliding_window, sample_slices, device_type, dtype)
     full_position_ids = full_position_ids.repeat(batch_size, 1)
     full_mask = full_mask.repeat(batch_size, 1, 1, 1)
 
@@ -250,14 +267,21 @@ def _run_attention_cp(
 def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str, seq_len: int) -> None:
     """The compact candidates a shard builds must be the global build's own rows.
 
-    The eager float32 path ignores ``sparse_topk_indices``, so this is the only
-    thing that pins down ``query_offset`` / ``kv_full_len`` / ``compressed_len``.
-    Get them wrong and the TileLang kernel silently reads the wrong KV rows.
+    The eager path ignores ``sparse_topk_indices``, so requesting TileLang is the
+    only thing that pins down ``query_offset`` / ``kv_full_len`` /
+    ``compressed_len``. Get them wrong and the TileLang kernel silently reads the
+    wrong KV rows.
+
+    Unlike the rest of the file this fixture is bfloat16, because the compact
+    candidate list is a bfloat16-only path: the attention declines to build one
+    unless the kernel can actually consume it, and the kernel is compiled for
+    bfloat16 operands. The assertion is unaffected -- candidates are integer
+    indices, compared exactly.
     """
     from veomni.distributed.parallel_state import clear_parallel_state
 
     dsv4, _, _forward, full_hidden, full_position_ids, full_mask = _init_cp_attention(
-        rank, world_size, init_file, seq_len, with_compressor=False
+        rank, world_size, init_file, seq_len, with_compressor=False, dtype=torch.bfloat16
     )
     dsv4.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
 
@@ -380,6 +404,7 @@ def _run_compressor_cp(
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
+    _use_full_float32_matmuls()
     dist.init_process_group(
         backend=get_dist_comm_backend(),
         init_method=f"file://{init_file}",
@@ -525,6 +550,7 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
+    _use_full_float32_matmuls()
     dist.init_process_group(
         backend=get_dist_comm_backend(),
         init_method=f"file://{init_file}",
@@ -1108,6 +1134,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
+    _use_full_float32_matmuls()
     dist.init_process_group(
         backend=get_dist_comm_backend(),
         init_method=f"file://{init_file}",
@@ -1218,6 +1245,7 @@ def _run_cp_collator_contract(rank: int, world_size: int, init_file: str) -> Non
 
     device_type = get_device_type()
     get_torch_device().set_device(rank)
+    _use_full_float32_matmuls()
     dist.init_process_group(
         backend=get_dist_comm_backend(),
         init_method=f"file://{init_file}",
