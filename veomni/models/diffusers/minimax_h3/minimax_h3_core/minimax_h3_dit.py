@@ -6,12 +6,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from veomni.distributed.sequence_parallel import (
+from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
+from veomni.distributed.sequence_parallel.ulysses import (
+    _Gather,
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
 )
-from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
-from veomni.distributed.sequence_parallel.ulysses import _GatherSplitNoSum
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .core import attention_forward, gradient_checkpoint_forward
@@ -157,9 +157,16 @@ class MiniMaxH3Attention(nn.Module):
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
 
     def forward(self, x, *, rope_cos, rope_sin, cu_seqlens, max_seqlen=None, use_ulysses=False):
+        sp_group = get_ulysses_sequence_parallel_group() if use_ulysses else None
         total = x.shape[0]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
+        if sp_group is not None:
+            # Ulysses: exchange the whole interleaved qkv in one all-to-all
+            # (scatter along heads, gather along seq). The q/k/v block of each
+            # head is contiguous in the interleaved layout, so after the
+            # exchange this rank holds the full sequence for its own heads.
+            qkv = gather_seq_scatter_heads(qkv, seq_dim=0, head_dim=1, group=sp_group)
         q = qkv[:, :, 0, :]
         k = qkv[:, :, 1, :]
         v = qkv[:, :, 2, :]
@@ -168,16 +175,12 @@ class MiniMaxH3Attention(nn.Module):
         if rope_cos is not None:
             q = _apply_rope(q, rope_cos, rope_sin)
             k = _apply_rope(k, rope_cos, rope_sin)
-        # Ulysses: exchange local seq for half heads; attention runs on the full
-        # sequence with num_heads / sp_size heads, then the output is exchanged
-        # back so the residual / MLP / AdaLN path stays local to this rank's half.
-        sp_group = get_ulysses_sequence_parallel_group() if use_ulysses else None
-        if sp_group is not None:
-            q = gather_seq_scatter_heads(q, seq_dim=0, head_dim=1, group=sp_group)
-            k = gather_seq_scatter_heads(k, seq_dim=0, head_dim=1, group=sp_group)
-            v = gather_seq_scatter_heads(v, seq_dim=0, head_dim=1, group=sp_group)
         out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
+
         if sp_group is not None:
+            # Exchange back: this rank's sequence rows with ALL heads (the
+            # inverse exchange concatenates the gathered blocks along the head
+            # dim), so the full out_proj weight applies locally.
             out = gather_heads_scatter_seq(out, seq_dim=0, head_dim=1, group=sp_group)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
@@ -491,8 +494,9 @@ class MiniMaxH3DiT(nn.Module):
 
         # Ulysses sequence parallel: pad the packed sequence so it splits evenly
         # across the SP ranks, then each rank processes its own contiguous half.
-        # Attention exchanges local seq for half the heads inside the module; the
-        # residual / MLP / AdaLN path and the output projections stay local.
+        # Attention exchanges the local seq for this rank's share of heads
+        # inside the module; the residual / MLP / AdaLN path and the output
+        # projections stay local.
         sp_group = get_ulysses_sequence_parallel_group()
         sp_world = dist.get_world_size(sp_group) if sp_group is not None else 1
         sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
@@ -553,8 +557,6 @@ class MiniMaxH3DiT(nn.Module):
             decoder_input = decoder_input.narrow(0, unit * sp_rank, unit)
             combined_indices = combined_indices.narrow(0, unit * sp_rank, unit)
             inverse_indices = inverse_indices.narrow(0, unit * sp_rank, unit)
-            rope_cos = rope_cos.narrow(0, unit * sp_rank, unit)
-            rope_sin = rope_sin.narrow(0, unit * sp_rank, unit)
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
@@ -599,10 +601,11 @@ class MiniMaxH3DiT(nn.Module):
         if sp_group is not None:
             # Rebuild the full packed sequence so the output position
             # index_select / update_mask below see the original layout. The
-            # backward splits (no all-reduce): the downstream loss is replicated
-            # across the SP ranks, so a sum would double the gradient.
-            video_logits = _GatherSplitNoSum.apply(sp_group, video_logits, 0)
-            audio_logits = _GatherSplitNoSum.apply(sp_group, audio_logits, 0)
+            # backward splits without all-reduce (grad_scale=False,
+            # sum_grad=False): the downstream loss is replicated across the SP
+            # ranks, so a sum would multiply the gradient by the SP world size.
+            video_logits = _Gather.apply(sp_group, video_logits, 0, False, False)
+            audio_logits = _Gather.apply(sp_group, audio_logits, 0, False, False)
 
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))
