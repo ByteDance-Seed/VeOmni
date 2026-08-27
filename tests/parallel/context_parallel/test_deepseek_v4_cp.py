@@ -1022,6 +1022,11 @@ def test_deepseek_v4_compressor_cp_packed_straddling(kind, cp_size):
 
 
 @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
+# The TileLang scorer is what this case is about -- it is the only one that
+# partitions queries itself, and the run below counts kernel invocations to prove
+# it was not quietly swapped for the eager scorer. So there is nothing left to
+# assert once the kernel cannot run, and it needs SM90 or later.
+@pytest.mark.skipif(not is_sm90_or_above(), reason="the DeepSeek-V4 TileLang kernels need SM90 or later")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_indexer_cp(cp_size):
     """A CP shard's indexer selection matches the full-query result, packed and unpacked."""
