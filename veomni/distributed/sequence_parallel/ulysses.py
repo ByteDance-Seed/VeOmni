@@ -233,7 +233,13 @@ class _Gather(torch.autograd.Function):
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None, None]:
         if ctx.grad_scale:
             grad_output = grad_output * ctx.seq_world_size
-
+            
+        # A caller that reduces the gathered output with a bare ``.sum()`` (no
+        # elementwise op in between to materialise a real buffer) hands back a
+        # stride-0 broadcast view here, which NCCL's in-place all_reduce rejects
+        # with "Tensors must be contiguous". ``.contiguous()`` also protects
+        # against scribbling in place on a tensor autograd may still own.
+        grad_output = grad_output.contiguous()
         if ctx.sum_grad:
             dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
 
