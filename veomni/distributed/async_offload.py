@@ -59,20 +59,20 @@ def _is_active_accelerator_tensor(tensor) -> bool:
 
 
 def _has_private_dense_storage(tensor) -> bool:
-    """Return whether ``tensor`` uniquely owns contiguous, possibly padded storage.
+    """Return whether ``tensor`` can be swapped without mutating another live view.
 
     Expandable CUDA segments can make ``storage.nbytes()`` larger than the
-    logical tensor.  That padding is safe to swap only when this tensor is not
-    a view (``_base is None``) and starts at storage offset 0.  A non-zero
-    offset means another live tensor owns the prefix of the same storage.
+    logical tensor, and may also give a non-zero ``storage_offset``.  ``SwapTensor``
+    unbinds via ``set_`` rather than ``resize_(0)``, so padding and a non-zero
+    offset are safe when this tensor is not a view (``_base is None``).
     """
     if isinstance(tensor, torch.nn.parameter.Parameter) or tensor._base is not None:
         return False
-    if tensor.storage_offset() != 0 or not tensor.is_contiguous():
+    if not tensor.is_contiguous():
         return False
     storage_nbytes = tensor.untyped_storage().nbytes()
     tensor_nbytes = tensor.numel() * tensor.element_size()
-    return storage_nbytes > 0 and storage_nbytes >= tensor_nbytes
+    return storage_nbytes > 0 and storage_nbytes >= tensor_nbytes + tensor.storage_offset() * tensor.element_size()
 
 
 def base_check_fn(tensor) -> bool:
@@ -424,10 +424,18 @@ class async_save_on_cpu(saved_tensors_hooks):
         prefetch=True,
     ) -> None:
         def _pack_to_cpu(tensor):
+            matched_hidden = (
+                custom_check_fn is not None and isinstance(tensor, torch.Tensor) and custom_check_fn(tensor)
+            )
+            if matched_hidden and _is_active_accelerator_tensor(tensor) and not _has_private_dense_storage(tensor):
+                # Linear/GELU often save a view of hidden_states (e.g. a 2-D
+                # reshape). Unpack returns this private copy for backward.
+                tensor = tensor.detach().contiguous().clone()
+
             if not base_check_fn(tensor):
                 return tensor
 
-            if (custom_check_fn is not None) and (not custom_check_fn(tensor)):
+            if custom_check_fn is not None and not matched_hidden:
                 return tensor
 
             key, previous_block_idx = manager.get_cnt(block_idx)
