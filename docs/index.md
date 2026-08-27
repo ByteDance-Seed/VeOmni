@@ -90,8 +90,8 @@ key_features/lora.md
 :caption: Design
 
 design/kernel_selection.md
+design/gdn_headwise_context_parallel.md
 design/fused_moe_kernels.md
-design/gdn_lossless_context_parallel.md
 design/local_parallel_state.md
 design/patchgen.md
 design/unified_kernel_registry.md

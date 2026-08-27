@@ -13,8 +13,7 @@
 # limitations under the License.
 
 
-import math
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -264,100 +263,6 @@ def gather_seq_scatter_heads(
         padding_size = x.size(seq_dim) - unpadded_dim_size
         x = unpad_tensor(x, seq_dim, padding_size)
     return x
-
-
-def gather_seq_scatter_heads_grouped(
-    tensors: Sequence[Tensor],
-    seq_dim: int,
-    head_dim: int,
-    group: ProcessGroup = None,
-) -> tuple[Tensor, ...]:
-    """Gather sequence and scatter heads for several projections in one A2A.
-
-    Every tensor must use the same batch and local-sequence layout, dtype, and
-    device. Head counts and trailing feature shapes may differ, which covers
-    GQA-style q/k versus v/beta/gate projections. Packing only reduces
-    collective launch count; it preserves the rank-major sequence order and
-    wire bytes of independent :func:`gather_seq_scatter_heads` calls.
-    """
-
-    group = get_ulysses_sequence_parallel_group() if group is None else group
-    inputs = tuple(tensors)
-    if not inputs:
-        raise ValueError("grouped Ulysses exchange requires at least one tensor")
-    if not group:
-        return inputs
-
-    sp_world = get_ulysses_sequence_parallel_world_size(group)
-    first = inputs[0]
-    batch_size = int(first.size(0))
-    dtype = first.dtype
-    device = first.device
-    sequence_length: int | None = None
-    canonical_inputs: list[Tensor] = []
-    specs: list[tuple[int, int, int, tuple[int, ...], int]] = []
-
-    for index, tensor in enumerate(inputs):
-        if tensor.ndim < 3:
-            raise ValueError(f"grouped Ulysses input {index} must have at least three dimensions")
-        normalized_seq_dim = seq_dim % tensor.ndim
-        normalized_head_dim = head_dim % tensor.ndim
-        if normalized_seq_dim == normalized_head_dim or normalized_seq_dim == 0 or normalized_head_dim == 0:
-            raise ValueError("batch, sequence, and head dimensions must be distinct")
-        if int(tensor.size(0)) != batch_size:
-            raise ValueError(f"grouped Ulysses input {index} has a different batch size")
-        if tensor.dtype != dtype or tensor.device != device:
-            raise ValueError("all grouped Ulysses inputs must share dtype and device")
-
-        canonical = tensor.movedim((normalized_seq_dim, normalized_head_dim), (1, 2)).contiguous()
-        current_sequence_length = int(canonical.size(1))
-        if sequence_length is None:
-            sequence_length = current_sequence_length
-        elif current_sequence_length != sequence_length:
-            raise ValueError(f"grouped Ulysses input {index} has a different sequence length")
-        total_heads = int(canonical.size(2))
-        if total_heads <= 0 or total_heads % sp_world:
-            raise ValueError(
-                f"grouped Ulysses input {index} head count ({total_heads}) must be positive "
-                f"and divisible by SP size ({sp_world})"
-            )
-        local_heads = total_heads // sp_world
-        tail_shape = tuple(int(size) for size in canonical.shape[3:])
-        local_width = local_heads * math.prod(tail_shape)
-        canonical_inputs.append(canonical)
-        specs.append((normalized_seq_dim, normalized_head_dim, local_heads, tail_shape, local_width))
-
-    if sequence_length is None:
-        raise RuntimeError("grouped Ulysses validation produced no sequence length")
-
-    packed_features: list[Tensor] = []
-    for canonical, (_, _, local_heads, tail_shape, local_width) in zip(canonical_inputs, specs):
-        destination_major = canonical.reshape(
-            batch_size,
-            sequence_length,
-            sp_world,
-            local_heads,
-            *tail_shape,
-        ).permute(2, 0, 1, 3, *range(4, 4 + len(tail_shape)))
-        packed_features.append(destination_major.reshape(sp_world * batch_size, sequence_length, local_width))
-
-    send = torch.cat(packed_features, dim=-1).contiguous()
-    received = _SeqAllToAll.apply(group, send, 0, 0)
-    rank_major = (
-        received.reshape(sp_world, batch_size, sequence_length, -1)
-        .permute(1, 0, 2, 3)
-        .reshape(batch_size, sp_world * sequence_length, -1)
-        .contiguous()
-    )
-
-    outputs: list[Tensor] = []
-    offset = 0
-    for normalized_seq_dim, normalized_head_dim, local_heads, tail_shape, local_width in specs:
-        piece = rank_major.narrow(-1, offset, local_width)
-        offset += local_width
-        canonical = piece.reshape(batch_size, sp_world * sequence_length, local_heads, *tail_shape)
-        outputs.append(canonical.movedim((1, 2), (normalized_seq_dim, normalized_head_dim)).contiguous())
-    return tuple(outputs)
 
 
 def gather_seq_scatter_heads_qkv(

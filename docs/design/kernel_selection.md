@@ -26,7 +26,7 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
-| GDN context parallel | `gdn_context_parallel_implementation` | `disabled`, `state_passing_lossless`, `kcp`, `headwise_lossless` | `"disabled"` | Config validation + Qwen3.5 OpSlot binding. The current CP release is Ascend-NPU-only; CPU is for correctness oracles and CUDA CP is unsupported. `disabled` selects generic Ring/Hybrid for non-GDN models when `cp_size > 1`; it does not disable CP. `state_passing_lossless` is the recommended production selector. `kcp` is an explicit experimental selector using the Ascend-only TTX BC8/M1 backend and is not selected by production recipes. `headwise_lossless` packs one sequence↔head A2A pair per GDN layer over flattened CP×Ulysses. |
+| GDN context parallel | `gdn_context_parallel_implementation` | `disabled`, `headwise_lossless` | `"disabled"` | Config validation + Qwen3.5 OpSlot binding. The current CP release is Ascend-NPU-only; CPU is for correctness oracles and CUDA CP is unsupported. `disabled` selects generic Ring/Hybrid for non-GDN models when `cp_size > 1`; it does not disable CP. `headwise_lossless` packs one sequence↔head A2A pair per GDN layer over flattened CP×Ulysses. |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
 
@@ -300,7 +300,7 @@ model:
     rms_norm_gated_implementation: npu
     causal_conv1d_implementation: npu
     chunk_gated_delta_rule_implementation: npu
-    gdn_context_parallel_implementation: state_passing_lossless
+    gdn_context_parallel_implementation: headwise_lossless
 ```
 
 | Field | GPU values | NPU value | Eager limitation |
@@ -317,29 +317,15 @@ requiring a manual `fla_npu` install. Registrations live in
 `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
 values are documented by `OpsImplementationConfig`.
 
-### Lossless GDN and KCP context parallelism
+### Lossless headwise GDN context parallelism
 
-`state_passing_lossless` is the correctness foundation for hybrid Ring CP ×
-Ulysses training. It assigns complete native 64-token GDN chunks to monotonic
-owners, uses a reversible variable-split all-to-all between the physical Ring
-layout and the owned layout, and connects recurrent state plus causal-conv halo
-with autograd-aware P2P. Per-sample padding never enters the ownership wire and
-its inverse gradient is zero.
-
-`kcp` reuses that exact ownership, padding, BOS, and halo plan, but replaces
-the recurrent-state P2P chain with a fixed-size fp32 affine all-gather/prefix
-composition. It remains an explicit research path: production recipes must not
-select it until the Ascend TTX BC8/M1 forward/VJP passes the NPU parity gate and
-demonstrates a material end-to-end throughput win over `state_passing_lossless`.
-CUDA/GPU paths reject it instead of falling back.
-
-`headwise_lossless` instead leaves full-attention Ring/Hybrid CP unchanged and
+`headwise_lossless` leaves full-attention Ring/Hybrid CP unchanged and
 temporarily converts each GDN layer from physical sequence shards to canonical
 sequence plus flattened-SP head shards. q/k/v/b/a share one packed
 `all_to_all_single`; the output uses one inverse exchange. This is an exact
 head-parallel evaluation of GDN, not a recurrent-state approximation.
 
-Selecting `state_passing_lossless`, `kcp`, or `headwise_lossless` requires `cp_size > 1`, packed
+Selecting `headwise_lossless` requires `cp_size > 1`, packed
 dynamic batches, causal text self-attention, zero attention dropout, and the
 required accelerator kernels. The backwards-compatible `disabled` selector
 disables only the GDN-specific algorithm; with `cp_size > 1`, it selects generic
@@ -348,9 +334,7 @@ Qwen3.5 GDN, which must select an explicit lossless mode. The current production
 CP release, including generic Ring/Hybrid CP, runs on Ascend NPU only. CPU
 execution is reserved for correctness oracles, and CUDA CP is unsupported.
 Eager/SDPA, non-Qwen3.5 models using a GDN selector, and multimodal or
-cross-attention CP are intentionally unsupported in this foundation. See
-[Lossless GDN Context Parallelism](gdn_lossless_context_parallel.md) for
-layout, correctness, and test contracts.
+cross-attention CP are intentionally unsupported in this foundation.
 
 ---
 

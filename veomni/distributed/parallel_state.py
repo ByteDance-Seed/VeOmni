@@ -83,9 +83,7 @@ class ParallelState:
     async_enabled: Optional[bool] = False
     # Append new public fields so legacy positional constructors retain the
     # exact pre-context-parallel argument order.
-    gdn_context_parallel_implementation: Literal["disabled", "state_passing_lossless", "kcp", "headwise_lossless"] = (
-        "disabled"
-    )
+    gdn_context_parallel_implementation: Literal["disabled", "headwise_lossless"] = "disabled"
     # Ascend DeviceMesh may not expose a named flattened group through the
     # root mesh. Retain the explicit CP×Ulysses mesh returned by ``_flatten``.
     _sp_mesh: Optional["DeviceMesh"] = field(default=None, repr=False, compare=False)
@@ -94,8 +92,8 @@ class ParallelState:
         if not self.include_sp_in_fsdp:
             raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
-        supported_cp = {"disabled", "state_passing_lossless", "kcp", "headwise_lossless"}
-        enabled_gdn_cp = {"state_passing_lossless", "kcp", "headwise_lossless"}
+        supported_cp = {"disabled", "headwise_lossless"}
+        enabled_gdn_cp = {"headwise_lossless"}
         if self.cp_size > 1 and self.gdn_context_parallel_implementation not in supported_cp:
             raise ValueError(
                 "cp_size > 1 requires gdn_context_parallel_implementation to be one of "
@@ -507,9 +505,7 @@ def init_parallel_state(
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
     name: str = "base",
-    gdn_context_parallel_implementation: Literal[
-        "disabled", "state_passing_lossless", "kcp", "headwise_lossless"
-    ] = "disabled",
+    gdn_context_parallel_implementation: Literal["disabled", "headwise_lossless"] = "disabled",
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the

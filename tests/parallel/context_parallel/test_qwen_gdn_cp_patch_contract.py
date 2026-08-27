@@ -53,82 +53,28 @@ def _gdn_forward_block(source: str) -> str:
     [
         "veomni/models/transformers/qwen3_5/qwen3_5_gpu_patch_gen_config.py",
         "veomni/models/transformers/qwen3_5/qwen3_5_npu_patch_gen_config.py",
+        "veomni/models/transformers/qwen3_5_moe/qwen3_5_moe_gpu_patch_gen_config.py",
+        "veomni/models/transformers/qwen3_5_moe/qwen3_5_moe_npu_patch_gen_config.py",
     ],
 )
-def test_gdn_cp_plan_uses_host_cu_before_cache_lookup(relative_path: str):
+def test_removed_stateful_gdn_cp_paths_are_absent(relative_path: str):
     source = (ROOT / relative_path).read_text()
-    block = _function_block(source, "qwen3_5_gated_deltanet_forward_patched")
-
-    assert "valid_points = [int(point) for point in cu_seqlens_list]" in block
-    assert "cu_seq_lens_q.detach().cpu().tolist()" not in block
-    assert block.index("valid_points =") < block.index("_gdn_lossless_plan_cache")
-    assert "ulysses_local_cu_from_global" not in block
-    assert "cu_seqlens_list=gdn_lossless_plan.owned_cu_seqlens" in block
-
-
-@pytest.mark.parametrize(
-    "relative_path",
-    [
-        "veomni/models/transformers/qwen3_5/qwen3_5_gpu_patch_gen_config.py",
-        "veomni/models/transformers/qwen3_5/qwen3_5_npu_patch_gen_config.py",
-    ],
-)
-def test_gdn_runtime_observer_is_wired_through_lossless_ownership(relative_path: str):
-    source = (ROOT / relative_path).read_text()
-    block = _function_block(source, "qwen3_5_gated_deltanet_forward_patched")
-    assert "gdn_cp_runtime_evidence" in block
-    assert "observer=gdn_cp_observer" in block
+    for removed in (
+        "state_passing_lossless",
+        '"kcp"',
+        "gdn_lossless",
+        "gdn_kcp",
+        "resolve_kcp_initial_state",
+        "make_gdn_cp_runtime_observer",
+    ):
+        assert removed not in source
 
 
-def test_gpu_gdn_runtime_rejects_ascend_only_kcp():
+def test_gpu_gdn_context_parallel_remains_fail_closed():
     source = (ROOT / "veomni/models/transformers/qwen3_5/qwen3_5_gpu_patch_gen_config.py").read_text()
     block = _function_block(source, "qwen3_5_gated_deltanet_forward_patched")
-    assert 'self.gdn_context_parallel_implementation == "kcp"' in block
-    assert "KCP ttx_bc8_m1 is currently supported on Ascend NPU only" in block
-
-
-def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
-    source = (ROOT / "veomni/models/transformers/qwen3_5/qwen3_5_npu_patch_gen_config.py").read_text()
-    block = _function_block(source, "qwen3_5_gated_deltanet_forward_patched")
-    selector_start = block.index("if cp_enabled and self.gdn_context_parallel_implementation not in (")
-    selector_end = block.index("):", selector_start)
-    selector_block = block[selector_start:selector_end]
-    assert '"state_passing_lossless"' in selector_block
-    assert '"kcp"' in selector_block
-    assert '"headwise_lossless"' in selector_block
-    assert "resolve_kcp_initial_state(" in block
-    assert "cu_seqlens_list=aligned_host_cu" in block
-    assert "kcp_affine_impl = resolve_kcp_affine_implementation(backend_impl)" in block
-    assert "kcp_affine_backend = get_kcp_affine_backend_identity(kcp_affine_impl)" in block
-    assert "affine_impl=kcp_affine_impl" in block
-    assert 'affine_impl="ttx_bc8_m1"' not in block
-    assert block.index("physical_to_owned_grouped(") < block.index("resolve_kcp_initial_state(")
-    assert block.count("physical_to_owned_grouped(") == 1
-    assert "mixed_qkv, b, a = physical_to_owned_grouped(" in block
-    ownership_block = block[block.index("elif cp_enabled:") :]
-    assert ownership_block.index("align_gdn_varlen_chunks(") < ownership_block.index("prepare_gated_delta_rule_qk(")
-    assert ownership_block.index("prepare_gated_delta_rule_qk(") < ownership_block.index("resolve_kcp_initial_state(")
-    empty_owner_guard = "if gdn_lossless_plan.local.owned_token_count == 0:"
-    assert ownership_block.index(empty_owner_guard) < ownership_block.index("prepare_gated_delta_rule_qk(")
-    empty_owner_block = ownership_block[
-        ownership_block.index(empty_owner_guard) : ownership_block.index(
-            "else:", ownership_block.index(empty_owner_guard)
-        )
-    ]
-    assert "use_qk_l2norm_in_kernel = False" in empty_owner_block
-    assert "prepare_gated_delta_rule_qk(" not in empty_owner_block
-    assert 'force_external=self.gdn_context_parallel_implementation == "kcp"' in block
-    assert "use_qk_l2norm=False" in block
-    assert "use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel" in block
-    assert "extra_participation=make_state_participation(query_gdr)" in block
-    readiness_guard = 'not getattr(\n                    self, "_gdn_kcp_affine_ready", False\n                )'
-    assert readiness_guard in block
-    assert block.index(readiness_guard) < block.index("and kcp_plan_requires_affine_scan(gdn_lossless_plan)")
-    assert "coordinate_readiness=needs_affine_readiness" in block
-    assert "self._gdn_kcp_affine_ready = True" in block
-    assert block.count("attach_state_dependency(core_attn_out, initial_state)") == 1
-    assert "gdn_cp_runtime_evidence" in block
-    assert "observer=gdn_cp_observer" in block
+    assert "Qwen3.5 GDN context parallelism is supported on Ascend NPU only" in block
+    assert "prepare_gdn_headwise_inputs(" not in block
 
 
 @pytest.mark.parametrize(
@@ -139,25 +85,15 @@ def test_npu_gdn_runtime_wires_kcp_through_lossless_ownership():
         "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
     ],
 )
-def test_npu_kcp_groups_five_ulysses_inputs_before_ownership(relative_path: str):
+def test_npu_gdn_exposes_only_headwise_context_parallel(relative_path: str):
     source = (ROOT / relative_path).read_text()
     block = _gdn_forward_block(source)
-    grouped_start = block.index('if self.gdn_context_parallel_implementation == "kcp":')
-    grouped_call = block.index("gather_seq_scatter_heads_grouped(", grouped_start)
-    fallback_start = block.index("else:", grouped_call)
-    reorder_start = block.index("reorder_ulysses_rank_major_to_sample_major(", fallback_start)
-    ownership_start = block.index("physical_to_owned_grouped(", reorder_start)
-
-    assert grouped_call < fallback_start < reorder_start < ownership_start
-    grouped_block = block[grouped_start:fallback_start]
-    assert "(q_proj, k_proj, v_proj, b, a)" in grouped_block
-    assert "VEOMNI_GDN_KCP_RUNTIME grouped_ulysses_a2a=true" in grouped_block
-    assert grouped_block.count("gather_seq_scatter_heads_grouped(") == 1
-
-
-def test_moe_npu_patchgen_imports_grouped_ulysses_for_shared_gdn_forward():
-    source = (ROOT / "veomni/models/transformers/qwen3_5_moe/qwen3_5_moe_npu_patch_gen_config.py").read_text()
-    assert '"gather_seq_scatter_heads_grouped"' in source
+    assert 'gdn_context_parallel_implementation == "headwise_lossless"' in block
+    assert "prepare_gdn_headwise_inputs(" in block
+    assert "restore_gdn_headwise_output(" in block
+    assert "physical_to_owned" not in block
+    assert "receive_initial_state" not in block
+    assert "resolve_kcp_initial_state" not in block
 
 
 @pytest.mark.parametrize(
@@ -170,13 +106,9 @@ def test_moe_npu_patchgen_imports_grouped_ulysses_for_shared_gdn_forward():
 )
 def test_npu_gdn_mojo_routes_share_external_qk_norm(relative_path: str):
     source = (ROOT / relative_path).read_text()
-    assert source.count("prepare_gated_delta_rule_qk(") == 3
-    headwise_start = source.index("elif headwise_enabled:")
-    ownership_start = source.index("elif cp_enabled:", headwise_start)
-    headwise_block = source[headwise_start:ownership_start]
-    assert headwise_block.count("prepare_gated_delta_rule_qk(") == 1
+    assert source.count("prepare_gated_delta_rule_qk(") == 2
     assert "producer_dtype_l2norm(query_gdr)" not in source
-    assert 'use_qk_l2norm_in_kernel=self.gdn_context_parallel_implementation != "kcp"' not in source
+    assert "force_external=" not in source
 
 
 @pytest.mark.parametrize(
@@ -205,26 +137,13 @@ def test_npu_headwise_uses_cp_major_ulysses_inner_flat_rank(relative_path: str):
     assert "headwise_lossless requires CP-major/Ulysses-inner flattened SP rank order" in rank_contract
 
 
-def test_moe_npu_patchgen_imports_shared_external_qk_norm_contract():
+def test_moe_npu_patchgen_keeps_headwise_and_backend_adapter_contracts():
     source = (ROOT / "veomni/models/transformers/qwen3_5_moe/qwen3_5_moe_npu_patch_gen_config.py").read_text()
+    assert '"prepare_gdn_headwise_inputs"' in source
     assert '"prepare_gated_delta_rule_qk"' in source
-    assert '"resolve_kcp_affine_implementation"' in source
-    assert '"prepare_kcp_affine_summary"' in source
-
-
-@pytest.mark.parametrize(
-    "relative_path",
-    [
-        "veomni/models/transformers/qwen3_5/generated/patched_modeling_qwen3_5_npu.py",
-        "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py",
-    ],
-)
-def test_generated_npu_kcp_affine_tracks_the_selected_gdr_backend(relative_path: str):
-    source = (ROOT / relative_path).read_text()
-    assert "kcp_affine_impl = resolve_kcp_affine_implementation(backend_impl)" in source
-    assert "affine_impl=kcp_affine_impl" in source
-    assert "prepare_kcp_affine_summary(" in source
-    assert 'affine_impl="ttx_bc8_m1"' not in source
+    assert '"requires_chunked_varlen_metadata"' in source
+    assert "gdn_lossless" not in source
+    assert "gdn_kcp" not in source
 
 
 @pytest.mark.parametrize(
@@ -272,11 +191,12 @@ def test_generated_npu_model_separates_local_and_linear_cu_metadata(relative_pat
 
     assert 'kwargs["cu_seqlens_list_q"] =' in source
     assert 'kwargs["linear_attn_cu_seqlens_list_q"] = cu_seqlens_list' in source
+    assert "head_shard_size = (" in source
     assert "num_v_heads = ulysses_local_head_count(" in source
-    assert "aligned_host_cu = aligned_gdn_cu_seqlens(" in source
-    assert "cu_seqlens_list=aligned_cu_list" in source
-    assert "chunk_indices=aligned_chunk_indices" in source
-    assert "chunk_indices_list=aligned_chunk_indices_list" in source
+    assert "cu_seqlens_list=valid_points" in source
+    assert "chunk_indices=chunk_indices" in source
+    assert "chunk_indices_list=chunk_indices_list" in source
+    assert "aligned_gdn_cu_seqlens" not in source
 
 
 @pytest.mark.parametrize(

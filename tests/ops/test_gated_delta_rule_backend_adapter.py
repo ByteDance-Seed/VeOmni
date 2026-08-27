@@ -255,7 +255,7 @@ def test_mojo_qk_norm_uses_registered_provider_once_per_tensor_and_disables_kern
     assert not use_kernel_norm
 
 
-def test_mojo_external_norm_preserves_exact_custom_vjp_for_disabled_state_and_kcp(monkeypatch):
+def test_mojo_external_norm_preserves_exact_custom_vjp(monkeypatch):
     monkeypatch.setattr(
         "veomni.ops.kernels.gated_delta_rule.normalization._EXTERNAL_L2NORM_PROVIDERS",
         {},
@@ -278,29 +278,20 @@ def test_mojo_external_norm_preserves_exact_custom_vjp_for_disabled_state_and_kc
         return ExactNorm.apply(tensor)
 
     register_external_gated_delta_rule_l2norm("mojo", exact_provider, identity="test.mojo.custom-vjp")
-    results = []
-    base_query = torch.randn(2, 4)
-    base_key = torch.randn(2, 4)
-    for force_external in (False, True):
-        query = base_query.clone().requires_grad_()
-        key = base_key.clone().requires_grad_()
-        norm_query, norm_key, use_kernel_norm = prepare_gated_delta_rule_qk(
-            query,
-            key,
-            implementation="mojo",
-            force_external=force_external,
-        )
-        (norm_query.sum() + norm_key.sum()).backward()
-        results.append((norm_query.detach(), norm_key.detach(), query.grad, key.grad, use_kernel_norm))
+    query = torch.randn(2, 4, requires_grad=True)
+    key = torch.randn(2, 4, requires_grad=True)
+    norm_query, norm_key, use_kernel_norm = prepare_gated_delta_rule_qk(
+        query,
+        key,
+        implementation="mojo",
+    )
+    (norm_query.sum() + norm_key.sum()).backward()
 
-    for norm_query, norm_key, query_grad, key_grad, use_kernel_norm in results:
-        assert not use_kernel_norm
-        assert torch.equal(query_grad, torch.full_like(query_grad, 7))
-        assert torch.equal(key_grad, torch.full_like(key_grad, 7))
-        assert torch.isfinite(norm_query).all()
-        assert torch.isfinite(norm_key).all()
-    for left, right in zip(results[0][:4], results[1][:4]):
-        assert torch.equal(left, right)
+    assert not use_kernel_norm
+    assert torch.equal(query.grad, torch.full_like(query.grad, 7))
+    assert torch.equal(key.grad, torch.full_like(key.grad, 7))
+    assert torch.isfinite(norm_query).all()
+    assert torch.isfinite(norm_key).all()
 
 
 def test_external_provider_registration_is_idempotent_but_rejects_identity_drift(monkeypatch):
@@ -338,16 +329,6 @@ def test_external_provider_output_contract_fails_closed(monkeypatch):
     values = _inputs()
     with pytest.raises(RuntimeError, match="changed the tensor contract"):
         prepare_gated_delta_rule_qk(values["query"], values["key"], implementation="mojo")
-
-
-def test_kcp_forces_shared_external_norm_for_open_provider():
-    values = _inputs()
-    query, key, use_kernel_norm = prepare_gated_delta_rule_qk(
-        values["query"], values["key"], implementation="npu", force_external=True
-    )
-    assert torch.equal(query, values["query"])
-    assert torch.equal(key, values["key"])
-    assert not use_kernel_norm
 
 
 def test_non_mojo_default_keeps_backend_internal_norm():

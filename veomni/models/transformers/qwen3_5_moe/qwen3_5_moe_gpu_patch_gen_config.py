@@ -110,31 +110,6 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
-config.add_import(
-    "veomni.distributed.context_parallel.gdn_lossless",
-    names=[
-        "align_gdn_varlen_chunks",
-        "attach_state_dependency",
-        "compile_gdn_lossless_runtime_plan",
-        "exchange_conv_halo",
-        "make_state_participation",
-        "make_state_template",
-        "owned_to_physical",
-        "physical_to_owned",
-        "receive_initial_state",
-        "send_final_state",
-        "trim_conv_halo",
-        "unpad_gdn_varlen_output",
-    ],
-)
-config.add_import("veomni.distributed.context_parallel.gdn_runtime", names=["make_gdn_cp_runtime_observer"])
-config.add_import(
-    "veomni.distributed.context_parallel.packed_sharding",
-    names=[
-        "reorder_sample_major_to_ulysses_rank_major",
-        "reorder_ulysses_rank_major_to_sample_major",
-    ],
-)
 # gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
 # (re-exported by the package __init__), not in .ulysses.
 config.add_import(

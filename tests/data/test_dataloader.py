@@ -22,7 +22,7 @@ def _fake_ps(sp_size: int, *, cp_size: int = 1, ulysses_size: int | None = None)
         cp_rank=0,
         ulysses_size=sp_size if ulysses_size is None else ulysses_size,
         ulysses_rank=0,
-        gdn_context_parallel_implementation="kcp" if cp_size > 1 else "disabled",
+        gdn_context_parallel_implementation="headwise_lossless" if cp_size > 1 else "disabled",
     )
 
 

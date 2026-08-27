@@ -95,7 +95,7 @@ def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     assert out["max_length_k"] == exp_max_length
 
 
-@pytest.mark.parametrize("implementation", ["disabled", "state_passing_lossless", "kcp"])
+@pytest.mark.parametrize("implementation", ["disabled", "headwise_lossless"])
 def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, features_two_samples, implementation):
     import veomni.data.data_collator as m
 

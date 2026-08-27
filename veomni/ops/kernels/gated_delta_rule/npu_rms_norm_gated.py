@@ -24,13 +24,6 @@ import torch_npu
 
 
 class NPUFusedRMSNormGated(nn.Module):
-    # Capability marker only. The Qwen GDN patch opts an *instance* into the
-    # grouped nested FSDP2 leaf exclusively when KCP is selected. Keeping the
-    # collector marker off the class preserves CP-off and state-passing FSDP
-    # behavior. Do not replace the KCP leaf with ``to_local()``: that would feed
-    # the fused op a rank-local shard instead of the complete RMSNorm weight.
-    _veomni_kcp_requires_grouped_nested_fsdp_leaf = True
-
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))

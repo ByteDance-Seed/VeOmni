@@ -175,9 +175,9 @@ Core files:
    - Direct CUDA calls break NPU compatibility.
 
 24. **Native Ascend GDN varlen recurrences require strictly active segment ordinals**
-   - Lossless context parallel ownership can produce repeated CU boundaries for rank-local empty samples, for example `[0, 0, 32, 64]`.
+   - Packed batches can contain repeated CU boundaries for empty samples, for example `[0, 0, 32, 64]`.
    - Do not pass repeated CU points or full-N initial state directly into the native Triton/AscendC recurrence. The public wrapper must compact active segment ordinals and initial-state rows first, then restore full-N final state outside the custom autograd Function.
-   - The TTX affine summary remains full-N: inactive samples use the identity affine transform. Do not inject dummy tokens, renumber only one metadata representation, or delete packed-ragged coverage.
+   - `headwise_lossless` must preserve the original packed-sequence order and empty boundaries through its layout transform. Compact only at the backend metadata boundary; do not inject dummy tokens, renumber only one metadata representation, or delete packed-ragged coverage.
 
 ## Trainer Extensions
 

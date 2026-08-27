@@ -78,10 +78,9 @@ Context parallelism is currently a packed, causal-only Ascend NPU feature. CPU
 execution is reserved for correctness oracles, and CUDA CP is not supported in
 this release. For non-GDN causal models, the default
 `gdn_context_parallel_implementation: disabled` disables only the GDN-specific
-state-passing/KCP algorithm; with `cp_size > 1`, it selects generic Ring/Hybrid
+headwise algorithm; with `cp_size > 1`, it selects generic Ring/Hybrid
 attention and does not disable CP itself. Qwen3.5 GatedDeltaNet must opt into
-`state_passing_lossless` or `kcp`; it never silently falls back to Ring because
-recurrent-state ownership and backward semantics are different. In all cases,
+`headwise_lossless`; it never silently falls back to Ring. In all cases,
 CP sizes must be powers of two and dynamic packed metadata is required.
 
 ```python

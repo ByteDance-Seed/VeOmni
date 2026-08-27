@@ -110,41 +110,11 @@ from veomni.distributed.context_parallel.gdn_headwise import (
     prepare_gdn_headwise_inputs,
     restore_gdn_headwise_output,
 )
-from veomni.distributed.context_parallel.gdn_kcp import (
-    get_kcp_affine_backend_identity,
-    kcp_plan_requires_affine_scan,
-    prepare_kcp_affine_summary,
-    resolve_kcp_initial_state,
-)
-from veomni.distributed.context_parallel.gdn_lossless import (
-    align_gdn_varlen_chunks,
-    aligned_gdn_cu_seqlens,
-    attach_state_dependency,
-    compile_gdn_lossless_runtime_plan,
-    exchange_conv_halo,
-    make_state_participation,
-    make_state_template,
-    owned_to_physical,
-    physical_to_owned_grouped,
-    receive_initial_state,
-    send_final_state,
-    trim_conv_halo,
-    unpad_gdn_varlen_output,
-)
-from veomni.distributed.context_parallel.gdn_runtime import make_gdn_cp_runtime_observer
-from veomni.distributed.context_parallel.packed_sharding import (
-    reorder_sample_major_to_ulysses_rank_major,
-    reorder_ulysses_rank_major_to_sample_major,
-    ulysses_local_head_count,
-)
+from veomni.distributed.context_parallel.packed_sharding import ulysses_local_head_count
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.comm import get_unified_sequence_parallel_group
-from veomni.distributed.sequence_parallel.ulysses import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
-    gather_seq_scatter_heads_grouped,
-)
+from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.ops.kernels.attention._replicated_dummy import (
     _DUMMY_SP_TOKEN,
     _call_replicated_dummy_checkpointed_module,
@@ -156,7 +126,6 @@ from veomni.ops.kernels.gated_delta_rule.backend_adapter import (
     call_chunk_gated_delta_rule,
     prepare_gated_delta_rule_qk,
     requires_chunked_varlen_metadata,
-    resolve_kcp_affine_implementation,
 )
 from veomni.ops.kernels.load_balancing_loss.eager import load_balancing_loss_pytorch
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -669,10 +638,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.chunk_gated_delta_rule = veomni_chunk_gated_delta_rule.bound_kernel() or torch_chunk_gated_delta_rule
         self._veomni_chunk_gated_delta_rule_impl = veomni_chunk_gated_delta_rule.implementation
         self.gdn_context_parallel_implementation = veomni_gdn_context_parallel_implementation.value
-        if self.gdn_context_parallel_implementation == "kcp" and getattr(
-            self.norm, "_veomni_kcp_requires_grouped_nested_fsdp_leaf", False
-        ):
-            self.norm._veomni_grouped_nested_fsdp_leaf = True
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
         if not is_fast_path_available:
@@ -704,33 +669,19 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Modification: hardware-neutral lossless GDN CP.  The generic ownership
-        # and communication layer deliberately has no torch_npu import; only this
-        # NPU patch converts kernel metadata to the device-specific representation.
+        # Modification: lossless headwise GDN CP. The packed sequence is gathered
+        # once over the flattened CP x Ulysses group, then GDN heads are sharded.
         parallel_state = get_parallel_state()
         cp_enabled = parallel_state.cp_enabled
         headwise_enabled = self.gdn_context_parallel_implementation == "headwise_lossless"
-        if cp_enabled and self.gdn_context_parallel_implementation not in (
-            "state_passing_lossless",
-            "kcp",
-            "headwise_lossless",
-        ):
+        if cp_enabled and not headwise_enabled:
             raise RuntimeError(
-                "GDN context parallelism requires gdn_context_parallel_implementation to be "
-                "'state_passing_lossless', 'kcp', or 'headwise_lossless'."
+                "GDN context parallelism requires gdn_context_parallel_implementation='headwise_lossless'."
             )
         if not cp_enabled and self.gdn_context_parallel_implementation != "disabled":
             raise RuntimeError("The selected GDN CP implementation requires an initialized context-parallel group.")
-        gdn_lossless_plan = None
         gdn_headwise_layout = None
-        gdn_cp_observer = None
-        ulysses_local_cu = None
         backend_impl = self._veomni_chunk_gated_delta_rule_impl
-        kcp_affine_impl = None
-        kcp_affine_backend = None
-        if self.gdn_context_parallel_implementation == "kcp":
-            kcp_affine_impl = resolve_kcp_affine_implementation(backend_impl)
-            kcp_affine_backend = get_kcp_affine_backend_identity(kcp_affine_impl)
         if cp_enabled:
             if batch_size != 1 or cu_seq_lens_q is None:
                 raise RuntimeError("Lossless GDN CP requires a packed batch of size one and global valid cu_seqlens.")
@@ -744,54 +695,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     "the data collator must materialize it before device transfer."
                 )
             valid_points = [int(point) for point in cu_seqlens_list]
-            valid_lengths = [end - start for start, end in zip(valid_points, valid_points[1:])]
-            if not headwise_enabled:
-                plan_key = (tuple(valid_lengths), parallel_state.cp_size, parallel_state.ulysses_size)
-                cached_plan = getattr(self, "_gdn_lossless_plan_cache", None)
-                if cached_plan is None or cached_plan[0] != plan_key:
-                    cached_plan = (
-                        plan_key,
-                        compile_gdn_lossless_runtime_plan(
-                            valid_lengths,
-                            cp_group=parallel_state.cp_group,
-                            ulysses_size=parallel_state.ulysses_size,
-                        ),
-                    )
-                    self._gdn_lossless_plan_cache = cached_plan
-                gdn_lossless_plan = cached_plan[1]
-                observer = getattr(self, "gdn_cp_runtime_evidence", None)
-                expected_identity = (
-                    self.gdn_context_parallel_implementation,
-                    gdn_lossless_plan.plan_hash,
-                    gdn_lossless_plan.cp_size,
-                    gdn_lossless_plan.cp_rank,
-                    kcp_affine_backend,
-                )
-                live_identity = None
-                if observer is not None:
-                    identity = observer.identity
-                    live_identity = (
-                        identity.implementation,
-                        identity.ownership_plan_hash,
-                        identity.cp_size,
-                        identity.cp_rank,
-                        identity.affine_backend,
-                    )
-                if live_identity != expected_identity:
-                    observer = make_gdn_cp_runtime_observer(
-                        self.gdn_context_parallel_implementation,
-                        plan=gdn_lossless_plan,
-                        affine_backend=kcp_affine_backend,
-                    )
-                    self.gdn_cp_runtime_evidence = observer
-                gdn_cp_observer = observer
-                local_physical_lengths = [
-                    length // (parallel_state.cp_size * parallel_state.ulysses_size)
-                    for length in gdn_lossless_plan.global_plan.ring_physical_lengths
-                ]
-                ulysses_local_cu = [0]
-                for length in local_physical_lengths:
-                    ulysses_local_cu.append(ulysses_local_cu[-1] + length)
 
         use_precomputed_states = (
             cache_params is not None
@@ -911,48 +814,13 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             b = b.reshape(batch_size, seq_len, self.num_v_heads)
             a = a.reshape(batch_size, seq_len, self.num_v_heads)
 
-            # KCP keeps its ownership/state algorithm unchanged, but transports
-            # all five projections in one dense all_to_all_single. This preserves
-            # the independent Ulysses tensor layout and wire bytes while removing
-            # four collective launches in both forward and backward.
-            if self.gdn_context_parallel_implementation == "kcp":
-                q_proj, k_proj, v_proj, b, a = gather_seq_scatter_heads_grouped(
-                    (q_proj, k_proj, v_proj, b, a),
-                    seq_dim=1,
-                    head_dim=2,
-                    group=ulysses_group,
-                )
-                if not getattr(self, "_gdn_kcp_grouped_ulysses_logged", False):
-                    logger.info(
-                        "VEOMNI_GDN_KCP_RUNTIME grouped_ulysses_a2a=true "
-                        f"ulysses_size={ulysses_size} cp_size={parallel_state.cp_size}"
-                    )
-                    self._gdn_kcp_grouped_ulysses_logged = True
-            else:
-                # All-to-all: gather full sequence, scatter heads ->
-                # [B, S_full, local_heads, head_dim].
-                q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-                k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-                v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-                b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
-                a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
-
-            if cp_enabled:
-                q_proj = reorder_ulysses_rank_major_to_sample_major(
-                    q_proj, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
-                )
-                k_proj = reorder_ulysses_rank_major_to_sample_major(
-                    k_proj, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
-                )
-                v_proj = reorder_ulysses_rank_major_to_sample_major(
-                    v_proj, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
-                )
-                b = reorder_ulysses_rank_major_to_sample_major(
-                    b, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
-                )
-                a = reorder_ulysses_rank_major_to_sample_major(
-                    a, ulysses_local_cu, ulysses_size=ulysses_size, sequence_dim=1
-                )
+            # All-to-all: gather full sequence, scatter heads ->
+            # [B, S_full, local_heads, head_dim].
+            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
+            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
 
             # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
             q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
@@ -966,19 +834,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             local_value_dim = self.value_dim
 
         gdn_core_cu = cu_seq_lens_q
-        if cp_enabled and not headwise_enabled:
-            # These projections share the same token ownership plan and dtype.
-            # Route them in one packed all-to-all instead of paying three
-            # collective launches in forward and three inverse launches in
-            # backward.  Packing changes neither wire bytes nor tensor values.
-            mixed_qkv, b, a = physical_to_owned_grouped(
-                (mixed_qkv, b, a),
-                plan=gdn_lossless_plan,
-                cp_group=parallel_state.cp_group,
-                sequence_dim=1,
-                observer=gdn_cp_observer,
-            )
-            gdn_core_cu = mixed_qkv.new_tensor(gdn_lossless_plan.owned_cu_seqlens, dtype=torch.int32)
 
         if use_precomputed_states:
             # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
@@ -998,21 +853,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     )
                 else:
                     conv_weight = self.conv1d.weight.squeeze(1)
-                if cp_enabled and not headwise_enabled and gdn_lossless_plan.local.owned_token_count == 0:
-                    pass
-                elif headwise_enabled and gdn_headwise_layout.total_valid_tokens == 0:
+                if headwise_enabled and gdn_headwise_layout.total_valid_tokens == 0:
                     pass
                 else:
-                    conv_cu = gdn_core_cu
-                    if cp_enabled and not headwise_enabled:
-                        mixed_qkv, conv_cu = exchange_conv_halo(
-                            mixed_qkv,
-                            plan=gdn_lossless_plan,
-                            cp_group=parallel_state.cp_group,
-                            kernel_size=self.conv_kernel_size,
-                            sequence_dim=1,
-                            observer=gdn_cp_observer,
-                        )
                     # NPU causal-conv consumes device CU metadata.
                     mixed_qkv = self.causal_conv1d_fn(
                         x=mixed_qkv,
@@ -1021,15 +864,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                         activation=self.activation,
                         seq_idx=None,
                         backend="triton",
-                        cu_seqlens=conv_cu.npu(),
+                        cu_seqlens=gdn_core_cu.npu(),
                     )[0]
-                    if cp_enabled and not headwise_enabled:
-                        mixed_qkv = trim_conv_halo(
-                            mixed_qkv,
-                            plan=gdn_lossless_plan,
-                            kernel_size=self.conv_kernel_size,
-                            sequence_dim=1,
-                        )
             else:
                 raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
 
@@ -1098,130 +934,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                         chunk_indices=chunk_indices,
                         chunk_indices_list=chunk_indices_list,
                     )
-            elif cp_enabled:
-                aligned_host_cu = aligned_gdn_cu_seqlens(gdn_lossless_plan.owned_cu_seqlens)
-                query_gdr, key_gdr, value_gdr, g_gdr, beta_gdr, aligned_cu, unpad_index = align_gdn_varlen_chunks(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    gdn_core_cu,
-                    cu_seqlens_list=gdn_lossless_plan.owned_cu_seqlens,
-                )
-                if gdn_lossless_plan.local.owned_token_count == 0:
-                    # Empty owners still participate in KCP/state communication,
-                    # but the external Mojo norm has no rows to launch.  Keep the
-                    # tensors untouched and make the later kernel flag explicit.
-                    use_qk_l2norm_in_kernel = False
-                else:
-                    query_gdr, key_gdr, use_qk_l2norm_in_kernel = prepare_gated_delta_rule_qk(
-                        query_gdr,
-                        key_gdr,
-                        implementation=backend_impl,
-                        force_external=self.gdn_context_parallel_implementation == "kcp",
-                    )
-                if self.gdn_context_parallel_implementation == "kcp":
-                    # KCP's affine pre-scan and the local GDR core must consume the
-                    # exact same backend-normalized key. Normalizing once here also
-                    # gives both paths one shared autograd edge.
-                    needs_affine_readiness = not getattr(
-                        self, "_gdn_kcp_affine_ready", False
-                    ) and kcp_plan_requires_affine_scan(gdn_lossless_plan)
-                    initial_state = resolve_kcp_initial_state(
-                        key_gdr,
-                        value_gdr,
-                        g_gdr,
-                        beta_gdr,
-                        plan=gdn_lossless_plan,
-                        cp_group=parallel_state.cp_group,
-                        cu_seqlens=aligned_cu,
-                        cu_seqlens_list=aligned_host_cu,
-                        use_qk_l2norm=False,
-                        affine_impl=kcp_affine_impl,
-                        extra_participation=make_state_participation(query_gdr),
-                        coordinate_readiness=needs_affine_readiness,
-                        observer=gdn_cp_observer,
-                    )
-                    if needs_affine_readiness:
-                        self._gdn_kcp_affine_ready = True
-                else:
-                    state_template = make_state_template(query_gdr, value_gdr, aligned_cu)
-                    participation = make_state_participation(query, key, value, g, beta)
-                    initial_state = receive_initial_state(
-                        plan=gdn_lossless_plan,
-                        cp_group=parallel_state.cp_group,
-                        state_template=state_template,
-                        participation=participation,
-                        observer=gdn_cp_observer,
-                    )
-                if gdn_lossless_plan.local.owned_token_count == 0:
-                    core_attn_out = value.new_empty(value.shape)
-                    last_recurrent_state = initial_state
-                    if self.gdn_context_parallel_implementation == "kcp":
-                        # Empty owners still have to traverse KCP AG/RS and every
-                        # ownership-A2A backward ordinal. Preserve those graph
-                        # edges without changing the empty numerical output.
-                        core_attn_out = attach_state_dependency(core_attn_out, initial_state)
-                else:
-                    if requires_chunked_varlen_metadata(backend_impl):
-                        # The original precomputed metadata describes the physical
-                        # input. Build the owned/chunk-aligned metadata from host CU
-                        # once per layer+plan, then reuse it across steps. This avoids
-                        # _ensure_varlen_metadata copying aligned_cu back to the host.
-                        from veomni.ops.kernels.gated_delta_rule.varlen_metadata import (
-                            precompute_varlen_metadata,
-                        )
-
-                        metadata_key = (tuple(aligned_host_cu), local_num_v_heads, str(query.device))
-                        cached_metadata = getattr(self, "_gdn_lossless_npu_metadata_cache", None)
-                        if cached_metadata is None or cached_metadata[0] != metadata_key:
-                            cached_metadata = (
-                                metadata_key,
-                                precompute_varlen_metadata(
-                                    cu_seqlens=torch.tensor(aligned_host_cu, dtype=torch.int32),
-                                    num_heads=local_num_v_heads,
-                                    chunk_size=32,
-                                    device=query.device,
-                                ),
-                            )
-                            self._gdn_lossless_npu_metadata_cache = cached_metadata
-                        aligned_cu_list, aligned_chunk_indices, aligned_chunk_indices_list = cached_metadata[1]
-                    else:
-                        # Legacy cu/host-CU backends deliberately do not consume
-                        # chunk maps. Do not construct or pass maps they cannot
-                        # consume; the adapter still validates canonical CU data.
-                        aligned_cu_list = aligned_host_cu
-                        aligned_chunk_indices = None
-                        aligned_chunk_indices_list = None
-                    core_attn_out, last_recurrent_state = call_chunk_gated_delta_rule(
-                        self.chunk_gated_delta_rule,
-                        query_gdr,
-                        key_gdr,
-                        value_gdr,
-                        implementation=backend_impl,
-                        metadata_is_canonical=not requires_chunked_varlen_metadata(backend_impl),
-                        g=g_gdr,
-                        beta=beta_gdr,
-                        initial_state=initial_state,
-                        output_final_state=self.gdn_context_parallel_implementation == "state_passing_lossless",
-                        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                        cu_seqlens=aligned_cu.npu(),
-                        cu_seqlens_list=aligned_cu_list,
-                        chunk_indices=aligned_chunk_indices,
-                        chunk_indices_list=aligned_chunk_indices_list,
-                    )
-                    core_attn_out = unpad_gdn_varlen_output(core_attn_out, unpad_index)
-                if self.gdn_context_parallel_implementation == "state_passing_lossless":
-                    if last_recurrent_state is None:
-                        raise RuntimeError("Lossless state passing requires a final recurrent state.")
-                    final_state = send_final_state(
-                        last_recurrent_state,
-                        plan=gdn_lossless_plan,
-                        cp_group=parallel_state.cp_group,
-                        observer=gdn_cp_observer,
-                    )
-                    core_attn_out = attach_state_dependency(core_attn_out, final_state)
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
                 backend_impl = self._veomni_chunk_gated_delta_rule_impl
@@ -1269,21 +981,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 layout=gdn_headwise_layout,
                 group=parallel_state.sp_group,
             )
-        elif cp_enabled:
-            core_attn_out = owned_to_physical(
-                core_attn_out,
-                plan=gdn_lossless_plan,
-                cp_group=parallel_state.cp_group,
-                sequence_dim=1,
-                observer=gdn_cp_observer,
-            )
-            if ulysses_enabled:
-                core_attn_out = reorder_sample_major_to_ulysses_rank_major(
-                    core_attn_out,
-                    ulysses_local_cu,
-                    ulysses_size=ulysses_size,
-                    sequence_dim=1,
-                )
 
         # Modification: gather attention output back to sequence-sharded layout before gated norm.
         if ulysses_enabled and not headwise_enabled:
@@ -2516,8 +2213,8 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         if linear_attn_cu_seq_lens_q is not None and requires_chunked_varlen_metadata(backend_impl_for_metadata):
             from veomni.ops.kernels.gated_delta_rule.varlen_metadata import precompute_varlen_metadata
 
-            # Match the live head shard.  ``headwise_lossless`` uses the flattened
-            # CP x Ulysses group; legacy state/KCP modes shard heads only by Ulysses.
+            # Match the live head shard. ``headwise_lossless`` uses the flattened
+            # CP x Ulysses group; ordinary sequence parallelism uses Ulysses only.
             head_shard_size = (
                 parallel_state.sp_size
                 if getattr(first_gdn_for_metadata, "gdn_context_parallel_implementation", "disabled")
@@ -2543,75 +2240,6 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             kwargs["linear_attn_cu_seqlens_list_q"] = cu_seqlens_list
             kwargs["chunk_indices_q"] = chunk_indices
             kwargs["chunk_indices_list_q"] = chunk_indices_list
-
-        # TTX's first forward+VJP launch must happen outside decoder-layer
-        # checkpointing.  Non-reentrant checkpoint recomputation re-enters the
-        # layer body with a partially rebuilt autograd graph; doing the TTX
-        # compile/warmup there can trigger StopRecomputationError or leave CP
-        # ranks at different readiness points.  Prepare each distinct shape once
-        # before the first checkpointed layer and coordinate failures across CP.
-        if self.training and inputs_embeds.device.type == "npu" and parallel_state.cp_enabled:
-            first_gdn = next(
-                (
-                    getattr(layer, "linear_attn", None)
-                    for layer in self.layers[: self.config.num_hidden_layers]
-                    if getattr(layer, "layer_type", None) == "linear_attention"
-                ),
-                None,
-            )
-            if (
-                first_gdn is not None
-                and getattr(first_gdn, "gdn_context_parallel_implementation", "disabled") == "kcp"
-                and linear_attn_cu_seq_lens_q is not None
-            ):
-                num_v_heads = ulysses_local_head_count(
-                    self.config.linear_num_value_heads,
-                    parallel_state.ulysses_size,
-                )
-                # Do not call a child projection here: decoder layers are fully
-                # sharded by FSDP2 and their pre-forward hook has not run yet.  The
-                # root FSDP cast_forward_inputs hook has already cast
-                # ``inputs_embeds`` to the decoder compute dtype; an active device
-                # autocast policy takes precedence.  This gives the TTX readiness
-                # key the same dtype contract without bypassing FSDP materialization
-                # or adding a one-token forward.
-                device_type = inputs_embeds.device.type
-                try:
-                    autocast_enabled = torch.is_autocast_enabled(device_type)
-                except TypeError:  # older torch signature
-                    autocast_enabled = torch.is_autocast_enabled()
-                autocast_dtype = torch.get_autocast_dtype(device_type) if autocast_enabled else None
-                key_value_dtype = autocast_dtype or inputs_embeds.dtype
-                beta_dtype = autocast_dtype or inputs_embeds.dtype
-                warmup_signature = (
-                    inputs_embeds.device.type,
-                    inputs_embeds.device.index,
-                    int(num_v_heads),
-                    int(self.config.linear_key_head_dim),
-                    int(self.config.linear_value_head_dim),
-                    key_value_dtype,
-                    key_value_dtype,
-                    torch.float32,
-                    beta_dtype,
-                    get_kcp_affine_backend_identity(
-                        resolve_kcp_affine_implementation(first_gdn._veomni_chunk_gated_delta_rule_impl)
-                    ),
-                )
-                if getattr(self, "_gdn_kcp_affine_warmup_signature", None) != warmup_signature:
-                    prepare_kcp_affine_summary(
-                        resolve_kcp_affine_implementation(first_gdn._veomni_chunk_gated_delta_rule_impl),
-                        device=inputs_embeds.device,
-                        num_heads=int(num_v_heads),
-                        key_dim=int(self.config.linear_key_head_dim),
-                        value_dim=int(self.config.linear_value_head_dim),
-                        key_dtype=key_value_dtype,
-                        value_dtype=key_value_dtype,
-                        g_dtype=torch.float32,
-                        beta_dtype=beta_dtype,
-                        cp_group=parallel_state.cp_group,
-                        reference=inputs_embeds,
-                    )
-                    self._gdn_kcp_affine_warmup_signature = warmup_signature
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

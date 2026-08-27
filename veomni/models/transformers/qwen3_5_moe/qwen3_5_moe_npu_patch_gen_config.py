@@ -110,7 +110,7 @@ config.add_import(
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
-    names=["gather_seq_scatter_heads", "gather_seq_scatter_heads_grouped", "gather_heads_scatter_seq"],
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
 config.add_import(
     "veomni.distributed.context_parallel.gdn_headwise",
@@ -121,49 +121,16 @@ config.add_import(
     ],
 )
 config.add_import(
-    "veomni.distributed.context_parallel.gdn_lossless",
-    names=[
-        "align_gdn_varlen_chunks",
-        "aligned_gdn_cu_seqlens",
-        "attach_state_dependency",
-        "compile_gdn_lossless_runtime_plan",
-        "exchange_conv_halo",
-        "make_state_participation",
-        "make_state_template",
-        "owned_to_physical",
-        "physical_to_owned_grouped",
-        "receive_initial_state",
-        "send_final_state",
-        "trim_conv_halo",
-        "unpad_gdn_varlen_output",
-    ],
-)
-config.add_import(
-    "veomni.distributed.context_parallel.gdn_kcp",
-    names=[
-        "get_kcp_affine_backend_identity",
-        "kcp_plan_requires_affine_scan",
-        "prepare_kcp_affine_summary",
-        "resolve_kcp_initial_state",
-    ],
-)
-config.add_import("veomni.distributed.context_parallel.gdn_runtime", names=["make_gdn_cp_runtime_observer"])
-config.add_import(
     "veomni.ops.kernels.gated_delta_rule.backend_adapter",
     names=[
         "call_chunk_gated_delta_rule",
         "prepare_gated_delta_rule_qk",
         "requires_chunked_varlen_metadata",
-        "resolve_kcp_affine_implementation",
     ],
 )
 config.add_import(
     "veomni.distributed.context_parallel.packed_sharding",
-    names=[
-        "reorder_sample_major_to_ulysses_rank_major",
-        "reorder_ulysses_rank_major_to_sample_major",
-        "ulysses_local_head_count",
-    ],
+    names=["ulysses_local_head_count"],
 )
 # gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
 # (re-exported by the package __init__), not in .ulysses.
@@ -224,7 +191,6 @@ config.add_post_import_block(
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
 gather_seq_scatter_heads = None
-gather_seq_scatter_heads_grouped = None
 gather_heads_scatter_seq = None
 gather_outputs = None
 slice_input_tensor = None

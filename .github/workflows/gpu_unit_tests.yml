@@ -139,7 +139,6 @@ jobs:
           uv run --frozen pytest -s -x tests/parallel/context_parallel/test_ring_primitives.py
           uv run --frozen pytest -s -x tests/parallel/test_chunk_mbs.py
           uv run --frozen pytest -s -x tests/parallel/context_parallel
-          uv run --frozen pytest -s -x tests/distributed/test_grouped_nested_fsdp_leaf.py
       - name: Run models tests
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py

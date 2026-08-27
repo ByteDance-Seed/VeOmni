@@ -17,7 +17,7 @@ veomni/
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
-│   ├── context_parallel/  Packed Ring CP + lossless GDN ownership/state/halo + KCP affine prefix
+│   ├── context_parallel/  Packed Ring/Hybrid CP + Qwen3.5 GDN headwise-lossless CP
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
 ├── models/             Model loading and patching
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor

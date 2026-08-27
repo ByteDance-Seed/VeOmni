@@ -15,7 +15,7 @@
 
 import types
 from functools import partial
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,10 +39,6 @@ from .utils import check_fqn_match, sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
-
-# Private marker consumed by ``_fully_shard_grouped_nested_fsdp_leaves``.
-# Modules set this class/instance attribute; this file must not import NPU kernels.
-GROUPED_NESTED_FSDP_LEAF_ATTR = "_veomni_grouped_nested_fsdp_leaf"
 
 
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
@@ -72,66 +68,6 @@ def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) ->
     for module, name, buffer in buffers:
         materialized_buffer = module._buffers[name]
         materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
-
-
-def _iter_grouped_nested_fsdp_leaves(model: nn.Module) -> List[nn.Module]:
-    """Return unmarked-by-FSDP modules that opted into the grouped nested leaf."""
-
-    leaves: List[nn.Module] = []
-    seen: Set[int] = set()
-    for module in model.modules():
-        if not getattr(module, GROUPED_NESTED_FSDP_LEAF_ATTR, False):
-            continue
-        if isinstance(module, FSDPModule):
-            continue
-        key = id(module)
-        if key in seen:
-            continue
-        seen.add(key)
-        leaves.append(module)
-    return leaves
-
-
-def _fully_shard_grouped_nested_fsdp_leaves(
-    model: nn.Module,
-    fsdp_kwargs: dict,
-    fsdp_kwargs_without_mp: dict,
-    mp_ignored_classes: Optional[Tuple[type, ...]],
-) -> List[nn.Module]:
-    """Wrap marked gated norms into grouped nested FSDP2 leaves by MP policy.
-
-    Parent ``fully_shard(decoder_layer)`` then skips this group. The group uses
-    the same mesh as the parent layers and the appropriate mixed-precision
-    policy, while keeping ``reshard_after_forward=False`` so ``npu_rms_norm``
-    sees a full local Tensor for the whole forward-to-backward window.
-    """
-
-    leaves = _iter_grouped_nested_fsdp_leaves(model)
-    if not leaves:
-        return []
-
-    regular_leaves: List[nn.Module] = []
-    mp_ignored_leaves: List[nn.Module] = []
-    for leaf in leaves:
-        target = mp_ignored_leaves if mp_ignored_classes and isinstance(leaf, mp_ignored_classes) else regular_leaves
-        target.append(leaf)
-
-    groups = (
-        ("default", regular_leaves, fsdp_kwargs),
-        ("mixed_precision_ignored", mp_ignored_leaves, fsdp_kwargs_without_mp),
-    )
-    for policy_name, grouped_leaves, base_kwargs in groups:
-        if not grouped_leaves:
-            continue
-        grouped_kwargs = dict(base_kwargs)
-        grouped_kwargs["reshard_after_forward"] = False
-        fully_shard(grouped_leaves, **grouped_kwargs)
-        logger.info_rank0(
-            "grouped nested FSDP leaf: "
-            f"modules={len(grouped_leaves)} policy={policy_name} "
-            f"reshard_after_forward=False mesh={grouped_kwargs.get('mesh')}"
-        )
-    return leaves
 
 
 def _veomni_shard_placement_fn(param: "nn.Parameter") -> Optional[Shard]:
@@ -514,21 +450,9 @@ def parallelize_model_fsdp2(
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
 
-    # Bottom-up: wrap every marked gated-norm as one nested group before any
-    # decoder-layer ``fully_shard``. Parent layers then skip this group.
-    grouped_nested_fsdp_leaves = _fully_shard_grouped_nested_fsdp_leaves(
-        model,
-        fsdp_kwargs,
-        fsdp_kwargs_without_mp,
-        mp_ignored_classes,
-    )
-    grouped_nested_fsdp_leaf_ids = {id(module) for module in grouped_nested_fsdp_leaves}
-
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
-        layer_mod._fsdp_modules = [
-            sub_mod for sub_mod in layer_mod.modules() if id(sub_mod) in grouped_nested_fsdp_leaf_ids
-        ]
+        layer_mod._fsdp_modules = []
 
         for para in parallel_state.extra_parallel_names:
             # para (e.g. ep, emb) enabled and this layer contains the para module(s)

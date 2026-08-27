@@ -47,8 +47,8 @@ def producer_dtype_l2norm(x: torch.Tensor, *, dim: int = -1, eps: float = 1e-6) 
     """Normalize in the producer's active arithmetic context and storage dtype.
 
     This is the historical NPU GDR expression.  In particular, it must not be
-    replaced by an unconditional fp32 reduction followed by a cast: KCP and the
-    local GDR core must consume the exact same normalized key tensor.
+    replaced by an unconditional fp32 reduction followed by a cast: native NPU
+    kernels and their reference paths must consume the same normalized tensor.
     """
 
     original_dtype = x.dtype

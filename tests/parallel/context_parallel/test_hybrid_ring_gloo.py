@@ -32,7 +32,7 @@ def _run_hybrid_oracle(rank: int, world_size: int, port: int) -> None:
         state = init_parallel_state(
             dp_size=1,
             cp_size=cp_size,
-            gdn_context_parallel_implementation="state_passing_lossless",
+            gdn_context_parallel_implementation="headwise_lossless",
             ulysses_size=ulysses_size,
             device_type="cpu",
             name="hybrid_cp_test",
