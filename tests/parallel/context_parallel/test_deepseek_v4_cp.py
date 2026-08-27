@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device, is_sm90_or_above
 
 
 _PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
@@ -264,6 +264,19 @@ def _run_attention_cp(
     dist.destroy_process_group()
 
 
+def _stub_sparse_attn_tilelang(query: torch.Tensor, *_args, **_kwargs) -> torch.Tensor:
+    """Stand in for the TileLang kernel, which needs SM90 and is not asserted on here.
+
+    The caller only wants the candidate list the forward built on its way to the
+    kernel, so running the kernel would buy nothing but a hardware requirement --
+    and this is the one compact-candidate case that fits on the two GPUs CI has.
+    ``test_deepseek_v4_model_cp_packed_misaligned_tilelang`` covers the real
+    kernel. The shape follows the caller, which transposes to ``[b, s, h, d]``
+    before calling because the kernel is layout-specific.
+    """
+    return torch.zeros_like(query)
+
+
 def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str, seq_len: int) -> None:
     """The compact candidates a shard builds must be the global build's own rows.
 
@@ -272,10 +285,10 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
     ``compressed_len``. Get them wrong and the TileLang kernel silently reads the
     wrong KV rows.
 
-    Unlike the rest of the file this fixture is bfloat16, because the compact
-    candidate list is a bfloat16-only path: the attention declines to build one
-    unless the kernel can actually consume it, and the kernel is compiled for
-    bfloat16 operands. The assertion is unaffected -- candidates are integer
+    Unlike the rest of the file this fixture is bfloat16, and it stays bfloat16
+    even though the kernel is stubbed out: the attention refuses to build a
+    compact list unless the kernel could consume it, so a float32 fixture reaches
+    the builder not at all. The assertion is unaffected -- candidates are integer
     indices, compared exactly.
     """
     from veomni.distributed.parallel_state import clear_parallel_state
@@ -295,7 +308,11 @@ def _run_attention_cp_sparse_indices(rank: int, world_size: int, init_file: str,
 
     local_len = seq_len // world_size
     begin = rank * local_len
-    with torch.no_grad(), patch(f"{_PATCHED_MODULE}.build_sparse_attention_indices", _record):
+    with (
+        torch.no_grad(),
+        patch(f"{_PATCHED_MODULE}.build_sparse_attention_indices", _record),
+        patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _stub_sparse_attn_tilelang),
+    ):
         no_sp_state = SimpleNamespace(ulysses_enabled=False, cp_enabled=False)
         with patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=no_sp_state):
             _forward(full_hidden, full_position_ids, full_mask)
@@ -1325,6 +1342,7 @@ def test_deepseek_v4_model_cp_packed_misaligned():
 
 
 @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="needs 4 devices")
+@pytest.mark.skipif(not is_sm90_or_above(), reason="the DeepSeek-V4 TileLang kernels need SM90 or later")
 def test_deepseek_v4_model_cp_packed_misaligned_tilelang():
     """The same in bf16, where the model withholds the mask and TileLang runs instead.
 
