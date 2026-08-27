@@ -377,23 +377,24 @@ def test_async_offload_accelerator_gradient_parity_and_peak_memory():
     device_api.synchronize()
     device_api.empty_cache()
 
-    class Block(nn.Module):
+    class Block(GradientCheckpointingLayer):
         def __init__(self):
             super().__init__()
+            # Same nesting as production: patched ``__call__`` (async pack) wraps
+            # ``GradientCheckpointingLayer.__call__`` (checkpoint). NPU Linear
+            # often saves a tensor whose ``data_ptr`` is not the module input, so
+            # a checkpoint-less Sequential never packs (allocations == 0).
+            self.gradient_checkpointing = True
+            self._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
             self.proj = nn.Linear(512, 512)
 
         def forward(self, hidden_states):
-            # Production offload packs checkpoint inputs via _NoopSaveInputs.
-            # Without GC, Linear only saves a view of hidden_states, so the
-            # host pool would stay empty and peak memory would not drop.
-            return checkpoint(
-                lambda h: torch.nn.functional.gelu(self.proj(h)),
-                hidden_states,
-                use_reentrant=False,
-            )
+            return torch.nn.functional.gelu(self.proj(hidden_states))
 
     def make_model():
-        return nn.Sequential(*(Block() for _ in range(4))).to(device)
+        model = nn.Sequential(*(Block() for _ in range(4))).to(device)
+        model.train()
+        return model
 
     torch.manual_seed(0)
     baseline = make_model()
