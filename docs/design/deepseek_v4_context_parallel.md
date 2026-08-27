@@ -31,6 +31,7 @@ communication than necessary to get it.
 | Contiguous sharding, `cp_size` in {2, 4} verified | Zigzag / load-balanced sharding |
 | All-gather for full-resolution KV, compressed rows and compressor halos | P2P halos; multi-hop halos |
 | DeepSeek-V4 only, via an allow-list | Any other model |
+| GPU-only (`check_context_parallel_supported` rejects NPU) | Ascend/NPU CP |
 | `cp_size > 1` with `ulysses_size == 1` | Hybrid CP x Ulysses |
 | Training | KV cache and decode paths |
 | Correctness | Measured performance; `cp_size=8` |
@@ -56,6 +57,7 @@ the compressor. It needs four GPUs. `cp_size=8` has never been run.
 | `cp_size <= S / max(config.compress_rates)` | `plan_compressor_shard`, called by all three window compressors before their halo exchange | `ValueError` on the first forward |
 | `cp_size > 1` requires `ulysses_size == 1` | `ParallelState.__post_init__` and `TrainingArguments._validate_accelerator` | `NotImplementedError` at launch |
 | the model type must implement CP | `check_context_parallel_supported`, from `build_foundation_model` and `build_omni_model` | `NotImplementedError` at model build |
+| CP is GPU-only | `check_context_parallel_supported` | `NotImplementedError` at model build on Ascend/NPU |
 | explicit `position_ids` under either sequence-parallel mode | `DeepseekV4Model.forward` | `ValueError` on the first forward |
 | the attention mask spans the full sequence | `DeepseekV4Attention.forward`, ahead of the KV all-gather | `ValueError` on the first forward |
 | no KV cache under CP | `DeepseekV4Attention.forward` | `NotImplementedError` |

@@ -67,6 +67,9 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
+    if is_torch_npu_available():
+        raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
+
     model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
         return
