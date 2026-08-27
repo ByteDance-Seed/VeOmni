@@ -28,11 +28,11 @@
 #    - method_override: DeepseekV4DecoderLayer.forward
 #      Dispatch DeepSeek V4 mHC residual post-mixing through an OpSlot
 #    - method_override: DeepseekV4Indexer.forward
-#      Optional TileLang Lightning Indexer dispatch (no-ops to eager on NPU)
+#      Ascend Lightning Indexer dispatch with an explicit eager fallback
 #    - method_override: DeepseekV4Attention.forward
-#      Packed compressor path + Ulysses SP for DeepSeek-V4 eager/TileLang attention
+#      Packed compressor path + Ulysses SP for DeepSeek-V4 eager/NPU attention
 #    - function_replacement: eager_attention_forward
-#      Optional TileLang sparse MQA dispatch (no-ops to eager on NPU)
+#      DeepSeek-V4 eager attention fallback for the NPU model
 #    - method_override: DeepseekV4Model.forward
 #      Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
@@ -78,7 +78,6 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 
 # Additional imports for patches
 from veomni.ops import fused_moe_forward
-from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_outputs, gather_seq_scatter_heads
 from veomni.models.transformers.deepseek_v4.packed_utils import CompressedCandidates, build_packed_compression_metadata, build_packed_sparse_attention_indices, build_sparse_attention_indices, compress_packed_windows, isolate_packed_causal_mask_, mask_sparse_attention_indices, packed_compressed_block_bias, packed_compressed_causal_ranges
@@ -728,10 +727,10 @@ class DeepseekV4Indexer(nn.Module):
 
         # --- Patch.1 ---
         indexer_implementation = veomni_dsa_indexer_implementation.value
-        if indexer_implementation not in {"eager", "npu", "tilelang"}:
+        if indexer_implementation not in {"eager", "npu"}:
             raise ValueError(
                 "DeepSeek-V4 does not support "
-                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager', 'npu', or 'tilelang'"
+                f"dsa_indexer_implementation={indexer_implementation!r} on NPU; expected 'eager' or 'npu'"
             )
         canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
         packed_ranges = None
@@ -755,30 +754,6 @@ class DeepseekV4Indexer(nn.Module):
             )
             return top_k_indices.to(torch.long)
 
-        use_tilelang = (
-            indexer_implementation == "tilelang"
-            and hidden_states.is_cuda
-            and q.dtype == torch.bfloat16
-            and compressed_kv.dtype == torch.bfloat16
-            and self.num_heads <= 64
-            and self.num_heads % 8 == 0
-            and self.head_dim >= 32
-            and self.head_dim == 1 << (self.head_dim - 1).bit_length()
-            and cache_layer is None
-            and compressed_len > 0
-            and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
-        )
-        if use_tilelang:
-            _, top_k_indices = v4_lighting_indexer(
-                q.transpose(0, 1).contiguous(),
-                compressed_kv.transpose(0, 1).contiguous(),
-                weights.transpose(0, 1).contiguous(),
-                self.compress_rate,
-                top_k,
-                cu_seqlen_ks=None if packed_ranges is None else packed_ranges[0],
-                cu_seqlen_ke=None if packed_ranges is None else packed_ranges[1],
-            )
-            return top_k_indices.to(torch.long)
         # --- Patch.1 ---
 
         scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
@@ -974,16 +949,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 # ======================================================================
 # [PATCHED FUNCTION] eager_attention_forward
-# Reason: Optional TileLang sparse MQA dispatch (no-ops to eager on NPU)
+# Reason: DeepSeek-V4 eager attention fallback for the NPU model
 # Source: veomni.models.transformers.deepseek_v4.deepseek_v4_npu_patch_gen_config
 # ======================================================================
 # ================================================================
 # Patch: eager_attention_forward
-# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
-#    ``dsa_attention_implementation=tilelang``. The existing additive mask is
-#    converted to a compact fixed-width index list, preserving sliding-window,
-#    compressor, causal, and invalid-index semantics.
-# 2. Preserve the upstream eager implementation as the default fallback.
+# Preserve the upstream eager implementation for sliding-attention layers and
+# as the explicit NPU fallback. Compressed-attention layers dispatch through
+# ``deepseek_v4_attention_forward_npu`` above.
 # ================================================================
 def eager_attention_forward(
     module: nn.Module,
@@ -997,48 +970,11 @@ def eager_attention_forward(
 ):
     # --- Patch.1 ---
     attention_implementation = veomni_dsa_attention_implementation.value
-    if attention_implementation not in {"eager", "npu", "tilelang"}:
+    if attention_implementation not in {"eager", "npu"}:
         raise ValueError(
             "DeepSeek-V4 does not support "
-            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager', 'npu', or 'tilelang'"
+            f"dsa_attention_implementation={attention_implementation!r} on NPU; expected 'eager' or 'npu'"
         )
-    use_tilelang = (
-        attention_implementation == "tilelang"
-        and query.is_cuda
-        and query.dtype == torch.bfloat16
-        and key.dtype == torch.bfloat16
-        and value.dtype == torch.bfloat16
-        and query.shape[-1] == 1 << (query.shape[-1] - 1).bit_length()
-        and isinstance(attention_mask, torch.Tensor)
-        and dropout == 0
-        and key.shape[1] == 1
-    )
-    if use_tilelang:
-        batch, _, seq_len, _ = query.shape
-        kv_len = key.shape[-2]
-        compressed_len = max(0, kv_len - seq_len)
-        compressed_budget = compressed_len
-        indexer = getattr(getattr(module, "compressor", None), "indexer", None)
-        if indexer is not None:
-            compressed_budget = min(compressed_len, indexer.index_topk)
-        selected_width = min(kv_len, module.sliding_window + compressed_budget)
-
-        mask = attention_mask
-        if mask.shape[0] == 1 and batch > 1:
-            mask = mask.expand(batch, -1, -1, -1)
-        allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
-        _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
-        selected_valid = allowed.gather(-1, topk_indices)
-        topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
-        sinks = kwargs.get("s_aux", module.sinks)
-        attn_output = sparse_attn_tilelang(
-            query.transpose(1, 2).contiguous(),
-            key[:, 0].contiguous(),
-            sinks.float().contiguous(),
-            topk_indices,
-            scaling,
-        )
-        return attn_output, None
     # --- Patch.1 ---
 
     # --- Patch.2 ---
@@ -1268,7 +1204,7 @@ class DeepseekV4Attention(nn.Module):
         )
 
         if ulysses_enabled:
-            # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
+            # Eager returns [B, S_full, H_local, D]; restore local seq + full heads.
             attn_output = gather_heads_scatter_seq(
                 attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
             )
@@ -1813,15 +1749,12 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         self.post_init()
 
     # ================================================================
-    # Patch: DeepseekV4Model.forward
-    # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
-    # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
-    # 3. Under Ulysses SP the collator keeps full ``attention_mask`` /
-    #    ``cu_seq_lens_*`` while slicing ``input_ids`` / local ``position_ids``.
-    #    Build the sliding-window mask and packed compression metadata on the full
-    #    sequence length so attention matches non-SP semantics after the all-gather
-    #    inside ``DeepseekV4Attention``.
-    # ================================================================
+    # Patch: DeepseekV4ForCausalLM.forward
+    # 1. OpSlot guard for fused cross-entropy loss; falls back to the eager
+    #    HF loss path when no fused kernel is bound. Returns the unified
+    #    ``MoeCausalLMOutputWithLogProbs`` so callers can read per-token
+    #    log-probs and entropy alongside the loss (required by RL/PPO-style
+    #    trainers).
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -1837,10 +1770,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        # Stateless prefill/training must keep the cache absent: the TileLang
-        # Lightning Indexer dispatch is intentionally cache-free, and creating a
-        # DynamicCache here would silently force its eager decode fallback even
-        # when use_cache=False.
+        # Stateless prefill/training keeps the cache absent. The fused NPU indexer
+        # is cache-free, while decode uses the eager cache-compatible fallback.
         if past_key_values is None and use_cache:
             past_key_values = DynamicCache(config=self.config)
         return_cache = past_key_values if use_cache else None
@@ -1860,9 +1791,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             gather_outputs(position_ids, gather_dim=-1, group=ulysses_group) if ulysses_enabled else position_ids
         )
 
-        # The TileLang sparse kernel reads a compact candidate list, and packed
-        # metadata already pins down every constraint a dense mask would encode, so
-        # the O(S^2) mask and block bias are skipped entirely on that path.
+        # NPU fused DSA currently requires unpacked canonical positions. Packed
+        # training therefore retains the dense causal mask for the eager fallback.
         mask_free_sparse = False
 
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
@@ -1877,17 +1807,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             kwargs["packed_sequence_slices"] = packed_sequence_slices
             compress_rates = tuple(self.config.compress_rates.values())
             hca_rate = self.config.compress_rates["heavily_compressed_attention"]
-            # Packed training disables the cache below, so TileLang attention is the
-            # only mask consumer left and it can validate candidates on its own.
-            # ``eager_attention_forward`` declines the TileLang dispatch for non-bf16
-            # or host tensors, and its dense fallback needs the mask to stay causal,
-            # so mirror those two runtime conditions before dropping the mask.
-            mask_free_sparse = (
-                veomni_dsa_attention_implementation.value == "tilelang"
-                and not isinstance(attention_mask, dict)
-                and inputs_embeds.dtype == torch.bfloat16
-                and inputs_embeds.is_cuda
-            )
+            # Packed input is not supported by the fused NPU DSA contract, so keep
+            # the full causal mask for the eager fallback.
+            mask_free_sparse = False
             # Dropping the mask is only sound if it masked nothing out. The check on
             # ``boundaries`` above already establishes that every position belongs to
             # some sequence, so a zero here contradicts the caller's own cu-seqlens --

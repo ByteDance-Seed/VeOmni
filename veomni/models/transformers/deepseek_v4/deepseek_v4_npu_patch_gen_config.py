@@ -28,18 +28,13 @@ than merely convenient:
   is bound to a non-eager implementation; Liger requires CUDA, so these fall
   straight through to the shared eager arithmetic on NPU without any change
   needed here.
-- ``DeepseekV4Indexer.forward`` / ``eager_attention_forward`` gate their
-  TileLang fast paths behind ``.is_cuda`` (and SM90 checks inside
-  ``veomni.ops.kernels.deepseek_v4``). The module-level import of
-  ``sparse_attn_tilelang`` / ``v4_lighting_indexer`` is lazy-safe on NPU:
-  ``veomni/ops/kernels/deepseek_v4/__init__.py`` only imports TileLang inside
-  the wrapper *bodies*, guarded by ``_require_tilelang_sm90()``, which is
-  never reached because the ``.is_cuda`` condition short-circuits first. Both
-  functions fall straight through to the eager PyTorch computation on NPU.
+- ``DeepseekV4Indexer.forward`` / ``eager_attention_forward`` only accept the
+  ``eager`` and ``npu`` implementations. GPU-only dispatch remains owned
+  by the GPU patch and is intentionally absent from this NPU sibling.
 - The mHC pre/post/head patches are OpSlot-guarded
   (``veomni_mhc_{pre,post,head}``); ``mhc_implementation`` defaults to
   ``"eager"`` (see ``OpsImplementationConfig.mhc_implementation`` —
-  ``tilelang`` is documented SM90+ only), so the pure-PyTorch branch already
+  the GPU-only backend is not registered here), so the pure-PyTorch branch already
   in these functions is what actually runs on NPU without any change.
 - ``DeepseekV4Experts.forward`` dispatches through the OpSlot-guarded
   ``fused_moe_forward``, which already has an NPU backend
@@ -91,6 +86,7 @@ from transformers.utils import TransformersKwargs
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4CSACache,
     DeepseekV4HCACache,
+    MoeModelOutputWithPast,
     apply_rotary_pos_emb,
 )
 
@@ -109,7 +105,6 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_hyper_connection_forward_patched,
     deepseek_v4_hyper_head_forward_patched,
     deepseek_v4_mlp_forward_patched,
-    deepseek_v4_model_forward_patched,
     deepseek_v4_rms_norm_forward_patched,
     deepseek_v4_rotary_embedding_forward_patched,
     deepseek_v4_unweighted_rmsnorm_forward_patched,
@@ -123,10 +118,6 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
-config.add_import(
-    "veomni.ops.kernels.deepseek_v4",
-    names=["sparse_attn_tilelang", "v4_lighting_indexer"],
-)
 config.add_import(
     "veomni.distributed.parallel_state",
     names=["get_parallel_state"],
@@ -270,10 +261,10 @@ def deepseek_v4_indexer_forward_npu(
 
     # --- Patch.1 ---
     indexer_implementation = veomni_dsa_indexer_implementation.value
-    if indexer_implementation not in {"eager", "npu", "tilelang"}:
+    if indexer_implementation not in {"eager", "npu"}:
         raise ValueError(
             "DeepSeek-V4 does not support "
-            f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager', 'npu', or 'tilelang'"
+            f"dsa_indexer_implementation={indexer_implementation!r} on NPU; expected 'eager' or 'npu'"
         )
     canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
     packed_ranges = None
@@ -297,30 +288,6 @@ def deepseek_v4_indexer_forward_npu(
         )
         return top_k_indices.to(torch.long)
 
-    use_tilelang = (
-        indexer_implementation == "tilelang"
-        and hidden_states.is_cuda
-        and q.dtype == torch.bfloat16
-        and compressed_kv.dtype == torch.bfloat16
-        and self.num_heads <= 64
-        and self.num_heads % 8 == 0
-        and self.head_dim >= 32
-        and self.head_dim == 1 << (self.head_dim - 1).bit_length()
-        and cache_layer is None
-        and compressed_len > 0
-        and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
-    )
-    if use_tilelang:
-        _, top_k_indices = v4_lighting_indexer(
-            q.transpose(0, 1).contiguous(),
-            compressed_kv.transpose(0, 1).contiguous(),
-            weights.transpose(0, 1).contiguous(),
-            self.compress_rate,
-            top_k,
-            cu_seqlen_ks=None if packed_ranges is None else packed_ranges[0],
-            cu_seqlen_ke=None if packed_ranges is None else packed_ranges[1],
-        )
-        return top_k_indices.to(torch.long)
     # --- Patch.1 ---
 
     scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
@@ -488,7 +455,7 @@ def deepseek_v4_attention_forward_npu(
     )
 
     if ulysses_enabled:
-        # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
+        # Eager returns [B, S_full, H_local, D]; restore local seq + full heads.
         attn_output = gather_heads_scatter_seq(
             attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
         )
@@ -502,11 +469,9 @@ def deepseek_v4_attention_forward_npu(
 
 # ================================================================
 # Patch: eager_attention_forward
-# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
-#    ``dsa_attention_implementation=tilelang``. The existing additive mask is
-#    converted to a compact fixed-width index list, preserving sliding-window,
-#    compressor, causal, and invalid-index semantics.
-# 2. Preserve the upstream eager implementation as the default fallback.
+# Preserve the upstream eager implementation for sliding-attention layers and
+# as the explicit NPU fallback. Compressed-attention layers dispatch through
+# ``deepseek_v4_attention_forward_npu`` above.
 # ================================================================
 def deepseek_v4_eager_attention_forward_npu(
     module: nn.Module,
@@ -520,48 +485,11 @@ def deepseek_v4_eager_attention_forward_npu(
 ):
     # --- Patch.1 ---
     attention_implementation = veomni_dsa_attention_implementation.value
-    if attention_implementation not in {"eager", "npu", "tilelang"}:
+    if attention_implementation not in {"eager", "npu"}:
         raise ValueError(
             "DeepSeek-V4 does not support "
-            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager', 'npu', or 'tilelang'"
+            f"dsa_attention_implementation={attention_implementation!r} on NPU; expected 'eager' or 'npu'"
         )
-    use_tilelang = (
-        attention_implementation == "tilelang"
-        and query.is_cuda
-        and query.dtype == torch.bfloat16
-        and key.dtype == torch.bfloat16
-        and value.dtype == torch.bfloat16
-        and query.shape[-1] == 1 << (query.shape[-1] - 1).bit_length()
-        and isinstance(attention_mask, torch.Tensor)
-        and dropout == 0
-        and key.shape[1] == 1
-    )
-    if use_tilelang:
-        batch, _, seq_len, _ = query.shape
-        kv_len = key.shape[-2]
-        compressed_len = max(0, kv_len - seq_len)
-        compressed_budget = compressed_len
-        indexer = getattr(getattr(module, "compressor", None), "indexer", None)
-        if indexer is not None:
-            compressed_budget = min(compressed_len, indexer.index_topk)
-        selected_width = min(kv_len, module.sliding_window + compressed_budget)
-
-        mask = attention_mask
-        if mask.shape[0] == 1 and batch > 1:
-            mask = mask.expand(batch, -1, -1, -1)
-        allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
-        _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
-        selected_valid = allowed.gather(-1, topk_indices)
-        topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
-        sinks = kwargs.get("s_aux", module.sinks)
-        attn_output = sparse_attn_tilelang(
-            query.transpose(1, 2).contiguous(),
-            key[:, 0].contiguous(),
-            sinks.float().contiguous(),
-            topk_indices,
-            scaling,
-        )
-        return attn_output, None
     # --- Patch.1 ---
 
     # --- Patch.2 ---
@@ -632,6 +560,135 @@ def deepseek_v4_hash_router_forward_npu(
 #    log-probs and entropy alongside the loss (required by RL/PPO-style
 #    trainers).
 
+def deepseek_v4_model_forward_npu(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> MoeModelOutputWithPast:
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+    # Stateless prefill/training keeps the cache absent. The fused NPU indexer
+    # is cache-free, while decode uses the eager cache-compatible fallback.
+    if past_key_values is None and use_cache:
+        past_key_values = DynamicCache(config=self.config)
+    return_cache = past_key_values if use_cache else None
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+    if position_ids is None:
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
+        position_ids = position_ids.unsqueeze(0)
+
+    ulysses_enabled = get_parallel_state().ulysses_enabled
+    ulysses_group = get_parallel_state().ulysses_group if ulysses_enabled else None
+    ulysses_size = get_parallel_state().ulysses_size if ulysses_enabled else 1
+    local_seq_len = inputs_embeds.shape[1]
+    full_seq_len = local_seq_len * ulysses_size if ulysses_enabled else local_seq_len
+    full_position_ids = (
+        gather_outputs(position_ids, gather_dim=-1, group=ulysses_group) if ulysses_enabled else position_ids
+    )
+
+    # NPU fused DSA currently requires unpacked canonical positions. Packed
+    # training therefore retains the dense causal mask for the eager fallback.
+    mask_free_sparse = False
+
+    cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+    if isinstance(cu_seq_lens_q, torch.Tensor) and inputs_embeds.shape[0] == 1:
+        boundaries = cu_seq_lens_q.detach().cpu().tolist()
+        if boundaries[0] != 0 or boundaries[-1] != full_seq_len:
+            raise ValueError(
+                "DeepSeek V4 packed cu_seq_lens_q must span the full sequence; "
+                f"got {boundaries} for length {full_seq_len}"
+            )
+        packed_sequence_slices = tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
+        kwargs["packed_sequence_slices"] = packed_sequence_slices
+        compress_rates = tuple(self.config.compress_rates.values())
+        hca_rate = self.config.compress_rates["heavily_compressed_attention"]
+        # Packed input is not supported by the fused NPU DSA contract, so keep
+        # the full causal mask for the eager fallback.
+        mask_free_sparse = False
+        # Dropping the mask is only sound if it masked nothing out. The check on
+        # ``boundaries`` above already establishes that every position belongs to
+        # some sequence, so a zero here contradicts the caller's own cu-seqlens --
+        # but ``build_packed_sparse_attention_indices`` rebuilds candidates from
+        # ``position_ids`` alone, so an unnoticed zero would silently make a padded
+        # token attendable and move the loss. VeOmni's collator guarantees all-ones
+        # on this path (see ``data_collator.py``: SP slices ``input_ids`` but keeps
+        # the full mask), yet this is a public entry point, so verify rather than
+        # trust. Reading the mask costs one device sync on a branch that already
+        # pays for ``cu_seq_lens_q.cpu()`` a few lines up, so this adds no new
+        # class of stall.
+        if mask_free_sparse and isinstance(attention_mask, torch.Tensor) and not bool(attention_mask.all()):
+            raise ValueError(
+                "DeepSeek V4 packed attention received an attention_mask with masked-out "
+                "positions alongside cu_seq_lens_q that span the full sequence. Express "
+                "padding through cu_seq_lens_q, which the sparse path reads, instead of a "
+                "dense mask, which it drops."
+            )
+        # Metadata is indexed by global positions / cu-seqlens; under SP the
+        # collator already provides full-sequence cu-seqlens while local embeds
+        # are only one shard, so materialize a full-length reference tensor.
+        metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
+        kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
+            metadata_reference,
+            full_position_ids,
+            packed_sequence_slices,
+            compress_rates,
+            block_bias_rates=() if mask_free_sparse else (hca_rate,),
+        )
+        # Packed training combines independent samples in one physical row;
+        # treating that row as a decode cache would merge their KV histories.
+        past_key_values = None
+        return_cache = None
+
+    if mask_free_sparse:
+        causal_mask = None
+    elif isinstance(attention_mask, dict):
+        causal_mask = next(iter(attention_mask.values()))
+    else:
+        mask_embeds = inputs_embeds
+        mask_position_ids = position_ids
+        if ulysses_enabled:
+            # SP collator keeps the full 2D attention_mask while slicing
+            # input_ids; build the 4D sliding-window mask on the full length.
+            mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
+            mask_position_ids = full_position_ids
+        causal_mask = create_sliding_window_causal_mask(
+            config=self.config,
+            inputs_embeds=mask_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=mask_position_ids,
+        )
+    if causal_mask is not None and "packed_sequence_slices" in kwargs:
+        causal_mask = isolate_packed_causal_mask_(causal_mask, kwargs["packed_sequence_slices"])
+    hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+    position_embeddings = {
+        "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
+        "compress": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="compress"),
+    }
+
+    for layer in self.layers:
+        hidden_states = layer(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            attention_mask=causal_mask,
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    hidden_states = self.norm(self.hc_head(hidden_states))
+    return MoeModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=return_cache)
+
+
+
 # Structural + numerics patches reused verbatim from the GPU config. Keeping
 # these byte-identical across backends guarantees GPU/NPU checkpoint and
 # numerics parity.
@@ -693,13 +750,13 @@ config.override_method(
 config.override_method(
     "DeepseekV4Indexer.forward",
     replacement=deepseek_v4_indexer_forward_npu,
-    description="Optional TileLang Lightning Indexer dispatch (no-ops to eager on NPU)",
+    description="Ascend Lightning Indexer dispatch with an explicit eager fallback",
 )
 
 config.override_method(
     "DeepseekV4Attention.forward",
     replacement=deepseek_v4_attention_forward_npu,
-    description="Packed compressor path + Ulysses SP for DeepSeek-V4 eager/TileLang attention",
+    description="Packed compressor path + Ulysses SP for DeepSeek-V4 eager/NPU attention",
 )
 
 # NOTE: applied as a manual decorator call (rather than the ``replacement=``
@@ -709,12 +766,12 @@ config.override_method(
 # does not depend on a ``replacement=`` kwarg existing on that decorator.
 config.replace_function(
     "eager_attention_forward",
-    description="Optional TileLang sparse MQA dispatch (no-ops to eager on NPU)",
+    description="DeepSeek-V4 eager attention fallback for the NPU model"
 )(deepseek_v4_eager_attention_forward_npu)
 
 config.override_method(
     "DeepseekV4Model.forward",
-    replacement=deepseek_v4_model_forward_patched,
+    replacement=deepseek_v4_model_forward_npu,
     description="Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch",
 )
 
