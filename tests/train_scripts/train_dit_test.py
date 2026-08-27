@@ -90,10 +90,14 @@ class TestDiTTrainer(DiTTrainer):
         super().on_train_end()
         self.base._log_callback.on_train_end(self.base.state)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        super().on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        super().on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
         self.base._log_callback.on_step_end(
-            self.base.state, loss=loss, loss_dict=loss_dict or {}, grad_norm=grad_norm or 0.0
+            self.base.state,
+            loss=loss,
+            loss_dict=loss_dict or {},
+            grad_norm=grad_norm or 0.0,
+            aux_metrics=aux_metrics,
         )
 
 
