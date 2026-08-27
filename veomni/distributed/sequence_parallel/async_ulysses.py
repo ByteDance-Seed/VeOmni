@@ -37,9 +37,6 @@ from .utils import (
 )
 
 
-if IS_MLU_AVAILABLE:
-    import torch_mlu
-
 fused_layer_norm_cuda = None
 
 
