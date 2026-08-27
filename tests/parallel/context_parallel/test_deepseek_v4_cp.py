@@ -794,11 +794,11 @@ def test_deepseek_v4_model_without_sp_still_defaults_position_ids():
     torch.testing.assert_close(defaulted, explicit, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_sliding_only(cp_size):
     """A CP shard's sliding-window attention matches the full-sequence forward and backward."""
-    if torch.cuda.device_count() < cp_size:
+    if get_torch_device().device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
@@ -824,7 +824,7 @@ def test_deepseek_v4_attention_cp_sliding_only(cp_size):
 _PACKED_SLIDING_SAMPLES = ((0, 70), (70, 128))
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_packed_sliding_only(cp_size):
     """A CP shard of a packed batch matches the full forward and backward without a compressor.
@@ -835,7 +835,7 @@ def test_deepseek_v4_attention_cp_packed_sliding_only(cp_size):
     arithmetic, no halo, no compressed-row gather -- and what remains is the KV
     all-gather and the mask, which is the whole of the sliding-only CP path.
     """
-    if torch.cuda.device_count() < cp_size:
+    if get_torch_device().device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
@@ -847,11 +847,11 @@ def test_deepseek_v4_attention_cp_packed_sliding_only(cp_size):
         )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_sparse_indices(cp_size):
     """A CP shard's compact sparse candidates match the full-sequence build's rows."""
-    if torch.cuda.device_count() < cp_size:
+    if get_torch_device().device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
@@ -863,7 +863,7 @@ def test_deepseek_v4_attention_cp_sparse_indices(cp_size):
         )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_with_compressor(cp_size):
     """A whole HCA layer under CP matches the full-sequence forward and backward.
@@ -871,7 +871,7 @@ def test_deepseek_v4_attention_cp_with_compressor(cp_size):
     Sequence length 128 keeps every rank holding at least one window at
     ``cp_size=4`` with the toy HCA rate of 32.
     """
-    if torch.cuda.device_count() < cp_size:
+    if get_torch_device().device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
@@ -883,7 +883,7 @@ def test_deepseek_v4_attention_cp_with_compressor(cp_size):
         )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 def test_deepseek_v4_attention_cp_with_compressor_batch_2():
     """The same HCA layer at batch 2, which is where the KV gather's backward broke.
 
@@ -908,12 +908,12 @@ def test_deepseek_v4_attention_cp_with_compressor_batch_2():
         )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("kind", ["hca", "csa"])
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_compressor_cp_unpacked(kind, cp_size):
     """Both compressors rebuild the global compressed KV from per-shard windows."""
-    if torch.cuda.device_count() < cp_size:
+    if get_torch_device().device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
@@ -960,12 +960,12 @@ _PACKED_COMPRESSOR_FIXTURES = {
 }
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("kind", ["hca", "csa"])
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_compressor_cp_packed_straddling(kind, cp_size):
     """Windows that cross a shard boundary still land in the right global slot."""
-    if torch.cuda.device_count() < cp_size:
+    if get_torch_device().device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     seq_len, sample_slices = _PACKED_COMPRESSOR_FIXTURES[(kind, cp_size)]
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -978,11 +978,11 @@ def test_deepseek_v4_compressor_cp_packed_straddling(kind, cp_size):
         )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_indexer_cp(cp_size):
     """A CP shard's indexer selection matches the full-query result, packed and unpacked."""
-    if torch.cuda.device_count() < cp_size:
+    if get_torch_device().device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
@@ -1004,7 +1004,7 @@ def test_deepseek_v4_indexer_cp(cp_size):
 _ZERO_WINDOW_UNPACKED_SEQ_LEN = {"hca": 80, "csa": 10}
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("kind", ["hca", "csa"])
 def test_deepseek_v4_compressor_cp_zero_windows_unpacked(kind):
     """A rank owning no window keeps its peers' backward collectives from hanging.
@@ -1045,7 +1045,7 @@ _ZERO_WINDOW_PACKED_SEQ_LEN = 16
 _ZERO_WINDOW_PACKED_SAMPLES = ((0, 6), (6, 16))
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_compressor_cp_zero_windows_packed_with_indexer():
     """The same, packed, with the CSA compressor's real Lightning Indexer attached.
 
@@ -1280,7 +1280,7 @@ def _run_cp_collator_contract(rank: int, world_size: int, init_file: str) -> Non
     dist.destroy_process_group()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank():
     """The collator gives rank ``r`` rows ``[r*L, (r+1)*L)``, global positions, global cu-seqlens."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1288,7 +1288,7 @@ def test_deepseek_v4_cp_collator_shards_contiguously_by_cp_rank():
         mp.spawn(_run_cp_collator_contract, args=(4, init_file), nprocs=4, join=True)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_model_cp_packed_misaligned():
     """A whole packed model under CP matches the single-rank forward and backward."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1296,7 +1296,7 @@ def test_deepseek_v4_model_cp_packed_misaligned():
         mp.spawn(_run_model_cp_packed, args=(4, init_file, torch.float32, False), nprocs=4, join=True)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_model_cp_packed_misaligned_tilelang():
     """The same in bf16, where the model withholds the mask and TileLang runs instead.
 
@@ -1310,7 +1310,7 @@ def test_deepseek_v4_model_cp_packed_misaligned_tilelang():
         mp.spawn(_run_model_cp_packed, args=(4, init_file, torch.bfloat16, True), nprocs=4, join=True)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_attention_cp_unpacked_misaligned():
     """A shard length that is a multiple of no compression rate still matches.
 
@@ -1326,7 +1326,7 @@ def test_deepseek_v4_attention_cp_unpacked_misaligned():
         mp.spawn(_run_attention_cp, args=(4, init_file, 68, False), nprocs=4, join=True)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 4, reason="needs 4 devices")
 def test_deepseek_v4_attention_cp_unpacked_misaligned_with_compressor():
     """A misaligned shard that is still wide enough to compress.
 
@@ -1347,7 +1347,7 @@ def test_deepseek_v4_attention_cp_unpacked_misaligned_with_compressor():
         mp.spawn(_run_attention_cp, args=(4, init_file, 160, True), nprocs=4, join=True)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.skipif(get_torch_device().device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_deepseek_v4_attention_cp_with_csa_compressor(cp_size):
     """A whole CSA layer under CP -- compressor and Lightning Indexer -- matches the baseline.
@@ -1363,7 +1363,7 @@ def test_deepseek_v4_attention_cp_with_csa_compressor(cp_size):
     block bias this produces does not depend on the top-k *order*. The ranking
     itself is what ``test_deepseek_v4_indexer_cp`` covers.
     """
-    if torch.cuda.device_count() < cp_size:
+    if get_torch_device().device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")
