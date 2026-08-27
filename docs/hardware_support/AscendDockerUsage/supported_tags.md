@@ -10,9 +10,18 @@ Two tag schemes coexist on quay.io:
 - **Product-based** (current): `<veomni_version>-cann<CANN>-torch_npu<torch_npu>-<chip_series>-<os>-py<python>-veomni`
 - **Legacy**: `veomni-<cann>-<chip_series>-<os>-py<python>[-torch<torch>][-<suffix>]`
 
-> The product-based tags use the dedicated CANN 9.0.0 / torch-npu 2.10.0.post2
-> Dockerfiles below, which include the triton-ascend and fla_npu GDN stack. The
-> general-purpose Dockerfiles remain available for the legacy tags.
+> Product-based tags use dedicated CANN / torch-npu Dockerfiles that include the
+> triton-ascend and fla_npu GDN stack. General-purpose Dockerfiles remain
+> available for the legacy tags.
+
+## CANN 9.1.0
+
+### Product-based tags
+
+| Tag | Dockerfile | Content |
+|---|---|---|
+| `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [Dockerfile] [a2.x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [a2.arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) | veomni / torch-npu / triton-ascend / fla_npu |
+| `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [Dockerfile] [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) | veomni / torch-npu / triton-ascend / fla_npu |
 
 ## CANN 9.0.0
 
