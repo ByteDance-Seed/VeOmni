@@ -196,6 +196,19 @@ class _Slice(torch.autograd.Function):
 
 
 class _Gather(torch.autograd.Function):
+    """All-gather + concat over the SP group; backward slices the incoming
+    full-sequence grad back to this rank's local segment.
+
+    ``sum_grad`` selects the backward semantics:
+    - True (default): all-reduce the grad first. After a mid-model gather each
+      rank consumed a DIFFERENT segment of the full sequence downstream, so its
+      grads only cover its own rows — summing reconstructs the full grad.
+    - False: no all-reduce. Used at the model output, where the downstream loss
+      (e.g. the MiniMaxH3 wrapper's MSE over the full output) is identical on
+      every SP rank, so the incoming grad is already the true full grad and a
+      sum would multiply it by the SP world size.
+    """
+
     @staticmethod
     def forward(
         ctx: Any,
@@ -203,11 +216,13 @@ class _Gather(torch.autograd.Function):
         local_input: Tensor,
         dim: int,
         grad_scale: Optional[bool] = False,
+        sum_grad: Optional[bool] = True,
     ) -> Tensor:
         ctx.group = group
         ctx.rank = dist.get_rank(group)
         ctx.dim = dim
         ctx.grad_scale = grad_scale
+        ctx.sum_grad = sum_grad
         seq_world_size = dist.get_world_size(group)
         ctx.seq_world_size = seq_world_size
         output, size_list = _all_gather(local_input.contiguous(), group=ctx.group)
@@ -215,15 +230,23 @@ class _Gather(torch.autograd.Function):
         return torch.cat(output, dim=dim)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor]:
+    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None, None]:
         if ctx.grad_scale:
             grad_output = grad_output * ctx.seq_world_size
 
-        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
+        # A caller that reduces the gathered output with a bare ``.sum()`` (no
+        # elementwise op in between to materialise a real buffer) hands back a
+        # stride-0 broadcast view here, which NCCL's in-place all_reduce rejects
+        # with "Tensors must be contiguous". ``.contiguous()`` also protects
+        # against scribbling in place on a tensor autograd may still own.
+        grad_output = grad_output.contiguous()
+        if ctx.sum_grad:
+            dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
 
         return (
             None,
             grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous(),
+            None,
             None,
             None,
         )

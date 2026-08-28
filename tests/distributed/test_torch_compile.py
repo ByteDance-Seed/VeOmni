@@ -439,7 +439,7 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
         _configure_hsdp_allreduce=lambda *_: None,
         sync_before_train_step=lambda: None,
         _reset_async_activation_offload_if_enabled=lambda: None,
-        forward_backward_step=lambda _: (torch.tensor(1.0), {}),
+        forward_backward_step=lambda _: (torch.tensor(1.0), {}, {}),
         optimizer=SimpleNamespace(step=lambda: None, zero_grad=lambda: None),
         lr_scheduler=SimpleNamespace(step=lambda: None),
         on_step_begin=lambda **_: None,
