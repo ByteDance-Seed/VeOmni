@@ -423,7 +423,6 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
         # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
         "head_group_size": int(optimizer_cfg.muon_head_group_size),
         "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
-        "head_split_exclude_indexer": bool(optimizer_cfg.muon_head_split_exclude_indexer),
         # Surface for startup summary only; not a DistributedMuon ctor kwarg.
         "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
     }
@@ -582,19 +581,15 @@ def _build_muon_with_adamw(
     adamw_lr = float(lr)
     head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
     head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
-    # ``is None`` rather than falsy, unlike the two above: this flag defaults to
-    # True, so folding an absent value into ``bool(None)`` would flip it to the
-    # side that changes the update math.
-    exclude_indexer = muon_kwargs.pop("head_split_exclude_indexer", None)
-    head_split_exclude_indexer = True if exclude_indexer is None else bool(exclude_indexer)
     if head_group_size < 0:
         raise ValueError(f"muon_head_group_size must be >= 0 (0 disables head splitting), got {head_group_size}")
     if head_group_size >= 1 and not head_split_modules:
         raise ValueError(
             f"muon_head_group_size={head_group_size} requires muon_head_split_modules: there is no "
             "default list, because which attention projections benefit from head splitting depends "
-            "on the architecture. List the leaf module names to split, e.g. ['q_b_proj'] for "
-            "DeepSeek V4/V3 MLA up-projections or ['q_proj', 'k_proj', 'v_proj'] for GQA attention."
+            "on the architecture. List the modules to split as leaf names or dotted path suffixes, "
+            "e.g. ['self_attn.q_b_proj'] for DeepSeek V4/V3 MLA up-projections or "
+            "['q_proj', 'k_proj', 'v_proj'] for GQA attention."
         )
     # The single owner of the Muon-vs-AdamW LR policy: an unset Muon LR either
     # inherits the AdamW LR (match_rms_adamw) or takes the Moonlight-style 25x.
@@ -616,9 +611,7 @@ def _build_muon_with_adamw(
     head_blocks_by_param: Dict[int, int] = {}
     head_split_names: List[str] = []
     if head_group_size >= 1:
-        blocks_by_fqn = infer_head_block_counts(
-            model, head_group_size, head_split_modules, exclude_indexer=head_split_exclude_indexer
-        )
+        blocks_by_fqn = infer_head_block_counts(model, head_group_size, head_split_modules)
         muon_name_set = set(muon_names)
         param_by_name = dict(model.named_parameters())
         for fqn, blocks in sorted(blocks_by_fqn.items()):
