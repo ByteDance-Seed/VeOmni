@@ -387,7 +387,7 @@ def mlu_group_gemm_fused_moe_forward(
         from apex.contrib.unpermute import unpermute
         permute_tokens, sorted_indice = permute(
             hidden_states, selected_experts, -1
-        ) 
+        )
         splits = torch.bincount(selected_experts.view(-1), minlength=num_experts)
         cumsum = torch.cumsum(splits, dim=0)
 
