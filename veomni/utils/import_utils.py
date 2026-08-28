@@ -70,15 +70,18 @@ def is_liger_kernel_available() -> bool:
 def is_torch_npu_available() -> bool:
     return _PACKAGE_FLAGS["torch_npu"]
 
+
 def is_torch_mlu_available() -> bool:
     if _PACKAGE_FLAGS["torch_mlu"]:
         try:
             import torch
+
             return torch.mlu.is_available()
         except importlib.metadata.PackageNotFoundError:
             return False
     else:
         return False
+
 
 def is_apex_mlu_available() -> bool:
     if not _PACKAGE_FLAGS["apex"]:
@@ -88,6 +91,7 @@ def is_apex_mlu_available() -> bool:
     except importlib.metadata.PackageNotFoundError:
         return False
 
+
 def is_diffusers_available() -> bool:
     return _PACKAGE_FLAGS["diffusers"]
 
@@ -95,7 +99,11 @@ def is_diffusers_available() -> bool:
 def is_fused_moe_available() -> bool:
     import torch
 
-    return (torch.cuda.is_available() or _PACKAGE_FLAGS["torch_mlu"]) and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
+    return (
+        (torch.cuda.is_available() or _PACKAGE_FLAGS["torch_mlu"])
+        and not _PACKAGE_FLAGS["torch_npu"]
+        and _PACKAGE_FLAGS["triton"]
+    )
 
 
 def is_quack_package_available() -> bool:
@@ -107,7 +115,12 @@ def is_quack_gemm_available() -> bool:
     """Check if quack GEMM kernels can run (package installed + SM90+ GPU)."""
     from .device import is_sm90_or_above
 
-    return is_quack_package_available() and not _PACKAGE_FLAGS["torch_npu"] and not _PACKAGE_FLAGS["torch_mlu"] and is_sm90_or_above()
+    return (
+        is_quack_package_available()
+        and not _PACKAGE_FLAGS["torch_npu"]
+        and not _PACKAGE_FLAGS["torch_mlu"]
+        and is_sm90_or_above()
+    )
 
 
 def is_video_audio_available() -> bool:

@@ -18,8 +18,8 @@ from ....utils import logging
 from ....utils.import_utils import (
     is_fused_moe_available,
     is_quack_gemm_available,
-    is_torch_npu_available,
     is_torch_mlu_available,
+    is_torch_npu_available,
 )
 
 
@@ -128,7 +128,9 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
 
         _fused_moe_forward = group_gemm_fused_moe_forward
     else:
-        raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu', 'mlu', 'mlu_triton'.")
+        raise ValueError(
+            f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu', 'mlu', 'mlu_triton'."
+        )
 
     # Bind the LoRA-aware fused MoE kernels (owned by ``veomni.lora.ops``) to
     # match the base backend just selected. Whether a LoRA kernel exists is a
@@ -283,6 +285,7 @@ KERNEL_REGISTRY.register(
         description="NPU group-gemm fused MoE forward",
     )
 )
+
 
 def _mlu_kernel_factory():
     from .mlu_group_gemm import mlu_group_gemm_fused_moe_forward

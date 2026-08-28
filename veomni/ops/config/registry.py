@@ -163,7 +163,12 @@ def _import_entry(entry: str) -> object:
 
 def _check_requires(requires: tuple[str, ...]) -> None:
     """Validate that the listed packages are importable."""
-    from ...utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_mlu_available, is_torch_npu_available
+    from ...utils.import_utils import (
+        is_liger_kernel_available,
+        is_package_available,
+        is_torch_mlu_available,
+        is_torch_npu_available,
+    )
 
     for pkg in requires:
         if pkg == "liger_kernel":

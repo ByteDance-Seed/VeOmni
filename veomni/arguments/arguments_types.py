@@ -1172,7 +1172,7 @@ class OpsImplementationConfig:
         # Ascend, MLU group-gemm or triton on Cambricon MLU. Kept for back-compat with pre-#678 YAMLs; warn so users
         # migrate to the explicit name.
         if self.moe_implementation == "fused":
-            from ..utils.import_utils import is_torch_npu_available, is_torch_mlu_available, is_apex_mlu_available
+            from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
 
             if is_torch_npu_available():
                 resolved = "fused_npu"
@@ -1226,7 +1226,7 @@ class OpsImplementationConfig:
         user overrides (non-default values) are left untouched and will be
         caught by ``_validate_implementations`` if unsupported.
         """
-        from ..utils.import_utils import is_torch_mlu_available, is_apex_mlu_available
+        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
 
         if not is_torch_mlu_available():
             return
@@ -1256,7 +1256,12 @@ class OpsImplementationConfig:
         """
         from ..ops import config as _ops_config_pkg  # noqa: F401  triggers op registrations
         from ..ops.config.registry import list_ops
-        from ..utils.import_utils import is_package_available, is_torch_npu_available, is_torch_mlu_available, is_apex_mlu_available
+        from ..utils.import_utils import (
+            is_apex_mlu_available,
+            is_package_available,
+            is_torch_mlu_available,
+            is_torch_npu_available,
+        )
 
         # Coverage check: every registered op must appear in ``_NPU_ALLOWED``,
         # otherwise a future op addition silently bypasses NPU validation.
@@ -1290,9 +1295,7 @@ class OpsImplementationConfig:
                 continue
             if on_mlu:
                 if value == "fused_mlu" and not is_apex_mlu_available():
-                    raise ValueError(
-                        "moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU."
-                    )
+                    raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
                 if value not in mlu_ok:
                     allowed = sorted(mlu_ok | {"eager"})
                     raise ValueError(

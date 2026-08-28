@@ -35,7 +35,7 @@ logger = logging.get_logger(__name__)
 class HardwareRequirement:
     """Describes hardware constraints for a kernel."""
 
-    device_type: str | list[str] # "gpu" | "npu" | "mlu"
+    device_type: str | list[str]  # "gpu" | "npu" | "mlu"
     min_compute_capability: int | None = None  # e.g. 70, 80, 90
     # Inclusive upper bound for kernels that don't yet support newer arches
     # (e.g. FlashQLA today only ships SM90; SM100/SM120 wheels are WIP per
@@ -68,13 +68,12 @@ class HardwareRequirement:
             # without an accelerator).
             return True
         raise ValueError(f"Unknown device_type: {device_type!r} (expected 'gpu' | 'npu' | 'mlu' | 'any')")
-    
+
     def is_satisfied(self) -> bool:
         if isinstance(self.device_type, str):
             return self._is_single_device_satisfied(self.device_type)
         else:
             return any(self._is_single_device_satisfied(device_type) for device_type in self.device_type)
-
 
 
 @dataclass(frozen=True)

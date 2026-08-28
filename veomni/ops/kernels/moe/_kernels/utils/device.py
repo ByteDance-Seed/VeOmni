@@ -14,9 +14,9 @@
 
 from functools import lru_cache
 
-from ......utils.device import get_device_name
-
 from veomni.utils.device import IS_MLU_AVAILABLE
+
+from ......utils.device import get_device_name
 
 
 @lru_cache

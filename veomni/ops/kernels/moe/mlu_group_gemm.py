@@ -20,6 +20,7 @@ from ....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2a
 from ....distributed.moe.moe_layer import _apply_swiglu_clamp
 from ....distributed.parallel_state import get_parallel_state
 
+
 class MLUGroupGemm(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -196,7 +197,6 @@ class MLUGroupGemm(torch.autograd.Function):
 
 
 class MLUMergedFc1GroupGemm(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -385,9 +385,8 @@ def mlu_group_gemm_fused_moe_forward(
     else:
         from apex.contrib.permute import permute
         from apex.contrib.unpermute import unpermute
-        permute_tokens, sorted_indice = permute(
-            hidden_states, selected_experts, -1
-        )
+
+        permute_tokens, sorted_indice = permute(hidden_states, selected_experts, -1)
         splits = torch.bincount(selected_experts.view(-1), minlength=num_experts)
         cumsum = torch.cumsum(splits, dim=0)
 
@@ -429,7 +428,5 @@ def mlu_group_gemm_fused_moe_forward(
             ep_group=get_parallel_state().ep_group,
         )
     else:
-        final_hidden_states = unpermute(
-            final_permute_tokens, sorted_indice, routing_weights
-        )
+        final_hidden_states = unpermute(final_permute_tokens, sorted_indice, routing_weights)
     return final_hidden_states
