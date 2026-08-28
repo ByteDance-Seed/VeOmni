@@ -29,7 +29,7 @@ from .backward import (
 )
 from .comm import get_ulysses_sequence_parallel_group
 from .op_wrappers import get_op_wrapper, pack_saved_state, unpack_saved_state
-from .ulysses import all_to_all_tensor
+from .ulysses import _all_to_all_single, all_to_all_tensor
 from .utils import (
     padding_tensor_for_seqeunce_parallel,
     unpadding_tensor_for_seqeunce_parallel,
@@ -527,3 +527,27 @@ def async_ulysses_output_projection(
         unpadded_dim_size,
         group,
     )
+
+
+class _AsyncA2A(torch.autograd.Function):
+    """Wait on an async all-to-all started by ``_all_to_all_single(async_op=True)``.
+
+    ``x`` only anchors the gradient graph: backward performs the inverse
+    exchange on the incoming gradient, matching the exchange that ``x`` went
+    through, so gradients reach the pre-exchange tensor.
+    """
+
+    @staticmethod
+    def forward(ctx, wait_fn, x, scatter_dim, gather_dim, group):
+        ctx.group, ctx.scatter_dim, ctx.gather_dim = group, scatter_dim, gather_dim
+        return wait_fn()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (
+            None,
+            _all_to_all_single(grad_output, ctx.gather_dim, ctx.scatter_dim, ctx.group),
+            None,
+            None,
+            None,
+        )

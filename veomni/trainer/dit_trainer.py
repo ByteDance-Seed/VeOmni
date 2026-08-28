@@ -25,6 +25,10 @@ from datasets import Dataset
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.data.multimodal.dit import (
+    data_transform as _data_transform_register,  # noqa: F401  (import side effect: registers dit_offline / dit_online / minimax_h3_online transforms)
+)
+
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
