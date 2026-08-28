@@ -6,11 +6,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from veomni.distributed.sequence_parallel.async_ulysses_dit import _AsyncA2A
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.ulysses import (
+    _all_to_all_single,
     _Gather,
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -162,26 +162,48 @@ class MiniMaxH3Attention(nn.Module):
         qkv = self.qkv_proj(x)
         qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
         if sp_group is not None:
-            # Ulysses: exchange the whole interleaved qkv in one all-to-all
-            # (scatter along heads, gather along seq). The q/k/v block of each
-            # head is contiguous in the interleaved layout, so after the
-            # exchange this rank holds the full sequence for its own heads.
-            qkv = gather_seq_scatter_heads(qkv, seq_dim=0, head_dim=1, group=sp_group)
-        q = qkv[:, :, 0, :]
-        k = qkv[:, :, 1, :]
-        v = qkv[:, :, 2, :]
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        if rope_cos is not None:
-            q = _apply_rope(q, rope_cos, rope_sin)
-            k = _apply_rope(k, rope_cos, rope_sin)
-        out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
-
-        if sp_group is not None:
-            # Exchange back: this rank's sequence rows with ALL heads (the
-            # inverse exchange concatenates the gathered blocks along the head
-            # dim), so the full out_proj weight applies locally.
-            out = gather_heads_scatter_seq(out, seq_dim=0, head_dim=1, group=sp_group)
+            # Ulysses, pipelined per head-block: split heads into blocks of
+            # sp_world heads, launch each block's all-to-all asynchronously and
+            # compute the previous block while the next one is in flight (block
+            # i's exchange leaves one head per rank; the per-block inverse
+            # exchange concatenates the ranks back along the head dim, so the
+            # contiguous head order is restored for the local out_proj).
+            sp_world = dist.get_world_size(sp_group)
+            assert self.num_heads % sp_world == 0
+            nb = self.num_heads // sp_world
+            blocks = qkv.view(total, nb, sp_world, 3, self.head_dim).unbind(1)
+            w = _all_to_all_single(blocks[0], 1, 0, sp_group, async_op=True)
+            out_blocks = []
+            o_wait, o_prev = None, None
+            for i, b in enumerate(blocks):
+                if i + 1 < nb:  # launch block i+1: transfers while block i computes
+                    w_next = _all_to_all_single(blocks[i + 1], 1, 0, sp_group, async_op=True)
+                full = _AsyncA2A.apply(w, b, 1, 0, sp_group)  # [SEQ, 1, 3, d]: this rank's head of block i
+                q = self.q_norm(full[:, :, 0])
+                k = self.k_norm(full[:, :, 1])
+                if rope_cos is not None:
+                    q = _apply_rope(q, rope_cos, rope_sin)
+                    k = _apply_rope(k, rope_cos, rope_sin)
+                o = _sdpa_varlen_attention(
+                    q, k, full[:, :, 2], cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale
+                )
+                if o_wait is not None:  # block i-1's inverse exchange finished during this sdpa
+                    out_blocks.append(_AsyncA2A.apply(o_wait, o_prev, 0, 1, sp_group))
+                o_wait = _all_to_all_single(o, 0, 1, sp_group, async_op=True)
+                o_prev = o
+                w = w_next
+            out_blocks.append(_AsyncA2A.apply(o_wait, o_prev, 0, 1, sp_group))
+            out = torch.cat(out_blocks, dim=1)  # [unit, sp_world, d] per block -> [unit, num_heads, d]
+        else:
+            q = qkv[:, :, 0, :]
+            k = qkv[:, :, 1, :]
+            v = qkv[:, :, 2, :]
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            if rope_cos is not None:
+                q = _apply_rope(q, rope_cos, rope_sin)
+                k = _apply_rope(k, rope_cos, rope_sin)
+            out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
