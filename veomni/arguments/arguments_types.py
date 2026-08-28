@@ -1277,6 +1277,28 @@ class OpsImplementationConfig:
                 "gradient, and no indexer metric is reported. Set a positive coefficient to train it."
             )
 
+        # The objective's two same-dataclass prerequisites. The model refuses these
+        # again on its first forward, which is where a check keyed on the parallel
+        # state has to live -- but these two are fields sitting beside the flag, and
+        # waiting for the forward means every rank has already built a model and read
+        # the checkpoint (54.8 GB for DeepSeek-V4-Flash) before being told that three
+        # lines of YAML disagree with each other. A zero coefficient is off, so it is
+        # not held to prerequisites it no longer has.
+        if self.dsa_indexer_loss and self.dsa_indexer_loss_coef > 0:
+            for field_name, reason in (
+                (
+                    "dsa_indexer_implementation",
+                    "the eager indexer discards the per-slot scores the KL trains against",
+                ),
+                (
+                    "dsa_attention_implementation",
+                    "the teacher distribution is derived from the TileLang attention's log-sum-exp",
+                ),
+            ):
+                value = getattr(self, field_name)
+                if value != "tilelang":
+                    raise ValueError(f"dsa_indexer_loss requires {field_name}='tilelang', got {value!r}: {reason}.")
+
         # The Triton load-balancing-loss kernel imports ``triton`` at module
         # top — surface a missing package here with an actionable message
         # instead of a noisy ImportError at apply_global_ops time.

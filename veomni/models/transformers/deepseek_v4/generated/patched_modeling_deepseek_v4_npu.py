@@ -141,7 +141,7 @@ def _indexer_loss_enabled(module) -> bool:
     ``dsa_indexer_loss: false`` costs, which is what ``arguments_types.py`` has always
     promised.
 
-    Before the three refusals, not after: a user who switched the term off with the
+    Before the refusals below, not after: a user who switched the term off with the
     coefficient has not asked for a TileLang indexer, and refusing their run over the
     configuration of a feature they just disabled would be advice about the wrong
     thing.
@@ -164,22 +164,27 @@ def _indexer_loss_enabled(module) -> bool:
     if state.ulysses_size > 1:
         raise ValueError(
             f"dsa_indexer_loss requires ulysses_size=1, got ulysses_size={state.ulysses_size}: under "
-            "Ulysses each rank holds a head shard, so the head sum in the teacher would be partial. "
-            "Use context parallelism instead."
+            "Ulysses each rank holds a head shard, so the head sum in the teacher would be partial."
+        )
+    if state.cp_size > 1:
+        raise ValueError(
+            f"dsa_indexer_loss requires cp_size=1, got cp_size={state.cp_size}: DeepSeek-V4's forward "
+            "has no context-parallel path, so each rank would treat its sequence shard as a whole "
+            "sequence and the teacher would be built from the resulting attention."
         )
     return True
 
 
 def _builds_indexer_kl(module) -> bool:
-    """Whether *this attention layer* builds a KL, and so returns three values.
+    """Whether *this attention layer* builds a KL, and so returns four values.
 
     ``module`` is a ``DeepseekV4Attention``. Three call sites act on this answer --
-    the attention forward that returns the third value, the decoder layer that
-    unpacks it, and the model loop that accumulates it -- and they are in three
+    the attention forward that returns the extra values, the decoder layer that
+    unpacks them, and the model loop that accumulates them -- and they are in three
     different functions. They read this predicate rather than each re-deriving the
     condition, because a copy that goes stale in any one of them is an arity
     mismatch: gating the decoder layer on ``_indexer_loss_enabled`` alone would
-    three-unpack the two-tuple every sliding and HCA layer returns, which is three
+    four-unpack the two-tuple every sliding and HCA layer returns, which is three
     of the four layers of the reference checkpoint.
 
     ``_indexer_loss_enabled`` comes first so that its refusals fire on every layer
@@ -211,6 +216,14 @@ def _split_indexer_output(module, indexer_output):
     ``isinstance(..., tuple)`` test, so that the compressor and the indexer decide by
     the same gate and a mismatch surfaces as an unpacking error at the call rather than
     as a silently missing student distribution much later.
+
+    Deliberately ``_indexer_loss_enabled`` and not ``_builds_indexer_kl``: this side
+    is about the indexer's own arity, which does not depend on the layer type, while
+    the attention side adds that test because only a CSA layer has a KL to return. The
+    two therefore disagree for any layer that runs an indexer without being CSA, and
+    the disagreement costs a scores tensor that nothing reads rather than an arity
+    mismatch. Tightening this one to match would couple the indexer's contract to a
+    consumer two frames up, which is the direction that goes stale.
     """
     if not _indexer_loss_enabled(module):
         return indexer_output, None
@@ -224,7 +237,8 @@ def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> tuple[t
 
     Args:
         index_score: [B, S, C] indexer scores at the selected slots, -inf at misses
-        target:      [B, S, C] fp32, L1-normalised, zero at misses
+        target:      [B, S, C] fp32, zero at misses, and per row either L1-normalised
+                     or identically zero where the teacher had no mass to give
 
     Returns:
         ``(kl, uniform_kl)``, both [B, S] fp32. ``uniform_kl`` is detached: it is a
@@ -241,13 +255,21 @@ def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> tuple[t
     # first ``compress_rate - 1`` positions of every packed sample have no complete
     # compression window behind them.
     scoreable = torch.isfinite(index_score)
-    all_missing = ~scoreable.any(-1, keepdim=True)
+    # Two ways a row has nothing to teach, and both have to be excluded from *both*
+    # returned terms rather than only from the KL. A row scored entirely ``-inf`` is
+    # the NaN case above. A row the teacher gave no mass -- every slot a miss, or
+    # every selected logit so far below the LSE that ``exp`` underflowed -- would
+    # otherwise contribute 0 to the KL and a full ``log(n_candidates)`` to the
+    # reference, which is not a student that captured everything; it is a row with
+    # nothing to capture, and leaving it in the denominator alone flatters the
+    # captured fraction by exactly the rows where the objective did no work.
+    nothing_to_learn = ~scoreable.any(-1, keepdim=True) | (target.sum(-1, keepdim=True) <= 0)
     # Scalar zeros rather than ``torch.zeros_like``: the operand is only a zero, and
     # a materialised one is a full [B, S, C] fp32 tensor -- 50 MB each at S=24576,
     # C=512, about a third of the ~300 MB transient this function costs per CSA layer
     # call. ``torch.where`` promotes a Python float as a weak scalar, so the result
     # dtype is the fp32 of the other operand either way.
-    scores = torch.where(all_missing, 0.0, index_score.float())
+    scores = torch.where(nothing_to_learn, 0.0, index_score.float())
     log_q = torch.log_softmax(scores, dim=-1)
     log_target = torch.log(target.clamp_min(torch.finfo(torch.float32).tiny))
     # ``log_q`` is -inf exactly where ``target`` is 0, and 0 * -inf is NaN, so the
@@ -272,7 +294,7 @@ def indexer_kl_terms(index_score: torch.Tensor, target: torch.Tensor) -> tuple[t
     # even if a future teacher becomes differentiable.
     neg_entropy = (target * log_target).sum(-1)
     uniform_kl = torch.where(
-        all_missing.squeeze(-1),
+        nothing_to_learn.squeeze(-1),
         0.0,
         torch.log(scoreable.sum(-1).clamp_min(1).to(torch.float32)) + neg_entropy,
     )
@@ -824,11 +846,14 @@ class DeepseekV4Indexer(nn.Module):
     # Patch: DeepseekV4Indexer.forward
     # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
     #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
-    #    position layouts retain the upstream eager implementation.
+    #    position layouts fall outside what that kernel accepts, and having been asked
+    #    for it explicitly this refuses rather than demoting to the eager scorer.
     # 2. Under ``dsa_indexer_loss``, hand the per-slot index scores back next to the
     #    selection so the auxiliary KL has a student to train, and detach the inputs so
-    #    that KL cannot reach the main model. The eager fallback is refused, because it
-    #    discards those scores.
+    #    that KL cannot reach the main model. The eager scorer discards those scores and
+    #    so cannot serve the objective, but needs no refusal of its own here: the gate
+    #    admits the objective only under ``tilelang``, and the dispatch refusal in (1)
+    #    then covers every call that TileLang cannot take.
     # ================================================================
     def forward(
         self,
@@ -961,9 +986,13 @@ class DeepseekV4Indexer(nn.Module):
             and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
         )
         if indexer_implementation == "tilelang" and not use_tilelang:
+            # Names ``dsa_indexer_loss`` when that is what selected the implementation:
+            # the objective requires ``tilelang``, so a user who enabled it and then lands
+            # here would otherwise get an error about a flag they never chose.
+            chosen_by = " (required by dsa_indexer_loss)" if veomni_dsa_indexer_loss.value else ""
             raise ValueError(
-                "dsa_indexer_implementation='tilelang' was requested but the TileLang indexer does not "
-                f"support this call: is_cuda={hidden_states.is_cuda}, num_heads={self.num_heads}, "
+                f"dsa_indexer_implementation='tilelang'{chosen_by} was requested but the TileLang indexer "
+                f"does not support this call: is_cuda={hidden_states.is_cuda}, num_heads={self.num_heads}, "
                 f"head_dim={self.head_dim}, decode={cache_layer is not None}, "
                 f"compressed_len={compressed_len}, packed={packed_ranges is not None}"
             )
@@ -1018,15 +1047,15 @@ class DeepseekV4Indexer(nn.Module):
             return top_k_indices.to(torch.long)
         # --- Patch.1 ---
 
-        # --- Patch.2 ---
-        if indexer_loss_enabled:
-            raise RuntimeError(
-                "dsa_indexer_loss is enabled but the indexer fell back to the eager path, which "
-                "discards its scores. Check that hidden_states/compressed_kv are bf16 CUDA tensors "
-                "and that head count, head dim and compressed length satisfy the TileLang gate."
-            )
-        # --- Patch.2 ---
-
+        # No refusal for the loss here, deliberately: reaching this line under
+        # ``dsa_indexer_loss`` would discard the scores the KL trains against, but it
+        # cannot happen. ``_indexer_loss_enabled`` admits the objective only when
+        # ``dsa_indexer_implementation`` is ``tilelang``, and the refusal above already
+        # rejects that value whenever ``use_tilelang`` came out false -- for every
+        # caller, not just this one, and before the module does any work. A second
+        # refusal here would be unreachable by construction, and an unreachable ``raise``
+        # that no test can exercise is worse than none: it reads as the protection while
+        # the one doing the work sits elsewhere.
         scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
         scores = F.relu(scores) * self.softmax_scale
         eager_weights = self.weights_proj(hidden_states).float() * self.weights_scaling
@@ -1340,7 +1369,21 @@ def eager_attention_forward(
                 lse,
                 scaling,
             )
-            target = target / target.sum(-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+            # A row the teacher gave no mass at all goes out as exactly zero rather
+            # than as ``0 / tiny``. The two differ: dividing by the clamp raises the
+            # denominator instead of the numerator, so a row whose mass is denormal
+            # rather than zero comes back summing to something in (0, 1) -- neither a
+            # distribution nor an absence of one, and ``indexer_kl_terms`` weights it
+            # as though it were the former. Zero is the case that says "nothing to
+            # learn from this row", and the KL excludes it from both of its terms.
+            #
+            # Reachable two ways: every slot of the row was a miss, which is the
+            # common one; or every selected compressed logit sat so far below the LSE
+            # that ``exp`` underflowed, i.e. attention put essentially all of this
+            # query's mass on its sliding window and sink.
+            target_mass = target.sum(-1, keepdim=True)
+            tiny = torch.finfo(torch.float32).tiny
+            target = torch.where(target_mass > tiny, target / target_mass.clamp_min(tiny), 0.0)
             return attn_output, None, target
         # --- Patch.3 ---
         attn_output = sparse_attn_tilelang(
@@ -1442,9 +1485,10 @@ class DeepseekV4Attention(nn.Module):
     # 2. Ulysses SP: all-to-all Q heads, sequence all-gather for MQA KV and
     #    compressor inputs (windows/indexers need the full sequence), then
     #    scatter attention outputs back to the local sequence shard.
-    # 3. Under ``dsa_indexer_loss`` on a CSA layer, return the indexer KL as a
-    #    third value. The return annotation states that arity, so a caller reads
-    #    the contract off the signature rather than off a comment.
+    # 3. Under ``dsa_indexer_loss`` on a CSA layer, return the indexer KL and its
+    #    zero-information reference as third and fourth values. The return
+    #    annotation states that arity, so a caller reads the contract off the
+    #    signature rather than off a comment -- keep the two in step.
     # ================================================================
     def forward(
         self,
@@ -1454,7 +1498,9 @@ class DeepseekV4Attention(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]
+    ):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings[self.rope_layer_type]
@@ -1646,8 +1692,9 @@ class DeepseekV4Attention(nn.Module):
         output = self.o_b_proj(grouped)
         # --- Patch.3 ---
         # 0-d sums rather than the [B, S] terms: the decoder layer above only has to
-        # add these together, and summing here keeps the reduction over *local* query
-        # rows, which is what makes the CP case a plain sum of per-rank contributions.
+        # add these together, and summing here keeps the reduction over the query rows
+        # this rank holds, so a future sequence-parallel mode reduces a plain sum of
+        # per-rank contributions rather than having to re-derive the row weighting.
         if build_indexer_loss:
             return output, attn_weights, indexer_kl, indexer_uniform
         # --- Patch.3 ---
@@ -2047,7 +2094,7 @@ class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dtype = hidden_states.dtype
         post, comb, collapsed = self.attn_hc(hidden_states)
         # --- Patch.3 ---
@@ -2690,9 +2737,14 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             # ``.clone()`` on the token count for each call, not a shared tensor:
             # ``ReduceLoss.forward`` all-reduces ``num_valid_tokens`` *in place*, so a
             # second call handed the same tensor would divide by an SP-world-size-times
-            # inflated count -- correct on one rank, wrong on two, which is the class of
-            # bug this file's CP tests exist to catch.
+            # inflated count -- correct on one rank, wrong on two, and so invisible to
+            # every test this feature has.
             local_uniform_mean = outputs.indexer_uniform_total / local_query_tokens.clamp_min(1)
+            # Unreachable today, and deliberately still here: ``_indexer_loss_enabled``
+            # refuses both sequence-parallel modes, so ``sp_enabled`` is False by the time
+            # control reaches this line. Whichever change lifts one of those refusals
+            # inherits a reduction whose weighting is already right, rather than growing
+            # one next to a fold-in that reads correct on a single rank either way.
             if get_parallel_state().sp_enabled:
                 indexer_kl = reduce_sequence_parallel_loss(local_mean, local_query_tokens.clone())
                 indexer_uniform = reduce_sequence_parallel_loss(local_uniform_mean, local_query_tokens.clone())
@@ -2728,6 +2780,20 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             # query row has at most one candidate, in which case the KL is zero too and
             # nothing was there to capture. 1.0 -- "captured everything" -- is the honest
             # reading of that, and a NaN in a metric would propagate into the logger.
+            #
+            # The ratio is formed here, over this micro-batch, and what the logger shows
+            # is therefore a mean of per-micro-batch ratios once ``mean_aux_metrics``
+            # divides by the micro-step count and ``EnvironMeterCallback`` averages over
+            # the data-parallel group -- *not* one minus the ratio of the two numbers
+            # logged beside it. That is the aggregation the comments above rule out for
+            # rows and for sequence-parallel ranks, and the reason it is fine here is a
+            # property of what is being averaged rather than a change of principle: the
+            # rows those comments are about differ by orders of magnitude in their
+            # reference, so the small ones dominate a mean of ratios, while these terms
+            # are each already a mean over a whole micro-batch of rows and land within a
+            # few percent of one another. An exact global ratio would need the aux-metric
+            # path to carry a numerator and a denominator instead of a value, which is a
+            # trainer-wide change for a third decimal place.
             indexer_kl_metric = indexer_kl.detach() / indexer_kl_layers
             indexer_uniform_metric = indexer_uniform.detach() / indexer_kl_layers
             aux_metrics = {

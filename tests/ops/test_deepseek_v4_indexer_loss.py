@@ -465,6 +465,52 @@ def test_indexer_loss_coef_accepts_finite_non_negative_weights(coef):
     assert config.dsa_indexer_loss_coef == coef
 
 
+@_HDFS_STDENV_DEPRECATION_FILTER
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({}, "dsa_indexer_implementation"),
+        ({"dsa_indexer_implementation": "tilelang"}, "dsa_attention_implementation"),
+        (
+            {"dsa_indexer_implementation": "cudnn", "dsa_attention_implementation": "tilelang"},
+            "dsa_indexer_implementation",
+        ),
+    ],
+)
+def test_the_two_same_dataclass_prerequisites_are_refused_at_parse_time(overrides, expected):
+    """The model refuses these again on its first forward, and that refusal is not
+    what this is about: getting there means every rank has already built a model and
+    read the checkpoint -- 54.8 GB for DeepSeek-V4-Flash -- to be told that three
+    lines of YAML disagree with each other. Both fields sit on the same dataclass as
+    the flag, so nothing has to be constructed to know.
+
+    Parametrised over which of the two is wrong, because a check written as one
+    condition over both would pass this test while naming the wrong field in its
+    message, and the message is the entire value of failing early.
+    """
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    with pytest.raises(ValueError, match=expected):
+        OpsImplementationConfig(load_balancing_loss_implementation="eager", dsa_indexer_loss=True, **overrides)
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_a_zero_coefficient_is_not_held_to_the_prerequisites():
+    """A zero coefficient switches the objective off, so it is not a configuration of
+    the objective any more and must not be refused over one.
+
+    The runtime gate reads the coefficient before its own refusals for exactly this
+    reason; the parse-time check has to agree, or the two would disagree about what
+    "off" means and a config that trains fine would fail to launch.
+    """
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    config = OpsImplementationConfig(
+        load_balancing_loss_implementation="eager", dsa_indexer_loss=True, dsa_indexer_loss_coef=0.0
+    )
+    assert config.dsa_indexer_implementation == "eager"
+
+
 @contextlib.contextmanager
 def _ops_config_slots_bound(pre_state):
     """Put the generated module's ``OpsConfigSlot``s in a known state, and undo every
@@ -556,21 +602,32 @@ class TestIndexerLossGate:
         with _ops_config_slots_bound(self._GATE_SLOT_PRE_STATE):
             yield
 
-    def test_indexer_loss_refuses_ulysses(self, monkeypatch):
-        """Ulysses shards heads across ranks, so the head sum inside the teacher would
-        only cover this rank's shard. That is a *wrong* teacher rather than a missing
-        one, and it would still produce a decreasing loss curve, so the gate has to
-        refuse rather than warn.
+    @pytest.mark.parametrize(
+        "mode, expected",
+        [
+            ("ulysses", r"requires ulysses_size=1, got ulysses_size=2"),
+            ("cp", r"requires cp_size=1, got cp_size=2"),
+        ],
+    )
+    def test_indexer_loss_refuses_every_sequence_parallel_mode(self, monkeypatch, mode, expected):
+        """Both modes shard something the teacher needs whole, and each is wrong in its
+        own way rather than merely unsupported -- which is why neither may warn.
 
-        The match pins the message's two actionable halves: the size observed, and the
-        one size that is supported.
+        Under Ulysses a rank holds a head shard, so the head sum inside the teacher
+        would cover only that shard: a *wrong* teacher, and one that still produces a
+        decreasing curve. Under context parallelism the sharding is of the sequence
+        and DeepSeek-V4's forward has no context-parallel path at all, so each rank
+        would treat its shard as a whole sequence and the teacher would be built from
+        the resulting attention.
 
-        The state is a real ``ParallelState`` rather than a namespace carrying an
-        ``ulysses_size`` attribute: a duck-typed stand-in keeps this test green
-        through a rename of the field, while the gate's ``state.ulysses_size`` would
-        raise ``AttributeError`` in production. Two accommodations are needed to build
-        one in a single process, both with precedent in
-        ``tests/parallel/context_parallel/test_dsv4_cp_parallel_state.py``:
+        The match pins each message's two actionable halves: the size observed, and
+        the one size that is supported.
+
+        The state is a real ``ParallelState`` rather than a namespace carrying the
+        attribute: a duck-typed stand-in keeps this test green through a rename of the
+        field, while the gate's own read would raise ``AttributeError`` in production.
+        Two accommodations are needed to build one in a single process, the first with
+        precedent in ``tests/parallel/context_parallel/test_dsv4_cp_gates.py`` --
         ``ParallelState.world_size`` reads ``torch.distributed`` directly, and a
         sequence-parallel state requires a non-``None`` device mesh that nothing here
         touches.
@@ -584,7 +641,8 @@ class TestIndexerLossGate:
 
         monkeypatch.setattr("veomni.distributed.parallel_state.dist.is_initialized", lambda: True)
         monkeypatch.setattr("veomni.distributed.parallel_state.dist.get_world_size", lambda: 2)
-        state = ParallelState(dp_size=1, ulysses_size=2, device_type="cpu", device_mesh=MagicMock())
+        sizes = {"ulysses_size": 2} if mode == "ulysses" else {"cp_size": 2}
+        state = ParallelState(dp_size=1, device_type="cpu", device_mesh=MagicMock(), **sizes)
 
         modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
@@ -593,7 +651,7 @@ class TestIndexerLossGate:
             "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
             return_value=state,
         ):
-            with pytest.raises(ValueError, match=r"requires ulysses_size=1, got ulysses_size=2"):
+            with pytest.raises(ValueError, match=expected):
                 modeling._indexer_loss_enabled(object())
 
     def test_indexer_loss_refuses_eager_indexer(self):
@@ -829,22 +887,27 @@ def _run_indexer(indexer, hidden_states, q_residual, position_ids=None, **kwargs
     return indexer(hidden_states, q_residual, position_ids, None, 0, **kwargs)
 
 
-def _bind_indexer_loss(*, enabled, coef=1.0):
-    """Bind every slot ``_indexer_loss_enabled`` reads, with the two implementation
-    slots on the one configuration the loss supports.
+def _bind_indexer_loss(*, enabled, coef=1.0, indexer_implementation="tilelang"):
+    """Bind every slot ``_indexer_loss_enabled`` reads, defaulting the two
+    implementation slots to the one configuration the loss supports.
 
     All four, always: a test that left one unbound would read it from whatever ran
     before, and a deleted guard would then fall into a neighbouring refusal instead of
     through to the behaviour under test. The coefficient is one of the four because
     the gate treats ``coef <= 0`` as off, so a test that left it to the session could
     find the whole objective disabled by whatever ran before it.
+
+    ``indexer_implementation`` is overridable for the two tests about the eager
+    scorer: requesting ``tilelang`` and missing its per-call gate is refused rather
+    than fallen back from, so ``eager`` is the only way to reach that scorer at all --
+    with the objective off to run it, and with the objective on to be refused for it.
     """
     from types import SimpleNamespace
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
     modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=enabled))
-    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation=indexer_implementation))
     modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
     modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
 
@@ -976,8 +1039,8 @@ class TestIndexerScoresAndDecoupling:
 
         This is the only test that pins the off side of that branch. Invert it and the
         two-tuple leaks into every flag-off forward: ``DeepseekV4CSACompressor`` would
-        keep working, because it unpacks by the same gate, and the break would surface
-        somewhere else entirely — the CP and Ulysses suites call the indexer directly.
+        keep working, because it unpacks by the same gate, so the break would surface
+        wherever something calls the indexer without going through that gate.
         """
         _require_tilelang_cuda()
         _bind_indexer_loss(enabled=False)
@@ -995,49 +1058,64 @@ class TestIndexerScoresAndDecoupling:
         assert result.dtype == torch.long
         assert result.shape == (1, seq_len, min(config.index_topk, seq_len // indexer.compress_rate))
 
-    def test_indexer_refuses_the_eager_fallback_under_the_loss(self):
-        """A configuration that passes every construction-time check can still miss the
-        kernel at runtime, and the eager path discards its scores.
+    def test_the_loss_never_reaches_the_eager_scorer(self):
+        """The eager scorer discards the scores the KL trains against, so reaching it
+        with the objective on is the worst outcome available: the loss would train on
+        nothing at all while its curve looked entirely reasonable.
 
-        ``use_tilelang`` is decided per call out of dtypes, devices and shapes, so this
-        refusal cannot live where Task 3's configuration refusals live. The miss staged
-        here is the device — CPU tensors — but an fp32 activation dtype or a head count
-        outside the kernel's range lands at the same line. Silence is the worst outcome
-        available: the loss would train on nothing at all while its curve looked
-        entirely reasonable.
+        The indexer carries no refusal of its own for that, and this test is what
+        makes the absence safe by closing both routes to it.
 
-        The match is on ``fell back to the eager path``, which no other message in the
-        generated module contains. ``eager`` alone would also be satisfied by the
-        ``dsa_indexer_implementation`` refusal, and a match on TileLang by the
-        attention forward's own runtime refusal a few hundred lines down.
+        The first is a configuration that passes every construction-time check and
+        then misses the kernel at runtime. ``_indexer_loss_enabled`` admits the
+        objective only under ``dsa_indexer_implementation='tilelang'``, and that value
+        is refused outright whenever the per-call gate declines rather than demoted to
+        the eager scorer. The miss staged here is the device -- CPU tensors -- but an
+        fp32 activation dtype or a head count outside the kernel's range lands at the
+        same line. Narrowing that refusal to a warning or a fallback would leave the
+        objective silently untrained.
+
+        The second is asking for the eager scorer outright while the objective is on,
+        which the gate refuses. That leg is what makes the first one's premise hold:
+        without it, loosening the gate's ``tilelang`` requirement would reach the
+        eager scorer with the loss on and nothing here would notice.
         """
-        _bind_indexer_loss(enabled=True)
-
         indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
         hidden = torch.randn(1, 32, config.hidden_size)
         q_residual = torch.randn(1, 32, config.q_lora_rank)
 
         with _single_rank_parallel_state():
-            with pytest.raises(RuntimeError, match="fell back to the eager path"):
+            _bind_indexer_loss(enabled=True)
+            with pytest.raises(ValueError, match="TileLang indexer does not support this call"):
                 _run_indexer(indexer, hidden, q_residual)
 
-    def test_indexer_eager_fallback_still_runs_with_the_loss_off(self):
-        """The refusal above is conditional, and this is the only test that says so.
+            _bind_indexer_loss(enabled=True, indexer_implementation="eager")
+            with pytest.raises(ValueError, match="dsa_indexer_loss requires dsa_indexer_implementation"):
+                _run_indexer(indexer, hidden, q_residual)
 
-        The eager scorer is the production path for cache/decode and for any layout the
-        kernel declines, so a refusal that fired regardless of the flag would break
-        inference for every DeepSeek-V4 model in the tree — while the suite stayed
-        green on the enabled path, because that path never reaches the eager scorer.
+    def test_the_eager_scorer_still_runs_when_it_is_the_one_asked_for(self):
+        """The refusals above are about running the eager scorer *under the objective*,
+        and this is the only test that says the scorer itself still works.
+
+        It is the production path for cache/decode and for anyone who asks for it, so
+        an indexer-loss change that broke it would break inference for every
+        DeepSeek-V4 model in the tree -- while the suite stayed green on the enabled
+        path, because that path never reaches the eager scorer.
+
+        The objective is bound off here rather than left to the gate: with it on, this
+        implementation is refused outright rather than silently demoted, which is the
+        leg above.
         """
-        _bind_indexer_loss(enabled=False)
+        _bind_indexer_loss(enabled=False, indexer_implementation="eager")
 
         indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
         hidden = torch.randn(1, 32, config.hidden_size)
         q_residual = torch.randn(1, 32, config.q_lora_rank)
 
-        with _single_rank_parallel_state():
+        with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
             result = _run_indexer(indexer, hidden, q_residual)
 
+        assert not kernel_calls, "the eager scorer is what this test is about, and the kernel ran instead"
         assert isinstance(result, torch.Tensor)
         assert result.shape == (1, 32, 32 // indexer.compress_rate)
 
@@ -1380,6 +1458,40 @@ def test_indexer_kl_terms_ignores_zero_target_slots():
     assert torch.allclose(uniform, torch.zeros(1, 1), atol=1e-6), (
         "one scoreable slot carrying all the mass is a row where nothing can be learned"
     )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_a_row_the_teacher_gave_no_mass_is_excluded_from_both_terms():
+    """A row can be scoreable and still have nothing to teach, and it has to leave
+    *both* returned terms rather than only the KL.
+
+    The attention forward emits an exactly-zero teacher row when the compressed
+    slots carried no mass -- every selected logit far enough below the LSE that
+    ``exp`` underflowed, i.e. attention put essentially everything on the sliding
+    window and the sink. The KL of such a row is 0 whatever the student did, so
+    leaving its ``log(n_candidates)`` in the reference would credit the objective
+    with capturing everything on exactly the rows where it did no work: the
+    published fraction moves and neither term looks wrong.
+
+    Distinct from ``test_indexer_kl_terms_gradient_is_finite_...``, whose rows are
+    unscoreable; here the student has two live candidates and the teacher has
+    nothing to say about them.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    index_score = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]], requires_grad=True)
+    target = torch.tensor([[[0.0, 0.0], [0.4, 0.6]]])
+
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
+    assert torch.allclose(kl[0, 0], torch.zeros(())), "no teacher mass, so no KL"
+    assert torch.allclose(uniform[0, 0], torch.zeros(())), (
+        "a row with nothing to capture must not enlarge the reference the captured fraction divides by"
+    )
+    assert uniform[0, 1] > 0, "the row that does carry mass still has a reference, or this pins nothing"
+
+    kl.sum().backward()
+    assert torch.isfinite(index_score.grad).all()
+    assert (index_score.grad[0, 0] == 0).all(), "an empty teacher must not push the indexer anywhere"
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -1917,55 +2029,75 @@ class TestAttentionForwardIndexerKL:
         assert verdict is (enabled and layer_type == "compressed_sparse_attention")
 
 
-# The reference 4-layer DeepSeek-V4 checkpoint. Its ``compress_ratios`` of
-# ``[0, 0, 4, 128]`` is the layer schedule this whole task is about: two sliding
-# layers, one CSA layer at rate 4 and one HCA layer at rate 128, i.e. exactly one
-# layer carrying a Lightning Indexer and three that must pass a flag-on forward
-# through untouched.
-_CHECKPOINT_4L = Path("/mnt/hdfs/__MERLIN_USER_DIR__/veomni/models/DeepSeek/DeepSeek-V4-Flash-Base-4L")
+# The layer schedule this whole task is about: two sliding layers, one CSA layer
+# and one HCA layer, i.e. exactly one layer carrying a Lightning Indexer and three
+# that must pass a flag-on forward through untouched. It is the schedule of the
+# reference 4-layer checkpoint ``DeepSeek-V4-Flash-Base-4L``, whose legacy
+# ``compress_ratios`` of ``[0, 0, 4, 128]`` derives exactly this.
+_LAYER_SCHEDULE_4L = (
+    "sliding_attention",
+    "sliding_attention",
+    "compressed_sparse_attention",
+    "heavily_compressed_attention",
+)
+_TOY_CONFIG_4L = Path("tests/toy_config/deepseek_v4_toy")
 
 
 def _4layer_test_config():
-    """The 4-layer checkpoint's own config, with the widths nothing here reads reduced.
+    """The reference 4-layer checkpoint's architecture, at the toy config's widths.
 
-    Everything the indexer loss touches comes from the checkpoint verbatim:
-    ``layer_types`` (from its legacy ``compress_ratios``), ``compress_rates``,
-    ``sliding_window``, and the three fields the indexer's TileLang gate reads --
-    ``index_n_heads=64``, ``index_head_dim=128``, ``index_topk=512``. What is reduced
-    is width alone: hidden size, head dim, the two LoRA ranks, the expert count and
-    width, and the vocabulary.
+    Built from the in-repo toy config rather than from the checkpoint itself. The
+    checkpoint lives on an HDFS FUSE mount, and reading it would make every test
+    below skip on any machine without one -- CI included, where these are the only
+    tests covering this objective's integration with the model. Width was never the
+    point in any case: at the checkpoint's own widths the model is 27.4B parameters
+    and 54.8 GB in bf16 before gradients, so these tests reduced it anyway, to
+    exactly the widths the toy config already carries.
 
-    Measured, not assumed. At the checkpoint's own widths this model is 27.4B
-    parameters, 54.8 GB in bf16 before gradients; ``test_the_indexer_objective...``
-    and its neighbours build several models per session, and one build alone leaves
-    no room for a backward on the 189 GB this device has. At the widths below the
-    model is 7.8M parameters and builds in 0.4 s, while every gate, kernel dispatch
-    and layer type under test is still the checkpoint's own.
+    Taken from the reference checkpoint's architecture rather than the toy config's,
+    because the objective reads them:
 
-    Skips rather than fails when the checkpoint is absent: it lives on an HDFS FUSE
-    mount that a machine running these tests need not have.
+    - ``layer_types``, the schedule above. The toy config derives three HCA layers
+      and one CSA layer from its own ``compress_rates``, which leaves no sliding
+      layer to pass a flag-on forward through and puts the CSA layer last.
+    - ``compress_rates``. The CSA rate of 4 the toy config already has, and it is
+      what makes ``compressed_len`` a quarter of the sequence and so decides whether
+      the top-k binds; what moves is the HCA rate, from 32 to 128, so that the
+      non-CSA layer these tests pass a forward through is the one the checkpoint has.
+    - ``index_topk=512``, over the toy config's 32, so that at ``seq_len=4096`` and
+      rate 4 the ``compressed_len`` of 1024 exceeds it and the top-k actually ranks
+      rather than selecting everything visible. Not a kernel requirement: the teacher
+      interface pads ``topk`` up to its ``block_I`` of 64 and slices the result back,
+      so 32 runs -- it just does not exercise a selection.
+    - ``index_n_heads=64``, over the toy config's 8. The indexer's own head count is
+      what resolves its ``q_b_proj`` to 64 row blocks under head-split Muon, and the
+      8192 rows that makes are the shape the decoupling tests assert gradients on.
+    - ``num_attention_heads=64``, over the toy config's 8. This is the head axis the
+      teacher sums over, and 64 is the count the kernel is designed around: one CTA
+      owns every head of a query, so the sum needs no atomics, and the interface
+      passes it through without the padding to 16 that 8 heads would take. It is
+      also what makes the head aggregation observable at all -- at 8 heads the two
+      aggregations ``test_the_captured_fraction_is_a_ratio_of_means_and_touches_no_gradient``
+      exists to distinguish sit 1.3e-04 apart, under that test's own separation
+      guard, which then fails rather than passing vacuously.
+
+    Everything else stays at the toy config's value, and is pinned here rather than
+    inherited so that an unrelated edit to a config shared with other test files
+    cannot quietly change what these tests exercise. ``sliding_window`` is the one
+    worth naming: it is a term in the teacher's denominator, so it moves the numbers
+    the separation guard reads, and the toy config's 32 is the *least* favourable of
+    the widths tried -- the fixture is not tuned to make that guard pass.
     """
     from transformers import AutoConfig
 
-    if not (_CHECKPOINT_4L / "config.json").is_file():
-        pytest.skip(f"the reference 4-layer DeepSeek-V4 checkpoint is not present at {_CHECKPOINT_4L}")
-
-    config = AutoConfig.from_pretrained(str(_CHECKPOINT_4L))
-    config.hidden_size = 256
-    config.head_dim = 64
-    config.q_lora_rank = 64
-    config.o_lora_rank = 64
-    config.n_routed_experts = 8
-    config.num_experts_per_tok = 2
-    config.moe_intermediate_size = 128
-    config.vocab_size = 1024
-    # An MTP head is a second stack of layers with its own attention, and nothing in
-    # this file reads it; the toy config drops it the same way.
-    config.num_nextn_predict_layers = 0
-    # The checkpoint ships fp8 block-quantised experts. ``from_pretrained`` would act
-    # on this; building from the config alone must not, and the weights are random
-    # here in any case.
-    config.quantization_config = None
+    config = AutoConfig.from_pretrained(str(_TOY_CONFIG_4L))
+    config.layer_types = list(_LAYER_SCHEDULE_4L)
+    config.compress_rates = {"compressed_sparse_attention": 4, "heavily_compressed_attention": 128}
+    config.index_topk = 512
+    config.index_n_heads = 64
+    config.index_head_dim = 128
+    config.num_attention_heads = 64
+    config.sliding_window = 32
     return config
 
 
@@ -2624,12 +2756,19 @@ class TestFourLayerModelIndexerKL:
         torch.testing.assert_close(out.aux_metrics["indexer_kl_captured"], 1.0 - ratio_of_means, atol=0, rtol=rtol)
         assert torch.isfinite(out.aux_metrics["indexer_kl_captured"]).all()
 
-        # ... and the alternative is measured rather than assumed to differ. Observed
-        # on this fixture: 1.0429 against 1.0382, ~450x the tolerance above.
+        # ... and the alternative is measured rather than assumed to differ. The
+        # threshold is scaled by what the leg above actually admits, which is
+        # ``rtol * |1 - ratio_of_means|`` and not ``rtol * ratio_of_means``: the two
+        # differ by a factor of 35 on this fixture, and the second would make this
+        # guard the strictest assertion in the test rather than a floor under the
+        # first. Observed here: 1.030161 against 1.029003, a separation of 1.16e-03
+        # where the leg admits 2.9e-06, so the wrong aggregation misses by ~400x. The
+        # factor of 10 leaves ordinary drift in the forward a wide berth while still
+        # failing before the fixture stops discriminating.
         scoreable = uniform_rows > 1e-6
         mean_of_ratios = (kl_rows[scoreable] / uniform_rows[scoreable]).mean()
         separation = float((mean_of_ratios - ratio_of_means).abs())
-        assert separation > 20 * rtol * float(ratio_of_means), (
+        assert separation > 10 * rtol * abs(1.0 - float(ratio_of_means)), (
             f"the mean of the per-row ratios is {float(mean_of_ratios):.6f} against a ratio of means of "
             f"{float(ratio_of_means):.6f}, only {separation:.2e} apart: this fixture can no longer tell the "
             "two aggregations apart and the leg above is vacuous"
@@ -2809,17 +2948,16 @@ class TestModelBuildRefusesModelsThatDoNotImplementIt:
     time, before anything is constructed.
 
     Neither of the two gates inside the model can do this: they are in DeepSeek-V4's
-    own patched forward, which a GLM run never reaches.
+    own patched forward, which a GLM run never reaches. So it has to be refused from
+    outside the model, at the one place every model build goes through.
     """
 
     @staticmethod
-    def _build(config_path, indexer_loss, loader=None, omni=False):
-        """``build_foundation_model`` (or the omni branch) with nothing built.
+    def _build(config_path, indexer_loss, loader):
+        """``build_foundation_model`` with nothing built, returning the loader's calls.
 
-        Both construction paths are exercised, because there are two: the omni
-        encoder/decoder branch does not delegate to ``build_foundation_model``, and a
-        gate installed in only one of them would leave the other silent -- which is
-        exactly the shape of the bug this refusal exists to close.
+        ``build_foundation_model`` is the whole surface: it is the one construction
+        path in the tree, so a gate installed there covers every model build.
         """
         from types import SimpleNamespace
         from unittest import mock
@@ -2831,20 +2969,10 @@ class TestModelBuildRefusesModelsThatDoNotImplementIt:
         with (
             mock.patch("veomni.models.auto.get_parallel_state", return_value=parallel_state),
             mock.patch("veomni.ops.config.singleton.get_ops_config", return_value=ops_config),
+            mock.patch("veomni.models.auto.get_loader", return_value=loader),
         ):
-            if omni:
-                from veomni.models.seed_omni.auto import build_omni_model
-
-                model_cls = mock.MagicMock()
-                with (
-                    mock.patch("veomni.models.seed_omni.auto.SeedOmniModel", model_cls),
-                    mock.patch("veomni.models.seed_omni.auto.SeedOmniConfig", _StubOmniConfig),
-                ):
-                    build_omni_model(config_path=config_path, init_device="meta")
-                return model_cls._from_config.call_count
-            with mock.patch("veomni.models.auto.get_loader", return_value=loader):
-                build_foundation_model(config_path=build_config(config_path), init_device="meta")
-            return loader.calls
+            build_foundation_model(config_path=build_config(config_path), init_device="meta")
+        return loader.calls
 
     def test_a_model_with_its_own_lightning_indexer_is_still_refused(self):
         """GLM MoE DSA: the case from the review, and the one most likely to be tried."""
@@ -2875,26 +3003,13 @@ class TestModelBuildRefusesModelsThatDoNotImplementIt:
         loader = _StubLoader()
         assert self._build("tests/toy_config/glm_moe_dsa_toy", indexer_loss=False, loader=loader) == 1
 
-    def test_the_omni_branch_refuses_it_too(self):
-        """The omni encoder/decoder path builds ``SeedOmniModel._from_config`` itself
-        rather than going through ``build_foundation_model``, so it needs the gate
-        installed separately -- the same reason the context-parallel gate is in both.
-        """
-        with pytest.raises(NotImplementedError, match="dsa_indexer_loss") as raised:
-            self._build("tests/toy_config/qwen3_toy", indexer_loss=True, omni=True)
-        assert "'qwen3'" in str(raised.value), str(raised.value)
-
-    def test_the_omni_branch_admits_it_with_the_flag_off(self):
-        assert self._build("tests/toy_config/qwen3_toy", indexer_loss=False, omni=True) == 1
-
 
 class _StubLoader:
     """Stands in for the real loader, so the gate is the only thing under test.
 
-    Copied from ``tests/parallel/context_parallel/test_dsv4_cp_model_gate.py``, for
-    the same reason it exists there: the gate runs before construction, so building
-    a real model would make an assertion that *nothing happened* the most expensive
-    test in the file. Carrying no ``model_cls`` is deliberate --
+    The gate runs before construction, so building a real model would make an
+    assertion that *nothing happened* the most expensive test in the file. Carrying
+    no ``model_cls`` is deliberate --
     ``build_foundation_model`` reads it with ``getattr(..., None)`` and skips the
     OpSlot binding.
     """
@@ -2906,13 +3021,3 @@ class _StubLoader:
     def load_model(self, **kwargs):
         self.calls += 1
         return self.model
-
-
-class _StubOmniConfig:
-    """Stands in for ``SeedOmniConfig``: ``build_omni_model`` selects its branch with
-    ``isinstance(foundation_config, SeedOmniConfig)``, and a foundation config is not
-    an instance of this, which is the branch under test.
-    """
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs

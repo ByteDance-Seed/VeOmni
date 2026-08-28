@@ -97,6 +97,7 @@ design/local_parallel_state.md
 design/patchgen.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
+design/deepseek_v4_indexer_loss.md
 ```
 
 ```{toctree}

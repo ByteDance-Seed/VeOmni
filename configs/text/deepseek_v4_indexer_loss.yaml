@@ -36,7 +36,10 @@
 # nothing on this dataset comes within 6000 tokens of it one conversation at a time.
 
 model:
-  model_path: /mnt/hdfs/__MERLIN_USER_DIR__/veomni/models/DeepSeek/DeepSeek-V4-Flash-Base-4L
+  # The 4-layer checkpoint, whose compress_ratios of [0, 0, 4, 128] give exactly one CSA
+  # layer to train an indexer on. Named as the sibling config names its own checkpoint;
+  # point it at wherever yours lives.
+  model_path: DeepSeek-V4-Flash-Base-4L
   ops_implementation:
     attn_implementation: eager
     moe_implementation: fused_triton
@@ -56,10 +59,10 @@ model:
     rotary_pos_emb_implementation: triton
 
 data:
-  # .../tulu-3-sft-mixture/data, not .../tulu-3-sft-mixture/. get_data_files lists a directory
-  # non-recursively and takes the extension of its first sorted entry; the parent's first entry
-  # is .cache, so it raises " files are not supported" before it ever sees a parquet.
-  train_path: /mnt/hdfs/__MERLIN_USER_DIR__/veomni/datasets/tulu-3-sft-mixture/data
+  # tulu-3-sft-mixture/data, not tulu-3-sft-mixture/. get_data_files lists a directory
+  # non-recursively and takes the extension of its first sorted entry; if the parent holds a
+  # .cache entry it raises " files are not supported" before it ever sees a parquet.
+  train_path: tulu-3-sft-mixture/data
   data_type: conversation
   chat_template: chatml
   max_seq_len: 8192
@@ -73,7 +76,9 @@ train:
   pad_to_length: true
   accelerator:
     # ulysses_size must stay 1: the indexer loss refuses Ulysses, because each rank would hold a
-    # head shard of the index scores and the teacher is built from the full head set.
+    # head shard of the index scores and the teacher is built from the full head set. cp_size is
+    # refused too, and is left at its default of 1 here; DeepSeek-V4's forward has no
+    # context-parallel path, so a shard would be scored as though it were a whole sequence.
     ulysses_size: 1
     ep_size: 1
     fsdp_config:
@@ -91,9 +96,14 @@ train:
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
   optimizer:
-    # Muon + AdamW. The indexer's parameters now carry gradients, so they join Muon's 2D group;
-    # muon_head_split_exclude_indexer (default true) keeps the indexer's q_b_proj on full-matrix
-    # Muon rather than head-split, because it shares its name with the main attention's.
+    # Muon + AdamW, as the sibling config ships. The indexer's parameters carry gradients for
+    # the first time under this objective, so they join Muon's 2D group by dimensionality --
+    # which is the paper-faithful routing (V4 §2.4 puts everything but embeddings, the head,
+    # mHC biases and norms on Muon), and needs no configuration.
+    #
+    # muon_head_split_modules is deliberately unset. The indexer names its up-projection
+    # q_b_proj, the same as the main attention's, so listing q_b_proj there would head-split
+    # the indexer's matrix too -- as a side effect of a flag aimed at attention.
     type: muon
     lr: 3.0e-4
     lr_warmup_ratio: 0.007
