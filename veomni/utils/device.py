@@ -32,6 +32,8 @@ IS_MLU_AVAILABLE = is_torch_mlu_available()
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
 
+MOE_TRITON_DEVICE_TYPES = ("cuda", "mlu")
+
 
 def get_device_type() -> str:
     """Get device type based on current machine, currently only support CPU, CUDA, NPU, MLU."""
@@ -66,6 +68,12 @@ def get_torch_device() -> Any:
 def get_device_id() -> int:
     """Get current device id based on device type."""
     return get_torch_device().current_device()
+
+
+def is_moe_kernel_supported(device: torch.device | str) -> bool:
+    """Return True if ``device`` is one of the supported accelerator types (CUDA/MLU)."""
+    device_type = getattr(device, "type", device)
+    return str(device_type) in MOE_TRITON_DEVICE_TYPES
 
 
 def get_dist_comm_backend() -> str:

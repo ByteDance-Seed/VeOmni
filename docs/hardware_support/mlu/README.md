@@ -43,10 +43,11 @@ docker run -itd \
 docker exec -it veomni_test /bin/bash
 ```
 
-Once inside, register VeOmni as an editable package. This does not touch any dependency already installed in the image:
+Once inside, register VeOmni as an editable package, and VeOmni supports two installation methods for mlu: `uv` (recommended for faster installation) and `pip`:
 
 ```bash
-pip install -e . --no-deps
+uv pip install -e .
+pip install -e .
 ```
 
 
