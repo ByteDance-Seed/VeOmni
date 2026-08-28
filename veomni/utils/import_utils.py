@@ -74,7 +74,6 @@ def is_torch_mlu_available() -> bool:
     if _PACKAGE_FLAGS["torch_mlu"]:
         try:
             import torch
-            import torch_mlu
             return torch.mlu.is_available()
         except importlib.metadata.PackageNotFoundError:
             return False
