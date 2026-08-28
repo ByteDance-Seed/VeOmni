@@ -98,6 +98,9 @@ from veomni.patchgen.patch_spec import PatchConfig
 
 from .deepseek_v4_gpu_patch_gen_config import (
     PatchedDeepseekV4Experts,
+    _builds_indexer_kl,
+    _indexer_loss_enabled,
+    _split_indexer_output,
     deepseek_v4_attention_forward_patched,
     deepseek_v4_decoder_layer_forward_patched,
     deepseek_v4_eager_attention_forward_patched,
@@ -113,6 +116,7 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_rotary_embedding_forward_patched,
     deepseek_v4_topk_router_forward_patched,
     deepseek_v4_unweighted_rmsnorm_forward_patched,
+    indexer_kl_terms,
 )
 
 
@@ -123,9 +127,15 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
+# ``sparse_mqa_target_fwd`` is the indexer loss's teacher kernel. The objective
+# needs both the TileLang indexer and the TileLang attention (see
+# ``_indexer_loss_enabled``), and the TileLang sparse attention declines any
+# non-CUDA tensor, so the branches reusing it are dead on NPU and refuse on the
+# first attention call. The import exists only so patchgen can emit a module that
+# type-checks.
 config.add_import(
     "veomni.ops.kernels.deepseek_v4",
-    names=["sparse_attn_tilelang", "v4_lighting_indexer"],
+    names=["sparse_attn_tilelang", "sparse_mqa_target_fwd", "v4_lighting_indexer"],
 )
 config.add_import(
     "veomni.distributed.parallel_state",
@@ -133,7 +143,12 @@ config.add_import(
 )
 config.add_import(
     "veomni.distributed.sequence_parallel",
-    names=["gather_heads_scatter_seq", "gather_outputs", "gather_seq_scatter_heads"],
+    names=[
+        "gather_heads_scatter_seq",
+        "gather_outputs",
+        "gather_seq_scatter_heads",
+        "reduce_sequence_parallel_loss",
+    ],
 )
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
@@ -155,7 +170,12 @@ config.add_import(
 # constructor fields (FSDP2 unshard-hook safe — see GPU config comment).
 config.add_import(
     "veomni.utils.model_outputs",
-    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+    names=[
+        "FusedLinearAuxOutput",
+        "FusedLinearAuxOutputMixin",
+        "MoeCausalLMOutputWithLogProbs",
+        "MoeModelOutputWithIndexerKL",
+    ],
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
@@ -180,8 +200,20 @@ config.add_post_import_block(
     veomni_mhc_head = OpSlot("mhc", "head")
     veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
     veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+    veomni_dsa_indexer_loss = OpsConfigSlot("dsa_indexer_loss", default=False)
+    veomni_dsa_indexer_loss_coef = OpsConfigSlot("dsa_indexer_loss_coef", default=1.0)
     """
 )
+
+# The reused indexer/attention/model/ForCausalLM forwards read the indexer-loss
+# gate, so the generated NPU module needs the same helpers the GPU one defines.
+# Registered by reference rather than restated, so the two backends cannot drift
+# apart on a predicate whose whole purpose is to be read identically from the
+# three call sites that decide the forward's arity.
+config.add_helper(_indexer_loss_enabled)
+config.add_helper(_builds_indexer_kl)
+config.add_helper(_split_indexer_output)
+config.add_helper(indexer_kl_terms)
 
 # ================================================================
 # Structural + numerics patches reused verbatim from the GPU config. Keeping
