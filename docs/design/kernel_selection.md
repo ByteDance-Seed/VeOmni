@@ -21,7 +21,7 @@ selection knob.
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | Vision rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `npu` | `"eager"` | Model registration via ops config singleton |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
@@ -247,7 +247,7 @@ model:
 |-------|---------------|---|
 | `liger_kernel` | `liger_rotary_pos_emb` | `liger-kernel` package |
 | `npu` | `torch_npu.npu_rotary_mul` | `torch_npu` |
-| `triton` | Model-specific Triton kernel registered via `extra_backends` (e.g. DeepSeek-V3 deterministic RoPE) | `triton`, per-model registration |
+| `triton` | Model-specific Triton kernel registered via `extra_backends` (DeepSeek-V3 deterministic RoPE, DeepSeek-V4 fused partial-interleaved RoPE, Wan DiT) | `triton`, per-model registration |
 | `eager` | HuggingFace default (`apply_rotary_pos_emb`) | — |
 
 #### `swiglu_mlp_implementation`
@@ -277,8 +277,10 @@ only difference is the kernel callable on the other side of the registry.
 
 Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, DeepSeek-V4, Llama,
 Seed-OSS. DeepSeek-V4 supports weighted and unweighted RMSNorm plus a
-clamp-preserving Liger silu*mul path for shared experts; its partial
-interleaved RoPE remains eager-only.
+clamp-preserving Liger silu*mul path for shared experts. Its partial
+interleaved RoPE has no Liger equivalent, so `liger_kernel` is rejected for
+`rotary_pos_emb_implementation` on that model; the supported values are
+`triton` (the fused kernel above) and `eager`.
 
 ### Key files
 
@@ -328,13 +330,14 @@ head-parallel evaluation of GDN, not a recurrent-state approximation.
 Selecting `headwise_lossless` requires `cp_size > 1`, packed
 dynamic batches, causal text self-attention, zero attention dropout, and the
 required accelerator kernels. The backwards-compatible `disabled` selector
-disables only the GDN-specific algorithm; with `cp_size > 1`, it selects generic
-Ring/Hybrid CP for non-GDN causal models. It does not silently enable Ring for
-Qwen3.5 GDN, which must select an explicit lossless mode. The current production
-CP release, including generic Ring/Hybrid CP, runs on Ascend NPU only. CPU
-execution is reserved for correctness oracles, and CUDA CP is unsupported.
-Eager/SDPA, non-Qwen3.5 models using a GDN selector, and multimodal or
-cross-attention CP are intentionally unsupported in this foundation.
+disables only the GDN-specific algorithm; model-native CP implementations such
+as DeepSeek-V4 retain their own layout and metadata contract. It does not
+silently enable Ring for Qwen3.5 GDN, which must select an explicit lossless
+mode. Qwen3.5 headwise and generic Ring/Hybrid building blocks target Ascend
+NPU; CPU execution is reserved for correctness oracles and their CUDA path is
+unsupported. This hardware restriction does not apply to a model-native CP
+implementation. Eager/SDPA, non-Qwen3.5 models using a GDN selector, and
+multimodal or cross-attention GDN CP are intentionally unsupported here.
 
 ---
 

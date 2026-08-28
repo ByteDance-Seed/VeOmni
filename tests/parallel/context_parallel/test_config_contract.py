@@ -99,13 +99,36 @@ def test_combined_cp_ulysses_malformed_sp_mesh_fails_closed():
         _ = state.sp_rank
 
 
-@pytest.mark.parametrize("implementation", ["disabled", "headwise_lossless"])
-def test_context_parallel_rejects_cuda_topology_before_mesh_initialization(implementation):
+def test_headwise_context_parallel_rejects_cuda_topology_before_mesh_initialization():
     with pytest.raises(NotImplementedError, match="supported on Ascend NPU only"):
         ParallelState(
             cp_size=2,
-            gdn_context_parallel_implementation=implementation,
+            gdn_context_parallel_implementation="headwise_lossless",
             device_type="cuda",
+        )
+
+
+def test_deepseek_native_context_parallel_does_not_inherit_qwen_ring_contract():
+    validate_context_parallel_config(
+        cp_size=2,
+        implementation="disabled",
+        dyn_bsz=False,
+        attn_implementation="native-sparse",
+        data_type="plaintext",
+        model_type="deepseek_v4",
+    )
+
+
+def test_deepseek_native_context_parallel_rejects_hybrid_ulysses():
+    with pytest.raises(NotImplementedError, match="cannot be combined with Ulysses"):
+        validate_context_parallel_config(
+            cp_size=2,
+            ulysses_size=2,
+            implementation="disabled",
+            dyn_bsz=False,
+            attn_implementation="native-sparse",
+            data_type="plaintext",
+            model_type="deepseek_v4",
         )
 
 

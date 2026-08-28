@@ -351,11 +351,17 @@ class SequenceParallelCollator(DataCollator):
         self.cp_rank = int(getattr(parallel_state, "cp_rank", 0)) if self.cp_size > 1 else 0
         self.ulysses_size = int(getattr(parallel_state, "ulysses_size", self.sp_size))
         self.ulysses_rank = int(getattr(parallel_state, "ulysses_rank", self.sp_rank)) if self.ulysses_size > 1 else 0
+        self.gdn_context_parallel_implementation = getattr(
+            parallel_state, "gdn_context_parallel_implementation", "disabled"
+        )
+        self.headwise_cp_enabled = (
+            self.cp_size > 1 and self.gdn_context_parallel_implementation == "headwise_lossless"
+        )
         self.dp_rank = int(getattr(parallel_state, "dp_rank", 0))
         self._data_parity_trace_limit = _data_parity_trace_limit()
         self._data_parity_trace_index = 0
-        if self.cp_size > 1 and self.metadata_collate_func is not None:
-            raise NotImplementedError("Context parallelism currently supports text-only packed batches.")
+        if self.headwise_cp_enabled and self.metadata_collate_func is not None:
+            raise NotImplementedError("Headwise GDN context parallelism currently supports text-only packed batches.")
 
     def _trace_unsharded_batch(self, batch: Dict[str, Any]) -> None:
         if self.sp_rank != 0 or self._data_parity_trace_index >= self._data_parity_trace_limit:
@@ -442,7 +448,7 @@ class SequenceParallelCollator(DataCollator):
             sp_slice = collate_info.sp_slice
             sp_pad_value = collate_info.sp_pad_value
             sp_pad_scale = collate_info.sp_pad_scale
-            if self.cp_size <= 1 and sp_pad_value is not None:
+            if not self.headwise_cp_enabled and sp_pad_value is not None:
                 # sp padding
                 pre_pad_len = len(batch[key]) if isinstance(batch[key], list) else batch[key].size(pack_dim)
                 batch[key] = self.sp_padding(
@@ -458,13 +464,13 @@ class SequenceParallelCollator(DataCollator):
                 if key == "position_ids":
                     linear_attn_tail_padding_length += post_pad_len - pre_pad_len
 
-            if self.cp_size <= 1 and sp_slice and key != "position_ids":
+            if not self.headwise_cp_enabled and sp_slice and key != "position_ids":
                 # sp slice
                 batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
         add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
 
-        if self.cp_size > 1:
+        if self.headwise_cp_enabled:
             from ..distributed.context_parallel.packed_sharding import (
                 apply_packed_context_parallel_partition,
                 build_packed_context_parallel_partition,

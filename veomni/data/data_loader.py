@@ -213,6 +213,10 @@ def build_native_dataloader(
             physical_token_cap = None
             dyn_bsz_physical_length_fn = None
         cp_size = int(getattr(parallel_state, "cp_size", 1))
+        headwise_cp_enabled = (
+            cp_size > 1
+            and getattr(parallel_state, "gdn_context_parallel_implementation", "disabled") == "headwise_lossless"
+        )
         debug_sample_alignment = _debug_physical_length_multiple()
         if debug_sample_alignment is not None:
             ulysses_size = int(getattr(parallel_state, "ulysses_size", parallel_state.sp_size))
@@ -232,7 +236,7 @@ def build_native_dataloader(
                 "Use debug dynamic-batching sample alignment --> "
                 f"VEOMNI_DYN_BSZ_SAMPLE_ALIGNMENT={debug_sample_alignment}."
             )
-        elif cp_size > 1:
+        elif headwise_cp_enabled:
             ulysses_size = int(getattr(parallel_state, "ulysses_size", parallel_state.sp_size))
             cp_sample_multiple = 2 * cp_size * ulysses_size
             if physical_token_cap is None:

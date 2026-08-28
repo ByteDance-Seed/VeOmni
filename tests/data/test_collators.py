@@ -95,8 +95,7 @@ def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     assert out["max_length_k"] == exp_max_length
 
 
-@pytest.mark.parametrize("implementation", ["disabled", "headwise_lossless"])
-def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, features_two_samples, implementation):
+def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, features_two_samples):
     import veomni.data.data_collator as m
 
     monkeypatch.setattr(
@@ -110,7 +109,7 @@ def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, fea
             cp_rank=1,
             ulysses_size=2,
             ulysses_rank=0,
-            gdn_context_parallel_implementation=implementation,
+            gdn_context_parallel_implementation="headwise_lossless",
         ),
     )
     token_labels = [
@@ -146,6 +145,7 @@ def test_text_collator_cp_pad_to_length_preserves_logical_accounting(
             sp_size=cp_size * ulysses_size,
             cp_size=cp_size,
             ulysses_size=ulysses_size,
+            gdn_context_parallel_implementation="headwise_lossless",
         ),
     )
     token_labels = [
@@ -157,6 +157,35 @@ def test_text_collator_cp_pad_to_length_preserves_logical_accounting(
 
     assert torch.equal(out["linear_attn_cu_seq_lens_q"], torch.tensor([0, 3, 5, 16], dtype=torch.int32))
     assert _compute_seqlens(out) == [3, 2]
+
+
+def test_native_context_parallel_keeps_upstream_contiguous_sp_layout(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(
+        m,
+        "get_parallel_state",
+        lambda: _fake_ps(
+            sp_enabled=True,
+            sp_size=2,
+            sp_rank=1,
+            cp_size=2,
+            cp_rank=1,
+            ulysses_size=1,
+            gdn_context_parallel_implementation="disabled",
+        ),
+    )
+    token_labels = [
+        {**features_two_samples[0], "labels": torch.tensor([2, 3, 4], dtype=torch.long)},
+        {**features_two_samples[1], "labels": torch.tensor([1, 2], dtype=torch.long)},
+    ]
+
+    out = m.MainCollator()(token_labels)
+
+    assert torch.equal(out["input_ids"], torch.tensor([[21, 22, 0]], dtype=torch.long))
+    assert torch.equal(out["position_ids"], torch.tensor([[0, 1, 0]], dtype=torch.long))
+    assert "linear_attn_cu_seqlens_list_q" not in out
+    assert "router_attention_mask" not in out
 
 
 def test_post_collator_fails_closed_for_context_parallel_output(monkeypatch):

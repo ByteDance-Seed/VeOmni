@@ -60,5 +60,5 @@ softcap attention, and non-packed batches fail closed.
 `state_passing_lossless` and `kcp` were experimental implementations and are no
 longer accepted. Configurations using either value fail closed during argument
 validation. Use `headwise_lossless` for Qwen3.5 GDN CP. The `disabled` value
-continues to mean “no GDN-specific CP”; generic Ring/Hybrid CP remains
-available to supported non-GDN causal models.
+continues to mean “no GDN-specific CP”; model-native CP implementations retain
+their own layout and metadata contract.

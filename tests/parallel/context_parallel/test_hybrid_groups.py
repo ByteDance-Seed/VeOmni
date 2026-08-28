@@ -31,6 +31,7 @@ def _worker(rank: int, world_size: int, file_name: str, errors: mp.Queue):
             extra_parallel_placement_innermost=(False,),
             extra_parallel_names=("ep",),
             name="hybrid_groups_test",
+            gdn_context_parallel_implementation="headwise_lossless",
         )
 
         cp_rank, ulysses_rank = coords_from_sp_rank(rank % (cp_size * ulysses_size), cp_size, ulysses_size)

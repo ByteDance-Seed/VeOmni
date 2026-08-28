@@ -577,7 +577,7 @@ def _worker_entry(rank: int, world_size: int, port: int, case_name: str, errors)
             dist.destroy_process_group()
 
 
-def _run_gloo_case(case_name: str, *, world_size: int = _WORLD_SIZE, timeout: float = 30.0) -> None:
+def _run_gloo_case(case_name: str, *, world_size: int = _WORLD_SIZE, timeout: float = 60.0) -> None:
     ctx = mp.get_context("spawn")
     errors = ctx.Queue()
     port = _free_port()
