@@ -191,6 +191,7 @@ def _accumulating_trainer(outputs, recorded):
             accelerator=SimpleNamespace(
                 dp_replicate_size=1,
                 fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=True),
+                offload_config=SimpleNamespace(enable_async_activation=False),
             ),
             sync_each_train_step=False,
         )

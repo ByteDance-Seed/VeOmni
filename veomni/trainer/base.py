@@ -833,7 +833,9 @@ class BaseTrainer(Stateful, ABC):
                 self.model.set_requires_all_reduce(True)
 
     def _reset_async_activation_offload_if_enabled(self):
-        if self.args.train.accelerator.offload_config.enable_async_activation:
+        accelerator = getattr(self.args.train, "accelerator", None)
+        offload_config = getattr(accelerator, "offload_config", None)
+        if getattr(offload_config, "enable_async_activation", False):
             reset_async_activation_offload(self.model)
 
     def sync_before_train_step(self):

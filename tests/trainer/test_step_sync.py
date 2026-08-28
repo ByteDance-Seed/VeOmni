@@ -33,6 +33,22 @@ def test_train_step_uses_sync_helper():
         assert "synchronize()" not in source
 
 
+def test_reset_async_activation_offload_skips_missing_config(monkeypatch):
+    calls = []
+    monkeypatch.setattr(base_module, "reset_async_activation_offload", lambda model: calls.append(model))
+
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.model = object()
+    trainer.args = SimpleNamespace(train=SimpleNamespace(accelerator=SimpleNamespace()))
+
+    trainer._reset_async_activation_offload_if_enabled()
+    assert calls == []
+
+    trainer.args.train.accelerator.offload_config = SimpleNamespace(enable_async_activation=True)
+    trainer._reset_async_activation_offload_if_enabled()
+    assert calls == [trainer.model]
+
+
 def test_configure_hsdp_allreduce_toggles_outer_micro_steps():
     calls = []
     trainer = BaseTrainer.__new__(BaseTrainer)
@@ -50,6 +66,13 @@ def test_configure_hsdp_allreduce_toggles_outer_micro_steps():
         trainer._configure_hsdp_allreduce(micro_step, 4)
 
     assert calls == [False, True]
+
+
+def test_train_step_uses_async_offload_reset_helper():
+    for wrapper_cls in (BaseTrainer, TextTrainer, VLMTrainer, TextDPOTrainer, DiTTrainer):
+        source = inspect.getsource(wrapper_cls.train_step)
+
+        assert "_reset_async_activation_offload_if_enabled()" in source
 
 
 def test_train_step_uses_hsdp_allreduce_helper():
