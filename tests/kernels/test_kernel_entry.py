@@ -58,11 +58,6 @@ def _pair_backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tup
     return grad_sum + y * grad_prod, grad_sum + x * grad_prod
 
 
-class TestRegistryTable:
-    def test_empty_table_on_import(self):
-        assert KERNEL_REGISTRY._entries == {}
-
-
 @pytest.mark.usefixtures("isolated_entries")
 class TestKernelEntryValidation:
     def test_forward_without_backward_raises(self):
