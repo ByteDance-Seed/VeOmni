@@ -837,7 +837,7 @@ def _dsv4_indexer_test_config():
     return config
 
 
-def _build_test_indexer(device="cuda", dtype=torch.bfloat16):
+def _build_test_indexer(device=DEVICE, dtype=torch.bfloat16):
     """A ``DeepseekV4Indexer`` on the geometry above, ready to call.
 
     ``position_bias`` is a ``torch.empty`` parameter in the upstream constructor, so a
@@ -857,7 +857,7 @@ def _build_test_indexer(device="cuda", dtype=torch.bfloat16):
     return indexer, config
 
 
-def _build_test_csa_compressor(device="cuda", dtype=torch.bfloat16):
+def _build_test_csa_compressor(device=DEVICE, dtype=torch.bfloat16):
     """A ``DeepseekV4CSACompressor`` around an indexer of the same geometry.
 
     Both modules declare ``position_bias`` as ``torch.empty``, and the compressor's own
@@ -1010,10 +1010,10 @@ class TestIndexerScoresAndDecoupling:
         _bind_indexer_loss(enabled=True)
 
         seq_len = 2048
-        indexer, config = _build_test_indexer(device="cuda")
-        hidden = torch.randn(1, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        indexer, config = _build_test_indexer(device=DEVICE)
+        hidden = torch.randn(1, seq_len, config.hidden_size, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
         q_residual = torch.randn(
-            1, seq_len, config.q_lora_rank, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            1, seq_len, config.q_lora_rank, device=DEVICE, dtype=torch.bfloat16, requires_grad=True
         )
 
         with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
@@ -1046,9 +1046,9 @@ class TestIndexerScoresAndDecoupling:
         _bind_indexer_loss(enabled=False)
 
         seq_len = 2048
-        indexer, config = _build_test_indexer(device="cuda")
-        hidden = torch.randn(1, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        q_residual = torch.randn(1, seq_len, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
+        indexer, config = _build_test_indexer(device=DEVICE)
+        hidden = torch.randn(1, seq_len, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+        q_residual = torch.randn(1, seq_len, config.q_lora_rank, device=DEVICE, dtype=torch.bfloat16)
 
         with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
             result = _run_indexer(indexer, hidden, q_residual)
@@ -1137,15 +1137,15 @@ class TestIndexerScoresAndDecoupling:
         _require_tilelang_cuda()
 
         seq_len = 2048
-        compressor, config = _build_test_csa_compressor(device="cuda")
-        hidden = torch.randn(1, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        q_residual = torch.randn(1, seq_len, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
+        compressor, config = _build_test_csa_compressor(device=DEVICE)
+        hidden = torch.randn(1, seq_len, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+        q_residual = torch.randn(1, seq_len, config.q_lora_rank, device=DEVICE, dtype=torch.bfloat16)
         if packed:
             from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
             sequence_slices = ((0, 1024), (1024, seq_len))
             position_ids = torch.cat(
-                [torch.arange(end - start, device="cuda") for start, end in sequence_slices]
+                [torch.arange(end - start, device=DEVICE) for start, end in sequence_slices]
             ).unsqueeze(0)
             packed_kwargs = {
                 "packed_sequence_slices": sequence_slices,
@@ -1154,7 +1154,7 @@ class TestIndexerScoresAndDecoupling:
                 ),
             }
         else:
-            position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+            position_ids = torch.arange(seq_len, device=DEVICE).unsqueeze(0)
             packed_kwargs = {}
 
         def _candidates():
@@ -1182,7 +1182,7 @@ class TestIndexerScoresAndDecoupling:
         assert torch.equal(with_loss.topk_indices, without_loss.topk_indices)
 
 
-def _build_test_attention(device="cuda", seq_len=4096, layer_type="compressed_sparse_attention", seed=0):
+def _build_test_attention(device=DEVICE, seq_len=4096, layer_type="compressed_sparse_attention", seed=0):
     """One ``DeepseekV4Attention`` of the requested layer type, plus the kwargs its
     real call site hands it.
 
@@ -1614,7 +1614,7 @@ class TestAttentionForwardIndexerKL:
 
         _bind_indexer_loss(enabled=True)
         seq_len = self._RANKING_SEQ_LEN
-        attn, inputs = _build_test_attention(device="cuda", seq_len=seq_len)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
             _, _, kl_sum, _ = attn(**inputs)
 
@@ -1691,7 +1691,7 @@ class TestAttentionForwardIndexerKL:
 
         _bind_indexer_loss(enabled=True)
         seq_len = self._RANKING_SEQ_LEN
-        attn, inputs = _build_test_attention(device="cuda", seq_len=seq_len)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
             attn(**inputs)
 
@@ -1758,7 +1758,7 @@ class TestAttentionForwardIndexerKL:
 
         _bind_indexer_loss(enabled=True)
         seq_len = self._CHEAP_SEQ_LEN
-        attn, inputs = _build_test_attention(device="cuda", seq_len=seq_len)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
         # The mask builder dispatches on the config's attention implementation, and a
         # directly built layer leaves it unset; "eager" is what the model configures
         # here and it is the interface this file's patched forward replaces.
@@ -1766,7 +1766,7 @@ class TestAttentionForwardIndexerKL:
         inputs["attention_mask"] = create_sliding_window_causal_mask(
             config=attn.config,
             inputs_embeds=inputs["hidden_states"],
-            attention_mask=torch.ones(1, seq_len, dtype=torch.long, device="cuda"),
+            attention_mask=torch.ones(1, seq_len, dtype=torch.long, device=DEVICE),
             past_key_values=None,
             position_ids=inputs["position_ids"],
         )
@@ -1811,7 +1811,7 @@ class TestAttentionForwardIndexerKL:
         _require_tilelang_cuda()
 
         _bind_indexer_loss(enabled=False)
-        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
             result = attn(**inputs)
 
@@ -1831,7 +1831,7 @@ class TestAttentionForwardIndexerKL:
         """
         _require_tilelang_cuda()
 
-        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
         with _single_rank_parallel_state():
             _bind_indexer_loss(enabled=False)
             output_off, weights_off = attn(**inputs)
@@ -1864,7 +1864,7 @@ class TestAttentionForwardIndexerKL:
         _require_tilelang_cuda()
 
         _bind_indexer_loss(enabled=True)
-        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
         assert attn.layer_type != "compressed_sparse_attention", "this test is about the layers the gate excludes"
         assert getattr(attn.compressor, "indexer", None) is None, "this layer type is supposed to have no indexer"
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
@@ -1885,7 +1885,7 @@ class TestAttentionForwardIndexerKL:
         from unittest import mock
 
         _bind_indexer_loss(enabled=True)
-        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
         real_forward = attn.compressor.forward
 
         def _without_scores(*args, **kwargs):
@@ -1915,7 +1915,7 @@ class TestAttentionForwardIndexerKL:
         from unittest import mock
 
         _bind_indexer_loss(enabled=True)
-        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
         real_forward = attn.compressor.forward
 
         def _narrower_scores(*args, **kwargs):
@@ -1946,8 +1946,8 @@ class TestAttentionForwardIndexerKL:
         _bind_indexer_loss(enabled=True)
         # fp32 is the realistic way to lose the dispatch: the kernel is bf16-only, and
         # the attention forward hands it whatever dtype the module was built in.
-        query = torch.randn(1, 4, 8, 64, device="cuda")
-        kv = torch.randn(1, 1, 24, 64, device="cuda")
+        query = torch.randn(1, 4, 8, 64, device=DEVICE)
+        kv = torch.randn(1, 1, 24, 64, device=DEVICE)
         with pytest.raises(RuntimeError, match="needs the TileLang sparse attention dispatch"):
             modeling.eager_attention_forward(
                 None, query, kv, kv, None, 0.1, sparse_topk_indices=None, indexer_target_width=8
@@ -1973,7 +1973,7 @@ class TestAttentionForwardIndexerKL:
         _require_tilelang_cuda()
 
         _bind_indexer_loss(enabled=True)
-        attn, inputs = _build_test_attention(device="cuda", seq_len=self._RANKING_SEQ_LEN)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._RANKING_SEQ_LEN)
         with _single_rank_parallel_state():
             _, _, kl_sum, _ = attn(**inputs)
         kl_sum.backward()
@@ -2015,7 +2015,7 @@ class TestAttentionForwardIndexerKL:
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
         _bind_indexer_loss(enabled=enabled)
-        attn, inputs = _build_test_attention(device="cuda", seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
         with _single_rank_parallel_state():
             verdict = modeling._builds_indexer_kl(attn)
             result = attn(**inputs)
@@ -2129,7 +2129,7 @@ def _veomni_loss_mapping_installed():
 
 
 def _build_4layer_test_model(
-    device="cuda",
+    device=DEVICE,
     seq_len=4096,
     indexer_loss=True,
     enable_reentrant=False,
@@ -2302,7 +2302,7 @@ class TestFourLayerModelIndexerKL:
         is the setting production runs, and it had none.
         """
         _require_tilelang_cuda()
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, enable_reentrant=enable_reentrant)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, enable_reentrant=enable_reentrant)
         with _single_rank_parallel_state(), _checkpointed_layer_calls_recorded(model) as checkpointed:
             out = model(**batch)
             out.loss.backward()
@@ -2359,7 +2359,7 @@ class TestFourLayerModelIndexerKL:
         module-level function on the same object, and they would agree again.
         """
         _require_tilelang_cuda()
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=indexer_loss)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=indexer_loss)
         layer = model.model.layers[layer_index]
         real_forward = layer.forward
         if regression == "extra_none":
@@ -2413,7 +2413,7 @@ class TestFourLayerModelIndexerKL:
         """
         _require_tilelang_cuda()
         model, batch = _build_4layer_test_model(
-            device="cuda", seq_len=4096, labels=labels, layer_types=self._NO_CSA_LAYER_TYPES
+            device=DEVICE, seq_len=4096, labels=labels, layer_types=self._NO_CSA_LAYER_TYPES
         )
         assert not _csa_layers(model), "the no-CSA config still built a layer with an indexer"
 
@@ -2431,7 +2431,7 @@ class TestFourLayerModelIndexerKL:
         """
         _require_tilelang_cuda()
         model, batch = _build_4layer_test_model(
-            device="cuda", seq_len=4096, indexer_loss=False, layer_types=self._NO_CSA_LAYER_TYPES
+            device=DEVICE, seq_len=4096, indexer_loss=False, layer_types=self._NO_CSA_LAYER_TYPES
         )
         with _single_rank_parallel_state():
             out = model(**batch)
@@ -2445,7 +2445,7 @@ class TestFourLayerModelIndexerKL:
         has an indexer, so only it may contribute to the KL, and the total must be a
         finite positive number rather than a silent zero."""
         _require_tilelang_cuda()
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096)
 
         with_indexer = [
             i
@@ -2481,7 +2481,7 @@ class TestFourLayerModelIndexerKL:
         _require_tilelang_cuda()
         from torch.utils import _pytree as pytree
 
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096)
         with _single_rank_parallel_state():
             outputs = model.model(**_model_only_batch(batch))
 
@@ -2514,7 +2514,7 @@ class TestFourLayerModelIndexerKL:
         ``test_the_reported_kl_is_a_per_layer_mean_while_the_loss_keeps_the_sum``.
         """
         _require_tilelang_cuda()
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096)
         with _single_rank_parallel_state():
             outputs = model.model(**_model_only_batch(batch))
             out = model(**batch)
@@ -2569,7 +2569,7 @@ class TestFourLayerModelIndexerKL:
         """
         _require_tilelang_cuda()
 
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=True, coef=0.0, seed=0)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=True, coef=0.0, seed=0)
         assert _csa_layers(model), "the test model has no indexer to leave untrained"
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
             out = model(**batch)
@@ -2588,7 +2588,7 @@ class TestFourLayerModelIndexerKL:
                     "weight decay applies"
                 )
 
-        off, off_batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=False, seed=0)
+        off, off_batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=False, seed=0)
         with _single_rank_parallel_state():
             off_out = off(**off_batch)
         assert torch.equal(out.loss, off_out.loss), (
@@ -2615,7 +2615,7 @@ class TestFourLayerModelIndexerKL:
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
         def loss_at(indexer_loss, coef):
-            model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=indexer_loss, seed=0)
+            model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=indexer_loss, seed=0)
             modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
             with _single_rank_parallel_state():
                 out = model(**batch)
@@ -2662,7 +2662,7 @@ class TestFourLayerModelIndexerKL:
         _require_tilelang_cuda()
 
         model, batch = _build_4layer_test_model(
-            device="cuda", seq_len=4096, layer_types=self._TWO_CSA_LAYER_TYPES, coef=1.0, seed=0
+            device=DEVICE, seq_len=4096, layer_types=self._TWO_CSA_LAYER_TYPES, coef=1.0, seed=0
         )
         assert len(_csa_layers(model)) == 2, "the two-CSA schedule did not build two indexers"
 
@@ -2719,7 +2719,7 @@ class TestFourLayerModelIndexerKL:
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
         model, batch = _build_4layer_test_model(
-            device="cuda", seq_len=4096, layer_types=self._TWO_CSA_LAYER_TYPES, coef=1.0, seed=0
+            device=DEVICE, seq_len=4096, layer_types=self._TWO_CSA_LAYER_TYPES, coef=1.0, seed=0
         )
 
         # The per-row terms as the *reported* forward formed them, so the expectation
@@ -2821,7 +2821,7 @@ class TestFourLayerModelIndexerKL:
         """
         _require_tilelang_cuda()
 
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=True, coef=1.0, seed=0)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=True, coef=1.0, seed=0)
         with _single_rank_parallel_state():
             out = model(**batch)
 
@@ -2836,7 +2836,7 @@ class TestFourLayerModelIndexerKL:
         )
         torch.testing.assert_close(out.loss.detach() - pre_fold, reported, atol=admitted, rtol=0)
 
-        off, off_batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=False, seed=0)
+        off, off_batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=False, seed=0)
         with _single_rank_parallel_state():
             off_out = off(**off_batch)
         torch.testing.assert_close(pre_fold, off_out.loss.detach(), atol=admitted, rtol=0)
@@ -2851,7 +2851,7 @@ class TestFourLayerModelIndexerKL:
         """
         _require_tilelang_cuda()
 
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, labels=False)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, labels=False)
         with _single_rank_parallel_state():
             out = model(**batch)
 
@@ -2872,7 +2872,7 @@ class TestFourLayerModelIndexerKL:
         parameter outside the indexer either receives a gradient from it or does not.
         """
         _require_tilelang_cuda()
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096)
         with _single_rank_parallel_state():
             outputs = model.model(**_model_only_batch(batch))
         outputs.indexer_kl_total.backward()
@@ -2896,7 +2896,7 @@ class TestFourLayerModelIndexerKL:
         forward in the tree while leaving the enabled path green.
         """
         _require_tilelang_cuda()
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, indexer_loss=False)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=False)
         with _single_rank_parallel_state():
             outputs = model.model(**_model_only_batch(batch))
             out = model(**batch)
@@ -2928,7 +2928,7 @@ class TestFourLayerModelIndexerKL:
         KL entirely.
         """
         _require_tilelang_cuda()
-        model, batch = _build_4layer_test_model(device="cuda", seq_len=4096, labels=False)
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, labels=False)
         with _single_rank_parallel_state():
             out = model(**batch)
 
