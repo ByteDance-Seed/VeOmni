@@ -265,7 +265,6 @@ def _builder_trainer():
                 micro_batch_size=2,
                 moe_load_balance_monitor_interval=0,
                 profile=SimpleNamespace(enable=False),
-                chunk_mbs_config=SimpleNamespace(enable=False),
                 torch_compile=SimpleNamespace(enable=False),
             ),
         ),
@@ -456,7 +455,6 @@ def test_text_validation_runner_rejects_unimplemented_parallel_semantics(monkeyp
 @pytest.mark.parametrize(
     ("config_name", "match"),
     [
-        ("chunk_mbs_config", "ChunkMBS"),
         ("torch_compile", "torch.compile"),
         ("moe_load_balance_monitor_interval", "MoE router monitoring"),
         ("profile", "torch profiler"),

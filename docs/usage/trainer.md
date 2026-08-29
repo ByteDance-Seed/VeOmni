@@ -179,7 +179,7 @@ The initial support boundary is intentionally narrow: single-source conversation
 Text SFT with the native dataloader under pure DP/FSDP2. Plaintext is rejected because one raw row can
 expand into multiple chunks, and weighted multisource YAML is rejected because its interleave schedule
 does not represent an exact union of source samples. Iterable datasets, VLM, DPO, diffusion, RL,
-sequence/tensor/pipeline/extra parallelism, async sequence parallelism, ChunkMBS, and `torch.compile`
+sequence/tensor/pipeline/extra parallelism, async sequence parallelism, and `torch.compile`
 are rejected explicitly until their task-specific data, forward, and collective contracts are implemented.
 MoE router monitoring and torch profiling are also rejected so validation forwards cannot pollute
 training-only observability state.

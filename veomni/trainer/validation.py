@@ -99,8 +99,6 @@ class TextValidationRunner:
             unsupported.append("ExtraParallel/EP")
         if parallel_state.async_enabled:
             unsupported.append("async sequence parallelism")
-        if args.train.chunk_mbs_config.enable:
-            unsupported.append("ChunkMBS")
         if args.train.torch_compile.enable:
             unsupported.append("torch.compile")
         if args.train.moe_load_balance_monitor_interval > 0 and hasattr(self.trainer.model_config, "num_experts"):
