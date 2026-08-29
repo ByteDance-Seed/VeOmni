@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.utils.import_utils import is_torch_npu_available
+from veomni.utils.device import get_device_type
 
 from .launch_utils import find_free_port
 
@@ -142,7 +142,7 @@ def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
     returns the NPU-supported backend per op, with per-model eager fallbacks for
     ops without an NPU kernel for that model.
     """
-    if not is_torch_npu_available():
+    if get_device_type() != "npu":
         overrides = _GPU_PER_MODEL_OVERRIDES.get(model_name, {}) if model_name else {}
         return [f"--model.ops_implementation.{k}={v}" for k, v in overrides.items()]
     return [f"--model.ops_implementation.{k}={v}" for k, v in _npu_overrides(model_name).items()]

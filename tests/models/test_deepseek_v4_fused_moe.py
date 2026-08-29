@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -34,14 +35,13 @@ def _deepseek_v4_experts_reference(
     return output
 
 
-def test_deepseek_v4_test_overrides_keep_eager_attention_and_expected_moe():
-    from tests.tools.training_utils import resolve_ops_overrides
-    from veomni.utils.import_utils import is_torch_npu_available
+@pytest.mark.parametrize(("device_type", "expected_moe"), [("cuda", "fused_triton"), ("npu", "fused_npu")])
+def test_deepseek_v4_test_overrides_follow_active_device(monkeypatch, device_type, expected_moe):
+    from tests.tools import training_utils
 
-    overrides = resolve_ops_overrides("deepseek_v4")
+    monkeypatch.setattr(training_utils, "get_device_type", lambda: device_type)
+    overrides = training_utils.resolve_ops_overrides("deepseek_v4")
 
-    is_npu = is_torch_npu_available()
-    expected_moe = "fused_npu" if is_npu else "fused_triton"
     assert "--model.ops_implementation.attn_implementation=eager" in overrides
     assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
 

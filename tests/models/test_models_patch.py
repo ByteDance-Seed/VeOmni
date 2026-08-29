@@ -468,7 +468,7 @@ def test_models_patch_fwd_bwd(
     # backend: DeepSeek-V4 forwards ``swiglu_limit`` into fused_triton/fused_npu.
     if case_id == "deepseek_v4":
         hf_model_modes = [ModelMode("hf", "eager")]
-        moe_impl = "fused_npu" if IS_NPU_AVAILABLE else "fused_triton"
+        moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
         veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
 
     # Qwen3.5 compatibility:
