@@ -39,6 +39,7 @@ import veomni.trainer.base as base_trainer_module
 import veomni.trainer.callbacks.trace_callback as trace_callback_module
 import veomni.trainer.text_trainer as text_trainer_module
 import veomni.trainer.vlm_trainer as vlm_trainer_module
+from veomni.arguments.arguments_types import OffloadConfig
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.trace_callback import RESERVED_TRAINING_METRIC_NAMES
@@ -191,7 +192,7 @@ def _accumulating_trainer(outputs, recorded):
             accelerator=SimpleNamespace(
                 dp_replicate_size=1,
                 fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=True),
-                offload_config=SimpleNamespace(enable_async_activation=False),
+                offload_config=OffloadConfig(),
             ),
             sync_each_train_step=False,
         )

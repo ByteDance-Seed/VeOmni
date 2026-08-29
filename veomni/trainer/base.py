@@ -46,7 +46,7 @@ from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
-from ..arguments import VeOmniArguments, save_args
+from ..arguments import OffloadConfig, VeOmniArguments, save_args
 from ..checkpoint import CheckpointerBase
 from ..data import (
     DistributedDataloader,
@@ -207,6 +207,13 @@ class VeOmniIter:
         if hasattr(self.dataloader, "state_dict"):
             return self.dataloader.state_dict()
         return {}
+
+
+def _resolve_offload_config(args) -> OffloadConfig:
+    """Return activation-offload config, or the disabled defaults if a stub omitted it."""
+    accelerator = getattr(getattr(args, "train", None), "accelerator", None)
+    config = getattr(accelerator, "offload_config", None)
+    return config if config is not None else OffloadConfig()
 
 
 def mean_aux_metrics(total_aux_metrics: Dict[str, float], num_micro_steps: int) -> Dict[str, float]:
@@ -531,8 +538,8 @@ class BaseTrainer(Stateful, ABC):
         # matching MindSpeed-MM's GC+async offload behavior: hidden_states
         # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
         # activations are handled by GC recomputation (via _checkpoint_hook).
-        if args.train.accelerator.offload_config.enable_async_activation:
-            offload_config = args.train.accelerator.offload_config
+        offload_config = _resolve_offload_config(args)
+        if offload_config.enable_async_activation:
             apply_async_activation_offload(
                 self.model,
                 offload_config.activation_offload_modules,
@@ -625,7 +632,7 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_training_context(self):
         """Build training context for distributed training."""
-        offload_config = self.args.train.accelerator.offload_config
+        offload_config = _resolve_offload_config(self.args)
 
         # Async activation offload uses per-module saved_tensors_hooks (applied
         # before FSDP sharding), so the global fwd/bwd contexts are nullcontext.
@@ -833,9 +840,7 @@ class BaseTrainer(Stateful, ABC):
                 self.model.set_requires_all_reduce(True)
 
     def _reset_async_activation_offload_if_enabled(self):
-        accelerator = getattr(self.args.train, "accelerator", None)
-        offload_config = getattr(accelerator, "offload_config", None)
-        if getattr(offload_config, "enable_async_activation", False):
+        if _resolve_offload_config(self.args).enable_async_activation:
             reset_async_activation_offload(self.model)
 
     def sync_before_train_step(self):
