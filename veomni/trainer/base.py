@@ -681,10 +681,13 @@ class BaseTrainer(Stateful, ABC):
         # keeping its on_step_end position after the meter so its metrics are not
         # overwritten by the meter's per-step reset.
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
-        if channel_loss_callback is not None:
+        channel_loss_registered = channel_loss_callback is not None and any(
+            callback is channel_loss_callback for callback in self._callbacks
+        )
+        if channel_loss_registered:
             channel_loss_callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
         for callback in self._callbacks:
-            if callback is channel_loss_callback:
+            if channel_loss_registered and callback is channel_loss_callback:
                 continue
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 

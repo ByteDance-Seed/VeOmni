@@ -1648,6 +1648,26 @@ def test_base_step_begin_allows_missing_channel_loss_callback():
     assert calls == [micro_batches]
 
 
+def test_base_step_begin_skips_unregistered_channel_loss_callback():
+    calls = []
+
+    class RecordingCallback:
+        def __init__(self, name):
+            self.name = name
+
+        def on_step_begin(self, state, micro_batches=None, **kwargs):
+            calls.append(self.name)
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = TrainerState(global_step=1)
+    trainer.channel_loss_callback = RecordingCallback("unregistered-channel")
+    trainer._callbacks = [RecordingCallback("registered")]
+
+    BaseTrainer.on_step_begin(trainer, micro_batches=[{"input_ids": torch.tensor([1, 2])}])
+
+    assert calls == ["registered"]
+
+
 def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch):
     _install_test_parallel_state(monkeypatch)
     trainer = object.__new__(BaseTrainer)
