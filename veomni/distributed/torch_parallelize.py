@@ -525,13 +525,8 @@ def parallelize_model_fsdp2(
     for para in parallel_state.extra_parallel_names:
         if parallel_state.extra_parallel_enabled(para):
             para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
-            para_mesh_dim_names = para_mesh.mesh_dim_names
-            # exclude para_size dimension:
-            # - (ep_fsdp, ep) -> (ep_fsdp,)
-            # - (ep_replicate, ep_fsdp, ep) -> (ep_replicate, ep_fsdp)
-            para_fsdp_mesh = para_mesh[para_mesh_dim_names[:-1]]
             para_fsdp_kwargs = dict(fsdp_kwargs)
-            para_fsdp_kwargs["mesh"] = para_fsdp_mesh
+            para_fsdp_kwargs["mesh"] = parallel_state.extra_parallel_fsdp_mesh(para)
             shard_dim_for_para = 1
             # Muon zero-comm needs whole experts per rank; otherwise keep the
             # default hidden-dim sharding. A para this model's plan does not

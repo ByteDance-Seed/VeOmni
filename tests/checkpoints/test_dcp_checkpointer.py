@@ -26,6 +26,129 @@ from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
 
+class _NamedMeshStub:
+    def __init__(self, *mesh_dim_names):
+        self.mesh_dim_names = mesh_dim_names
+        self.ndim = len(mesh_dim_names)
+
+    def __getitem__(self, mesh_dim_names):
+        if isinstance(mesh_dim_names, str):
+            mesh_dim_names = (mesh_dim_names,)
+        return _NamedMeshStub(*mesh_dim_names)
+
+
+class TestExtraParallelCheckpointMeshSemantics:
+    @pytest.mark.parametrize(
+        ("mesh_dim_names", "expected_placements"),
+        [
+            (("ep_fsdp", "ep"), (("shard", 1), ("shard", 0))),
+            (("ep", "ep_fsdp"), (("shard", 0), ("shard", 1))),
+            (("ep_replicate", "ep", "ep_fsdp"), (("replicate", None), ("shard", 0), ("shard", 1))),
+        ],
+    )
+    def test_restore_maps_placements_to_named_mesh_dimensions(self, monkeypatch, mesh_dim_names, expected_placements):
+        import veomni.checkpoint.dcp_checkpointer as checkpointer
+
+        captured = {}
+
+        class FakeDTensor:
+            def __init__(self, local_tensor):
+                self._local_tensor = local_tensor
+
+            @classmethod
+            def from_local(cls, local_tensor, *, device_mesh, placements):
+                captured["mesh_dim_names"] = device_mesh.mesh_dim_names
+                captured["placements"] = placements
+                return cls(local_tensor)
+
+        monkeypatch.setattr(checkpointer, "DTensor", FakeDTensor)
+        full_mesh = _NamedMeshStub(*mesh_dim_names)
+        fsdp_mesh = full_mesh[tuple(name for name in mesh_dim_names if name != "ep")]
+
+        checkpointer.restore_extra_parallel_dim(
+            FakeDTensor(torch.ones(2, 2)),
+            full_mesh,
+            fsdp_mesh,
+            ep_shard_dim=0,
+            fsdp_shard_dim=1,
+        )
+
+        actual_placements = tuple(
+            ("shard", placement.dim) if isinstance(placement, checkpointer.Shard) else ("replicate", None)
+            for placement in captured["placements"]
+        )
+        assert captured["mesh_dim_names"] == mesh_dim_names
+        assert actual_placements == expected_placements
+
+    def test_preprocess_excludes_extra_parallel_dimension_by_name(self, monkeypatch):
+        import veomni.checkpoint.dcp_checkpointer as checkpointer
+
+        full_mesh = _NamedMeshStub("ep", "ep_fsdp")
+        spec_info = SimpleNamespace(
+            para_name="ep",
+            placement=checkpointer.Shard(0),
+            para_fsdp_mesh=full_mesh,
+            fsdp_shard_dim=1,
+        )
+        parallel_state = SimpleNamespace(extra_parallel_names=("ep",))
+        captured = {}
+
+        monkeypatch.setattr(checkpointer, "_validate_extra_parallel_meshes", lambda _: None)
+
+        def capture_drop(tensor, device_mesh, fsdp_shard_dim, extra_parallel_name):
+            captured["mesh_dim_names"] = device_mesh.mesh_dim_names
+            captured["fsdp_shard_dim"] = fsdp_shard_dim
+            captured["extra_parallel_name"] = extra_parallel_name
+            return tensor
+
+        monkeypatch.setattr(checkpointer, "drop_extra_parallel_dim", capture_drop)
+
+        checkpointer._apply_extra_parallel_dim(
+            {"experts.weight": torch.ones(2, 2)},
+            {"experts.weight": spec_info},
+            parallel_state,
+            "drop",
+            key_match="exact",
+        )
+
+        assert captured == {
+            "mesh_dim_names": ("ep_fsdp",),
+            "fsdp_shard_dim": 1,
+            "extra_parallel_name": "ep",
+        }
+
+    def test_preprocess_forwards_non_ep_parallel_name_when_dropping(self, monkeypatch):
+        import veomni.checkpoint.dcp_checkpointer as checkpointer
+
+        full_mesh = _NamedMeshStub("embedding", "embedding_fsdp")
+        spec_info = SimpleNamespace(
+            para_name="embedding",
+            placement=checkpointer.Shard(0),
+            para_fsdp_mesh=full_mesh,
+            fsdp_shard_dim=1,
+        )
+        parallel_state = SimpleNamespace(extra_parallel_names=("embedding",))
+        captured = {}
+
+        monkeypatch.setattr(checkpointer, "_validate_extra_parallel_meshes", lambda _: None)
+
+        def capture_drop(tensor, device_mesh, fsdp_shard_dim, extra_parallel_name="ep"):
+            captured["extra_parallel_name"] = extra_parallel_name
+            return tensor
+
+        monkeypatch.setattr(checkpointer, "drop_extra_parallel_dim", capture_drop)
+
+        checkpointer._apply_extra_parallel_dim(
+            {"embedding.weight": torch.ones(2, 2)},
+            {"embedding.weight": spec_info},
+            parallel_state,
+            "drop",
+            key_match="exact",
+        )
+
+        assert captured["extra_parallel_name"] == "embedding"
+
+
 # ---------------------------------------------------------------------------
 # OptimizerState: no fill, partial load
 # ---------------------------------------------------------------------------

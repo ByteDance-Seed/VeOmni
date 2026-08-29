@@ -249,8 +249,18 @@ if __name__ == "__main__":
     main()
 
 
-def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate_size: Optional[int] = None):
-    exec_command = get_checkpoint_test_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
+def _run_trainer_saveload_and_verify(
+    model_name: str,
+    ep_size: int,
+    dp_replicate_size: Optional[int] = None,
+    ep_outside: bool = False,
+):
+    exec_command = get_checkpoint_test_command(
+        model_name,
+        ep_size,
+        dp_replicate_size=dp_replicate_size,
+        ep_outside=ep_outside,
+    )
     merge_command = get_merge_dcp_to_hf_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
 
     exec_result = subprocess.run(exec_command, shell=True, check=True)
@@ -319,6 +329,19 @@ def test_trainer_saveload(model_name: str, ep_size: int):
 @pytest.mark.parametrize("ep_size", [2, 4])
 def test_trainer_saveload_hsdp(ep_size: int):
     _run_trainer_saveload_and_verify("qwen3_moe", ep_size, dp_replicate_size=2)
+
+
+# The outside layout changes the named mesh order to (ep, ep_fsdp), or
+# (ep_replicate, ep, ep_fsdp) with HSDP. Exercise model and optimizer DCP
+# round-trip plus DCP-to-HF consolidation for both forms.
+@pytest.mark.parametrize(("ep_size", "dp_replicate_size"), [(4, None), (2, 2)])
+def test_trainer_saveload_ep_outside(ep_size: int, dp_replicate_size: Optional[int]):
+    _run_trainer_saveload_and_verify(
+        "qwen3_moe",
+        ep_size,
+        dp_replicate_size=dp_replicate_size,
+        ep_outside=True,
+    )
 
 
 @pytest.mark.parametrize("ep_size", TEST_EP_SIZES)

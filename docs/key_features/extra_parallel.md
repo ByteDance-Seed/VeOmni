@@ -62,6 +62,25 @@ parallel_plan = ParallelPlan(
 )
 ```
 
+### Mesh placement
+
+The placement flag controls which mesh dimension is contiguous in row-major
+rank order. With 32 data-parallel ranks and `ep_size=8`:
+
+| Placement | Mesh dimensions | Contiguous groups |
+| --- | --- | --- |
+| `False` (default) | `(ep_fsdp=4, ep=8)` | EP8 |
+| `True` | `(ep=8, ep_fsdp=4)` | expert-FSDP4 |
+
+For expert parallelism, the convenience field
+`train.accelerator.ep_outside=true` appends `True` to the legacy
+`extra_parallel_placement_innermost` list and selects the second layout. Despite
+that legacy list name, `True` means that the extra-parallel dimension is placed
+outside the corresponding FSDP dimension. This can keep expert-FSDP traffic inside a node when four adjacent ranks
+share a fast local fabric, at the cost of making EP span those groups. It is a
+topology choice, not an unconditional performance optimization; benchmark the
+complete training step on the target interconnect before enabling it.
+
 
 
 ## Acknowledgements

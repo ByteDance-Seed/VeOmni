@@ -134,7 +134,7 @@ YAML Config -> VeOmniArguments -> Trainer
 
 VeOmni uses FSDP2 exclusively.
 
-1. `init_parallel_state()` -> global `DeviceMesh` with named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
+1. `init_parallel_state()` -> global `DeviceMesh` with named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel named submeshes. ExtraParallel/FSDP order is configurable, so consumers select submeshes and DTensor placements by dimension name.
 2. Model-specific `parallel_plan.py` -> define EP/embedding weight sharding via `ParallelPlan`
 3. `build_parallelize_model()` -> `parallelize_model_fsdp2()`:
    - `ParallelPlan.apply()` wraps EP/embedding params as DTensors on para mesh

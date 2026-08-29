@@ -26,6 +26,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from ..utils import logging
 from ..utils.device import get_device_type
+from .mesh_topology import build_extra_parallel_mesh_spec
 
 
 if TYPE_CHECKING:
@@ -336,7 +337,9 @@ class ParallelState:
 
     @requires_mesh
     def extra_parallel_fsdp_mesh(self, para_name) -> "DeviceMesh":
-        return self.extra_parallel_fsdp_device_mesh[para_name][para_name, f"{para_name}_fsdp"]
+        para_mesh = self.extra_parallel_fsdp_device_mesh[para_name]
+        fsdp_dim_names = tuple(name for name in para_mesh.mesh_dim_names if name != para_name)
+        return para_mesh[fsdp_dim_names]
 
     @requires_mesh
     def extra_parallel_group(self, para_name) -> "ProcessGroup":
@@ -619,31 +622,22 @@ def init_parallel_state(
         extra_parallel_sizes, extra_parallel_placement_innermost, extra_parallel_names
     ):
         if para_size > 1:
-            # TODO: drop para_outside?
-            assert not para_outside, f"{para_name} is not supported when para_outside is True."
-
             # NOTE: Support HSDP for extra parallel. For example, world_size=1024
             # - dense param device_mesh: (dp_replicate, dp_shard_sp)=(4, 256)
             # - ep_size=8, expert parallel device_mesh: (ep_replicate, ep_fsdp, ep)=(4, 32, 8)
-            # Note that ep_size should be a factor of dp_shard_sp_size.
-            param_mesh_shape, para_mesh_dim_names = [], []
-            if dp_replicate_size > 1:
-                param_mesh_shape.append(dp_replicate_size)
-                para_mesh_dim_names.append(f"{para_name}_replicate")
             dp_shard_sp_size = device_mesh["dp_shard_sp"].size()
-            assert dp_shard_sp_size % para_size == 0, (
-                f"{para_name}_size({para_size}) must be a factor of dp_shard_sp_size({dp_shard_sp_size})"
+            mesh_spec = build_extra_parallel_mesh_spec(
+                dp_replicate_size=dp_replicate_size,
+                dp_shard_sp_size=dp_shard_sp_size,
+                parallel_size=para_size,
+                parallel_name=para_name,
+                parallel_outside=para_outside,
             )
-            para_fsdp_size = dp_shard_sp_size // para_size
-            param_mesh_shape.append(para_fsdp_size)
-            param_mesh_shape.append(para_size)
-            para_mesh_dim_names.append(f"{para_name}_fsdp")
-            para_mesh_dim_names.append(para_name)
 
             extra_parallel_fsdp_device_mesh[f"{para_name}"] = init_device_mesh(
                 device_type=device_type,
-                mesh_shape=param_mesh_shape,
-                mesh_dim_names=para_mesh_dim_names,
+                mesh_shape=mesh_spec.shape,
+                mesh_dim_names=mesh_spec.dim_names,
             )
 
     logger.info_rank0(f"Device mesh: {device_mesh}")
