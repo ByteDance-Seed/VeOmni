@@ -30,6 +30,13 @@ The expert parallelism (EP) is applied on dim-0 (expert number), while FSDP2 is 
 
 This is to enable more flexible parallelism setup. Otherwise, if we also choose dim-0 for FSDP2, EP size x FSDP2 size needs to be exact expert number.
 
+PyTorch FSDP2 supports uneven sharding on dim-0, but a nonzero shard dimension
+must divide evenly across its FSDP mesh. Therefore, every EP-local expert
+parameter dimension selected by `Shard(1)` must be divisible by the expert-FSDP
+degree. VeOmni validates this before `fully_shard()` and reports the offending
+parameter FQN, dimension, size, and mesh size. Choose a compatible EP/FSDP
+topology rather than padding model weights implicitly.
+
 ### Parallelism Setup
 
 ![ep_fsdp2](../assets/ep_fsdp2.png)
