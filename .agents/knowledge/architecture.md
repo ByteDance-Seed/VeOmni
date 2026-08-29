@@ -222,7 +222,8 @@ Distributed tests (`tests/parallel/`, `tests/distributed/`, `tests/e2e/`) may re
 test files one by one. Only `tests/data` runs as a whole directory in both
 workflows; `tests/ops` runs wholesale on GPU only (the NPU job enumerates three
 named ops files). A new file anywhere else is invisible to CI until it is added
-to those workflows, usually both.
+to those workflows, usually both. See `.agents/knowledge/testing.md` before
+adding a test.
 
 ## Key Entry Points
 

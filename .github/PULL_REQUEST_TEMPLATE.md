@@ -13,6 +13,7 @@
 ### Test
 
 > Validation results (training curves, eval metrics) for changes not covered by CI.
+> State which of the three applies: extended an existing CI-enumerated test, added a new test and wired it into the unit-test workflows, or no test needed (with the reason).
 
 ### API and Usage Example
 
@@ -28,4 +29,4 @@
 - Applied pre-commit checks
 - Added/updated documentation
 - If `tasks/` training scripts were moved or renamed: updated `docs/` examples and verified `python3 scripts/ci/check_doc_task_paths.py` passes (also enforced by the **Check doc task paths** CI workflow)
-- Added tests to CI workflow (or explained why not feasible)
+- Tests: extended an existing CI-enumerated test, **or** added a new test and wired it into `gpu_unit_tests.yml` (and `npu_unit_tests.yml` where applicable), **or** explained in **Test** why none is needed. Note that CI enumerates test files individually — a new file outside `tests/data/` and `tests/ops/` does not run until it is listed. See [.agents/knowledge/testing.md](.agents/knowledge/testing.md).
