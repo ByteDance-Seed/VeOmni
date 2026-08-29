@@ -30,7 +30,7 @@ Read on demand:
 - **Explain, Don't Assume**: Explain **why** (motivation, tradeoffs), not just what. Cite files and line numbers.
 - **Ask When Stuck**: 3+ approaches fail? Stop, summarize, ask user. No hacks.
 - **Search Before You Act**: On unexpected behavior, search codebase + check constraints + review `git log` before attempting fixes.
-- **Planning Discipline**: Complex tasks (multi-file, >30 min) -> TodoWrite. Plan must state which skills will be used (e.g. `/veomni-develop` + `/veomni-review`). Simple tasks -> just do them.
+- **Planning Discipline**: Complex tasks (multi-file, >30 min) -> write a plan with the agent's todo/plan tool. The plan must state which skills will be used (e.g. `/veomni-develop` + `/veomni-review`). Simple tasks -> just do them.
 - **Cross-modality Awareness**: Changes in shared code (`BaseTrainer`, `data_collator`, `distributed/`) affect all modalities.
 - **No Patchgen Edits**: Never edit files under `veomni/models/transformers/*/generated/`.
 

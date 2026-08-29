@@ -30,7 +30,7 @@ If not resolved in 15 min → switch to Full Protocol.
 
 ### Before You Start
 
-Use TodoWrite to track all phases:
+Track the phases with whatever todo/plan tool the running agent provides:
 
 ```
 Phase 1: Investigate <symptom>       -> in_progress
@@ -61,11 +61,16 @@ Phase 5: Knowledge capture           -> pending
 4. Check dependencies — different transformers version? Different PyTorch version?
 5. **If a package version upgrade is suspected**, create isolated uv environments to bisect:
    ```bash
-   # Create the default env on the default pin (`transformers-stable` → 5.9.0).
-   uv venv .venv-default
-   VIRTUAL_ENV=.venv-default uv sync --extra gpu --dev
+   # Env A: the current default pin (the `transformers-stable` group).
+   uv venv .venv-a
+   VIRTUAL_ENV=.venv-a uv sync --extra gpu --dev
+
+   # Env B: the same tree with exactly one package moved.
+   uv venv .venv-b
+   VIRTUAL_ENV=.venv-b uv sync --extra gpu --dev
+   VIRTUAL_ENV=.venv-b uv pip install "<package>==<other-version>"
    ```
-   Run the same reproducer in both envs to confirm the version is the root cause. This avoids polluting the main `.venv/`.
+   Run the same reproducer in both envs to confirm the version is the root cause. This avoids polluting the main `.venv/`. If the suspect package is transformers, remember the `generated/` modeling was produced against the pinned version — a mismatch is itself a source of failures, so regenerate before concluding.
 
 ### Phase 3: Hypothesis and Testing
 
@@ -73,11 +78,6 @@ Phase 5: Knowledge capture           -> pending
 2. Design a MINIMAL experiment (change one thing only).
 3. Run the experiment. Record the result.
 4. If wrong, update understanding and form new hypothesis. No random guess-and-check.
-
-**Red flags — STOP and restart from Phase 1:**
-- "Let me just try changing X and see what happens"
-- "Quick fix for now, clean up later"
-- "It probably works, let me move on"
 
 **Verification gate** — before acting on a conclusion, check:
 - Does the evidence actually support this cause, or just correlate?
@@ -109,13 +109,14 @@ If none apply, explicitly note "no new knowledge to capture."
 
 ---
 
-## Three-Strike Rule
+## Stop Conditions
 
-If 3 consecutive fix attempts fail:
-- **STOP fixing symptoms.**
-- Question whether the underlying approach/architecture is wrong.
-- Step back and re-examine: are you solving the right problem?
-- Report to user with analysis before continuing.
+Restart from Phase 1 if you catch yourself thinking "let me just try changing X
+and see", "quick fix for now, clean up later", or "it probably works, moving on".
+
+After **3 consecutive failed fix attempts**, stop fixing symptoms. Question
+whether the underlying approach is wrong, re-examine whether you are solving the
+right problem, and report the analysis to the user before continuing.
 
 ## Common Pitfalls
 

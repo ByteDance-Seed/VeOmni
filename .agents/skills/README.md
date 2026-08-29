@@ -30,14 +30,8 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 
 ## Skill Index
 
-| Skill | Description |
-|-------|-------------|
-| `veomni-develop` | Feature development and refactoring — VeOmni-specific impact analysis and safety checklist |
-| `veomni-debug` | Bug fix and debugging — quick path for simple fixes, full protocol for complex issues |
-| `veomni-review` | Pre-commit code review via subagent (mandatory gate) |
-| `veomni-new-model` | Adding a new model to VeOmni (patchgen, parallel plan, registry) |
-| `veomni-migrate-transformers-v5` | Add or refresh a model's patchgen path under `veomni/models/transformers/<model>/generated/` (text + MoE + Omni). Use when porting upstream changes or adding a new model to the v5 patchgen flow. |
-| `veomni-new-op` | Adding a new optimized kernel/operator to veomni/ops/ |
-| `veomni-uv-update` | Dependency management with uv (version bumps, torch, lockfile) |
-| `create-pr` | Create a pull request — handles uncommitted changes, generates CI-compliant title and description |
-| `veomni-profile` | Performance profiling — analyze traces/snapshots or generate profiles and optimize |
+The dispatch table in [`AGENTS.md`](../../AGENTS.md) is the single index — it maps
+a task to the skill to use, and every agent already loads it. Each skill's own
+`description` frontmatter is the authoritative statement of when it applies.
+
+Keeping a second copy of the index here only produced drift, so it is gone.
