@@ -12,15 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import rms_norm as _rms_norm  # noqa: F401
-from . import rope as _rope  # noqa: F401
-from . import rope_vision as _rope_vision  # noqa: F401
-from .registry import KERNEL_REGISTRY, VeomniKernel, register_kernel, resolve_kernel
+"""Vision RoPE kernel family.
+
+cuda
+- full
+  - eager
+
+npu
+- full
+  - eager
+  - torch_npu
+"""
+
+from ..platform import NpuKernelRequirement
+from ..registry import register_kernel
+from .full import eager as full_eager
+from .full import torch_npu as full_npu
 
 
-__all__ = [
-    "KERNEL_REGISTRY",
-    "VeomniKernel",
-    "register_kernel",
-    "resolve_kernel",
-]
+register_kernel("rope_vision", "full", "eager", full_eager.forward, full_eager.backward)
+
+register_kernel(
+    "rope_vision",
+    "full",
+    "torch_npu",
+    full_npu.forward,
+    full_npu.backward,
+    requirement=NpuKernelRequirement(),
+)

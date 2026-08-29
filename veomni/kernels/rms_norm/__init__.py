@@ -37,9 +37,8 @@ npu
   - eager
 """
 
-from veomni.kernels.platform import CudaKernelRequirement, NpuKernelRequirement
-from veomni.kernels.registry import register_kernel
-
+from ..platform import CudaKernelRequirement, NpuKernelRequirement
+from ..registry import register_kernel
 from .qwen3_5 import eager as qwen3_5_eager
 from .qwen3_5 import liger_kernel as qwen3_5_liger
 from .qwen3_5 import torch_npu as qwen3_5_npu

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from veomni.kernels.registry import SavedState
+from ...registry import SavedState
 
 
 @dataclass(frozen=True)

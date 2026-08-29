@@ -22,8 +22,7 @@ from typing import Callable
 import torch
 from torch import Tensor
 
-from veomni.kernels.registry import SavedState
-
+from ...registry import SavedState
 from . import eager as _eager
 
 
