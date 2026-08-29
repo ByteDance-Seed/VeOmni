@@ -14,7 +14,10 @@
 # limitations under the License.
 
 
-# adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/ops/triton/rotary.py
+"""wan RoPE Triton adapter (interleaved complex multiply by freqs).
+
+Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/ops/triton/rotary.py
+"""
 
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -205,11 +208,18 @@ def apply_rotary_interleaved(
 
 @dataclass(frozen=True)
 class _Meta:
+    """Whether the fused launch ran. ``False`` means the empty eager fallback."""
+
     fused: bool
     head_dim: int
 
 
 def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedState]:
+    """Fused interleaved RoPE. ``freqs`` is split into real/imag ``cos`` / ``sin``.
+
+    Empty ``x`` falls back to the eager pair. Backward uses the conjugate
+    rotation.
+    """
     if x.numel() == 0:
         output, saved = _eager.forward(x, freqs, head_dim=head_dim)
         return output, SavedState(saved.tensors, _Meta(False, head_dim))
@@ -222,6 +232,7 @@ def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedSt
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
+    """Return ``(dx, None)``. The fused path uses the conjugate rotation."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     if not meta.fused:

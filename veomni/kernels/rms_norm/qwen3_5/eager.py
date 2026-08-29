@@ -26,15 +26,23 @@ from ...registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
+    """Whether the empty-tensor path ran, plus ``eps`` for the eager fallback."""
+
     empty: bool
     eps: float
 
 
 def _batch_dims(tensor: Tensor) -> tuple[int, ...]:
+    """Reduce over every dim except the last (the normalized channel)."""
     return tuple(range(tensor.ndim - 1))
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
+    """Affine RMSNorm with offset 1. Scale is ``1 + weight`` (gemma-style).
+
+    The reduction and the scale both run in fp32, then cast back to ``x.dtype``.
+    Empty ``x`` returns ``x * (1 + weight)``.
+    """
     scale = 1.0 + weight
     if x.numel() == 0:
         return x * scale, SavedState((x, weight), _Meta(True, eps))
@@ -46,6 +54,7 @@ def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedStat
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
+    """Return ``(grad_x, grad_weight)``. ``grad_weight`` is the offset-1 scale grad."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight, *optional_rstd = saved.tensors

@@ -26,16 +26,25 @@ from ...registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
+    """Empty flag plus the ``unsqueeze_dim`` used to broadcast ``cos`` / ``sin``."""
+
     empty: bool
     unsqueeze_dim: int
 
 
 def _rotate_half(x: Tensor) -> Tensor:
+    """Interleaved even/odd swap: ``(-odd, even)`` on the last dim."""
     even, odd = x[..., 0::2], x[..., 1::2]
     return torch.stack((-odd, even), dim=-1).flatten(-2)
 
 
 def forward(x: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1) -> tuple[Tensor, SavedState]:
+    """Rotate the trailing interleaved slice of ``x``.
+
+    ``cos`` / ``sin`` are half-width and broadcast with ``repeat_interleave``.
+    The leading ``nope`` channels pass through. Backward returns
+    ``(dx, None, None)``.
+    """
     if x.numel() == 0:
         return x, SavedState((cos, sin), _Meta(True, unsqueeze_dim))
 
@@ -48,6 +57,7 @@ def forward(x: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1) -> t
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None, None]:
+    """Return ``(dx, None, None)``. ``cos`` / ``sin`` are not differentiated."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     if meta.empty:

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""VeOmni kernel registry and the families registered on import.
+
+``compound`` holds nested-handle helpers. Importing this package registers
+``rms_norm``, ``rope``, ``rope_vision``, and ``async_ulysses_*``.
+"""
+
+from . import async_ulysses as _async_ulysses  # noqa: F401
 from . import rms_norm as _rms_norm  # noqa: F401
 from . import rope as _rope  # noqa: F401
 from . import rope_vision as _rope_vision  # noqa: F401

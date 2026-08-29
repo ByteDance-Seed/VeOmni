@@ -26,6 +26,10 @@ from . import eager as _eager
 def forward(
     q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
+    """NPU fused partial RoPE. Only the ``cos.shape[-1]`` prefix is rotated.
+
+    Empty inputs and backward reuse the eager pair.
+    """
     if q.numel() == 0 or k.numel() == 0:
         return _eager.forward(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
@@ -42,4 +46,5 @@ def forward(
 
 
 def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Tensor, Tensor, None, None]:
+    """Return ``(dq, dk, None, None)`` via the eager inverse rotation."""
     return _eager.backward(grad_output, saved)

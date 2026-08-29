@@ -26,16 +26,20 @@ from ...registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
+    """Empty flag plus the ``unsqueeze_dim`` used to broadcast ``cos`` / ``sin``."""
+
     empty: bool
     unsqueeze_dim: int
 
 
 def _rotate_half(x: Tensor) -> Tensor:
+    """Swap the two halves of the last dim, negating the second."""
     first, second = x.chunk(2, dim=-1)
     return torch.cat((-second, first), dim=-1)
 
 
 def _apply_prefix(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """Rotate ``x[..., :cos.shape[-1]]``. The remaining channels pass through."""
     rotary_dim = cos.shape[-1]
     rotated, passed = x[..., :rotary_dim], x[..., rotary_dim:]
     embedded = (rotated * cos) + (_rotate_half(rotated) * sin)
@@ -43,6 +47,7 @@ def _apply_prefix(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 def _grad_prefix(grad_output: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """Inverse-rotate the prefix. The unrotated suffix is copied through."""
     rotary_dim = cos.shape[-1]
     rotated, passed = grad_output[..., :rotary_dim], grad_output[..., rotary_dim:]
     grad_rotated = (rotated * cos) - _rotate_half(rotated * sin)
@@ -52,6 +57,11 @@ def _grad_prefix(grad_output: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 def forward(
     q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
+    """Rotate a prefix of each head. The remaining channels pass through.
+
+    Prefix width is ``cos.shape[-1]``. Empty inputs are returned unchanged.
+    Backward returns ``(dq, dk, None, None)``.
+    """
     if q.numel() == 0 or k.numel() == 0:
         return (q, k), SavedState((cos, sin), _Meta(True, unsqueeze_dim))
 
@@ -64,6 +74,7 @@ def forward(
 
 
 def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Tensor, Tensor, None, None]:
+    """Return ``(dq, dk, None, None)``. ``cos`` / ``sin`` are not differentiated."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     grad_q, grad_k = grad_output

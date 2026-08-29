@@ -26,15 +26,23 @@ from ...registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
+    """Whether the empty-tensor path ran, plus ``eps`` for the eager fallback."""
+
     empty: bool
     eps: float
 
 
 def _batch_dims(tensor: Tensor) -> tuple[int, ...]:
+    """Reduce over every dim except the last (the normalized channel)."""
     return tuple(range(tensor.ndim - 1))
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
+    """Affine RMSNorm with offset 0. Scale is ``weight`` itself.
+
+    Empty ``x`` skips the reduction and returns ``x * weight``. Saves
+    ``(x, weight, rstd)`` when the reduction ran.
+    """
     if x.numel() == 0:
         return x * weight, SavedState((x, weight), _Meta(True, eps))
 
@@ -45,6 +53,7 @@ def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedStat
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
+    """Return ``(grad_x, grad_weight)`` matching the positional tensors."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight, *optional_rstd = saved.tensors

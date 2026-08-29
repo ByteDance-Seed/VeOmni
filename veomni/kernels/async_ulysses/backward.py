@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reusable mathematical backward units for asynchronous Ulysses schedules.
+"""Linear and LayerNorm backward units for async Ulysses schedules.
 
-The functions in this module do not launch communication or retain autograd
-context. Async Ulysses implementations remain responsible for arranging these
-units around collective launch and wait points.
+These helpers do not launch collectives or keep autograd context. The QKV / O
+eager pairs arrange them around all-to-all launch and wait points.
 """
 
+from __future__ import annotations
+
 import importlib
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -34,6 +34,7 @@ def _flatten_linear_operands(
     input_tensor: Tensor,
     weight: Tensor,
 ) -> tuple[Tensor, Tensor]:
+    """Reshape linear operands to 2D and check that the leading sizes match."""
     grad_output_2d = grad_output.reshape(-1, weight.shape[0])
     input_2d = input_tensor.reshape(-1, weight.shape[1])
     if grad_output_2d.shape[0] != input_2d.shape[0]:
@@ -56,7 +57,7 @@ def linear_parameter_backward(
     weight: Tensor,
     *,
     has_bias: bool,
-) -> tuple[Tensor, Optional[Tensor]]:
+) -> tuple[Tensor, Tensor | None]:
     """Compute the weight and optional bias gradients of a linear projection."""
     grad_output_2d, input_2d = _flatten_linear_operands(grad_output, input_tensor, weight)
     grad_weight = grad_output_2d.transpose(0, 1) @ input_2d
@@ -70,7 +71,7 @@ def linear_backward(
     weight: Tensor,
     *,
     has_bias: bool,
-) -> tuple[Tensor, Tensor, Optional[Tensor]]:
+) -> tuple[Tensor, Tensor, Tensor | None]:
     """Compute input, weight, and optional bias gradients for a linear projection."""
     grad_output_2d, input_2d = _flatten_linear_operands(grad_output, input_tensor, weight)
     grad_input = (grad_output_2d @ weight).reshape_as(input_tensor)
@@ -80,6 +81,7 @@ def linear_backward(
 
 
 def _get_fused_layer_norm_cuda():
+    """Lazy-import the Apex fused LayerNorm CUDA extension."""
     global _fused_layer_norm_cuda
     if _fused_layer_norm_cuda is None:
         _fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
@@ -96,7 +98,10 @@ def layer_norm_backward(
     normalized_shape: torch.Size,
     eps: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Compute affine LayerNorm gradients with the fixed CUDA kernel."""
+    """Compute affine LayerNorm grads via ``fused_layer_norm_cuda.backward_affine``.
+
+    Pair with ``norm.layernorm_forward``, which saved ``mean`` and ``invvar``.
+    """
     return _get_fused_layer_norm_cuda().backward_affine(
         grad_output.contiguous(),
         mean,
@@ -117,7 +122,7 @@ def reduce_repeated_kv_gradient(
     *,
     head_dimension: int,
 ) -> Tensor:
-    """Reduce gradients from repeated KV heads back to their original heads."""
+    """Sum repeated-KV grads back to ``original_num_heads`` along ``head_dimension``."""
     if repeats == 1:
         return grad_output
     if repeats <= 0:

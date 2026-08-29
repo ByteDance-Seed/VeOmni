@@ -14,14 +14,9 @@
 
 """Vision RoPE kernel family.
 
-cuda
-- full
-  - eager
-
-npu
-- full
-  - eager
-  - torch_npu
+``full`` uses the same rotate-every-channel math as ``rope.full``, but the
+inputs are ``[S, H, D]`` query/key with ``cos`` / ``sin`` unsqueezed on the
+head axis. Registers eager plus an NPU adapter.
 """
 
 from ..platform import NpuKernelRequirement

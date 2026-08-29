@@ -186,6 +186,7 @@ def _rotary_launch(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, conjug
 
 
 def _is_supported(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int) -> bool:
+    """Return whether the fused kernel can consume these tensors."""
     if not (unsqueeze_dim == 1 and x.is_cuda and x.ndim == 4 and cos.ndim == 3):
         return False
     if not (cos.shape == sin.shape and cos.dtype == sin.dtype):
@@ -210,11 +211,14 @@ def _is_supported(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsquee
 
 @dataclass(frozen=True)
 class _Meta:
+    """Whether the fused launch ran. ``False`` means the saved tensors are eager's."""
+
     fused: bool
     unsqueeze_dim: int
 
 
 def forward(x: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1) -> tuple[Tensor, SavedState]:
+    """Fused trailing-interleaved RoPE. Unsupported shapes fall back to eager."""
     if x.numel() == 0 or not _is_supported(x, cos, sin, unsqueeze_dim):
         output, saved = _eager.forward(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
         return output, SavedState(saved.tensors, _Meta(False, unsqueeze_dim))
@@ -224,6 +228,7 @@ def forward(x: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1) -> t
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None, None]:
+    """Return ``(dx, None, None)``. The fused path uses the conjugate rotation."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     if not meta.fused:

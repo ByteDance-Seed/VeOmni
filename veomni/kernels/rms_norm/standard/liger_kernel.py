@@ -26,6 +26,8 @@ from . import eager as _eager
 
 @dataclass(frozen=True)
 class _Meta:
+    """Empty flag plus the Liger launch knobs needed by ``rms_norm_backward``."""
+
     empty: bool
     casting_mode: int
     block_size: int
@@ -34,6 +36,11 @@ class _Meta:
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
+    """Liger fused affine RMSNorm (offset 0, llama casting).
+
+    Empty ``x`` falls back to the eager pair. Otherwise saves the fused
+    ``rstd`` plus launch meta for ``rms_norm_backward``.
+    """
     if x.numel() == 0:
         output, saved = _eager.forward(x, weight, eps=eps)
         return output, SavedState(saved.tensors, _Meta(True, 0, 0, 0, eps))
@@ -55,6 +62,7 @@ def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedStat
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
+    """Return ``(grad_x, grad_weight)``. Empty inputs reuse the eager backward."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight, *optional_rstd = saved.tensors

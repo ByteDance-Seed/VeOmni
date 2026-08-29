@@ -26,6 +26,8 @@ from . import eager as _eager
 
 @dataclass(frozen=True)
 class _Meta:
+    """Empty flag plus the ``unsqueeze_dim`` used by the eager fallback."""
+
     empty: bool
     unsqueeze_dim: int
 
@@ -33,6 +35,7 @@ class _Meta:
 def forward(
     q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
+    """Liger fused full RoPE. Empty inputs fall back to the eager pair."""
     if q.numel() == 0 or k.numel() == 0:
         output, saved = _eager.forward(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
         return output, SavedState(saved.tensors, _Meta(True, unsqueeze_dim))
@@ -44,6 +47,7 @@ def forward(
 
 
 def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Tensor, Tensor, None, None]:
+    """Return ``(dq, dk, None, None)``. Empty inputs reuse the eager backward."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     if meta.empty:

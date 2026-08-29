@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Kernel registry.
 
 ``KERNEL_REGISTRY`` stores ``KernelEntry`` rows keyed by
@@ -35,6 +36,12 @@ Output = Tensor | tuple[Tensor, ...]
 
 @dataclass(frozen=True)
 class SavedState:
+    """Tensors and non-tensor metadata produced by a raw ``forward``.
+
+    ``tensors`` are what autograd ``save_for_backward`` stores. ``metadata``
+    holds dims, flags, nested-handle specs, and other non-tensors.
+    """
+
     tensors: tuple[Tensor, ...]
     metadata: Any = None
 
@@ -83,6 +90,12 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
 
 @dataclass
 class KernelEntry:
+    """One registered row.
+
+    Either a raw ``forward`` / ``backward`` pair (the wrapper is generated)
+    or an opaque ``wrapper``. Hardware ``requirement`` is optional.
+    """
+
     kernel: str
     variant: str
     impl: str
@@ -92,6 +105,7 @@ class KernelEntry:
     requirement: KernelRequirement | None = None
 
     def __post_init__(self) -> None:
+        """Validate the raw/wrapper pairing and generate the wrapper if needed."""
         if (self.forward is None) != (self.backward is None):
             raise ValueError("forward and backward must both be set or both be None")
         if self.forward is None and self.wrapper is None:
@@ -109,9 +123,11 @@ class KernelRegistry:
         self._entries: dict[tuple[str, str, str], KernelEntry] = {}
 
     def _entry_visible(self, entry: KernelEntry) -> bool:
+        """Return whether ``entry.requirement`` is missing or matches this machine."""
         return entry.requirement is None or entry.requirement.matches()
 
     def register(self, entry: KernelEntry) -> None:
+        """Insert ``entry`` if it is visible. Duplicate keys raise."""
         if not isinstance(entry, KernelEntry):
             raise TypeError(f"KERNEL_REGISTRY.register expects KernelEntry, got {type(entry).__name__}")
         if not self._entry_visible(entry):
@@ -126,6 +142,7 @@ class KernelRegistry:
         self._entries[key] = entry
 
     def resolve(self, kernel: str, variant: str, impl: str) -> KernelEntry:
+        """Return the row for ``(kernel, variant, impl)`` or raise ``KeyError``."""
         key = (kernel, variant, impl)
         entry = self._entries.get(key)
         if entry is None:
@@ -133,6 +150,7 @@ class KernelRegistry:
         return entry
 
     def list_available(self, kernel: str, variant: str) -> list[str]:
+        """Return impl names registered for ``(kernel, variant)``."""
         return [
             impl
             for (entry_kernel, entry_variant, impl) in self._entries
@@ -153,6 +171,11 @@ def register_kernel(
     wrapper: Callable | None = None,
     requirement: KernelRequirement | None = None,
 ) -> None:
+    """Register one row on ``KERNEL_REGISTRY``.
+
+    Pass a raw pair or an opaque ``wrapper``, not both. ``requirement`` is
+    evaluated at register time.
+    """
     KERNEL_REGISTRY.register(
         KernelEntry(
             kernel=kernel,
@@ -167,6 +190,7 @@ def register_kernel(
 
 
 def resolve_kernel(kernel: str, variant: str, impl: str) -> KernelEntry:
+    """Look up ``(kernel, variant, impl)`` in ``KERNEL_REGISTRY``."""
     return KERNEL_REGISTRY.resolve(kernel, variant, impl)
 
 
@@ -195,12 +219,14 @@ class VeomniKernel:
         type(self)._intern[(kernel, variant, impl)] = self
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Call ``entry.wrapper``. Tensors are positional, non-tensors are keywords."""
         if self._entry.wrapper is None:
             raise RuntimeError(f"VeomniKernel({self.kernel!r}, {self.variant!r}, {self.impl!r}) has no wrapper")
         return self._entry.wrapper(*args, **kwargs)
 
     @property
     def entry(self) -> KernelEntry:
+        """The resolved ``KernelEntry`` for this handle."""
         return self._entry
 
     def __repr__(self) -> str:

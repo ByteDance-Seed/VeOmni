@@ -26,11 +26,18 @@ from ...registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
+    """Whether the empty-tensor path ran, plus ``eps`` for the eager fallback."""
+
     empty: bool
     eps: float
 
 
 def forward(x: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
+    """RMSNorm without an affine weight.
+
+    Empty ``x`` is returned unchanged. Backward returns a one-element
+    ``(grad_x,)`` tuple.
+    """
     if x.numel() == 0:
         return x, SavedState((x,), _Meta(True, eps))
 
@@ -41,6 +48,7 @@ def forward(x: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor]:
+    """Return ``(grad_x,)``. There is no weight grad."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, *optional_rstd = saved.tensors

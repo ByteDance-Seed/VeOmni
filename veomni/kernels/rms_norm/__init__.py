@@ -14,27 +14,9 @@
 
 """RMSNorm kernel family.
 
-cuda
-- standard
-  - eager
-  - liger_kernel
-  - triton
-- qwen3_5
-  - eager
-  - liger_kernel
-- unweighted
-  - eager
-  - liger_kernel
-
-npu
-- standard
-  - eager
-  - torch_npu
-- qwen3_5
-  - eager
-  - torch_npu
-- unweighted
-  - eager
+Variants: ``standard`` (offset 0, llama-style cast), ``qwen3_5`` (offset 1,
+gemma-style fp32 scale), and ``unweighted`` (no affine weight). Each variant
+registers an eager row plus optional CUDA / NPU adapters.
 """
 
 from ..platform import CudaKernelRequirement, NpuKernelRequirement

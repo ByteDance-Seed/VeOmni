@@ -1,39 +1,31 @@
-"""Four-GPU dense async Ulysses parity against the sync attention path.
-
-Single-process projection-grad contracts live in ``test_async_ulysses_grad.py``.
-Shared backward-unit math lives in ``test_backward.py``.
-"""
+"""Four-GPU dense async Ulysses parity against the sync attention path."""
 
 import sys
 
+import pytest
 import torch
 import torch.distributed as c10d
-
-from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
-
-
-if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
-    print("c10d NCCL not available, skipping tests", file=sys.stderr)
-    sys.exit(0)
-
-import pytest
 import torch.distributed as dist
 from torch.testing._internal.common_utils import run_tests
 
+from tests.parallel.ulysses.attention import Attention
+from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.sequence_parallel.comm import (
     get_ulysses_sequence_parallel_group,
     set_ulysses_sequence_parallel_group,
 )
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 from veomni.utils.import_utils import is_torch_npu_available
 
-from .attention import Attention
-from .utils import (
-    SequenceParallelTest,
-    sync_tensor,
-)
+
+_NCCL_AVAILABLE = c10d.is_available() and c10d.is_backend_available(get_dist_comm_backend())
+if not _NCCL_AVAILABLE:
+    if __name__ == "__main__":
+        sys.exit(0)
+    pytest.skip("c10d NCCL not available", allow_module_level=True)
 
 
 class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
@@ -79,7 +71,6 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         full_input.requires_grad = True
         part_input.requires_grad = True
 
-        # initialize attn module
         attn_dp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
         ).to(get_device_type())
@@ -91,7 +82,6 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
         loss_func = self._overlapping_grad
 
-        # forward & backward for sp
         sp_rst = attn_sp(part_input, unpad_size)
         sp_full_rst = gather_outputs(
             sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
@@ -106,7 +96,6 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        # forward & backward for dp
         set_ulysses_sequence_parallel_group(None)
         dp_rst = attn_dp(full_input, unpad_size)
         loss_dp = loss_func(dp_rst)
@@ -131,7 +120,6 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         full_input.requires_grad = True
         part_input.requires_grad = True
 
-        # initialize attn module
         attn_dp = Attention(
             dim=64 * 16, num_heads=16, qkv_bias=False, qk_norm=True, attn_drop=0, proj_drop=0, sp_async=False
         ).to(get_device_type())
@@ -143,7 +131,6 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 
         loss_func = self._non_overlapping_grad
 
-        # forward & backward for sp
         sp_rst = attn_sp(part_input, unpad_size)
         sp_full_rst = gather_outputs(
             sp_rst, gather_dim=1, padding_dim=1, unpad_dim_size=unpad_size, scale_grad=False, group=sp_group
@@ -158,7 +145,6 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
         part_input_grad = sync_tensor(part_input_grad, 1)
         part_input_grad = unpadding_tensor_for_seqeunce_parallel(part_input_grad, 1, unpad_size)
 
-        # forward & backward for dp
         set_ulysses_sequence_parallel_group(None)
         dp_rst = attn_dp(full_input, unpad_size)
         loss_dp = loss_func(dp_rst)

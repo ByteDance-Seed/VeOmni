@@ -30,6 +30,7 @@ _kernel: Callable | None = None
 
 
 def _rms_norm_kernel():
+    """Compile and cache the Triton RMSNorm kernel."""
     global _kernel
     if _kernel is not None:
         return _kernel
@@ -74,6 +75,7 @@ def _rms_norm_kernel():
 
 
 def _rms_norm_forward(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    """Launch the row-wise Triton RMSNorm and restore ``x``'s original shape."""
     input_2d = x.reshape(-1, x.shape[-1]).contiguous()
     n_rows, n_cols = input_2d.shape
     output = torch.empty_like(input_2d)
@@ -96,11 +98,18 @@ def _rms_norm_forward(x: Tensor, weight: Tensor, eps: float) -> Tensor:
 
 @dataclass(frozen=True)
 class _Meta:
+    """Whether the empty-tensor path ran, plus ``eps`` for the eager fallback."""
+
     empty: bool
     eps: float
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
+    """Triton affine RMSNorm (offset 0). Reduction is batch-invariant per row.
+
+    Empty ``x`` falls back to the eager pair. Backward recomputes ``rstd``
+    from the saved ``x`` rather than storing it.
+    """
     if x.numel() == 0:
         output, saved = _eager.forward(x, weight, eps=eps)
         return output, SavedState(saved.tensors, _Meta(True, eps))
@@ -110,6 +119,7 @@ def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedStat
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
+    """Return ``(grad_x, grad_weight)``. Empty inputs reuse the eager backward."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight = saved.tensors

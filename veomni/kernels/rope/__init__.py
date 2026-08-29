@@ -14,29 +14,10 @@
 
 """RoPE kernel family.
 
-cuda
-- full
-  - eager
-  - liger_kernel
-- partial
-  - eager
-- deepseek_v4
-  - eager
-  - triton
-- wan
-  - eager
-  - triton
-
-npu
-- full
-  - eager
-  - torch_npu
-- partial
-  - eager
-  - torch_npu
-- wan
-  - eager
-  - torch_npu
+Variants: ``full`` (rotate every channel), ``partial`` (rotate a prefix),
+``deepseek_v4`` (trailing interleaved slice), and ``wan`` (complex multiply
+by freqs). Each variant registers an eager row plus optional CUDA / NPU
+adapters.
 """
 
 from ..platform import CudaKernelRequirement, NpuKernelRequirement

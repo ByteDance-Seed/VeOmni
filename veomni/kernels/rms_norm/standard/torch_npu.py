@@ -26,11 +26,17 @@ from . import eager as _eager
 
 @dataclass(frozen=True)
 class _Meta:
+    """Whether the empty-tensor path ran, plus ``eps`` for the eager fallback."""
+
     empty: bool
     eps: float
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
+    """NPU fused affine RMSNorm (offset 0).
+
+    Empty ``x`` falls back to the eager pair. Otherwise saves ``(x, weight, rstd)``.
+    """
     if x.numel() == 0:
         output, saved = _eager.forward(x, weight, eps=eps)
         return output, SavedState(saved.tensors, _Meta(True, eps))
@@ -42,6 +48,7 @@ def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedStat
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
+    """Return ``(grad_x, grad_weight)``. Empty inputs reuse the eager backward."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     x, weight, *optional_rstd = saved.tensors

@@ -24,6 +24,18 @@ from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb as hf_
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb as hf_partial_rope
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb_vision as hf_vision_rope
 
+from tests.kernels.tol import (
+    EAGER_ATOL,
+    EAGER_GRAD_ATOL,
+    EAGER_GRAD_RTOL,
+    EAGER_RTOL,
+    ROPE_FUSED_ATOL,
+    ROPE_FUSED_GRAD_ATOL,
+    ROPE_FUSED_GRAD_RTOL,
+    ROPE_FUSED_RTOL,
+    ROPE_NPU_ATOL,
+    ROPE_NPU_RTOL,
+)
 from veomni.kernels import resolve_kernel
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
@@ -62,13 +74,13 @@ def test_full_eager_matches_hf():
 
     q_e, k_e = _clone_qk(q, k)
     out_e = resolve_kernel("rope", "full", "eager").wrapper(q_e, k_e, cos, sin, unsqueeze_dim=1)
-    _assert_pair(out_e, out_h, atol=1e-6, rtol=1e-6)
+    _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
     torch.autograd.backward(out_h, go)
     torch.autograd.backward(out_e, go)
-    assert torch.allclose(q_e.grad, q_h.grad, atol=1e-5, rtol=1e-5)
-    assert torch.allclose(k_e.grad, k_h.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 def test_partial_eager_matches_hf():
@@ -83,13 +95,13 @@ def test_partial_eager_matches_hf():
 
     q_e, k_e = _clone_qk(q, k)
     out_e = resolve_kernel("rope", "partial", "eager").wrapper(q_e, k_e, cos, sin, unsqueeze_dim=1)
-    _assert_pair(out_e, out_h, atol=1e-6, rtol=1e-6)
+    _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
     torch.autograd.backward(out_h, go)
     torch.autograd.backward(out_e, go)
-    assert torch.allclose(q_e.grad, q_h.grad, atol=1e-5, rtol=1e-5)
-    assert torch.allclose(k_e.grad, k_h.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 def test_vision_eager_matches_hf():
@@ -104,13 +116,13 @@ def test_vision_eager_matches_hf():
 
     q_e, k_e = _clone_qk(q, k)
     out_e = resolve_kernel("rope_vision", "full", "eager").wrapper(q_e, k_e, cos, sin)
-    _assert_pair(out_e, out_h, atol=1e-6, rtol=1e-6)
+    _assert_pair(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
     torch.autograd.backward(out_h, go)
     torch.autograd.backward(out_e, go)
-    assert torch.allclose(q_e.grad, q_h.grad, atol=1e-5, rtol=1e-5)
-    assert torch.allclose(k_e.grad, k_h.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs CUDA")
@@ -131,13 +143,13 @@ def test_full_liger_matches_eager():
     q_o, k_o = _clone_qk(q, k)
     out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=1)
     out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=1)
-    _assert_pair(out_e, out_o, atol=4e-2, rtol=2e-2)
+    _assert_pair(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
     torch.autograd.backward(out_e, go)
     torch.autograd.backward(out_o, go)
-    assert torch.allclose(q_e.grad, q_o.grad, atol=4e-2, rtol=2e-2)
-    assert torch.allclose(k_e.grad, k_o.grad, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(q_e.grad, q_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="torch_npu RoPE needs NPU")
@@ -157,13 +169,18 @@ def test_rope_torch_npu_matches_eager(variant: str):
     q_o, k_o = _clone_qk(q, k)
     out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=1)
     out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=1)
-    _assert_pair(out_e, out_o, atol=4e-2, rtol=2e-2)
+    _assert_pair(
+        (out_e[0].float(), out_e[1].float()),
+        (out_o[0].float(), out_o[1].float()),
+        atol=ROPE_NPU_ATOL,
+        rtol=ROPE_NPU_RTOL,
+    )
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
     torch.autograd.backward(out_e, go)
     torch.autograd.backward(out_o, go)
-    assert torch.allclose(q_e.grad, q_o.grad, atol=4e-2, rtol=2e-2)
-    assert torch.allclose(k_e.grad, k_o.grad, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(q_e.grad.float(), q_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
+    assert torch.allclose(k_e.grad.float(), k_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="torch_npu vision RoPE needs NPU")
@@ -180,13 +197,18 @@ def test_vision_torch_npu_matches_eager():
     q_o, k_o = _clone_qk(q, k)
     out_e = eager(q_e, k_e, cos, sin)
     out_o = other(q_o, k_o, cos, sin)
-    _assert_pair(out_e, out_o, atol=4e-2, rtol=2e-2)
+    _assert_pair(
+        (out_e[0].float(), out_e[1].float()),
+        (out_o[0].float(), out_o[1].float()),
+        atol=ROPE_NPU_ATOL,
+        rtol=ROPE_NPU_RTOL,
+    )
 
     go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
     torch.autograd.backward(out_e, go)
     torch.autograd.backward(out_o, go)
-    assert torch.allclose(q_e.grad, q_o.grad, atol=4e-2, rtol=2e-2)
-    assert torch.allclose(k_e.grad, k_o.grad, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(q_e.grad.float(), q_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
+    assert torch.allclose(k_e.grad.float(), k_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
 
 
 def test_deepseek_v4_eager_matches_hf():
@@ -199,12 +221,12 @@ def test_deepseek_v4_eager_matches_hf():
     x_e = x.detach().requires_grad_(True)
     out_h = hf_dsv4_rope(x_h, cos, sin, unsqueeze_dim=1)
     out_e = resolve_kernel("rope", "deepseek_v4", "eager").wrapper(x_e, cos, sin, unsqueeze_dim=1)
-    assert torch.allclose(out_e, out_h, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
     out_h.backward(go)
     out_e.backward(go)
-    assert torch.allclose(x_e.grad, x_h.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
@@ -221,12 +243,12 @@ def test_deepseek_v4_triton_matches_eager():
     x_o = x.detach().requires_grad_(True)
     out_e = eager(x_e, cos, sin, unsqueeze_dim=1)
     out_o = other(x_o, cos, sin, unsqueeze_dim=1)
-    assert torch.allclose(out_e, out_o, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
 
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
-    assert torch.allclose(x_e.grad, x_o.grad, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(x_e.grad, x_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
 def test_wan_eager_matches_official():
@@ -241,12 +263,12 @@ def test_wan_eager_matches_official():
 
     x_e = x.detach().requires_grad_(True)
     out_e = resolve_kernel("rope", "wan", "eager").wrapper(x_e, freqs, head_dim=head_dim)
-    assert torch.allclose(out_e, out_h, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
     out_h.backward(go)
     out_e.backward(go)
-    assert torch.allclose(x_e.grad, x_h.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Wan Triton RoPE needs CUDA")
@@ -264,12 +286,12 @@ def test_wan_triton_matches_eager():
     x_o = x.detach().requires_grad_(True)
     out_e = eager(x_e, freqs, head_dim=head_dim)
     out_o = other(x_o, freqs, head_dim=head_dim)
-    assert torch.allclose(out_e, out_o, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
 
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
-    assert torch.allclose(x_e.grad, x_o.grad, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(x_e.grad, x_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="torch_npu Wan RoPE needs NPU")
@@ -286,9 +308,9 @@ def test_wan_torch_npu_matches_eager():
     x_o = x.detach().requires_grad_(True)
     out_e = eager(x_e, freqs, head_dim=head_dim)
     out_o = other(x_o, freqs, head_dim=head_dim)
-    assert torch.allclose(out_e, out_o, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(out_e.float(), out_o.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
 
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
-    assert torch.allclose(x_e.grad, x_o.grad, atol=4e-2, rtol=2e-2)
+    assert torch.allclose(x_e.grad.float(), x_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)

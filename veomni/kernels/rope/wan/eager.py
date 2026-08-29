@@ -26,11 +26,18 @@ from ...registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
+    """Empty flag plus the ``head_dim`` used to unflatten heads."""
+
     empty: bool
     head_dim: int
 
 
 def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedState]:
+    """Complex-multiply ``x`` by ``freqs`` after viewing each head as complex.
+
+    ``head_dim`` is the last-axis size used to unflatten heads. Empty ``x``
+    is returned unchanged. Backward conjugates ``freqs``.
+    """
     if x.numel() == 0:
         return x, SavedState((freqs,), _Meta(True, head_dim))
 
@@ -41,6 +48,7 @@ def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedSt
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
+    """Return ``(dx, None)``. ``freqs`` is not differentiated."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     (freqs,) = saved.tensors

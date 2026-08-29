@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Hardware requirements for kernel rows."""
+
+"""Hardware requirements for kernel rows.
+
+A requirement is a register-time visibility filter, not part of the
+``(kernel, variant, impl)`` key. Invisible rows are dropped on register
+and never enter ``KERNEL_REGISTRY``.
+"""
 
 from __future__ import annotations
 
@@ -22,17 +28,26 @@ from ..utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_
 
 
 class KernelRequirement(Protocol):
-    def matches(self) -> bool: ...
+    """Predicate that decides whether a registered row is visible here."""
 
-    def check(self) -> None: ...
+    def matches(self) -> bool:
+        """Return whether this machine can run the row."""
+        ...
+
+    def check(self) -> None:
+        """Raise if ``matches`` is false."""
+        ...
 
 
 @dataclass(frozen=True)
 class CudaKernelRequirement:
+    """CUDA plus optional compute-capability bounds (``min_cc`` / ``max_cc``)."""
+
     min_cc: int | None = None
     max_cc: int | None = None
 
     def matches(self) -> bool:
+        """Return whether CUDA is available and the compute capability is in range."""
         if not IS_CUDA_AVAILABLE:
             return False
 
@@ -44,6 +59,7 @@ class CudaKernelRequirement:
         return True
 
     def check(self) -> None:
+        """Raise if this machine is not CUDA or the compute capability is out of range."""
         if self.matches():
             return
         cc = get_gpu_compute_capability()
@@ -55,10 +71,14 @@ class CudaKernelRequirement:
 
 @dataclass(frozen=True)
 class NpuKernelRequirement:
+    """torch_npu device is available."""
+
     def matches(self) -> bool:
+        """Return whether a torch_npu device is available."""
         return IS_NPU_AVAILABLE
 
     def check(self) -> None:
+        """Raise if a torch_npu device is not available."""
         if self.matches():
             return
         raise RuntimeError("NpuKernelRequirement is not satisfied (torch_npu device is unavailable)")

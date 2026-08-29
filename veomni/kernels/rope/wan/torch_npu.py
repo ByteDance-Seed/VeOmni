@@ -24,6 +24,7 @@ from . import eager as _eager
 
 
 def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedState]:
+    """NPU interleaved RoPE. Empty inputs and backward reuse the eager pair."""
     if x.numel() == 0:
         return _eager.forward(x, freqs, head_dim=head_dim)
 
@@ -37,4 +38,5 @@ def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedSt
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
+    """Return ``(dx, None)`` via the eager conjugate multiply."""
     return _eager.backward(grad_output, saved)
