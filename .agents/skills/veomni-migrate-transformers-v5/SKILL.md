@@ -147,9 +147,10 @@ already gitignored so it won't leak into the repo).
 
 ---
 
-## Before You Start: Create Todos
+## Before You Start: Create a Plan
 
-Use TodoWrite to track phases. Suggested plan:
+Track the phases with whatever todo/plan tool the running agent provides.
+Suggested plan:
 
 ```
 Phase 0: Verify venv + drop HF reference files       -> in_progress
