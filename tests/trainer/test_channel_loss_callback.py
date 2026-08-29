@@ -1593,6 +1593,7 @@ def test_channel_loss_computer_aggregates_step_results_locally():
 
 def test_base_step_begin_captures_channel_metadata_before_multisource_meter():
     calls = []
+    step_end_calls = []
 
     class RecordingCallback:
         def __init__(self, name, consume_metadata=False):
@@ -1605,17 +1606,28 @@ def test_base_step_begin_captures_channel_metadata_before_multisource_meter():
                 micro_batches[0].pop("ds_idx")
                 micro_batches[0].pop("source_name")
 
+        def on_step_end(self, state, **kwargs):
+            step_end_calls.append(self.name)
+
     trainer = object.__new__(BaseTrainer)
     trainer.state = TrainerState(global_step=1)
     trainer.channel_loss_callback = RecordingCallback("channel")
     meter = RecordingCallback("meter", consume_metadata=True)
     tail = RecordingCallback("tail")
-    trainer._callbacks = [trainer.channel_loss_callback, meter, tail]
+    # Production keeps the meter before channel loss for ``on_step_end`` so
+    # the meter resets step metrics before channel loss publishes its values.
+    # ``on_step_begin`` must still let channel loss snapshot source metadata
+    # before the meter consumes it.
+    trainer._callbacks = [meter, trainer.channel_loss_callback, tail]
     micro_batches = [{"ds_idx": torch.tensor([7]), "source_name": ["repoqa"]}]
 
     BaseTrainer.on_step_begin(trainer, micro_batches=micro_batches, channel_loss_source_repeat=2)
 
     assert calls == [("channel", True, 2), ("meter", True, 2), ("tail", False, 2)]
+
+    BaseTrainer.on_step_end(trainer)
+
+    assert step_end_calls == ["meter", "channel", "tail"]
 
 
 def test_base_step_begin_allows_missing_channel_loss_callback():
