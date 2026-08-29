@@ -162,10 +162,13 @@ ships a `device_patch.py`.
 
 ## Phase 3: Test
 
-1. **Add unit tests** to `tests/ops/`:
+1. **Add unit tests** to `tests/ops/` — this directory runs wholesale in CI, so a
+   new file needs no workflow change (see `.agents/knowledge/testing.md`):
    - Test correctness: compare output against a reference implementation (eager PyTorch)
    - Test numerical precision: verify tolerance for bf16/fp16
    - Test edge cases: empty inputs, single-element tensors, extreme shapes
+   If the kernel only binds on SM90+, guard it so the SM89 GPU runners skip
+   rather than fail.
 
 2. **Add benchmark** (optional but recommended for performance-critical ops):
    - Use `veomni/ops/kernels/moe/_kernels/utils/benchmark_utils.py` as reference

@@ -53,6 +53,7 @@ The `knowledge/` directory contains domain-specific context loaded by agents on 
 - **architecture.md** — module map, trainer hierarchy, data flow
 - **constraints.md** — hard constraints checked before any code change
 - **multimodal_metadata.md** — canonical multimodal metadata keys and ownership
+- **testing.md** — how CI selects tests; whether a change needs one and where it goes
 - **uv.md** — dependency management architecture
 
 ## Keeping these docs honest

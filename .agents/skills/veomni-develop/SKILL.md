@@ -43,6 +43,14 @@ Before committing, check if the change requires documentation updates:
 - **Architecture change** → update `.agents/knowledge/architecture.md`.
 - **New constraint discovered** → add to `.agents/knowledge/constraints.md`.
 
+## Tests
+
+Follow `.agents/knowledge/testing.md`. In short: extend an existing
+CI-enumerated test before creating a new file, and if you do create one outside
+`tests/ops/` / `tests/data/`, wire it into the unit-test workflows or it will
+not run. A pure refactor with existing coverage does not need a new test — say
+so in the PR instead of adding one.
+
 ## When to Use Other Skills
 
 - **New model** → `/veomni-new-model`
