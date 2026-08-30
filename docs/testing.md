@@ -49,8 +49,11 @@ tests/
 ├── parallel/                       # Parallelism primitives
 │   ├── ulysses/                    # Sequence parallelism (Ulysses)
 │   │   ├── test_ulysses.py             # Basic SP attention (4+ GPUs)
-│   │   ├── test_async_ulysses.py       # Async overlapping comm (4+ GPUs)
-│   │   ├── test_async_ulysses_dit.py   # DiT + async SP
+│   │   ├── test_async_ulysses.py       # Dense async SP parity (4+ GPUs)
+│   │   ├── test_async_ulysses_dit.py   # DiT async SP parity (4+ GPUs)
+│   │   ├── test_async_ulysses_grad.py  # Dense async projection grad shapes and bias-index guards
+│   │   ├── test_op_wrapper.py          # No-autograd RMSNorm/RoPE wrappers for async Functions
+│   │   ├── test_backward.py            # Shared async linear/LayerNorm/repeat-KV units
 │   │   ├── test_qwen3_5_gated_deltanet_ulysses.py  # Gated DeltaNet + SP
 │   │   ├── test_slice_input_tensor.py  # Input slicing utilities
 │   │   ├── test_all_gather.py          # All-gather collective ops
@@ -285,8 +288,11 @@ NVIDIA GPU for kernel execution.
 | Test | Purpose | GPU |
 |---|---|---|
 | `test_ulysses.py` | Basic Ulysses SP attention | 4+ |
-| `test_async_ulysses.py` | Async overlapping communication | 4+ |
-| `test_async_ulysses_dit.py` | DiT + async SP | 4+ |
+| `test_async_ulysses.py` | Dense async Ulysses forward/backward parity | 4+ |
+| `test_async_ulysses_dit.py` | DiT async Ulysses forward/backward parity | 4+ |
+| `test_async_ulysses_grad.py` | Dense async projection grad shapes and frozen-weight bias grads | CPU |
+| `test_op_wrapper.py` | No-autograd RMSNorm/RoPE wrappers selected by `ops_implementation` | CUDA for Liger cases; eager cases use the active device |
+| `test_backward.py` | Shared linear, LayerNorm, and repeated-KV backward units | CUDA for fused LayerNorm; remaining cases use the active device |
 | `test_qwen3_5_gated_deltanet_ulysses.py` | Gated DeltaNet + SP | 4+ |
 | `test_slice_input_tensor.py` | SP input slicing utilities | CPU |
 | `test_all_gather.py` | All-gather collective ops | multi |
