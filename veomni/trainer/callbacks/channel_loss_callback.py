@@ -127,6 +127,7 @@ class _PendingSPObservation:
     world: int
     capture_descriptor: _SPCaptureDescriptor
     segment_count: int
+    alignment_mode: str
     loss_payload: torch.Tensor
     integer_payload: torch.Tensor
     gathered_segment_counts: list[int]
@@ -213,6 +214,7 @@ class ChannelLossComputer:
         self._source_ids: list[ChannelKey] = []
         self._position_ids: torch.Tensor | None = None
         self._attention_mask: torch.Tensor | None = None
+        self._packed_cu_seqlens: Any | None = None
         self._result: list[dict[str, Any]] | None = None
         self._pending_observations: list[_PendingSPObservation | list[dict[str, Any]]] = []
         self._observation_attempt_count = 0
@@ -222,6 +224,7 @@ class ChannelLossComputer:
         self._per_mb_source_ids: list[list[ChannelKey]] = []
         self._per_mb_position_ids: list[torch.Tensor | None] = []
         self._per_mb_attention_masks: list[torch.Tensor | None] = []
+        self._per_mb_packed_cu_seqlens: list[Any | None] = []
         self._micro_step = 0
         self._micro_step_observation_count = 0
         self._micro_step_failed = False
@@ -641,6 +644,7 @@ class ChannelLossComputer:
                 for observation in pending_sp
             ],
             "segment_counts": [observation.segment_count for observation in pending_sp],
+            "alignment_modes": [observation.alignment_mode for observation in pending_sp],
             "descriptor_spec": (descriptor.enabled, descriptor.world, descriptor.group is not None),
             "errors": [*self._capture_errors, *descriptor_errors],
         }
@@ -709,11 +713,19 @@ class ChannelLossComputer:
         observation_sources = [status.get("observation_source_ids") or [] for status in statuses]
         payload_specs = [status.get("payload_specs") or [] for status in statuses]
         segment_counts = [status.get("segment_counts") or [] for status in statuses]
+        alignment_modes = [status.get("alignment_modes") or [] for status in statuses]
         descriptor_specs = [status.get("descriptor_spec") for status in statuses]
         expected_observation_count = observation_counts[0] if observation_counts else -1
         segment_count_contract_valid = True
-        for rank_specs, rank_counts in zip(payload_specs, segment_counts):
-            if len(rank_specs) != expected_observation_count or len(rank_counts) != expected_observation_count:
+        for rank_idx, (rank_specs, rank_counts, rank_modes) in enumerate(
+            zip(payload_specs, segment_counts, alignment_modes)
+        ):
+            if (
+                len(rank_specs) != expected_observation_count
+                or len(rank_counts) != expected_observation_count
+                or len(rank_modes) != expected_observation_count
+                or any(mode not in ("packed_cu", "positions") for mode in rank_modes)
+            ):
                 segment_count_contract_valid = False
                 break
             for observation_idx, segment_count in enumerate(rank_counts):
@@ -721,6 +733,9 @@ class ChannelLossComputer:
                     not isinstance(segment_count, int)
                     or segment_count < 0
                     or segment_count > int(rank_specs[observation_idx][0])
+                    or (
+                        rank_modes[observation_idx] == "packed_cu" and segment_count != len(source_ids[rank_idx] or ())
+                    )
                 ):
                     segment_count_contract_valid = False
                     break
@@ -734,6 +749,7 @@ class ChannelLossComputer:
             and payload_counts == observation_counts
             and all(source_id == source_ids[0] for source_id in source_ids)
             and all(payload_spec == payload_specs[0] for payload_spec in payload_specs)
+            and all(alignment_mode == alignment_modes[0] for alignment_mode in alignment_modes)
             and all(descriptor_spec == descriptor_specs[0] for descriptor_spec in descriptor_specs)
             and all(not rank_errors for rank_errors in errors)
             and segment_count_contract_valid
@@ -751,7 +767,8 @@ class ChannelLossComputer:
             f"(has_source={has_source}, observation_counts={observation_counts}, "
             f"successful_counts={successful_counts}, payload_counts={payload_counts}, "
             f"source_ids={source_ids}, payload_specs={payload_specs}, "
-            f"segment_counts={segment_counts}, descriptor_specs={descriptor_specs}, errors={errors})."
+            f"segment_counts={segment_counts}, alignment_modes={alignment_modes}, "
+            f"descriptor_specs={descriptor_specs}, errors={errors})."
         )
 
     def _append_observations(self, observations: list[list[dict[str, Any]]]) -> None:
@@ -806,10 +823,14 @@ class ChannelLossComputer:
         per_mb_source_ids: list[list[ChannelKey]],
         per_mb_position_ids: list[torch.Tensor | None],
         per_mb_attention_masks: list[torch.Tensor | None],
+        per_mb_packed_cu_seqlens: list[Any | None] | None = None,
     ) -> None:
         self._per_mb_source_ids = per_mb_source_ids
         self._per_mb_position_ids = per_mb_position_ids
         self._per_mb_attention_masks = per_mb_attention_masks
+        self._per_mb_packed_cu_seqlens = (
+            per_mb_packed_cu_seqlens if per_mb_packed_cu_seqlens is not None else [None] * len(per_mb_source_ids)
+        )
         self._micro_step = 0
         self._micro_step_observation_count = 0
         self._micro_step_failed = False
@@ -824,10 +845,12 @@ class ChannelLossComputer:
             self._source_ids = self._per_mb_source_ids[step]
             self._position_ids = self._per_mb_position_ids[step]
             self._attention_mask = self._per_mb_attention_masks[step]
+            self._packed_cu_seqlens = self._per_mb_packed_cu_seqlens[step]
         else:
             self._source_ids = []
             self._position_ids = None
             self._attention_mask = None
+            self._packed_cu_seqlens = None
         self._result = None
         self._micro_step_observation_count = 0
         self._micro_step_failed = False
@@ -861,6 +884,7 @@ class ChannelLossComputer:
         self._source_ids = []
         self._position_ids = None
         self._attention_mask = None
+        self._packed_cu_seqlens = None
         self._result = None
         self._reset_capture_state()
         self._micro_step += 1
@@ -1007,6 +1031,7 @@ class ChannelLossComputer:
             attention_mask_flat=attention_mask_flat,
             source_ids=self._source_ids,
             position_ids=self._position_ids,
+            packed_cu_seqlens=self._packed_cu_seqlens,
             ignore_index=ignore_index,
             sp_enabled=sp_enabled,
             parallel_state=descriptor.parallel_state if sp_enabled else None,
@@ -1109,6 +1134,7 @@ class ChannelLossComputer:
         source_ids: list[ChannelKey],
         position_ids: torch.Tensor | None,
         ignore_index: int,
+        packed_cu_seqlens: Any | None = None,
         sp_enabled: bool = False,
         parallel_state: ParallelState | None = None,
         capture_descriptor: _SPCaptureDescriptor | None = None,
@@ -1142,6 +1168,7 @@ class ChannelLossComputer:
                     attention_mask_flat=attention_mask_flat,
                     source_ids=source_ids,
                     positions=pos_2d,
+                    packed_cu_seqlens=packed_cu_seqlens,
                     seq_len=seq_len,
                     ignore_index=ignore_index,
                     parallel_state=parallel_state,
@@ -1220,6 +1247,7 @@ class ChannelLossComputer:
         positions: torch.Tensor,
         seq_len: int,
         ignore_index: int,
+        packed_cu_seqlens: Any | None = None,
         parallel_state: ParallelState | None = None,
         capture_descriptor: _SPCaptureDescriptor | None = None,
         strict: bool = False,
@@ -1252,14 +1280,20 @@ class ChannelLossComputer:
             end: int,
             is_start: bool,
             local_order: int,
+            *,
+            flat_indices: bool = False,
         ) -> None:
-            if end <= start:
+            if end < start:
                 return
-            flat_start = batch_idx * local_width + start
-            flat_end = min(batch_idx * local_width + end, seq_len)
+            flat_start = start if flat_indices else batch_idx * local_width + start
+            flat_end = min(end if flat_indices else batch_idx * local_width + end, seq_len)
             labels_slice = labels_flat[flat_start:flat_end]
             loss_slice = per_token_loss[flat_start:flat_end]
-            pos_slice = positions_cpu[batch_idx, start:end].reshape(-1)[: labels_slice.numel()]
+            pos_slice = (
+                positions_cpu.reshape(-1)[flat_start:flat_end]
+                if flat_indices
+                else positions_cpu[batch_idx, start:end].reshape(-1)[: labels_slice.numel()]
+            )
             mask_slice = None
             if attention_mask_flat is not None:
                 mask_slice = attention_mask_flat[flat_start:flat_end]
@@ -1292,34 +1326,59 @@ class ChannelLossComputer:
                 )
             segments.append(segment)
 
-        for batch_idx, row_pos in enumerate(positions_cpu):
-            row_len = min(local_width, max(seq_len - batch_idx * local_width, 0))
-            if row_len <= 0:
-                continue
-            local_starts = row_pos[:row_len].eq(0).nonzero(as_tuple=True)[0].tolist()
-            local_order = 0
-            if not local_starts:
-                _partial(batch_idx, 0, row_len, is_start=False, local_order=local_order)
-                continue
+        packed_source_spans = _rank_local_packed_source_spans(
+            packed_cu_seqlens,
+            source_count=len(source_ids),
+            seq_len=seq_len,
+            attention_mask_flat=attention_mask_flat,
+        )
+        if packed_source_spans is not None:
+            alignment_mode = "packed_cu"
+            # Headwise CP keeps one rank-local span per original packed sample.
+            # Use those authoritative boundaries instead of interpreting every
+            # padding ``position_id == 0`` as a new sample. Exactly one SP rank
+            # owns each logical start; all other ranks contribute continuation
+            # totals for the same source index.
+            for source_idx, (start, end) in enumerate(packed_source_spans):
+                _partial(
+                    source_idx,
+                    start,
+                    end,
+                    is_start=sp_rank == 0,
+                    local_order=0,
+                    flat_indices=True,
+                )
+        else:
+            alignment_mode = "positions"
+            for batch_idx, row_pos in enumerate(positions_cpu):
+                row_len = min(local_width, max(seq_len - batch_idx * local_width, 0))
+                if row_len <= 0:
+                    continue
+                local_starts = row_pos[:row_len].eq(0).nonzero(as_tuple=True)[0].tolist()
+                local_order = 0
+                if not local_starts:
+                    _partial(batch_idx, 0, row_len, is_start=False, local_order=local_order)
+                    continue
 
-            first = local_starts[0]
-            if first > 0:
-                _partial(batch_idx, 0, first, is_start=False, local_order=local_order)
-                local_order += 1
-            ends = local_starts[1:] + [row_len]
-            for start, end in zip(local_starts, ends):
-                _partial(batch_idx, start, end, is_start=True, local_order=local_order)
-                local_order += 1
+                first = local_starts[0]
+                if first > 0:
+                    _partial(batch_idx, 0, first, is_start=False, local_order=local_order)
+                    local_order += 1
+                ends = local_starts[1:] + [row_len]
+                for start, end in zip(local_starts, ends):
+                    _partial(batch_idx, start, end, is_start=True, local_order=local_order)
+                    local_order += 1
 
         if defer_reduce:
             return ChannelLossComputer._prepare_sp_observation_payload(
                 local_segments=segments,
                 source_ids=source_ids,
                 device=per_token_loss.device,
-                payload_capacity=max(seq_len, 1),
+                payload_capacity=max(seq_len, len(source_ids), 1),
                 parallel_state=parallel_state,
                 capture_descriptor=capture_descriptor,
                 include_data_stats=include_data_stats,
+                alignment_mode=alignment_mode,
             )
 
         reduced = ChannelLossComputer._reduce_sp(
@@ -1356,6 +1415,7 @@ class ChannelLossComputer:
         parallel_state: ParallelState | None = None,
         capture_descriptor: _SPCaptureDescriptor | None = None,
         include_data_stats: bool = False,
+        alignment_mode: str = "positions",
     ) -> _PendingSPObservation:
         """Materialize every rank-local buffer before the SP preflight."""
 
@@ -1439,6 +1499,7 @@ class ChannelLossComputer:
             world=world,
             capture_descriptor=capture_descriptor,
             segment_count=len(local_segments),
+            alignment_mode=alignment_mode,
             loss_payload=loss_payload,
             integer_payload=integer_payload,
             gathered_segment_counts=[len(local_segments)] if world <= 1 else [0] * world,
@@ -1781,8 +1842,7 @@ class ChannelLossCallback(Callback):
             return
         if channel_loss_source_repeat < 1:
             raise ValueError(
-                "Channel loss channel_loss_source_repeat must be >= 1, "
-                f"got {channel_loss_source_repeat}."
+                f"Channel loss channel_loss_source_repeat must be >= 1, got {channel_loss_source_repeat}."
             )
 
         self._collect_step = state.global_step % self.config.interval == 0
@@ -1791,7 +1851,7 @@ class ChannelLossCallback(Callback):
             if self.config.strict:
                 missing_source_micro_steps = []
                 for micro_step, micro_batch in enumerate(micro_batches or []):
-                    source_ids, _, _, _ = self._extract_metadata(micro_batch)
+                    source_ids, _, _, _, _ = self._extract_metadata(micro_batch)
                     if not source_ids:
                         missing_source_micro_steps.append(micro_step)
                 self._raise_if_missing_source_ids(missing_source_micro_steps)
@@ -1800,9 +1860,12 @@ class ChannelLossCallback(Callback):
         per_mb_source_ids: list[list[ChannelKey]] = []
         per_mb_position_ids: list[torch.Tensor | None] = []
         per_mb_attention_masks: list[torch.Tensor | None] = []
+        per_mb_packed_cu_seqlens: list[Any | None] = []
         missing_source_micro_steps = []
         for micro_step, micro_batch in enumerate(micro_batches or []):
-            source_ids, source_names, position_ids, attention_mask = self._extract_metadata(micro_batch)
+            source_ids, source_names, position_ids, attention_mask, packed_cu_seqlens = self._extract_metadata(
+                micro_batch
+            )
             if self.config.strict and not source_ids:
                 missing_source_micro_steps.append(micro_step)
             source_ids, source_names = self._repeat_source_metadata(
@@ -1814,8 +1877,14 @@ class ChannelLossCallback(Callback):
             per_mb_source_ids.append(source_ids)
             per_mb_position_ids.append(position_ids)
             per_mb_attention_masks.append(attention_mask)
+            per_mb_packed_cu_seqlens.append(packed_cu_seqlens)
 
-        self.computer.begin_step(per_mb_source_ids, per_mb_position_ids, per_mb_attention_masks)
+        self.computer.begin_step(
+            per_mb_source_ids,
+            per_mb_position_ids,
+            per_mb_attention_masks,
+            per_mb_packed_cu_seqlens,
+        )
         if self.config.strict:
             self._raise_if_missing_source_ids(missing_source_micro_steps)
 
@@ -2147,17 +2216,35 @@ class ChannelLossCallback(Callback):
     def _extract_metadata(
         self,
         micro_batch: Any,
-    ) -> tuple[list[ChannelKey], list[str], torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[list[ChannelKey], list[str], torch.Tensor | None, torch.Tensor | None, Any | None]:
         if isinstance(micro_batch, dict):
             source_ids = self._first_present_list(micro_batch, self.config.source_id_keys, _as_channel_key_list)
             source_names = self._first_present_list(micro_batch, self.config.source_name_keys, _as_str_list)
             position_ids = micro_batch.get("position_ids")
-            attention_mask = micro_batch.get("attention_mask")
+            # Headwise CP keeps the full attention mask for full-attention
+            # kernels, while its router mask is rank-local and excludes the
+            # per-sample CP padding. Channel-loss metadata must follow the
+            # local labels/positions rather than the global full-attention
+            # shape.
+            labels = micro_batch.get("labels")
+            router_attention_mask = micro_batch.get("router_attention_mask")
+            if (
+                isinstance(router_attention_mask, torch.Tensor)
+                and isinstance(labels, torch.Tensor)
+                and router_attention_mask.numel() == labels.numel()
+            ):
+                attention_mask = router_attention_mask
+            else:
+                attention_mask = micro_batch.get("attention_mask")
+            packed_cu_seqlens = micro_batch.get("cu_seqlens_list_q")
+            if packed_cu_seqlens is None:
+                packed_cu_seqlens = micro_batch.get("cu_seq_lens_q")
             return (
                 source_ids,
                 source_names,
                 position_ids if isinstance(position_ids, torch.Tensor) else None,
                 attention_mask if isinstance(attention_mask, torch.Tensor) else None,
+                packed_cu_seqlens,
             )
 
         if isinstance(micro_batch, (list, tuple)):
@@ -2168,9 +2255,9 @@ class ChannelLossCallback(Callback):
                     continue
                 source_ids.extend(self._first_present_list(sample, self.config.source_id_keys, _as_channel_key_list))
                 source_names.extend(self._first_present_list(sample, self.config.source_name_keys, _as_str_list))
-            return source_ids, source_names, None, None
+            return source_ids, source_names, None, None, None
 
-        return [], [], None, None
+        return [], [], None, None, None
 
     @staticmethod
     def _first_present_list(
@@ -2240,6 +2327,56 @@ def _position_aligned_attention_mask_flat(
     if attention_mask.numel() == labels.numel() or attention_mask.numel() == effective_labels.numel():
         return attention_mask.reshape(-1)
     return None
+
+
+def _rank_local_packed_source_spans(
+    packed_cu_seqlens: Any | None,
+    *,
+    source_count: int,
+    seq_len: int,
+    attention_mask_flat: torch.Tensor | None,
+) -> list[tuple[int, int]] | None:
+    """Resolve authoritative rank-local packed spans when they match sources.
+
+    Standard contiguous Ulysses can retain global CU metadata after slicing;
+    its final CU point therefore does not match the rank-local loss width and
+    deliberately falls back to position-based alignment. Headwise CP instead
+    publishes one local CU span per packed source, plus at most one explicit
+    padding-only tail span introduced by ``pad_to_length``.
+    """
+
+    if packed_cu_seqlens is None:
+        return None
+    if isinstance(packed_cu_seqlens, torch.Tensor):
+        if packed_cu_seqlens.ndim != 1 or packed_cu_seqlens.dtype not in (torch.int32, torch.int64):
+            return None
+        raw_points = packed_cu_seqlens.detach().cpu().tolist()
+    elif isinstance(packed_cu_seqlens, (list, tuple)):
+        raw_points = list(packed_cu_seqlens)
+    else:
+        return None
+
+    points: list[int] = []
+    for point in raw_points:
+        if isinstance(point, bool) or not isinstance(point, Integral):
+            return None
+        points.append(int(point))
+    if not points or points[0] != 0 or points[-1] != seq_len:
+        return None
+    if any(end < start for start, end in zip(points, points[1:])):
+        return None
+
+    spans = list(zip(points, points[1:]))
+    if len(spans) == source_count:
+        return spans
+    if len(spans) != source_count + 1 or attention_mask_flat is None:
+        return None
+
+    tail_start, tail_end = spans[-1]
+    tail_mask = attention_mask_flat[tail_start:tail_end]
+    if tail_mask.numel() > 0 and tail_mask.to(torch.bool).any().item():
+        return None
+    return spans[:-1]
 
 
 def _filter_surplus_tail_padding_segments(

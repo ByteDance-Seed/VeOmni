@@ -893,6 +893,45 @@ def test_channel_loss_sp_filters_padding_tail_per_batch_row(monkeypatch):
     ]
 
 
+def test_channel_loss_sp_uses_rank_local_cu_for_headwise_padding():
+    parallel_state = _test_parallel_state(sp_enabled=True)
+
+    result = ChannelLossComputer._aggregate_by_source(
+        per_token_loss=torch.arange(1, 11, dtype=torch.float32),
+        labels_flat=torch.tensor(
+            [1, 1, IGNORE_INDEX, IGNORE_INDEX, 1, 1, 1, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]
+        ),
+        attention_mask_flat=torch.tensor([1, 1, 0, 0, 1, 1, 1, 0, 0, 0]),
+        source_ids=["first", "second"],
+        # Per-sample CP padding and the synthetic pad-to-length tail all use
+        # zero positions. Position-only segmentation would find six sources.
+        position_ids=torch.tensor([[0, 1, 0, 0, 0, 1, 2, 0, 0, 0]]),
+        packed_cu_seqlens=[0, 4, 8, 10],
+        ignore_index=IGNORE_INDEX,
+        sp_enabled=True,
+        parallel_state=parallel_state,
+        strict=True,
+        include_data_stats=True,
+    )
+
+    assert result == [
+        {
+            "source_id": "first",
+            "loss_sum": 3.0,
+            "token_count": 2,
+            "sample_count": 1,
+            "input_token_count": 2,
+        },
+        {
+            "source_id": "second",
+            "loss_sum": 18.0,
+            "token_count": 3,
+            "sample_count": 1,
+            "input_token_count": 3,
+        },
+    ]
+
+
 def test_channel_loss_sp_preserves_zero_supervision_tail_when_later_row_has_padding(monkeypatch):
     parallel_state = _test_parallel_state(sp_enabled=True)
 
@@ -1093,6 +1132,7 @@ def test_channel_loss_sp_preflight_precedes_all_ordered_payloads_and_cache_relea
         ("has_source", False),
         ("observation_count", 2),
         ("source_ids", (("str", "'source-b'"),)),
+        ("alignment_modes", ["packed_cu"]),
         ("descriptor_spec", (True, 3, True)),
         ("errors", [("generic", "rank-local observer failure")]),
     ],
@@ -2142,6 +2182,117 @@ def test_channel_loss_callback_strips_metadata_after_preforward():
     assert "position_ids" in micro_batch
     assert callback.computer._source_ids == [3]
     assert callback.computer.source_names == {3: "train/a"}
+
+
+def test_channel_loss_metadata_prefers_rank_local_router_mask_and_cu():
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    global_attention_mask = torch.ones(1, 16, dtype=torch.long)
+    local_router_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.long)
+    local_cu = [0, 2, 4]
+
+    source_ids, source_names, position_ids, attention_mask, packed_cu_seqlens = callback._extract_metadata(
+        {
+            "ds_idx": torch.tensor([3, 4]),
+            "source_name": ["train/a", "train/b"],
+            "labels": torch.tensor([[1, 2, IGNORE_INDEX, IGNORE_INDEX]]),
+            "position_ids": torch.tensor([[0, 1, 0, 0]]),
+            "attention_mask": global_attention_mask,
+            "router_attention_mask": local_router_mask,
+            "cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32),
+            "cu_seqlens_list_q": local_cu,
+        }
+    )
+
+    assert source_ids == [3, 4]
+    assert source_names == ["train/a", "train/b"]
+    assert position_ids.shape == (1, 4)
+    assert attention_mask is local_router_mask
+    assert packed_cu_seqlens is local_cu
+
+
+def test_channel_loss_sp_rank_local_cu_keeps_empty_source():
+    parallel_state = _test_parallel_state(sp_enabled=True)
+
+    result = ChannelLossComputer._aggregate_sp(
+        per_token_loss=torch.empty(0),
+        labels_flat=torch.empty(0, dtype=torch.long),
+        attention_mask_flat=torch.empty(0, dtype=torch.long),
+        source_ids=["empty"],
+        positions=torch.empty((1, 0), dtype=torch.long),
+        packed_cu_seqlens=[0, 0],
+        seq_len=0,
+        ignore_index=IGNORE_INDEX,
+        parallel_state=parallel_state,
+        strict=True,
+    )
+
+    assert result == [{"source_id": "empty", "loss_sum": 0.0, "token_count": 0}]
+
+
+def test_channel_loss_sp_rank_local_cu_keeps_multiple_empty_sources():
+    parallel_state = _test_parallel_state(sp_enabled=True)
+
+    prepared = ChannelLossComputer._aggregate_sp(
+        per_token_loss=torch.empty(0),
+        labels_flat=torch.empty(0, dtype=torch.long),
+        attention_mask_flat=torch.empty(0, dtype=torch.long),
+        source_ids=["empty-a", "empty-b"],
+        positions=torch.empty((1, 0), dtype=torch.long),
+        packed_cu_seqlens=[0, 0, 0],
+        seq_len=0,
+        ignore_index=IGNORE_INDEX,
+        parallel_state=parallel_state,
+        strict=True,
+        defer_reduce=True,
+    )
+
+    assert isinstance(prepared, channel_loss_module._PendingSPObservation)
+    assert prepared.segment_count == 2
+    result = ChannelLossComputer._reconstruct_prepared_sp_payload(prepared, strict=True)
+    assert result == [
+        {"source_id": "empty-a", "loss_sum": 0.0, "token_count": 0},
+        {"source_id": "empty-b", "loss_sum": 0.0, "token_count": 0},
+    ]
+
+
+def test_channel_loss_sp_rank_local_cu_drops_zero_length_synthetic_tail():
+    parallel_state = _test_parallel_state(sp_enabled=True)
+
+    result = ChannelLossComputer._aggregate_sp(
+        per_token_loss=torch.tensor([2.0, 3.0]),
+        labels_flat=torch.tensor([1, 1]),
+        attention_mask_flat=torch.ones(2, dtype=torch.long),
+        source_ids=["source"],
+        positions=torch.tensor([[0, 1]]),
+        packed_cu_seqlens=[0, 2, 2],
+        seq_len=2,
+        ignore_index=IGNORE_INDEX,
+        parallel_state=parallel_state,
+        strict=True,
+    )
+
+    assert result == [{"source_id": "source", "loss_sum": 5.0, "token_count": 2}]
+
+
+def test_channel_loss_metadata_rejects_misaligned_router_mask():
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    global_attention_mask = torch.ones(1, 4, dtype=torch.long)
+
+    _, _, _, attention_mask, _ = callback._extract_metadata(
+        {
+            "ds_idx": torch.tensor([3]),
+            "labels": torch.tensor([[1, 2, 3, 4]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3]]),
+            "attention_mask": global_attention_mask,
+            "router_attention_mask": torch.ones(1, 2, dtype=torch.long),
+        }
+    )
+
+    assert attention_mask is global_attention_mask
 
 
 def test_channel_loss_callback_samples_steps_but_always_strips_metadata():
