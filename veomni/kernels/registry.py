@@ -28,7 +28,7 @@ from typing import Any, Callable
 import torch
 from torch import Tensor
 
-from .platform import KernelRequirement
+from .requirement import KernelRequirement
 
 
 Output = Tensor | tuple[Tensor, ...]

@@ -16,18 +16,24 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from veomni.kernels.async_ulysses.backward import (
-    layer_norm_backward,
-    linear_backward,
-    linear_input_backward,
-    linear_parameter_backward,
-    reduce_repeated_kv_gradient,
-)
+from veomni.kernels import VeomniKernel
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+_qkv = inspect.getmodule(VeomniKernel("async_ulysses_qkv", "standard").entry.backward)
+_o = inspect.getmodule(VeomniKernel("async_ulysses_o", "standard").entry.backward)
+assert _qkv is not None and _o is not None
+layer_norm_backward = _qkv.layer_norm_backward
+linear_backward = _qkv.linear_backward
+reduce_repeated_kv_gradient = _qkv.reduce_repeated_kv_gradient
+linear_input_backward = _o.linear_input_backward
+linear_parameter_backward = _o.linear_parameter_backward
 
 
 @pytest.mark.parametrize("has_bias", [False, True])

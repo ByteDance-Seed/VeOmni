@@ -20,7 +20,7 @@ without overlapping the next linear with an in-flight all-to-all.
 
 from __future__ import annotations
 
-import importlib
+import inspect
 
 import pytest
 import torch
@@ -31,12 +31,19 @@ from veomni.kernels import VeomniKernel, resolve_kernel
 from veomni.kernels.registry import KernelEntry, SavedState
 
 
-_EAGER_MODULES = (
-    "veomni.kernels.async_ulysses.qkv_proj.standard.eager",
-    "veomni.kernels.async_ulysses.qkv_proj.dit.eager",
-    "veomni.kernels.async_ulysses.o_proj.standard.eager",
-    "veomni.kernels.async_ulysses.o_proj.dit.eager",
+_EAGER_ROWS = (
+    ("async_ulysses_qkv", "standard"),
+    ("async_ulysses_qkv", "dit"),
+    ("async_ulysses_o", "standard"),
+    ("async_ulysses_o", "dit"),
 )
+
+
+def _eager_module(kernel: str, variant: str):
+    """Return the impl module that registered this row's raw pair."""
+    module = inspect.getmodule(VeomniKernel(kernel, variant, "eager").entry.backward)
+    assert module is not None
+    return module
 
 
 def _mock_identity_comm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -49,8 +56,8 @@ def _mock_identity_comm(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_unpad(tensor: Tensor, dim, size, **kwargs):
         return tensor
 
-    for name in _EAGER_MODULES:
-        module = importlib.import_module(name)
+    for kernel, variant in _EAGER_ROWS:
+        module = _eager_module(kernel, variant)
         monkeypatch.setattr(module, "all_to_all_tensor", fake_all_to_all)
         monkeypatch.setattr(module, "padding_tensor_for_seqeunce_parallel", fake_pad)
         monkeypatch.setattr(module, "unpadding_tensor_for_seqeunce_parallel", fake_unpad)

@@ -12,20 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VeOmni kernel registry and the families registered on import.
+"""Registered kernel families.
 
-``compound`` holds nested-handle helpers. Importing this package registers
-families under ``_kernels``: ``rms_norm``, ``rope``, ``rope_vision``,
-``async_ulysses_*``, ``swiglu_mlp``, and ``loss`` (load-balancing first).
+Importing this package registers every family on ``KERNEL_REGISTRY``.
+Callers resolve rows through ``veomni.kernels``, not this package.
 """
 
-from . import _kernels as _kernel_families  # noqa: F401
-from .registry import KERNEL_REGISTRY, VeomniKernel, register_kernel, resolve_kernel
-
-
-__all__ = [
-    "KERNEL_REGISTRY",
-    "VeomniKernel",
-    "register_kernel",
-    "resolve_kernel",
-]
+from . import async_ulysses as _async_ulysses  # noqa: F401
+from . import loss as _loss  # noqa: F401
+from . import rms_norm as _rms_norm  # noqa: F401
+from . import rope as _rope  # noqa: F401
+from . import rope_vision as _rope_vision  # noqa: F401
+from . import swiglu_mlp as _swiglu_mlp  # noqa: F401

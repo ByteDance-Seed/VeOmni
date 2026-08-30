@@ -21,8 +21,8 @@ import torch
 from torch import Tensor
 
 from veomni.kernels import KERNEL_REGISTRY, VeomniKernel, register_kernel, resolve_kernel
-from veomni.kernels.platform import CudaKernelRequirement, NpuKernelRequirement
 from veomni.kernels.registry import KernelEntry, SavedState
+from veomni.kernels.requirement import CudaKernelRequirement, NpuKernelRequirement
 
 
 @pytest.fixture
