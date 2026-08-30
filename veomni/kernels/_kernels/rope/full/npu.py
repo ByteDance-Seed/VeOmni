@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""partial RoPE torch_npu adapter."""
+"""full RoPE npu adapter."""
 
 from __future__ import annotations
 
-import torch
 from torch import Tensor
 
 from ....registry import SavedState
@@ -26,10 +25,7 @@ from . import eager as _eager
 def forward(
     q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
-    """NPU fused partial RoPE. Only the ``cos.shape[-1]`` prefix is rotated.
-
-    Empty inputs and backward reuse the eager pair.
-    """
+    """NPU fused full RoPE. Empty inputs and backward reuse the eager pair."""
     if q.numel() == 0 or k.numel() == 0:
         return _eager.forward(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
@@ -37,11 +33,8 @@ def forward(
 
     cos_u = cos.unsqueeze(unsqueeze_dim)
     sin_u = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_embed = torch.cat((torch_npu.npu_rotary_mul(q_rot, cos_u, sin_u), q_pass), dim=-1)
-    k_embed = torch.cat((torch_npu.npu_rotary_mul(k_rot, cos_u, sin_u), k_pass), dim=-1)
+    q_embed = torch_npu.npu_rotary_mul(q, cos_u, sin_u).to(q.dtype)
+    k_embed = torch_npu.npu_rotary_mul(k, cos_u, sin_u).to(k.dtype)
     return (q_embed, k_embed), SavedState((cos, sin), _eager._Meta(False, unsqueeze_dim))
 
 

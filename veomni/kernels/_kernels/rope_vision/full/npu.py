@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""full RoPE torch_npu adapter."""
+"""vision RoPE npu adapter."""
 
 from __future__ import annotations
 
@@ -22,20 +22,19 @@ from ....registry import SavedState
 from . import eager as _eager
 
 
-def forward(
-    q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1
-) -> tuple[tuple[Tensor, Tensor], SavedState]:
-    """NPU fused full RoPE. Empty inputs and backward reuse the eager pair."""
+def forward(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[tuple[Tensor, Tensor], SavedState]:
+    """NPU fused vision RoPE. Empty inputs and backward reuse the eager pair."""
     if q.numel() == 0 or k.numel() == 0:
-        return _eager.forward(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+        return _eager.forward(q, k, cos, sin)
 
     import torch_npu
 
-    cos_u = cos.unsqueeze(unsqueeze_dim)
-    sin_u = sin.unsqueeze(unsqueeze_dim)
-    q_embed = torch_npu.npu_rotary_mul(q, cos_u, sin_u).to(q.dtype)
-    k_embed = torch_npu.npu_rotary_mul(k, cos_u, sin_u).to(k.dtype)
-    return (q_embed, k_embed), SavedState((cos, sin), _eager._Meta(False, unsqueeze_dim))
+    q_in, k_in = q.unsqueeze(0), k.unsqueeze(0)
+    cos_u = cos.unsqueeze(0).unsqueeze(2).float()
+    sin_u = sin.unsqueeze(0).unsqueeze(2).float()
+    q_embed = torch_npu.npu_rotary_mul(q_in, cos_u, sin_u).squeeze(0).to(q.dtype)
+    k_embed = torch_npu.npu_rotary_mul(k_in, cos_u, sin_u).squeeze(0).to(k.dtype)
+    return (q_embed, k_embed), SavedState((cos, sin), _eager._Meta(False))
 
 
 def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Tensor, Tensor, None, None]:

@@ -24,8 +24,8 @@ from ...requirement import CudaKernelRequirement, NpuKernelRequirement
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
 from .standard import eager as standard_eager
+from .standard import npu as standard_npu
 from .standard import quack as standard_quack
-from .standard import torch_npu as standard_npu
 from .standard import triton as standard_triton
 
 
@@ -50,7 +50,7 @@ register_kernel(
 register_kernel(
     "moe_experts",
     "standard",
-    "torch_npu",
+    "npu",
     wrapper=standard_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )

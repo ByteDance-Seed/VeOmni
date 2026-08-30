@@ -204,12 +204,12 @@ def test_triton_matches_eager():
     )
 
 
-@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="torch_npu RMSNorm needs NPU")
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
 @pytest.mark.parametrize("variant", ["standard", "qwen3_5"])
-def test_torch_npu_matches_eager(variant: str):
+def test_npu_matches_eager(variant: str):
     _fused_matches_eager(
         variant,
-        "torch_npu",
+        "npu",
         "npu",
         torch.bfloat16,
         atol=RMS_NPU_ATOL,

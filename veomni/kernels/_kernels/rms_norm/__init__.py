@@ -23,10 +23,10 @@ from ...registry import register_kernel
 from ...requirement import CudaKernelRequirement, NpuKernelRequirement
 from .qwen3_5 import eager as qwen3_5_eager
 from .qwen3_5 import liger_kernel as qwen3_5_liger
-from .qwen3_5 import torch_npu as qwen3_5_npu
+from .qwen3_5 import npu as qwen3_5_npu
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
-from .standard import torch_npu as standard_npu
+from .standard import npu as standard_npu
 from .standard import triton as standard_triton
 from .unweighted import eager as unweighted_eager
 from .unweighted import liger_kernel as unweighted_liger
@@ -46,7 +46,7 @@ register_kernel(
 register_kernel(
     "rms_norm",
     "standard",
-    "torch_npu",
+    "npu",
     standard_npu.forward,
     standard_npu.backward,
     requirement=NpuKernelRequirement(),
@@ -75,7 +75,7 @@ register_kernel(
 register_kernel(
     "rms_norm",
     "qwen3_5",
-    "torch_npu",
+    "npu",
     qwen3_5_npu.forward,
     qwen3_5_npu.backward,
     requirement=NpuKernelRequirement(),

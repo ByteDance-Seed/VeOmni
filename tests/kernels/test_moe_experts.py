@@ -35,7 +35,7 @@ from tests.kernels.tol import (
     MOE_FUSED_RTOL,
 )
 from veomni.kernels import resolve_kernel
-from veomni.kernels._kernels.moe_experts.standard.torch_npu import _fc1_weight
+from veomni.kernels._kernels.moe_experts.standard.npu import _fc1_weight
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
@@ -283,7 +283,7 @@ def _run_fused_vs_eager(
     seed: int = 0,
 ):
     torch.manual_seed(seed)
-    device = torch.device("npu" if impl == "torch_npu" else "cuda")
+    device = torch.device("npu" if impl == "npu" else "cuda")
     dtype = torch.bfloat16
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = shape
     hidden = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
@@ -458,4 +458,4 @@ def test_gpt_oss_quack_matches_eager():
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU fused MoE needs torch_npu")
 def test_npu_matches_eager():
-    _run_fused_vs_eager("torch_npu")
+    _run_fused_vs_eager("npu")

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""standard MoE experts torch_npu implementation."""
+"""standard MoE experts npu implementation."""
 
 from __future__ import annotations
 

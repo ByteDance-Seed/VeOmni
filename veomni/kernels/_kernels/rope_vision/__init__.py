@@ -22,7 +22,7 @@ head axis. Registers eager plus an NPU adapter.
 from ...registry import register_kernel
 from ...requirement import NpuKernelRequirement
 from .full import eager as full_eager
-from .full import torch_npu as full_npu
+from .full import npu as full_npu
 
 
 register_kernel("rope_vision", "full", "eager", full_eager.forward, full_eager.backward)
@@ -30,7 +30,7 @@ register_kernel("rope_vision", "full", "eager", full_eager.forward, full_eager.b
 register_kernel(
     "rope_vision",
     "full",
-    "torch_npu",
+    "npu",
     full_npu.forward,
     full_npu.backward,
     requirement=NpuKernelRequirement(),

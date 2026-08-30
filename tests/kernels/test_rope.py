@@ -152,11 +152,11 @@ def test_full_liger_matches_eager():
     assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="torch_npu RoPE needs NPU")
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RoPE needs NPU")
 @pytest.mark.parametrize("variant", ["full", "partial"])
-def test_rope_torch_npu_matches_eager(variant: str):
+def test_rope_npu_matches_eager(variant: str):
     eager = resolve_kernel("rope", variant, "eager").wrapper
-    other = resolve_kernel("rope", variant, "torch_npu").wrapper
+    other = resolve_kernel("rope", variant, "npu").wrapper
     torch.manual_seed(0)
     head_dim = 64 if variant == "full" else 128
     rotary_dim = 64
@@ -183,10 +183,10 @@ def test_rope_torch_npu_matches_eager(variant: str):
     assert torch.allclose(k_e.grad.float(), k_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
 
 
-@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="torch_npu vision RoPE needs NPU")
-def test_vision_torch_npu_matches_eager():
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU vision RoPE needs NPU")
+def test_vision_npu_matches_eager():
     eager = resolve_kernel("rope_vision", "full", "eager").wrapper
-    other = resolve_kernel("rope_vision", "full", "torch_npu").wrapper
+    other = resolve_kernel("rope_vision", "full", "npu").wrapper
     torch.manual_seed(0)
     q = torch.randn(16, 8, 64, device="npu", dtype=torch.bfloat16)
     k = torch.randn(16, 8, 64, device="npu", dtype=torch.bfloat16)
@@ -294,10 +294,10 @@ def test_wan_triton_matches_eager():
     assert torch.allclose(x_e.grad, x_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="torch_npu Wan RoPE needs NPU")
-def test_wan_torch_npu_matches_eager():
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU Wan RoPE needs NPU")
+def test_wan_npu_matches_eager():
     eager = resolve_kernel("rope", "wan", "eager").wrapper
-    other = resolve_kernel("rope", "wan", "torch_npu").wrapper
+    other = resolve_kernel("rope", "wan", "npu").wrapper
     torch.manual_seed(0)
     head_dim = 64
     x = torch.randn(2, 16, 4 * head_dim, device="npu", dtype=torch.bfloat16)

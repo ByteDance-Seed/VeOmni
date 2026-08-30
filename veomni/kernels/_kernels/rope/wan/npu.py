@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""wan RoPE torch_npu adapter."""
+"""wan RoPE npu adapter."""
 
 from __future__ import annotations
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""standard RMSNorm torch_npu adapter."""
+"""qwen3_5 RMSNorm npu adapter (scale is 1 + weight)."""
 
 from __future__ import annotations
 
@@ -33,17 +33,19 @@ class _Meta:
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
-    """NPU fused affine RMSNorm (offset 0).
+    """NPU fused affine RMSNorm. The fused scale is ``1 + weight``.
 
-    Empty ``x`` falls back to the eager pair. Otherwise saves ``(x, weight, rstd)``.
+    Empty ``x`` falls back to the eager pair. Backward also passes
+    ``1 + weight`` into ``npu_rms_norm_backward``.
     """
+    scale = 1.0 + weight
     if x.numel() == 0:
         output, saved = _eager.forward(x, weight, eps=eps)
         return output, SavedState(saved.tensors, _Meta(True, eps))
 
     import torch_npu
 
-    output, rstd = torch_npu.npu_rms_norm(x, weight, eps)
+    output, rstd = torch_npu.npu_rms_norm(x, scale, eps)
     return output, SavedState((x, weight, rstd), _Meta(False, eps))
 
 
@@ -58,4 +60,5 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     import torch_npu
 
     (rstd,) = optional_rstd
-    return torch_npu.npu_rms_norm_backward(grad_output.contiguous(), x, weight, rstd)
+    scale = 1.0 + weight
+    return torch_npu.npu_rms_norm_backward(grad_output.contiguous(), x, scale, rstd)

@@ -26,11 +26,11 @@ from .deepseek_v4 import eager as dsv4_eager
 from .deepseek_v4 import triton as dsv4_triton
 from .full import eager as full_eager
 from .full import liger_kernel as full_liger
-from .full import torch_npu as full_npu
+from .full import npu as full_npu
 from .partial import eager as partial_eager
-from .partial import torch_npu as partial_npu
+from .partial import npu as partial_npu
 from .wan import eager as wan_eager
-from .wan import torch_npu as wan_npu
+from .wan import npu as wan_npu
 from .wan import triton as wan_triton
 
 
@@ -48,7 +48,7 @@ register_kernel(
 register_kernel(
     "rope",
     "full",
-    "torch_npu",
+    "npu",
     full_npu.forward,
     full_npu.backward,
     requirement=NpuKernelRequirement(),
@@ -59,7 +59,7 @@ register_kernel("rope", "partial", "eager", partial_eager.forward, partial_eager
 register_kernel(
     "rope",
     "partial",
-    "torch_npu",
+    "npu",
     partial_npu.forward,
     partial_npu.backward,
     requirement=NpuKernelRequirement(),
@@ -90,7 +90,7 @@ register_kernel(
 register_kernel(
     "rope",
     "wan",
-    "torch_npu",
+    "npu",
     wan_npu.forward,
     wan_npu.backward,
     requirement=NpuKernelRequirement(),
