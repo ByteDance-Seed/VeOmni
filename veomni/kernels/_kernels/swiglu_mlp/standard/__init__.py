@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""standard SwiGLU implementations (``silu(gate) * up``)."""
+"""standard SwiGLU MLP implementations (gate / up / down)."""

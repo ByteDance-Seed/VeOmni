@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SwiGLU eager vs HF, and fused impls vs eager."""
+"""SwiGLU MLP eager vs HF, and fused impls vs eager."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from torch import Tensor
+import torch.nn.functional as F
+from torch import Tensor, nn
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
@@ -36,8 +37,24 @@ from veomni.kernels import resolve_kernel
 from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
-def _clone_pair(gate: Tensor, up: Tensor) -> tuple[Tensor, Tensor]:
-    return gate.detach().requires_grad_(True), up.detach().requires_grad_(True)
+def _empty_bias(weight: Tensor) -> Tensor:
+    return weight.new_empty(0)
+
+
+def _bias(linear: nn.Linear) -> Tensor:
+    return linear.bias if linear.bias is not None else _empty_bias(linear.weight)
+
+
+def _mlp_args(mlp: nn.Module, x: Tensor) -> tuple[Tensor, ...]:
+    return (
+        x,
+        mlp.gate_proj.weight,
+        _bias(mlp.gate_proj),
+        mlp.up_proj.weight,
+        _bias(mlp.up_proj),
+        mlp.down_proj.weight,
+        _bias(mlp.down_proj),
+    )
 
 
 def _tiny_qwen3_mlp() -> Qwen3MLP:
@@ -52,6 +69,12 @@ def _tiny_qwen3_mlp() -> Qwen3MLP:
     return Qwen3MLP(config)
 
 
+def _copy_linear(src: nn.Linear) -> nn.Linear:
+    dst = nn.Linear(src.in_features, src.out_features, bias=src.bias is not None)
+    dst.load_state_dict(src.state_dict())
+    return dst
+
+
 def test_eager_matches_hf():
     torch.manual_seed(0)
     mlp_h = _tiny_qwen3_mlp()
@@ -64,7 +87,7 @@ def test_eager_matches_hf():
 
     x_e = x.detach().requires_grad_(True)
     wrapper = resolve_kernel("swiglu_mlp", "standard", "eager").wrapper
-    out_e = mlp_e.down_proj(wrapper(mlp_e.gate_proj(x_e), mlp_e.up_proj(x_e)))
+    out_e = wrapper(*_mlp_args(mlp_e, x_e))
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
@@ -75,25 +98,74 @@ def test_eager_matches_hf():
         assert torch.allclose(param_e.grad, param_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-def test_eager_matches_hf_activation():
-    torch.manual_seed(0)
-    mlp = _tiny_qwen3_mlp()
-    hidden = torch.randn(2, 16, mlp.hidden_size, dtype=torch.float32)
-    gate = mlp.gate_proj(hidden).detach().requires_grad_(True)
-    up = mlp.up_proj(hidden).detach().requires_grad_(True)
+def test_eager_matches_biased_linears():
+    torch.manual_seed(1)
+    hidden, intermediate = 64, 128
+    gate_h = nn.Linear(hidden, intermediate, bias=True)
+    up_h = nn.Linear(hidden, intermediate, bias=True)
+    down_h = nn.Linear(intermediate, hidden, bias=True)
+    gate_e = _copy_linear(gate_h)
+    up_e = _copy_linear(up_h)
+    down_e = _copy_linear(down_h)
+    x = torch.randn(2, 16, hidden, dtype=torch.float32)
 
-    gate_h, up_h = _clone_pair(gate, up)
-    out_h = mlp.act_fn(gate_h) * up_h
+    x_h = x.detach().requires_grad_(True)
+    out_h = down_h(F.silu(gate_h(x_h)) * up_h(x_h))
 
-    gate_e, up_e = _clone_pair(gate, up)
-    out_e = resolve_kernel("swiglu_mlp", "standard", "eager").wrapper(gate_e, up_e)
+    x_e = x.detach().requires_grad_(True)
+    wrapper = resolve_kernel("swiglu_mlp", "standard", "eager").wrapper
+    out_e = wrapper(x_e, gate_e.weight, gate_e.bias, up_e.weight, up_e.bias, down_e.weight, down_e.bias)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
     out_h.backward(go)
     out_e.backward(go)
-    assert torch.allclose(gate_e.grad, gate_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(up_e.grad, up_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(gate_e.weight.grad, gate_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(gate_e.bias.grad, gate_h.bias.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(up_e.weight.grad, up_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(up_e.bias.grad, up_h.bias.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(down_e.weight.grad, down_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(down_e.bias.grad, down_h.bias.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_eager_matches_swiglu_limit():
+    torch.manual_seed(2)
+    hidden, intermediate, limit = 64, 128, 7.0
+    gate_h = nn.Linear(hidden, intermediate, bias=False)
+    up_h = nn.Linear(hidden, intermediate, bias=False)
+    down_h = nn.Linear(intermediate, hidden, bias=False)
+    gate_e = _copy_linear(gate_h)
+    up_e = _copy_linear(up_h)
+    down_e = _copy_linear(down_h)
+    x = torch.randn(2, 16, hidden, dtype=torch.float32)
+
+    x_h = x.detach().requires_grad_(True)
+    gate_act = gate_h(x_h).float().clamp(max=limit)
+    up_act = up_h(x_h).float().clamp(min=-limit, max=limit)
+    out_h = down_h((F.silu(gate_act) * up_act).to(dtype=x_h.dtype))
+
+    x_e = x.detach().requires_grad_(True)
+    wrapper = resolve_kernel("swiglu_mlp", "standard", "eager").wrapper
+    out_e = wrapper(
+        x_e,
+        gate_e.weight,
+        _empty_bias(gate_e.weight),
+        up_e.weight,
+        _empty_bias(up_e.weight),
+        down_e.weight,
+        _empty_bias(down_e.weight),
+        swiglu_limit=limit,
+    )
+    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = torch.randn_like(out_e)
+    out_h.backward(go)
+    out_e.backward(go)
+    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(gate_e.weight.grad, gate_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(up_e.weight.grad, up_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(down_e.weight.grad, down_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs CUDA")
@@ -102,17 +174,22 @@ def test_liger_matches_eager():
     eager = resolve_kernel("swiglu_mlp", "standard", "eager").wrapper
     other = resolve_kernel("swiglu_mlp", "standard", "liger_kernel").wrapper
     torch.manual_seed(0)
-    base_gate = torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16)
-    base_up = torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16)
+    mlp = _tiny_qwen3_mlp().to(device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(2, 16, mlp.hidden_size, device="cuda", dtype=torch.bfloat16)
 
-    gate_e, up_e = _clone_pair(base_gate, base_up)
-    gate_o, up_o = _clone_pair(base_gate, base_up)
-    out_e = eager(gate_e, up_e)
-    out_o = other(gate_o, up_o)
+    x_e = x.detach().requires_grad_(True)
+    x_o = x.detach().requires_grad_(True)
+    mlp_e = _tiny_qwen3_mlp().to(device="cuda", dtype=torch.bfloat16)
+    mlp_o = _tiny_qwen3_mlp().to(device="cuda", dtype=torch.bfloat16)
+    mlp_e.load_state_dict(mlp.state_dict())
+    mlp_o.load_state_dict(mlp.state_dict())
+    out_e = eager(*_mlp_args(mlp_e, x_e))
+    out_o = other(*_mlp_args(mlp_o, x_o))
     assert torch.allclose(out_e, out_o, atol=SWIGLU_FUSED_ATOL, rtol=SWIGLU_FUSED_RTOL)
 
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
-    assert torch.allclose(gate_e.grad, gate_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
-    assert torch.allclose(up_e.grad, up_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
+    assert torch.allclose(x_e.grad, x_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
+    for param_e, param_o in zip(mlp_e.parameters(), mlp_o.parameters(), strict=True):
+        assert torch.allclose(param_e.grad, param_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)

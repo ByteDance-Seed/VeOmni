@@ -158,40 +158,34 @@ class _Meta:
 
 
 def forward(gate_logits: Tensor, attention_mask: Tensor, *, top_k: int) -> tuple[Tensor, SavedState]:
-    """Fused Triton load-balancing loss on stacked layer logits.
+    """Fused Triton load-balancing loss on concatenated layer logits.
 
-    Empty ``attention_mask`` means every token counts. Top-k counts are
-    constants in backward.
+    ``gate_logits`` is ``[N, E]``. Empty ``attention_mask`` means every token
+    counts. Top-k counts are constants in backward.
     """
     import triton
 
-    num_layers, _num_tokens, num_experts = gate_logits.shape
-    concatenated = gate_logits.reshape(-1, num_experts).contiguous()
-    token_count, _ = concatenated.shape
+    if gate_logits.ndim != 2:
+        raise ValueError(f"gate_logits must be [N, E], got {tuple(gate_logits.shape)}")
+    concatenated = gate_logits.contiguous()
+    token_count, num_experts = concatenated.shape
     device = concatenated.device
-    has_mask = attention_mask.numel() > 0
+    mask_weights = _eager.token_mask(concatenated, attention_mask)
+    has_mask = mask_weights is not None
 
     if has_mask:
-        batch_size, seq_len = attention_mask.shape
-        mask_weights = (
-            attention_mask.to(device=device, dtype=torch.float32)
-            .expand(num_layers, batch_size, seq_len)
-            .reshape(-1)
-            .contiguous()
-        )
         total_weight = mask_weights.sum()
         if total_weight == 0:
             output, saved = _eager.forward(gate_logits, attention_mask, top_k=top_k)
             return output, SavedState(saved.tensors, _Meta(top_k, True))
     else:
-        mask_weights = None
         total_weight = torch.tensor(float(token_count), device=device)
 
     num_blocks = triton.cdiv(token_count, BLOCK_N)
     block_e = triton.next_power_of_2(num_experts)
     partial_expert_count = torch.zeros(num_blocks, num_experts, device=device, dtype=torch.float32)
     partial_router_prob_sum = torch.zeros(num_blocks, num_experts, device=device, dtype=torch.float32)
-    mask_ptr = mask_weights if has_mask else partial_expert_count
+    mask_ptr = mask_weights.contiguous() if has_mask else partial_expert_count
 
     _lb_loss_fwd_kernel()[(num_blocks,)](
         concatenated,
@@ -225,23 +219,15 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
     if total_weight == 0:
         return torch.zeros_like(gate_logits), None
 
-    num_layers, _num_tokens, num_experts = gate_logits.shape
-    concatenated = gate_logits.reshape(-1, num_experts).contiguous()
-    token_count, _ = concatenated.shape
+    if gate_logits.ndim != 2:
+        raise ValueError(f"gate_logits must be [N, E], got {tuple(gate_logits.shape)}")
+    concatenated = gate_logits.contiguous()
+    token_count, num_experts = concatenated.shape
     grad_logits = torch.empty_like(concatenated, dtype=torch.float32)
     block_e = triton.next_power_of_2(num_experts)
     grad_scale = grad_output * num_experts / (total_weight * total_weight)
-
-    if meta.has_mask:
-        batch_size, seq_len = attention_mask.shape
-        mask_ptr = (
-            attention_mask.to(device=gate_logits.device, dtype=torch.float32)
-            .expand(num_layers, batch_size, seq_len)
-            .reshape(-1)
-            .contiguous()
-        )
-    else:
-        mask_ptr = concatenated
+    mask_weights = _eager.token_mask(concatenated, attention_mask) if meta.has_mask else None
+    mask_ptr = mask_weights.contiguous() if mask_weights is not None else concatenated
 
     _lb_loss_bwd_kernel()[(token_count,)](
         concatenated,
@@ -256,4 +242,4 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
         BLOCK_E=block_e,
         HAS_MASK=meta.has_mask,
     )
-    return grad_logits.to(dtype=gate_logits.dtype).view_as(gate_logits), None
+    return grad_logits.to(dtype=gate_logits.dtype), None

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SwiGLU kernel family.
+"""SwiGLU MLP kernel family.
 
-Variant ``standard`` is ``silu(gate) * up``. The three MLP linears stay in
-the module, matching ``veomni.ops.liger``'s Liger factory.
+Variant ``standard`` is the full MLP: ``down(silu(gate(x)) * up(x))``.
+Empty biases are unused. ``swiglu_limit`` is a keyword for DeepSeek-V4 clamp.
 """
 
 from ...registry import register_kernel

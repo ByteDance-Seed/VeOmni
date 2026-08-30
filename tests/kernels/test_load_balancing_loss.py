@@ -41,8 +41,9 @@ def _empty_mask(device: torch.device | str) -> Tensor:
     return torch.empty(0, device=device, dtype=torch.float32)
 
 
-def _clone_stacked(gate_logits: Tensor) -> Tensor:
-    return gate_logits.detach().requires_grad_(True)
+def _concat_layers(base: Tensor) -> Tensor:
+    """``[num_layers, tokens, E]`` -> ops-style ``[N, E]``."""
+    return base.reshape(-1, base.shape[-1]).detach().requires_grad_(True)
 
 
 def test_eager_matches_hf():
@@ -50,18 +51,18 @@ def test_eager_matches_hf():
     num_layers, batch, seq_len, num_experts, top_k = 2, 2, 16, 8, 2
     base = torch.randn(num_layers, batch * seq_len, num_experts, dtype=torch.float32)
     layers_h = tuple(base[i].detach().requires_grad_(True) for i in range(num_layers))
-    stacked_e = _clone_stacked(base)
+    concat_e = _concat_layers(base)
 
     out_h = hf_load_balancing_loss(layers_h, num_experts, top_k)
     out_e = resolve_kernel("load_balancing_loss", "standard", "eager").wrapper(
-        stacked_e, _empty_mask(base.device), top_k=top_k
+        concat_e, _empty_mask(base.device), top_k=top_k
     )
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     out_h.backward()
     out_e.backward()
-    grad_h = torch.stack([layer.grad for layer in layers_h])
-    assert torch.allclose(stacked_e.grad, grad_h, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    grad_h = torch.cat([layer.grad for layer in layers_h], dim=0)
+    assert torch.allclose(concat_e.grad, grad_h, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 def test_eager_matches_hf_with_mask():
@@ -71,16 +72,16 @@ def test_eager_matches_hf_with_mask():
     attention_mask = torch.ones(batch, seq_len, dtype=torch.float32)
     attention_mask[:, seq_len // 2 :] = 0
     layers_h = tuple(base[i].detach().requires_grad_(True) for i in range(num_layers))
-    stacked_e = _clone_stacked(base)
+    concat_e = _concat_layers(base)
 
     out_h = hf_load_balancing_loss(layers_h, num_experts, top_k, attention_mask)
-    out_e = resolve_kernel("load_balancing_loss", "standard", "eager").wrapper(stacked_e, attention_mask, top_k=top_k)
+    out_e = resolve_kernel("load_balancing_loss", "standard", "eager").wrapper(concat_e, attention_mask, top_k=top_k)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     out_h.backward()
     out_e.backward()
-    grad_h = torch.stack([layer.grad for layer in layers_h])
-    assert torch.allclose(stacked_e.grad, grad_h, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    grad_h = torch.cat([layer.grad for layer in layers_h], dim=0)
+    assert torch.allclose(concat_e.grad, grad_h, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs CUDA")
@@ -98,12 +99,12 @@ def test_triton_matches_eager(use_mask: bool):
     else:
         attention_mask = _empty_mask("cuda")
 
-    stacked_e = _clone_stacked(base)
-    stacked_o = _clone_stacked(base)
-    out_e = eager(stacked_e, attention_mask, top_k=top_k)
-    out_o = other(stacked_o, attention_mask, top_k=top_k)
+    concat_e = _concat_layers(base)
+    concat_o = _concat_layers(base)
+    out_e = eager(concat_e, attention_mask, top_k=top_k)
+    out_o = other(concat_o, attention_mask, top_k=top_k)
     assert torch.allclose(out_e, out_o, atol=LB_FUSED_ATOL, rtol=LB_FUSED_RTOL)
 
     out_e.backward()
     out_o.backward()
-    assert torch.allclose(stacked_e.grad, stacked_o.grad, atol=LB_FUSED_GRAD_ATOL, rtol=LB_FUSED_GRAD_RTOL)
+    assert torch.allclose(concat_e.grad, concat_o.grad, atol=LB_FUSED_GRAD_ATOL, rtol=LB_FUSED_GRAD_RTOL)

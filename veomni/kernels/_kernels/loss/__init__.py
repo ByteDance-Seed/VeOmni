@@ -14,8 +14,8 @@
 
 """Loss kernels.
 
-``load_balancing_loss`` has ``standard`` eager / triton rows. Callers stack
-per-layer gate logits to ``[num_layers, tokens, num_experts]``. An empty
+``load_balancing_loss`` has ``standard`` eager / triton rows. Callers
+``torch.cat`` the per-layer tuple to ``[N, num_experts]``. An empty
 ``attention_mask`` means every token counts.
 
 ``cross_entropy_loss`` ``standard`` is token-level CE. Empty ``weight`` means
