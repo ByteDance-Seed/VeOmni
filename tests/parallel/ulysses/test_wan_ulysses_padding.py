@@ -59,7 +59,7 @@ class WanUlyssesUnpatchifyPaddingTest(SequenceParallelTest):
         c10d.broadcast(full_input, src=0)
         full_input.requires_grad_(True)
 
-        # -- the exact sequence WanModel.forward now runs --
+        # The exact sequence WanModel.forward now runs.
         unpadded_seq_len = full_input.shape[1]
         padded = padding_tensor_for_seqeunce_parallel(full_input, dim=1, group=sp_group)
         local = slice_input_tensor_scale_grad(padded, dim=1, group=sp_group)
