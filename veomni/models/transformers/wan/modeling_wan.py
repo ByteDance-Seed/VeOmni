@@ -33,6 +33,7 @@ from veomni.distributed.sequence_parallel.async_ulysses_dit import (
     async_ulysses_output_projection,
     async_ulysses_qkv_projection,
 )
+from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
 
 from ....utils import logging
 from .config_wan import WanConfig
@@ -603,8 +604,18 @@ class WanModel(PreTrainedModel):
             .to(x.device)
         )
 
+        # f*h*w is not guaranteed to be divisible by the Ulysses SP size (e.g. a
+        # 21x60x45 grid under sp_size=8 has 56700 tokens, and 56700 % 8 == 4).
+        # `slice_input_tensor_scale_grad` floor-divides internally
+        # (`dim_size // seq_world_size`), so an un-padded call silently drops the
+        # remainder tokens instead of distributing them to any rank. Pad both `x`
+        # and `freqs` up to a multiple of sp_size first, and strip the padding
+        # back off after the post-block gather using the true `f*h*w` length.
+        unpadded_seq_len = x.shape[1]
         if get_parallel_state().ulysses_enabled:
+            x = padding_tensor_for_seqeunce_parallel(x, dim=1)
             x = slice_input_tensor_scale_grad(x, dim=1)
+            freqs = padding_tensor_for_seqeunce_parallel(freqs, dim=0)
             freqs = slice_input_tensor_scale_grad(freqs, dim=0)
 
         cos = freqs.real.squeeze().contiguous()
@@ -628,7 +639,7 @@ class WanModel(PreTrainedModel):
         x = self.head(x, t)
 
         if get_parallel_state().ulysses_enabled:
-            x = gather_outputs(x, gather_dim=1)
+            x = gather_outputs(x, gather_dim=1, padding_dim=1, unpad_dim_size=unpadded_seq_len)
         x = self.unpatchify(x, (f, h, w))
         return x
 
