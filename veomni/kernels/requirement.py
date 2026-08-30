@@ -14,9 +14,9 @@
 
 """Hardware requirements for kernel rows.
 
-A requirement is a register-time visibility filter, not part of the
-``(kernel, variant, impl)`` key. Invisible rows are dropped on register
-and never enter ``KERNEL_REGISTRY``.
+A requirement is not part of the ``(kernel, variant, impl)`` key. Rows are
+always registered. ``resolve_kernel`` calls ``check()``. ``list_available``
+keeps only rows whose ``matches()`` is true.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from ..utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_
 
 
 class KernelRequirement(Protocol):
-    """Predicate that decides whether a registered row is visible here."""
+    """Predicate that decides whether this machine can run a registered row."""
 
     def matches(self) -> bool:
         """Return whether this machine can run the row."""

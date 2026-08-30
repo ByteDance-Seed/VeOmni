@@ -128,16 +128,14 @@ class KernelRegistry:
         """Create an empty registry table."""
         self._entries: dict[tuple[str, str, str], KernelEntry] = {}
 
-    def _entry_visible(self, entry: KernelEntry) -> bool:
+    def _requirement_matches(self, entry: KernelEntry) -> bool:
         """Return whether ``entry.requirement`` is missing or matches this machine."""
         return entry.requirement is None or entry.requirement.matches()
 
     def register(self, entry: KernelEntry) -> None:
-        """Insert ``entry`` if it is visible. Duplicate keys raise."""
+        """Insert ``entry``. Duplicate ``(kernel, variant, impl)`` keys raise."""
         if not isinstance(entry, KernelEntry):
             raise TypeError(f"KERNEL_REGISTRY.register expects KernelEntry, got {type(entry).__name__}")
-        if not self._entry_visible(entry):
-            return
 
         key = (entry.kernel, entry.variant, entry.impl)
         if key in self._entries:
@@ -148,19 +146,38 @@ class KernelRegistry:
         self._entries[key] = entry
 
     def resolve(self, kernel: str, variant: str, impl: str) -> KernelEntry:
-        """Return the row for ``(kernel, variant, impl)`` or raise ``KeyError``."""
+        """Return the row for ``(kernel, variant, impl)``.
+
+        Unknown triples raise ``KeyError``. A registered row whose
+        ``requirement`` does not match this machine raises ``RuntimeError``.
+        """
         key = (kernel, variant, impl)
         entry = self._entries.get(key)
         if entry is None:
             raise KeyError(f"Unknown kernel {kernel!r} variant={variant!r} impl={impl!r}")
+        if entry.requirement is not None:
+            try:
+                entry.requirement.check()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Kernel {kernel!r} variant={variant!r} impl={impl!r} requirement is not satisfied: {exc}"
+                ) from exc
         return entry
 
-    def list_available(self, kernel: str, variant: str) -> list[str]:
-        """Return impl names registered for ``(kernel, variant)``."""
+    def list_registered(self, kernel: str, variant: str) -> list[str]:
+        """Return every registered impl name for ``(kernel, variant)``."""
         return [
             impl
             for (entry_kernel, entry_variant, impl) in self._entries
             if entry_kernel == kernel and entry_variant == variant
+        ]
+
+    def list_available(self, kernel: str, variant: str) -> list[str]:
+        """Return impl names for ``(kernel, variant)`` that match this machine."""
+        return [
+            impl
+            for (entry_kernel, entry_variant, impl), entry in self._entries.items()
+            if entry_kernel == kernel and entry_variant == variant and self._requirement_matches(entry)
         ]
 
 
@@ -180,7 +197,7 @@ def register_kernel(
     """Register one row on ``KERNEL_REGISTRY``.
 
     Pass a raw pair or an opaque ``wrapper``, not both. ``requirement`` is
-    evaluated at register time.
+    stored on the row and checked by ``resolve_kernel``.
     """
     KERNEL_REGISTRY.register(
         KernelEntry(

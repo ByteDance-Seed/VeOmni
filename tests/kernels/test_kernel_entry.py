@@ -100,7 +100,7 @@ class TestRegisterAndResolve:
         with pytest.raises(ValueError, match="Duplicate kernel registration"):
             register_kernel("add", "standard", "eager", _add_forward, _add_backward)
 
-    def test_disjoint_hardware_does_not_conflict(self):
+    def test_same_impl_conflicts_across_requirements(self):
         KERNEL_REGISTRY.register(
             KernelEntry(
                 kernel="add",
@@ -111,18 +111,19 @@ class TestRegisterAndResolve:
                 requirement=CudaKernelRequirement(),
             )
         )
-        KERNEL_REGISTRY.register(
-            KernelEntry(
-                kernel="add",
-                variant="standard",
-                impl="fused",
-                forward=_add_forward,
-                backward=_add_backward,
-                requirement=NpuKernelRequirement(),
+        with pytest.raises(ValueError, match="Duplicate kernel registration"):
+            KERNEL_REGISTRY.register(
+                KernelEntry(
+                    kernel="add",
+                    variant="standard",
+                    impl="fused",
+                    forward=_add_forward,
+                    backward=_add_backward,
+                    requirement=NpuKernelRequirement(),
+                )
             )
-        )
 
-    def test_unmatched_requirement_is_not_registered(self):
+    def test_unmatched_requirement_is_registered_but_not_resolvable(self):
         register_kernel(
             "add",
             "standard",
@@ -131,9 +132,12 @@ class TestRegisterAndResolve:
             _add_backward,
             requirement=CudaKernelRequirement(min_cc=999),
         )
+        assert "cuda_only" in KERNEL_REGISTRY.list_registered("add", "standard")
         assert "cuda_only" not in KERNEL_REGISTRY.list_available("add", "standard")
-        with pytest.raises(KeyError, match="Unknown kernel"):
+        with pytest.raises(RuntimeError, match="requirement is not satisfied"):
             resolve_kernel("add", "standard", "cuda_only")
+        with pytest.raises(RuntimeError, match="requirement is not satisfied"):
+            VeomniKernel("add", "standard", "cuda_only")
 
     def test_register_rejects_non_entry(self):
         with pytest.raises(TypeError, match="KernelEntry"):
