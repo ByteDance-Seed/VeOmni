@@ -14,14 +14,20 @@
 
 """Loss kernels.
 
-``load_balancing_loss`` has ``standard`` eager / triton rows. Cross-entropy
-lands here later. Callers stack per-layer gate logits to
-``[num_layers, tokens, num_experts]``. An empty ``attention_mask`` means
-every token counts.
+``load_balancing_loss`` has ``standard`` eager / triton rows. Callers stack
+per-layer gate logits to ``[num_layers, tokens, num_experts]``. An empty
+``attention_mask`` means every token counts.
+
+``cross_entropy_loss`` ``standard`` is token-level CE. Empty ``weight`` means
+the first tensor is already logits. Label shift and SP reduction stay in the
+caller. ``chunk_logprobs`` / top-k distill are not this kernel.
 """
 
 from ...registry import register_kernel
 from ...requirement import CudaKernelRequirement
+from .cross_entropy_loss.standard import chunk_loss as ce_chunk
+from .cross_entropy_loss.standard import eager as ce_eager
+from .cross_entropy_loss.standard import liger_kernel as ce_liger
 from .load_balancing_loss.standard import eager as lb_eager
 from .load_balancing_loss.standard import triton as lb_triton
 
@@ -36,3 +42,16 @@ register_kernel(
     lb_triton.backward,
     requirement=CudaKernelRequirement(),
 )
+
+register_kernel("cross_entropy_loss", "standard", "eager", ce_eager.forward, ce_eager.backward)
+
+register_kernel(
+    "cross_entropy_loss",
+    "standard",
+    "liger_kernel",
+    ce_liger.forward,
+    ce_liger.backward,
+    requirement=CudaKernelRequirement(),
+)
+
+register_kernel("cross_entropy_loss", "standard", "chunk_loss", ce_chunk.forward, ce_chunk.backward)
