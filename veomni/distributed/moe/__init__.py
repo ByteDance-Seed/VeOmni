@@ -13,9 +13,9 @@
 # limitations under the License.
 
 
+# Temporary: ops and older tests still import these from distributed.moe.
+from ...kernels._kernels.moe_experts.shared.ep import EPGroupGemm, EPMergedFc1GroupGemm
 from .moe_layer import (
-    EPGroupGemm,
-    EPMergedFc1GroupGemm,
     dispatch_to_ep_class,
     preprocess,
     token_pre_all2all,

@@ -539,7 +539,8 @@ def group_gemm_fused_moe_forward(
     - Non-EP path: dispatches to ``MergedFc1TritonFusedMoeExpertFunction`` when
       merged weights are provided, or ``TritonFusedMoeExpertFunction`` when split
       weights are provided.  No format conversion is performed.
-    - EP path: always resolves to split format for ``EPGroupGemm``.
+    - EP path: ``dispatch_to_ep_class`` plus local ``EPGroupGemm`` /
+      ``EPMergedFc1GroupGemm``.
 
     ``swiglu_limit``: gpt-oss / DeepSeek-V4 style clamp on the SwiGLU
     pre-activations (``gate.clamp(max=L)``, ``up.clamp(min=-L, max=L)``).
@@ -548,7 +549,8 @@ def group_gemm_fused_moe_forward(
     """
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
-        from .....distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, dispatch_to_ep_class
+        from .....distributed.moe import dispatch_to_ep_class
+        from ..shared.ep import EPGroupGemm, EPMergedFc1GroupGemm
 
         if fc1_1_2_weight is not None:
             if fc1_1_weight is not None or fc1_2_weight is not None:

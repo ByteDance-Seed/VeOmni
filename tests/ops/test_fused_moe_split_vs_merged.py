@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from veomni.distributed.moe.moe_layer import EPGroupGemm, EPMergedFc1GroupGemm
+from veomni.distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm
 from veomni.ops.kernels import moe as fused_moe
 from veomni.ops.kernels.moe import fused_moe_forward
 from veomni.ops.kernels.moe._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
