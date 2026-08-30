@@ -26,6 +26,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_outputs,
     gather_seq_scatter_heads,
+    get_ulysses_sequence_parallel_rank,
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor_scale_grad,
 )
@@ -313,7 +314,7 @@ class SelfAttention(nn.Module):
         self.attn = AttentionModule(config, self.num_heads, self.head_dim)
         self.sp_async = False
 
-    def forward(self, x, freqs, cos, sin, last_loss):
+    def forward(self, x, freqs, cos, sin, last_loss, self_attn_mask=None):
         if not self.sp_async:
             q = self.norm_q(self.q(x))
             k = self.norm_k(self.k(x))
@@ -337,7 +338,7 @@ class SelfAttention(nn.Module):
         q = rope_apply(q, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
         k = rope_apply(k, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
 
-        x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True)
+        x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True, attention_mask=self_attn_mask)
 
         if not self.sp_async:
             x = self.o(x)
@@ -437,12 +438,12 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs, cos, sin, last_loss):
+    def forward(self, x, context, t_mod, freqs, cos, sin, last_loss, self_attn_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
         ).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, cos, sin, last_loss))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, cos, sin, last_loss, self_attn_mask=self_attn_mask))
         x = x + self.cross_attn(self.norm3(x), context, skip_ulysses=True)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -612,10 +613,33 @@ class WanModel(PreTrainedModel):
         # and `freqs` up to a multiple of sp_size first, and strip the padding
         # back off after the post-block gather using the true `f*h*w` length.
         unpadded_seq_len = x.shape[1]
+        self_attn_mask = None
         if get_parallel_state().ulysses_enabled:
+            sp_size = get_ulysses_sequence_parallel_world_size()
+            pad_size = (sp_size - unpadded_seq_len % sp_size) % sp_size
+            padded_seq_len = unpadded_seq_len + pad_size
+
             x = padding_tensor_for_seqeunce_parallel(x, dim=1)
-            x = slice_input_tensor_scale_grad(x, dim=1)
             freqs = padding_tensor_for_seqeunce_parallel(freqs, dim=0)
+
+            # Padding lands at the tail of the *global* sequence, and each rank
+            # gets an equal-size contiguous chunk after the slice below, so only
+            # the LAST rank's local shard can contain any padding. Build an
+            # additive self-attention mask over that rank's local key positions
+            # so the pad tokens (which the attention implementations here do not
+            # otherwise know about) can't influence real tokens' attention
+            # output. Only `eager_attention_forward` reads this today -- the
+            # flash_attention_3/sageattention wrappers below ignore
+            # `attention_mask` entirely, so this is a strict improvement where
+            # supported and a no-op (unchanged prior behavior) elsewhere. See PR
+            # discussion on #61 for the scope of what remains unmasked.
+            sp_rank = get_ulysses_sequence_parallel_rank()
+            if pad_size > 0 and sp_rank == sp_size - 1:
+                local_len = padded_seq_len // sp_size
+                self_attn_mask = torch.zeros(1, 1, 1, local_len, dtype=x.dtype, device=x.device)
+                self_attn_mask[..., local_len - pad_size :] = torch.finfo(x.dtype).min
+
+            x = slice_input_tensor_scale_grad(x, dim=1)
             freqs = slice_input_tensor_scale_grad(freqs, dim=0)
 
         cos = freqs.real.squeeze().contiguous()
@@ -632,9 +656,10 @@ class WanModel(PreTrainedModel):
                     cos,
                     sin,
                     last_loss=last_loss,
+                    self_attn_mask=self_attn_mask,
                 )
             else:
-                x = block(x, context, t_mod, freqs, cos, sin, last_loss=last_loss)
+                x = block(x, context, t_mod, freqs, cos, sin, last_loss=last_loss, self_attn_mask=self_attn_mask)
 
         x = self.head(x, t)
 
