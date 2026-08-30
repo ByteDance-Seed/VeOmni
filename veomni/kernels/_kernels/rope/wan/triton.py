@@ -66,6 +66,7 @@ def _wan_rotary_kernel():
         CONJUGATE: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
+        """Apply Wan RoPE, optionally with packed ``cu_seqlens``."""
         pid_m = tl.program_id(axis=0)
         pid_batch = tl.program_id(axis=1)
         pid_head = tl.program_id(axis=2)

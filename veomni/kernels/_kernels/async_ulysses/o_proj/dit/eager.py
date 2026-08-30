@@ -29,7 +29,7 @@ from ......distributed.sequence_parallel.utils import (
     unpadding_tensor_for_seqeunce_parallel,
 )
 from .....registry import SavedState
-from ...backward import linear_input_backward, linear_parameter_backward
+from ...shared.backward import linear_input_backward, linear_parameter_backward
 
 
 @dataclass
@@ -71,6 +71,7 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
     assert isinstance(meta, _Meta)
     hidden_states, proj_weight, proj_bias = saved.tensors
     grad_hidden = linear_input_backward(grad_output, hidden_states, proj_weight)
+    # Reverse A2A first so weight/bias grads overlap the collective.
     grad_out_res = all_to_all_tensor(
         grad_hidden,
         scatter_dim=meta.head_dimension,

@@ -50,8 +50,11 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
     """Build a modeling wrapper from raw ``forward`` / ``backward``."""
 
     class _KernelFn(torch.autograd.Function):
+        """Generated Function that calls the raw pair and unpacks ``SavedState``."""
+
         @staticmethod
         def forward(ctx: Any, *args: Any) -> Output:
+            """Run raw ``forward`` and stash tensors plus metadata on ``ctx``."""
             *tensors, attrs = args
             output, saved = raw_forward(*tensors, **attrs)
             if not isinstance(saved, SavedState):
@@ -72,6 +75,7 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
 
         @staticmethod
         def backward(ctx: Any, *grad_outputs: Tensor) -> tuple[Tensor | None, ...]:
+            """Rebuild ``SavedState`` and return grads for the positional tensors."""
             saved = SavedState(ctx.saved_tensors, ctx.saved_metadata)
             grad_output: Output = grad_outputs[0] if ctx.n_out == 1 else grad_outputs
             grads = raw_backward(grad_output, saved)
@@ -83,6 +87,7 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
             return (*grads, None)
 
     def wrapper(*tensors: Tensor, **attrs: Any) -> Output:
+        """Pack keyword attrs as the last ``apply`` argument."""
         return _KernelFn.apply(*tensors, attrs)
 
     return wrapper
@@ -119,7 +124,8 @@ class KernelEntry:
 class KernelRegistry:
     """Global ``KernelEntry`` table keyed by ``(kernel, variant, impl)``."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Create an empty registry table."""
         self._entries: dict[tuple[str, str, str], KernelEntry] = {}
 
     def _entry_visible(self, entry: KernelEntry) -> bool:
@@ -204,12 +210,14 @@ class VeomniKernel:
     _intern: dict[tuple[str, str, str], VeomniKernel] = {}
 
     def __new__(cls, kernel: str, variant: str, impl: str = "eager"):
+        """Return the interned handle for ``(kernel, variant, impl)``."""
         cached = cls._intern.get((kernel, variant, impl))
         if cached is not None:
             return cached
         return super().__new__(cls)
 
     def __init__(self, kernel: str, variant: str, impl: str = "eager"):
+        """Resolve the registry row and intern this handle."""
         if getattr(self, "_entry", None) is not None:
             return
         self.kernel = kernel
@@ -230,4 +238,5 @@ class VeomniKernel:
         return self._entry
 
     def __repr__(self) -> str:
+        """Return ``VeomniKernel(kernel=..., variant=..., impl=...)``."""
         return f"VeomniKernel(kernel={self.kernel!r}, variant={self.variant!r}, impl={self.impl!r})"

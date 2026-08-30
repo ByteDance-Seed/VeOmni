@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ...registry import KernelEntry, SavedState
+from ....registry import KernelEntry, SavedState
 
 
 # Positional tensors of raw QKV ``forward`` (hidden + Q/K/V weights/biases + QK norms).

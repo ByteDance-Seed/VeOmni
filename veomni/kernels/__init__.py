@@ -16,7 +16,7 @@
 
 ``compound`` holds nested-handle helpers. Importing this package registers
 families under ``_kernels``: ``rms_norm``, ``rope``, ``rope_vision``,
-``async_ulysses_*``, ``swiglu_mlp``, and ``loss`` (LB + CE).
+``async_ulysses_*``, ``swiglu_mlp``, ``moe_experts``, and ``loss`` (LB + CE).
 """
 
 from . import _kernels as _kernel_families  # noqa: F401

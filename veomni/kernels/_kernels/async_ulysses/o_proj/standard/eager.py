@@ -29,7 +29,7 @@ from ......distributed.sequence_parallel.utils import (
     unpadding_tensor_for_seqeunce_parallel,
 )
 from .....registry import SavedState
-from ...backward import linear_input_backward, linear_parameter_backward
+from ...shared.backward import linear_input_backward, linear_parameter_backward
 
 
 @dataclass

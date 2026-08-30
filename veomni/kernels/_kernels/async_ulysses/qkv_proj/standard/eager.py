@@ -32,9 +32,9 @@ from ......distributed.sequence_parallel.utils import (
 )
 from .....compound import InnerHandle, append_inner, resolve_inner_kernel, take_inner
 from .....registry import SavedState
-from ...backward import layer_norm_backward, linear_backward, reduce_repeated_kv_gradient
-from ...norm import layernorm_forward, normalize_shape
-from ...qkv_state import QKVMeta, qkv_grads, unpack_qkv
+from ...shared.backward import layer_norm_backward, linear_backward, reduce_repeated_kv_gradient
+from ...shared.norm import layernorm_forward, normalize_shape
+from ...shared.qkv_state import QKVMeta, qkv_grads, unpack_qkv
 
 
 def forward(

@@ -96,6 +96,7 @@ def _dsv4_rotary_kernel():
         BLOCK_M: tl.constexpr,
         CONJUGATE: tl.constexpr,
     ):
+        """Apply DeepSeek-V4 RoPE to the rotary slice of each head."""
         pid_m = tl.program_id(axis=0)
         pid_batch = tl.program_id(axis=1)
         pid_head = tl.program_id(axis=2)

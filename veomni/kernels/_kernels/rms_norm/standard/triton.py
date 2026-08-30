@@ -43,6 +43,7 @@ def _rms_norm_kernel():
         eps,
         BLOCK_SIZE: tl.constexpr,
     ):
+        """Per-row RMSNorm: reduce sum-of-squares, then scale by weight."""
         row_idx = tl.program_id(0).to(tl.int64)
         row_start_ptr = input_ptr + row_idx * input_row_stride
         output_row_start_ptr = output_ptr + row_idx * output_row_stride
