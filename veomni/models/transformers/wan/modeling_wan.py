@@ -315,6 +315,16 @@ class SelfAttention(nn.Module):
         self.sp_async = False
 
     def forward(self, x, freqs, cos, sin, last_loss, self_attn_mask=None):
+        if self_attn_mask is not None and not self.sp_async:
+            # The sync path attends only over this rank's local SP shard (see
+            # AttentionModule), so the global tail-padding mask built in
+            # WanModel.forward must be narrowed to this rank's own segment --
+            # every shard is equal-size since it was padded to a multiple of
+            # sp_size before slicing.
+            sp_rank = get_ulysses_sequence_parallel_rank()
+            local_len = x.shape[1]
+            self_attn_mask = self_attn_mask[..., sp_rank * local_len : (sp_rank + 1) * local_len]
+
         if not self.sp_async:
             q = self.norm_q(self.q(x))
             k = self.norm_k(self.k(x))
@@ -622,22 +632,26 @@ class WanModel(PreTrainedModel):
             x = padding_tensor_for_seqeunce_parallel(x, dim=1)
             freqs = padding_tensor_for_seqeunce_parallel(freqs, dim=0)
 
-            # Padding lands at the tail of the *global* sequence, and each rank
-            # gets an equal-size contiguous chunk after the slice below, so only
-            # the LAST rank's local shard can contain any padding. Build an
-            # additive self-attention mask over that rank's local key positions
-            # so the pad tokens (which the attention implementations here do not
-            # otherwise know about) can't influence real tokens' attention
-            # output. Only `eager_attention_forward` reads this today -- the
-            # flash_attention_3/sageattention wrappers below ignore
-            # `attention_mask` entirely, so this is a strict improvement where
-            # supported and a no-op (unchanged prior behavior) elsewhere. See PR
-            # discussion on #61 for the scope of what remains unmasked.
-            sp_rank = get_ulysses_sequence_parallel_rank()
-            if pad_size > 0 and sp_rank == sp_size - 1:
-                local_len = padded_seq_len // sp_size
-                self_attn_mask = torch.zeros(1, 1, 1, local_len, dtype=x.dtype, device=x.device)
-                self_attn_mask[..., local_len - pad_size :] = torch.finfo(x.dtype).min
+            # Build one GLOBAL additive mask over the padded tail, identical on
+            # every rank, marking the pad positions so they can't influence real
+            # tokens' attention output. `SelfAttention.forward` adapts it to
+            # whichever shape its attention call actually needs:
+            #   - sync path (`sp_async=False`, the only path Wan uses today):
+            #     each attention backend here runs on the LOCAL SP shard only,
+            #     so only the LAST rank's shard ever contains padding --
+            #     `SelfAttention` slices this mask down to its own local segment.
+            #   - async path (`sp_async=True`): `async_ulysses_qkv_projection`
+            #     all-to-alls K/V to their full GLOBAL length on every rank (its
+            #     own unpad call is a no-op here since it's told the padded, not
+            #     true, length), so every rank needs the full mask as-is.
+            # Only `eager_attention_forward` reads this today -- the
+            # flash_attention_3/sageattention wrappers ignore `attention_mask`
+            # entirely, so this is a strict improvement where supported and a
+            # no-op (unchanged prior behavior) elsewhere. See PR #1139 for the
+            # scope of what remains unmasked.
+            if pad_size > 0:
+                self_attn_mask = torch.zeros(1, 1, 1, padded_seq_len, dtype=x.dtype, device=x.device)
+                self_attn_mask[..., padded_seq_len - pad_size :] = torch.finfo(x.dtype).min
 
             x = slice_input_tensor_scale_grad(x, dim=1)
             freqs = slice_input_tensor_scale_grad(freqs, dim=0)
