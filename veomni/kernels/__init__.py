@@ -15,13 +15,14 @@
 """VeOmni kernel registry and the families registered on import.
 
 ``compound`` holds nested-handle helpers. Importing this package registers
-``rms_norm``, ``rope``, ``rope_vision``, and ``async_ulysses_*``.
+``rms_norm``, ``rope``, ``rope_vision``, ``async_ulysses_*``, and ``swiglu_mlp``.
 """
 
 from . import async_ulysses as _async_ulysses  # noqa: F401
 from . import rms_norm as _rms_norm  # noqa: F401
 from . import rope as _rope  # noqa: F401
 from . import rope_vision as _rope_vision  # noqa: F401
+from . import swiglu_mlp as _swiglu_mlp  # noqa: F401
 from .registry import KERNEL_REGISTRY, VeomniKernel, register_kernel, resolve_kernel
 
 
