@@ -10,7 +10,8 @@ What is checked, in ``AGENTS.md``, ``.agents/**/*.md`` and ``.cursor/rules/*``:
 
 * Inline-code spans and Markdown link targets that look repo-root-relative --
   i.e. whose first segment matches an entry that exists at the repo root -- must
-  resolve to a real file or directory.
+  resolve to a real file or directory. A ``path.py::symbol`` reference is
+  checked as ``path.py``.
 * ``/skill-name`` references must resolve to ``.agents/skills/<name>/SKILL.md``.
 * So must a backticked name used as a skill, as in "see ``some-skill`` skill".
 
@@ -61,7 +62,8 @@ def looks_like_path(candidate: str) -> bool:
 
 
 def normalize(candidate: str) -> str:
-    """Strip a trailing line-number suffix, trailing punctuation and slashes."""
+    """Strip a trailing symbol or line-number suffix, punctuation and slashes."""
+    candidate = re.sub(r"::[\w.]+$", "", candidate)
     candidate = re.sub(r":\d+(-\d+)?$", "", candidate)
     return candidate.rstrip("/.,;:")
 
