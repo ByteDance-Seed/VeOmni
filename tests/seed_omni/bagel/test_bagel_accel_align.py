@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 
 import pytest
 import torch
@@ -24,21 +25,50 @@ from tests.seed_omni.bagel.helpers import (
     tiny_align_qwen2_cfg,
 )
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import BagelQwen2MoTAccelerated
+from veomni.ops.kernels.attention.magi import _fa4_cuda as magi_fa4_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 _PATCH_LATENT_DIM = 4
 _CASES: tuple[ToyCase, ...] = ("ce_only", "vit_ce", "mse_only", "mixed")
+_MAGI_IMPLEMENTATION = "veomni_magi_attention_with_sp"
+_FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
+
+
+def _is_magi_ffa_available() -> bool:
+    if not IS_CUDA_AVAILABLE or importlib.util.find_spec("magi_attention") is None:
+        return False
+
+    kernel_mode = magi_fa4_backend._get_magi_kernel_mode(torch.device(get_device_type()))
+    if kernel_mode == magi_fa4_backend._MAGI_KERNEL_CUTE_JIT:
+        return importlib.util.find_spec("flash_attn_cute") is not None
+    if kernel_mode != magi_fa4_backend._MAGI_KERNEL_CUTLASS:
+        return False
+
+    try:
+        from flash_attn_cute.ffa_fa3 import flash_attn_interface
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+    return all(
+        callable(getattr(flash_attn_interface, name, None)) for name in ("_flash_attn_forward", "_flash_attn_backward")
+    )
+
+
+_MAGI_FFA_AVAILABLE = _is_magi_ffa_available()
+_MAGI_FFA_REASON = (
+    "MagiAttention alignment requires a supported NVIDIA GPU with its CUTLASS overlay or CUTE DSL/JIT backend"
+)
 
 
 def _eager_config():
     return config_cls("bagel_qwen2_mot")(**tiny_align_qwen2_cfg(), attn_implementation="sdpa")
 
 
-def _flex_config():
+def _accelerated_config(attn_implementation: str):
     return config_cls("bagel_qwen2_mot")(
         **tiny_align_qwen2_cfg(),
-        attn_implementation="veomni_flex_attention_with_sp",
+        attn_implementation=attn_implementation,
     )
 
 
@@ -48,20 +78,20 @@ def _shared_heads(hidden_size: int, vocab_size: int, device: torch.device) -> tu
     return lm_head, llm2vae
 
 
-def _build_aligned_models(device: torch.device, dtype: torch.dtype):
+def _build_aligned_models(device: torch.device, dtype: torch.dtype, *, attn_implementation: str):
     torch.manual_seed(29)
     eager = native_model_cls("bagel_qwen2_mot")(_eager_config()).to(device=device, dtype=dtype).train()
-    accelerated = BagelQwen2MoTAccelerated(_flex_config()).to(device=device, dtype=dtype).train()
+    accelerated = (
+        BagelQwen2MoTAccelerated(_accelerated_config(attn_implementation)).to(device=device, dtype=dtype).train()
+    )
     accelerated.load_state_dict(copy.deepcopy(eager.state_dict()))
     return eager, accelerated
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlexAttention alignment requires CUDA")
-@pytest.mark.parametrize("case", _CASES)
-def test_accelerated_ce_mse_matches_eager_on_toy_data(case: ToyCase) -> None:
+def _assert_accelerated_matches_eager(case: ToyCase, attn_implementation: str) -> None:
     device = torch.device(get_device_type())
     dtype = torch.bfloat16
-    eager, accelerated = _build_aligned_models(device, dtype)
+    eager, accelerated = _build_aligned_models(device, dtype, attn_implementation=attn_implementation)
     hidden_size = int(eager.config.hidden_size)
     vocab_size = int(eager.config.vocab_size)
     conversation = build_toy_conversation(
@@ -129,3 +159,15 @@ def test_accelerated_ce_mse_matches_eager_on_toy_data(case: ToyCase) -> None:
             rtol=ALIGN_GRAD_RTOL,
             msg=f"gradient mismatch for {name}",
         )
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlexAttention alignment requires CUDA")
+@pytest.mark.parametrize("case", _CASES)
+def test_accelerated_ce_mse_matches_eager_on_toy_data(case: ToyCase) -> None:
+    _assert_accelerated_matches_eager(case, _FLEX_IMPLEMENTATION)
+
+
+@pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)
+@pytest.mark.parametrize("case", _CASES)
+def test_magi_ce_mse_matches_eager_on_toy_data(case: ToyCase) -> None:
+    _assert_accelerated_matches_eager(case, _MAGI_IMPLEMENTATION)

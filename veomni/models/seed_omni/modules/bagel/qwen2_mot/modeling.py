@@ -800,7 +800,12 @@ class BagelQwen2MoTAttention(nn.Module):
         return torch.cat((query_states, key_states, value_states), dim=-1)
 
     @staticmethod
-    def build_attention_mask(packed_attention_metadata: torch.Tensor) -> torch.Tensor:
+    def build_attention_mask(
+        packed_attention_metadata: torch.Tensor,
+        *,
+        attn_implementation: str | None = None,
+    ) -> torch.Tensor:
+        del attn_implementation
         return build_mot_sdpa_mask(packed_attention_metadata)
 
     def apply_rotary_pos_emb(
@@ -1318,6 +1323,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         rms_norm_cls: type[Qwen2RMSNorm] = Qwen2RMSNorm,
     ):
         super().__init__()
+        self.config = config
         self.gradient_checkpointing = False
         self.layers = nn.ModuleList(
             [
@@ -1357,7 +1363,8 @@ class BagelQwen2MoTBackbone(nn.Module):
                 f"expected {expected_metadata_shape}, got {tuple(packed_attention_metadata.shape)}."
             )
         return self.attention_cls.build_attention_mask(
-            packed_attention_metadata.to(device=packed_query_sequence.device)
+            packed_attention_metadata.to(device=packed_query_sequence.device),
+            attn_implementation=self.config._attn_implementation,
         )
 
     def _apply_inference_final_norm(
@@ -1385,7 +1392,10 @@ class BagelQwen2MoTBackbone(nn.Module):
         packed_und_token_indexes: Optional[torch.Tensor] = None,
         packed_gen_token_indexes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        attention_mask = self.attention_cls.build_attention_mask(packed_attention_metadata)
+        attention_mask = self.attention_cls.build_attention_mask(
+            packed_attention_metadata,
+            attn_implementation=self.config._attn_implementation,
+        )
         cos, sin = self.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
         packed_position_cos = cos.squeeze(0)
         packed_position_sin = sin.squeeze(0)

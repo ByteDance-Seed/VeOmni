@@ -22,7 +22,7 @@ from ......distributed.sequence_parallel import (
     sp_pad,
 )
 from ......ops.dispatch import OpSlot
-from ......ops.kernels.attention import fused_attention_forward
+from ......ops.kernels.attention import MagiAttentionMask, fused_attention_forward
 from ......utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from ....mixins.base_mixin import BaseMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
@@ -36,7 +36,7 @@ from .checkpoint_conversion import (
     split_qkv_state_dict_post_hook,
 )
 from .configuration import BagelQwen2MoTConfig
-from .masking import build_mot_block_mask, pad_mot_attention_metadata
+from .masking import build_mot_block_mask, build_mot_magi_mask, pad_mot_attention_metadata
 from .modeling import (
     _FLASH_ATTENTION_2,
     BagelQwen2MoTAttention,
@@ -409,6 +409,8 @@ _PACKED_FUSED_ATTN_IMPLEMENTATIONS = (
     "veomni_flex_attention_with_sp",
     "veomni_magi_attention_with_sp",
 )
+_FLEX_ATTN_IMPLEMENTATIONS = frozenset({"flex_attention", "veomni_flex_attention_with_sp"})
+_MAGI_ATTN_IMPLEMENTATIONS = frozenset({"magi_attention", "veomni_magi_attention_with_sp"})
 
 
 class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
@@ -443,8 +445,19 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         return projected
 
     @staticmethod
-    def build_attention_mask(packed_attention_metadata: torch.Tensor) -> BlockMask:
-        return build_mot_block_mask(packed_attention_metadata)
+    def build_attention_mask(
+        packed_attention_metadata: torch.Tensor,
+        *,
+        attn_implementation: str | None = None,
+    ) -> BlockMask | MagiAttentionMask:
+        if attn_implementation in _MAGI_ATTN_IMPLEMENTATIONS:
+            return build_mot_magi_mask(packed_attention_metadata)
+        if attn_implementation in _FLEX_ATTN_IMPLEMENTATIONS or attn_implementation is None:
+            return build_mot_block_mask(packed_attention_metadata)
+        raise ValueError(
+            "BAGEL Qwen2-MoT packed fused attention requires "
+            f"{', '.join(_PACKED_FUSED_ATTN_IMPLEMENTATIONS)}, got {attn_implementation!r}."
+        )
 
     def apply_rotary_pos_emb(
         self,
@@ -461,7 +474,7 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         packed_query_states: torch.Tensor,
         packed_key_states: torch.Tensor,
         packed_value_states: torch.Tensor,
-        attention_mask: BlockMask,
+        attention_mask: BlockMask | MagiAttentionMask,
     ) -> torch.Tensor:
         if self.config._attn_implementation not in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
             raise ValueError(
@@ -487,7 +500,7 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         merged_key_states: torch.Tensor,
         merged_value_states: torch.Tensor,
         *,
-        attention_mask: BlockMask | None,
+        attention_mask: BlockMask | MagiAttentionMask | None,
         is_causal: bool,
         cu_seq_lens_q: torch.Tensor,
         cu_seq_lens_k: torch.Tensor,
@@ -605,6 +618,7 @@ class InferenceMixinAccelerated(InferenceMixin):
 
 class BagelQwen2MoTAccelerated(VeOmniMixin, InferenceMixinAccelerated, BagelQwen2MoTCore):
     _supports_flex_attn = True
+    _supports_magi_attn = True
     _export_hf_checkpoint_with_weight_conversions = True
     attention_cls = BagelQwen2MoTAttentionAccelerated
     mlp_cls = Qwen2MLPAccelerated
