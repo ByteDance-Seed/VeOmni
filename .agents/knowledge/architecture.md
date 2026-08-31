@@ -208,7 +208,7 @@ tests/
 | `veomni/distributed/` | `pytest tests/parallel/ tests/distributed/` |
 | `veomni/checkpoint/` | `pytest tests/checkpoints/` |
 | `veomni/utils/` | `pytest tests/utils/` |
-| `veomni/trainer/` | `pytest tests/trainer/`, then `tests/e2e/` for loop changes |
+| `veomni/trainer/` | `pytest tests/trainer/`, then `pytest tests/e2e/` for loop changes |
 | `veomni/lora/` | `pytest tests/lora/` |
 | `veomni/optim/` | `pytest tests/optim/` |
 | Full regression | `pytest tests/` |

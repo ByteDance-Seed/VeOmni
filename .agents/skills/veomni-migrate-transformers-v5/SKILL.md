@@ -85,9 +85,13 @@ Use the pinned version as the directory name so several pins can coexist:
 PIN=$(python -c "import transformers; print(transformers.__version__)")
 mkdir -p ".agents_workspace/hf_reference/<m>/v${PIN}"
 
-curl -sL -o ".agents_workspace/hf_reference/<m>/v${PIN}/modeling_<m>.py" \
+curl -fsSL -o ".agents_workspace/hf_reference/<m>/v${PIN}/modeling_<m>.py" \
   "https://github.com/huggingface/transformers/raw/v${PIN}/src/transformers/models/<m>/modeling_<m>.py"
 ```
+
+`-f` matters: without it a missing tag or renamed module returns 404 and curl
+writes the error page into `modeling_<m>.py` with exit status 0, so you would
+diff against an HTML page and not notice.
 
 For VLMs also grab `processing_<m>.py` / `image_processing_<m>.py` /
 `configuration_<m>.py` if you expect processor-side or config-shape work.
@@ -101,9 +105,9 @@ between:
 
 ```bash
 mkdir -p .agents_workspace/hf_reference/<m>/{old,new}
-curl -sL -o .agents_workspace/hf_reference/<m>/old/modeling_<m>.py \
+curl -fsSL -o .agents_workspace/hf_reference/<m>/old/modeling_<m>.py \
   "https://github.com/huggingface/transformers/raw/<old_ver>/src/transformers/models/<m>/modeling_<m>.py"
-curl -sL -o .agents_workspace/hf_reference/<m>/new/modeling_<m>.py \
+curl -fsSL -o .agents_workspace/hf_reference/<m>/new/modeling_<m>.py \
   "https://github.com/huggingface/transformers/raw/<new_ver>/src/transformers/models/<m>/modeling_<m>.py"
 diff -u .agents_workspace/hf_reference/<m>/{old,new}/modeling_<m>.py | less
 ```

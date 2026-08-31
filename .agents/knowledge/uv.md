@@ -103,7 +103,7 @@ forced into a specific 5.x patch.
 | `flash-attn-3` (Hopper) | cp310-abi3 Luosuu wheel on x86_64; cp39-abi3 PyTorch cu130 wheel on aarch64 | abi3 covers supported Python versions; aarch64 requires glibc 2.34+ |
 | `flash-mla` | cp311/cp312 Luosuu cu130/torch2.11/sm90a+sm100f wheels | architecture-specific x86_64/aarch64 wheels |
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
-| `flash-qla` | PyPI `0.1.2` | pure-Python wheel; static metadata already matches the TileLang / tvm-ffi pins, so no source build and no metadata override |
+| `flash-qla` | PyPI `0.1.2` | pure-Python wheel that publishes usable metadata (it declares only `apache-tvm-ffi`), so no source build and no `dependency-metadata` override |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
 | `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | the only source builds left; SM90+ only, excluded on the SM89 GPU CI runners |
 
@@ -129,8 +129,11 @@ Two pyproject knobs make the remaining git source builds succeed:
    flags for the three that need them (not `flash-attn-cute`).
 
 `FLASH_ATTENTION_FORCE_BUILD=TRUE` and `[tool.uv.no-build-isolation-package]`
-are gone — no FA setup.py runs anywhere now (FA2/3/MLA are wheels, FA4 and
-flash-qla are pure-Python PyPI releases).
+are gone. FA2/3/MLA are wheels and FA4 and flash-qla are pure-Python PyPI
+releases, so nothing forces a build of mainline flash-attention. One FA-shaped
+source build remains: `flash-attn-cute` is the `flash_attn` subdirectory of the
+pinned `demonatic/flash-attention` fork, and it takes its toolchain from
+`[tool.uv.extra-build-dependencies]` rather than from `--no-build-isolation`.
 
 ## Common Commands
 
