@@ -72,10 +72,11 @@ def test_postforward_prefers_loss_dict_over_loss():
     trainer.micro_batches_token_len = {"foundation_tokens": torch.tensor(1), "mtp_tokens": torch.tensor(1)}
     trainer.global_micro_batches_token_len = {"foundation_tokens": 1.0, "mtp_tokens": 1.0}
 
-    loss, loss_dict = trainer.postforward(out, {})
+    loss, loss_dict, aux_metrics = trainer.postforward(out, {})
 
     assert set(loss_dict) == {"foundation_loss", "mtp_loss"}
     assert loss.item() == 3.0
+    assert aux_metrics == {}
 
 
 def test_postforward_falls_back_to_plain_loss_tensor():
@@ -88,10 +89,11 @@ def test_postforward_falls_back_to_plain_loss_tensor():
     trainer.micro_batches_token_len = {"foundation_tokens": torch.tensor(1)}
     trainer.global_micro_batches_token_len = {"foundation_tokens": 1.0}
 
-    loss, loss_dict = trainer.postforward(out, {})
+    loss, loss_dict, aux_metrics = trainer.postforward(out, {})
 
     assert set(loss_dict) == {"foundation_loss"}
     assert loss.item() == 2.0
+    assert aux_metrics == {}
 
 
 def test_model_output_subclass_field_order_is_still_loss_first():
