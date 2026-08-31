@@ -18,6 +18,7 @@ from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     build_mot_attention_metadata,
     build_mot_block_mask,
 )
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import _sdpa_packed_attention
 
 
 def _flex_config() -> BagelQwen2MoTConfig:
@@ -31,6 +32,27 @@ def _flex_config() -> BagelQwen2MoTConfig:
         max_position_embeddings=64,
         attn_implementation="veomni_flex_attention_with_sp",
     )
+
+
+def test_cached_sdpa_causal_attention_is_bottom_right_aligned() -> None:
+    query = torch.zeros(1, 1, 1)
+    key = torch.zeros(4, 1, 1)
+    value = torch.tensor([1.0, 2.0, 4.0, 8.0]).reshape(4, 1, 1)
+
+    output = _sdpa_packed_attention(
+        query,
+        key,
+        value,
+        is_causal=True,
+        cu_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seq_lens_k=torch.tensor([0, 4], dtype=torch.int32),
+        scale=1.0,
+        enable_gqa=False,
+    )
+
+    # A single cached decode query is the final logical row, so it can attend
+    # to all four historical keys. Upper-left causal alignment would return 1.
+    torch.testing.assert_close(output, torch.tensor([[[3.75]]]))
 
 
 def test_accelerated_training_attention_rejects_non_flex_backend() -> None:
