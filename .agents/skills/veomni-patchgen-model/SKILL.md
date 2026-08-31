@@ -18,40 +18,22 @@ supported transformers-family model. The non-transformers architectures
 - `docs/transformers_v5/veomni_flash_attention_kernel_adapter.md` — FA custom-name adapter
 - `docs/transformers_v5/testing_new_model.md` — test case SOP for a new model
 
-**Working examples (copy the structure, do not edit `generated/`):**
+## What to read for your model
 
-Examples grouped by complexity / capability — pick the closest one and adapt:
+This file is the spine: it applies to every model. The category-specific
+material lives in `references/` — load only what your model needs.
 
-- **Text LLM (dense)** — `veomni/models/transformers/qwen3/`, `veomni/models/transformers/llama/`, `veomni/models/transformers/qwen2/`, `veomni/models/transformers/seed_oss/`
-  - `__init__.py` — registers a patchgen-generated `<Model>ForCausalLM` / `<Model>Model` / `<Model>ForSequenceClassification` via `MODELING_REGISTRY`.
-  - `<m>_gpu_patch_gen_config.py` — Liger + SP + fused-CE patches. Llama is the minimal reference (5 OpSlot patches: RMSNorm, MLP, RoPE, ForCausalLM, ForSequenceClassification — no SP or MoE specifics).
-- **Text LLM with NPU patchgen** — `veomni/models/transformers/seed_oss/`
-  - `__init__.py` — branches on `IS_NPU_AVAILABLE` between `patched_modeling_seed_oss_{gpu,npu}`.
-  - Sibling configs produce separate `generated/*_{gpu,npu}.py` outputs.
-- **MoE** — `veomni/models/transformers/qwen3_moe/`
-  - `__init__.py` — attaches `_create_checkpoint_tensor_converter` as a `staticmethod` on every patchgen-generated class.
-  - `qwen3_moe_gpu_patch_gen_config.py` — replaces `Qwen3MoeExperts` with the fused-MoE layout and overrides `get_parallel_plan`.
-  - `checkpoint_tensor_converter.py` — HF per-expert → fused runtime converter.
-  - `parallel_plan.py` — single `get_parallel_plan()` sharding the fused `gate_up_proj`.
-- **MoE + NPU patchgen** — `veomni/models/transformers/deepseek_v3/`
-  - Sibling `deepseek_v3_{gpu,npu}_patch_gen_config.py`; both generated files committed.
-  - Runtime kernel choice (deterministic Triton RoPE + batch-invariant RMSNorm) is wired in `__init__.py` via `apply_veomni_deepseek_v3_device_patch(gen_module)` for actor/rollout numerical parity. No Liger kernels in the generated file itself.
-- **VLM (non-MoE) + GPU+NPU patchgen** — `veomni/models/transformers/qwen3_vl/`
-  - `__init__.py` — registers the patchgen-generated classes, branching on `IS_NPU_AVAILABLE` between `patched_modeling_qwen3_vl_{gpu,npu}`.
-  - `qwen3_vl_gpu_patch_gen_config.py` — full VLM forward with Ulysses SP, async Ulysses text attention, deepstack, precomputed mrope via `get_position_id_func`, and a SP-aware `dummy_forward`.
-  - `qwen3_vl_npu_patch_gen_config.py` — demonstrates the **NPU-inherits-GPU** pattern: a thin NPU config that extends `gpu_config.helpers` / `gpu_config.post_import_blocks` / `gpu_config.additional_imports` and only overrides RMSNorm / rotary with `torch_npu.npu_rms_norm` / `torch_npu.npu_rotary_mul`. Avoids duplicating ~1K lines of shared VLM SP/deepstack patches.
-- **Omni (thinker+talker subtree, non-MoE)** — `veomni/models/transformers/qwen2_5_omni/`
-  - `__init__.py` — imports `Qwen2_5OmniForConditionalGeneration` / `Qwen2_5OmniThinkerForConditionalGeneration` from the patchgen-generated module **and** `Qwen2_5OmniTalkerModel` / `Qwen2_5OmniTalkerForConditionalGeneration` directly from `transformers.models.qwen2_5_omni.modeling_qwen2_5_omni` (talker classes are excluded from the generated file but the registry still needs to return them when `architecture` mentions `Talker...`). `MODEL_CONFIG_REGISTRY` applies the `tie_word_embeddings=False` config patch.
-  - `qwen2_5_omni_gpu_patch_gen_config.py` — the canonical **non-MoE Omni** template: excludes talker + token2wav + DiT + BigVGAN subtrees, overrides `_init_weights` to drop excluded `UpSample1d`/`DownSample1d` branches, overrides `ForConditionalGeneration.__init__` to force `has_talker=False` and pin `_no_split_modules=[DecoderLayer, VisionBlock, AudioEncoderLayer]` (use a `list[str]` to match the upstream HF convention — `modeling_utils.py` converts it to a set internally, so either works at runtime, but staying with `list[str]` keeps the patched class isomorphic with the upstream base class attr), registers a load-state-dict pre-hook to strip `talker.*`/`token2wav.*` keys, overrides `enable_talker`/`generate` to raise `NotImplementedError`, and forwards `ForConditionalGeneration.forward` to thinker only — **minus** all MoE/EP machinery (no `replace_class("…Experts")`, no `parallel_plan.py`, no `checkpoint_tensor_converter.py`). Thinker uses `Qwen2_5OmniThinkerCausalLMOutputWithLogProbs` from `veomni.utils.model_outputs` to carry `log_probs`/`entropy` as constructor fields (same FSDP2 unshard-hook rationale as qwen3_omni_moe). Audio encoder uses 1D convs (`conv1`/`conv2`) — pull dummy-forward dtype from `self.conv1.weight.dtype`, not `self.conv2d1` (that's qwen3_omni_moe-specific).
-  - **No `parallel_plan.py` / no `checkpoint_tensor_converter.py`** — qwen2.5-Omni's thinker text model is dense (Qwen2-class MLP, not MoE), so neither EP nor fused-expert weight conversion applies. If you start from the qwen3_omni_moe template and forget to delete these, you'll get import errors from dangling references.
-- **VLM + MoE + GPU+NPU patchgen** — `veomni/models/transformers/qwen3_vl_moe/`
-  - `__init__.py` — registers three classes (`Qwen3VLMoeForConditionalGeneration`, `Qwen3VLMoeModel`, `Qwen3VLMoeTextModel`) and attaches `_create_checkpoint_tensor_converter` as a `staticmethod` on each (the inner text submodel is also loadable standalone and must carry the converter).
-  - `qwen3_vl_moe_gpu_patch_gen_config.py` — minimal config that imports *most* VLM SP / deepstack / async-Ulysses / dummy_forward patches from `qwen3_vl` via `name_map={"Qwen3VL": "Qwen3VLMoe"}`, and only writes MoE-specific deltas: `replace_class("Qwen3VLMoeExperts")` with fused layout, `override_method("Qwen3VLMoeModel.__init__")` to propagate `_moe_implementation` into `config.text_config`, a hand-cloned `Qwen3VLMoeModel.forward` (see below), `Qwen3VLMoeForConditionalGeneration.forward` with fused loss + aux_loss, and `get_parallel_plan`. This is the canonical template for any new VLM+MoE migration. **Exception — do NOT reuse `Model.forward` via name_map**: `Qwen3VLMoeModelOutputWithPast` carries an extra `router_logits` field absent from the dense `Qwen3VLModelOutputWithPast`; rewriting class names at the AST level keeps the dense constructor's argument list, silently dropping `router_logits` and collapsing MoE routing. Clone the forward body and hand-author the return.
-  - `checkpoint_tensor_converter.py` — HF ships *fused* expert tensors under the *same key names* as VeOmni but in transposed layout (`[E, H, 2*I]` vs `[E, 2*I, H]`). Uses dim-1 shape dispatch to recognize HF vs VeOmni layout, passes VeOmni-native tensors through untouched, and hard-errors on unrecognized shapes — see Phase 3 "round-trip safety".
-- **Text + linear attention (`qwen3_5`) / VLM + MoE (`qwen3_5_moe`)** — `veomni/models/transformers/qwen3_5/`, `qwen3_5_moe/`
-  - `qwen3_5_moe_gpu_patch_gen_config.py` — demonstrates `config.drop_import_names(...)`, `config.add_post_import_block(...)`, cross-config reuse via `from ...qwen3_5.qwen3_5_gpu_patch_gen_config import <fn>`, and `name_map={"Qwen3_5": "Qwen3_5Moe"}` on `override_method` to share patches between sibling configs.
-- **MLA + MoE (GLM)** — `veomni/models/transformers/glm_moe_dsa/`
-  - Sibling `glm_moe_dsa_{gpu,npu}_patch_gen_config.py` produces separate `generated/*_{gpu,npu}.py` outputs.
+| Your model | Also read |
+|---|---|
+| Any model, before Phase 1 | `references/model-examples.md` — pick the closest existing model and mirror it |
+| Has routed experts (MoE) | `references/moe.md` — Phase 2 expert patches, Phase 3 checkpoint converter, MoE pitfalls |
+| Has a vision / audio / speech tower (VLM or Omni) | `references/multimodal.md` — SP-aware multimodal forward, metadata precompute, `dummy_forward`, subtree pruning, VLM/Omni pitfalls |
+| Text-only and dense | neither — the spine plus the examples file is the whole protocol |
+
+A text-only dense GPU model therefore reads this file plus the examples, and
+skips about 380 lines of MoE and multimodal material. A VLM+MoE model reads
+everything. Read the spine first either way; the reference files add to it and
+never replace a phase.
 
 ---
 
@@ -123,24 +105,17 @@ Things to watch for in upstream contracts:
   add params like `audio_feature_lengths`, `feature_lens`, `aftercnn_lens`,
   `rope_deltas`, `image_grid_thw`, `video_grid_thw`, etc., copy the upstream
   docstring and append minimal one-line entries for every new param.
-- Helper-method signatures (e.g. `get_placeholder_mask` takes `inputs_embeds`
-  + `image_features` / `video_features`).
-- Return-shape conventions: e.g. `get_{image,video}_features.pooler_output`
-  is a `tuple[per-image tensor]` after `torch.split`, not a flat tensor.
-- Packed position-ids contract (`[4, bs, seq-len]` with prepended
-  `text_position_ids`).
-- **RoPE shape collapse** — VLMs use `apply_interleaved_mrope` (and similar
-  helpers) that collapse the leading 3-axis of mrope before layers see
-  cos/sin, so the shape is `(bs, seq_len, head_dim)`. Any SP path that gathers
-  cos/sin across the sequence dim (async Ulysses, ring attention) must use
-  the correct `gather_dim`. Grep upstream for `interleaved_mrope`,
-  `mrope_section`, or any pre-attention RoPE reshape before writing the patch.
 - **`attention_mask` may be a dict** — HF v5 routinely passes
   `attention_mask={"full_attention": <tensor>, ...}` keyed by attention type.
   Any patched forward that forwards `attention_mask` to
   `compute_3d_position_ids` / `get_rope_index` / other tensor-expecting
   helpers must defensively unwrap `attention_mask.get("full_attention", None)`
   when it's a dict.
+
+VLM and Omni models have four more upstream contracts to check before writing
+any patch — placeholder masks, `get_{image,video}_features` return shapes, the
+packed position-ids layout and mrope shape collapse. See
+`references/multimodal.md`, "Phase 0: upstream contracts".
 
 Keep this directory around through commit; delete it after the PR merges (it's
 already gitignored so it won't leak into the repo).
@@ -189,7 +164,8 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
    - GPU + NPU → add sibling `<m>_npu_patch_gen_config.py` that writes
      `generated/patched_modeling_<m>_npu.py`; mirror the `glm_moe_dsa` or
      `qwen3_vl` layout.
-4. Check model category:
+4. Check model category. Each entry below names the closest existing model;
+   `references/model-examples.md` says what to copy out of it, file by file.
    - Text-only LLM → reference `qwen3/` (or `llama/` for the minimal example)
    - MoE → reference `qwen3_moe/` (plus converter work in Phase 3)
    - VLM (non-MoE) → reference `qwen3_vl/`
@@ -248,63 +224,6 @@ config = PatchConfig(
 | Remove unused class from output               | `config.exclude_from_output("<Class>")`                |
 | Inherit an entire sibling GPU config into an NPU config (reuse helpers / imports / post-import blocks; only override device-specific kernels) | `config.helpers.extend(gpu_config.helpers)` + `config.post_import_blocks.extend(gpu_config.post_import_blocks)` + `config.additional_imports.extend(gpu_config.additional_imports)` + import each `<fn>_patched` and re-register via `config.override_method(...)`. See `qwen3_vl_npu_patch_gen_config.py` |
 
-**Pruning inactive subtrees** (e.g. talker / code2wav in an omni model where
-training only uses the thinker): use `config.exclude_from_output(<Class>, ...)`
-to drop classes entirely from the generated file. This has three downstream
-ripples you must clean up in the same patch config — otherwise `make quality`
-or `import` will fail on the regenerated output:
-
-- **`_init_weights` `isinstance(...)` branches** — upstream's
-  `<M>PreTrainedModel._init_weights` typically has one `elif isinstance(module,
-  <ExcludedClass>)` branch per leaf init. Override it
-  (`@config.override_method("<M>PreTrainedModel._init_weights")`) and drop
-  every branch that references an excluded class.
-- **Public methods whose bodies reference excluded classes** — e.g.
-  `enable_talker` constructs the talker. Override it to
-  `raise NotImplementedError("<what>. Use upstream transformers for <purpose>.")`
-  so callers get a clear message instead of an F821/NameError at import.
-- **`__all__` is auto-filtered** by `veomni/patchgen/codegen.py` — any excluded
-  class name is removed from the generated `__all__` list automatically, so
-  you don't need a manual `drop_import_names` dance for it.
-- **Transitively-dead helper classes** — activations / small utility modules
-  used *only* by classes you just excluded will still land in the generated
-  file as dead code. Grep the generated output for each excluded class's
-  private helpers and add them to `exclude_from_output` too. Example:
-  `SnakeBeta` is only referenced by `Qwen3OmniMoeCode2WavDecoderResidualUnit`;
-  excluding Code2Wav without also excluding `SnakeBeta` leaves ~40 lines of
-  dead code in `generated/`. For qwen2_5_omni's BigVGAN vocoder,
-  `UpSample1d`/`DownSample1d` are referenced **both** by Token2Wav residual
-  blocks (caught by exclusion) **and** by the base `_init_weights` method
-  via `isinstance` checks (NOT caught — `ast.walk` doesn't trace
-  `isinstance` strings). After excluding the speech subtree, always
-  `rg "isinstance\(.*<excluded_class>" generated/` and override the methods
-  that still reference excluded names.
-- **`_init_weights` referencing excluded classes** — base `PreTrainedModel._init_weights`
-  often has `isinstance(module, <SpeechHeadClass>)` / `<UpSample1d>` /
-  `<SnakeBeta>` branches that init excluded modules. These do not generate a
-  patchgen warning but explode at first model build with `NameError: name 'X'
-  is not defined` (ruff also flags as `F821`). Always override `_init_weights`
-  to drop branches that touch excluded classes — see qwen2_5_omni's override
-  that strips `UpSample1d`/`DownSample1d` branches.
-- **Upstream `generate()` with mutable default arg** — Omni models like
-  qwen2_5_omni define `generate(..., talker_eos_token_id: list[int] = [8292, 8294], ...)`
-  which `ruff B006` rejects when copied verbatim into the generated file.
-  Since the speech path is excluded anyway, override `<M>ForConditionalGeneration.generate`
-  to raise `NotImplementedError("...generate is disabled in the VeOmni
-  training modeling (talker / token2wav are excluded). Use upstream
-  transformers for TTS generation.")`. This double-serves to kill the lint
-  and make the contract explicit.
-
-See `qwen3_omni_moe_gpu_patch_gen_config.py` (MoE thinker) and
-`qwen2_5_omni_gpu_patch_gen_config.py` (dense thinker) for the canonical
-templates. Both exclude the whole speech subtree plus the dead-after-exclusion
-activations (`SnakeBeta` for qwen3_omni_moe; `UpSample1d`/`DownSample1d` for
-qwen2_5_omni's BigVGAN), override `_init_weights` to drop the excluded-module
-branches, override `enable_talker` to raise, and (for qwen2_5_omni) also
-override `ForConditionalGeneration.generate` to raise `NotImplementedError`
-— upstream's `generate(...)` signature has a mutable default arg
-(`talker_eos_token_id: list[int] = [...]`) that trips `ruff B006` in the
-generated file, and the TTS path is excluded anyway.
 
 **Cross-config reuse pattern** (qwen3_5_moe reusing qwen3_5):
 
@@ -344,59 +263,17 @@ duplicating ~hundreds of lines per sibling model.
   for VLM) → fused cross-entropy path via `self.loss_function(logits=logits,
   labels=labels, vocab_size=..., hidden_states=..., weights=self.lm_head.weight, **kwargs)`.
   Note VLM top-level models use `config.text_config.vocab_size`, not `config.vocab_size`.
-- **MoE expert replacement** — `@config.replace_class("<M>Experts")` with
-  `gate_up_proj [E, 2*I, H]` + `down_proj [E, H, I]` + `fused_moe_forward(...)`
-  branching on `_moe_implementation in {"eager", "fused"}`. See qwen3_moe and
-  qwen3_5_moe (the latter also removes the upstream `@use_experts_implementation`
-  decorator which would otherwise re-route around our fused path).
-- **MoE top-level init propagation** — v5 often wraps a text_config under a top
-  model. You must propagate `_moe_implementation` from `config` to
-  `config.text_config` *before* `super().__init__(config)`, via a
-  `@config.override_method("<M>Model.__init__")` patch (see qwen3_5_moe).
-- **MoE expert parallel plan** — `@config.override_method("<M>ForCausalLM.get_parallel_plan")`
-  (or `ForConditionalGeneration.get_parallel_plan`) returning
-  `parallel_plan.get_parallel_plan()`. `parallel_plan.py` shards the fused
-  `model.layers.*.mlp.experts.gate_up_proj` (Shard(0)) — see
-  `qwen3_moe/parallel_plan.py` for the canonical template.
-- **VLM/multimodal forward** — replicate qwen3_5_moe's pattern (VLM+MoE) or
-  qwen3_vl's (VLM, non-MoE): pop LM-level flash-attn kwargs before ViT call,
-  transpose seq↔head layout for Ulysses SP, shard image/video embeds, shard
-  placeholder masks, and transpose back. Add
-  `@config.override_method("<M>ForConditionalGeneration.get_position_id_func")`
-  via an `add_post_import_block` that defines the helper `get_position_id` in
-  generated scope (module-level, so multiprocessing can pickle it).
-- **Multimodal metadata precompute** — to keep the ViT forward host-device-sync
-  free, derive ViT `cu_seqlens` / `max_seqlen` in the collator, not the forward.
-  See `.agents/knowledge/multimodal_metadata.md` for the full contract. Checklist
-  for a new VLM:
-  1. Add a module-level `collate_multimodal_metadata(batch, sp_pad)` helper
-     (`@config.add_helper`) — read `batch["image_grid_thw"]` / `["video_grid_thw"]`,
-     `.tolist()`, derive `vit_*_cu_seqlens` / `vit_*_max_seqlen` (+ the `sp_pad`
-     tail entry), write `batch["multimodal_metadata"]`.
-  2. `@config.override_method("<M>ForConditionalGeneration.get_metadata_collate_func")`
-     returning that helper (or a `partial` over it if the formula needs config).
-  3. Optional `get_extra_collate_infos` `override_method` for audio / extra
-     feature tensors (Omni).
-  4. Model.forward: pop `multimodal_metadata`, build the per-modality
-     `vit_metadata` sub-dict (`grid_thw_list` / `cu_seqlens` / `max_seqlen`),
-     pass to `get_image_features` / `get_video_features`.
-  5. ViT.forward: pop the single `vit_metadata` kwarg; consume the precomputed
-     values **with a runtime fallback** (in-forward `.tolist()` / cu_seqlens
-     build) for callers that bypass `MainCollator`.
-  6. `dummy_forward` (FSDP path): build the `vit_metadata` sub-dict host-side.
-  7. Add the model to `_MM_METADATA_WIRED_CASES` in
-     `tests/models/test_model_forward_no_implicit_sync.py`.
-  When SP is enabled and you need to all-gather `input_ids` (or any tensor that
-  went through `MainCollator`'s `pack_dim=-1` path) back to full seq on each
-  rank, use `torch.cat(list, dim=1)` — the collator's `PackingCollator.__call__`
-  does `torch.cat(..., dim=pack_dim).unsqueeze(0)` (see
-  `veomni/data/data_collator.py:246-248`), so the shape at model forward is
-  `[1, seq_per_rank]`, not flat `[seq_per_rank]`. Using `dim=0` would wrongly
-  produce `[sp_size, seq_per_rank]` and silently break downstream mask slicing.
 - **DecoderLayer varlen metadata** — if the model has linear-attention / Mamba /
   GatedDeltaNet layers, override `<M>DecoderLayer.forward` to pass `cu_seq_lens_q`
   through (see qwen3_5_moe), and import cu-free FLA impls via
   `add_post_import_block` with a try/except fallback.
+
+**MoE models** add three more patches here — expert replacement, `_moe_implementation`
+propagation and the expert parallel plan. See `references/moe.md`, "Phase 2 additions".
+
+**VLM / Omni models** add the SP-aware multimodal forward and the metadata
+precompute contract, and Omni models also prune the speech subtree. See
+`references/multimodal.md`.
 
 **Flash attention**: VeOmni custom names
 (`veomni_flash_attention_{2,3,4}_with_sp`) are handled globally by
@@ -461,99 +338,13 @@ identified in Phase 1 has a corresponding decorator here.
 
 ## Phase 3: MoE Checkpoint Tensor Converter (MoE models only)
 
-Skip for text-only LLMs.
+**Skip this phase entirely for dense models.**
 
-V5 MoE uses fused expert tensors `gate_up_proj [E, 2*I, H]` + `down_proj [E, H, I]`,
-but HF safetensor checkpoints may ship either **per-expert split** keys *or*
-**pre-fused** keys (sometimes transposed) depending on the model. A runtime
-converter avoids the old `scripts/moe_ckpt_merge/moe_merge.py` offline step.
-
-**Verify the HF source layout empirically BEFORE picking a template** — do not
-infer it from model family / sibling converter docstrings, because those have
-been copy-pasted across unrelated layout families in the past (e.g. the initial
-qwen3_omni_moe converter shipped a qwen3_vl_moe-style transposer while the real
-checkpoint had per-expert split keys — silent load failure).
-
-Two authoritative sources:
-
-1. **HF's own mapping** — `transformers/conversion_mapping.py::_MODEL_TO_CONVERSION_PATTERN`
-   points the model_type at a WeightConverter recipe:
-   - `"qwen2_moe"` recipe = `MergeModulelist(dim=0) + Concatenate(dim=1)` →
-     source is **per-expert split** → qwen3_moe-style template.
-   - `"qwen3_vl_moe"` recipe = `Transpose(1, 2)` →
-     source is **pre-fused, transposed** → qwen3_vl_moe-style template.
-   - No entry or pass-through → source is **pre-fused, direct v5 layout** →
-     no converter needed (qwen3_5_moe-style).
-   Cross-family aliases are common: `qwen3_omni_moe → qwen2_moe`,
-   `deepseek_v3 → qwen2_moe`, etc. Always resolve the alias before choosing.
-2. **A real checkpoint's index** — sanity-check by grepping
-   `<ckpt>/model.safetensors.index.json`:
-   ```bash
-   python3 -c "
-   import json, sys
-   idx = json.load(open(sys.argv[1]))
-   per_expert = sum(1 for k in idx['weight_map'] if '.experts.' in k and k.endswith('gate_proj.weight'))
-   fused      = sum(1 for k in idx['weight_map'] if k.endswith('.experts.gate_up_proj'))
-   print(f'per-expert keys: {per_expert}, fused keys: {fused}')
-   " <ckpt_path>/model.safetensors.index.json
-   ```
-   If per-expert > 0 → qwen3_moe-style. If fused > 0 → inspect one tensor's
-   shape to distinguish transposed (qwen3_vl_moe-style) from direct v5 (no
-   converter).
-
-**Pick the template by the verified HF layout, not by model family:**
-
-- **HF ships per-expert split keys** (`*.mlp.experts.{j}.{gate|up|down}_proj.weight`)
-  → template = `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`.
-  The regex only matches *HF-side* keys, so a v5-saved fused-key checkpoint
-  passes through the converter untouched — no round-trip hazard.
-- **HF ships fused expert keys with same names as v5** (`*.mlp.experts.{gate_up_proj|down_proj}`
-  at the module level, not per-expert) → template =
-  `veomni/models/transformers/qwen3_vl_moe/checkpoint_tensor_converter.py`.
-  Key names collide with v5 output, so you **must** use shape-based dispatch
-  (see "Round-trip safety" below); blindly transposing corrupts v5-saved ckpts.
-
-**Steps:**
-
-1. Copy the matching template above.
-2. Update the regex `_EXPERT_PATTERN` to match your upstream key layout.
-3. Update merge order / transpose for the HF-side layout. Three layouts exist
-   — see table in
-   `docs/transformers_v5/transformers_v5_moe_weight_loading.md`:
-   - qwen3_moe: per-expert split → stack on dim 0.
-   - qwen3_vl_moe: fused, transposed (`[E, H, 2*I]` / `[E, I, H]`) → `transpose(1, 2)`.
-   - qwen3_5_moe: fused, direct (`[E, 2*I, H]` / `[E, H, I]`) → no-op (no converter needed).
-4. Export a factory `create_<m>_checkpoint_tensor_converter(model)`:
-   - Keyed on `num_experts` + (for fused-key converters) `hidden_size` + `intermediate_size`.
-   - Resolve the text config defensively: `text_config = getattr(model.config, "text_config", model.config)`.
-     VLM-MoE submodels (e.g. `Qwen3VLMoeTextModel`) are loaded standalone with a
-     *flat* `<M>TextConfig` that has no `text_config` attribute; top-level
-     `<M>Model` / `<M>ForConditionalGeneration` have a nested one. Both paths
-     must work because Pattern B registers the converter on all three classes.
-5. Implement `can_handle`, `convert`, and `finalize` — `finalize` must raise on
-   any unflushed per-expert or stacked buffer (indicates corrupt/partial ckpt).
-
-**Round-trip safety (fused-key converters only):**
-
-When HF and v5 use identical expert key names but different axis orders
-(qwen3_vl_moe pattern), the converter will be invoked on both HF-original
-checkpoints *and* v5-saved checkpoints (VeOmni's save path can emit either
-format). Dispatch on the `dim-1` shape:
-
-- `gate_up_proj`: HF has `dim-1 == hidden_size`, v5 has `dim-1 == 2 * intermediate_size`.
-- `down_proj`:    HF has `dim-1 == intermediate_size`, v5 has `dim-1 == hidden_size`.
-
-For any realistic config, these four numbers are pairwise distinct, so the
-dispatch is unambiguous. Transpose only when dim-1 matches the HF expectation;
-pass through when it matches v5; **raise on anything else** rather than
-silently corrupting weights. See `qwen3_vl_moe/checkpoint_tensor_converter.py`
-for the canonical implementation.
-
-**Validation**: on a toy checkpoint with per-expert keys, the converter emits
-exactly one `experts.gate_up_proj` and one `experts.down_proj` per layer and
-`finalize()` returns `[]` without raising. For fused-key converters, also
-validate that a v5-saved checkpoint round-trips: feed `[E, 2*I, H]` / `[E, H, I]`
-tensors through and confirm they come out identical (no transpose applied).
+MoE models need a runtime converter because v5 stores fused expert tensors
+while HF checkpoints ship one of three different layouts. Picking the wrong
+one loads zero expert weights, silently. The full procedure — how to verify the
+HF layout empirically, which template to copy, and the round-trip safety rule —
+is in `references/moe.md`, "Phase 3: checkpoint tensor converter".
 
 ---
 
@@ -794,6 +585,10 @@ Extra e2e gotchas:
 
 ## Common Pitfalls
 
+These apply to every model. MoE and VLM/Omni have their own lists in
+`references/moe.md` and `references/multimodal.md` — read the one for your
+category too, since most of the expensive, silent failures live there.
+
 - **Editing `generated/`** → any manual edit is wiped on next regen and CI drift
   check fails. Always go back to `<m>_gpu_patch_gen_config.py`.
 - **Forgetting `config.add_import(...)`** → generated file will import-fail when
@@ -804,39 +599,6 @@ Extra e2e gotchas:
 - **Hand-writing `modeling_<m>.py` / `gpu_patch.py`** → don't. The
   patchgen-generated file under `generated/` is the single source of truth;
   legacy monkey-patch modules have been retired.
-- **MoE expert layout mismatch** → three distinct upstream layouts exist
-  (qwen3_moe per-expert, qwen3_vl_moe transposed, qwen3_5_moe direct). Confirm
-  which one applies before writing the converter.
-- **Copy-pasting a sibling converter's docstring** — the `__doc__` on a
-  neighboring `checkpoint_tensor_converter.py` is an unreliable source of truth
-  for the HF layout; it was written for *that* model, not yours, and survives
-  unchanged through copy-paste. Always cross-check against
-  `conversion_mapping._MODEL_TO_CONVERSION_PATTERN[<model_type>]` and a real
-  checkpoint's index file (Phase 3). This is exactly the trap the qwen3_omni_moe
-  migration hit — docstring claimed "HF ships fused, transposed" (copied from
-  qwen3_vl_moe) but HF actually ships per-expert split for qwen3_omni_moe
-  (via the `qwen2_moe` alias). Direct `from_pretrained(...)` silently loaded
-  zero expert weights until the converter was rewritten.
-- **Blind-transpose fused-key converter corrupts v5-save round-trip** — when HF
-  and v5 use *identical* fused expert key names but different axis orders
-  (qwen3_vl_moe pattern), a converter that transposes every matching key will
-  silently corrupt a v5-saved checkpoint on reload (VeOmni's training save path
-  can emit the v5 layout directly). Dispatch on `tensor.shape[1]`: transpose
-  only when it matches the HF layout, pass through when it matches v5, hard-error
-  otherwise. The qwen3_moe-style per-expert converter is immune because its
-  regex only matches HF-side keys (the v5 fused keys have different names).
-- **Converter factory assumes nested `config.text_config`** → VLM-MoE submodels
-  like `<M>TextModel` are loaded standalone with a flat `<M>TextConfig` that
-  has no `text_config` attribute. Use
-  `text_config = getattr(model.config, "text_config", model.config)` so the
-  factory works for all three classes Pattern B registers the converter on.
-- **Leaving `@use_experts_implementation` on the MoE experts class** — upstream
-  v5 may decorate `<M>Experts` with this, which routes to `grouped_mm` and
-  bypasses our fused path. Use `@config.replace_class("<M>Experts")` (not
-  `override_method`) so the decorator is dropped in the generated file.
-- **Forgetting to propagate `_moe_implementation` to `config.text_config`** in
-  VLM-MoE models — the submodel reads `config.text_config._moe_implementation`,
-  so override the top-level `__init__` to copy it down before `super().__init__(config)`.
 - **Replacing `apply_rotary_pos_emb` with liger on partial-rotary models** —
   liger applies RoPE to full head_dim; partial-rotary models (e.g. qwen3_5_moe
   with `partial_rotary_factor=0.25`, `mrope_interleaved=True`) will NaN.
@@ -847,42 +609,12 @@ Extra e2e gotchas:
   `(loss, logits)` and expects `hidden_states` + `weights` kwargs (see qwen3
   ForCausalLM.forward). Calling it the old pre-v5 way will silently compute
   nothing or double-compute logits.
-- **VLM `vocab_size` lookup** — top-level VLM configs use
-  `config.text_config.vocab_size`, not `config.vocab_size`. Same for
-  `num_experts`, `num_experts_per_tok`, `router_aux_loss_coef` on VLM-MoE.
 - **`logits_to_keep` handling** — `ForCausalLM.forward` takes
   `logits_to_keep: int | torch.Tensor = 0` and slices `hidden_states` before the
   `lm_head` path. Omitting it breaks generation-time compatibility.
-- **Registering converter on the wrong class tuple** — make sure `_create_checkpoint_tensor_converter`
-  is attached to every concrete model class you import from `generated/`, not
-  just `ForCausalLM`. Must use `staticmethod(...)`.
 - **Duplicating patches across sibling models** — if qwen3_5 and qwen3_5_moe share
   a GatedDeltaNet / ViT, import the replacement functions from the sibling
   patchgen config and use `name_map={"OldPrefix": "NewPrefix"}` — don't copy.
-- **Reusing a dense `Model.forward` on an MoE sibling via `name_map`** — name_map
-  rewrites `<DensePrefix>*` → `<MoePrefix>*` at the AST level, but the
-  constructed `<DensePrefix>ModelOutputWithPast(...)` return call is rewritten
-  to `<MoePrefix>ModelOutputWithPast(...)` **with the same argument list as the
-  dense version**, silently dropping MoE-only fields (`router_logits`).
-  Downstream `ForConditionalGeneration.forward` then sees
-  `outputs.router_logits = None`; `load_balancing_loss_func(None, ...)` returns
-  int `0`, and either (a) aux_loss stays at 0 → router collapse, or
-  (b) `0.to(loss.device)` crashes with `AttributeError`. Clone the forward body
-  and hand-author the return whenever the sibling output dataclass has extra
-  fields. `qwen3_vl_moe` hit this — see `qwen3_vl_moe_gpu_patch_gen_config.py`
-  for the clone pattern.
-- **`load_balancing_loss_func` can return a Python `int`, not a tensor** — when
-  `router_logits` is `None` or an empty tuple, `load_balancing_loss_func(...)`
-  returns scalar `0` (int), not `torch.tensor(0.0)`. Any later
-  `loss += coef * aux_loss.to(loss.device)` will then raise
-  `AttributeError: 'int' object has no attribute 'to'`. Guard with
-  `isinstance(aux_loss, torch.Tensor)` before composing into `loss`, and
-  prefer out-of-place `loss = loss + ...` over `+=` to avoid mutating a tensor
-  that may be used elsewhere.
-- **Non-picklable helpers inside override bodies** — VLM `get_position_id_func`
-  returns a `partial` over a helper; that helper must be at module scope in the
-  generated file (injected via `add_post_import_block`), not a local closure,
-  or DataLoader worker processes will fail to pickle it.
 - **Don't override a public HF method just to change its return shape** — if the
   v5 upstream contract says `get_{image,video}_features(...).pooler_output` is a
   `tuple[per-item tensor]` after `torch.split`, don't `override_method` to return
@@ -903,15 +635,6 @@ Extra e2e gotchas:
   `self.lm_head(...)`. Slicing only in the `else` (no-labels) branch silently
   computes loss on the wrong positions when labels + `logits_to_keep>0` are
   both set.
-- **SP + `compute_3d_position_ids` on-the-fly is incorrect** — under Ulysses SP
-  the `input_ids` / `inputs_embeds` arriving at `<VLM>Model.forward` are per-rank
-  slices; computing mrope positions on them produces positions that drift across
-  ranks. VeOmni training expects precomputed position_ids via `get_position_id_func`
-  in the data transform. If your patched `Model.forward` has a fallback branch
-  that calls `compute_3d_position_ids` (or equivalent) when `position_ids is
-  None`, raise a clear `RuntimeError` under `get_parallel_state().sp_enabled`
-  rather than silently returning wrong positions. This keeps inference /
-  generation (single-rank, SP off) working while fail-fast-ing under SP.
 - **Forgetting `hidden_states` / `attentions` on custom return objects** — when
   your patched `Model.forward` or `ForConditionalGeneration.forward` manually
   constructs a `<M>ModelOutputWithPast` / `<M>CausalLMOutputWithPast` (instead
@@ -919,44 +642,6 @@ Extra e2e gotchas:
   through `hidden_states=outputs.hidden_states` and
   `attentions=outputs.attentions`. Otherwise callers using
   `output_hidden_states=True` / `output_attentions=True` silently get `None`.
-- **Hardcoded shapes in `<M>VisionModel.dummy_forward`** — compute pixel row
-  size and `grid_thw` from `self.config.patch_size` / `temporal_patch_size` /
-  `in_channels` and `self.spatial_merge_size`, not from the model variant you
-  first tested. Grids must be multiples of `spatial_merge_size` (merger
-  requirement); under SP, scale one spatial dim by `sp_size` so the post-slice
-  seq length stays a multiple of `sp_size`.
-- **`self.dtype` / cached `_dummy_data` in `dummy_forward` is wrong under
-  FSDP2 + MixedPrecisionConfig** — `self.dtype` returns the *first parameter's*
-  dtype, which under FSDP2+MixedPrecision is the stored dtype (fp32), not the
-  per-call compute dtype (bf16) the framework casts weights to at forward time.
-  If `dummy_forward` allocates inputs via `torch.zeros(..., dtype=self.dtype)`
-  or caches a `_dummy_data` buffer at `__init__`, the first conv/linear on a
-  text-only rank crashes with "Input type (float) and bias type
-  (c10::BFloat16) should be the same", while the multimodal rank hangs on the
-  collective — masquerading as an NCCL hang. Always look up dtype from a live
-  parameter at call time and don't cache dummy tensors across calls. The
-  exact attribute is **model-specific** and copy-pasting the wrong one is a
-  classic-silently-broken bug:
-  - qwen3_omni_moe audio: `dtype = self.conv2d1.weight.dtype` (2D conv front-end)
-  - qwen2_5_omni audio: `dtype = self.conv1.weight.dtype` (1D conv front-end —
-    qwen3_omni_moe-style `conv2d1` does not exist on this model)
-  - qwen2_5_omni / qwen3_omni_moe vision: `dtype = self.patch_embed.proj.weight.dtype`
-  See the audio / vision `dummy_forward` patches in
-  `qwen2_5_omni_gpu_patch_gen_config.py` and
-  `qwen3_omni_moe_gpu_patch_gen_config.py`.
-- **FSDP2 "hang" may be a rank-asymmetric crash** — when one rank crashes
-  inside a collective-spanning forward (dtype mismatch, shape mismatch,
-  unexpected `None`), the surviving ranks block on the never-completing
-  collective and the test wall-clocks to SIGTERM. Re-run with
-  `TORCH_DISTRIBUTED_DEBUG=DETAIL` to force the per-rank exception to surface;
-  once you see the real traceback on the crashing rank, fix *that* rather than
-  hunting for deadlocks in the happy-path code.
-- **`gather_dim` for cos/sin in async Ulysses attention paths** — the correct
-  seq dim depends on whether a pre-attention RoPE reshape has happened. In
-  Qwen3-VL v5, `apply_interleaved_mrope` runs before attention and collapses
-  the leading 3-axis, so cos/sin arriving at async Ulysses is
-  `(bs, seq_len, head_dim)` → `gather_dim=1`. Don't blindly copy `gather_dim`
-  from a sibling model; read the upstream RoPE path first.
 - **Skipping `check_patchgen`** → CI will fail on PR. Always run it locally.
 - **Empty class body written as `: ...` instead of `: pass`** — when the upstream
   HF source defines an empty class via inline Ellipsis (e.g.
@@ -974,19 +659,6 @@ Extra e2e gotchas:
   via `override_method` on a synthetic class (e.g.
   `LlamaForSequenceClassification`), verify the generated file imports cleanly
   before declaring victory.
-- **`TypeError: expected string or buffer` when manually exercising
-  `MODEL_CONFIG_REGISTRY` before `MODELING_REGISTRY` (Omni models with patched
-  configs)** — calling `MODEL_CONFIG_REGISTRY.get("<m>")()` *before*
-  `MODELING_REGISTRY.get("<m>")()` causes the config-registration monkey patch
-  to fire first; transformers' `@auto_docstring` then tries to read the patched
-  config class's source via `CONFIG_MAPPING` and gets a live Python object
-  instead of a source string. This blows up inside upstream
-  `transformers/utils/auto_docstring.py`. **Not a real bug** — the natural model
-  build order (`build_foundation_model_from_config(...)` → `MODELING_REGISTRY`
-  first, which imports modeling and triggers the config import transitively)
-  hits the right order and the error never fires. Only matters if your smoke
-  test calls the registries directly in the wrong order. Confirmed on
-  qwen2_5_omni / qwen3_omni_moe.
 - **Text/MoE models silently fail on NPU CI with `KeyError: "Unknown kernel
   'npu' for op='rotary_pos_emb'/'rms_norm'"`** — the `KERNEL_REGISTRY` (used
   by the OpSlot path in patchgen-generated modeling) currently registers only
@@ -1020,20 +692,6 @@ Extra e2e gotchas:
   `TypeError`. Don't blindly copy the qwen3 Liger MLP swap — if the model uses the
   same MLP class for routed + shared experts with different `intermediate_size`,
   skip the Liger replacement.
-- **Parallel plan keys must track the fused expert layout** — `parallel_plan.py`
-  shards `model.layers.*.mlp.experts.gate_up_proj` (Shard(0)) and
-  `model.layers.*.mlp.experts.down_proj` (Shard(0)). Stale split-key plans
-  leave `gate_up_proj` un-sharded and EP training hits
-  `AssertionError: len(cumsum_M) == b.shape[0]` inside `group_gemm_same_nk`
-  (cumsum length = `E_local`, but the weight has all `E` experts). See
-  `veomni/models/transformers/deepseek_v3/parallel_plan.py`.
-- **Checkpoint converters must detect the fused layout** — HF checkpoints may
-  already ship `experts.gate_up_proj` / `experts.down_proj`. A
-  `CheckpointTensorConverter` that unconditionally stacks per-expert
-  `gate_proj`/`up_proj`/`down_proj` will raise
-  `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence check,
-  skip stacking when fused keys are already present, and cover both layouts in
-  `tests/models/test_checkpoint_tensor_converter.py`.
 
 ---
 
