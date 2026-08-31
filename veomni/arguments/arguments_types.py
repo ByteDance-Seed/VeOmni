@@ -179,9 +179,11 @@ class OptimizerConfig:
         default_factory=list,
         metadata={
             "help": (
-                "Leaf module names to head-split, matched exactly against the children of an "
-                "attention module, e.g. ['q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
-                "['q_proj', 'k_proj', 'v_proj'] for GQA. Required whenever "
+                "Projection modules to head-split, each matched as a leaf module name or a dotted "
+                "path suffix, e.g. ['self_attn.q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
+                "['q_proj', 'k_proj', 'v_proj'] for GQA. An entry that would split two nested "
+                "projections is rejected with the qualified names to use instead -- DeepSeek-V4's "
+                "MLA and the DSA indexer inside it both call theirs q_b_proj. Required whenever "
                 "muon_head_group_size >= 1; see docs/usage/basic_modules.md."
             )
         },
