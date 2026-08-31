@@ -33,6 +33,9 @@ def eager_kernels_config() -> SimpleNamespace:
         swiglu_mlp_implementation="eager",
         load_balancing_loss_implementation="eager",
         moe_implementation="eager",
+        rms_norm_gated_implementation="eager",
+        causal_conv1d_implementation="eager",
+        chunk_gated_delta_rule_implementation="eager",
     )
 
 
@@ -59,21 +62,25 @@ def assert_eager_matches_hf(
     *,
     input_ids: torch.Tensor,
     fwd_kwargs: dict | None = None,
+    ours_fwd_kwargs: dict | None = None,
     atol: float = EAGER_ATOL,
     rtol: float = EAGER_RTOL,
     grad_atol: float = EAGER_GRAD_ATOL,
     grad_rtol: float = EAGER_GRAD_RTOL,
 ) -> None:
     """Compare unlabeled logits, labeled loss, and grads against HF."""
-    fwd_kwargs = {} if fwd_kwargs is None else dict(fwd_kwargs)
+    hf_kwargs = {} if fwd_kwargs is None else dict(fwd_kwargs)
+    ours_kwargs = dict(hf_kwargs)
+    if ours_fwd_kwargs is not None:
+        ours_kwargs.update(ours_fwd_kwargs)
 
-    hf_logits = hf(input_ids=input_ids, use_cache=False, **fwd_kwargs).logits
-    ours_logits = ours(input_ids=input_ids, use_cache=False, **fwd_kwargs).logits
+    hf_logits = hf(input_ids=input_ids, use_cache=False, **hf_kwargs).logits
+    ours_logits = ours(input_ids=input_ids, use_cache=False, **ours_kwargs).logits
     torch.testing.assert_close(ours_logits, hf_logits, atol=atol, rtol=rtol)
 
     labels = input_ids.clone()
-    hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, **fwd_kwargs)
-    ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False, **fwd_kwargs)
+    hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, **hf_kwargs)
+    ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False, **ours_kwargs)
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=atol, rtol=rtol)
     assert ours_out.logits is None
 
