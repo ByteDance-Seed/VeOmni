@@ -54,3 +54,12 @@ def test_linear_bias_empty_sentinel():
     assert bias.numel() == 0
     assert bias.device == linear.weight.device
     assert bias.dtype == linear.weight.dtype
+
+
+def test_resolve_moe_impl_strips_fused_prefix():
+    from veomni.models_kernel.utils.kernel_utils import resolve_moe_impl
+
+    set_kernels_config(SimpleNamespace(moe_implementation="fused_triton"))
+    assert resolve_moe_impl() == "triton"
+    set_kernels_config(SimpleNamespace(moe_implementation="eager"))
+    assert resolve_moe_impl() == "eager"

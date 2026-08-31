@@ -12,14 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-from .kernel_utils import linear_bias, resolve_kernel_impl, resolve_moe_impl
-from .loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-
-
-__all__ = [
-    "ForCausalLMLoss",
-    "ForSequenceClassificationLoss",
-    "linear_bias",
-    "resolve_kernel_impl",
-    "resolve_moe_impl",
-]
+"""Qwen3-VL VeomniKernel consume. Not registered on ``MODELING_REGISTRY`` yet."""

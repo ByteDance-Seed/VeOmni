@@ -38,6 +38,18 @@ def resolve_kernel_impl(field: str, *, npu_as: str | None = None) -> str:
     return impl
 
 
+def resolve_moe_impl() -> str:
+    """Map ``moe_implementation`` onto a ``moe_experts`` registry impl.
+
+    YAML still uses the ops names ``fused_triton`` / ``fused_quack`` /
+    ``fused_npu``. Registry rows are ``triton`` / ``quack`` / ``npu``.
+    """
+    impl = resolve_kernel_impl("moe_implementation")
+    if impl.startswith("fused_"):
+        return impl.removeprefix("fused_")
+    return impl
+
+
 def empty_bias(weight: Tensor) -> Tensor:
     """Empty unused-layout bias for a Linear that has ``bias=None``."""
     return weight.new_empty(0)
