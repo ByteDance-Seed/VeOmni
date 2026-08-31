@@ -61,7 +61,12 @@ The `knowledge/` directory contains domain-specific context loaded by agents on 
 ## Keeping these docs honest
 
 `make check-agent-docs` (run in CI by the **Check doc task paths** workflow)
-verifies that every repo path and skill name referenced from `AGENTS.md`,
-`.agents/**/*.md` and `.cursor/rules/*` actually exists. Use `<angle brackets>`
-for placeholders so they are skipped. It cannot check prose claims about
-behaviour — when you edit a skill, re-read the file it describes.
+resolves, in `AGENTS.md`, `.agents/**/*.md` and `.cursor/rules/*`: every
+repo-root-relative path, every bare `*.yml` workflow name, and every skill
+reference. Skill references are checked across the whole tracked tree, since a
+renamed skill also leaves dangling mentions in code comments. Use
+`<angle brackets>` for placeholders so they are skipped, and note that a bare
+`.py` name is deliberately not resolved — docs name upstream transformers
+modules and illustrative filenames that do not exist here. It cannot check
+prose claims about behaviour: when you edit a skill, re-read the file it
+describes.
