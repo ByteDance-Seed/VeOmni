@@ -46,9 +46,12 @@ Before committing, check if the change requires documentation updates:
 ## Tests
 
 Follow `.agents/knowledge/testing.md`. In short: extend an existing
-CI-enumerated test before creating a new file, and if you do create one outside
-`tests/ops/` / `tests/data/`, wire it into the unit-test workflows or it will
-not run. A pure refactor with existing coverage does not need a new test — say
+CI-enumerated test before creating a new file. If you do create one, check its
+path against the table there and wire it into the workflow that owns that path
+— the directory-level entries (`tests/data/`, `tests/ops/` on GPU,
+`tests/parallel/context_parallel/` on GPU) need no line, e2e paths belong to
+`{gpu,npu}_e2e_test.yml`, and everything else is invisible to CI until it is
+listed. A pure refactor with existing coverage does not need a new test — say
 so in the PR instead of adding one.
 
 ## When to Use Other Skills

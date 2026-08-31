@@ -30,8 +30,9 @@ Consequences that cut both ways:
 Check whether a file is wired — by name, and by the directory it sits in:
 
 ```bash
-rg -n "$(basename <path/to/test_file.py>)" .github/workflows/
-rg -n "$(dirname  <path/to/test_file.py>)" .github/workflows/
+TEST_PATH=tests/trainer/test_my_new_thing.py
+rg -n "$(basename "$TEST_PATH")" .github/workflows/
+rg -n "$(dirname  "$TEST_PATH")" .github/workflows/
 ```
 
 ## Decision rule
