@@ -38,7 +38,12 @@ def wrapper(
     chunk_indices_list: object = None,
     scale: float | None = None,
 ) -> tuple[Tensor, Tensor | None]:
-    """FlashQLA chunk gated delta rule. Lazy-imports ``flash_qla``."""
+    """FlashQLA chunk gated delta rule. Lazy-imports ``flash_qla``.
+
+    Vendor ``flash_qla`` does not take ``chunk_size``. The kwarg stays on the
+    common face so callers can pass it; this adapter ignores it. Fused-vs-eager
+    tests must compare at the vendor default (64), not an eager-only override.
+    """
     from flash_qla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     del chunk_size, cu_seqlens_list, chunk_indices, chunk_indices_list, scale

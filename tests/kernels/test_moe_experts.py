@@ -21,8 +21,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from transformers import GptOssConfig
+from transformers import GptOssConfig, Qwen3MoeConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
 
 from tests.kernels.tol import (
     EAGER_ATOL,
@@ -129,6 +130,77 @@ def _gpt_oss_hf_loop(
     experts.alpha = alpha
     experts.limit = limit
     return experts(hidden, selected, routing), experts
+
+
+def _qwen3_moe_hf_experts(
+    hidden: Tensor,
+    routing: Tensor,
+    selected: Tensor,
+    gate_up: Tensor,
+    down: Tensor,
+    *,
+    num_experts: int,
+) -> tuple[Tensor, Qwen3MoeExperts]:
+    """Call HuggingFace ``Qwen3MoeExperts.forward``.
+
+    Installed class: ``transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts``.
+
+    Source:
+    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py
+
+    HF scales routing after ``down_proj``. Our eager scales the SwiGLU
+    intermediate before ``fc2``. Those match when ``down_proj`` has no bias.
+    """
+    config = Qwen3MoeConfig(
+        hidden_size=hidden.shape[-1],
+        moe_intermediate_size=down.shape[-1],
+        num_experts=num_experts,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+    )
+    config._experts_implementation = "eager"
+    experts = Qwen3MoeExperts(config)
+    experts.gate_up_proj = nn.Parameter(gate_up)
+    experts.down_proj = nn.Parameter(down)
+    return experts(hidden, selected, routing), experts
+
+
+def test_standard_eager_matches_hf_qwen3_moe_experts():
+    torch.manual_seed(0)
+    num_tokens, num_experts, hidden_dim, ffn_dim, top_k = 8, 4, 16, 8, 2
+    hidden = torch.randn(num_tokens, hidden_dim)
+    routing, selected = _route(num_tokens, num_experts, top_k, hidden.device, hidden.dtype)
+    fc1_1 = torch.randn(num_experts, ffn_dim, hidden_dim)
+    fc1_2 = torch.randn(num_experts, ffn_dim, hidden_dim)
+    gate_up = torch.cat([fc1_1, fc1_2], dim=1).contiguous()
+    fc2 = torch.randn(num_experts, hidden_dim, ffn_dim)
+
+    hidden_h, routing_h, gu_h, fc2_h = map(_clone, (hidden, routing, gate_up, fc2))
+    out_h, experts_h = _qwen3_moe_hf_experts(hidden_h, routing_h, selected, gu_h, fc2_h, num_experts=num_experts)
+
+    hidden_e, routing_e, gu_e, fc2_e = map(_clone, (hidden, routing, gate_up, fc2))
+    out_e = resolve_kernel("moe_experts", "standard", "eager").wrapper(
+        hidden_e,
+        routing_e,
+        selected,
+        _empty(hidden.device),
+        _empty(hidden.device),
+        fc2_e,
+        gu_e,
+        num_experts=num_experts,
+    )
+    # Pre-fc2 vs post-fc2 routing is algebraically the same without down bias,
+    # but the multiply order leaves a few ulps.
+    assert torch.allclose(out_e, out_h, atol=1e-5, rtol=1e-5)
+
+    go = torch.randn_like(out_e)
+    out_h.backward(go)
+    out_e.backward(go)
+    assert torch.allclose(hidden_e.grad, hidden_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(routing_e.grad, routing_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(gu_e.grad, experts_h.gate_up_proj.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(fc2_e.grad, experts_h.down_proj.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 def test_eager_matches_fused_reference():

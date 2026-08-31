@@ -20,7 +20,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from transformers import Qwen3Config
+from transformers import DeepseekV4Config, Qwen3Config
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
 from tests.kernels.tol import (
@@ -130,31 +131,54 @@ def test_eager_matches_biased_linears():
 
 
 def test_eager_matches_swiglu_limit():
+    """``swiglu_limit`` matches HF ``DeepseekV4Experts._apply_gate``.
+
+    Installed class: ``transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts``.
+
+    Source:
+    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py
+
+    One expert, every token routed to it with weight 1, so the expert MLP
+    is the same as ``swiglu_mlp`` with the DSV4 clamp.
+    """
     torch.manual_seed(2)
     hidden, intermediate, limit = 64, 128, 7.0
-    gate_h = nn.Linear(hidden, intermediate, bias=False)
-    up_h = nn.Linear(hidden, intermediate, bias=False)
-    down_h = nn.Linear(intermediate, hidden, bias=False)
-    gate_e = _copy_linear(gate_h)
-    up_e = _copy_linear(up_h)
-    down_e = _copy_linear(down_h)
+    tokens = 2 * 16
+    config = DeepseekV4Config(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_local_experts=1,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        swiglu_limit=limit,
+    )
+    config._experts_implementation = "eager"
+    experts = DeepseekV4Experts(config)
+    nn.init.normal_(experts.gate_up_proj, std=0.1)
+    nn.init.normal_(experts.down_proj, std=0.1)
     x = torch.randn(2, 16, hidden, dtype=torch.float32)
+    selected = torch.zeros(tokens, 1, dtype=torch.long)
+    routing = torch.ones(tokens, 1, dtype=torch.float32)
 
     x_h = x.detach().requires_grad_(True)
-    gate_act = gate_h(x_h).float().clamp(max=limit)
-    up_act = up_h(x_h).float().clamp(min=-limit, max=limit)
-    out_h = down_h((F.silu(gate_act) * up_act).to(dtype=x_h.dtype))
+    out_h = experts(x_h.reshape(tokens, hidden), selected, routing).reshape_as(x)
 
     x_e = x.detach().requires_grad_(True)
+    gate_w, up_w = experts.gate_up_proj[0].detach().chunk(2, dim=0)
+    down_w = experts.down_proj[0].detach()
+    gate_e = nn.Parameter(gate_w.clone())
+    up_e = nn.Parameter(up_w.clone())
+    down_e = nn.Parameter(down_w.clone())
     wrapper = resolve_kernel("swiglu_mlp", "standard", "eager").wrapper
     out_e = wrapper(
         x_e,
-        gate_e.weight,
-        _empty_bias(gate_e.weight),
-        up_e.weight,
-        _empty_bias(up_e.weight),
-        down_e.weight,
-        _empty_bias(down_e.weight),
+        gate_e,
+        _empty_bias(gate_e),
+        up_e,
+        _empty_bias(up_e),
+        down_e,
+        _empty_bias(down_e),
         swiglu_limit=limit,
     )
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
@@ -163,9 +187,10 @@ def test_eager_matches_swiglu_limit():
     out_h.backward(go)
     out_e.backward(go)
     assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(gate_e.weight.grad, gate_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(up_e.weight.grad, up_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(down_e.weight.grad, down_h.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    gate_h_grad, up_h_grad = experts.gate_up_proj.grad[0].chunk(2, dim=0)
+    assert torch.allclose(gate_e.grad, gate_h_grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(up_e.grad, up_h_grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(down_e.grad, experts.down_proj.grad[0], atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs CUDA")

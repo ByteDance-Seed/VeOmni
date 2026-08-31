@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, torch_chunk_gated_delta_rule
 
@@ -95,7 +96,28 @@ def test_rms_norm_gated_fla_matches_eager():
     assert torch.allclose(w_e.grad, w_o.grad, atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL)
 
 
-def test_causal_conv1d_eager_matches_conv1d():
+def _hf_qwen3_5_prefill_causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, *, kernel_size: int) -> Tensor:
+    """Qwen3.5 GatedDeltaNet prefill conv when ``causal_conv1d_fn`` is None.
+
+    Adapted from ``Qwen3_5GatedDeltaNet.forward``:
+    ``F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]])``.
+    ``self.conv1d`` is ``nn.Conv1d(..., padding=kernel_size-1, groups=dim)``.
+
+    Source:
+    https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/models/qwen3_5/modeling_qwen3_5.py
+    """
+    mixed = x.transpose(1, 2)
+    conv = F.conv1d(
+        mixed,
+        weight.unsqueeze(1),
+        bias,
+        padding=kernel_size - 1,
+        groups=mixed.shape[1],
+    )
+    return F.silu(conv[:, :, : mixed.shape[-1]]).transpose(1, 2).contiguous()
+
+
+def test_causal_conv1d_eager_matches_hf():
     torch.manual_seed(1)
     batch, seq, dim, kernel = 2, 16, 32, 4
     x = torch.randn(batch, seq, dim, dtype=torch.float32)
@@ -106,14 +128,7 @@ def test_causal_conv1d_eager_matches_conv1d():
     out_e = resolve_kernel("causal_conv1d", "standard", "eager").wrapper(x_e, w_e, b_e, activation="silu")
 
     x_r, w_r, b_r = _clone(x, weight, bias)
-    padded = torch.nn.functional.conv1d(
-        x_r.transpose(1, 2),
-        w_r.unsqueeze(1),
-        b_r,
-        padding=kernel - 1,
-        groups=dim,
-    )[..., :seq]
-    out_r = torch.nn.functional.silu(padded).transpose(1, 2).contiguous()
+    out_r = _hf_qwen3_5_prefill_causal_conv1d(x_r, w_r, b_r, kernel_size=kernel)
     assert torch.allclose(out_e, out_r, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
@@ -206,6 +221,7 @@ def test_chunk_gated_delta_rule_fla_matches_eager():
 
     q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
     q_o, k_o, v_o, g_o, b_o = _clone(q, k, v, g, beta)
+    # FLA ignores ``chunk_size``. Compare at the vendor / eager default (64).
     out_e, _ = eager(
         q_e,
         k_e,
@@ -213,7 +229,6 @@ def test_chunk_gated_delta_rule_fla_matches_eager():
         g_e,
         b_e,
         use_qk_l2norm_in_kernel=True,
-        chunk_size=16,
     )
     out_o, _ = other(
         q_o,
@@ -222,7 +237,6 @@ def test_chunk_gated_delta_rule_fla_matches_eager():
         g_o,
         b_o,
         use_qk_l2norm_in_kernel=True,
-        chunk_size=16,
     )
     assert torch.allclose(out_e, out_o, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
 
@@ -253,3 +267,34 @@ def test_chunk_gated_delta_rule_flash_qla_matches_fla():
     out_fla, _ = fla(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
     out_qla, _ = other(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
     assert torch.allclose(out_fla, out_qla, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+
+
+@pytest.mark.skipif(
+    not IS_CUDA_AVAILABLE or get_gpu_compute_capability() != 90,
+    reason="flash_qla only ships Hopper SM90 kernels",
+)
+def test_chunk_gated_delta_rule_flash_qla_matches_eager():
+    pytest.importorskip("flash_qla")
+    eager = resolve_kernel("chunk_gated_delta_rule", "standard", "eager").wrapper
+    other = resolve_kernel("chunk_gated_delta_rule", "standard", "flash_qla").wrapper
+    torch.manual_seed(2)
+    batch, seq, heads, dim = 1, 32, 2, 16
+    q = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+    g = -torch.rand(batch, seq, heads, device="cuda", dtype=torch.float32) * 0.5
+    beta = torch.rand(batch, seq, heads, device="cuda", dtype=torch.bfloat16)
+
+    q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
+    q_o, k_o, v_o, g_o, b_o = _clone(q, k, v, g, beta)
+    # FlashQLA ignores ``chunk_size``. Compare at the vendor / eager default (64).
+    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
+    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
+    assert torch.allclose(out_e, out_o, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+
+    go = torch.randn_like(out_e)
+    out_e.backward(go)
+    out_o.backward(go)
+    assert torch.allclose(q_e.grad, q_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
+    assert torch.allclose(v_e.grad, v_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
