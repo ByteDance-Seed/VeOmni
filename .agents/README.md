@@ -11,15 +11,17 @@ Reusable skills and knowledge for AI coding agents working on VeOmni. Follows th
 │   ├── veomni-debug/
 │   ├── veomni-review/
 │   ├── veomni-new-model/
-│   ├── veomni-migrate-transformers-v5/
+│   ├── veomni-patchgen-model/
 │   ├── veomni-new-op/
 │   ├── veomni-uv-update/
 │   ├── veomni-profile/
 │   └── create-pr/
 ├── knowledge/           # Shared knowledge base
 │   ├── architecture.md
+│   ├── cloud_env.md
 │   ├── constraints.md
 │   ├── multimodal_metadata.md
+│   ├── testing.md
 │   └── uv.md
 ├── setup_agent.sh       # Bootstrap script (see below)
 └── README.md

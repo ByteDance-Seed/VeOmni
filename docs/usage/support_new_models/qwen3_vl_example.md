@@ -12,7 +12,7 @@ This document walks through the specific patches applied to integrate **Qwen3-VL
 > what has changed is *where* the patches are declared (in the patchgen config
 > and emitted into `generated/`) rather than applied at import time. See
 > [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-migrate-transformers-v5` agent skill for the current flow.
+> the `veomni-patchgen-model` agent skill for the current flow.
 
 ---
 
