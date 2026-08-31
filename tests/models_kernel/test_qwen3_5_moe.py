@@ -58,7 +58,7 @@ def _tiny_text_config(*, layer_types: list[str]) -> Qwen3_5MoeTextConfig:
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
-        num_hidden_layers=2,
+        num_hidden_layers=len(layer_types),
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=16,
@@ -268,9 +268,26 @@ def test_qwen3_5_moe_eager_matches_hf_linear_attention():
     )
 
 
+def test_qwen3_5_moe_eager_matches_hf_mixed_attention():
+    torch.manual_seed(0)
+    config = _tiny_text_config(layer_types=["linear_attention", "linear_attention", "full_attention"])
+    hf = HFQwen3_5MoeForCausalLM(config)
+    ours = _build_causal(config)
+    ours.load_state_dict(hf.state_dict())
+
+    _pin_hf_gdn_to_torch(hf)
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    assert_eager_matches_hf(
+        hf,
+        ours,
+        input_ids=input_ids,
+        ours_fwd_kwargs={"cu_seq_lens_q": _empty_cu_seq_lens()},
+    )
+
+
 def test_qwen3_5_moe_eager_matches_hf_image_and_text():
     torch.manual_seed(0)
-    config = _tiny_vl_config(layer_types=["full_attention", "full_attention"])
+    config = _tiny_vl_config(layer_types=["linear_attention", "linear_attention", "full_attention"])
     hf = HFQwen3_5MoeForConditionalGeneration(config)
     ours = _build_vlm(config)
     ours.load_state_dict(hf.state_dict())
@@ -278,6 +295,7 @@ def test_qwen3_5_moe_eager_matches_hf_image_and_text():
     input_ids = torch.randint(3, 100, (2, 8))
     image = _image_inputs(config, input_ids)
     ids = image.pop("input_ids")
+    _pin_hf_gdn_to_torch(hf)
     assert_eager_matches_hf(
         hf,
         ours,
@@ -289,16 +307,22 @@ def test_qwen3_5_moe_eager_matches_hf_image_and_text():
 
 def test_qwen3_5_moe_eager_matches_hf_aux_loss():
     torch.manual_seed(0)
-    config = _tiny_vl_config(layer_types=["full_attention", "full_attention"])
+    config = _tiny_vl_config(layer_types=["linear_attention", "linear_attention", "full_attention"])
     hf = HFQwen3_5MoeForConditionalGeneration(config)
     ours = _build_vlm(config)
     ours.load_state_dict(hf.state_dict())
 
+    _pin_hf_gdn_to_torch(hf)
     input_ids = torch.randint(3, 100, (2, 8))
     labels = input_ids.clone()
-    extra = {"output_router_logits": True, "cu_seq_lens_q": _empty_cu_seq_lens()}
-    hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, **extra)
-    ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False, **extra)
+    hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=True)
+    ours_out = ours(
+        input_ids=input_ids,
+        labels=labels,
+        use_cache=False,
+        output_router_logits=True,
+        cu_seq_lens_q=_empty_cu_seq_lens(),
+    )
     assert ours_out.aux_loss is not None
     assert hf_out.aux_loss is not None
     torch.testing.assert_close(ours_out.aux_loss, hf_out.aux_loss, atol=1e-6, rtol=1e-6)

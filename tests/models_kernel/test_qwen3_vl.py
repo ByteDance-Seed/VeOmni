@@ -42,8 +42,8 @@ from veomni.kernels import VeomniKernel
 from veomni.kernels.config import get_kernels_config, set_kernels_config
 
 
-IMAGE_TOKEN_ID = 10
-VIDEO_TOKEN_ID = 11
+IMAGE_TOKEN_ID = 120
+VIDEO_TOKEN_ID = 121
 
 
 def _tiny_config() -> Qwen3VLConfig:
@@ -168,7 +168,7 @@ def test_qwen3_vl_eager_matches_hf_text_only():
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, config.text_config.vocab_size, (2, 8))
+    input_ids = torch.randint(3, 100, (2, 8))
     assert_eager_matches_hf(hf, ours, input_ids=input_ids)
 
 
@@ -179,7 +179,7 @@ def test_qwen3_vl_eager_matches_hf_image_and_text():
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, config.text_config.vocab_size, (2, 8))
+    input_ids = torch.randint(3, 100, (2, 8))
     image = _image_inputs(config, input_ids)
     ids = image.pop("input_ids")
     assert_eager_matches_hf(hf, ours, input_ids=ids, fwd_kwargs=image)

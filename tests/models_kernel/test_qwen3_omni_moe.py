@@ -206,7 +206,7 @@ def test_qwen3_omni_moe_eager_matches_hf_text_only():
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, config.text_config.vocab_size, (2, 8))
+    input_ids = torch.randint(3, 100, (2, 8))
     assert_eager_matches_hf(
         hf,
         ours,
@@ -246,7 +246,7 @@ def test_qwen3_omni_moe_eager_matches_hf_aux_loss():
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
 
-    input_ids = torch.randint(3, config.text_config.vocab_size, (2, 8))
+    input_ids = torch.randint(3, 100, (2, 8))
     labels = input_ids.clone()
     masks = _mask_kwargs(input_ids)
     hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False, output_router_logits=True)

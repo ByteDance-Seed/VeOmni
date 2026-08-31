@@ -26,21 +26,30 @@ import torch
 from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM as HFGemma3ForCausalLM
 
+from tests.kernels.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
     assert_no_ops_or_old_models_import,
     eager_kernels_config,
+    named_trainable,
 )
 from veomni.kernels import VeomniKernel
 from veomni.kernels.config import get_kernels_config, set_kernels_config
 
 
-def _tiny_config() -> Gemma3TextConfig:
+def _tiny_config(
+    *,
+    layer_types: list[str] | None = None,
+    final_logit_softcapping: float | None = None,
+    attn_logit_softcapping: float | None = None,
+) -> Gemma3TextConfig:
+    if layer_types is None:
+        layer_types = ["sliding_attention", "sliding_attention", "full_attention"]
     return Gemma3TextConfig(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
-        num_hidden_layers=2,
+        num_hidden_layers=len(layer_types),
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=16,
@@ -51,9 +60,9 @@ def _tiny_config() -> Gemma3TextConfig:
         attention_dropout=0.0,
         query_pre_attn_scalar=16,
         sliding_window=8,
-        layer_types=["full_attention", "full_attention"],
-        final_logit_softcapping=None,
-        attn_logit_softcapping=None,
+        layer_types=layer_types,
+        final_logit_softcapping=final_logit_softcapping,
+        attn_logit_softcapping=attn_logit_softcapping,
         use_bidirectional_attention=False,
         pad_token_id=0,
         bos_token_id=2,
@@ -110,3 +119,42 @@ def test_gemma3_eager_matches_hf():
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+
+
+def test_gemma3_eager_matches_hf_softcap():
+    """Softcap-on labeled path keeps logits. The helper sees `logits=`, not fused hidden+weight."""
+    torch.manual_seed(1)
+    config = _tiny_config(final_logit_softcapping=30.0)
+    hf = HFGemma3ForCausalLM(config)
+    ours = _build_ours(config)
+    ours.load_state_dict(hf.state_dict())
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    hf_logits = hf(input_ids=input_ids, use_cache=False).logits
+    ours_logits = ours(input_ids=input_ids, use_cache=False).logits
+    torch.testing.assert_close(ours_logits, hf_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    labels = input_ids.clone()
+    hf_out = hf(input_ids=input_ids, labels=labels, use_cache=False)
+    ours_out = ours(input_ids=input_ids, labels=labels, use_cache=False)
+    torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    assert ours_out.logits is not None
+    torch.testing.assert_close(ours_out.logits, hf_out.logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    hf_out.loss.backward()
+    ours_out.loss.backward()
+    hf_grads = named_trainable(hf)
+    ours_grads = named_trainable(ours)
+    assert hf_grads.keys() == ours_grads.keys()
+    for name, param in hf_grads.items():
+        if param.grad is None:
+            assert ours_grads[name].grad is None, name
+            continue
+        assert ours_grads[name].grad is not None, name
+        torch.testing.assert_close(
+            ours_grads[name].grad,
+            param.grad,
+            atol=EAGER_GRAD_ATOL,
+            rtol=EAGER_GRAD_RTOL,
+            msg=name,
+        )
