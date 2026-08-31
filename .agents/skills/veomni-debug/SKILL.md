@@ -63,14 +63,24 @@ Phase 5: Knowledge capture           -> pending
    ```bash
    # Env A: the current default pin (the `transformers-stable` group).
    uv venv .venv-a
-   VIRTUAL_ENV=.venv-a uv sync --extra gpu --dev
+   VIRTUAL_ENV=.venv-a uv sync --active --extra gpu --dev
 
    # Env B: the same tree with exactly one package moved.
    uv venv .venv-b
-   VIRTUAL_ENV=.venv-b uv sync --extra gpu --dev
+   VIRTUAL_ENV=.venv-b uv sync --active --extra gpu --dev
    VIRTUAL_ENV=.venv-b uv pip install "<package>==<other-version>"
    ```
-   Run the same reproducer in both envs to confirm the version is the root cause. This avoids polluting the main `.venv/`. If the suspect package is transformers, remember the `generated/` modeling was produced against the pinned version — a mismatch is itself a source of failures, so regenerate before concluding.
+   `--active` is load-bearing. Without it `uv sync` runs in project mode and
+   targets `.venv/`, ignoring `VIRTUAL_ENV` — so both commands would rebuild
+   the main environment instead of the two you just created, which is the
+   opposite of what this is for. (`UV_PROJECT_ENVIRONMENT` works too.)
+
+   Then run the same reproducer in both envs to confirm the version is the
+   root cause. **If the suspect package is transformers, use two worktrees
+   rather than two venvs**: `generated/` modeling lives in the checkout, not
+   the venv, so regenerating it for Env B silently changes what Env A runs.
+   It is produced against the pinned version, and a stale `generated/` is
+   itself a source of failures.
 
 ### Phase 3: Hypothesis and Testing
 

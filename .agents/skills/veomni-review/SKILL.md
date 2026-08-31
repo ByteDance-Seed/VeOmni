@@ -1,6 +1,6 @@
 ---
 name: veomni-review
-description: "Pre-commit code review gate. Required before committing any change to Python under veomni/, tasks/ or tests/, and any change to CI workflows, pyproject.toml or configs/. Also trigger proactively when a change spans multiple files, touches shared infrastructure (BaseTrainer, distributed, model loading, data pipeline, ops dispatch), or you are unsure a fix is safe. The review launches a subagent that checks implementation quality, multi-file consistency, and known constraint violations, then rates the change as safe/needs-attention/risky."
+description: "Pre-commit code review gate. Required before committing any change to Python under veomni/, tasks/ or tests/, and any change to CI workflows, pyproject.toml, uv.lock, docker/ or configs/. Also trigger proactively when a change spans multiple files, touches shared infrastructure (BaseTrainer, distributed, model loading, data pipeline, ops dispatch), or you are unsure a fix is safe. The review launches a subagent that checks implementation quality, multi-file consistency, and known constraint violations, then rates the change as safe/needs-attention/risky."
 ---
 
 ## When this gate applies
@@ -17,7 +17,8 @@ branch you took, so the reader knows a review happened or why it didn't.
 
 ## Steps
 
-1. Run `git diff` (staged + unstaged) to capture the full diff.
+1. Run `git diff HEAD` to capture the full diff — plain `git diff` omits
+   anything already staged, which is exactly what is about to be committed.
 2. Read `.agents/knowledge/constraints.md` for known constraints.
 3. **Launch a review subagent** with your agent's subagent/task mechanism (see
    the prompt below). The subagent receives only the diff + constraints — NOT
@@ -74,7 +75,7 @@ For each changed file, check:
 - PR title format: `[{modules}] {type}: {description}`?
 - All comments and docstrings in English?
 - No auto-generated files (`veomni/models/transformers/*/generated/`) edited directly?
-- Tests: does the diff extend an existing CI-enumerated test, or add a new file that is actually wired into the unit-test workflows? A new test file outside `tests/data/` and `tests/ops/` that no workflow lists will never run. Conversely, a workflow line added for a file under `tests/data/` or `tests/ops/` is redundant. See `.agents/knowledge/testing.md`.
+- Tests: does the diff extend an existing CI-enumerated test, or add a new file that the workflow owning that path actually lists? Check the owning workflow rather than assuming — `tests/data/` runs wholesale in both unit workflows, `tests/ops/` only in the GPU one (NPU enumerates ops files by name, so an Ascend-relevant ops file still needs a line), the e2e paths belong to `{gpu,npu}_e2e_test.yml`, and everything else must be listed file by file or it never runs. See `.agents/knowledge/testing.md`.
 - Ruff-compliant (`make quality` passes)?
 
 ## Output
