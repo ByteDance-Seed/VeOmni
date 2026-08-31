@@ -20,11 +20,27 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-def wrapper(x: Tensor, gate: Tensor, weight: Tensor, *, eps: float = 1e-6) -> Tensor:
+def wrapper(
+    x: Tensor,
+    gate: Tensor,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    eps: float = 1e-6,
+    activation: str | None = "silu",
+) -> Tensor:
     """``weight * rms_norm(x) * silu(gate)``. Regular autograd.
 
-    Matches HuggingFace ``Qwen3_5RMSNormGated``.
+    Matches HuggingFace ``Qwen3_5RMSNormGated``. Functional extra is *weight*.
+    FLA's unused norm bias and *activation* are accepted; nonempty bias is
+    rejected. ``activation`` must be ``silu`` / ``swish`` / ``None``.
     """
+    from ...optional import optional_tensor
+
+    if optional_tensor(bias) is not None:
+        raise ValueError("rms_norm_gated does not use a norm bias")
+    if activation not in {None, "silu", "swish"}:
+        raise ValueError(f"unsupported rms_norm_gated activation: {activation!r}")
     input_dtype = x.dtype
     x_f = x.float()
     rstd = (x_f.square().mean(dim=-1, keepdim=True) + eps).rsqrt()

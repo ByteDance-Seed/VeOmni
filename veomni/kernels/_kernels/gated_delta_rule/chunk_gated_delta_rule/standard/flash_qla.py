@@ -27,17 +27,21 @@ def wrapper(
     value: Tensor,
     g: Tensor,
     beta: Tensor,
-    initial_state: Tensor,
-    cu_seqlens: Tensor,
+    initial_state: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
     *,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     chunk_size: int = 64,
+    cu_seqlens_list: list[int] | None = None,
+    chunk_indices: object = None,
+    chunk_indices_list: object = None,
+    scale: float | None = None,
 ) -> tuple[Tensor, Tensor | None]:
     """FlashQLA chunk gated delta rule. Lazy-imports ``flash_qla``."""
     from flash_qla.ops.gated_delta_rule import chunk_gated_delta_rule
 
-    del chunk_size
+    del chunk_size, cu_seqlens_list, chunk_indices, chunk_indices_list, scale
     return chunk_gated_delta_rule(
         query,
         key,

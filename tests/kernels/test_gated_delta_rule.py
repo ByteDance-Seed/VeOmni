@@ -39,10 +39,6 @@ from veomni.kernels import resolve_kernel
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
-def _empty(device: torch.device | str, dtype: torch.dtype) -> Tensor:
-    return torch.empty(0, device=device, dtype=dtype)
-
-
 def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
     return tuple(t.detach().requires_grad_(True) for t in tensors)
 
@@ -105,10 +101,9 @@ def test_causal_conv1d_eager_matches_conv1d():
     x = torch.randn(batch, seq, dim, dtype=torch.float32)
     weight = torch.randn(dim, kernel, dtype=torch.float32)
     bias = torch.randn(dim, dtype=torch.float32)
-    empty = _empty("cpu", torch.int32)
 
     x_e, w_e, b_e = _clone(x, weight, bias)
-    out_e = resolve_kernel("causal_conv1d", "standard", "eager").wrapper(x_e, w_e, b_e, empty, activation="silu")
+    out_e = resolve_kernel("causal_conv1d", "standard", "eager").wrapper(x_e, w_e, b_e, activation="silu")
 
     x_r, w_r, b_r = _clone(x, weight, bias)
     padded = torch.nn.functional.conv1d(
@@ -139,12 +134,11 @@ def test_causal_conv1d_fla_matches_eager():
     x = torch.randn(batch, seq, dim, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(dim, kernel, device="cuda", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
-    empty = _empty("cuda", torch.int32)
 
     x_e, w_e, b_e = _clone(x, weight, bias)
     x_o, w_o, b_o = _clone(x, weight, bias)
-    out_e = eager(x_e, w_e, b_e, empty, activation="silu")
-    out_o = other(x_o, w_o, b_o, empty, activation="silu")
+    out_e = eager(x_e, w_e, b_e, activation="silu")
+    out_o = other(x_o, w_o, b_o, activation="silu")
     assert torch.allclose(out_e, out_o, atol=GDN_FUSED_ATOL, rtol=GDN_FUSED_RTOL)
 
     go = torch.randn_like(out_e)
@@ -163,8 +157,6 @@ def test_chunk_gated_delta_rule_eager_matches_hf():
     v = torch.randn(batch, seq, heads, dim, dtype=torch.float32)
     g = -torch.rand(batch, seq, heads, dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, dtype=torch.float32)
-    empty_state = _empty("cpu", torch.float32)
-    empty_cu = _empty("cpu", torch.int32)
 
     q_h, k_h, v_h, g_h, b_h = _clone(q, k, v, g, beta)
     out_h, _ = torch_chunk_gated_delta_rule(
@@ -184,8 +176,6 @@ def test_chunk_gated_delta_rule_eager_matches_hf():
         v_e,
         g_e,
         b_e,
-        empty_state,
-        empty_cu,
         use_qk_l2norm_in_kernel=True,
         chunk_size=16,
     )
@@ -213,8 +203,6 @@ def test_chunk_gated_delta_rule_fla_matches_eager():
     v = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
     g = -torch.rand(batch, seq, heads, device="cuda", dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device="cuda", dtype=torch.bfloat16)
-    empty_state = _empty("cuda", torch.bfloat16)
-    empty_cu = _empty("cuda", torch.int32)
 
     q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
     q_o, k_o, v_o, g_o, b_o = _clone(q, k, v, g, beta)
@@ -224,8 +212,6 @@ def test_chunk_gated_delta_rule_fla_matches_eager():
         v_e,
         g_e,
         b_e,
-        empty_state,
-        empty_cu,
         use_qk_l2norm_in_kernel=True,
         chunk_size=16,
     )
@@ -235,8 +221,6 @@ def test_chunk_gated_delta_rule_fla_matches_eager():
         v_o,
         g_o,
         b_o,
-        empty_state,
-        empty_cu,
         use_qk_l2norm_in_kernel=True,
         chunk_size=16,
     )
@@ -265,9 +249,7 @@ def test_chunk_gated_delta_rule_flash_qla_matches_fla():
     v = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
     g = -torch.rand(batch, seq, heads, device="cuda", dtype=torch.float32).abs() * 0.5
     beta = torch.rand(batch, seq, heads, device="cuda", dtype=torch.bfloat16)
-    empty_state = _empty("cuda", torch.bfloat16)
-    empty_cu = _empty("cuda", torch.int32)
 
-    out_fla, _ = fla(q, k, v, g, beta, empty_state, empty_cu, use_qk_l2norm_in_kernel=True)
-    out_qla, _ = other(q, k, v, g, beta, empty_state, empty_cu, use_qk_l2norm_in_kernel=True)
+    out_fla, _ = fla(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
+    out_qla, _ = other(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
     assert torch.allclose(out_fla, out_qla, atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)

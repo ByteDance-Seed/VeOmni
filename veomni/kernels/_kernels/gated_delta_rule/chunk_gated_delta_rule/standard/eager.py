@@ -34,17 +34,23 @@ def wrapper(
     value: Tensor,
     g: Tensor,
     beta: Tensor,
-    initial_state: Tensor,
-    cu_seqlens: Tensor,
+    initial_state: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
     *,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     chunk_size: int = 64,
+    cu_seqlens_list: list[int] | None = None,
+    chunk_indices: object = None,
+    chunk_indices_list: object = None,
+    scale: float | None = None,
 ) -> tuple[Tensor, Tensor | None]:
-    """HF ``torch_chunk_gated_delta_rule``. Empty *initial_state* is unused.
+    """HF ``torch_chunk_gated_delta_rule``. Empty or omitted *initial_state* is unused.
 
     Layout is FLA ``[B, T, H, D]``. Nonempty *cu_seqlens* is unsupported.
+    NPU-only varlen tables are accepted and ignored.
     """
+    del cu_seqlens_list, chunk_indices, chunk_indices_list, scale
     if optional_tensor(cu_seqlens) is not None:
         raise ValueError("chunk_gated_delta_rule eager does not support cu_seqlens")
 

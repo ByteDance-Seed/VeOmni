@@ -28,7 +28,7 @@ import torch
 from torch import Tensor
 
 from .....registry import SavedState
-from ...optional import optional_tensor
+from ...optional import optional_tensor, unused_like
 
 
 _DEFAULT_VARLEN_CHUNK_SIZES = (16, 32, 64, 128, 608 * 2)
@@ -401,20 +401,31 @@ def forward(
     value: Tensor,
     g: Tensor,
     beta: Tensor,
-    initial_state: Tensor,
-    cu_seqlens: Tensor,
+    initial_state: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
     *,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     chunk_size: int = 64,
+    cu_seqlens_list: list[int] | None = None,
+    chunk_indices: object = None,
+    chunk_indices_list: object = None,
+    scale: float | None = None,
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
     """AscendC fused chunk gated delta rule. Layout is FLA ``[B, T, H, D]``.
 
-    Empty *initial_state* / *cu_seqlens* are unused. Unused final state is an
-    empty tensor so the registry output stays tensors-only. The fused backward
-    does not produce ``dh0``.
+    Empty or omitted *initial_state* / *cu_seqlens* are unused. Unused final
+    state is an empty tensor so the registry output stays tensors-only. The
+    fused backward does not produce ``dh0``. Extra NPU varlen tables are
+    accepted; this path rebuilds them from ``cu_seqlens``.
     """
     from ...vendor.triton.utils import input_guard
+
+    del scale
+    if initial_state is None:
+        initial_state = unused_like(query)
+    if cu_seqlens is None:
+        cu_seqlens = unused_like(query, dtype=torch.int32)
 
     query_h = query.transpose(1, 2).contiguous()
     key_h = key.transpose(1, 2).contiguous()

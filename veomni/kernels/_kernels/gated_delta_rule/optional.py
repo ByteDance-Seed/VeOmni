@@ -14,9 +14,17 @@
 
 """First-party helpers for gated-delta-rule kernels."""
 
+from __future__ import annotations
+
+import torch
 from torch import Tensor
 
 
-def optional_tensor(tensor: Tensor) -> Tensor | None:
-    """Return ``None`` when *tensor* is the empty unused-layout sentinel."""
-    return None if tensor.numel() == 0 else tensor
+def optional_tensor(tensor: Tensor | None) -> Tensor | None:
+    """Return ``None`` when *tensor* is missing or the empty unused sentinel."""
+    return None if tensor is None or tensor.numel() == 0 else tensor
+
+
+def unused_like(tensor: Tensor, dtype: torch.dtype | None = None) -> Tensor:
+    """Empty unused-layout sentinel on *tensor*'s device."""
+    return tensor.new_empty(0) if dtype is None else tensor.new_empty(0, dtype=dtype)

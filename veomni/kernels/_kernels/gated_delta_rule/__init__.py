@@ -17,11 +17,14 @@
 Three independent families share this package. They are not a compound
 kernel and are not ``rms_norm`` variants.
 
-``rms_norm_gated`` is ``weight * rms_norm(x) * silu(gate)``.
-``causal_conv1d`` is depthwise causal conv on ``[B, S, D]``. Empty bias /
-``cu_seqlens`` are unused. Eager has no varlen path.
-``chunk_gated_delta_rule`` takes FLA ``[B, T, H, D]``. Empty
-``initial_state`` / ``cu_seqlens`` are unused. Eager has no varlen path.
+``rms_norm_gated`` is ``weight * rms_norm(x) * silu(gate)``. Functional extra
+is *weight*. FLA's unused norm bias and ``activation`` are accepted.
+``causal_conv1d`` is depthwise causal conv on ``[B, S, D]``. ``None`` or empty
+bias / ``cu_seqlens`` are unused. FLA ``seq_idx`` / ``backend`` are accepted.
+Eager has no varlen path.
+``chunk_gated_delta_rule`` takes FLA ``[B, T, H, D]``. ``None`` or empty
+``initial_state`` / ``cu_seqlens`` are unused. NPU varlen tables are accepted.
+Eager has no varlen path.
 """
 
 from ...registry import register_kernel

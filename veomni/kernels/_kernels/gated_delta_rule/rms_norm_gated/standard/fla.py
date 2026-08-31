@@ -19,8 +19,23 @@ from __future__ import annotations
 from torch import Tensor
 
 
-def wrapper(x: Tensor, gate: Tensor, weight: Tensor, *, eps: float = 1e-6) -> Tensor:
+def wrapper(
+    x: Tensor,
+    gate: Tensor,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    eps: float = 1e-6,
+    activation: str | None = "silu",
+) -> Tensor:
     """FLA fused ``rms_norm(x) * silu(gate)``. Lazy-imports ``fla``."""
     from fla.modules.fused_norm_gate import rms_norm_gated
+
+    from ...optional import optional_tensor
+
+    if optional_tensor(bias) is not None:
+        raise ValueError("rms_norm_gated does not use a norm bias")
+    if activation not in {None, "silu", "swish"}:
+        raise ValueError(f"unsupported rms_norm_gated activation: {activation!r}")
 
     return rms_norm_gated(x, gate, weight, None, activation="silu", eps=eps)

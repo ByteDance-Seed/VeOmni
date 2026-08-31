@@ -20,11 +20,26 @@ import torch
 from torch import Tensor
 
 
-def wrapper(x: Tensor, gate: Tensor, weight: Tensor, *, eps: float = 1e-6) -> Tensor:
+def wrapper(
+    x: Tensor,
+    gate: Tensor,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    eps: float = 1e-6,
+    activation: str | None = "silu",
+) -> Tensor:
     """NPU ``npu_rms_norm`` plus ``npu_swiglu`` on ``cat(gate, normed)``.
 
     Same math as ``NPUFusedRMSNormGated``. Lazy-imports ``torch_npu``.
     """
+    from ...optional import optional_tensor
+
+    if optional_tensor(bias) is not None:
+        raise ValueError("rms_norm_gated does not use a norm bias")
+    if activation not in {None, "silu", "swish"}:
+        raise ValueError(f"unsupported rms_norm_gated activation: {activation!r}")
+
     import torch_npu
 
     normed = torch_npu.npu_rms_norm(x, weight, eps)[0]

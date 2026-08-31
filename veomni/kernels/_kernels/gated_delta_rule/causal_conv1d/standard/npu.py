@@ -18,32 +18,43 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor
 
 from .....registry import SavedState
-from ...optional import optional_tensor
+from ...optional import optional_tensor, unused_like
 
 
 @dataclass(frozen=True)
 class _Meta:
-    """Activation plus which optional tensors were real."""
+    """Activation, which optionals were real, and how many apply inputs to grad."""
 
     activation: str | None
     has_bias: bool
     has_cu_seqlens: bool
+    n_in: int
 
 
 def forward(
     x: Tensor,
     weight: Tensor,
-    bias: Tensor,
-    cu_seqlens: Tensor,
+    bias: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
     *,
     activation: str | None = "silu",
+    seq_idx: Tensor | None = None,
+    backend: str | None = None,
 ) -> tuple[Tensor, SavedState]:
     """NPU causal conv1d. *weight* is FLA ``[D, W]``; the kernel wants ``[W, D]``."""
     from ...vendor.triton.convolution import causal_conv1d_fwd_impl
     from ...vendor.triton.utils import is_arch35
+
+    del seq_idx, backend
+    n_in = 2 + (bias is not None) + (cu_seqlens is not None)
+    if bias is None:
+        bias = unused_like(weight)
+    if cu_seqlens is None:
+        cu_seqlens = unused_like(x, dtype=torch.int32)
 
     if is_arch35():
         raise NotImplementedError("causal_conv1d is not supported on arch35")
@@ -63,7 +74,7 @@ def forward(
     )
     return output, SavedState(
         (x, weight_wd, bias, cu_seqlens),
-        _Meta(activation, bias_opt is not None, cu_opt is not None),
+        _Meta(activation, bias_opt is not None, cu_opt is not None, n_in),
     )
 
 
@@ -94,4 +105,4 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
     grad_weight = None if grad_weight_wd is None else grad_weight_wd.transpose(0, 1)
     if not meta.has_bias:
         grad_bias = None
-    return grad_x, grad_weight, grad_bias, None
+    return (grad_x, grad_weight, grad_bias, None)[: meta.n_in]

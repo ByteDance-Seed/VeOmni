@@ -24,12 +24,15 @@ from ...optional import optional_tensor
 def wrapper(
     x: Tensor,
     weight: Tensor,
-    bias: Tensor,
-    cu_seqlens: Tensor,
+    bias: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
     *,
     activation: str | None = "silu",
+    seq_idx: Tensor | None = None,
+    backend: str | None = None,
 ) -> Tensor:
     """FLA Triton causal conv1d. Returns ``y`` only. Lazy-imports ``fla``."""
+    del seq_idx
     from fla.modules.convolution import causal_conv1d
 
     output, _final_state = causal_conv1d(
@@ -38,6 +41,6 @@ def wrapper(
         bias=optional_tensor(bias),
         activation=activation,
         cu_seqlens=optional_tensor(cu_seqlens),
-        backend="triton",
+        backend=backend or "triton",
     )
     return output

@@ -25,16 +25,20 @@ from ...optional import optional_tensor
 def wrapper(
     x: Tensor,
     weight: Tensor,
-    bias: Tensor,
-    cu_seqlens: Tensor,
+    bias: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
     *,
     activation: str | None = "silu",
+    seq_idx: Tensor | None = None,
+    backend: str | None = None,
 ) -> Tensor:
-    """Dense causal depthwise conv1d. Empty *bias* is unused.
+    """Dense causal depthwise conv1d. Empty or omitted *bias* is unused.
 
-    *x* is ``[B, S, D]``. *weight* is ``[D, W]``. Nonempty *cu_seqlens* is
+    *x* is ``[B, S, D]``. *weight* is ``[D, W]``. Matches the FLA call
+    (``seq_idx`` / ``backend`` ignored). Nonempty *cu_seqlens* is
     unsupported on eager.
     """
+    del seq_idx, backend
     if optional_tensor(cu_seqlens) is not None:
         raise ValueError("causal_conv1d eager does not support cu_seqlens")
 
