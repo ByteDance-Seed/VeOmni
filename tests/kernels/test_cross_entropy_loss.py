@@ -173,6 +173,28 @@ def test_liger_matches_eager():
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs CUDA")
+def test_liger_matches_eager_noncontiguous_hidden():
+    pytest.importorskip("liger_kernel")
+    eager = resolve_kernel("cross_entropy_loss", "standard", "eager").wrapper
+    other = resolve_kernel("cross_entropy_loss", "standard", "liger_kernel").wrapper
+    torch.manual_seed(1)
+    hidden = torch.randn(4, 16, 32, device="cuda", dtype=torch.bfloat16).transpose(0, 1).contiguous().transpose(0, 1)
+    assert not hidden.is_contiguous()
+    weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+    labels = torch.randint(0, 64, (4, 16), device="cuda")
+    hidden_e, weight_e = _clone(hidden), _clone(weight)
+    hidden_o, weight_o = _clone(hidden), _clone(weight)
+    out_e = eager(hidden_e, labels, weight_e)
+    out_o = other(hidden_o, labels, weight_o)
+    assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
+    out_e.backward()
+    out_o.backward()
+    assert torch.allclose(
+        hidden_e.grad.float(), hidden_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
+    )
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs CUDA")
 def test_liger_requires_weight():
     pytest.importorskip("liger_kernel")
     with pytest.raises(RuntimeError, match="nonempty ``weight``"):

@@ -356,6 +356,8 @@ select = ["B", "C", "E", "F", "I", "W"]
 # string literals until patchgen materializes them into the generated file.
 "veomni/models/transformers/**/generated/*.py" = ["E402", "B007"]
 "veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
+"veomni/models_kernel/**/generated/*.py" = ["E402", "B007"]
+"veomni/models_kernel/**/*_patch_gen_config.py" = ["F821"]
 "veomni/ops/kernels/gated_delta_rule/_ascend/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
 "veomni/kernels/_kernels/gated_delta_rule/vendor/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
 

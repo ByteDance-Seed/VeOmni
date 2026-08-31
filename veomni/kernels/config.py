@@ -12,28 +12,31 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Ops-facing aliases for the kernel-impl config singleton.
+"""Installed kernel-impl config.
 
-Storage lives in ``veomni.kernels.config``. These names stay for
-``apply_ops_config`` and unconsumed OpSlot models.
+One process-global object. ``apply_ops_config`` still writes it. Modeling
+reads ``get_kernels_config``. ``get_ops_config`` is the same store for
+unconsumed OpSlot models.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from ...kernels.config import get_kernels_config, set_kernels_config
-
 
 if TYPE_CHECKING:
-    from ...arguments.arguments_types import OpsImplementationConfig
+    from ..arguments.arguments_types import OpsImplementationConfig
 
 
-def set_ops_config(config: OpsImplementationConfig | None) -> None:
-    """Write the shared kernel-impl config."""
-    set_kernels_config(config)
+_kernels_config: OpsImplementationConfig | None = None
 
 
-def get_ops_config() -> Any:
-    """Read the shared kernel-impl config."""
-    return get_kernels_config()
+def set_kernels_config(config: Any) -> None:
+    """Install the process-global kernel-impl config."""
+    global _kernels_config
+    _kernels_config = config
+
+
+def get_kernels_config() -> Any:
+    """Return the installed kernel-impl config, or ``None``."""
+    return _kernels_config
