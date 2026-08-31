@@ -2,6 +2,7 @@
 
 BAGEL_SIGLIP_CONTEXT = "bagel_siglip_context"
 BAGEL_VAE_CONTEXT = "bagel_vae_context"
+BAGEL_START_TOKEN = "bagel_start_token"
 BAGEL_FLOW_QUERY = "bagel_flow_query"
 BAGEL_FLOW_HIDDEN = "bagel_flow_hidden"
 BAGEL_FLOW_VELOCITY = "bagel_flow_velocity"
@@ -13,5 +14,6 @@ __all__ = [
     "BAGEL_FLOW_VELOCITY",
     "BAGEL_GENERATED_LATENT",
     "BAGEL_SIGLIP_CONTEXT",
+    "BAGEL_START_TOKEN",
     "BAGEL_VAE_CONTEXT",
 ]
