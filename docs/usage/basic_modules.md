@@ -416,7 +416,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
 | `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
 | `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
-| `muon_head_split_modules` | `[]` | Leaf module names to head-split, matched exactly against the children of an attention module. **Required** when `muon_head_group_size >= 1`; there is no default list. |
+| `muon_head_split_modules` | `[]` | Projections to head-split, each matched as a leaf module name or a dotted path suffix (`self_attn.q_b_proj`). **Required** when `muon_head_group_size >= 1`; there is no default list. See below for the nested-name rule. |
 
 On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `expert_zero_comm`). Whether zero-comm sharding actually activated is logged separately as `[muon_expert_zero_comm]` during parallelize.
 
@@ -435,7 +435,7 @@ model:
   optimizer:
     type: muon
     muon_head_group_size: 1            # heads per block
-    muon_head_split_modules: [q_b_proj]  # which projections to split
+    muon_head_split_modules: [self_attn.q_b_proj]  # which projections to split
 ```
 
 Whether this helps depends on the shape of the stacked matrix:
@@ -462,11 +462,48 @@ Mechanics worth knowing when running an A/B:
   `sqrt(32)`-times-larger step and the experiment would really be measuring a
   learning-rate change.
 - Splitting is applied by name, so pick the list deliberately. Reasonable
-  starting points: `[q_b_proj]` for DeepSeek V3/V4 MLA up-projections,
+  starting points: `[self_attn.q_b_proj]` for DeepSeek V3/V4 MLA up-projections,
   `[q_proj, k_proj, v_proj]` for GQA attention, `[wq_b]` for a GLM MoE DSA
   indexer. Nothing stops you from listing `o_proj` (head-structured along
   *columns*) or MLA `kv_b_proj` (interleaves K and V inside each head), but row
   blocks would not line up with heads there.
+- Each entry matches a leaf module name **or any dotted path suffix**, so
+  `q_b_proj`, `self_attn.q_b_proj` and `compressor.indexer.q_b_proj` all address
+  the projections they name. That is how DeepSeek-V4 is disambiguated: its DSA
+  indexer, which sits *inside* the MLA under the compressor, names its own
+  up-projection `q_b_proj` too, so a bare `[q_b_proj]` would head-split the MLA's
+  8 heads and the indexer's `[index_n_heads * index_head_dim, q_lora_rank]` stack
+  at once. Rather than pick one, VeOmni rejects the entry and names the two
+  qualified forms:
+
+  ```
+  muon_head_split_modules entry 'q_b_proj' is ambiguous: it selects
+  model.layers.3.self_attn.q_b_proj (8 heads) and
+  model.layers.3.self_attn.compressor.indexer.q_b_proj (64 heads), and the second
+  sits inside the module holding the first, so the name cannot say which one was
+  meant. Replace it with 'self_attn.q_b_proj' or 'indexer.q_b_proj' -- list both
+  to split both.
+  ```
+
+  Note **replace**, not supplement: `[q_b_proj, self_attn.q_b_proj]` is refused
+  too, because the bare entry still selects both sites. The rule is per pair of
+  selected projections rather than per entry, so there is no spelling that slips
+  a nested pair through, and it holds at every `muon_head_group_size` — including
+  the sizes where one side of the pair stops splitting on its own.
+
+  Only *nested* matches are rejected. Sibling matches stay selected together,
+  because there the plain reading is unambiguous: Qwen2.5-Omni's text and audio
+  towers both name a `q_proj`, neither encloses the other, and `[q_proj]` means
+  both. GLM MoE DSA needs nothing special either — its indexer calls its
+  up-projection `wq_b` while the attention around it uses `q_b_proj`, so the two
+  names never collide.
+
+  **Migration.** `muon_head_split_modules: [q_b_proj]` was previously accepted on
+  DeepSeek-V4 and quietly split the indexer along with the MLA; it now fails at
+  optimizer construction. Use `[self_attn.q_b_proj]` for the MLA alone, or add
+  `indexer.q_b_proj` to keep splitting both. Every other model in the repo is
+  unaffected — no other pair of head-declaring modules shares a child name
+  through nesting.
 - The head count is never guessed from the shape alone: a projection is split
   only when its row count equals a *declared* head count times a *declared*
   per-head dim (`num_heads`/`n_heads`/config equivalents against
