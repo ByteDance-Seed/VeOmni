@@ -630,10 +630,10 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
-    init_device: Literal["cuda", "meta", "npu"] = field(
+    init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={
-            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU."
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU."
         },
     )
     broadcast_model_weights_from_rank0: bool = field(
@@ -1056,6 +1056,20 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
     "moe_implementation": "fused_npu",
 }
 
+# MLU compatibility tables for ``_validate_implementations``.
+_MLU_ALLOWED: Dict[str, frozenset] = {
+    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
+}
+
+_MLU_DEFAULT_FALLBACK: Dict[str, str | frozenset] = {
+    "rms_norm_implementation": "eager",
+    "rotary_pos_emb_implementation": "eager",
+    "swiglu_mlp_implementation": "eager",
+    "load_balancing_loss_implementation": "eager",
+    "cross_entropy_loss_implementation": "eager",
+    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
+}
+
 
 @dataclass
 class OpsImplementationConfig:
@@ -1111,7 +1125,7 @@ class OpsImplementationConfig:
         default="fused_triton",
         metadata={
             "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'eager'. "
+            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'fused_mlu' (MLU) | 'fused_mlu_triton' (MLU) | 'eager'. "
             "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
             "incompatible non-default overrides raise. Legacy 'fused' "
             "auto-resolves to fused_quack/fused_npu with a deprecation warning."
@@ -1163,7 +1177,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
-            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU). "
+            "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU or MLU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
             "'npu' uses the VeOmni NPUFusedRMSNormGated."
         },
@@ -1172,7 +1186,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Varlen depthwise causal conv1d implementation (Qwen3.5 GatedDeltaNet pre-mixer). "
-            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU). "
+            "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU or MLU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
@@ -1184,7 +1198,7 @@ class OpsImplementationConfig:
         default="fla",
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
-            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
+            "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU or MLU). "
             "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
@@ -1227,12 +1241,21 @@ class OpsImplementationConfig:
 
         # Legacy alias: ``moe_implementation='fused'`` resolves to a
         # hardware-appropriate fused kernel — Quack on GPU, NPU group-gemm on
-        # Ascend. Kept for back-compat with pre-#678 YAMLs; warn so users
+        # Ascend, MLU group-gemm or triton on Cambricon MLU. Kept for back-compat with pre-#678 YAMLs; warn so users
         # migrate to the explicit name.
         if self.moe_implementation == "fused":
-            from ..utils.import_utils import is_torch_npu_available
+            from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
 
-            resolved = "fused_npu" if is_torch_npu_available() else "fused_quack"
+            if is_torch_npu_available():
+                resolved = "fused_npu"
+            elif is_torch_mlu_available():
+                if is_apex_mlu_available():
+                    resolved = "fused_mlu"
+                else:
+                    resolved = "fused_mlu_triton"
+            else:
+                resolved = "fused_quack"
+
             logger.warning_rank0(
                 f"moe_implementation='fused' is a deprecated alias; resolving to '{resolved}' on this host. "
                 f"Set moe_implementation='{resolved}' explicitly to silence this warning."
@@ -1240,6 +1263,7 @@ class OpsImplementationConfig:
             self.moe_implementation = resolved
 
         self._apply_npu_default_fallback()
+        self._apply_mlu_default_fallback()
         self._validate_implementations()
 
     def _apply_npu_default_fallback(self):
@@ -1266,6 +1290,33 @@ class OpsImplementationConfig:
                     f"{field_name}: auto-resolved GPU default {current!r} -> {npu_value!r} on Ascend NPU."
                 )
 
+    def _apply_mlu_default_fallback(self):
+        """Auto-resolve GPU-only defaults to MLU-compatible alternatives.
+
+        When running on MLU, fields still at their GPU default are silently
+        swapped to the MLU fallback from ``_MLU_DEFAULT_FALLBACK``. Explicit
+        user overrides (non-default values) are left untouched and will be
+        caught by ``_validate_implementations`` if unsupported.
+        """
+        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
+
+        if not is_torch_mlu_available():
+            return
+
+        gpu_defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
+        for field_name, mlu_value in _MLU_DEFAULT_FALLBACK.items():
+            if field_name not in gpu_defaults:
+                continue
+
+            current = getattr(self, field_name)
+            if current == gpu_defaults[field_name]:
+                if field_name == "moe_implementation":
+                    mlu_value = "fused_mlu" if is_apex_mlu_available() else "fused_mlu_triton"
+                setattr(self, field_name, mlu_value)
+                logger.info_rank0(
+                    f"{field_name}: auto-resolved GPU default {current!r} -> {mlu_value!r} on Cambricon MLU."
+                )
+
     def _validate_implementations(self):
         """Fail fast on hardware/op mismatch at config-parse time.
 
@@ -1277,7 +1328,12 @@ class OpsImplementationConfig:
         """
         from ..ops import config as _ops_config_pkg  # noqa: F401  triggers op registrations
         from ..ops.config.registry import list_ops
-        from ..utils.import_utils import is_package_available, is_torch_npu_available
+        from ..utils.import_utils import (
+            is_apex_mlu_available,
+            is_package_available,
+            is_torch_mlu_available,
+            is_torch_npu_available,
+        )
 
         # Coverage check: every registered op must appear in ``_NPU_ALLOWED``,
         # otherwise a future op addition silently bypasses NPU validation.
@@ -1289,6 +1345,7 @@ class OpsImplementationConfig:
         )
 
         on_npu = is_torch_npu_available()
+        on_mlu = is_torch_mlu_available()
 
         for field_name, npu_ok in _NPU_ALLOWED.items():
             value = getattr(self, field_name)
@@ -1303,6 +1360,21 @@ class OpsImplementationConfig:
                 )
             if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
                 raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
+
+        for field_name, mlu_ok in _MLU_ALLOWED.items():
+            value = getattr(self, field_name)
+            if value == "eager":
+                continue
+            if on_mlu:
+                if value == "fused_mlu" and not is_apex_mlu_available():
+                    raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
+                if value not in mlu_ok:
+                    allowed = sorted(mlu_ok | {"eager"})
+                    raise ValueError(
+                        f"{field_name}={value!r} is not supported on Cambricon MLU. "
+                        f"Set to one of {allowed}; 'eager' is the universal fallback "
+                        f"for ops with no MLU kernel for the current model."
+                    )
 
         # The Triton load-balancing-loss kernel imports ``triton`` at module
         # top — surface a missing package here with an actionable message

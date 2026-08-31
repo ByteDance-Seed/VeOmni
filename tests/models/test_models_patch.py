@@ -312,7 +312,7 @@ class TrainerTest(BaseTrainer):
         if batch["position_ids"].dim() == 3 and batch["position_ids"].shape[1] == 3:
             batch["position_ids"] = batch["position_ids"].transpose(0, 1).contiguous()
 
-        loss, loss_dict = super().forward_backward_step(batch)
+        loss, loss_dict, _ = super().forward_backward_step(batch)
         grad_norm = veomni_clip_grad_norm(self.model, args.model.optimizer.max_grad_norm)
 
         _release_device_memory()

@@ -102,9 +102,10 @@ def test_opslot_fused_quack_on_npu_raises():
 
 @patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", False)
 @patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", True)
+@patch(f"{_REGISTRY_MODULE}.IS_MLU_AVAILABLE", False)
 def test_opslot_fused_triton_on_npu_raises():
     slot = OpSlot("moe_experts", "standard")
-    with pytest.raises(RuntimeError, match="device_type='gpu'"):
+    with pytest.raises(RuntimeError, match=r"\['gpu', 'mlu'\]"):
         slot.bind("triton")
 
 
@@ -142,10 +143,11 @@ def test_opslot_unknown_kernel_name_raises():
 # with ``fused_quack`` on the NPU CI runner without the validator firing
 # before the bind step we actually want to exercise.
 @patch("veomni.utils.import_utils.is_torch_npu_available", return_value=False)
+@patch("veomni.utils.import_utils.is_torch_mlu_available", return_value=False)
 @patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
 @patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
 @patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc, _mock_npu):
+def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc, _mock_npu, _mock_mlu):
     """Reproducer for the silent-fallback regression:
 
     User sets ``moe_implementation='fused_quack'`` on an A100. The binding
