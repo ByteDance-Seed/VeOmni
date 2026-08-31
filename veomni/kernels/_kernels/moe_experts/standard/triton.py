@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""standard MoE experts Triton implementation."""
+"""standard MoE experts Triton implementation.
+
+Also registered as ``mlu_triton`` (same wrapper, ``MluKernelRequirement``).
+"""
 
 from __future__ import annotations
 

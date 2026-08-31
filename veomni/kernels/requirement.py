@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from ..utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from ..utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 
 
 class KernelRequirement(Protocol):
@@ -82,3 +82,18 @@ class NpuKernelRequirement:
         if self.matches():
             return
         raise RuntimeError("NpuKernelRequirement is not satisfied (torch_npu device is unavailable)")
+
+
+@dataclass(frozen=True)
+class MluKernelRequirement:
+    """torch_mlu device is available."""
+
+    def matches(self) -> bool:
+        """Return whether a torch_mlu device is available."""
+        return IS_MLU_AVAILABLE
+
+    def check(self) -> None:
+        """Raise if a torch_mlu device is not available."""
+        if self.matches():
+            return
+        raise RuntimeError("MluKernelRequirement is not satisfied (torch_mlu device is unavailable)")

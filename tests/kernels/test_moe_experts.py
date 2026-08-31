@@ -34,9 +34,9 @@ from tests.kernels.tol import (
     MOE_FUSED_GRAD_RTOL,
     MOE_FUSED_RTOL,
 )
-from veomni.kernels import resolve_kernel
+from veomni.kernels import KERNEL_REGISTRY, resolve_kernel
 from veomni.kernels._kernels.moe_experts.standard.npu import _fc1_weight
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
 from veomni.utils.import_utils import is_fused_moe_available, is_quack_gemm_available
 
 
@@ -283,7 +283,12 @@ def _run_fused_vs_eager(
     seed: int = 0,
 ):
     torch.manual_seed(seed)
-    device = torch.device("npu" if impl == "npu" else "cuda")
+    if impl == "npu":
+        device = torch.device("npu")
+    elif impl in {"mlu", "mlu_triton"}:
+        device = torch.device("mlu")
+    else:
+        device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = shape
     hidden = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
@@ -459,3 +464,31 @@ def test_gpt_oss_quack_matches_eager():
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU fused MoE needs torch_npu")
 def test_npu_matches_eager():
     _run_fused_vs_eager("npu")
+
+
+def test_mlu_rows_are_registered():
+    registered = KERNEL_REGISTRY.list_registered("moe_experts", "standard")
+    assert "mlu" in registered
+    assert "mlu_triton" in registered
+    if not IS_MLU_AVAILABLE:
+        assert "mlu" not in KERNEL_REGISTRY.list_available("moe_experts", "standard")
+        assert "mlu_triton" not in KERNEL_REGISTRY.list_available("moe_experts", "standard")
+        with pytest.raises(RuntimeError, match="MluKernelRequirement"):
+            resolve_kernel("moe_experts", "standard", "mlu")
+        with pytest.raises(RuntimeError, match="MluKernelRequirement"):
+            resolve_kernel("moe_experts", "standard", "mlu_triton")
+
+
+@pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="MLU fused MoE needs torch_mlu")
+def test_mlu_matches_eager():
+    _run_fused_vs_eager("mlu")
+
+
+@pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="MLU Triton fused MoE needs torch_mlu")
+def test_mlu_triton_matches_eager():
+    _run_fused_vs_eager("mlu_triton")
+
+
+@pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="MLU fused MoE needs torch_mlu")
+def test_mlu_matches_eager_merged():
+    _run_fused_vs_eager("mlu", merged=True)

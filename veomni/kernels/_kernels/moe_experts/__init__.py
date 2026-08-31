@@ -20,10 +20,11 @@ the HF expert loop (regular autograd). Fused rows wrap the local Functions.
 """
 
 from ...registry import register_kernel
-from ...requirement import CudaKernelRequirement, NpuKernelRequirement
+from ...requirement import CudaKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
 from .standard import eager as standard_eager
+from .standard import mlu as standard_mlu
 from .standard import npu as standard_npu
 from .standard import quack as standard_quack
 from .standard import triton as standard_triton
@@ -53,6 +54,22 @@ register_kernel(
     "npu",
     wrapper=standard_npu.wrapper,
     requirement=NpuKernelRequirement(),
+)
+
+register_kernel(
+    "moe_experts",
+    "standard",
+    "mlu",
+    wrapper=standard_mlu.wrapper,
+    requirement=MluKernelRequirement(),
+)
+
+register_kernel(
+    "moe_experts",
+    "standard",
+    "mlu_triton",
+    wrapper=standard_triton.wrapper,
+    requirement=MluKernelRequirement(),
 )
 
 register_kernel("moe_experts", "gpt_oss", "eager", wrapper=gpt_oss_eager.wrapper)

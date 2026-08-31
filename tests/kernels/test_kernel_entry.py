@@ -22,7 +22,7 @@ from torch import Tensor
 
 from veomni.kernels import KERNEL_REGISTRY, VeomniKernel, register_kernel, resolve_kernel
 from veomni.kernels.registry import KernelEntry, SavedState
-from veomni.kernels.requirement import CudaKernelRequirement, NpuKernelRequirement
+from veomni.kernels.requirement import CudaKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 
 
 @pytest.fixture
@@ -120,6 +120,17 @@ class TestRegisterAndResolve:
                     forward=_add_forward,
                     backward=_add_backward,
                     requirement=NpuKernelRequirement(),
+                )
+            )
+        with pytest.raises(ValueError, match="Duplicate kernel registration"):
+            KERNEL_REGISTRY.register(
+                KernelEntry(
+                    kernel="add",
+                    variant="standard",
+                    impl="fused",
+                    forward=_add_forward,
+                    backward=_add_backward,
+                    requirement=MluKernelRequirement(),
                 )
             )
 
