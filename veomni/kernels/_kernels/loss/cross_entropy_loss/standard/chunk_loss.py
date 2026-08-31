@@ -28,7 +28,7 @@ def _ce_loss_func(
     hidden_states: Tensor,
     weight: Tensor,
     labels: Tensor,
-    num_items_in_batch: int,
+    num_items_in_batch: int | Tensor,
     ignore_index: int,
 ) -> Tensor:
     """Per-chunk body from ops ``chunk_loss_function``: linear then eager CE."""
@@ -61,12 +61,15 @@ def forward(
         raise RuntimeError("chunk_loss requires a nonempty ``weight`` (fused-linear path)")
 
     labels_flat = labels.reshape(-1)
-    n_valid = int((labels_flat != ignore_index).sum().item()) if labels_flat.numel() else 0
-    if hidden.numel() == 0 or n_valid == 0:
+    if hidden.numel() == 0 or labels_flat.numel() == 0:
         loss = hidden.sum() * 0 if hidden.numel() else torch.zeros((), device=hidden.device, dtype=torch.float32)
         return loss, SavedState((torch.zeros_like(hidden), torch.zeros_like(weight)))
 
-    denom = n_valid if num_items_in_batch is None else int(num_items_in_batch)
+    denom: int | Tensor
+    if num_items_in_batch is None:
+        denom = (labels_flat != ignore_index).sum().clamp(min=1)
+    else:
+        denom = num_items_in_batch
     split_dim = 1 if hidden.ndim >= 3 else 0
 
     accumulated_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)

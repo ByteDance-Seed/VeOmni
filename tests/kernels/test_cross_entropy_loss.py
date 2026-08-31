@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from transformers.loss.loss_utils import fixed_cross_entropy
 
 from tests.kernels.tol import (
     CE_FUSED_ATOL,
@@ -39,21 +40,6 @@ def _empty_weight(device: torch.device | str) -> Tensor:
     return torch.empty(0, device=device)
 
 
-def _hf_ce(
-    logits: Tensor,
-    labels: Tensor,
-    *,
-    ignore_index: int = -100,
-    num_items_in_batch: int | None = None,
-) -> Tensor:
-    """Match HuggingFace ``fixed_cross_entropy``."""
-    reduction = "sum" if num_items_in_batch is not None else "mean"
-    loss = F.cross_entropy(logits.float(), labels, ignore_index=ignore_index, reduction=reduction)
-    if num_items_in_batch is not None:
-        loss = loss / num_items_in_batch
-    return loss
-
-
 def _clone(tensor: Tensor) -> Tensor:
     return tensor.detach().requires_grad_(True)
 
@@ -65,7 +51,7 @@ def test_eager_matches_hf_logits():
     labels[0] = -100
 
     logits_h = _clone(logits)
-    out_h = _hf_ce(logits_h, labels)
+    out_h = fixed_cross_entropy(logits_h, labels)
 
     logits_e = _clone(logits)
     out_e = resolve_kernel("cross_entropy_loss", "standard", "eager").wrapper(
@@ -86,7 +72,7 @@ def test_eager_matches_hf_hidden_weight():
     labels[:, 0] = -100
 
     hidden_h, weight_h = _clone(hidden), _clone(weight)
-    out_h = _hf_ce(F.linear(hidden_h.reshape(-1, 32), weight_h), labels.reshape(-1))
+    out_h = fixed_cross_entropy(F.linear(hidden_h.reshape(-1, 32), weight_h), labels.reshape(-1))
 
     hidden_e, weight_e = _clone(hidden), _clone(weight)
     out_e = resolve_kernel("cross_entropy_loss", "standard", "eager").wrapper(hidden_e, labels, weight_e)
@@ -105,7 +91,7 @@ def test_eager_matches_hf_num_items():
     num_items = 6
 
     logits_h = _clone(logits)
-    out_h = _hf_ce(logits_h, labels, num_items_in_batch=num_items)
+    out_h = fixed_cross_entropy(logits_h, labels, num_items_in_batch=num_items)
     logits_e = _clone(logits)
     out_e = resolve_kernel("cross_entropy_loss", "standard", "eager").wrapper(
         logits_e, labels, _empty_weight(logits.device), num_items_in_batch=num_items
@@ -160,6 +146,35 @@ def test_liger_matches_eager():
     hidden_o, weight_o = _clone(hidden), _clone(weight)
     out_e = eager(hidden_e, labels, weight_e)
     out_o = other(hidden_o, labels, weight_o)
+    assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
+
+    out_e.backward()
+    out_o.backward()
+    assert torch.allclose(
+        hidden_e.grad.float(), hidden_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
+    )
+    assert torch.allclose(
+        weight_e.grad.float(), weight_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
+    )
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs CUDA")
+def test_liger_matches_eager_num_items():
+    pytest.importorskip("liger_kernel")
+    eager = resolve_kernel("cross_entropy_loss", "standard", "eager").wrapper
+    other = resolve_kernel("cross_entropy_loss", "standard", "liger_kernel").wrapper
+    torch.manual_seed(3)
+    hidden = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+    labels = torch.randint(0, 64, (2, 16), device="cuda")
+    labels[:, 0] = -100
+    # Deliberately not the valid-token count so mean and sum/N diverge.
+    num_items = 12
+
+    hidden_e, weight_e = _clone(hidden), _clone(weight)
+    hidden_o, weight_o = _clone(hidden), _clone(weight)
+    out_e = eager(hidden_e, labels, weight_e, num_items_in_batch=num_items)
+    out_o = other(hidden_o, labels, weight_o, num_items_in_batch=num_items)
     assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
 
     out_e.backward()

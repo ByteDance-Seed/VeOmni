@@ -46,20 +46,22 @@ def cross_entropy_from_logits(
     labels: Tensor,
     *,
     ignore_index: int,
-    num_items_in_batch: int | None,
+    num_items_in_batch: int | Tensor | None,
 ) -> Tensor:
     """Same reduction as HuggingFace ``fixed_cross_entropy``.
 
     ``mean`` over non-ignored tokens, or ``sum / num_items_in_batch``. All-ignored
-    or empty labels return a graph-connected zero.
+    or empty labels return a graph-connected zero. Valid-token count stays on
+    device; do not ``.item()`` it.
     """
-    if labels.numel() == 0 or int((labels != ignore_index).sum().item()) == 0:
+    if labels.numel() == 0:
         return logits.sum() * 0
-    reduction = "sum" if num_items_in_batch is not None else "mean"
-    loss = F.cross_entropy(logits.float(), labels, ignore_index=ignore_index, reduction=reduction)
+    loss = F.cross_entropy(logits.float(), labels, ignore_index=ignore_index, reduction="sum")
+    connected = loss + logits.sum() * 0
     if num_items_in_batch is not None:
-        loss = loss / num_items_in_batch
-    return loss
+        return connected / num_items_in_batch
+    n_valid = (labels != ignore_index).sum().to(dtype=connected.dtype)
+    return connected / n_valid.clamp(min=1)
 
 
 def _loss_hidden_weight(
@@ -67,7 +69,7 @@ def _loss_hidden_weight(
     weight: Tensor,
     labels: Tensor,
     ignore_index: int,
-    num_items_in_batch: int | None,
+    num_items_in_batch: int | Tensor | None,
 ) -> Tensor:
     """Ops eager path: ``F.linear`` then ``fixed_cross_entropy``."""
     hidden_flat, labels_flat = flatten_tokens(hidden, labels)
@@ -81,7 +83,7 @@ def _loss_logits(
     hidden: Tensor,
     labels: Tensor,
     ignore_index: int,
-    num_items_in_batch: int | None,
+    num_items_in_batch: int | Tensor | None,
 ) -> Tensor:
     """Ops eager path when ``hidden`` is already logits."""
     hidden_flat, labels_flat = flatten_tokens(hidden, labels)

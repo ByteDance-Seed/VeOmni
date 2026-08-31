@@ -42,16 +42,16 @@ def forward(
     """Liger fused linear + CE. ``weight`` must be present.
 
     Calls ``fused_linear_cross_entropy_forward`` / ``_backward`` the same way
-    ``LigerFusedLinearCrossEntropyFunction`` does. Reduction is ``mean``,
-    matching ops ``LigerFusedLinearCrossEntropyLoss(reduction="mean")``.
-    ``num_items_in_batch`` is accepted for the shared signature and ignored,
-    same as ops. Empty ``hidden`` falls back to the eager pair.
+    ``LigerFusedLinearCrossEntropyFunction`` does. Reduction matches eager /
+    HF ``fixed_cross_entropy``: mean over non-ignored tokens, or
+    ``sum / num_items_in_batch``. Empty ``hidden`` falls back to the eager pair.
     """
-    del num_items_in_batch
     if weight.numel() == 0:
         raise RuntimeError("liger_kernel requires a nonempty ``weight`` (fused-linear path)")
     if hidden.numel() == 0:
-        output, saved = _eager.forward(hidden, labels, weight, ignore_index=ignore_index)
+        output, saved = _eager.forward(
+            hidden, labels, weight, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch
+        )
         return output, SavedState(saved.tensors, _Meta(True))
 
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
@@ -67,16 +67,22 @@ def forward(
         hidden_flat.requires_grad_(True)
     if weight_needs_grad and not weight_c.requires_grad:
         weight_c.requires_grad_(True)
+    reduction = "sum" if num_items_in_batch is not None else "mean"
     loss, _z_loss, _token_accuracy, grad_hidden, grad_weight, _grad_bias = fused_linear_cross_entropy_forward(
         _input=hidden_flat,
         weight=weight_c,
         target=labels_flat.contiguous(),
         bias=None,
         ignore_index=ignore_index,
-        reduction="mean",
+        reduction=reduction,
     )
     if grad_hidden is None or grad_weight is None:
         raise RuntimeError("liger fused CE did not allocate input/weight grads")
+    if num_items_in_batch is not None:
+        scale = 1.0 / num_items_in_batch
+        loss = loss * scale
+        grad_hidden = grad_hidden * scale
+        grad_weight = grad_weight * scale
     return loss, SavedState((hidden, grad_hidden.detach(), grad_weight.detach()), _Meta(False))
 
 

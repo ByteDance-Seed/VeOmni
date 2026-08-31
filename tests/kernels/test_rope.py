@@ -40,8 +40,8 @@ from veomni.kernels import resolve_kernel
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
-def _wan_official_rope_apply(x: Tensor, freqs: Tensor, head_dim: int) -> Tensor:
-    """Wan2.1 official RoPE. transformers has no Wan.
+def _wan_reference_rope_apply(x: Tensor, freqs: Tensor, head_dim: int) -> Tensor:
+    """Wan2.1 reference RoPE. transformers has no Wan.
 
     Copied from Wan-Video/Wan2.1 ``wan/modules/model.py`` ``rope_apply``:
     ``view_as_complex(x.float64.reshape(..., 2)) * freqs`` then ``view_as_real``.
@@ -152,6 +152,33 @@ def test_full_liger_matches_eager():
     assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs CUDA")
+def test_full_liger_matches_eager_unsqueeze_dim_2():
+    pytest.importorskip("liger_kernel")
+    eager = resolve_kernel("rope", "full", "eager").wrapper
+    other = resolve_kernel("rope", "full", "liger_kernel").wrapper
+    torch.manual_seed(4)
+    # HF unsqueeze_dim=2: q/k are [B, S, H, D], tables are [B, S, D].
+    q = torch.randn(2, 16, 8, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
+    cos_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    sin_half = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    cos = torch.cat((cos_half, cos_half), dim=-1)
+    sin = torch.cat((sin_half, sin_half), dim=-1)
+
+    q_e, k_e = _clone_qk(q, k)
+    q_o, k_o = _clone_qk(q, k)
+    out_e = eager(q_e, k_e, cos, sin, unsqueeze_dim=2)
+    out_o = other(q_o, k_o, cos, sin, unsqueeze_dim=2)
+    _assert_pair(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
+
+    go = (torch.randn_like(out_e[0]), torch.randn_like(out_e[1]))
+    torch.autograd.backward(out_e, go)
+    torch.autograd.backward(out_o, go)
+    assert torch.allclose(q_e.grad, q_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
+    assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
+
+
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RoPE needs NPU")
 @pytest.mark.parametrize("variant", ["full", "partial"])
 def test_rope_npu_matches_eager(variant: str):
@@ -251,7 +278,7 @@ def test_deepseek_v4_triton_matches_eager():
     assert torch.allclose(x_e.grad, x_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
-def test_wan_eager_matches_official():
+def test_wan_eager_matches_reference():
     torch.manual_seed(0)
     head_dim = 64
     x = torch.randn(2, 16, 4 * head_dim, dtype=torch.float32, requires_grad=True)
@@ -259,7 +286,7 @@ def test_wan_eager_matches_official():
     freqs = torch.polar(torch.ones_like(angle), angle)
 
     x_h = x.detach().requires_grad_(True)
-    out_h = _wan_official_rope_apply(x_h, freqs, head_dim)
+    out_h = _wan_reference_rope_apply(x_h, freqs, head_dim)
 
     x_e = x.detach().requires_grad_(True)
     out_e = resolve_kernel("rope", "wan", "eager").wrapper(x_e, freqs, head_dim=head_dim)
