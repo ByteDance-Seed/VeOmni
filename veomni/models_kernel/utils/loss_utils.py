@@ -14,28 +14,25 @@
 
 """Modeling helpers around token-level ``cross_entropy_loss``.
 
-Shift, SP reduce, and the log-probs / distill side paths live here. The
-registry row is only ``(hidden, labels, weight, *, ignore_index,
-num_items_in_batch)``.
+Shift, caller-selected reduction, and the log-probs / distill side paths
+live here. The registry row is only ``(hidden, labels, weight, *,
+ignore_index, num_items_in_batch)``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from torch import Tensor, nn
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import reduce_sequence_parallel_loss
 from veomni.kernels import VeomniKernel
-from veomni.utils import logging
 from veomni.utils.model_outputs import FusedLinearAuxOutput
 
 from .chunk_logprobs import chunk_logprobs_function
 from .chunk_topk_distill import chunk_topk_distill_function
-
-
-logger = logging.get_logger(__name__)
 
 
 def _default_kernel() -> VeomniKernel:
@@ -61,6 +58,50 @@ def _select_hidden_weight(
     raise ValueError("Provide hidden_states and weights, or logits.")
 
 
+def _select_causal_target(
+    labels: Tensor | None,
+    shift_labels: Tensor | None,
+    *,
+    ignore_index: int,
+    sp_enabled: bool,
+) -> Tensor:
+    """Return the token targets the CE kernel should consume.
+
+    A provided ``shift_labels`` always wins, including when SP is on.
+    SeedOmni V2 BAGEL builds segment-aware pre-shifted targets that a
+    single causal shift cannot reconstruct. When ``shift_labels`` is
+    missing, non-SP applies the ordinary causal shift and SP uses
+    collator-prepared ``labels``.
+    """
+    if shift_labels is not None:
+        return shift_labels
+    if labels is None:
+        raise ValueError("labels or shift_labels must be provided.")
+    if not sp_enabled:
+        padded = nn.functional.pad(labels, (0, 1), value=ignore_index)
+        return padded[..., 1:].contiguous()
+    return labels
+
+
+def _maybe_reduce_loss(
+    loss: Tensor,
+    target: Tensor,
+    *,
+    ignore_index: int,
+    sp_enabled: bool,
+    loss_reduction_group: Any,
+) -> Tensor:
+    """Reduce on an explicit group, or on the default SP group when SP is on.
+
+    Valid-token count comes from the final target, not the raw labels.
+    An explicit group is not tied to the SP switch.
+    """
+    if loss_reduction_group is None and not sp_enabled:
+        return loss
+    num_valid_tokens = (target != ignore_index).sum()
+    return reduce_sequence_parallel_loss(loss, num_valid_tokens, group=loss_reduction_group)
+
+
 def ForCausalLMLoss(
     logits: Tensor | None = None,
     labels: Tensor | None = None,
@@ -70,11 +111,14 @@ def ForCausalLMLoss(
     shift_labels: Tensor | None = None,
     *,
     kernel: Callable | None = None,
+    loss_reduction_group: Any = None,
     **kwargs,
 ) -> tuple[Tensor | None, Tensor | None, FusedLinearAuxOutput | None]:
-    """Causal LM helper: shift, flatten, token CE, SP reduce.
+    """Causal LM helper: choose target, flatten, token CE, optional reduce.
 
-    ``kernel`` is a token-level ``cross_entropy_loss`` handle.
+    ``kernel`` is a token-level ``cross_entropy_loss`` handle. A provided
+    ``shift_labels`` is the final target. ``loss_reduction_group`` stays here
+    and must not reach the kernel.
     """
     del vocab_size
     hidden_states = kwargs.pop("hidden_states", None)
@@ -137,34 +181,30 @@ def ForCausalLMLoss(
     token_kernel = kernel if kernel is not None else _default_kernel()
     device = logits.device if logits is not None else hidden_states.device
     sp_enabled = get_parallel_state().sp_enabled
+    target = _select_causal_target(labels, shift_labels, ignore_index=ignore_index, sp_enabled=sp_enabled)
 
-    if not sp_enabled:
-        if shift_labels is None:
-            labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
-            shift_labels = labels[..., 1:].contiguous()
-    else:
-        if shift_labels is not None:
-            logger.warning_once("labels have been shifted in dataloader when `sp_enabeld=True`, ignore shift_labels.")
-        shift_labels = labels
-
-    shift_labels = shift_labels.view(-1)
+    target = target.view(-1)
     if hidden_states is not None:
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
     if logits is not None:
         logits = logits.view(-1, logits.size(-1))
-    shift_labels = shift_labels.to(device)
+    target = target.to(device)
 
     hidden, weight, out_logits = _select_hidden_weight(logits, hidden_states, weights)
     loss = token_kernel(
         hidden,
-        shift_labels,
+        target,
         weight,
         ignore_index=ignore_index,
         num_items_in_batch=num_items_in_batch,
     )
-    if sp_enabled:
-        num_valid_tokens = (labels != ignore_index).sum()
-        loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
+    loss = _maybe_reduce_loss(
+        loss,
+        target,
+        ignore_index=ignore_index,
+        sp_enabled=sp_enabled,
+        loss_reduction_group=loss_reduction_group,
+    )
     return loss, out_logits, None
 
 
