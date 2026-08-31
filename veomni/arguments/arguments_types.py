@@ -604,7 +604,8 @@ class OffloadConfig:
         default=4.0,
         metadata={
             "help": (
-                "Maximum GB of free host buffers retained by async activation offload between steps. "
+                "Maximum GB of free host buffers retained by async activation offload between steps, "
+                "counted once for the process rather than per offloaded module. "
                 "In-flight offloads may temporarily use more host memory. Set to 0 to disable reuse."
             )
         },
