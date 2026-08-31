@@ -19,11 +19,11 @@ def test_reduce_global_loss_token_reduces_each_denominator_once(monkeypatch):
     reduced = loss_utils.reduce_global_loss_token(
         {
             "foundation_tokens": torch.tensor(3),
-            "image_decoder_tokens": torch.tensor(0),
+            "extra_tokens": torch.tensor(0),
         }
     )
 
-    assert reduced == {"foundation_tokens": 13, "image_decoder_tokens": 10}
+    assert reduced == {"foundation_tokens": 13, "extra_tokens": 10}
     assert calls == [(3, "sum", None), (0, "sum", None)]
 
 

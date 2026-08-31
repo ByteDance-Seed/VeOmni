@@ -20,16 +20,25 @@ You can find the latest official Ascend CANN images at: [Ascend Hub](https://www
 
 ```bash
 # for arm
-docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
+docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-ubuntu22.04-py3.12
 
 # for x86
-docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11
+docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-ubuntu22.04-py3.12
 ```
 
 ## Step 2: Build the Custom Image
-Build the VeOmni Ascend A2 image using the appropriate Dockerfile for your architecture.
+
+Build the GDN-ready VeOmni Ascend A2 image using
+`Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86` for x86 or
+`Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm` for ARM64. These Dockerfiles include
+`torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`.
+
+The existing `Dockerfile.ascend_9.0.0_a2.x86` and `Dockerfile.ascend_9.0.0_a2.arm` remain available for
+general-purpose images.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
+
+The x86 Dockerfile also accepts `APT_SOURCE` and `PIP_INDEX` build arguments. The ARM64 Dockerfile accepts `PIP_INDEX`.
 
 ### For x86 Architecture
 
@@ -40,7 +49,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86 \
   .
 ```
 
@@ -53,7 +62,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.arm \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm \
   .
 ```
 
@@ -63,7 +72,7 @@ For x86:
 ```bash
 docker build \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.x86 \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86 \
   .
 ```
 
@@ -71,15 +80,16 @@ For ARM64:
 ```bash
 docker build \
   -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a2.arm \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm \
   .
 ```
 
 ### Image Components
 The built image includes:
-- Ubuntu 22.04 with Python 3.11
-- Ascend CANN 9.0.0 runtime
+- Ubuntu 22.04 with Python 3.12
+- Ascend CANN 9.1.0 runtime
 - VeOmni framework with NPU support
+- torch-npu 2.10.0.post2, triton-ascend, and fla_npu for GDN
 - TorchCodec for efficient video processing
 - All necessary development tools and dependencies
 
@@ -173,7 +183,7 @@ For x86 architecture, you need to activate the virtual environment created by `u
 source /app/.venv/bin/activate
 ```
 
-### Training Command Example
+### General Qwen3-VL Smoke Test
 
 After starting the container with appropriate mounts (and activating the environment for x86), you can run training commands. Here's an example for Qwen3-VL training using generic paths:
 
@@ -188,6 +198,24 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
 ```
 
 **Note:** Replace `/app/ckpt/your-model-checkpoint` and `/app/dataset/your-dataset.json` with the actual paths you used in your mount configuration.
+
+### Qwen3.5 GDN Training Example
+
+The GDN-ready image includes `triton-ascend` and `fla_npu`. Select the NPU
+implementations explicitly when running Qwen3.5:
+
+```bash
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
+    --model.model_path /app/ckpt/Qwen3.5-9B \
+    --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
+    --model.ops_implementation.rms_norm_gated_implementation npu \
+    --model.ops_implementation.causal_conv1d_implementation npu \
+    --model.ops_implementation.chunk_gated_delta_rule_implementation npu_ascendc \
+    --train.max_steps 20
+```
+
+See the [Qwen3.5 training guide](../../examples/qwen3_5.md#start-training-on-npu)
+for backend details and the Qwen3.5 MoE example.
 
 ## Step 5: Stop and Remove the Container
 When you're done, stop and remove the container:
@@ -205,7 +233,7 @@ docker stop ascend-a2-container && docker rm ascend-a2-container
 | Dependency Manager | uv | pip |
 | Virtual Environment | Required | Not Required |
 | Activation Command | `source /app/.venv/bin/activate` | N/A |
-| Installation Command | `uv sync --locked --all-packages --extra npu --dev` | `pip install -e .[npu_aarch64]` |
+| Installation Command | `uv sync --system-certs --python 3.12 --locked --extra npu` | `pip install -e .[npu_aarch64]` |
 
 ### Device Access
 The container requires access to all Ascend devices for proper functionality. The `--device` flags in the run command grant access to these devices.
@@ -221,14 +249,14 @@ Update the proxy settings in both the build and run commands to match your envir
 
 ### Dockerfile Details
 
-#### x86 Dockerfile (Dockerfile.ascend_9.0.0_a2)
+#### x86 Dockerfile (Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Installs and configures `uv` for dependency management
 4. Uses `uv` to install VeOmni framework with NPU support
 5. Sets up the virtual environment
 
-#### ARM64 Dockerfile (Dockerfile.ascend_9.0.0_a2.arm)
+#### ARM64 Dockerfile (Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Uses `pip` to install VeOmni framework with NPU support

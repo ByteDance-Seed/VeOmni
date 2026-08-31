@@ -15,13 +15,15 @@ First, pull the Huawei Ascend CANN base image. **Note: This image is for ARM64 a
 You can find the latest official Ascend CANN images at: [Ascend Hub](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)
 
 ```bash
-docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-ubuntu22.04-py3.11
+docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-a3-ubuntu22.04-py3.12
 ```
 
 ## Step 2: Build the Custom Image
-Build the VeOmni Ascend A3 image using the provided Dockerfile.
+Build the GDN-ready VeOmni Ascend A3 image using the provided Dockerfile. It includes `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`. The existing `Dockerfile.ascend_9.0.0_a3` remains available for the general-purpose image.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
+
+The GDN-ready Dockerfile also accepts `PIP_INDEX` and `APT_SOURCE` build arguments. `APT_SOURCE` must point to an Ubuntu Ports mirror.
 
 ```bash
 # Optional proxy settings (remove if not needed)
@@ -30,7 +32,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a3 \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3 \
   .
 ```
 
@@ -38,15 +40,16 @@ Without proxy (simplified):
 ```bash
 docker build \
   -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.0.0_a3 \
+  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3 \
   .
 ```
 
 ### Image Components
 The built image includes:
-- Ubuntu 22.04 with Python 3.11
-- Ascend CANN 9.0.0 runtime
+- Ubuntu 22.04 with Python 3.12
+- Ascend CANN 9.1.0 runtime
 - VeOmni framework with NPU support
+- torch-npu 2.10.0.post2, triton-ascend, and fla_npu for GDN
 - TorchCodec for efficient video processing
 - All necessary development tools and dependencies
 
@@ -130,6 +133,9 @@ docker run --runtime=runc -it \
 ```
 
 ## Step 4: Run Training Inside the Container
+
+### General Qwen3-VL Smoke Test
+
 After starting the container with appropriate mounts, you can run training commands. Here's an example for Qwen3-VL training using generic paths:
 
 ```bash
@@ -143,6 +149,24 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
 ```
 
 **Note:** Replace `/app/ckpt/your-model-checkpoint` and `/app/dataset/your-dataset.json` with the actual paths you used in your mount configuration.
+
+### Qwen3.5 GDN Training Example
+
+The GDN-ready image includes `triton-ascend` and `fla_npu`. Select the NPU
+implementations explicitly when running Qwen3.5:
+
+```bash
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5/qwen3_5_vl.yaml \
+    --model.model_path /app/ckpt/Qwen3.5-9B \
+    --data.train_path ./configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml \
+    --model.ops_implementation.rms_norm_gated_implementation npu \
+    --model.ops_implementation.causal_conv1d_implementation npu \
+    --model.ops_implementation.chunk_gated_delta_rule_implementation npu_ascendc \
+    --train.max_steps 20
+```
+
+See the [Qwen3.5 training guide](../../examples/qwen3_5.md#start-training-on-npu)
+for backend details and the Qwen3.5 MoE example.
 
 ## Step 5: Stop and Remove the Container
 When you're done, stop and remove the container:

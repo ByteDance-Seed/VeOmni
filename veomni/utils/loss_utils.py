@@ -27,7 +27,6 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
         batches = [batches]
     token_len = {
         "foundation_tokens": torch.tensor(0),
-        "image_decoder_tokens": torch.tensor(0),
     }
 
     def _count(obj):
@@ -42,7 +41,9 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
                     )
 
             if "image_output_mask" in obj:
-                token_len["image_decoder_tokens"] += torch.sum(obj["image_output_mask"])  # image generation tokens
+                token_len["image_decoder_tokens"] = token_len.get("image_decoder_tokens", torch.tensor(0)) + torch.sum(
+                    obj["image_output_mask"]
+                )  # image generation tokens
         elif isinstance(obj, (list, tuple)):
             for item in obj:
                 _count(item)

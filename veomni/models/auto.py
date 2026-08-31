@@ -25,7 +25,7 @@ from transformers import (
 )
 
 from ..arguments.arguments_types import OpsImplementationConfig
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from ..ops.dispatch import OpsConfigSlot, OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
@@ -36,6 +36,47 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
 
 logger = logging.get_logger(__name__)
+
+# Models whose forward implements context parallelism. An allow-list rather than
+# a deny-list so that a model has to be ported deliberately: CP is enabled
+# model-agnostically (``ParallelState`` and ``TrainingArguments`` both admit
+# ``cp_size > 1`` for anything), and nothing downstream would notice a model that
+# has not been. ``SequenceParallelCollator`` shards the sequence on
+# ``sp_enabled``, which CP alone turns on, while every unported model gates its
+# sequence-parallel collectives on ``ulysses_enabled``, which CP alone leaves
+# false — so the shards are never gathered, each rank attends only within its own
+# 1/cp_size of the sequence, and the run trains to a plausible loss curve while
+# being silently wrong.
+CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+
+
+def check_context_parallel_supported(config: PretrainedConfig) -> None:
+    """Raise unless this model type implements context parallelism.
+
+    A no-op when context parallelism is off, which is every other configuration.
+    """
+    # ``build_foundation_model`` runs this for every model, including in processes
+    # that never installed a parallel state -- tests that spawn a multi-rank world
+    # and build a model directly do exactly that. Asking ``get_parallel_state``
+    # there would *construct* a default single-process state, whose ``dp_size=1``
+    # contradicts the real world size and raises on the topology check. No state
+    # installed means no context parallelism to gate.
+    if not is_parallel_state_initialized():
+        return
+
+    if not get_parallel_state().cp_enabled:
+        return
+
+    model_type = getattr(config, "model_type", None)
+    if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
+        return
+
+    supported = ", ".join(sorted(CONTEXT_PARALLEL_MODEL_TYPES))
+    raise NotImplementedError(
+        f"Context parallelism is not implemented for model type {model_type!r}; "
+        f"only {supported} supports it. Set cp_size=1 to disable it, or use "
+        "ulysses_size for sequence parallelism on this model."
+    )
 
 
 def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
@@ -107,6 +148,17 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     return bool(bound)
 
 
+def _validate_attention_parallelism(attn_implementation: Optional[str]) -> None:
+    if attn_implementation not in ("magi_attention", "veomni_magi_attention_with_sp"):
+        return
+
+    cp_size = get_parallel_state().cp_size
+    if cp_size != 1:
+        raise ValueError(
+            f"MagiAttention currently requires context parallel size 1 (cp_size == 1), got cp_size={cp_size}."
+        )
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
@@ -123,14 +175,16 @@ def build_foundation_model(
             "flash_attention_3",
             "flash_attention_4",
             "flex_attention",
+            "magi_attention",
             "veomni_flex_attention_with_sp",
+            "veomni_magi_attention_with_sp",
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
             "veomni_flash_attention_4_with_sp",
             "native-sparse",
         ]
     ] = None,
-    init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
@@ -154,8 +208,9 @@ def build_foundation_model(
     from ..ops.config.singleton import get_ops_config
 
     if ops_implementation is not None:
-        apply_ops_config(ops_implementation)
         attn_implementation = ops_implementation.attn_implementation
+        _validate_attention_parallelism(attn_implementation)
+        apply_ops_config(ops_implementation)
     else:
         installed = get_ops_config()
         if installed is None:
@@ -173,6 +228,7 @@ def build_foundation_model(
         # variant the user selected.
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation
+        _validate_attention_parallelism(attn_implementation)
 
     if config_kwargs is None:
         config_kwargs = {}
@@ -181,6 +237,8 @@ def build_foundation_model(
         config = config_path
     else:
         config = build_config(config_path, **config_kwargs)
+
+    check_context_parallel_supported(config)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
@@ -231,6 +289,7 @@ def build_foundation_model(
 
     if attn_implementation not in (
         "veomni_flex_attention_with_sp",
+        "veomni_magi_attention_with_sp",
         "veomni_flash_attention_2_with_sp",
         "veomni_flash_attention_3_with_sp",
         "veomni_flash_attention_4_with_sp",
