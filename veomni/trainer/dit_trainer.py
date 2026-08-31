@@ -525,6 +525,7 @@ class DiTTrainer:
             else:
                 micro_batches = next(data_iterator)
 
+        self.base._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
         self.base.sync_before_train_step()

@@ -13,6 +13,7 @@ from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     DataArguments,
     ModelArguments,
+    OffloadConfig,
     OpsImplementationConfig,
     TrainingArguments,
     VeOmniArguments,
@@ -423,6 +424,7 @@ def test_mark_compile_step_begin_skips_without_torch_compiler(monkeypatch):
 
 
 def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
+    from veomni.trainer.base import BaseTrainer
     from veomni.trainer.vlm_trainer import VLMTrainer
 
     marks = []
@@ -434,7 +436,12 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
 
     trainer = VLMTrainer.__new__(VLMTrainer)
     trainer.base = SimpleNamespace(
-        args=SimpleNamespace(model=SimpleNamespace(optimizer=SimpleNamespace(max_grad_norm=1.0))),
+        args=SimpleNamespace(
+            model=SimpleNamespace(
+                optimizer=SimpleNamespace(max_grad_norm=1.0),
+                accelerator=SimpleNamespace(offload_config=OffloadConfig()),
+            )
+        ),
         state=SimpleNamespace(global_step=0),
         model=SimpleNamespace(_veomni_compile_uses_cuda_graphs=True),
         model_reshard=lambda *_: None,
@@ -445,6 +452,9 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
         lr_scheduler=SimpleNamespace(step=lambda: None),
         on_step_begin=lambda **_: None,
         on_step_end=lambda **_: None,
+    )
+    trainer.base._reset_async_activation_offload_if_enabled = (
+        lambda: BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base)
     )
 
     trainer.train_step(iter([[{}, {}]]))
