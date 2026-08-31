@@ -1,6 +1,6 @@
 # VeOmni Agent Skills
 
-Reusable workflow definitions for AI coding agents working on VeOmni. Skills follow the [Agent Skills](https://agentskills.io) open standard and are auto-discovered by compatible agents (Cursor, Claude Code, Codex, Junie, etc.).
+Reusable workflow definitions for AI coding agents working on VeOmni. Skills follow the [Agent Skills](https://agentskills.io) open standard, so any agent that implements it auto-discovers them.
 
 ## Structure
 
