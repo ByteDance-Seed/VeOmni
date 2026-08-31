@@ -18,6 +18,9 @@ On session start, read the following:
 - `.agents/knowledge/uv.md` — dependency management architecture (uv, extras, lockfile)
 - `.agents/knowledge/cloud_env.md` — Cursor Cloud (CPU-only VM) setup; read when running on the Cursor Cloud VM
 
+Read on demand:
+- `.agents/knowledge/multimodal_metadata.md` — multimodal metadata precompute contract; read before touching VLM/Omni collators, ViT forwards, or the model metadata hooks
+
 ---
 
 ## Core Principles

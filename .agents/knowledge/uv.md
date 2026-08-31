@@ -11,8 +11,19 @@ CI install a concrete pin and use `--locked` / `--frozen` for reproducibility.
 | Location | Format |
 |----------|--------|
 | `pyproject.toml` -> `[tool.uv]` -> `required-version` | range |
-| `docker/cuda/Dockerfile.cu130`, `docker/ascend/Dockerfile.*` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
+| `docker/**/Dockerfile.*` | concrete pin, per file: `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
 | `.github/workflows/check_patchgen.yml` | `setup-uv` `version: "X.Y.Z"` |
+
+Every Dockerfile is standalone and hand-maintained — the Jinja template
+generator and its matrix were dropped in #1133, so nothing fans a pin out for
+you. Only the uv-based images carry a pin at all; the pip-based ascend variants
+(`*.arm`, `*_a3`) install with `pip` and have none. Never assume one file's pin
+covers the rest; enumerate:
+
+```bash
+grep -rn "astral-sh/uv" docker/     # every uv pin
+grep -rnE "torch(-npu)?==" docker/  # same for torch; -npu is the ascend form
+```
 
 ## Dependency Layout
 
@@ -92,31 +103,34 @@ forced into a specific 5.x patch.
 | `flash-attn-3` (Hopper) | cp310-abi3 Luosuu wheel on x86_64; cp39-abi3 PyTorch cu130 wheel on aarch64 | abi3 covers supported Python versions; aarch64 requires glibc 2.34+ |
 | `flash-mla` | cp311/cp312 Luosuu cu130/torch2.11/sm90a+sm100f wheels | architecture-specific x86_64/aarch64 wheels |
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
-| `flash-qla` | git: QwenLM/FlashQLA | source-built; uv overrides its TileLang 0.1.8 metadata pin |
+| `flash-qla` | PyPI `0.1.2` | pure-Python wheel; static metadata already matches the TileLang / tvm-ffi pins, so no source build and no metadata override |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
+| `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | the only source builds left; SM90+ only, excluded on the SM89 GPU CI runners |
 
-Two pyproject knobs make the remaining FlashQLA source build succeed:
+`flash-qla` and `tile-kernels` must agree on one TileLang version, so
+`[tool.uv].override-dependencies` pins the shared GPU environment to
+`tilelang==0.1.9`. DeepSeek V4 TileLang and TileKernels tests cover that
+resolved combination — bump the two packages and the override as a set.
 
-1. **`[[tool.uv.dependency-metadata]]`** with `version` for `flash-qla`.
-   It has no `pyproject.toml`; without static metadata uv runs its setup.py
-   on a fresh venv and crashes with `ModuleNotFoundError: No module named
-   'setuptools'`. The static `requires-dist` mirrors flash-qla's own
-   install_requires (`torch`, `tilelang==0.1.8`, `apache-tvm-ffi==0.1.9`)
-   — `flash_qla/__init__.py` top-level imports `tilelang`, so they have to
-   ship alongside, even though the `flash_qla` kernel itself only binds on
-   sm90 (gated by `KernelSpec(min_compute_capability=90)`).
+Two pyproject knobs make the remaining git source builds succeed:
 
-   The GPU extra also installs `tile-kernels==1.0.0`, which requires
-   `tilelang>=0.1.9`. `[tool.uv].override-dependencies` therefore pins the
-   shared GPU environment to `tilelang==0.1.9`; DeepSeek V4 TileLang and
-   TileKernels tests cover that resolved combination.
-
+1. **`[[tool.uv.dependency-metadata]]`** — these projects ship no usable
+   metadata, so without a static `requires-dist` uv runs their `setup.py` on a
+   fresh venv and crashes with `ModuleNotFoundError: No module named
+   'setuptools'`. All four blocks declare `requires-dist = []`: the three
+   companion extensions have no upstream runtime requirements, while
+   MagiAttention's are omitted from its metadata and kept in a separate CUDA 12
+   NVSHMEM requirements file. The CUDA 13 closure is supplied through the `gpu`
+   extra instead.
 2. **`[tool.uv.extra-build-dependencies]`** seeds `setuptools / wheel /
-   packaging / ninja` (+ `torch` where needed) — uv venvs are not seeded.
+   packaging / ninja` (+ `torch`, with `match-runtime = true` where the
+   extension links against it) — uv venvs are not seeded.
+   `[tool.uv.extra-build-variables]` carries `MAX_JOBS` / compute-capability
+   flags for the three that need them (not `flash-attn-cute`).
 
 `FLASH_ATTENTION_FORCE_BUILD=TRUE` and `[tool.uv.no-build-isolation-package]`
-are gone — no FA setup.py runs anywhere now (FA2/3 wheel, FA4 cute is a
-DSL package, flash-qla uses dependency-metadata).
+are gone — no FA setup.py runs anywhere now (FA2/3/MLA are wheels, FA4 and
+flash-qla are pure-Python PyPI releases).
 
 ## Common Commands
 

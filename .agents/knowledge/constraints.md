@@ -187,13 +187,14 @@ Core files:
 
 ## Hardware
 
-22. **NPU (Ascend) code paths require guards**
-    - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
-    - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/` — they must not be imported on GPU-only environments.
+22. **Non-CUDA accelerator code paths require guards**
+    - There are three backends today: CUDA, Ascend NPU and Cambricon MLU. Guard vendor-specific code with `is_torch_npu_available()` / `IS_NPU_AVAILABLE` or `is_torch_mlu_available()` / `IS_MLU_AVAILABLE` (`veomni/utils/import_utils.py`, `veomni/utils/device.py`).
+    - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/`; the MLU kernel is `veomni/ops/kernels/moe/mlu_group_gemm.py`. They must not be imported on a host without that vendor's runtime.
+    - Device-type sets, not `== "cuda"`, decide dispatch: `MOE_TRITON_DEVICE_TYPES` in `veomni/utils/device.py` is `("cuda", "mlu")` today. Adding a backend means auditing those sets, not just adding a branch.
 
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
-   - Direct CUDA calls break NPU compatibility.
+   - Direct CUDA calls break NPU and MLU compatibility.
 
 ## Trainer Extensions
 

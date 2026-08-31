@@ -5,7 +5,9 @@ description: "Use this skill when adding a new optimized kernel or operator to v
 
 ## Before You Start
 
-1. Read `.agents/knowledge/constraints.md` — especially rules about NPU guards (#19, #20).
+1. Read `.agents/knowledge/constraints.md` — especially the "Hardware" section
+   (NPU guards, device-agnostic helpers) and "Module-level OpSlots are shared by
+   every model instance" under "Trainer Extensions".
 2. Read `docs/design/kernel_selection.md` and `docs/design/unified_kernel_registry.md` — understand the kernel lifecycle, the `KERNEL_REGISTRY`, and `OpSlot` dispatch.
 3. Familiarize yourself with the ops architecture below.
 
@@ -22,11 +24,15 @@ veomni/ops/
 ├── __init__.py          # apply_ops_patch / apply_ops_config entry points
 ├── kernel_registry.py   # KERNEL_REGISTRY (the single source of truth)
 ├── dispatch.py          # OpSlot + binding helpers
-├── config/              # OpsImplementationConfig + per-op registry helpers
+├── config/              # legacy OpSpec/BackendSpec registry: apply_global_ops()
+│                        # + apply_per_model_patches() for device_patch.py models
 ├── kernels/             # all registry-driven kernels
 │   ├── attention/       # FA2/3/4 + sequence-parallel wrappers
 │   ├── cross_entropy/   # eager + liger fused CE
+│   ├── deepseek_sparse_attention/
+│   ├── deepseek_v4/     # TileLang sparse attention / indexer
 │   ├── load_balancing_loss/
+│   ├── mhc/             # TileKernels DeepSeek V4 adapters
 │   ├── moe/             # fused MoE (group_gemm / quack / npu_group_gemm)
 │   ├── rms_norm/        # eager / liger / batch-invariant
 │   ├── rotary/          # default / triton-deterministic
@@ -37,7 +43,8 @@ veomni/ops/
 └── platform/            # NPU-specific helpers
 ```
 
-**Two complementary mechanisms** coexist:
+**Three mechanisms coexist.** Pick the first one unless you have a concrete
+reason not to:
 
 1. **`KERNEL_REGISTRY` + `OpSlot`** (preferred for new ops). Each kernel
    registers itself under a `(slot_name, variant)` pair (e.g.
@@ -52,10 +59,18 @@ veomni/ops/
    that is rebound by `apply_ops_config()` so call sites in non-patchgen code
    (DeepSeek MLA inference paths, NPU custom forwards) can keep importing the
    public name without going through an `OpSlot`.
+3. **Per-model `device_patch.py`** via `OpSpec`/`BackendSpec` in
+   `ops/config/registry.py`. `apply_per_model_patches(hf_module, model_name,
+   targets={op: attr})` setattr-replaces attributes on an HF module. Used by the
+   models that have no patchgen-generated file (`wan`) or that need a runtime
+   device-specific swap after generation (`deepseek_v3`, `deepseek_v4`). Those
+   three `device_patch.py` files are its only callers. Do not extend this for
+   new kernels.
 
-Pick mechanism 1 for any kernel that lives inside a patchgen-generated
-modeling file. Use mechanism 2 only when the kernel must be callable from
-unpatched (or non-Transformers) Python code.
+Mechanism 1 covers any kernel living inside a patchgen-generated modeling file.
+Use 2 only when the kernel must be callable from unpatched (or
+non-Transformers) Python code, and 3 only when touching a model that already
+ships a `device_patch.py`.
 
 ## Phase 1: Design
 
