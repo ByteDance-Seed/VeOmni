@@ -16,7 +16,7 @@ On session start, read the following:
 - `.agents/knowledge/constraints.md` — hard constraints to check before any code change
 - `.agents/knowledge/architecture.md` — module map, trainer hierarchy, data flow
 - `.agents/knowledge/uv.md` — dependency management architecture (uv, extras, lockfile)
-- `.agents/knowledge/cloud_env.md` — Cursor Cloud (CPU-only VM) setup; read when running on the Cursor Cloud VM
+- `.agents/knowledge/cpu_only_env.md` — what can be verified without a GPU/NPU; read when running on a CPU-only machine
 
 Read on demand:
 - `.agents/knowledge/testing.md` — how CI selects tests, and how to decide whether a change needs one; read before adding or wiring a test
@@ -82,14 +82,14 @@ Title: `[{modules}] {type}: {description}`
 4. **safe** -> commit. **risky** -> report to user, wait for approval.
 5. Each fix -> immediate commit. Do not batch unrelated changes.
 6. Run `make quality` before every commit.
-7. **Commit messages must NOT mention Claude/AI/Co-Authored-By.**
+7. **Commit messages describe the change, not the tool that produced it** — no agent or model names, and no `Co-Authored-By` trailers.
 8. **Skill gap check**: If the task didn't match any existing skill, briefly assess after completion: Was this a one-off, or a repeatable pattern? If repeatable, suggest creating a new skill to the user.
 
 ---
 
 ## Skills
 
-Skills follow the [Agent Skills](https://agentskills.io) open standard. Each skill is a folder in `.agents/skills/<name>/` containing a `SKILL.md` with YAML frontmatter (`name`, `description`). Skills are auto-discovered by compatible agents (Cursor, Claude Code, Codex, etc.) and can also be invoked manually with `/skill-name` in chat.
+Skills follow the [Agent Skills](https://agentskills.io) open standard. Each skill is a folder in `.agents/skills/<name>/` containing a `SKILL.md` with YAML frontmatter (`name`, `description`). Agents that implement the standard auto-discover them from the `description`; they can also be invoked manually with `/skill-name` in chat.
 
 | Task | Skill |
 |------|-------|

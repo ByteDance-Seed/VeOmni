@@ -579,7 +579,8 @@ Extra e2e gotchas:
    - Title: `[BREAKING]` only if the change alters checkpoint format
      expectations or public APIs. Follow `[{modules}] {type}: {description}`.
      Example: `[veomni] feat: add patchgen-generated modeling for <m>`.
-   - Commit message **must not** mention Claude / AI / Co-Authored-By.
+   - Commit message describes the change, not the tool that produced it — no
+     agent or model names, no `Co-Authored-By` trailers.
 
 ---
 
