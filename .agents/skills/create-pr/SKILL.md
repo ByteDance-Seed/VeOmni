@@ -58,7 +58,7 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    | `veomni/models/` | `model` |
    | `veomni/trainer/` | `trainer` |
    | `veomni/data/` | `data` |
-   | `veomni/distributed/` | `dist` |
+   | `veomni/distributed/` | `dist` (use `parallel` when the change is about a parallelism strategy rather than the plumbing) |
    | `veomni/ops/` | `ops` |
    | `veomni/checkpoint/` | `ckpt` |
    | `veomni/optim/` | `optim` |
@@ -69,16 +69,16 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    | `docker/` | `docker` |
    | `tasks/` | `task` |
    | `.agents/` | `agent` |
+   | anything with a measurable speed/memory claim | add `perf` |
    | other / mixed | `misc` |
 
-   `parallel`, `logging`, `omni`, `perf` and `release` have no directory of
-   their own: use `parallel` when a `veomni/distributed/` change is about a
-   parallelism strategy rather than the plumbing, `perf` alongside another
-   module when the PR makes a measurable speed or memory claim, and `omni`,
-   `logging`, `release` for omni-model, log/telemetry-surface and
-   release-plumbing work respectively.
+   `omni`, `logging` and `release` have no directory of their own — use them
+   for omni-model, log/telemetry-surface and release-plumbing changes
+   respectively.
 
-   Allowed modules: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `docker`, `trainer`, `agent`, `lora`
+   The authoritative module and type lists live in
+   `.github/workflows/check_pr_title.yml` (`allowedModules` / `allowedTypes`).
+   Read it rather than trusting this table if a name is rejected.
 
 3. Determine **change type**:
 
@@ -98,7 +98,9 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    - Breaking changes: prepend `[BREAKING]`
    - Must pass the regex in `.github/workflows/check_pr_title.yml`
 
-2. Draft PR description following `.github/PULL_REQUEST_TEMPLATE.md`.
+2. Draft the PR description by **reading `.github/PULL_REQUEST_TEMPLATE.md`**
+   and filling in its sections. Do not reproduce the template from memory — it
+   changes, and a stale copy silently drops checklist items.
 
 3. **Write to `.pr-drafts/`** (already in `.gitignore`):
    ```bash
@@ -114,35 +116,11 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    ```markdown
    [model] feat: add support for Qwen4
 
-   ### What does this PR do?
-
-   > Summary here.
-
-   ### Checklist Before Starting
-
-   - Search for relative PRs/issues and link here: ...
-   - PR title follows `[{modules}] {type}: {description}` format
-
-   ### Test
-
-   > Test description here.
-
-   ### API and Usage Example
-
-   > N/A
-
-   ### Design & Code Changes
-
-   > - Change 1
-   > - Change 2
-
-   ### Checklist Before Submitting
-
-   - [ ] Read the [Contribute Guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/CONTRIBUTING.md)
-   - [ ] Applied pre-commit checks
-   - [ ] Added/updated documentation
-   - [ ] Added tests to CI workflow (or explained why not feasible)
+   <sections copied from .github/PULL_REQUEST_TEMPLATE.md, filled in>
    ```
+
+   Keep the template's own bullet/checkbox style. Fill every section: an empty
+   `### Test` section is the most common review blocker.
 
 4. Tell the user the draft file path (so they know where to find it if they want to review later).
 
