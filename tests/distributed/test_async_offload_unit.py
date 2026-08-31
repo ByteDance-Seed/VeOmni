@@ -483,22 +483,22 @@ def _run_async_offload_base_trainer_fsdp2_gc():
             fqn_to_index_mapping=None,
             model_path=None,
             basic_modules=[],
-        ),
-        train=SimpleNamespace(
+            optimizer=OptimizerConfig(),
             accelerator=SimpleNamespace(
                 offload_config=OffloadConfig(
                     enable_async_activation=True,
                     activation_offload_host_cache_limit_gb=0.01,
                 ),
                 fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
+                init_device="meta",
+                gradient_checkpointing=GradientCheckpointingConfig(enable=True),
+                broadcast_model_weights_from_rank0=False,
+                ep_sharded_stream_load=False,
+                torch_compile=TorchCompileConfig(enable=False),
             ),
-            optimizer=OptimizerConfig(),
+        ),
+        train=SimpleNamespace(
             checkpoint=SimpleNamespace(load_path=None),
-            init_device="meta",
-            gradient_checkpointing=GradientCheckpointingConfig(enable=True),
-            broadcast_model_weights_from_rank0=False,
-            ep_sharded_stream_load=False,
-            torch_compile=TorchCompileConfig(enable=False),
         ),
     )
 
