@@ -6,10 +6,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from veomni.distributed.sequence_parallel.async_ulysses_dit import _AsyncA2A
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.ulysses import (
     _all_to_all_single,
+    _AsyncA2A,
     _Gather,
 )
 from veomni.utils.device import IS_NPU_AVAILABLE

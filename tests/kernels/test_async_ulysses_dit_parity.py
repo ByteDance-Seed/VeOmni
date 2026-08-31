@@ -16,18 +16,13 @@ from torch.testing._internal.common_utils import run_tests
 
 from tests.parallel.ulysses.utils import SequenceParallelTest, sync_tensor
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.distributed.sequence_parallel.async_ulysses_dit import (
-    async_ulysses_output_projection as async_ulysses_dit_output_projection,
-)
-from veomni.distributed.sequence_parallel.async_ulysses_dit import (
-    async_ulysses_qkv_projection as async_ulysses_dit_qkv_projection,
-)
 from veomni.distributed.sequence_parallel.comm import (
     get_ulysses_sequence_parallel_group,
     set_ulysses_sequence_parallel_group,
 )
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
+from veomni.kernels import VeomniKernel
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 from veomni.utils.import_utils import is_torch_npu_available
@@ -125,7 +120,7 @@ class AttentionDiT(nn.Module):
             k = gather_seq_scatter_heads(k, seq_dim=1, head_dim=2, unpadded_dim_size=unpadded_seq_len)
             v = gather_seq_scatter_heads(v, seq_dim=1, head_dim=2, unpadded_dim_size=unpadded_seq_len)
         else:
-            q, k, v = async_ulysses_dit_qkv_projection(
+            q, k, v = VeomniKernel("async_ulysses_qkv", "dit")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,
@@ -159,7 +154,7 @@ class AttentionDiT(nn.Module):
             x = gather_heads_scatter_seq(x, head_dim=2, seq_dim=1)
             x = self.proj_o(x)
         else:
-            x = async_ulysses_dit_output_projection(
+            x = VeomniKernel("async_ulysses_o", "dit")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,

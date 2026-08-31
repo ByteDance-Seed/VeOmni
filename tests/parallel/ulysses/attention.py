@@ -5,10 +5,7 @@ import torch.utils.checkpoint
 from einops import rearrange
 
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.distributed.sequence_parallel.async_ulysses import (
-    async_ulysses_output_projection,
-    async_ulysses_qkv_projection,
-)
+from veomni.kernels import VeomniKernel
 
 from .normalization import get_layernorm
 
@@ -71,7 +68,7 @@ class Attention(nn.Module):
             v = rearrange(v, "B N (h d) -> B N h d", d=self.head_dim).contiguous()
             q, k = self.q_norm(q), self.k_norm(k)
         else:
-            q, k, v = async_ulysses_qkv_projection(
+            q, k, v = VeomniKernel("async_ulysses_qkv", "standard")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,
@@ -110,7 +107,7 @@ class Attention(nn.Module):
             x = gather_heads_scatter_seq(x, head_dim=2, seq_dim=1)
             x = self.proj_o(x)
         else:
-            x = async_ulysses_output_projection(
+            x = VeomniKernel("async_ulysses_o", "standard")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,
