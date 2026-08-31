@@ -13,7 +13,7 @@
 ### Test
 
 > Validation results (training curves, eval metrics) for changes not covered by CI.
-> State which of the three applies: extended an existing CI-enumerated test, added a new test and wired it into the unit-test workflows, or no test needed (with the reason).
+> State which of the three applies: extended an existing CI-enumerated test, added a new test and wired it into the CI workflow that owns its path (a unit-test workflow, or `gpu_e2e_test.yml` / `npu_e2e_test.yml` for e2e), or no test needed (with the reason).
 
 ### API and Usage Example
 

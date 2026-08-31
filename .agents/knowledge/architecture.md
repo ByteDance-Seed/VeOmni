@@ -220,10 +220,11 @@ Distributed tests (`tests/parallel/`, `tests/distributed/`, `tests/e2e/`) may re
 **A passing local run does not mean CI runs it.**
 `.github/workflows/gpu_unit_tests.yml` and `npu_unit_tests.yml` enumerate most
 test files one by one. Only `tests/data` runs as a whole directory in both
-workflows; `tests/ops` runs wholesale on GPU only (the NPU job enumerates three
-named ops files). A new file anywhere else is invisible to CI until it is added
-to those workflows, usually both. See `.agents/knowledge/testing.md` before
-adding a test.
+workflows; `tests/ops` and `tests/parallel/context_parallel` run wholesale on
+GPU only (the NPU job enumerates three named ops files). The e2e paths belong
+to `gpu_e2e_test.yml` / `npu_e2e_test.yml` instead. A new file anywhere else is
+invisible to CI until it is added to the workflow that owns its path, usually
+both unit workflows. See `.agents/knowledge/testing.md` before adding a test.
 
 ## Key Entry Points
 

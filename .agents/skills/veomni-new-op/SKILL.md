@@ -162,8 +162,11 @@ ships a `device_patch.py`.
 
 ## Phase 3: Test
 
-1. **Add unit tests** to `tests/ops/` — this directory runs wholesale in CI, so a
-   new file needs no workflow change (see `.agents/knowledge/testing.md`):
+1. **Add unit tests** to `tests/ops/`. The GPU job runs this directory
+   wholesale, so a new file needs no `gpu_unit_tests.yml` change. The NPU job
+   does *not* — it enumerates ops files by name, so if the kernel must run on
+   Ascend, add a line to `npu_unit_tests.yml` (see
+   `.agents/knowledge/testing.md`):
    - Test correctness: compare output against a reference implementation (eager PyTorch)
    - Test numerical precision: verify tolerance for bf16/fp16
    - Test edge cases: empty inputs, single-element tensors, extreme shapes
