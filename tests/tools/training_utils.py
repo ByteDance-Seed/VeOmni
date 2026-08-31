@@ -45,6 +45,8 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v4": {
         # DeepSeek-V4 attention is eager-only and its clamped SwiGLU requires
         # swiglu_limit support that the NPU fused-MoE kernel does not yet have.
+        # The rotary pin is mandatory rather than a preference: V4 has no NPU
+        # patchgen config and device_patch.py disables the npu rotary backend.
         "attn_implementation": "eager",
         "moe_implementation": "eager",
         "rms_norm_implementation": "eager",
@@ -111,13 +113,16 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
-    # DeepSeek-V4 attention and partial interleaved RoPE are eager-only. MoE
-    # uses the GPU-default fused_triton backend, while weighted/unweighted
-    # RMSNorm and the shared-expert MLP use their default Liger OpSlots.
+    # DeepSeek-V4 attention is eager-only. RoPE matches the shipped
+    # configs/text/deepseek_v4.yaml so the fused partial-interleaved Triton
+    # kernel is exercised under FSDP2, Ulysses SP and the TileLang paths rather
+    # than only by the standalone kernel tests. MoE uses the GPU-default
+    # fused_triton backend, while weighted/unweighted RMSNorm and the
+    # shared-expert MLP use their default Liger OpSlots.
     "deepseek_v4": {
         "attn_implementation": "eager",
         "moe_implementation": "fused_triton",
-        "rotary_pos_emb_implementation": "eager",
+        "rotary_pos_emb_implementation": "triton",
     },
 }
 
@@ -183,6 +188,26 @@ def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImp
     merged.setdefault("causal_conv1d_implementation", "eager")
     merged.setdefault("chunk_gated_delta_rule_implementation", "eager")
     return OpsImplementationConfig(**merged)
+
+
+def unbuilt_runtime(args, *, cls=None, name: str = "base", train=None):
+    """A runtime holding only its config, for tests about seams rather than models.
+
+    Constructing one normally builds the model it wraps — the whole point of the
+    class — so a test that wants to inspect a config seam, or to drop a fake
+    module in by hand, has to bypass the constructor. ``args`` is this model's
+    own arguments, exactly as the constructor takes them; ``train`` is required
+    of a real runtime but optional here, since a seam that reads no job-wide
+    setting has no use for it.
+    """
+    from veomni.models.model_runtime import VeOmniModelRuntime
+
+    cls = cls or VeOmniModelRuntime
+    runtime = cls.__new__(cls)
+    runtime.args = args
+    runtime.model_name = name
+    runtime.train = train
+    return runtime
 
 
 def release_device_memory():

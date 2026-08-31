@@ -6,7 +6,7 @@ Tests that gradient flows correctly through both models and that
 VeOmni's optimizer + LR scheduler work end-to-end.
 
 VeOmni infrastructure used:
-  - init_parallel_state()       — distributed setup + FSDP mesh
+  - _init_parallel_state()       — distributed setup + FSDP mesh
   - build_parallelize_model()   — FSDP2 / no-op wrapping per model
   - build_optimizer()           — AdamW over combined param set
   - build_lr_scheduler()        — constant+warmup schedule
@@ -28,7 +28,7 @@ from transformers import LlamaConfig, LlamaForCausalLM, LlamaModel
 
 from veomni.arguments import MixedPrecisionConfig
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -93,7 +93,7 @@ def main() -> None:
     dp_mode = "fsdp2" if fsdp_enabled else "ddp"
     init_device = "meta" if fsdp_enabled else device_type
 
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=world_size,
         dp_mode=dp_mode,
     )

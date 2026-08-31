@@ -182,7 +182,7 @@ def omni_clip_grad_norm(
       ``gradient_clip_val`` semantics. A single threshold is inherent to this
       scope, so the per-module values do not apply.
 
-    Each ``_clip_grad_norm`` enters the module's own ``ParallelState``; the
+    Each ``clip_grad_norm`` enters the module's own ``ParallelState``; the
     ``global`` rescale re-enters it via ``_scoped()`` for the same reason.
     """
     runtimes = list(module_runtimes.values()) if isinstance(module_runtimes, dict) else list(module_runtimes)
@@ -191,13 +191,13 @@ def omni_clip_grad_norm(
 
     scope = grad_clip_scope or "per_module"
     if scope == "per_module":
-        module_norms = [rt._clip_grad_norm(rt.args.optimizer.max_grad_norm) for rt in runtimes]
+        module_norms = [rt.clip_grad_norm(rt.args.optimizer.max_grad_norm) for rt in runtimes]
         return math.sqrt(sum(g * g for g in module_norms))
 
     if scope != "global":
         raise ValueError(f"Unknown grad_clip_scope={scope!r}; expected 'per_module' or 'global'")
 
-    module_norms = [rt._clip_grad_norm(float("inf")) for rt in runtimes]
+    module_norms = [rt.clip_grad_norm(float("inf")) for rt in runtimes]
     total = math.sqrt(sum(g * g for g in module_norms))
     if max_grad_norm is not None and max_grad_norm > 0 and total > float(max_grad_norm):
         coeff = float(max_grad_norm) / (total + 1e-6)

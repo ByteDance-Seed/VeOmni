@@ -149,7 +149,7 @@ matching fixture and test function. The same `max_sp_size` field is available.
 
 ### What it tests
 
-Builds a real toy VLM model and calls `VLMTrainer._freeze_model_module()`
+Builds a real toy VLM model and calls `VLMTrainer.freeze_model()`
 directly. The test only checks one behavior:
 
 - `freeze_vit=False` -> the vision tower parameters remain trainable

@@ -15,7 +15,7 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.sequence_parallel import get_ulysses_sequence_parallel_group
 
 
@@ -75,7 +75,7 @@ class SequenceParallelTest(CommonDistributedDataParallelTest, MultiProcessTestCa
         # injecting a raw group: the SP getters resolve from the current state's
         # device mesh. ``set_parallel_state(None)`` in a test disables SP (the DP
         # reference path). ``device_type`` defaults to the current accelerator.
-        init_parallel_state(dp_size=1, ulysses_size=self.world_size)
+        _init_parallel_state(dp_size=1, ulysses_size=self.world_size)
         group = get_ulysses_sequence_parallel_group()
         self.rank = dist.get_rank(group)
         return group

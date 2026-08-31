@@ -48,6 +48,7 @@ model:
     lr_min: 1.0e-5
     lr_warmup_ratio: 0.0
     weight_decay: 0.01
+
   accelerator:
     init_device: meta
     ulysses_size: 1

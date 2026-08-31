@@ -159,7 +159,6 @@ _RELOCATED_KEYS = {
     "train.ep_sharded_stream_load": "model.accelerator.ep_sharded_stream_load",
     "train.gradient_checkpointing": "model.accelerator.gradient_checkpointing",
     "train.torch_compile": "model.accelerator.torch_compile",
-    "train.chunk_mbs_config": "model.accelerator.chunk_mbs_config",
 }
 
 

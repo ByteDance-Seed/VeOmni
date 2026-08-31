@@ -13,7 +13,7 @@ from transformers.utils import ModelOutput
 
 from ....omni_pretrained_model import OmniPreTrainedModel
 from ....utils.conversation import ConversationItem, get_tail_output_item
-from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY
+from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY, BAGEL_START_TOKEN
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
 from .masking import build_mot_sdpa_mask
@@ -109,9 +109,15 @@ class InferenceMixin:
         generation_kwargs = generation_kwargs or {}
         infer_mode = self._generation_state.update_infer_mode(generation_kwargs)
         # Generation/edit rebuilds all CFG prompt caches. Understanding reuses
-        # the main cache and switches to one-token AR decode after prefill.
-        if self._generation_state.main.cache is None or infer_mode == "gen":
+        # the main cache and starts AR from the raw assistant BOS embedding.
+        if infer_mode == "gen":
             hidden_states = self._prefill_prompt(conversation_list, generation_kwargs)
+        elif self._generation_state.main.cache is None:
+            tail = conversation_list[-1]
+            if tail.type != "output" or tail.source != BAGEL_START_TOKEN:
+                raise ValueError("BAGEL understanding prefill requires a tail assistant BOS embedding.")
+            self._prefill_prompt(conversation_list[:-1], generation_kwargs)
+            hidden_states = self._decode_next_token(conversation_list)
         else:
             hidden_states = self._decode_next_token(conversation_list)
 
@@ -120,13 +126,11 @@ class InferenceMixin:
                 hidden_states = hidden_states.squeeze(0)
             if hidden_states.dim() != 2:
                 raise ValueError(f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}.")
-            conversation_list.append(
-                ConversationItem(
-                    type="output",
-                    value=hidden_states[-1:].contiguous(),
-                    role="assistant",
-                )
-            )
+            tail = conversation_list[-1]
+            if tail.type != "output":
+                raise ValueError(f"BAGEL understanding decode expects tail output item, got {tail.type!r}.")
+            tail.value = hidden_states[-1:].contiguous()
+            tail.source = None
         return {"conversation_list": conversation_list}
 
     def _prepare_denoise_query(
@@ -592,15 +596,37 @@ def _sdpa_packed_attention(
         key_end = int(cu_seq_lens_k[seq_idx + 1].item())
         if query_end <= query_start:
             continue
+
         query = packed_query_states[query_start:query_end].transpose(0, 1).unsqueeze(0)
         key = packed_key_states[key_start:key_end].transpose(0, 1).unsqueeze(0)
         value = packed_value_states[key_start:key_end].transpose(0, 1).unsqueeze(0)
+
+        query_length = query_end - query_start
+        key_length = key_end - key_start
+        causal_mask = None
+        sdpa_is_causal = is_causal
+        if is_causal and query_length != key_length:
+            # FlashAttention varlen uses bottom-right causal alignment. PyTorch
+            # SDPA's ``is_causal=True`` is upper-left aligned when Q and K have
+            # different lengths, which makes a one-token cached decode see only
+            # the first key. The common Q=1 case needs no mask because the final
+            # logical query can see the entire cache; use an explicit lower-right
+            # mask only for multi-token cached decode.
+            sdpa_is_causal = False
+            if query_length != 1:
+                causal_mask = torch.ones(
+                    (query_length, key_length),
+                    dtype=torch.bool,
+                    device=query.device,
+                ).tril(diagonal=key_length - query_length)
+
         output = scaled_dot_product_attention(
             query,
             key,
             value,
+            attn_mask=causal_mask,
             dropout_p=0.0,
-            is_causal=is_causal,
+            is_causal=sdpa_is_causal,
             scale=scale,
             enable_gqa=enable_gqa,
         )

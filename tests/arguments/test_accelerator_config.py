@@ -28,6 +28,7 @@ Run:
 
 import dataclasses
 import json
+import re
 
 import pytest
 
@@ -35,7 +36,6 @@ from veomni.arguments import arguments_types
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     BaseModelArguments,
-    ChunkMBSConfig,
     DataArguments,
     FSDPConfig,
     ModelArguments,
@@ -189,7 +189,6 @@ def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
         "ep_sharded_stream_load",
         "gradient_checkpointing",
         "torch_compile",
-        "chunk_mbs_config",
     ],
 )
 def test_moved_knobs_live_on_the_accelerator_and_not_on_training_arguments(name, world_size):
@@ -229,15 +228,18 @@ def test_batch_config_follows_a_model_level_ulysses_override(world_size):
 def test_model_runtime_arguments_is_a_standalone_training_unit():
     """What an omni module inherits: model fields + its own accelerator/optimizer.
 
-    Notably without ``config_path``/``tokenizer_path``/``safetensor_idx_path`` — a
-    module is addressed by its subfolder in a composed checkpoint, so inheriting
-    those would hand every module a tokenizer it has no use for.
+    ``config_path`` is among them because every unit has to say where its
+    architecture is defined, even when that is just its own subfolder — the
+    runtime reads it directly rather than asking the job to hand one over.
+    ``tokenizer_path`` and ``safetensor_idx_path`` are not: a module inside a
+    composed checkpoint is addressed by its subfolder, so inheriting those would
+    hand every module a tokenizer it has no use for.
     """
     names = {f.name for f in dataclasses.fields(ModelRuntimeArguments)}
 
-    assert {"model_path", "model_config", "basic_modules", "lora_config", "ops_implementation"} <= names
-    assert {"accelerator", "optimizer"} <= names
-    assert names.isdisjoint({"config_path", "tokenizer_path", "safetensor_idx_path"})
+    assert {"model_path", "config_path", "model_config", "basic_modules", "lora_config"} <= names
+    assert {"processor_config", "ops_implementation", "accelerator", "optimizer"} <= names
+    assert names.isdisjoint({"tokenizer_path", "safetensor_idx_path"})
 
 
 def test_base_localizes_model_path_so_every_subclass_inherits_it(monkeypatch):
@@ -385,36 +387,24 @@ def test_global_grad_clip_scope_is_accepted_now_that_omni_clip_implements_it():
     assert OptimizerConfig(grad_clip_scope="global").grad_clip_scope == "global"
 
 
-def test_chunk_mbs_validates_itself():
-    with pytest.raises(ValueError, match="chunk_mbs must be >= 1"):
-        ChunkMBSConfig(chunk_mbs=0)
-
-
 @pytest.mark.parametrize(
-    "key",
+    ("key", "moved_to"),
     [
-        "init_device",
-        "broadcast_model_weights_from_rank0",
-        "ep_sharded_stream_load",
-        "gradient_checkpointing",
-        "torch_compile",
-        "chunk_mbs_config",
+        ("init_device", "model.accelerator.init_device"),
+        ("broadcast_model_weights_from_rank0", "model.accelerator.broadcast_model_weights_from_rank0"),
+        ("ep_sharded_stream_load", "model.accelerator.ep_sharded_stream_load"),
+        ("gradient_checkpointing", "model.accelerator.gradient_checkpointing"),
+        ("torch_compile", "model.accelerator.torch_compile"),
+        ("accelerator", "model.accelerator"),
+        ("optimizer", "model.optimizer"),
     ],
 )
-def test_parser_points_a_relocated_key_at_its_new_home(key, world_size):
+def test_parser_rejects_a_key_that_used_to_live_on_train(key, moved_to, world_size):
     world_size(1)
-    value = {"enable": True} if key in ("gradient_checkpointing", "torch_compile", "chunk_mbs_config") else "meta"
+    value = {"enable": True} if key in ("gradient_checkpointing", "torch_compile") else "meta"
 
-    with pytest.raises(ValueError, match=rf"train\.{key} has moved to model\.accelerator\.{key}"):
+    with pytest.raises(ValueError, match=rf"train\.{key} has moved to {re.escape(moved_to)}"):
         _instantiate_recursive(TrainingArguments, {key: value}, path="train")
-
-
-@pytest.mark.parametrize("block", ["accelerator", "optimizer"])
-def test_parser_points_a_relocated_block_at_model(block, world_size):
-    """The whole block moved, so a config that still nests it under train must say so."""
-    world_size(1)
-    with pytest.raises(ValueError, match=rf"train\.{block} has moved to model\.{block}"):
-        _instantiate_recursive(TrainingArguments, {block: {}}, path="train")
 
 
 def test_parser_rejects_a_key_no_dataclass_declares(world_size):
@@ -446,7 +436,6 @@ def test_parser_still_accepts_the_new_paths(world_size):
             "accelerator": {
                 "init_device": "meta",
                 "gradient_checkpointing": {"enable": False},
-                "chunk_mbs_config": {"chunk_mbs": 4},
             },
             "optimizer": {"lr": 3.0e-4},
         },
@@ -455,5 +444,4 @@ def test_parser_still_accepts_the_new_paths(world_size):
 
     assert args.accelerator.init_device == "meta"
     assert args.accelerator.gradient_checkpointing.enable is False
-    assert args.accelerator.chunk_mbs_config.chunk_mbs == 4
     assert args.optimizer.lr == pytest.approx(3.0e-4)

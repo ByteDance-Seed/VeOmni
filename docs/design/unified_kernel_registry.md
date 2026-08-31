@@ -291,7 +291,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 |-------|------------------|-------|
 | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | VeOmni rewrites FA2/3/4 to SP-aware variants under `MODELING_BACKEND=veomni` |
 | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
-| `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
+| `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | |
 | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
 | `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field. On NPU, a value still equal to the GPU default `fused_triton` is normalized to `fused_npu`; incompatible non-default overrides raise. |
 | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | |

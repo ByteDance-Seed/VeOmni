@@ -291,7 +291,7 @@ def resolve_omni_model(args: OmniArguments, *, for_inference: bool = False) -> O
         for_inference=for_inference,
     )
     for module_args in modules.values():
-        _validate_omni_accelerator(module_args.accelerator, pad_to_length=args.train.pad_to_length)
+        _validate_omni_accelerator(module_args.accelerator)
     training_graphs = _load_graph_map(train_graph)
     generation_graphs = _load_graph_map(infer_graph)
     if train_type is not None and train_type not in training_graphs:
@@ -878,33 +878,21 @@ class OmniTrainingArguments:
             self.profile.this_rank = False
 
 
-def _validate_omni_accelerator(accelerator: AcceleratorConfig, *, pad_to_length: bool | int = False) -> None:
+def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     """Checks an ``AcceleratorConfig`` cannot make for itself, for the Omni launcher.
 
     Everything self-contained — the init-device rules, the ``ep_sharded_stream_load``
     /``broadcast_model_weights_from_rank0`` exclusion — now runs in
     ``AcceleratorConfig.__post_init__``, so it holds for a config built anywhere and is
-    not repeated here. What is left needs context the config does not have: the
-    launcher-wide ``train.pad_to_length``, and the V2-only ``torch_compile`` ban (V1
-    supports it, with its own validation in ``VeOmniArguments``).
+    not repeated here. What is left is the V2-only ``torch_compile`` ban (V1 supports it,
+    with its own validation in ``VeOmniArguments``).
 
     Called once for the top-level default (``model.accelerator``, at ``OmniArguments.__post_init__``
     time, before modules are resolved) and once per module (in :func:`resolve_omni_model`, after
     ``modules`` merges each module's own ``accelerator:`` YAML override) so a per-module override is
     validated too, not just the global default.
     """
-    acc = accelerator
-
-    if acc.chunk_mbs_config.enable:
-        if pad_to_length:
-            raise ValueError("accelerator.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
-        if acc.gradient_checkpointing.enable and acc.gradient_checkpointing.enable_reentrant:
-            raise ValueError(
-                "accelerator.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
-                "Set accelerator.gradient_checkpointing.enable_reentrant=False."
-            )
-
-    if acc.torch_compile.enable:
+    if accelerator.torch_compile.enable:
         raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni V2 yet.")
 
 
@@ -941,7 +929,7 @@ class OmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
-        _validate_omni_accelerator(self.model.accelerator, pad_to_length=self.train.pad_to_length)
+        _validate_omni_accelerator(self.model.accelerator)
 
     def resolve_model(self, *, for_inference: bool = False) -> OmniModelRuntimeArguments:
         """Build a resolved :class:`OmniModelRuntimeArguments`.

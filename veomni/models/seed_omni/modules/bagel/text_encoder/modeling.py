@@ -9,7 +9,7 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
 from ...base.text_encoder.modeling import TextEncoder
-from ..sources import BAGEL_FLOW_QUERY
+from ..sources import BAGEL_FLOW_QUERY, BAGEL_START_TOKEN
 from .configuration import BagelTextEncoderConfig
 from .processing import BagelTextEncoderPreprocessor, apply_image_marker
 
@@ -99,6 +99,20 @@ class BagelTextEncoder(TextEncoder):
                 device=self.device,
                 dtype=self.dtype,
             )
+            infer_type = str((generation_kwargs or {}).get("infer_type", ""))
+            if infer_type == "infer_und" and not self._bos_injected:
+                input_ids = self._token_id_tensor(self._chat_template.bos_token_id)
+                start_embed = self.encode(input_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
+                conversation_list.append(
+                    ConversationItem(
+                        type="output",
+                        value=start_embed,
+                        role="assistant",
+                        source=BAGEL_START_TOKEN,
+                        meta={"input_ids": input_ids.reshape(-1).detach()},
+                    )
+                )
+                self._bos_injected = True
             return {"conversation_list": batched[0]}
 
         if tail.type == "output":

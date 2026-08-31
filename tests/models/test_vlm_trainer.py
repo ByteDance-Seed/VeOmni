@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 
 from veomni.models import build_foundation_model
@@ -7,11 +5,11 @@ from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
     VLMMDataArguments,
     VLMMModelArguments,
-    VLMTrainer,
+    VLMModelRuntime,
     _get_vlm_visual_module,
 )
 
-from ..tools.training_utils import make_eager_ops_config
+from ..tools.training_utils import make_eager_ops_config, unbuilt_runtime
 
 
 _FREEZE_VIT_VLM_CASES = [
@@ -50,9 +48,10 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
         data=VLMMDataArguments(train_path="dummy"),
     )
     args.train.freeze_vit = freeze_vit
-    trainer = VLMTrainer.__new__(VLMTrainer)
-    trainer.base = SimpleNamespace(args=args, model=model, model_config=model.config)
+    runtime = unbuilt_runtime(args.model, cls=VLMModelRuntime, train=args.train)
+    runtime.model = model
+    runtime.model_config = model.config
 
-    trainer._freeze_model_module()
+    runtime.freeze_model()
 
     assert all(param.requires_grad is not freeze_vit for param in visual.parameters())

@@ -1,10 +1,9 @@
 """Tests for the per-module accelerator training knobs moved off `OmniTrainingArguments`.
 
-Covers: `AcceleratorConfig` gaining the six SeedOmni-V2-only fields, `ChunkMBSConfig`
-validation, per-module `accelerator.*` override survival through
-`build_module_runtime_args`, and `_validate_omni_accelerator` being invoked both for
-the top-level default (`OmniArguments.__post_init__`) and per resolved module
-(`resolve_omni_model`).
+Covers: `AcceleratorConfig` gaining the SeedOmni-V2-only fields, per-module
+`accelerator.*` override survival through `build_module_runtime_args`, and
+`_validate_omni_accelerator` being invoked both for the top-level default
+(`OmniArguments.__post_init__`) and per resolved module (`resolve_omni_model`).
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import pytest
 from veomni.arguments import OmniDataArguments, OmniInferArguments
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
-    ChunkMBSConfig,
     FSDPConfig,
     GradientCheckpointingConfig,
     TorchCompileConfig,
@@ -64,13 +62,6 @@ def test_accelerator_config_has_seed_omni_v2_fields_with_expected_defaults():
     assert acc.ep_sharded_stream_load is False
     assert isinstance(acc.gradient_checkpointing, GradientCheckpointingConfig)
     assert isinstance(acc.torch_compile, TorchCompileConfig)
-    assert isinstance(acc.chunk_mbs_config, ChunkMBSConfig)
-
-
-def test_chunk_mbs_config_rejects_non_positive_chunk_mbs():
-    ChunkMBSConfig(chunk_mbs=1)  # boundary value is valid
-    with pytest.raises(ValueError, match="chunk_mbs"):
-        ChunkMBSConfig(chunk_mbs=0)
 
 
 def test_validate_omni_accelerator_accepts_defaults():
@@ -95,21 +86,6 @@ def test_ddp_cpu_init_is_enforced_at_construction():
 def test_ep_sharded_stream_load_with_broadcast_is_enforced_at_construction():
     with pytest.raises(AssertionError, match="ep_sharded_stream_load"):
         AcceleratorConfig(ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=True)
-
-
-def test_validate_omni_accelerator_rejects_chunk_mbs_with_pad_to_length():
-    acc = AcceleratorConfig(chunk_mbs_config=ChunkMBSConfig(enable=True))
-    with pytest.raises(ValueError, match="pad_to_length"):
-        _validate_omni_accelerator(acc, pad_to_length=128)
-
-
-def test_validate_omni_accelerator_rejects_chunk_mbs_with_reentrant_checkpointing():
-    acc = AcceleratorConfig(
-        chunk_mbs_config=ChunkMBSConfig(enable=True),
-        gradient_checkpointing=GradientCheckpointingConfig(enable=True, enable_reentrant=True),
-    )
-    with pytest.raises(ValueError, match="non-reentrant"):
-        _validate_omni_accelerator(acc)
 
 
 def test_validate_omni_accelerator_bans_torch_compile():

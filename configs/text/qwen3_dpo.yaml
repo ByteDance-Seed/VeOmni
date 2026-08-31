@@ -54,3 +54,7 @@ dpo_config:
   loss_type: sigmoid
   reference_free: false
   refer_model_precision: bfloat16
+
+# Optional full model-level config for the frozen reference. Omit to reuse `model`.
+# reference_model:
+#   model_path: ./Qwen3-0.6B-sft

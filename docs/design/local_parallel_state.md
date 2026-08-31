@@ -10,13 +10,13 @@ use different sequence-parallel groups while preserving the simple
 
 | API | Purpose |
 |-----|---------|
-| `init_parallel_state(..., name="base")` | Build a topology, register it under `name`, and establish the first state as the ambient default. |
+| `init_parallel_state_from_accelerator(accelerator, name)` | Build the topology an `AcceleratorConfig` describes, register it under `name`, and establish the first state as the ambient default. |
 | `get_parallel_state_by_name(name)` | Retrieve a registered state without changing the ambient state. |
 | `use_parallel_state(name_or_state)` | Temporarily make a registered name or `ParallelState` object ambient, then restore the previous state on exit. |
 | `get_parallel_state()` | Return the current ambient state; before initialization it returns a single-process state and logs a warning. |
 | `clear_parallel_state()` | Clear the ambient state, topology cache, and named registry after distributed teardown. |
 
-`init_parallel_state` maintains two independent mappings:
+Registration maintains two independent mappings:
 
 - The **named registry** maps logical module names to states. Registering an
   existing name logs a warning and returns the existing state.
@@ -26,19 +26,19 @@ use different sequence-parallel groups while preserving the simple
 
 ## Basic usage
 
+Every parallelism knob already lives on `AcceleratorConfig`, so the topology is
+described there rather than restated at the call site:
+
 ```python
+from veomni.arguments import AcceleratorConfig
 from veomni.distributed.parallel_state import (
     get_parallel_state_by_name,
-    init_parallel_state,
+    init_parallel_state_from_accelerator,
     use_parallel_state,
 )
 
-init_parallel_state(
-    dp_size=4,
-    dp_shard_size=4,
-    ulysses_size=2,
-    name="base",
-)
+accelerator = AcceleratorConfig(dp_shard_size=4, ulysses_size=2)
+init_parallel_state_from_accelerator(accelerator, name="base")
 
 base_state = get_parallel_state_by_name("base")
 
@@ -56,8 +56,8 @@ Register each logical module on every rank, in the same order, before its first
 scoped operation. For an eight-rank process group:
 
 ```python
-init_parallel_state(dp_size=4, dp_shard_size=4, ulysses_size=2, name="thinker")
-init_parallel_state(dp_size=8, dp_shard_size=8, ulysses_size=1, name="talker")
+init_parallel_state_from_accelerator(thinker_args.accelerator, name="thinker")
+init_parallel_state_from_accelerator(talker_args.accelerator, name="talker")
 
 with use_parallel_state("thinker"):
     thinker_output = thinker(batch)
@@ -66,19 +66,26 @@ with use_parallel_state("talker"):
     talker_output = talker(thinker_output)
 ```
 
+Each module carries its own `AcceleratorConfig`, which is what lets `thinker`
+run at `ulysses_size=2` while `talker` runs without sequence parallelism.
+
 Sequence-parallel communication helpers resolve their process groups from the
-current ambient state. A sequence-parallel state must therefore be created by
-`init_parallel_state`; constructing a meshless `ParallelState` with SP enabled
-raises an error.
+current ambient state. A sequence-parallel state must therefore be built with a
+device mesh; constructing a meshless `ParallelState` with SP enabled raises an
+error.
 
 ## Trainer lifecycle
 
 Current built-in trainers register the main topology as `"base"` during
-`BaseTrainer._setup()`. Model, dataloader, optimizer, and scheduler construction
-run inside one `use_parallel_state("base")` build scope. At run time, only
-operations that depend on ambient groups are scoped: model forward,
-post-forward loss handling, backward, and gradient clipping. Callbacks retain
-their state explicitly rather than depending on an ambient scope.
+`BaseTrainer.setup_distributed()`, which runs before any model is built. That
+registration also makes `"base"` the global state, so the dataloader, scheduler
+and callbacks read it ambiently with no scope of their own. The one scope during
+build belongs to `VeOmniModelRuntime.setup()`, which wraps everything
+model-bound (meta-init, freeze, parallelize, optimizer) in
+`use_parallel_state(<its own name>)` — a no-op for a single-model job, and the
+mechanism by which sibling modules each build over their own mesh. At run time,
+only operations that depend on ambient groups are scoped: model forward,
+post-forward loss handling, backward, and gradient clipping.
 
 When an API accepts an explicit process group, prefer passing the group from
 `get_parallel_state_by_name("base")` instead of opening a broader context.

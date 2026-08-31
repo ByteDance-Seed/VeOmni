@@ -12,7 +12,7 @@ from tests.seed_omni.bagel.helpers import (
     run_eager_mot,
     tiny_bagel_qwen2_cfg,
 )
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY
+from veomni.models.seed_omni.modules.bagel.sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_START_TOKEN
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
@@ -58,8 +58,14 @@ def test_eager_und_generate_runs() -> None:
         value=torch.randn(4, int(model.config.hidden_size), device=model.device, dtype=model.dtype),
         role="user",
     )
+    bos = ConversationItem(
+        type="output",
+        value=torch.randn(1, int(model.config.hidden_size), device=model.device, dtype=model.dtype),
+        role="assistant",
+        source=BAGEL_START_TOKEN,
+    )
 
-    outputs = model.generate([prompt], generation_kwargs={"infer_type": "infer_und"})
+    outputs = model.generate([prompt, bos], generation_kwargs={"infer_type": "infer_und"})
     conversation = outputs["conversation_list"]
     tail = conversation[-1]
     assert tail.type == "output"
