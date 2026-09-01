@@ -3,7 +3,7 @@
 check_dirs := tasks tests veomni docs
 
 build:
-	python3 setup.py sdist bdist_wheel
+	python3 -m build
 
 commit:
 	pre-commit install
