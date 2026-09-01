@@ -48,6 +48,7 @@ from veomni.models_kernel.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_con
     collate_multimodal_metadata,
     get_position_id,
     mm_token_type_ids_from_input_ids,
+    qwen3_5_moe_attention_forward_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forcausallm_init_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
@@ -96,7 +97,7 @@ config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", 
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
+    names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
@@ -415,4 +416,10 @@ config.override_method(
     "Qwen3_5MoeForConditionalGeneration.get_parallel_plan",
     replacement=qwen3_5_moe_get_parallel_plan_patched,
     description="Register Qwen3_5Moe expert parallel plan for v5 generated modeling",
+)
+
+config.override_method(
+    "Qwen3_5MoeAttention.forward",
+    replacement=qwen3_5_moe_attention_forward_patched,
+    description="Dispatch attention through the interned VeomniKernel",
 )

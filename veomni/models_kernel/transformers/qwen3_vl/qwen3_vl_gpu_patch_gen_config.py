@@ -24,7 +24,6 @@ Only the OpSlot guards become local VeomniKernel calls.
 import copy
 from functools import lru_cache, partial
 from types import SimpleNamespace
-from typing import Callable
 
 import numpy as np
 import torch
@@ -33,7 +32,6 @@ from torch import nn
 from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_utils import (
-    ALL_ATTENTION_FUNCTIONS,
     is_flash_attention_requested,
 )
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -42,7 +40,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLModelOutputWithPast,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_vision,
-    eager_attention_forward,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -55,7 +52,7 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -105,14 +102,14 @@ from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log
     Qwen3VLCausalLMOutputWithLogProbs,
 )
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 """)
 
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["resolve_kernel_impl"],
+    names=["attention_kernel", "resolve_kernel_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
@@ -264,9 +261,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
     query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
+    attention_interface = attention_kernel()
     attn_output, attn_weights = attention_interface(
         self,
         query_states,
@@ -407,9 +402,7 @@ def qwen3_vl_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
+    attention_interface = attention_kernel()
 
     if is_flash_attention_requested(self.config):
         # --- Patch.1 ---
@@ -897,9 +890,7 @@ def qwen3_vl_text_attention_forward_patched(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
+    attention_interface = attention_kernel()
 
     attn_output, attn_weights = attention_interface(
         self,

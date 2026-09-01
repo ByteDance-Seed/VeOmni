@@ -51,6 +51,10 @@
 #      Declare omni-specific (audio) collate rules for the VeOmni collator
 #    - method_override: Qwen3OmniMoeForConditionalGeneration.get_parallel_plan
 #      Register Qwen3-Omni-MoE thinker expert parallel plan for v5 generated modeling
+#    - method_override: Qwen3OmniMoeAudioAttention.forward
+#      Dispatch audio attention through the interned VeomniKernel
+#    - method_override: Qwen3OmniMoeThinkerTextAttention.forward
+#      Dispatch thinker attention through the interned VeomniKernel
 #
 # ==============================================================================
 
@@ -86,7 +90,7 @@ from transformers.modeling_outputs import (
     MoeModelOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoderConfig,
     Qwen3OmniMoeConfig,
@@ -114,7 +118,7 @@ from veomni.distributed.sequence_parallel import gather_outputs, slice_input_ten
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.kernels import VeomniKernel
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models_kernel.utils.kernel_utils import empty_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, empty_bias, resolve_kernel_impl, resolve_moe_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
@@ -610,6 +614,12 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3OmniMoeAudioAttention
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen3OmniMoeAudioAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -642,8 +652,6 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """Input shape: Batch x Time x Channel"""
-
         seq_length, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
@@ -654,12 +662,9 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = attention_kernel()
 
         if is_flash_attention_requested(self.config):
-            # Flash Attention: Use cu_seqlens for variable length attention
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,
@@ -677,7 +682,6 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
                 **kwargs,
             )
         else:
-            # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
@@ -700,7 +704,6 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.out_proj(attn_output)
-
         return attn_output
 
 
@@ -1164,9 +1167,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface = attention_kernel()
 
         # --- Patch.1 ---
         if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1809,6 +1810,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3OmniMoeThinkerTextAttention
+# Methods patched: forward
+# ======================================================================
+
+
 @use_kernelized_func(apply_rotary_pos_emb)
 class Qwen3OmniMoeThinkerTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -1864,11 +1871,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = attention_kernel()(
             self,
             query_states,
             key_states,
@@ -1876,7 +1879,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
+            sliding_window=self.sliding_window,
             **kwargs,
         )
 

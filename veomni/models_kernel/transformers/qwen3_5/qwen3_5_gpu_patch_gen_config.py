@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
@@ -48,7 +49,7 @@ from transformers.utils import TransformersKwargs, logging
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -98,7 +99,7 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["resolve_kernel_impl"],
+    names=["attention_kernel", "resolve_kernel_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
@@ -995,9 +996,7 @@ def qwen3_5_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
+    attention_interface = attention_kernel()
 
     if is_flash_attention_requested(self.config):
         # Modification: prefer the int max_seqlen pre-computed once in
@@ -1621,3 +1620,49 @@ def qwen3_5_forconditional_generation_forward_patched(
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,
     )
+
+
+@config.override_method(
+    "Qwen3_5Attention.forward",
+    description="Dispatch attention through the interned VeomniKernel",
+)
+def qwen3_5_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = attention_kernel()(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = attn_output * torch.sigmoid(gate)
+
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

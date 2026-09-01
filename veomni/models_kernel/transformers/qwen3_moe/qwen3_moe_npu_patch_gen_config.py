@@ -21,6 +21,7 @@ patchgen veomni.models_kernel.transformers.qwen3_moe.qwen3_moe_npu_patch_gen_con
 from veomni.models_kernel.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config import (
     PatchedQwen3MoeExperts,
     apply_rotary_pos_emb_patched,
+    qwen3_moe_attention_forward_patched,
     qwen3_moe_forcausallm_forward_patched,
     qwen3_moe_forcausallm_init_patched,
     qwen3_moe_get_parallel_plan_patched,
@@ -128,4 +129,10 @@ config.override_method(
     "Qwen3MoeForCausalLM.get_parallel_plan",
     replacement=qwen3_moe_get_parallel_plan_patched,
     description="Register Qwen3Moe expert parallel plan for v5 generated modeling",
+)
+
+config.override_method(
+    "Qwen3MoeAttention.forward",
+    replacement=qwen3_moe_attention_forward_patched,
+    description="Dispatch attention through the interned VeomniKernel",
 )

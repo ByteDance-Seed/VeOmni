@@ -33,6 +33,8 @@
 #      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
 #    - method_override: Qwen2_5_VLForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side window-attention ViT multimodal-metadata derivation to the VeOmni collator
+#    - method_override: Qwen2_5_VLAttention.forward
+#      Dispatch attention through the interned VeomniKernel
 #
 # ==============================================================================
 
@@ -60,7 +62,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLTextConfig,
@@ -86,7 +88,7 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (
@@ -481,9 +483,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = attention_kernel()
 
         if is_flash_attention_requested(self.config):
             # --- Patch.1 ---
@@ -1066,6 +1066,12 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
     return q_embed, k_embed
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5_VLAttention
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen2_5_VLAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
@@ -1116,6 +1122,7 @@ class Qwen2_5_VLAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+        del output_attentions, use_cache
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -1134,11 +1141,7 @@ class Qwen2_5_VLAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = attention_kernel()(
             self,
             query_states,
             key_states,
@@ -1147,7 +1150,7 @@ class Qwen2_5_VLAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            position_ids=position_ids,  # pass positions for FA2
+            position_ids=position_ids,
             **kwargs,
         )
 

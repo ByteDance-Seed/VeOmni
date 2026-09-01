@@ -19,6 +19,7 @@ are registered on that dict by ``install.apply_veomni_attention_patch``.
 Mask builders live under ``mask/`` and are not kernel rows.
 """
 
+import sys
 from collections.abc import Callable
 from typing import Optional
 
@@ -27,6 +28,20 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...registry import register_kernel
 from .install import apply_veomni_attention_patch
+
+
+def _module_eager_forward(module: torch.nn.Module) -> Callable | None:
+    """HF does not register ``eager`` on ``ALL_ATTENTION_FUNCTIONS``.
+
+    Each modeling file keeps a local ``eager_attention_forward`` (Gemma3
+    softcap, GPT-OSS sinks, ...). Resolve that from the Attention class
+    module so ``get_interface("eager", default)`` matches HF consume.
+    """
+    defining = sys.modules.get(type(module).__module__)
+    if defining is None:
+        return None
+    eager = getattr(defining, "eager_attention_forward", None)
+    return eager if callable(eager) else None
 
 
 def lookup(impl: str) -> Callable:
@@ -44,7 +59,15 @@ def lookup(impl: str) -> Callable:
         softcap: Optional[float] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return ALL_ATTENTION_FUNCTIONS[impl](
+        eager_default = _module_eager_forward(module)
+        forward = ALL_ATTENTION_FUNCTIONS.get_interface(impl, eager_default)
+        if forward is None:
+            raise KeyError(
+                f"attention impl {impl!r} is not registered and "
+                f"{type(module).__module__} has no eager_attention_forward"
+            )
+
+        return forward(
             module,
             query,
             key,

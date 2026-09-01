@@ -53,17 +53,19 @@ Keeps the models/ VeOmni thinker patches. Only the OpSlot CE guard becomes a loc
 import copy
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPooling
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.modeling_utils import is_flash_attention_requested
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration,
+    apply_multimodal_rotary_pos_emb,
     apply_rotary_pos_emb_vision,
-    eager_attention_forward,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -77,7 +79,7 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.kernels import VeomniKernel
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
@@ -117,7 +119,7 @@ config.add_import("veomni.models_kernel.utils.attention_utils", names=["VARLEN_A
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["resolve_kernel_impl"],
+    names=["attention_kernel", "resolve_kernel_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
@@ -720,9 +722,7 @@ def qwen2_5_omni_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface: Callable = eager_attention_forward
-    if self.config._attn_implementation != "eager":
-        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+    attention_interface = attention_kernel()
 
     # --- Patch.1 ---
     if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1656,3 +1656,118 @@ def qwen2_5_omni_thinker_get_metadata_collate_func_patched(self):
 )
 def qwen2_5_omni_top_get_metadata_collate_func_patched(self):
     return self.thinker.get_metadata_collate_func()
+
+
+@config.override_method(
+    "Qwen2_5OmniAudioAttention.forward",
+    description="Dispatch audio attention through the interned VeomniKernel",
+)
+def qwen2_5_omni_audio_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    **kwargs,
+) -> torch.Tensor:
+    seq_length, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+    key_states = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+    value_states = self.v_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+
+    query_states = query_states.transpose(0, 1).unsqueeze(0)
+    key_states = key_states.transpose(0, 1).unsqueeze(0)
+    value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+    attention_interface = attention_kernel()
+
+    if is_flash_attention_requested(self.config):
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        attn_output, _ = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
+    else:
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
+        attn_outputs = [
+            attention_interface(
+                self,
+                q,
+                k,
+                v,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )[0]
+            for q, k, v in zip(*splits)
+        ]
+        attn_output = torch.cat(attn_outputs, dim=1)
+
+    attn_output = attn_output.reshape(seq_length, -1).contiguous()
+    attn_output = self.out_proj(attn_output)
+    return attn_output
+
+
+@config.override_method(
+    "Qwen2_5OmniAttention.forward",
+    description="Dispatch thinker attention through the interned VeomniKernel",
+)
+def qwen2_5_omni_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    del output_attentions, use_cache
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_multimodal_rotary_pos_emb(
+        query_states, key_states, cos, sin, self.config.rope_parameters["mrope_section"]
+    )
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = attention_kernel()(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        position_ids=position_ids,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

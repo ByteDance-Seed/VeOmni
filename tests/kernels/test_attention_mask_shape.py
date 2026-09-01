@@ -18,6 +18,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from transformers.masking_utils import (
+    ALL_MASK_ATTENTION_FUNCTIONS,
+    and_masks,
+    causal_mask_function,
+    sliding_window_overlay,
+)
 
 from tests.kernels.attention_cases import flex_visible
 from veomni.kernels.mask import (
@@ -40,12 +46,23 @@ def test_flash_shapes_are_none():
     )
 
 
-@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa", "eager"))
+@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
 def test_sdpa_causal_aligns_with_hf_builder(impl):
     built = sdpa_attention_mask_builder(1, 4, 4, device="cpu", allow_is_causal_skip=False)
     shaped = causal_mask(4, 4, impl=impl, device="cpu")
     torch.testing.assert_close(shaped, built)
     torch.testing.assert_close(shaped[0, 0], torch.tril(torch.ones(4, 4, dtype=torch.bool)))
+
+
+def test_eager_causal_is_additive_like_hf():
+    built = ALL_MASK_ATTENTION_FUNCTIONS["eager"](batch_size=1, q_length=4, kv_length=4, device="cpu")
+    shaped = causal_mask(4, 4, impl="eager", device="cpu")
+    torch.testing.assert_close(shaped, built)
+    assert shaped.dtype == torch.float32
+    keep = torch.tril(torch.ones(4, 4, dtype=torch.bool))
+    torch.testing.assert_close(shaped[0, 0][keep], torch.zeros(keep.sum(), dtype=torch.float32))
+    blocked = shaped[0, 0][~keep]
+    torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
 
 
 @pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
@@ -57,10 +74,9 @@ def test_sdpa_cached_causal_aligns_with_hf_builder(impl):
     torch.testing.assert_close(shaped[0, 0], torch.ones(2, 4, dtype=torch.bool).tril(diagonal=2))
 
 
-@pytest.mark.parametrize("impl", ("sdpa", "eager"))
-def test_sdpa_sliding_aligns_with_hf_builder(impl):
+def test_sdpa_sliding_aligns_with_hf_builder():
     built = sdpa_attention_mask_builder(1, 4, 4, device="cpu", sliding_window=2, allow_is_causal_skip=False)
-    shaped = sliding_window_mask(4, 4, impl=impl, device="cpu", sliding_window=2)
+    shaped = sliding_window_mask(4, 4, impl="sdpa", device="cpu", sliding_window=2)
     torch.testing.assert_close(shaped, built)
     expected = torch.tensor(
         [
@@ -71,6 +87,19 @@ def test_sdpa_sliding_aligns_with_hf_builder(impl):
         ]
     )
     torch.testing.assert_close(shaped[0, 0], expected)
+
+
+def test_eager_sliding_is_additive_like_hf():
+    built = ALL_MASK_ATTENTION_FUNCTIONS["eager"](
+        batch_size=1,
+        q_length=4,
+        kv_length=4,
+        device="cpu",
+        mask_function=and_masks(causal_mask_function, sliding_window_overlay(2)),
+    )
+    shaped = sliding_window_mask(4, 4, impl="eager", device="cpu", sliding_window=2)
+    torch.testing.assert_close(shaped, built)
+    assert shaped.dtype == torch.float32
 
 
 def test_sdpa_packed_aligns_with_hf_builder():

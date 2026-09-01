@@ -33,7 +33,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import linear_bias, resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, linear_bias, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
@@ -57,7 +57,7 @@ config.add_import(
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["linear_bias", "resolve_kernel_impl"],
+    names=["attention_kernel", "linear_bias", "resolve_kernel_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
@@ -204,3 +204,46 @@ def seed_oss_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
+
+
+@config.override_method(
+    "SeedOssAttention.forward",
+    description="Dispatch attention through the interned VeomniKernel",
+)
+def seed_oss_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = attention_kernel()(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    attn_output = nn.functional.dropout(attn_output, p=self.residual_dropout, training=self.training)
+
+    return attn_output, attn_weights

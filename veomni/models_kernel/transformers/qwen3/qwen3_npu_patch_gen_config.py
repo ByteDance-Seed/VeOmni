@@ -83,12 +83,12 @@ config.replace_function(
 config.override_method(
     "Qwen3Attention.__init__",
     replacement=qwen3_attention_init_patched,
-    description="Construct a local rope full VeomniKernel",
+    description="Construct local rope and attention VeomniKernels",
 )
 config.override_method(
     "Qwen3Attention.forward",
     replacement=qwen3_attention_forward_patched,
-    description="Always call the local rope VeomniKernel",
+    description="Always call the local rope and attention VeomniKernels",
 )
 config.override_method(
     "Qwen3ForCausalLM.__init__",

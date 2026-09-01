@@ -1,6 +1,6 @@
 --- a/transformers/models/qwen2_vl/modeling_qwen2_vl.py
 +++ b/patched_modeling_qwen2_vl_gpu.py
-@@ -1,3 +1,165 @@
+@@ -1,3 +1,167 @@
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
 +# ==============================================================================
@@ -32,6 +32,8 @@
 +#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
 +#    - method_override: Qwen2VLForConditionalGeneration.forward
 +#      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
++#    - method_override: Qwen2VLAttention.forward
++#      Dispatch attention through the interned VeomniKernel
 +#
 +# ==============================================================================
 +
@@ -59,7 +61,7 @@
 +from transformers.modeling_layers import GradientCheckpointingLayer
 +from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
++from transformers.modeling_utils import PreTrainedModel
 +from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
@@ -75,7 +77,7 @@
 +from veomni.distributed.parallel_state import get_parallel_state
 +from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, sp_pad_and_slice
 +from veomni.kernels import VeomniKernel
-+from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
++from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 +from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 +from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +from veomni.utils.model_outputs import (
@@ -166,7 +168,7 @@
  # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
  #
  # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-@@ -17,45 +179,6 @@
+@@ -17,45 +181,6 @@
  # See the License for the specific language governing permissions and
  # limitations under the License.
  """PyTorch Qwen2-VL model."""
@@ -212,7 +214,7 @@
 
 
  logger = logging.get_logger(__name__)
-@@ -375,6 +498,12 @@
+@@ -375,6 +500,12 @@
      return attn_output, attn_weights
 
 
@@ -225,7 +227,7 @@
  class VisionAttention(nn.Module):
      def __init__(self, config: Qwen2VLVisionConfig) -> None:
          super().__init__()
-@@ -393,6 +522,7 @@
+@@ -393,6 +524,7 @@
          self,
          hidden_states: torch.Tensor,
          cu_seqlens: torch.Tensor,
@@ -233,8 +235,14 @@
          rotary_pos_emb: torch.Tensor | None = None,
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs,
-@@ -413,8 +543,7 @@
-         )
+@@ -408,13 +540,10 @@
+         key_states = key_states.transpose(0, 1).unsqueeze(0)
+         value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+-            self.config._attn_implementation, eager_attention_forward
+-        )
++        attention_interface = attention_kernel()
 
          if is_flash_attention_requested(self.config):
 -            # Flash Attention: Use cu_seqlens for variable length attention
@@ -256,7 +264,50 @@
              attn_outputs = [
                  attention_interface(
                      self,
-@@ -683,6 +810,12 @@
+@@ -504,6 +631,12 @@
+         return down_proj
+
+
++# ======================================================================
++# [MODIFIED CLASS] Qwen2VLAttention
++# Methods patched: forward
++# ======================================================================
++
++
+ class Qwen2VLAttention(nn.Module):
+     """
+     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
+@@ -554,6 +687,7 @@
+         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+         **kwargs: Unpack[FlashAttentionKwargs],
+     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
++        del output_attentions, use_cache
+         bsz, q_len, _ = hidden_states.size()
+
+         query_states = self.q_proj(hidden_states)
+@@ -572,11 +706,7 @@
+         if past_key_values is not None:
+             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+-            self.config._attn_implementation, eager_attention_forward
+-        )
+-
+-        attn_output, attn_weights = attention_interface(
++        attn_output, attn_weights = attention_kernel()(
+             self,
+             query_states,
+             key_states,
+@@ -585,7 +715,7 @@
+             dropout=0.0 if not self.training else self.attention_dropout,
+             scaling=self.scaling,
+             sliding_window=self.sliding_window,
+-            position_ids=position_ids,  # pass positions for FA2
++            position_ids=position_ids,
+             **kwargs,
+         )
+
+@@ -683,6 +813,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -269,7 +320,7 @@
  @auto_docstring
  class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
      config: Qwen2VLVisionConfig
-@@ -736,24 +869,92 @@
+@@ -736,24 +872,92 @@
      @capture_outputs
      @auto_docstring
      def forward(
@@ -367,7 +418,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -764,6 +965,47 @@
+@@ -764,6 +968,47 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -415,7 +466,7 @@
 
 
  @auto_docstring
-@@ -879,6 +1121,12 @@
+@@ -879,6 +1124,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -428,7 +479,7 @@
 
 
  @auto_docstring
-@@ -1074,10 +1322,7 @@
+@@ -1074,10 +1325,7 @@
              The temporal, height and width of feature shape of each video in LLM.
          """
          pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
@@ -440,7 +491,7 @@
 
          return vision_outputs
 
-@@ -1097,10 +1342,7 @@
+@@ -1097,10 +1345,7 @@
              The temporal, height and width of feature shape of each image in LLM.
          """
          pixel_values = pixel_values.type(self.visual.dtype)
@@ -452,7 +503,7 @@
 
          return vision_outputs
 
-@@ -1204,15 +1446,20 @@
+@@ -1204,15 +1449,20 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -474,7 +525,7 @@
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-@@ -1220,27 +1467,107 @@
+@@ -1220,27 +1470,107 @@
          rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
              The rope index difference between sequence length and multimodal rope.
          """
@@ -592,7 +643,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1250,6 +1577,10 @@
+@@ -1250,6 +1580,10 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -603,7 +654,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1258,15 +1589,27 @@
+@@ -1258,15 +1592,27 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -632,7 +683,7 @@
 
 
  class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
-@@ -1276,7 +1619,9 @@
+@@ -1276,7 +1622,9 @@
          super().__init__(config)
          self.model = Qwen2VLModel(config)
          self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
@@ -643,7 +694,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1320,97 +1665,82 @@
+@@ -1320,97 +1668,82 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -777,7 +828,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1628,5 +1958,46 @@
+@@ -1628,5 +1961,46 @@
 
          return input_ids, model_kwargs
 

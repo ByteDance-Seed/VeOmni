@@ -39,6 +39,35 @@ def eager_kernels_config() -> SimpleNamespace:
     )
 
 
+def pin_eager_attn_implementation(model: torch.nn.Module) -> None:
+    """Force every config on ``model`` onto HF eager attention.
+
+    Composite VL/omni configs drop ``attn_implementation`` when nested
+    configs go through ``to_dict()``, so HuggingFace defaults to ``sdpa``.
+    models_kernel consume reads kernels ``attn_implementation`` (eager in
+    these tests). Pin HF to the same impl before comparing.
+    """
+    configs: list[object] = []
+    top = getattr(model, "config", None)
+    if top is not None:
+        configs.append(top)
+    for module in model.modules():
+        cfg = getattr(module, "config", None)
+        if cfg is not None:
+            configs.append(cfg)
+    seen: set[int] = set()
+    stack = list(configs)
+    while stack:
+        cfg = stack.pop()
+        if cfg is None or id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        if hasattr(cfg, "_attn_implementation"):
+            cfg._attn_implementation = "eager"
+        for name in ("text_config", "vision_config", "audio_config", "thinker_config"):
+            stack.append(getattr(cfg, name, None))
+
+
 def named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {name: param for name, param in model.named_parameters() if param.requires_grad}
 
@@ -69,6 +98,9 @@ def assert_eager_matches_hf(
     grad_rtol: float = EAGER_GRAD_RTOL,
 ) -> None:
     """Compare unlabeled logits, labeled loss, and grads against HF."""
+    pin_eager_attn_implementation(hf)
+    pin_eager_attn_implementation(ours)
+
     hf_kwargs = {} if fwd_kwargs is None else dict(fwd_kwargs)
     ours_kwargs = dict(hf_kwargs)
     if ours_fwd_kwargs is not None:

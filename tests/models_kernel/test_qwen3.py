@@ -119,6 +119,7 @@ def test_qwen3_constructs_local_kernels():
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
     assert layer.mlp.veomni_swiglu_mlp.impl == "eager"
     assert layer.self_attn.veomni_rope.impl == "eager"
+    assert layer.self_attn.veomni_attn.impl == "eager"
 
 
 def test_qwen3_instances_keep_distinct_impls():

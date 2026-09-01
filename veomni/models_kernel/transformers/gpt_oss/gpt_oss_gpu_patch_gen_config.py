@@ -40,7 +40,7 @@ from transformers.utils import TransformersKwargs, auto_docstring
 from transformers.utils.output_capturing import OutputRecorder
 
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl, resolve_moe_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
@@ -60,12 +60,15 @@ config.add_import(
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["resolve_kernel_impl", "resolve_moe_impl"],
+    names=["attention_kernel", "resolve_kernel_impl", "resolve_moe_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
     names=["ForCausalLMLoss"],
 )
+apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling file
+
+
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
 
@@ -95,7 +98,7 @@ class PatchedGptOssPreTrainedModel(PreTrainedModel):
     _compatible_flash_implementations = [
         "kernels-community/vllm-flash-attn3",
         "flash_attention_4",
-        "veomni_flash_attention_4_with_sp",
+        "veomni_flash_attention_4",
     ]
 
     @torch.no_grad()
@@ -272,3 +275,46 @@ def gpt_oss_forcausallm_forward_patched(
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
     )
+
+
+@config.override_method(
+    "GptOssAttention.forward",
+    description="Dispatch attention through the interned VeomniKernel",
+)
+def gpt_oss_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = attention_kernel()(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        s_aux=self.sinks,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

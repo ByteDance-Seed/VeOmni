@@ -81,7 +81,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPooling, ModelOutput, MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeConfig,
     Qwen3VLMoeTextConfig,
@@ -107,7 +107,7 @@ from veomni.distributed.sequence_parallel import (
 
 # Additional imports for patches
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import empty_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, empty_bias, resolve_kernel_impl, resolve_moe_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
@@ -215,9 +215,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
     query_states, key_states = apply_rotary_pos_emb(q, k, cos, sin)
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
+    attention_interface = attention_kernel()
     attn_output, attn_weights = attention_interface(
         self,
         query_states,
@@ -591,9 +589,7 @@ class Qwen3VLMoeTextAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = attention_kernel()
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -785,9 +781,7 @@ class Qwen3VLMoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = attention_kernel()
 
         if is_flash_attention_requested(self.config):
             # --- Patch.1 ---

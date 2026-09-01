@@ -10,11 +10,13 @@
 #
 #  Patches applied:
 #    - method_override: Gemma3TextModel.forward
-#      Pass packed-sequence boundaries into VeOmni FlexAttention mask preparation
+#      Build full / sliding masks through veomni.kernels.mask
 #    - method_override: Gemma3ForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
 #    - method_override: Gemma3ForCausalLM.forward
 #      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
+#    - method_override: Gemma3Attention.forward
+#      Dispatch attention through the interned VeomniKernel
 #
 # ==============================================================================
 
@@ -33,7 +35,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_func_from_hub, use_kernelized_func
-from transformers.masking_utils import create_masks_for_generate
+from transformers.masking_utils import create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
 from transformers.modeling_layers import GenericForSequenceClassification, GradientCheckpointingLayer
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -42,7 +44,7 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModel
 from transformers.models.gemma3.configuration_gemma3 import Gemma3Config, Gemma3TextConfig
 from transformers.processing_utils import Unpack
@@ -57,9 +59,9 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.kernels.mask import causal_mask, packed_causal_mask, sliding_window_mask
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -317,6 +319,12 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma3Attention
+# Methods patched: forward
+# ======================================================================
+
+
 @use_kernelized_func(apply_rotary_pos_emb)
 class Gemma3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -375,11 +383,7 @@ class Gemma3Attention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = attention_kernel()(
             self,
             query_states,
             key_states,
@@ -557,24 +561,44 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            mask_kwargs = {
-                "config": self.config,
-                "inputs_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-                "cu_seq_lens_q": kwargs.get("cu_seq_lens_q"),
+            impl = resolve_kernel_impl("attn_implementation")
+            q_len = inputs_embeds.shape[1]
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+            kv_len = q_len + past_seen
+            mask_kwargs: dict = {
+                "impl": impl,
+                "device": inputs_embeds.device,
+                "batch_size": inputs_embeds.shape[0],
+                "dtype": inputs_embeds.dtype,
             }
-            sliding_mask_kwargs = mask_kwargs.copy()
-
+            if attention_mask is not None:
+                mask_kwargs["attention_mask"] = attention_mask
+            sliding_kwargs = dict(mask_kwargs)
             if self.config.use_bidirectional_attention:
                 mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
-                sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
-
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
-            }
+                sliding_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
+            cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+            if cu_seq_lens_q is not None:
+                causal_mask_mapping = {
+                    "full_attention": packed_causal_mask(q_len, kv_len, cu_seqlens=cu_seq_lens_q, **mask_kwargs),
+                    "sliding_attention": sliding_window_mask(
+                        q_len,
+                        kv_len,
+                        sliding_window=self.config.sliding_window,
+                        cu_seqlens=cu_seq_lens_q,
+                        **sliding_kwargs,
+                    ),
+                }
+            else:
+                causal_mask_mapping = {
+                    "full_attention": causal_mask(q_len, kv_len, **mask_kwargs),
+                    "sliding_attention": sliding_window_mask(
+                        q_len,
+                        kv_len,
+                        sliding_window=self.config.sliding_window,
+                        **sliding_kwargs,
+                    ),
+                }
 
         hidden_states = inputs_embeds
         position_embeddings = {}

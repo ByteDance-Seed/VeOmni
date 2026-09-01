@@ -21,8 +21,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from veomni.kernels import VeomniKernel
 from veomni.kernels.config import get_kernels_config, set_kernels_config
-from veomni.models_kernel.utils.kernel_utils import linear_bias, resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, linear_bias, resolve_kernel_impl
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +55,22 @@ def test_linear_bias_empty_sentinel():
     assert bias.numel() == 0
     assert bias.device == linear.weight.device
     assert bias.dtype == linear.weight.dtype
+
+
+def test_attention_kernel_defaults_to_eager():
+    set_kernels_config(None)
+    kernel = attention_kernel()
+    assert isinstance(kernel, VeomniKernel)
+    assert kernel.kernel == "attention"
+    assert kernel.variant == "standard"
+    assert kernel.impl == "eager"
+
+
+def test_attention_kernel_reads_kernels_config():
+    set_kernels_config(SimpleNamespace(attn_implementation="veomni_flash_attention_2"))
+    kernel = attention_kernel()
+    assert kernel.impl == "veomni_flash_attention_2"
+    assert attention_kernel() is kernel
 
 
 def test_resolve_moe_impl_strips_fused_prefix():

@@ -39,6 +39,7 @@ from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config impo
     collate_multimodal_metadata,
     get_position_id,
     mm_token_type_ids_from_input_ids,
+    qwen3_5_attention_forward_patched,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forcausallm_init_patched,
     qwen3_5_forconditional_generation_forward_patched,
@@ -98,7 +99,7 @@ config.add_import(
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["resolve_kernel_impl"],
+    names=["attention_kernel", "resolve_kernel_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
@@ -846,3 +847,10 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
+
+
+config.override_method(
+    "Qwen3_5Attention.forward",
+    replacement=qwen3_5_attention_forward_patched,
+    description="Dispatch attention through the interned VeomniKernel",
+)

@@ -17,8 +17,8 @@ Patch configuration for the text-only Gemma 3 VeomniKernel consume.
 Regen command:
 patchgen veomni.models_kernel.transformers.gemma3.gemma3_gpu_patch_gen_config -o veomni/models_kernel/transformers/gemma3/generated --diff
 
-Keeps the models/ packed-sequence FlexAttention mask patch. Only the CE
-guard becomes a local VeomniKernel call.
+TextModel mask prep uses ``veomni.kernels.mask``. Multimodal
+``Gemma3Model.forward`` keeps HuggingFace ``create_causal_mask``.
 """
 
 from functools import partial
@@ -31,9 +31,9 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.kernels.mask import causal_mask, packed_causal_mask, sliding_window_mask
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -56,22 +56,23 @@ config.add_import(
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["resolve_kernel_impl"],
+    names=["attention_kernel", "resolve_kernel_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
     names=["ForCausalLMLoss"],
 )
-config.drop_import_names("create_causal_mask", "create_sliding_window_causal_mask")
 config.add_import(
-    "veomni.models_kernel.utils.masking_utils",
-    names=["create_causal_mask", "create_sliding_window_causal_mask"],
+    "veomni.kernels.mask",
+    names=["causal_mask", "packed_causal_mask", "sliding_window_mask"],
 )
+apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling file
+_bidirectional_window_overlay = None  # noqa: E305  resolved from the generated modeling file
 
 
 @config.override_method(
     "Gemma3TextModel.forward",
-    description="Pass packed-sequence boundaries into VeOmni FlexAttention mask preparation",
+    description="Build full / sliding masks through veomni.kernels.mask",
 )
 def gemma3_textmodel_forward_patched(
     self,
@@ -98,24 +99,44 @@ def gemma3_textmodel_forward_patched(
         position_ids = position_ids.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
-        mask_kwargs = {
-            "config": self.config,
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "position_ids": position_ids,
-            "cu_seq_lens_q": kwargs.get("cu_seq_lens_q"),
+        impl = resolve_kernel_impl("attn_implementation")
+        q_len = inputs_embeds.shape[1]
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        kv_len = q_len + past_seen
+        mask_kwargs: dict = {
+            "impl": impl,
+            "device": inputs_embeds.device,
+            "batch_size": inputs_embeds.shape[0],
+            "dtype": inputs_embeds.dtype,
         }
-        sliding_mask_kwargs = mask_kwargs.copy()
-
+        if attention_mask is not None:
+            mask_kwargs["attention_mask"] = attention_mask
+        sliding_kwargs = dict(mask_kwargs)
         if self.config.use_bidirectional_attention:
             mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
-            sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
-
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
-        }
+            sliding_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        if cu_seq_lens_q is not None:
+            causal_mask_mapping = {
+                "full_attention": packed_causal_mask(q_len, kv_len, cu_seqlens=cu_seq_lens_q, **mask_kwargs),
+                "sliding_attention": sliding_window_mask(
+                    q_len,
+                    kv_len,
+                    sliding_window=self.config.sliding_window,
+                    cu_seqlens=cu_seq_lens_q,
+                    **sliding_kwargs,
+                ),
+            }
+        else:
+            causal_mask_mapping = {
+                "full_attention": causal_mask(q_len, kv_len, **mask_kwargs),
+                "sliding_attention": sliding_window_mask(
+                    q_len,
+                    kv_len,
+                    sliding_window=self.config.sliding_window,
+                    **sliding_kwargs,
+                ),
+            }
 
     hidden_states = inputs_embeds
     position_embeddings = {}
@@ -225,3 +246,48 @@ def gemma3_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
+
+
+@config.override_method(
+    "Gemma3Attention.forward",
+    description="Dispatch attention through the interned VeomniKernel",
+)
+def gemma3_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: torch.Tensor = None,
+    attention_mask: torch.Tensor | None = None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    query_states = self.q_norm(query_states)
+    key_states = self.k_norm(key_states)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = attention_kernel()(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=self.attention_dropout if self.training else 0.0,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

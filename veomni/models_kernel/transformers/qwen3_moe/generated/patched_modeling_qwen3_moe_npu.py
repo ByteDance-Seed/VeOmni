@@ -31,6 +31,8 @@
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniKernels
 #    - method_override: Qwen3MoeForCausalLM.get_parallel_plan
 #      Register Qwen3Moe expert parallel plan for v5 generated modeling
+#    - method_override: Qwen3MoeAttention.forward
+#      Dispatch attention through the interned VeomniKernel
 #
 # ==============================================================================
 
@@ -58,7 +60,7 @@ from transformers.modeling_layers import (
 )
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -66,7 +68,13 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import empty_bias, linear_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.kernel_utils import (
+    attention_kernel,
+    empty_bias,
+    linear_bias,
+    resolve_kernel_impl,
+    resolve_moe_impl,
+)
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 
 # Additional imports for patches
@@ -135,6 +143,12 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeAttention
+# Methods patched: forward
+# ======================================================================
+
+
 @use_kernelized_func(apply_rotary_pos_emb)
 class Qwen3MoeAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -186,11 +200,7 @@ class Qwen3MoeAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = attention_kernel()(
             self,
             query_states,
             key_states,
@@ -198,7 +208,7 @@ class Qwen3MoeAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
+            sliding_window=self.sliding_window,
             **kwargs,
         )
 

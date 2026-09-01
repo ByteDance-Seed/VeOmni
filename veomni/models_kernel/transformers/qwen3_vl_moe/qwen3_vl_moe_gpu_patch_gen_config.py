@@ -106,7 +106,7 @@ config.add_import(
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
+    names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",

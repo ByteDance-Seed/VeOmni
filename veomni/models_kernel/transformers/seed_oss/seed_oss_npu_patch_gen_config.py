@@ -23,6 +23,7 @@ directly for RoPE / RMSNorm; those become local VeomniKernel calls.
 
 from veomni.models_kernel.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (
     apply_rotary_pos_emb_patched,
+    seed_oss_attention_forward_patched,
     seed_oss_forcausallm_forward_patched,
     seed_oss_forcausallm_init_patched,
     seed_oss_mlp_forward_patched,
@@ -81,4 +82,10 @@ config.override_method(
     "SeedOssForCausalLM.forward",
     replacement=seed_oss_forcausallm_forward_patched,
     description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+)
+
+config.override_method(
+    "SeedOssAttention.forward",
+    replacement=seed_oss_attention_forward_patched,
+    description="Dispatch attention through the interned VeomniKernel",
 )

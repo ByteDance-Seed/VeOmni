@@ -36,7 +36,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import linear_bias, resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, linear_bias, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -56,7 +56,7 @@ config.add_import(
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["linear_bias", "resolve_kernel_impl"],
+    names=["attention_kernel", "linear_bias", "resolve_kernel_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
@@ -129,7 +129,7 @@ def apply_rotary_pos_emb_patched(
 
 @config.override_method(
     "Qwen3Attention.__init__",
-    description="Construct a local rope full VeomniKernel",
+    description="Construct local rope and attention VeomniKernels",
 )
 def qwen3_attention_init_patched(self, config, layer_idx: int):
     nn.Module.__init__(self)
@@ -150,11 +150,12 @@ def qwen3_attention_init_patched(self, config, layer_idx: int):
     self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
     self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
     self.veomni_rope = VeomniKernel("rope", "full", resolve_kernel_impl("rotary_pos_emb_implementation"))
+    self.veomni_attn = attention_kernel()
 
 
 @config.override_method(
     "Qwen3Attention.forward",
-    description="Always call the local rope VeomniKernel",
+    description="Always call the local rope and attention VeomniKernels",
 )
 def qwen3_attention_forward_patched(
     self,
@@ -177,11 +178,7 @@ def qwen3_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
-
-    attn_output, attn_weights = attention_interface(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,

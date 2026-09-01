@@ -12,13 +12,13 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Attention helpers for models_kernel consume. Do not import ``veomni.models``."""
+"""Attention helpers for models_kernel consume."""
 
 VARLEN_ATTENTION_TYPES = (
     "flash_attention_2",
     "flash_attention_3",
     "flash_attention_4",
-    "veomni_flash_attention_2_with_sp",
-    "veomni_flash_attention_3_with_sp",
-    "veomni_flash_attention_4_with_sp",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_4",
 )

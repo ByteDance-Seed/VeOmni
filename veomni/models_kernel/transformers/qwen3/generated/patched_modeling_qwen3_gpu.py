@@ -20,9 +20,9 @@
 #    - function_replacement: apply_rotary_pos_emb
 #      Always call rope full VeomniKernel
 #    - method_override: Qwen3Attention.__init__
-#      Construct a local rope full VeomniKernel
+#      Construct local rope and attention VeomniKernels
 #    - method_override: Qwen3Attention.forward
-#      Always call the local rope VeomniKernel
+#      Always call the local rope and attention VeomniKernels
 #    - method_override: Qwen3ForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
 #    - method_override: Qwen3ForCausalLM.forward
@@ -60,7 +60,7 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -68,7 +68,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import linear_bias, resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, linear_bias, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -288,6 +288,7 @@ class Qwen3Attention(nn.Module):
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.veomni_rope = VeomniKernel("rope", "full", resolve_kernel_impl("rotary_pos_emb_implementation"))
+        self.veomni_attn = attention_kernel()
 
     def forward(
         self,
@@ -310,11 +311,7 @@ class Qwen3Attention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,

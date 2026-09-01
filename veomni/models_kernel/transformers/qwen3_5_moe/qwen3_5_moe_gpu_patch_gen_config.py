@@ -62,7 +62,7 @@ from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config impo
     qwen3_5_vision_model_forward,
     qwen3_5_vision_model_rot_pos_emb,
 )
-from veomni.models_kernel.utils.kernel_utils import empty_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, empty_bias, resolve_kernel_impl, resolve_moe_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -105,7 +105,7 @@ config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", 
 config.add_import("veomni.kernels", names=["VeomniKernel"])
 config.add_import(
     "veomni.models_kernel.utils.kernel_utils",
-    names=["empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
+    names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
 )
 config.add_import(
     "veomni.models_kernel.utils.loss_utils",
@@ -1068,3 +1068,49 @@ def qwen3_5_moe_get_parallel_plan_patched(self):
     from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
+
+
+@config.override_method(
+    "Qwen3_5MoeAttention.forward",
+    description="Dispatch attention through the interned VeomniKernel",
+)
+def qwen3_5_moe_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = attention_kernel()(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = attn_output * torch.sigmoid(gate)
+
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

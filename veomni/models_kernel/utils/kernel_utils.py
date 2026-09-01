@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from torch import Tensor, nn
 
+from veomni.kernels import VeomniKernel
 from veomni.kernels.config import get_kernels_config
 
 
@@ -36,6 +37,16 @@ def resolve_kernel_impl(field: str, *, npu_as: str | None = None) -> str:
     if npu_as is not None and impl == "npu":
         return npu_as
     return impl
+
+
+def attention_kernel() -> VeomniKernel:
+    """Return the interned standard-attention kernel for the active impl.
+
+    Missing kernels config resolves to ``eager``. Construct in ``__init__``
+    when the attention module is already patched; otherwise call this in
+    ``forward``. The handle is interned either way.
+    """
+    return VeomniKernel("attention", "standard", resolve_kernel_impl("attn_implementation"))
 
 
 def resolve_moe_impl() -> str:

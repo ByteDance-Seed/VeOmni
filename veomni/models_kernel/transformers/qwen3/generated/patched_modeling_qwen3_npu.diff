@@ -39,9 +39,9 @@
 +#    - function_replacement: apply_rotary_pos_emb
 +#      Always call rope full VeomniKernel
 +#    - method_override: Qwen3Attention.__init__
-+#      Construct a local rope full VeomniKernel
++#      Construct local rope and attention VeomniKernels
 +#    - method_override: Qwen3Attention.forward
-+#      Always call the local rope VeomniKernel
++#      Always call the local rope and attention VeomniKernels
 +#    - method_override: Qwen3ForCausalLM.__init__
 +#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
 +#    - method_override: Qwen3ForCausalLM.forward
@@ -95,7 +95,7 @@
 +    SequenceClassifierOutputWithPast,
 +)
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
++from transformers.modeling_utils import PreTrainedModel
 +from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -103,7 +103,7 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.kernels import VeomniKernel
-+from veomni.models_kernel.utils.kernel_utils import linear_bias, resolve_kernel_impl
++from veomni.models_kernel.utils.kernel_utils import attention_kernel, linear_bias, resolve_kernel_impl
 +from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 +
@@ -240,7 +240,7 @@
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.config = config
          self.layer_idx = layer_idx
-@@ -245,9 +284,10 @@
+@@ -245,9 +284,11 @@
          self.o_proj = nn.Linear(
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
@@ -250,10 +250,11 @@
 +        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 +        self.veomni_rope = VeomniKernel("rope", "full", resolve_kernel_impl("rotary_pos_emb_implementation"))
++        self.veomni_attn = attention_kernel()
 
      def forward(
          self,
-@@ -265,12 +305,12 @@
+@@ -265,16 +306,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -264,11 +265,15 @@
              key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
 -        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-             self.config._attn_implementation, eager_attention_forward
-         )
-
-@@ -282,7 +322,7 @@
+-            self.config._attn_implementation, eager_attention_forward
+-        )
+-
+-        attn_output, attn_weights = attention_interface(
++        attn_output, attn_weights = self.veomni_attn(
+             self,
+             query_states,
+             key_states,
+@@ -282,7 +319,7 @@
              attention_mask,
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
@@ -277,7 +282,7 @@
              **kwargs,
          )
 
-@@ -438,6 +478,12 @@
+@@ -438,6 +475,12 @@
          )
 
 
@@ -290,7 +295,7 @@
  @auto_docstring
  class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -445,12 +491,13 @@
+@@ -445,12 +488,13 @@
      _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
      def __init__(self, config):
@@ -307,7 +312,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -464,61 +511,105 @@
+@@ -464,61 +508,105 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

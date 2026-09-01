@@ -49,6 +49,10 @@
 #      Expose CPU-side window-attention ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen2_5OmniForConditionalGeneration.get_metadata_collate_func
 #      Delegate ViT multimodal-metadata derivation to the thinker submodule
+#    - method_override: Qwen2_5OmniAudioAttention.forward
+#      Dispatch audio attention through the interned VeomniKernel
+#    - method_override: Qwen2_5OmniAttention.forward
+#      Dispatch thinker attention through the interned VeomniKernel
 #
 # ==============================================================================
 
@@ -76,7 +80,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniAudioEncoderConfig,
     Qwen2_5OmniConfig,
@@ -108,7 +112,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, unpad_tensor
 from veomni.kernels import VeomniKernel
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
@@ -757,6 +761,12 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5OmniAudioAttention
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen2_5OmniAudioAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -793,8 +803,6 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """Input shape: Batch x Time x Channel"""
-
         seq_length, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
@@ -805,12 +813,9 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface = attention_kernel()
 
         if is_flash_attention_requested(self.config):
-            # Flash Attention: Use cu_seqlens for variable length attention
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,
@@ -828,7 +833,6 @@ class Qwen2_5OmniAudioAttention(nn.Module):
                 **kwargs,
             )
         else:
-            # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
                 torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
@@ -851,7 +855,6 @@ class Qwen2_5OmniAudioAttention(nn.Module):
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.out_proj(attn_output)
-
         return attn_output
 
 
@@ -1364,9 +1367,7 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface = attention_kernel()
 
         # --- Patch.1 ---
         if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1939,6 +1940,12 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
     return q_embed, k_embed
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen2_5OmniAttention
+# Methods patched: forward
+# ======================================================================
+
+
 class Qwen2_5OmniAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
@@ -1984,6 +1991,7 @@ class Qwen2_5OmniAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+        del output_attentions, use_cache
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -2002,11 +2010,7 @@ class Qwen2_5OmniAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = attention_kernel()(
             self,
             query_states,
             key_states,
@@ -2015,7 +2019,7 @@ class Qwen2_5OmniAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            position_ids=position_ids,  # pass positions for FA2
+            position_ids=position_ids,
             **kwargs,
         )
 

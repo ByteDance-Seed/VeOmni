@@ -21,6 +21,8 @@
 #      Bind ForCausalLMLoss and load_balancing_loss VeomniKernels
 #    - method_override: GptOssForCausalLM.forward
 #      Always call ForCausalLMLoss and load_balancing_loss VeomniKernels
+#    - method_override: GptOssAttention.forward
+#      Dispatch attention through the interned VeomniKernel
 #
 # ==============================================================================
 
@@ -49,7 +51,7 @@ from transformers.modeling_layers import (
 )
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -57,7 +59,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl, resolve_moe_impl
 from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -283,6 +285,12 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] GptOssAttention
+# Methods patched: forward
+# ======================================================================
+
+
 @use_kernelized_func(apply_rotary_pos_emb)
 class GptOssAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -333,11 +341,7 @@ class GptOssAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = attention_kernel()(
             self,
             query_states,
             key_states,
@@ -346,7 +350,7 @@ class GptOssAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            s_aux=self.sinks,  # diff with Llama
+            s_aux=self.sinks,
             **kwargs,
         )
 
@@ -424,7 +428,7 @@ class GptOssPreTrainedModel(PreTrainedModel):
     _compatible_flash_implementations = [
         "kernels-community/vllm-flash-attn3",
         "flash_attention_4",
-        "veomni_flash_attention_4_with_sp",
+        "veomni_flash_attention_4",
     ]
 
     @torch.no_grad()

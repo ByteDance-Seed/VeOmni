@@ -1,6 +1,6 @@
 --- a/transformers/models/llama/modeling_llama.py
 +++ b/patched_modeling_llama_gpu.py
-@@ -1,70 +1,92 @@
+@@ -1,70 +1,94 @@
 -# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
 +#  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
@@ -39,6 +39,8 @@
 +#      Bind ForSequenceClassificationLoss to a local cross_entropy_loss VeomniKernel
 +#    - method_override: LlamaForSequenceClassification.forward
 +#      Always call self.loss_function (seq-cls helper + VeomniKernel)
++#    - method_override: LlamaAttention.forward
++#      Dispatch attention through the interned VeomniKernel
  #
 -# Unless required by applicable law or agreed to in writing, software
 -# distributed under the License is distributed on an "AS IS" BASIS,
@@ -87,7 +89,7 @@
 -from ...utils.output_capturing import capture_outputs
 -from .configuration_llama import LlamaConfig
 +from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
++from transformers.modeling_utils import PreTrainedModel
 +from transformers.models.llama.configuration_llama import LlamaConfig
 +from transformers.processing_utils import Unpack
 +from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
@@ -95,7 +97,7 @@
 +from transformers.utils.output_capturing import capture_outputs
 +
 +from veomni.kernels import VeomniKernel
-+from veomni.models_kernel.utils.kernel_utils import linear_bias, resolve_kernel_impl
++from veomni.models_kernel.utils.kernel_utils import attention_kernel, linear_bias, resolve_kernel_impl
 +from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
@@ -131,7 +133,7 @@
 
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-@@ -142,35 +164,31 @@
+@@ -142,35 +166,31 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -188,7 +190,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -178,10 +196,20 @@
+@@ -178,10 +198,20 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -211,7 +213,33 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -425,6 +453,12 @@
+@@ -221,6 +251,12 @@
+     return attn_output, attn_weights
+
+
++# ======================================================================
++# [MODIFIED CLASS] LlamaAttention
++# Methods patched: forward
++# ======================================================================
++
++
+ @use_kernelized_func(apply_rotary_pos_emb)
+ class LlamaAttention(nn.Module):
+     """Multi-headed attention from 'Attention Is All You Need' paper"""
+@@ -269,11 +305,7 @@
+         if past_key_values is not None:
+             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+-            self.config._attn_implementation, eager_attention_forward
+-        )
+-
+-        attn_output, attn_weights = attention_interface(
++        attn_output, attn_weights = attention_kernel()(
+             self,
+             query_states,
+             key_states,
+@@ -425,6 +457,12 @@
          )
 
 
@@ -224,7 +252,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -436,8 +470,9 @@
+@@ -436,8 +474,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -236,7 +264,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -451,55 +486,105 @@
+@@ -451,55 +490,105 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

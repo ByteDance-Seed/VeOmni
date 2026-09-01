@@ -72,6 +72,28 @@ def test_apply_veomni_attention_patch_is_idempotent():
         assert ALL_ATTENTION_FUNCTIONS[name] is forward
 
 
+def eager_attention_forward(module, query, key, value, attention_mask, **kwargs):
+    del module, key, value, attention_mask, kwargs
+    return query.transpose(1, 2), "eager-local"
+
+
+class _EagerAttentionModule(torch.nn.Module):
+    """Lookup resolves ``eager_attention_forward`` from this test module."""
+
+
+def test_lookup_eager_uses_module_local_forward():
+    module = _EagerAttentionModule()
+    query = torch.randn(2, 4, 3, 8)
+    output, metadata = lookup("eager")(module, query, query, query, None, dropout=0.0, scaling=0.5)
+    torch.testing.assert_close(output, query.transpose(1, 2))
+    assert metadata == "eager-local"
+
+    kernel = VeomniKernel("attention", "standard", "eager")
+    kernel_output, kernel_metadata = kernel(module, query, query, query, None, dropout=0.0, scaling=0.5)
+    torch.testing.assert_close(kernel_output, query.transpose(1, 2))
+    assert kernel_metadata == "eager-local"
+
+
 def test_lookup_dispatches_through_hf_dict(monkeypatch):
     captured = {}
 
