@@ -69,7 +69,7 @@ def check_indexer_loss_supported(config: PretrainedConfig) -> None:
     configuration. Reads the installed ops singleton rather than taking the config
     as an argument, so that every construction path is covered by the same call.
 
-    "Off" includes a non-positive coefficient, matching ``OpsImplementationConfig``
+    "Off" includes a zero coefficient, matching ``OpsImplementationConfig``
     and the runtime gate in DeepSeek-V4's forward, both of which read the weight
     before anything else and treat zero as the objective being switched off rather
     than as a configuration of it. Without that agreement here, a shared config that
@@ -82,6 +82,9 @@ def check_indexer_loss_supported(config: PretrainedConfig) -> None:
     ops_config = get_ops_config()
     if ops_config is None or not getattr(ops_config, "dsa_indexer_loss", False):
         return
+    # ``<= 0`` rather than ``== 0`` only because the other two gates are written
+    # that way; a negative weight never reaches here, ``OpsImplementationConfig``
+    # having rejected it at launch.
     if getattr(ops_config, "dsa_indexer_loss_coef", 1.0) <= 0:
         return
 

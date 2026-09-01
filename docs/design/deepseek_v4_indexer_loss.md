@@ -98,12 +98,14 @@ distinguish the correct teacher from Megatron's.
 | a layer's return arity matches the shared gate | `DeepseekV4Model.forward` | `RuntimeError` on the first forward |
 | the top-k actually binds | not enforced | the dense eq. (3) objective, silently |
 
-Every one of these is keyed on the objective being *on*, and a non-positive
-coefficient is off. That reading is the same in all three places that make it —
+Every one of these is keyed on the objective being *on*, and a coefficient of
+`0.0` is off. That reading is the same in all three places that make it —
 `OpsImplementationConfig`, `check_indexer_loss_supported` and
 `_indexer_loss_enabled` — because `arguments.md` documents the coefficient as the
 way to disable the term without editing the flag, and a gate that disagreed would
 refuse a shared config for enabling something that config had just switched off.
+A negative coefficient is not a third state: the row above rejects it at launch,
+so the `<= 0` the gates are written with never sees one.
 
 The model-type gate is an allow-list (`INDEXER_LOSS_MODEL_TYPES`) for the same
 reason CP's is, and against a specific run: GLM MoE DSA has a Lightning Indexer of
