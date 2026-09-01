@@ -10,8 +10,13 @@ everything beneath them moved.
 attention distribution, restricted to the candidates the indexer itself selected,
 to `softmax(index_score)`. The teacher is recomputed in the forward by
 `sparse_mqa_target_fwd` from the TileLang attention's own log-sum-exp, summed over
-CSA layers, normalised per query token, reduced across sequence-parallel ranks,
-scaled by `dsa_indexer_loss_coef` and added to the total loss.
+CSA layers, normalised per query token, scaled by `dsa_indexer_loss_coef` and added
+to the total loss.
+
+The objective requires sequence parallelism switched off. Ulysses and context
+parallelism are the only two modes that enable it and the gate refuses both, for
+different reasons recorded below — so an accepted run holds each sequence whole on
+one rank, and the per-token normalisation above is already the global one.
 
 The user-facing surface — the two flags, the four metrics, the sparsity regime the
 objective needs to be the paper's objective at all, and the measured effect on a
@@ -43,8 +48,10 @@ Five call sites in three functions, because the objective changes return arities
    query rows.
 4. `DeepseekV4DecoderLayer.forward` passes them up; `DeepseekV4Model.forward` sums
    over the CSA layers and counts them.
-5. `DeepseekV4ForCausalLM.forward` takes the local mean, reduces over the SP group,
-   folds `coef * kl` into the loss, and reports the four metrics.
+5. `DeepseekV4ForCausalLM.forward` takes the per-token mean, folds `coef * kl` into
+   the loss, and reports the four metrics. The mean is written as a *local* one
+   behind an `sp_enabled` branch that the gate above makes unreachable; see the
+   context-parallelism note below for why that branch is there at all.
 
 ## Why the teacher is not a softmax over the compressed logits
 
@@ -90,6 +97,13 @@ distinguish the correct teacher from Megatron's.
 | teacher width == selection width | `DeepseekV4Attention.forward` | `RuntimeError` on the first forward |
 | a layer's return arity matches the shared gate | `DeepseekV4Model.forward` | `RuntimeError` on the first forward |
 | the top-k actually binds | not enforced | the dense eq. (3) objective, silently |
+
+Every one of these is keyed on the objective being *on*, and a non-positive
+coefficient is off. That reading is the same in all three places that make it —
+`OpsImplementationConfig`, `check_indexer_loss_supported` and
+`_indexer_loss_enabled` — because `arguments.md` documents the coefficient as the
+way to disable the term without editing the flag, and a gate that disagreed would
+refuse a shared config for enabling something that config had just switched off.
 
 The model-type gate is an allow-list (`INDEXER_LOSS_MODEL_TYPES`) for the same
 reason CP's is, and against a specific run: GLM MoE DSA has a Lightning Indexer of
@@ -167,23 +181,24 @@ the forward returned integer indices, which carry no gradient. From here the
 objective off the language-modelling one, and
 `test_the_indexer_objective_moves_only_the_indexer` is what says so.
 
-**The reduction takes a local mean and a local count.** The MoE load-balancing
-loss is the right precedent for the *fold-in* shape and the wrong one for
-reduction: it is folded in after `ForCausalLMLoss` has returned and therefore
-misses the SP reduction entirely, which is fine for a router statistic and not for
-a per-token objective. The indexer KL calls `reduce_sequence_parallel_loss`
-itself, which re-weights by the local count before dividing by the global one.
-Handing it the local *sum* instead trains perfectly well on a single rank and
-converges to the wrong cross-rank weighting — invisible to any single-process test
-of the value.
+**The reduction takes a local mean and a local count**, on the unreachable
+sequence-parallel branch. The MoE load-balancing loss is the right precedent for
+the *fold-in* shape and the wrong one for reduction: it is folded in after
+`ForCausalLMLoss` has returned and therefore misses the SP reduction entirely,
+which is fine for a router statistic and not for a per-token objective. So the
+indexer KL calls `reduce_sequence_parallel_loss` itself, which re-weights by the
+local count before dividing by the global one. Handing it the local *sum* instead
+trains perfectly well on a single rank and converges to the wrong cross-rank
+weighting — invisible to any single-process test of the value, which is why the
+shape is settled now rather than when a sequence-parallel mode is admitted.
 
-Two details there are load-bearing. The token count is all non-padding query
-positions, not the LM loss's unmasked-label count: eq. (4) sums over query
-positions with no reference to labels, and a query has a meaningful attention
-distribution where its label is masked. And the count tensor is `.clone()`d for
-each of the two calls, because `ReduceLoss.forward` all-reduces it in place — a
-shared tensor would divide the second term by an SP-world-size-inflated count,
-correct on one rank and wrong on two.
+The token count is load-bearing on both branches: it is all non-padding query
+positions, not the LM loss's unmasked-label count, because eq. (4) sums over query
+positions with no reference to labels and a query has a meaningful attention
+distribution where its label is masked. One detail belongs to the reduction alone
+— the count tensor is `.clone()`d for each of the two calls, because
+`ReduceLoss.forward` all-reduces it in place, and a shared tensor would divide the
+second term by an SP-world-size-inflated count: correct on one rank, wrong on two.
 
 **The loss keeps the layer sum; the metric is a per-layer mean.** Summed,
 `training/indexer_kl` is ~21x larger on DeepSeek-V4-Flash than on the 1-CSA-layer

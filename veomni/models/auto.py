@@ -68,11 +68,21 @@ def check_indexer_loss_supported(config: PretrainedConfig) -> None:
     A no-op when ``dsa_indexer_loss`` is off, which is the default and every other
     configuration. Reads the installed ops singleton rather than taking the config
     as an argument, so that every construction path is covered by the same call.
+
+    "Off" includes a non-positive coefficient, matching ``OpsImplementationConfig``
+    and the runtime gate in DeepSeek-V4's forward, both of which read the weight
+    before anything else and treat zero as the objective being switched off rather
+    than as a configuration of it. Without that agreement here, a shared config that
+    parks ``dsa_indexer_loss: true`` and disables the term with the documented
+    coefficient-only switch would still be refused on every other model type -- and
+    refused for enabling something it just turned off.
     """
     from ..ops.config.singleton import get_ops_config
 
     ops_config = get_ops_config()
     if ops_config is None or not getattr(ops_config, "dsa_indexer_loss", False):
+        return
+    if getattr(ops_config, "dsa_indexer_loss_coef", 1.0) <= 0:
         return
 
     model_type = getattr(config, "model_type", None)

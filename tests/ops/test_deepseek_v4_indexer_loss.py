@@ -2953,7 +2953,7 @@ class TestModelBuildRefusesModelsThatDoNotImplementIt:
     """
 
     @staticmethod
-    def _build(config_path, indexer_loss, loader):
+    def _build(config_path, indexer_loss, loader, coef=1.0):
         """``build_foundation_model`` with nothing built, returning the loader's calls.
 
         ``build_foundation_model`` is the whole surface: it is the one construction
@@ -2965,7 +2965,9 @@ class TestModelBuildRefusesModelsThatDoNotImplementIt:
         from veomni.models.auto import build_config, build_foundation_model
 
         parallel_state = SimpleNamespace(cp_enabled=False, sp_enabled=False, global_rank=0)
-        ops_config = SimpleNamespace(attn_implementation="eager", dsa_indexer_loss=indexer_loss)
+        ops_config = SimpleNamespace(
+            attn_implementation="eager", dsa_indexer_loss=indexer_loss, dsa_indexer_loss_coef=coef
+        )
         with (
             mock.patch("veomni.models.auto.get_parallel_state", return_value=parallel_state),
             mock.patch("veomni.ops.config.singleton.get_ops_config", return_value=ops_config),
@@ -3002,6 +3004,20 @@ class TestModelBuildRefusesModelsThatDoNotImplementIt:
         """
         loader = _StubLoader()
         assert self._build("tests/toy_config/glm_moe_dsa_toy", indexer_loss=False, loader=loader) == 1
+
+    def test_a_zero_coefficient_admits_every_model_too(self):
+        """The coefficient-only switch has to mean the same thing here as everywhere
+        else, or it is not a switch.
+
+        ``OpsImplementationConfig`` and the runtime gate both read the weight before
+        anything else and treat zero as off, and ``arguments.md`` documents it as the
+        way to disable the term without editing the flag. A build gate that ignored
+        the coefficient would refuse a shared config on every other model type -- for
+        enabling something that config had just switched off, which is advice about
+        the opposite of what the user did.
+        """
+        loader = _StubLoader()
+        assert self._build("tests/toy_config/glm_moe_dsa_toy", indexer_loss=True, coef=0.0, loader=loader) == 1
 
 
 class _StubLoader:
