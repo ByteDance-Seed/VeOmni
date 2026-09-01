@@ -1,6 +1,6 @@
 .PHONY: build commit quality style test patchgen check-patchgen
 
-check_dirs := tasks tests veomni docs
+check_dirs := tasks tests veomni docs scripts
 
 build:
 	python3 -m build
