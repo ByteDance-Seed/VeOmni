@@ -227,15 +227,17 @@ def test_batch_config_follows_a_model_level_ulysses_override(world_size):
 def test_model_runtime_arguments_is_a_standalone_training_unit():
     """What an omni module inherits: model fields + its own accelerator/optimizer.
 
-    Notably without ``config_path``/``tokenizer_path``/``safetensor_idx_path`` — a
-    module is addressed by its subfolder in a composed checkpoint, so inheriting
-    those would hand every module a tokenizer it has no use for.
+    ``config_path`` is included — every unit has to say where its architecture is
+    defined. ``tokenizer_path``/``safetensor_idx_path`` are not: a composed model
+    has one tokenizer, and a module is addressed by its subfolder in a shared
+    checkpoint, so inheriting those would hand every module a tokenizer it has no
+    use for and an index override it cannot meaningfully set.
     """
     names = {f.name for f in dataclasses.fields(ModelRuntimeArguments)}
 
-    assert {"model_path", "model_config", "basic_modules", "lora_config", "ops_implementation"} <= names
-    assert {"accelerator", "optimizer"} <= names
-    assert names.isdisjoint({"config_path", "tokenizer_path", "safetensor_idx_path"})
+    assert {"model_path", "config_path", "model_config", "basic_modules", "lora_config"} <= names
+    assert {"ops_implementation", "accelerator", "optimizer"} <= names
+    assert names.isdisjoint({"tokenizer_path", "safetensor_idx_path"})
 
 
 def test_base_localizes_model_path_so_every_subclass_inherits_it(monkeypatch):
@@ -253,6 +255,18 @@ def test_base_localizes_model_path_so_every_subclass_inherits_it(monkeypatch):
 
     assert seen == ["hdfs://ns/ckpt/vision"]
     assert runtime.model_path == "/local/cache/vision"
+
+
+def test_base_settles_config_path_so_a_module_inherits_it(monkeypatch):
+    """A module points at its own architecture; only the tokenizer belongs to the model."""
+    monkeypatch.setattr("veomni.utils.fs.copy_to_local", lambda path, **kw: f"/local/cache/{path.rsplit('/', 1)[-1]}")
+    monkeypatch.setattr("veomni.utils.fs.is_non_local", lambda p: str(p).startswith("hdfs://"))
+
+    derived = ModelRuntimeArguments(model_path="hdfs://ns/ckpt/vision")
+    explicit = ModelRuntimeArguments(model_path="/ckpt/vision", config_path="hdfs://ns/cfg/vit_cfg")
+
+    assert derived.config_path == "/local/cache/vision"
+    assert explicit.config_path == "/local/cache/vit_cfg"
 
 
 def test_model_arguments_still_localizes_through_super(monkeypatch):
@@ -334,6 +348,28 @@ def test_model_arguments_honours_an_explicit_index_path(tmp_path, index_cache):
     )
 
     assert args.fqn_to_index_mapping == {"layer.weight": 3}
+
+
+def test_an_explicit_hdfs_index_path_is_localized(tmp_path, index_cache, monkeypatch):
+    """Its sibling paths are localized; left remote, this one reaches the loader as a URI."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    local_index = _write_index(elsewhere, {"layer.weight": "model-00003-of-00004.safetensors"})
+    local_index = str(local_index / "model.safetensors.index.json")
+
+    downloads = []
+    monkeypatch.setattr("veomni.utils.fs.is_non_local", lambda p: str(p).startswith("hdfs://"))
+    monkeypatch.setattr("veomni.utils.fs.copy_to_local", lambda path, **kw: (downloads.append(path), local_index)[1])
+
+    args = ModelArguments(
+        model_path=str(tmp_path),
+        safetensor_idx_path="hdfs://ns/ckpt/model.safetensors.index.json",
+    )
+
+    assert args.safetensor_idx_path == local_index
+    assert args.fqn_to_index_mapping == {"layer.weight": 3}
+    # Resolved in __post_init__, not on every property access.
+    assert downloads == ["hdfs://ns/ckpt/model.safetensors.index.json"]
 
 
 def test_a_checkpoint_without_an_index_still_warns(tmp_path, index_cache, monkeypatch):

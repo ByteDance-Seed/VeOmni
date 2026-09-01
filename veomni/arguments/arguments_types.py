@@ -70,9 +70,9 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #
 # `model.*` is split so an omni module can reuse it without inheriting a
 # single-model loader's baggage:
-#   BaseModelArguments      model fields alone (model_path, lora_config, ops, …)
+#   BaseModelArguments      model fields alone (model_path, config_path, lora_config, ops, …)
 #   └── ModelRuntimeArguments   + accelerator + optimizer — one training unit
-#       └── ModelArguments      + config/tokenizer/safetensor-index paths
+#       └── ModelArguments      + tokenizer/safetensor-index paths
 #
 
 
@@ -1445,14 +1445,20 @@ class OpsImplementationConfig:
 class BaseModelArguments:
     """Model fields shared by every trainable unit, whole model or single module.
 
-    Deliberately excludes the config/tokenizer/index paths: an omni module is
+    Deliberately excludes the tokenizer and index paths: an omni module is
     addressed by its subfolder inside a composed checkpoint and never carries
     its own tokenizer, so those belong on :class:`ModelArguments` alone.
+    ``config_path`` is here because every unit has to say where its architecture
+    is defined, even when that is just its own subfolder.
     """
 
     model_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
+    )
+    config_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
     )
     model_config: Optional[Dict] = field(
         default_factory=dict,
@@ -1475,6 +1481,9 @@ class BaseModelArguments:
         # ``model_path`` that exists on disk before any loader touches it, and a
         # composed model resolves its module subfolders against this root.
         self.model_path = _resolve_hdfs_path(self.model_path)
+        self.config_path = _resolve_hdfs_path(self.config_path)
+        if self.config_path is None:
+            self.config_path = self.model_path
 
     def _safetensor_idx_path(self) -> Optional[str]:
         """Where to read the HF ``weight_map`` from. Overridden to allow an explicit path."""
@@ -1532,10 +1541,6 @@ class ModelRuntimeArguments(BaseModelArguments):
 class ModelArguments(ModelRuntimeArguments):
     """model.* — One composed model, plus the paths its loaders resolve from."""
 
-    config_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
-    )
     tokenizer_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
@@ -1543,7 +1548,8 @@ class ModelArguments(ModelRuntimeArguments):
     safetensor_idx_path: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
+            "help": "Local path/HDFS path to model.safetensors.index.json. "
+            "Defaults to `model_path`/model.safetensors.index.json."
         },
     )
 
@@ -1553,12 +1559,12 @@ class ModelArguments(ModelRuntimeArguments):
 
         # Download HDFS-hosted paths to a local cache before resolving defaults so
         # that all downstream loaders (config/tokenizer/safetensors) see local paths.
+        # ``super()`` settles ``config_path``, which the tokenizer then falls back to.
         super().__post_init__()
-        self.config_path = _resolve_hdfs_path(self.config_path)
         self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
-
-        if self.config_path is None:
-            self.config_path = self.model_path
+        # Resolved once here rather than in ``_safetensor_idx_path()``, which the
+        # ``fqn_to_index_mapping`` property calls on every access.
+        self.safetensor_idx_path = _resolve_hdfs_path(self.safetensor_idx_path)
 
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
