@@ -249,20 +249,24 @@ covers it.
 
 ## Interactions this change deliberately leaves alone
 
-**Muon's head split already covers the indexer, and will activate silently.** The
-indexer and the main attention both name their up-projection `q_b_proj`, and this
-is not a collision the head-split machinery is unaware of — `_head_layout_tiers`
-is written for it, resolving the indexer's 8192 rows to 64 × 128 from the module's
-own attributes rather than 16 × 512 from the config. So a run with
-`--train.optimizer.muon_head_split_modules q_b_proj` has been assigning the
-indexer's matrix 64 row blocks all along; it was inert only because `p.grad` was
-`None` at step time. This objective populates that gradient, which turns
-head-split Muon on for the indexer as a side effect of a flag aimed at attention.
-The papers describe plain Muon over the whole matrix, so the paper-faithful
-routing is the dimensionality-based one `split_muon_adamw_params` already does,
-and `configs/text/deepseek_v4_indexer_loss.yaml` leaves
-`muon_head_split_modules` unset. Making the exclusion explicit is a separate
-change.
+**Muon's head split reaches the indexer, and this objective is what makes that
+reach matter.** The indexer and the main attention both name their up-projection
+`q_b_proj`, and the head-split machinery is not unaware of the collision:
+`_head_layout_tiers` resolves the indexer's 8192 rows to 64 × 128 from the
+module's own attributes rather than 16 × 512 from the config. So head-split Muon
+has been assigning the indexer's matrix 64 row blocks whenever the name selected
+it — inert only because `p.grad` was `None` at step time. This objective
+populates that gradient.
+
+What keeps that from being a surprise is #1108, which made a bare `[q_b_proj]` an
+error rather than a selection of both sites: the message names
+`self_attn.q_b_proj` and `indexer.q_b_proj` and asks which was meant. Splitting
+the indexer is therefore something a config now has to say, and this objective
+only changes whether saying it does anything. The papers describe plain Muon over
+the whole matrix, so the paper-faithful routing is the dimensionality-based one
+`split_muon_adamw_params` already does, and
+`configs/text/deepseek_v4_indexer_loss.yaml` leaves `muon_head_split_modules`
+unset.
 
 **Context parallelism, which the gate refuses today.** DeepSeek-V4's forward has
 no context-parallel path on `main`: no rank exchanges compressor halos or gathers

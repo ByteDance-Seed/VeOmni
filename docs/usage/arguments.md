@@ -391,7 +391,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_eps | `float` | `1e-7` | Numerical-stability epsilon used in spectral-norm normalization. |
 | muon_adjust_lr_fn | `Literal["original", "match_rms_adamw"]` | `"match_rms_adamw"` | Per-matrix learning-rate adjustment strategy. |
 | muon_head_group_size | `int` | `0` | Attention heads per Newton–Schulz block ("Muon Split"). `0` orthogonalizes each projection as one matrix, `1` is per-head, `g>1` groups `g` heads. Any value `>= 1` requires `muon_head_split_modules`. |
-| muon_head_split_modules | `List[str]` | `[]` | Leaf module names to head-split, e.g. `[q_b_proj]`. No default — required when `muon_head_group_size >= 1`. |
+| muon_head_split_modules | `List[str]` | `[]` | Projections to head-split, each a leaf module name or a dotted path suffix, e.g. `[self_attn.q_b_proj]`. An entry that would split two *nested* projections is rejected with the qualified names to use instead. No default — required when `muon_head_group_size >= 1`. |
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
@@ -520,8 +520,20 @@ distinct from the first emission.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable_activation | `bool` | `False` | Enable activation offload to CPU. |
+| enable_activation | `bool` | `False` | Enable synchronous activation offload to CPU. |
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
+| enable_async_activation | `bool` | `False` | Enable async activation offload via stream-based D2H/H2D. Mutually exclusive with `enable_activation`. When `activation_offload_modules` is empty, targets are discovered from `model._no_split_modules`; missing or unmatched model metadata fails closed. |
+| activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
+| activation_offload_host_cache_limit_gb | `float` | `4.0` | Maximum GB of free host buffers retained between steps. In-flight offloads may temporarily exceed this value. Set to `0` to disable reuse. |
+
+Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
+through unchanged. Only private, dense, contiguous activations are swapped so
+shared-storage views are never resized. Host buffers are pooled per model,
+keyed by shape, stride, and dtype, and evicted by least-recently-used layout to
+enforce `activation_offload_host_cache_limit_gb`. The manager is reset at every training-step
+boundary, including before a step after a failed forward/backward, so stale
+autograd keys cannot affect the next step. The path wraps selected module instances
+and is not intended to be captured by `torch.compile`.
 
 ### CheckpointConfig
 

@@ -488,6 +488,17 @@ def _head_layout_tiers(module: "nn.Module") -> List[Tuple[List[int], List[int]]]
     return tiers
 
 
+def _selects(entry: str, child_path: str) -> bool:
+    """Whether a ``muon_head_split_modules`` entry selects the module at ``child_path``.
+
+    An entry is a leaf module name or any dotted path suffix, so ``q_b_proj``,
+    ``self_attn.q_b_proj`` and ``compressor.indexer.q_b_proj`` all address the
+    DeepSeek-V4 projections they name. Segments are matched whole: ``q_b_proj``
+    never selects a module called ``xq_b_proj``.
+    """
+    return child_path == entry or child_path.endswith(f".{entry}")
+
+
 def _stacked_head_counts(rows: int, tiers: Sequence[Tuple[Sequence[int], Sequence[int]]]) -> List[int]:
     """Head counts consistent with ``rows == heads * per_head_dim``.
 
@@ -504,6 +515,84 @@ def _stacked_head_counts(rows: int, tiers: Sequence[Tuple[Sequence[int], Sequenc
     return matches
 
 
+def _discriminating_suffix(path: str, other: str) -> Optional[str]:
+    """Shortest dotted suffix of ``path`` that does not also select ``other``.
+
+    This is what turns a rejected entry into one a user can paste back into the
+    config. ``None`` when no suffix works, which happens only when ``path`` is a
+    direct child of the traversal root: every suffix of it is then a suffix of the
+    nested ``other`` as well.
+    """
+    parts = path.split(".")
+    for depth in range(1, len(parts) + 1):
+        candidate = ".".join(parts[-depth:])
+        if not _selects(candidate, other):
+            return candidate
+    return None
+
+
+def _encloses(outer_path: str, inner_path: str) -> bool:
+    """Whether the module holding ``outer_path`` contains the one holding ``inner_path``.
+
+    Compared on the *parent* paths, which is where the nesting lives: DeepSeek-V4's
+    two ``q_b_proj`` sit at ``self_attn`` and ``self_attn.compressor.indexer``, so
+    neither selected path is a prefix of the other while one attention plainly
+    encloses the other.
+    """
+    outer_parent, inner_parent = outer_path.rpartition(".")[0], inner_path.rpartition(".")[0]
+    if outer_parent == inner_parent:
+        return False
+    return not outer_parent or inner_parent.startswith(f"{outer_parent}.")
+
+
+def _reject_ambiguous_nesting(sites: Dict[str, Tuple[int, bool]], entries: Sequence[str]) -> None:
+    """Refuse a single entry that selects two projections nested inside one another.
+
+    DeepSeek-V4 names the MLA's up-projection ``q_b_proj`` and the DSA indexer's --
+    which sits *inside* that MLA, under the compressor -- ``q_b_proj`` as well, so one
+    such entry cannot say which was meant, and either reading silently decides the
+    update math. The check is per *pair of sites*, not per entry: an entry stays legal
+    only while every nested pair is addressed by entries specific to each side, so
+    supplementing a bare entry (``[q_b_proj, self_attn.q_b_proj]``) is refused just
+    like the bare entry alone, and only qualifying both is accepted.
+
+    ``sites`` maps a selected module path to ``(head count, whether it splits)``. A
+    pair where neither side splits is left to the ordinary skip warnings.
+
+    Sibling matches are a different case and stay allowed: Qwen2.5-Omni's text and
+    audio towers both name a ``q_proj``, neither encloses the other, and splitting
+    both is the plain reading of ``[q_proj]``.
+    """
+    paths = sorted(sites)
+    nested = [
+        (outer, inner, entry)
+        for outer in paths
+        for inner in paths
+        if _encloses(outer, inner) and (sites[outer][1] or sites[inner][1])
+        for entry in [next((e for e in entries if _selects(e, outer) and _selects(e, inner)), None)]
+        if entry is not None
+    ]
+    if not nested:
+        return
+
+    outer, inner, entry = nested[0]
+    repeats = f" The same collision repeats in {len(nested) - 1} other module(s)." if len(nested) > 1 else ""
+    outer_suffix, inner_suffix = _discriminating_suffix(outer, inner), _discriminating_suffix(inner, outer)
+    if outer_suffix is None:
+        fix = (
+            f"No dotted suffix selects {outer} without also selecting the nested one, because it is a "
+            f"direct child of the model passed in; select {inner_suffix!r} if the nested projection is "
+            "what you meant."
+        )
+    else:
+        fix = f"Replace it with {outer_suffix!r} or {inner_suffix!r} -- list both to split both."
+    raise ValueError(
+        f"muon_head_split_modules entry {entry!r} is ambiguous: it selects {outer} "
+        f"({sites[outer][0]} heads) and {inner} ({sites[inner][0]} heads), and the second sits inside "
+        f"the module holding the first, so the name cannot say which one was meant. {fix}{repeats}"
+    )
+
+
 def infer_head_block_counts(
     model: "nn.Module",
     head_group_size: int,
@@ -511,9 +600,13 @@ def infer_head_block_counts(
 ) -> Dict[str, int]:
     """Map parameter FQN to the number of row blocks for head-split Muon.
 
-    A weight is eligible when it lives in a direct child module named in
-    ``module_names`` of an attention module that declares both a head count and
-    a per-head dim. ``head_group_size`` is the number of heads per block.
+    A weight is eligible when it lives in a module selected by ``module_names`` --
+    a leaf name, or any dotted path suffix such as ``self_attn.q_b_proj`` -- whose
+    parent declares both a head count and a per-head dim. ``head_group_size`` is
+    the number of heads per block.
+
+    An entry that selects two *nested* projections raises rather than picking one;
+    see ``_reject_ambiguous_nesting``.
 
     Returns only params that end up with >1 block; anything whose head layout
     cannot be pinned down, or whose head count is not divisible by
@@ -527,8 +620,12 @@ def infer_head_block_counts(
             "(head_group_size >= 1 with an empty module_names)."
         )
 
-    allowed = set(module_names)
+    entries = tuple(dict.fromkeys(module_names))
     blocks: Dict[str, int] = {}
+    # Selected module path -> (head count, whether it splits), for the nesting check.
+    # Populated for every resolved site, so a pair stays visible when one side
+    # collapses to a single block under this ``head_group_size``.
+    sites: Dict[str, Tuple[int, bool]] = {}
     warned: set = set()
 
     def _warn_once(key: Tuple[Any, ...], message: str) -> None:
@@ -540,12 +637,13 @@ def infer_head_block_counts(
         tiers = _head_layout_tiers(module)
         head_counts, strides = tiers[-1]
         for child_name, child in module.named_children():
-            if child_name not in allowed:
+            child_path = f"{module_name}.{child_name}" if module_name else child_name
+            if not any(_selects(entry, child_path) for entry in entries):
                 continue
             for param_name, param in child.named_parameters(recurse=False):
                 if param.ndim != 2 or not param.requires_grad:
                     continue
-                fqn = ".".join(part for part in (module_name, child_name, param_name) if part)
+                fqn = f"{child_path}.{param_name}"
                 if not head_counts or not strides:
                     _warn_once(
                         (module.__class__.__name__, child_name, "undeclared"),
@@ -564,17 +662,19 @@ def infer_head_block_counts(
                     )
                     continue
                 num_heads = matches[0]
-                if num_heads % head_group_size != 0:
+                divisible = num_heads % head_group_size == 0
+                if not divisible:
                     _warn_once(
                         (child_name, num_heads, head_group_size, "group"),
                         f"head split skipped for {fqn}: {num_heads} heads are not divisible by "
                         f"head_group_size={head_group_size}.",
                     )
-                    continue
-                num_blocks = num_heads // head_group_size
+                num_blocks = num_heads // head_group_size if divisible else 1
+                sites[child_path] = (num_heads, num_blocks > 1)
                 if num_blocks > 1:
                     blocks[fqn] = num_blocks
 
+    _reject_ambiguous_nesting(sites, entries)
     return blocks
 
 

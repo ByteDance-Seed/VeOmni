@@ -46,7 +46,7 @@ from torch.utils.data import Dataset
 from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.modeling_outputs import ModelOutput
 
-from ..arguments import VeOmniArguments, save_args
+from ..arguments import OffloadConfig, VeOmniArguments, save_args
 from ..checkpoint import CheckpointerBase
 from ..data import (
     DistributedDataloader,
@@ -56,6 +56,7 @@ from ..data import (
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
+from ..distributed.async_offload import apply_async_activation_offload, reset_async_activation_offload
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
@@ -206,6 +207,13 @@ class VeOmniIter:
         if hasattr(self.dataloader, "state_dict"):
             return self.dataloader.state_dict()
         return {}
+
+
+def _resolve_offload_config(args) -> OffloadConfig:
+    """Return activation-offload config, or the disabled defaults if a stub omitted it."""
+    accelerator = getattr(getattr(args, "train", None), "accelerator", None)
+    config = getattr(accelerator, "offload_config", None)
+    return config if config is not None else OffloadConfig()
 
 
 def mean_aux_metrics(total_aux_metrics: Dict[str, float], num_micro_steps: int) -> Dict[str, float]:
@@ -524,6 +532,20 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
+        # Apply async activation offload BEFORE FSDP2 sharding.
+        # Uses per-instance __call__ patching so that async_save_on_cpu is
+        # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
+        # matching MindSpeed-MM's GC+async offload behavior: hidden_states
+        # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
+        # activations are handled by GC recomputation (via _checkpoint_hook).
+        offload_config = _resolve_offload_config(args)
+        if offload_config.enable_async_activation:
+            apply_async_activation_offload(
+                self.model,
+                offload_config.activation_offload_modules,
+                host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
+            )
+
         kwargs = {}
         cpu_load_param_name = None
         if hasattr(self.model, "get_parallel_plan"):
@@ -610,10 +632,19 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_training_context(self):
         """Build training context for distributed training."""
+        offload_config = _resolve_offload_config(self.args)
+
+        # Async activation offload uses per-module saved_tensors_hooks (applied
+        # before FSDP sharding), so the global fwd/bwd contexts are nullcontext.
+        if offload_config.enable_async_activation:
+            from contextlib import nullcontext
+
+            self.model_fwd_context, self.model_bwd_context = nullcontext(), nullcontext()
+            return
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
-            self.args.train.accelerator.offload_config.enable_activation,
+            offload_config.enable_activation,
             self.args.train.gradient_checkpointing.enable,
-            self.args.train.accelerator.offload_config.activation_gpu_limit,
+            offload_config.activation_gpu_limit,
         )
 
     def _init_callbacks(self):
@@ -808,6 +839,10 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_requires_all_reduce(True)
 
+    def _reset_async_activation_offload_if_enabled(self):
+        if _resolve_offload_config(self.args).enable_async_activation:
+            reset_async_activation_offload(self.model)
+
     def sync_before_train_step(self):
         if self.args.train.sync_each_train_step:
             synchronize()
@@ -821,6 +856,7 @@ class BaseTrainer(Stateful, ABC):
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
+        self._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch

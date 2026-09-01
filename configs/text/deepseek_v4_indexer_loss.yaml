@@ -101,9 +101,12 @@ train:
     # which is the paper-faithful routing (V4 §2.4 puts everything but embeddings, the head,
     # mHC biases and norms on Muon), and needs no configuration.
     #
-    # muon_head_split_modules is deliberately unset. The indexer names its up-projection
-    # q_b_proj, the same as the main attention's, so listing q_b_proj there would head-split
-    # the indexer's matrix too -- as a side effect of a flag aimed at attention.
+    # muon_head_split_modules is deliberately unset. Head-split Muon reaches the indexer,
+    # whose up-projection is named q_b_proj like the main attention's, and this objective is
+    # what gives that matrix a gradient for the split to act on. Which of the two is meant has
+    # to be spelled out -- a bare [q_b_proj] is rejected, and the qualified forms are
+    # self_attn.q_b_proj and indexer.q_b_proj -- so the sibling config's commented-out
+    # self_attn.q_b_proj stays the paper-faithful choice here too.
     type: muon
     lr: 3.0e-4
     lr_warmup_ratio: 0.007

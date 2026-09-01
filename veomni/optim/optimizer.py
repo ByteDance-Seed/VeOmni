@@ -587,8 +587,9 @@ def _build_muon_with_adamw(
         raise ValueError(
             f"muon_head_group_size={head_group_size} requires muon_head_split_modules: there is no "
             "default list, because which attention projections benefit from head splitting depends "
-            "on the architecture. List the leaf module names to split, e.g. ['q_b_proj'] for "
-            "DeepSeek V4/V3 MLA up-projections or ['q_proj', 'k_proj', 'v_proj'] for GQA attention."
+            "on the architecture. List the modules to split as leaf names or dotted path suffixes, "
+            "e.g. ['self_attn.q_b_proj'] for DeepSeek V4/V3 MLA up-projections or "
+            "['q_proj', 'k_proj', 'v_proj'] for GQA attention."
         )
     # The single owner of the Muon-vs-AdamW LR policy: an unset Muon LR either
     # inherits the AdamW LR (match_rms_adamw) or takes the Moonlight-style 25x.

@@ -55,6 +55,7 @@ hardware_support/AscendDockerUsage/overview.md
 hardware_support/AscendDockerUsage/supported_tags.md
 hardware_support/FAQ.md
 hardware_support/rocm/README.md
+hardware_support/mlu/README.md
 ```
 
 ```{toctree}
