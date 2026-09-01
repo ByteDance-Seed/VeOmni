@@ -5,10 +5,30 @@ import torch
 
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.helper import _compute_seqlens
 
 
-def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
-    return types.SimpleNamespace(sp_enabled=sp_enabled, sp_size=sp_size, sp_rank=sp_rank)
+def _fake_ps(
+    sp_enabled: bool,
+    sp_size: int = 1,
+    sp_rank: int = 0,
+    *,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+    ulysses_size: int | None = None,
+    ulysses_rank: int | None = None,
+    gdn_context_parallel_implementation: str = "disabled",
+):
+    return types.SimpleNamespace(
+        sp_enabled=sp_enabled,
+        sp_size=sp_size,
+        sp_rank=sp_rank,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        ulysses_size=sp_size if ulysses_size is None else ulysses_size,
+        ulysses_rank=sp_rank if ulysses_rank is None else ulysses_rank,
+        gdn_context_parallel_implementation=gdn_context_parallel_implementation,
+    )
 
 
 @pytest.fixture
@@ -73,6 +93,118 @@ def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+
+
+def test_text_collator_builds_hybrid_cp_u_partition_and_host_cu(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(
+        m,
+        "get_parallel_state",
+        lambda: _fake_ps(
+            sp_enabled=True,
+            sp_size=4,
+            sp_rank=2,
+            cp_size=2,
+            cp_rank=1,
+            ulysses_size=2,
+            ulysses_rank=0,
+            gdn_context_parallel_implementation="headwise_lossless",
+        ),
+    )
+    token_labels = [
+        {**features_two_samples[0], "labels": torch.tensor([2, 3, 4], dtype=torch.long)},
+        {**features_two_samples[1], "labels": torch.tensor([1, 2], dtype=torch.long)},
+    ]
+
+    out = m.MainCollator()(token_labels)
+
+    # Each sample is independently padded to 2*CP*U=8, then CP1 owns the
+    # middle zigzag pair and U0 owns the first half of that local shard.
+    assert torch.equal(out["input_ids"], torch.tensor([[13, 0, 0, 0]], dtype=torch.long))
+    assert torch.equal(out["position_ids"], torch.tensor([[2, 0, 0, 0]], dtype=torch.long))
+    assert out["cu_seqlens_list_q"] == [0, 2, 4]
+    assert out["linear_attn_cu_seqlens_list_q"] == [0, 3, 5]
+    assert torch.equal(out["cu_seq_lens_q"], torch.tensor([0, 2, 4], dtype=torch.int32))
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], torch.tensor([0, 3, 5], dtype=torch.int32))
+    assert out["attention_mask"].shape[-1] == 16
+    assert torch.equal(out["router_attention_mask"], torch.tensor([[1, 0, 0, 0]], dtype=torch.long))
+
+
+@pytest.mark.parametrize("cp_size, ulysses_size", [(2, 2), (4, 1), (8, 1)])
+def test_text_collator_cp_pad_to_length_preserves_logical_accounting(
+    monkeypatch, features_two_samples, cp_size, ulysses_size
+):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(
+        m,
+        "get_parallel_state",
+        lambda: _fake_ps(
+            sp_enabled=True,
+            sp_size=cp_size * ulysses_size,
+            cp_size=cp_size,
+            ulysses_size=ulysses_size,
+            gdn_context_parallel_implementation="headwise_lossless",
+        ),
+    )
+    token_labels = [
+        {**features_two_samples[0], "labels": torch.tensor([2, 3, 4], dtype=torch.long)},
+        {**features_two_samples[1], "labels": torch.tensor([1, 2], dtype=torch.long)},
+    ]
+
+    out = m.MainCollator(pad_to_length=16)(token_labels)
+
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], torch.tensor([0, 3, 5, 16], dtype=torch.int32))
+    assert _compute_seqlens(out) == [3, 2]
+
+
+def test_native_context_parallel_keeps_upstream_contiguous_sp_layout(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(
+        m,
+        "get_parallel_state",
+        lambda: _fake_ps(
+            sp_enabled=True,
+            sp_size=2,
+            sp_rank=1,
+            cp_size=2,
+            cp_rank=1,
+            ulysses_size=1,
+            gdn_context_parallel_implementation="disabled",
+        ),
+    )
+    token_labels = [
+        {**features_two_samples[0], "labels": torch.tensor([2, 3, 4], dtype=torch.long)},
+        {**features_two_samples[1], "labels": torch.tensor([1, 2], dtype=torch.long)},
+    ]
+
+    out = m.MainCollator()(token_labels)
+
+    assert torch.equal(out["input_ids"], torch.tensor([[21, 22, 0]], dtype=torch.long))
+    assert torch.equal(out["position_ids"], torch.tensor([[0, 1, 0]], dtype=torch.long))
+    assert "linear_attn_cu_seqlens_list_q" not in out
+    assert "router_attention_mask" not in out
+
+
+def test_post_collator_fails_closed_for_context_parallel_output(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, cp_size=2))
+
+    with pytest.raises(ValueError, match="does not support context-parallel output reordering"):
+        m.SeqlensComputePostCollator()({"cu_seq_lens_q": torch.tensor([0, 3], dtype=torch.int32)})
+
+
+def test_post_collator_accepts_logical_only_metadata_without_cp(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+
+    assert m.SeqlensComputePostCollator()(
+        {"linear_attn_cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=torch.int32)}
+    ) == [3, 2]
 
 
 def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_samples):

@@ -619,6 +619,8 @@ def parallelize_model_fsdp2(
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
+                if isinstance(sub_mod, FSDPModule):
+                    continue
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     layer_mod._fsdp_modules.append(sub_mod)

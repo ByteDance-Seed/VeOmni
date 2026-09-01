@@ -47,7 +47,10 @@ logger = logging.get_logger(__name__)
 # false — so the shards are never gathered, each rank attends only within its own
 # 1/cp_size of the sequence, and the run trains to a plausible loss curve while
 # being silently wrong.
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+NATIVE_CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
+HEADWISE_GDN_CONTEXT_PARALLEL_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}
+)
 
 
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
@@ -64,18 +67,21 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not is_parallel_state_initialized():
         return
 
-    if not get_parallel_state().cp_enabled:
+    parallel_state = get_parallel_state()
+    if not parallel_state.cp_enabled:
         return
 
     model_type = getattr(config, "model_type", None)
-    if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
+    implementation = getattr(parallel_state, "gdn_context_parallel_implementation", "disabled")
+    if implementation == "disabled" and model_type in NATIVE_CONTEXT_PARALLEL_MODEL_TYPES:
+        return
+    if implementation == "headwise_lossless" and model_type in HEADWISE_GDN_CONTEXT_PARALLEL_MODEL_TYPES:
         return
 
-    supported = ", ".join(sorted(CONTEXT_PARALLEL_MODEL_TYPES))
     raise NotImplementedError(
-        f"Context parallelism is not implemented for model type {model_type!r}; "
-        f"only {supported} supports it. Set cp_size=1 to disable it, or use "
-        "ulysses_size for sequence parallelism on this model."
+        f"Context parallelism implementation {implementation!r} is not implemented for model type {model_type!r}. "
+        "Use 'disabled' for a model with native CP support, 'headwise_lossless' for Qwen3.5 GDN on NPU, "
+        "or set cp_size=1 to disable context parallelism."
     )
 
 

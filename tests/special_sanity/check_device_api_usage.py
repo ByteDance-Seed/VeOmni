@@ -57,6 +57,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/test_model_forward_no_implicit_sync.py",
+    # This contract test passes an explicit CUDA device type to verify that
+    # Ascend-only GDN context parallelism rejects it before mesh setup.
+    "tests/parallel/context_parallel/test_config_contract.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff

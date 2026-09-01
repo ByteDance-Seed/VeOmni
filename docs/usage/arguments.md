@@ -141,8 +141,10 @@ Root config — assembles `model`, `data`, and `train`.
 `model.ops_implementation.*` — Attention, MoE, and fused kernel implementation.
 
 Each `*_implementation` field selects the kernel backend for that operation.
-The type is `str` (not `Literal`) so third-party backends can be registered
-without modifying the config class.
+Most extensible kernel selectors use `str` so third-party backends can be
+registered without changing the config class. Selectors with a deliberately
+closed public capability matrix use `Literal`; the table below is authoritative
+for each field's type.
 
 **Defaults are GPU-optimal** (Liger / Triton / fused_triton). On Ascend NPU,
 values that are still equal to the dataclass defaults automatically resolve as
@@ -190,6 +192,7 @@ NPU validation runs at two times:
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU), `npu` (requires `triton-ascend`). `eager` does not support the varlen path. |
 | chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (Hopper SM90), `npu` (requires `triton-ascend`). `eager` does not support varlen training. |
+| gdn_context_parallel_implementation | `Literal["disabled", "headwise_lossless"]` | `"disabled"` | Context-parallel algorithm selector for the current Ascend-NPU-only CP release. `disabled` disables only the GDN-specific algorithm; when `cp_size > 1`, it selects generic Ring/Hybrid CP for non-GDN causal models and does not disable CP itself. `headwise_lossless` evaluates GDN exactly after one packed sequence→head A2A over flattened CP×Ulysses and restores physical tokens with one inverse A2A. CPU execution is reserved for correctness oracles, and CUDA CP is not supported. Qwen3.5 must select the explicit headwise mode; it never silently falls back to generic Ring. |
 | dsa_indexer_implementation | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
 | mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
@@ -402,7 +405,7 @@ distinct from the first emission.
 | pp_size | `int` | `1` | Pipeline parallel size. |
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
-| cp_size | `int` | `1` | Ring-attention context parallel size. |
+| cp_size | `int` | `1` | Context-parallel size. Qwen3.5 dense/MoE text-only packed causal-LM training requires `gdn_context_parallel_implementation="headwise_lossless"`; this route targets Ascend NPU, uses VeOmni FlashAttention-2/3/4 dispatch, zero dropout, no sliding window, and a power-of-two CP size. The `disabled` selector means no GDN-specific CP and leaves model-native implementations such as DeepSeek-V4 on their own hardware, layout, and metadata contract. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
 

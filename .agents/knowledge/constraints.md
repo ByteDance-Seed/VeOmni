@@ -195,17 +195,29 @@ Core files:
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU compatibility.
 
+24. **Native Ascend GDN varlen recurrences require strictly active segment ordinals**
+   - Packed batches can contain repeated CU boundaries for empty samples, for example `[0, 0, 32, 64]`.
+   - Do not pass repeated CU points or full-N initial state directly into the native Triton/AscendC recurrence. The public wrapper must compact active segment ordinals and initial-state rows first, then restore full-N final state outside the custom autograd Function.
+   - `headwise_lossless` must preserve the original packed-sequence order and empty boundaries through its layout transform. Compact only at the backend metadata boundary; do not inject dummy tokens, renumber only one metadata representation, or delete packed-ragged coverage.
+
 ## Trainer Extensions
 
-24. **Trainer callback lifecycle changes must cover composed trainers**
+25. **Trainer callback lifecycle changes must cover composed trainers**
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
-25. **Module-level OpSlots are shared by every model instance**
+26. **Module-level OpSlots are shared by every model instance**
    - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
    - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
 
-26. **DCP full resume skips HF weight materialization**
+27. **FSDP vision dummy under CP must skip Ulysses and CP together**
+    - Text-only Qwen3.5 batches still call `VisionModel.dummy_forward()` so every FSDP rank touches the ViT.
+    - VisionAttention is non-causal. Inheriting the global CP group fail-closes in causal Ring CP.
+    - When `cp_enabled`, only `dummy_forward` may enter the private replicated-dummy scope and use a local 4×4 grid. Do not skip only Ring CP while keeping Ulysses: `sp_pad_and_slice` uses the unified U×CP size.
+    - The bypass is not a public boolean or vision `**kwargs` flag. Flex fail-closes inside the private scope.
+    - Ordinary Ulysses-only dummy behavior is unchanged. Real image/video non-causal CP remains fail-closed.
+
+28. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `should_skip_hf_weight_load=True` into `build_parallelize_model`, which forwards it to `parallelize_model_fsdp2` / `parallelize_model_ddp`.
     - The model is materialized without an HF weight read; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
     - Materialize through `_to_empty_preserving_nonpersistent_buffers()`, never bare `to_empty()`, on the random-init path as much as the resume path. `init_empty_weights()` patches `register_parameter` only, so a meta-built model holds *real* buffer values and `to_empty()` swaps every one for uninitialized memory. What restores them is narrower than it looks: DCP saves `state_dict()`, which omits `persistent=False`, and HF's `_init_weights` recomputes a rope table only for a module exposing `original_inv_freq` — which leaves Gemma3's per-layer-type `{type}_inv_freq`, its `embed_scale` and the Omni audio tower's sinusoidal `positional_embedding` with nothing behind them. A buffer built from a parameter is itself on meta, has no data to copy out of, and is skipped with a warning; no model registers one today. Note `veomni/models/module_utils.py` has the same unguarded pattern on the HF-load path.
@@ -214,5 +226,5 @@ Core files:
 
 ## Environment Reproducibility
 
-27. **Exact uv synchronization removes separately installed overlays**
+29. **Exact uv synchronization removes separately installed overlays**
     - The MagiAttention SM90 CUTLASS overlay is installed by `scripts/kernel/install_magi_sm90.sh` after the locked GPU environment. Reinstall it after a later exact `uv sync` before running MagiAttention on SM90.

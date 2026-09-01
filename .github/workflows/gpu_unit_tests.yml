@@ -111,7 +111,7 @@ jobs:
         run: |
           BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}"
           CHANGED=$(git diff --name-only "$BASE_SHA" HEAD -- || true)
-          if echo "$CHANGED" | grep -qE '(veomni/distributed/sequence_parallel/|veomni/models/transformers/qwen3_5/)'; then
+          if echo "$CHANGED" | grep -qE '(veomni/distributed/sequence_parallel/|veomni/distributed/context_parallel/|veomni/models/transformers/qwen3_5/)'; then
             echo "qwen3_5_ulysses=true" >> "$GITHUB_OUTPUT"
           else
             echo "qwen3_5_ulysses=false" >> "$GITHUB_OUTPUT"

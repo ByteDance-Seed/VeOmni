@@ -26,6 +26,7 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
+| GDN context parallel | `gdn_context_parallel_implementation` | `disabled`, `headwise_lossless` | `"disabled"` | Config validation + Qwen3.5 OpSlot binding. The current CP release is Ascend-NPU-only; CPU is for correctness oracles and CUDA CP is unsupported. `disabled` selects generic Ring/Hybrid for non-GDN models when `cp_size > 1`; it does not disable CP. `headwise_lossless` packs one sequence↔head A2A pair per GDN layer over flattened CP×Ulysses. |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
 
@@ -39,9 +40,11 @@ model-specific and are not auto-resolved: set them to `npu` explicitly because
 the causal-convolution and gated-delta-rule `eager` fallbacks do not support
 dynamic-batch `cu_seqlens`.
 
-The per-op fields are typed as plain `str` (not `Literal`), so third-party
-backends can be registered via `extra_backends` in a model's `device_patch.py`
-without modifying `OpsImplementationConfig`.
+The selector types intentionally use a mixed contract. Closed selectors such as
+attention, GDN context parallelism, DSA, and mHC use `Literal` allow-lists.
+Registry-extensible selectors remain plain `str`, so a model's
+`device_patch.py` can register third-party implementations through
+`extra_backends` without modifying `OpsImplementationConfig`.
 
 ---
 
@@ -299,6 +302,7 @@ model:
     rms_norm_gated_implementation: npu
     causal_conv1d_implementation: npu
     chunk_gated_delta_rule_implementation: npu
+    gdn_context_parallel_implementation: headwise_lossless
 ```
 
 | Field | GPU values | NPU value | Eager limitation |
@@ -314,6 +318,26 @@ kernel) and `npu_ascendc` (an AscendC fused `torch.ops.npu.*` path), the latter
 requiring a manual `fla_npu` install. Registrations live in
 `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
 values are documented by `OpsImplementationConfig`.
+
+### Lossless headwise GDN context parallelism
+
+`headwise_lossless` leaves full-attention Ring/Hybrid CP unchanged and
+temporarily converts each GDN layer from physical sequence shards to canonical
+sequence plus flattened-SP head shards. q/k/v/b/a share one packed
+`all_to_all_single`; the output uses one inverse exchange. This is an exact
+head-parallel evaluation of GDN, not a recurrent-state approximation.
+
+Selecting `headwise_lossless` requires `cp_size > 1`, packed
+dynamic batches, causal text self-attention, zero attention dropout, and the
+required accelerator kernels. The backwards-compatible `disabled` selector
+disables only the GDN-specific algorithm; model-native CP implementations such
+as DeepSeek-V4 retain their own layout and metadata contract. It does not
+silently enable Ring for Qwen3.5 GDN, which must select an explicit lossless
+mode. Qwen3.5 headwise and generic Ring/Hybrid building blocks target Ascend
+NPU; CPU execution is reserved for correctness oracles and their CUDA path is
+unsupported. This hardware restriction does not apply to a model-native CP
+implementation. Eager/SDPA, non-Qwen3.5 models using a GDN selector, and
+multimodal or cross-attention GDN CP are intentionally unsupported here.
 
 ---
 

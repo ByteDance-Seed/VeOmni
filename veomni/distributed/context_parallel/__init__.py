@@ -12,17 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Context parallelism for DeepSeek-V4 sparse attention."""
+"""Context-parallel primitives for dense causal attention, GDN, and DSA."""
 
 from .dsa_cp import all_gather_compressed_rows, all_gather_kv, exchange_compressor_halos
+from .gdn_headwise import (
+    GdnHeadwiseLayout,
+    compile_gdn_headwise_layout,
+    prepare_gdn_headwise_inputs,
+    restore_gdn_headwise_output,
+)
+from .packed_sharding import (
+    PackedContextParallelPartition,
+    apply_packed_context_parallel_partition,
+    build_packed_context_parallel_partition,
+    pad_packed_samples,
+    padded_sample_lengths,
+    reorder_sample_major_to_ulysses_rank_major,
+    reorder_ulysses_rank_major_to_sample_major,
+    ulysses_local_cu_from_global,
+    ulysses_local_cu_to_cp_local_cu,
+    ulysses_local_head_count,
+)
+from .ring_attention import (
+    AttentionWithCp,
+    dense_causal_attention,
+    ringattn_context_parallel,
+    simulate_packed_ring_causal_attention,
+    simulate_ring_causal_attention,
+)
 from .sharding import local_window_range, rebase_window_indices, window_owner_counts
 
 
 __all__ = [
+    "GdnHeadwiseLayout",
+    "PackedContextParallelPartition",
+    "AttentionWithCp",
     "all_gather_compressed_rows",
     "all_gather_kv",
+    "apply_packed_context_parallel_partition",
+    "build_packed_context_parallel_partition",
+    "compile_gdn_headwise_layout",
+    "dense_causal_attention",
     "exchange_compressor_halos",
     "local_window_range",
+    "pad_packed_samples",
+    "padded_sample_lengths",
+    "prepare_gdn_headwise_inputs",
+    "reorder_sample_major_to_ulysses_rank_major",
+    "reorder_ulysses_rank_major_to_sample_major",
     "rebase_window_indices",
+    "ringattn_context_parallel",
+    "restore_gdn_headwise_output",
+    "simulate_packed_ring_causal_attention",
+    "simulate_ring_causal_attention",
+    "ulysses_local_cu_from_global",
+    "ulysses_local_cu_to_cp_local_cu",
+    "ulysses_local_head_count",
     "window_owner_counts",
 ]

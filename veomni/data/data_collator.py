@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -28,8 +31,8 @@ from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import (
     coalesce_tail_padding_cu_seqlens,
+    logical_seqlens_from_cu_seqlens,
     prepare_fa_kwargs_from_position_ids,
-    valid_seqlens_from_cu_seqlens,
 )
 
 
@@ -45,6 +48,23 @@ MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 logger = logging.get_logger(__name__)
 
 _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
+_PARITY_TRACE_KEYS = ("input_ids", "labels", "position_ids", "attention_mask", "ds_idx", "source_id")
+
+
+def _data_parity_trace_limit() -> int:
+    raw = os.environ.get("VEOMNI_DATA_PARITY_TRACE_MICROBATCHES", "0")
+    if not raw.isdecimal():
+        raise ValueError("VEOMNI_DATA_PARITY_TRACE_MICROBATCHES must be a non-negative base-10 integer")
+    return int(raw)
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    host = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(host.dtype).encode())
+    digest.update(json.dumps(list(host.shape), separators=(",", ":")).encode())
+    digest.update(host.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def add_flash_attention_kwargs_from_position_ids(
@@ -324,8 +344,41 @@ class SequenceParallelCollator(DataCollator):
     metadata_collate_func: Optional[MetadataCollateFunc] = None
 
     def __post_init__(self):
-        self.sp_size = get_parallel_state().sp_size
-        self.sp_rank = get_parallel_state().sp_rank
+        parallel_state = get_parallel_state()
+        self.sp_size = parallel_state.sp_size
+        self.sp_rank = parallel_state.sp_rank
+        self.cp_size = int(getattr(parallel_state, "cp_size", 1))
+        self.cp_rank = int(getattr(parallel_state, "cp_rank", 0)) if self.cp_size > 1 else 0
+        self.ulysses_size = int(getattr(parallel_state, "ulysses_size", self.sp_size))
+        self.ulysses_rank = int(getattr(parallel_state, "ulysses_rank", self.sp_rank)) if self.ulysses_size > 1 else 0
+        self.gdn_context_parallel_implementation = getattr(
+            parallel_state, "gdn_context_parallel_implementation", "disabled"
+        )
+        self.headwise_cp_enabled = (
+            self.cp_size > 1 and self.gdn_context_parallel_implementation == "headwise_lossless"
+        )
+        self.dp_rank = int(getattr(parallel_state, "dp_rank", 0))
+        self._data_parity_trace_limit = _data_parity_trace_limit()
+        self._data_parity_trace_index = 0
+        if self.headwise_cp_enabled and self.metadata_collate_func is not None:
+            raise NotImplementedError("Headwise GDN context parallelism currently supports text-only packed batches.")
+
+    def _trace_unsharded_batch(self, batch: Dict[str, Any]) -> None:
+        if self.sp_rank != 0 or self._data_parity_trace_index >= self._data_parity_trace_limit:
+            return
+        tensors = {key: value for key in _PARITY_TRACE_KEYS if isinstance((value := batch.get(key)), torch.Tensor)}
+        labels = tensors.get("labels")
+        payload = {
+            "dp_rank": self.dp_rank,
+            "microbatch_index": self._data_parity_trace_index,
+            "tensor_sha256": {key: _tensor_sha256(value) for key, value in tensors.items()},
+            "tensor_shapes": {key: list(value.shape) for key, value in tensors.items()},
+            "valid_label_tokens": int((labels != IGNORE_INDEX).sum()) if labels is not None else None,
+        }
+        combined = hashlib.sha256(json.dumps(payload["tensor_sha256"], sort_keys=True).encode()).hexdigest()
+        payload["combined_sha256"] = combined
+        print("VEOMNI_DATA_PARITY_TRACE", json.dumps(payload, sort_keys=True), flush=True)
+        self._data_parity_trace_index += 1
 
     def sp_slice(self, key: str, feature: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if isinstance(feature, list):
@@ -375,6 +428,10 @@ class SequenceParallelCollator(DataCollator):
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
             batch["labels"] = labels
 
+        # Trace before any SP/CP padding or slicing.  It is opt-in, emits only
+        # hashes/counts, and therefore proves data parity without logging text.
+        self._trace_unsharded_batch(batch)
+
         linear_attn_tail_padding_length = int(batch.pop(_LINEAR_ATTN_TAIL_PADDING_LENGTH, 0))
 
         # Track sp_pad sizes for pixel_values{,_videos} so the ViT metadata
@@ -391,7 +448,7 @@ class SequenceParallelCollator(DataCollator):
             sp_slice = collate_info.sp_slice
             sp_pad_value = collate_info.sp_pad_value
             sp_pad_scale = collate_info.sp_pad_scale
-            if sp_pad_value is not None:
+            if not self.headwise_cp_enabled and sp_pad_value is not None:
                 # sp padding
                 pre_pad_len = len(batch[key]) if isinstance(batch[key], list) else batch[key].size(pack_dim)
                 batch[key] = self.sp_padding(
@@ -407,15 +464,102 @@ class SequenceParallelCollator(DataCollator):
                 if key == "position_ids":
                     linear_attn_tail_padding_length += post_pad_len - pre_pad_len
 
-            if sp_slice and key != "position_ids":  # position_ids should be sp sliced after precompute fa kwargs
+            if not self.headwise_cp_enabled and sp_slice and key != "position_ids":
                 # sp slice
                 batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
         add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
 
-        batch["position_ids"] = self.sp_slice(
-            "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
-        )
+        if self.headwise_cp_enabled:
+            from ..distributed.context_parallel.packed_sharding import (
+                apply_packed_context_parallel_partition,
+                build_packed_context_parallel_partition,
+                pad_packed_samples,
+            )
+
+            source_cu = batch["cu_seq_lens_q"]
+            router_attention_mask = batch.get("attention_mask")
+            if not isinstance(router_attention_mask, torch.Tensor):
+                raise RuntimeError("context-parallel MoE routing requires a packed attention_mask tensor")
+            padded_cu = None
+            sequence_keys = ("input_ids", "labels", "attention_mask", "position_ids")
+            for key in sequence_keys:
+                value = batch.get(key)
+                collate_info = self.collate_infos.get(key)
+                if not isinstance(value, torch.Tensor) or collate_info is None:
+                    continue
+                pad_value = 0 if collate_info.sp_pad_value is None else collate_info.sp_pad_value
+                value, current_cu = pad_packed_samples(
+                    value,
+                    source_cu,
+                    multiple=2 * self.cp_size * self.ulysses_size,
+                    dim=collate_info.pack_dim,
+                    pad_value=pad_value,
+                )
+                if padded_cu is not None and not torch.equal(padded_cu, current_cu):
+                    raise RuntimeError("context-parallel sample padding produced inconsistent CU metadata")
+                batch[key] = value
+                padded_cu = current_cu
+            if padded_cu is None:
+                raise RuntimeError("context-parallel packing found no token-aligned tensors")
+
+            # Full attention intentionally keeps a global all-ones mask, but
+            # router logits are rank-local after CP×Ulysses sharding. Build a
+            # separate local mask whose per-sample CP padding is zero so MoE
+            # load balancing neither sees a global shape nor counts padding.
+            router_attention_mask, router_padded_cu = pad_packed_samples(
+                router_attention_mask,
+                source_cu,
+                multiple=2 * self.cp_size * self.ulysses_size,
+                dim=self.collate_infos["attention_mask"].pack_dim,
+                pad_value=0,
+            )
+            if not torch.equal(padded_cu, router_padded_cu):
+                raise RuntimeError("context-parallel router padding produced inconsistent CU metadata")
+
+            partition = build_packed_context_parallel_partition(
+                padded_cu,
+                cp_size=self.cp_size,
+                cp_rank=self.cp_rank,
+                ulysses_size=self.ulysses_size,
+                ulysses_rank=self.ulysses_rank,
+            )
+            for key in ("input_ids", "labels", "position_ids"):
+                value = batch.get(key)
+                collate_info = self.collate_infos.get(key)
+                if isinstance(value, torch.Tensor) and collate_info is not None:
+                    batch[key] = apply_packed_context_parallel_partition(
+                        value,
+                        partition,
+                        dim=collate_info.pack_dim,
+                    )
+            batch["router_attention_mask"] = apply_packed_context_parallel_partition(
+                router_attention_mask,
+                partition,
+                dim=self.collate_infos["attention_mask"].pack_dim,
+            )
+
+            # Standard attention consumes rank-local *physical* metadata.  GDN
+            # receives the original valid sample boundaries: its ownership
+            # planner derives the physical ring padding itself and therefore
+            # must not mistake CP padding for real recurrent-state updates.
+            batch["cu_seq_lens_q"] = partition.local_cu_seqlens
+            batch["cu_seq_lens_k"] = partition.local_cu_seqlens.clone()
+            batch["max_length_q"] = partition.local_max_seqlen
+            batch["max_length_k"] = partition.local_max_seqlen
+            batch["linear_attn_cu_seq_lens_q"] = source_cu
+            # Preserve both host-side CU views while the collator still owns
+            # CPU tensors. Full attention consumes the rank-local physical CU,
+            # whereas GDN plans from the original valid sample boundaries.
+            # Keeping the views distinct avoids a device-to-host sync in every
+            # attention/GDN layer and prevents using physical CP padding as
+            # recurrent-state input.
+            batch["cu_seqlens_list_q"] = [int(point) for point in partition.local_cu_seqlens.tolist()]
+            batch["linear_attn_cu_seqlens_list_q"] = [int(point) for point in source_cu.tolist()]
+        else:
+            batch["position_ids"] = self.sp_slice(
+                "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
+            )
 
         # Hand the SP-padded batch + per-modality sp-pad patch counts to the
         # model-provided hook, which derives ``multimodal_metadata`` (cu_seqlens,
@@ -538,9 +682,15 @@ class PostCollator(DataCollator):
 @dataclass
 class SeqlensComputePostCollator(DataCollator):
     def __call__(self, micro_batch: Dict[str, torch.Tensor]):
+        if getattr(get_parallel_state(), "cp_size", 1) > 1:
+            raise ValueError(
+                "PostCollator does not support context-parallel output reordering yet; "
+                "use a non-CP RL/DPO topology or a CP-aware post-collator."
+            )
         tail_padding_length = micro_batch.get("tail_padding_length")
-        seq_lens = valid_seqlens_from_cu_seqlens(
-            micro_batch["cu_seq_lens_q"],
+        seq_lens = logical_seqlens_from_cu_seqlens(
+            micro_batch.get("cu_seq_lens_q"),
+            logical_cu_seqlens=micro_batch.get("linear_attn_cu_seq_lens_q"),
             tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
         ).tolist()
         return seq_lens

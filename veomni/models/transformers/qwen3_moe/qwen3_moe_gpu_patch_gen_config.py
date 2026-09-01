@@ -305,6 +305,11 @@ def qwen3_moe_forcausallm_forward_patched(
     output_router_logits = (
         output_router_logits if output_router_logits is not None else self.config.output_router_logits
     )
+    # CP keeps the full attention mask for Ring/Hybrid attention, while MoE
+    # router logits are rank-local. Consume the collator-provided local mask
+    # here so it is used only for the auxiliary loss and is not forwarded into
+    # decoder layers. Non-CP callers retain the original attention mask.
+    router_attention_mask = kwargs.pop("router_attention_mask", attention_mask)
 
     outputs: MoeModelOutputWithPast = self.model(
         input_ids=input_ids,
@@ -364,14 +369,14 @@ def qwen3_moe_forcausallm_forward_patched(
                 outputs.router_logits,
                 self.num_experts,
                 self.num_experts_per_tok,
-                attention_mask,
+                router_attention_mask,
             )
         else:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
                 self.num_experts,
                 self.num_experts_per_tok,
-                attention_mask,
+                router_attention_mask,
             )
         if labels is not None:
             loss += self.router_aux_loss_coef * aux_loss.to(loss.device)

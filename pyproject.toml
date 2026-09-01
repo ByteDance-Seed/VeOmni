@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project.urls]
@@ -12,7 +12,8 @@ dynamic = ["version"]
 description = "VeOmni: Scaling any Modality Model Training to any Accelerators with PyTorch native Training Framework"
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
   { name="ByteDance-Seed", email="doubao-llm@bytedance.com" },
 ]

@@ -389,6 +389,9 @@ class BaseTrainer(Stateful, ABC):
             tp_size=self.args.train.accelerator.tp_size,
             pp_size=self.args.train.accelerator.pp_size,
             cp_size=self.args.train.accelerator.cp_size,
+            gdn_context_parallel_implementation=(
+                self.args.model.ops_implementation.gdn_context_parallel_implementation
+            ),
             ulysses_size=self.args.train.accelerator.ulysses_size,
             extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
             extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
