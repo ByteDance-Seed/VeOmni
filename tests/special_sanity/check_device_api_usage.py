@@ -47,6 +47,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # contexts and cuda.bindings.runtime for the per-device stack limit, which
     # has no device-agnostic equivalent.
     "veomni/ops/kernels/attention/magi/_fa4_cuda.py",
+    "veomni/kernels/_kernels/attention/standard/magi/",
     # The consolidated Magi contract suite directly mocks the CUDA-only FA4
     # backend and its runtime bindings.
     "tests/ops/test_magi_attention_contract.py",

@@ -17,7 +17,8 @@
 ``compound`` holds nested-handle helpers. Importing this package registers
 families under ``_kernels``: ``rms_norm``, ``rope``, ``rope_vision``,
 ``async_ulysses_*``, ``swiglu_mlp``, ``moe_experts``, ``loss`` (LB + CE),
-and ``gated_delta_rule`` (gated RMSNorm / conv1d / chunk rule).
+``gated_delta_rule``, and ``attention``. Importing ``attention`` registers
+``veomni_*`` names on ``ALL_ATTENTION_FUNCTIONS``.
 """
 
 from . import _kernels as _kernel_families  # noqa: F401

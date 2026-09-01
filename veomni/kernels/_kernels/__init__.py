@@ -19,6 +19,7 @@ Callers resolve rows through ``veomni.kernels``, not this package.
 """
 
 from . import async_ulysses as _async_ulysses  # noqa: F401
+from . import attention as _attention  # noqa: F401
 from . import gated_delta_rule as _gated_delta_rule  # noqa: F401
 from . import loss as _loss  # noqa: F401
 from . import mhc as _mhc  # noqa: F401

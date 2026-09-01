@@ -69,24 +69,24 @@ class Attention(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
         else:
             q, k, v = VeomniKernel("async_ulysses_qkv", "standard")(
-                hidden_states=x,
+                x,
+                self.q_proj.weight,
+                self.q_proj.bias,
+                self.k_proj.weight,
+                self.k_proj.bias,
+                self.v_proj.weight,
+                self.v_proj.bias,
+                self.q_norm.weight,
+                self.q_norm.bias,
+                self.k_norm.weight,
+                self.k_norm.bias,
                 seq_dimension=1,
                 head_dimension=2,
-                q_weight=self.q_proj.weight,
-                q_bias=self.q_proj.bias,
-                k_weight=self.k_proj.weight,
-                k_bias=self.k_proj.bias,
-                v_weight=self.v_proj.weight,
-                v_bias=self.v_proj.bias,
-                norm_type="layernorm",
-                norm_q_weight=self.q_norm.weight,
-                norm_q_bias=self.q_norm.bias,
-                norm_k_weight=self.k_norm.weight,
-                norm_k_bias=self.k_norm.bias,
-                normalized_shape=self.head_dim,
-                eps=self.q_norm.eps,
                 unpadded_dim_size=unpadded_seq_len,
                 head_dim=self.head_dim,
+                norm_type="layernorm",
+                normalized_shape=self.head_dim,
+                eps=self.q_norm.eps,
             )
 
         if self.rope:
@@ -108,11 +108,11 @@ class Attention(nn.Module):
             x = self.proj_o(x)
         else:
             x = VeomniKernel("async_ulysses_o", "standard")(
-                hidden_states=x,
+                x,
+                self.proj_o.weight,
+                self.proj_o.bias,
                 seq_dimension=1,
                 head_dimension=2,
-                proj_weight=self.proj_o.weight,
-                proj_bias=self.proj_o.bias,
                 unpadded_dim_size=unpadded_seq_len,
             )
         x = self.proj_drop(x)

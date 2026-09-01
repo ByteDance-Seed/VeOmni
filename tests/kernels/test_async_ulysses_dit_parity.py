@@ -121,22 +121,24 @@ class AttentionDiT(nn.Module):
             v = gather_seq_scatter_heads(v, seq_dim=1, head_dim=2, unpadded_dim_size=unpadded_seq_len)
         else:
             q, k, v = VeomniKernel("async_ulysses_qkv", "dit")(
-                hidden_states=x,
+                x,
+                self.q_proj.weight,
+                self.q_proj.bias,
+                self.k_proj.weight,
+                self.k_proj.bias,
+                self.v_proj.weight,
+                self.v_proj.bias,
+                self.q_norm.weight,
+                None,
+                self.k_norm.weight,
+                None,
                 seq_dimension=1,
                 head_dimension=2,
-                q_weight=self.q_proj.weight,
-                q_bias=self.q_proj.bias,
-                k_weight=self.k_proj.weight,
-                k_bias=self.k_proj.bias,
-                v_weight=self.v_proj.weight,
-                v_bias=self.v_proj.bias,
-                norm_type="rmsnorm",
-                norm_q_weight=self.q_norm.weight,
-                norm_k_weight=self.k_norm.weight,
-                normalized_shape=self.dim,
-                eps=self.eps,
                 unpadded_dim_size=unpadded_seq_len,
                 head_dim=self.head_dim,
+                norm_type="rmsnorm",
+                normalized_shape=self.dim,
+                eps=self.eps,
             )
 
         q = rearrange(q, "B N (h d) -> B h N d", d=self.head_dim).contiguous()
@@ -155,11 +157,11 @@ class AttentionDiT(nn.Module):
             x = self.proj_o(x)
         else:
             x = VeomniKernel("async_ulysses_o", "dit")(
-                hidden_states=x,
+                x,
+                self.proj_o.weight,
+                self.proj_o.bias,
                 seq_dimension=1,
                 head_dimension=2,
-                proj_weight=self.proj_o.weight,
-                proj_bias=self.proj_o.bias,
                 unpadded_dim_size=unpadded_seq_len,
             )
         x = self.proj_drop(x)

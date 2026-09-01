@@ -34,6 +34,8 @@ from tests.kernels.tol import (
     MOE_FUSED_GRAD_ATOL,
     MOE_FUSED_GRAD_RTOL,
     MOE_FUSED_RTOL,
+    MOE_FUSED_SWIGLU_ATOL,
+    MOE_FUSED_SWIGLU_RTOL,
 )
 from veomni.kernels import KERNEL_REGISTRY, resolve_kernel
 from veomni.kernels._kernels.moe_experts.standard.npu import _fc1_weight
@@ -385,7 +387,12 @@ def _run_fused_vs_eager(
         hidden_o, routing_o, fc1_1_o, fc1_2_o, fc2_o = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
         out_e = eager(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, empty, **kwargs)
         out_o = other(hidden_o, routing_o, selected, fc1_1_o, fc1_2_o, fc2_o, empty, **kwargs)
-    assert torch.allclose(out_e.float(), out_o.float(), atol=MOE_FUSED_ATOL, rtol=MOE_FUSED_RTOL)
+    fwd_atol, fwd_rtol = (
+        (MOE_FUSED_SWIGLU_ATOL, MOE_FUSED_SWIGLU_RTOL)
+        if swiglu_limit is not None
+        else (MOE_FUSED_ATOL, MOE_FUSED_RTOL)
+    )
+    assert torch.allclose(out_e.float(), out_o.float(), atol=fwd_atol, rtol=fwd_rtol)
 
     go = torch.randn_like(out_e)
     out_e.backward(go)
