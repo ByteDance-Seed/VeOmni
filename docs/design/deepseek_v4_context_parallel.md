@@ -78,8 +78,8 @@ predecessor lands two or more ranks away and no halo carries it.
 
 The practical risk is a short sequence with a wide rate. Production carries its
 rates in the checkpoint's HF config, which is not vendored here, and a 512-wide
-rate caps `cp_size` at `S/512` — no constraint at all at `S=131072`, a ceiling of
-8 ranks at `S=4096`. There is no launch-time check, so an operator who exceeds it
+rate caps `cp_size` at `S/512` — at most 256 ranks at `S=131072` and at most 8
+ranks at `S=4096`. There is no launch-time check, so an operator who exceeds it
 learns so on step 1 of the job rather than at submission.
 
 That is a deliberate decision rather than an omission, and worth knowing before
