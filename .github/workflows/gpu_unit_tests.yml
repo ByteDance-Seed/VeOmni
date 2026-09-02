@@ -132,6 +132,7 @@ jobs:
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
+          uv run --frozen pytest -s -x tests/parallel/ulysses/test_wan_ulysses_padding.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_sorting_algo.py
           uv run --frozen pytest -s -x tests/parallel/test_ddp_sp_grad_sync.py
@@ -173,6 +174,7 @@ jobs:
           uv run --frozen pytest -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run distributed tests
         run: |
+          uv run --frozen pytest -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -s -x tests/distributed/test_dummy_forward.py
           uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
       - name: Run data tests

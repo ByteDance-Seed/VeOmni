@@ -135,6 +135,21 @@ config.add_import(
     "veomni.distributed.sequence_parallel",
     names=["gather_heads_scatter_seq", "gather_outputs", "gather_seq_scatter_heads"],
 )
+# The GPU attention/indexer forwards reused below include context-parallel
+# branches. CP is rejected at model build on NPU (see
+# ``check_context_parallel_supported``), so those branches are dead here; the
+# imports exist only so patchgen can emit a module that type-checks.
+config.add_import(
+    "veomni.distributed.context_parallel",
+    names=[
+        "all_gather_compressed_rows",
+        "all_gather_kv",
+        "empty_compressed_rows",
+        "exchange_compressor_halos",
+        "local_window_token_indices",
+        "plan_compressor_shard",
+    ],
+)
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
     names=[
@@ -147,6 +162,8 @@ config.add_import(
         "mask_sparse_attention_indices",
         "packed_compressed_block_bias",
         "packed_compressed_causal_ranges",
+        "scatter_topk_block_bias",
+        "shard_packed_compression_metadata",
     ],
 )
 
