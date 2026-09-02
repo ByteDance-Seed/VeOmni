@@ -54,9 +54,10 @@ def wrapper(
     kv_len = key.shape[1]
     valid = (topk_indices >= 0) & (topk_indices < kv_len)
     safe = topk_indices.clamp(0, max(kv_len - 1, 0)).long()
-    # Copied from GlmMoeDsaAttention.forward: -inf everywhere except top-k.
-    keep = torch.zeros(batch, q_len, kv_len, dtype=torch.bool, device=query.device)
-    keep.scatter_(-1, safe, valid)
+    # scatter_add so -1 sentinels (clamped to 0) cannot overwrite a real keep.
+    keep = torch.zeros(batch, q_len, kv_len, dtype=torch.int32, device=query.device)
+    keep.scatter_add_(-1, safe, valid.to(keep.dtype))
+    keep = keep > 0
     index_mask = torch.where(
         keep.unsqueeze(1),
         torch.zeros((), device=query.device, dtype=query.dtype),

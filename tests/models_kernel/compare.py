@@ -38,6 +38,7 @@ def eager_kernels_config() -> SimpleNamespace:
         chunk_gated_delta_rule_implementation="eager",
         dsa_indexer_implementation="eager",
         dsa_attention_implementation="eager",
+        mhc_implementation="eager",
     )
 
 

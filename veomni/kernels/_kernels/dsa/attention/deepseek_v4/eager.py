@@ -34,8 +34,10 @@ def _topk_to_additive_mask(topk_idxs: Tensor, kv_len: int, dtype: torch.dtype) -
     batch, q_len, _ = topk_idxs.shape
     valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
     safe = topk_idxs.clamp(0, max(kv_len - 1, 0)).long()
-    keep = torch.zeros(batch, q_len, kv_len, dtype=torch.bool, device=topk_idxs.device)
-    keep.scatter_(-1, safe, valid)
+    # scatter_add so -1 sentinels (clamped to 0) cannot overwrite a real keep.
+    keep = torch.zeros(batch, q_len, kv_len, dtype=torch.int32, device=topk_idxs.device)
+    keep.scatter_add_(-1, safe, valid.to(keep.dtype))
+    keep = keep > 0
     min_value = torch.finfo(dtype).min
     return torch.where(keep.unsqueeze(1), torch.zeros((), device=topk_idxs.device, dtype=dtype), min_value)
 

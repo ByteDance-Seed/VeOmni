@@ -62,15 +62,20 @@ class _HFAttentionModule(nn.Module):
         self.num_key_value_groups = num_key_value_groups
 
 
-def _hf_topk_mask(topk_idxs: Tensor, kv_len: int, dtype: torch.dtype) -> Tensor:
-    """HF additive mask used with ``eager_attention_forward``."""
+def _official_topk_additive_mask(topk_idxs: Tensor, kv_len: int, dtype: torch.dtype) -> Tensor:
+    """Official HF additive mask: 0 at selected keys, ``finfo.min`` elsewhere.
+
+    ``-1`` is not a selected key. Write selected positions directly so a
+    sentinel cannot overwrite key 0 the way ``scatter_(safe, valid)`` does.
+    """
     batch, q_len, _ = topk_idxs.shape
-    valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
-    safe = topk_idxs.clamp(0, max(kv_len - 1, 0)).long()
-    keep = torch.zeros(batch, q_len, kv_len, dtype=torch.bool, device=topk_idxs.device)
-    keep.scatter_(-1, safe, valid)
     min_value = torch.finfo(dtype).min
-    return torch.where(keep.unsqueeze(1), torch.zeros((), device=topk_idxs.device, dtype=dtype), min_value)
+    mask = torch.full((batch, 1, q_len, kv_len), min_value, dtype=dtype, device=topk_idxs.device)
+    valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
+    if valid.any():
+        batch_i, query_i, slot_i = valid.nonzero(as_tuple=True)
+        mask[batch_i, 0, query_i, topk_idxs[batch_i, query_i, slot_i].long()] = 0
+    return mask
 
 
 def _hf_dsv4_indexer_scores(
@@ -140,13 +145,14 @@ def test_dsa_attention_deepseek_v4_eager_matches_hf():
     kv = torch.randn(batch, kv_len, dim)
     sink = torch.randn(heads)
     indices = torch.randint(kv_len, (batch, seq_len, topk), dtype=torch.int32)
+    indices[..., 0] = 0
     indices[..., -1] = -1
     scale = dim**-0.5
 
     q_h, kv_h, sink_h = _clone(q, kv, sink)
     query = q_h.transpose(1, 2).contiguous()
     key = kv_h.unsqueeze(1).contiguous()
-    mask = _hf_topk_mask(indices, kv_len, query.dtype)
+    mask = _official_topk_additive_mask(indices, kv_len, query.dtype)
     hf_out, _ = eager_attention_forward(
         _HFAttentionModule(sink_h, heads),
         query,
@@ -167,6 +173,66 @@ def test_dsa_attention_deepseek_v4_eager_matches_hf():
     assert torch.allclose(q_e.grad, q_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(kv_e.grad, kv_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(sink_e.grad, sink_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_dsa_attention_deepseek_v4_eager_matches_official_hf_sliding_mask():
+    """Modeling mask→topk must match official HF additive sliding-window attention.
+
+    Query 0 only keeps key 0. The conversion fills the rest with ``-1``, which
+    is the overwrite case the eager mask helper has to survive.
+    """
+    from transformers.masking_utils import create_sliding_window_causal_mask
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    torch.manual_seed(5)
+    batch, seq_len, heads, dim = 2, 8, 2, 16
+    config = DeepseekV4Config(
+        vocab_size=32,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=heads,
+        num_key_value_heads=1,
+        head_dim=dim,
+        attn_implementation="eager",
+    )
+    embeds = torch.randn(batch, seq_len, config.hidden_size)
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    mask = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=embeds,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    q = torch.randn(batch, heads, seq_len, dim)
+    kv = torch.randn(batch, 1, seq_len, dim)
+    sinks = torch.randn(heads)
+    scale = dim**-0.5
+    hf_out, _ = eager_attention_forward(
+        _HFAttentionModule(sinks, heads),
+        q,
+        kv,
+        kv,
+        mask,
+        scale,
+        dropout=0.0,
+    )
+
+    allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
+    _, topk_indices = allowed.to(torch.int8).topk(seq_len, dim=-1, sorted=False)
+    selected_valid = allowed.gather(-1, topk_indices)
+    topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
+    assert (topk_indices[0, 0] == 0).any()
+    assert (topk_indices[0, 0] == -1).any()
+
+    ours = resolve_kernel("dsa_attention", "deepseek_v4", "eager").wrapper(
+        q.transpose(1, 2).contiguous(),
+        kv[:, 0].contiguous(),
+        sinks,
+        topk_indices,
+        sm_scale=scale,
+    )
+    torch.testing.assert_close(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
 def test_dsa_indexer_deepseek_v4_eager_matches_hf():
@@ -223,11 +289,10 @@ def test_dsa_attention_glm_eager_matches_hf_mask_path():
     query = torch.cat((q_nope, q_pe), dim=-1)
     key = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1)
     value = kv_cache.squeeze(2)
-    valid = (indices >= 0) & (indices < kv_len)
-    safe = indices.clamp(0, kv_len - 1).long()
-    keep = torch.zeros(batch, seq_len, kv_len, dtype=torch.bool)
-    keep.scatter_(-1, safe, valid)
-    index_mask = torch.where(keep.unsqueeze(1), torch.zeros((), dtype=query.dtype), float("-inf"))
+    # Official GlmMoeDsaAttention.forward: fill -inf, scatter 0 at top-k.
+    index_mask = torch.full((batch, seq_len, kv_len), float("-inf"), dtype=query.dtype)
+    index_mask.scatter_(-1, indices.long(), 0.0)
+    index_mask = index_mask.unsqueeze(1)
     query_h = query.transpose(1, 2)
     key_h = key.unsqueeze(1).expand(-1, heads, -1, -1)
     value_h = value.unsqueeze(1).expand(-1, heads, -1, -1)
@@ -239,6 +304,65 @@ def test_dsa_attention_glm_eager_matches_hf_mask_path():
         q_pe, k_pe, kv_cache, q_nope, indices, softmax_scale=scale
     )
     assert torch.allclose(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+def test_dsa_attention_glm_eager_matches_official_hf_causal_plus_scatter():
+    """GLM kernel matches official scatter top-k plus official causal additive mask."""
+    from transformers.masking_utils import create_causal_mask
+    from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+
+    torch.manual_seed(6)
+    batch, seq_len, heads, d_pe, d_nope, topk = 2, 8, 2, 8, 16, 4
+    config = GlmMoeDsaConfig(
+        vocab_size=32,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=heads,
+        num_key_value_heads=heads,
+        qk_rope_head_dim=d_pe,
+        qk_nope_head_dim=d_nope,
+        v_head_dim=d_nope,
+        attn_implementation="eager",
+    )
+    embeds = torch.randn(batch, seq_len, config.hidden_size)
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    causal = create_causal_mask(
+        config=config,
+        inputs_embeds=embeds,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    q_pe = torch.randn(batch, seq_len, heads, d_pe)
+    q_nope = torch.randn(batch, seq_len, heads, d_nope)
+    k_pe = torch.randn(batch, seq_len, 1, d_pe)
+    kv_cache = torch.randn(batch, seq_len, 1, d_nope)
+    indices = torch.randint(seq_len, (batch, seq_len, topk), dtype=torch.int32)
+    indices[..., 0] = 0
+    scale = 0.1
+    query = torch.cat((q_nope, q_pe), dim=-1)
+    key = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1)
+    value = kv_cache.squeeze(2)
+    index_mask = torch.full((batch, seq_len, seq_len), float("-inf"), dtype=query.dtype)
+    index_mask.scatter_(-1, indices.long(), 0.0)
+    combined = index_mask.unsqueeze(1) + causal[..., :seq_len]
+    query_h = query.transpose(1, 2)
+    key_h = key.unsqueeze(1).expand(-1, heads, -1, -1)
+    value_h = value.unsqueeze(1).expand(-1, heads, -1, -1)
+    attn_weights = torch.matmul(query_h, key_h.transpose(2, 3)) * scale + combined
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_h.dtype)
+    hf_out = torch.matmul(attn_weights, value_h).transpose(1, 2).contiguous()
+
+    ours = resolve_kernel("dsa_attention", "glm", "eager").wrapper(
+        q_pe,
+        k_pe,
+        kv_cache,
+        q_nope,
+        indices,
+        softmax_scale=scale,
+        attention_mask=causal,
+    )
+    torch.testing.assert_close(ours, hf_out, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="DeepSeek V4 TileLang requires SM90+ NVIDIA CUDA")
