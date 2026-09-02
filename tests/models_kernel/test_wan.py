@@ -21,8 +21,10 @@ Direct-import the staged class. Do not register or use
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.models_kernel.compare import (
@@ -33,7 +35,10 @@ from tests.models_kernel.refs.wan import WanConfig as RefWanConfig
 from tests.models_kernel.refs.wan import WanModel as RefWanModel
 from veomni.kernels import VeomniKernel
 from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.models_kernel.transformers.wan import fa3_fp8
+from veomni.models_kernel.transformers.wan import modeling_wan as wan_modeling
 from veomni.models_kernel.transformers.wan.config_wan import WanConfig
+from veomni.models_kernel.transformers.wan.fa3_fp8 import should_use_fa3_fp8
 
 
 def _tiny_kwargs() -> dict:
@@ -87,6 +92,85 @@ def test_wan_sage_constructs_veomni_sage_attention():
     model = _build_ours(_tiny_ours_config(), sage_cfg)
     assert model.blocks[0].self_attn.attn.veomni_attn.kernel == "attention"
     assert model.blocks[0].self_attn.attn.veomni_attn.impl == "veomni_sage_attention"
+
+
+def test_should_use_fa3_fp8_policy():
+    assert should_use_fa3_fp8("flash_attention_3", is_self_attn=True, last_loss=0.1)
+    assert should_use_fa3_fp8("veomni_flash_attention_3", is_self_attn=True, last_loss=1.0)
+    assert not should_use_fa3_fp8("flash_attention_3", is_self_attn=True, last_loss=None)
+    assert not should_use_fa3_fp8("flash_attention_3", is_self_attn=True, last_loss=math.nan)
+    assert not should_use_fa3_fp8("flash_attention_3", is_self_attn=False, last_loss=0.1)
+    assert not should_use_fa3_fp8("eager", is_self_attn=True, last_loss=0.1)
+    assert not should_use_fa3_fp8("veomni_sage_attention", is_self_attn=True, last_loss=0.1)
+
+
+def test_wan_fa3_constructs_generic_flash_attention_3():
+    fa3_cfg = eager_kernels_config()
+    fa3_cfg.attn_implementation = "flash_attention_3"
+    model = _build_ours(_tiny_ours_config(), fa3_cfg)
+    handle = model.blocks[0].self_attn.attn.veomni_attn
+    assert handle.kernel == "attention"
+    assert handle.impl == "flash_attention_3"
+
+
+def test_wan_fa3_finite_last_loss_quantizes(monkeypatch):
+    fa3_cfg = eager_kernels_config()
+    fa3_cfg.attn_implementation = "flash_attention_3"
+    model = _build_ours(_tiny_ours_config(), fa3_cfg)
+    attn = model.blocks[0].self_attn.attn
+    captured = {}
+
+    def fake_flash_attn_func(query, key, value, **kwargs):
+        captured.update(q=query, k=key, v=value, kwargs=kwargs)
+        return torch.zeros(query.shape[0], query.shape[1], query.shape[2], query.shape[3], dtype=torch.bfloat16)
+
+    monkeypatch.setattr(fa3_fp8, "flash_attn_interface", SimpleNamespace(flash_attn_func=fake_flash_attn_func))
+    monkeypatch.setattr(attn, "veomni_attn", lambda *args, **kwargs: pytest.fail("generic attention"))
+    attn.veomni_attn.impl = "flash_attention_3"
+
+    hidden = torch.randn(1, 8, 32)
+    output = attn(hidden, hidden, hidden, last_loss=0.1, isSelfAttn=True)
+
+    assert captured["q"].dtype == torch.float8_e4m3fn
+    assert "q_descale" in captured["kwargs"]
+    assert "k_descale" in captured["kwargs"]
+    assert "v_descale" in captured["kwargs"]
+    assert captured["kwargs"]["original_q"].shape == (1, 8, 4, 8)
+    assert output.shape == (1, 8, 32)
+
+
+@pytest.mark.parametrize(
+    ("kwargs",),
+    (
+        ({"last_loss": None, "isSelfAttn": True},),
+        ({"last_loss": math.nan, "isSelfAttn": True},),
+        ({"last_loss": 0.1, "isSelfAttn": False},),
+    ),
+)
+def test_wan_fa3_skips_fp8_outside_policy(monkeypatch, kwargs):
+    fa3_cfg = eager_kernels_config()
+    fa3_cfg.attn_implementation = "flash_attention_3"
+    model = _build_ours(_tiny_ours_config(), fa3_cfg)
+    attn = model.blocks[0].self_attn.attn
+    monkeypatch.setattr(
+        wan_modeling,
+        "flash_attention_3_fp8",
+        lambda *args, **kw: pytest.fail("fp8 path"),
+    )
+
+    called = {}
+
+    def fake_generic(module, query, key, value, attention_mask, **kw):
+        called["generic"] = True
+        return torch.zeros(query.shape[0], query.shape[2], query.shape[1], query.shape[3])
+
+    fake_generic.impl = "flash_attention_3"
+    monkeypatch.setattr(attn, "veomni_attn", fake_generic)
+
+    hidden = torch.randn(1, 8, 32)
+    output = attn(hidden, hidden, hidden, **kwargs)
+    assert called["generic"] is True
+    assert output.shape == (1, 8, 32)
 
 
 def test_wan_constructs_local_kernels():

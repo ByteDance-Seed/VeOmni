@@ -17,17 +17,16 @@
 
 import math
 import os
-from typing import Callable, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_outputs,
-    gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_rank,
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor_scale_grad,
@@ -38,79 +37,14 @@ from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_ke
 
 from ....utils import logging
 from .config_wan import WanConfig
+from .fa3_fp8 import flash_attention_3_fp8, should_use_fa3_fp8
 
 
 logger = logging.get_logger(__name__)
 
-try:
-    import flash_attn_interface
-
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_3_AVAILABLE = False
-
-
-def stochastic_round_tensor(x: torch.Tensor) -> torch.Tensor:
-    """
-    Perform stochastic rounding on a tensor
-    Args:
-        x (torch.Tensor): Input tensor
-    Returns:
-        torch.Tensor: Stochastically rounded integer tensor
-    """
-    floor_x = torch.floor(x)
-    frac = x - floor_x
-    rand_vals = torch.rand_like(x)
-    round_up = rand_vals < frac
-    result = floor_x + round_up.to(x.dtype)
-    return result
-
-
-def symmetric_quantize(x, dtype=torch.float8_e4m3fn):
-    """
-    Dynamic symmetric quantization that supports block-wise quantization under multi-head attention mechanism
-    Args:
-        x: Input tensor [batch_size, seq_len, head_count, head_dim]
-        dtype: Target quantization type, defaults to torch.float8_e4m3fn
-    Returns:
-        x_quantized: Quantized tensor [batch_size, seq_len, head_count, head_dim]
-        scales: Scaling factors for each head [batch_size, head_count]
-    """
-    batch_size, seq_len, head_count, head_dim = x.shape
-    x = x.to(torch.float32)
-    max_vals = x.abs().amax(dim=(1, 3), keepdim=True)  # [batch, 1, head, 1]
-    finfo = torch.finfo(dtype)
-    eps = 1e-12  # Smaller epsilon for better stability
-    scales = (max_vals + eps) / finfo.max  # Ensure non-zero denominator
-    scales = scales.clamp(min=eps)
-    x_scaled = x / scales
-    is_round = True
-    if is_round:
-        x_rounded = stochastic_round_tensor(x_scaled)
-        x_clamped = x_rounded.clamp(min=finfo.min, max=finfo.max)
-    else:
-        x_clamped = x_scaled.clamp(min=finfo.min, max=finfo.max)
-    x_quantized = x_clamped.to(dtype)
-    scales = scales.squeeze((1, 3)).to(torch.float32)
-    return x_quantized, scales
-
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return x * (1 + scale) + shift
-
-
-def rearrange_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rerange_type: str, head_dim: int):
-    q = rearrange(q, rerange_type, d=head_dim)
-    k = rearrange(k, rerange_type, d=head_dim)
-    v = rearrange(v, rerange_type, d=head_dim)
-    return q, k, v
-
-
-def gather_seq_scatter_heads_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_dim: int, head_dim: int):
-    q = gather_seq_scatter_heads(q, seq_dim, head_dim)
-    k = gather_seq_scatter_heads(k, seq_dim, head_dim)
-    v = gather_seq_scatter_heads(v, seq_dim, head_dim)
-    return q, k, v
 
 
 def eager_attention_forward(
@@ -135,48 +69,6 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
-
-
-def wrapped_flash_attention_3(
-    module: nn.Module,
-    query_states: torch.Tensor,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
-    last_loss=None,
-    isSelfAttn=False,
-    **kwargs,
-):
-    assert FLASH_ATTN_3_AVAILABLE
-    head_dim = query_states.shape[-1]
-    rerange_type_seq_head = "b n s d -> b s n d"
-
-    q, k, v = rearrange_qkv(query_states, key_states, value_states, rerange_type_seq_head, head_dim=head_dim)
-
-    if isSelfAttn and last_loss is not None:
-        if math.isnan(last_loss):
-            attn_output = flash_attn_interface.flash_attn_func(q, k, v)
-        else:
-            original_q = q
-            original_k = k
-            original_v = v
-            q, qscale = symmetric_quantize(q, dtype=torch.float8_e4m3fn)
-            k, kscale = symmetric_quantize(k, dtype=torch.float8_e4m3fn)
-            v, vscale = symmetric_quantize(v, dtype=torch.float8_e4m3fn)
-            attn_output = flash_attn_interface.flash_attn_func(
-                q,
-                k,
-                v,
-                q_descale=qscale,
-                k_descale=kscale,
-                v_descale=vscale,
-                original_q=original_q,
-                original_k=original_k,
-                original_v=original_v,
-            )
-    else:
-        attn_output = flash_attn_interface.flash_attn_func(q, k, v)
-
-    return attn_output
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -258,14 +150,21 @@ class AttentionModule(nn.Module):
             deterministic = os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
         kwargs["deterministic"] = deterministic
 
-        attn_output = self.veomni_attn(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            **kwargs,
-        )
+        if should_use_fa3_fp8(
+            self.veomni_attn.impl,
+            is_self_attn=bool(kwargs.get("isSelfAttn", False)),
+            last_loss=kwargs.get("last_loss"),
+        ):
+            attn_output = flash_attention_3_fp8(query_states, key_states, value_states)
+        else:
+            attn_output = self.veomni_attn(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                **kwargs,
+            )
 
         if isinstance(attn_output, tuple):
             attn_output = attn_output[0]
@@ -659,13 +558,3 @@ class WanModel(PreTrainedModel):
             x = gather_outputs(x, gather_dim=1, padding_dim=1, unpad_dim_size=unpadded_seq_len)
         x = self.unpatchify(x, (f, h, w))
         return x
-
-
-WAN_ATTENTION_FUNCTIONS: Dict[str, Dict[str, Callable]] = {}
-WAN_ATTENTION_FUNCTIONS.update(ALL_ATTENTION_FUNCTIONS)
-WAN_ATTENTION_FUNCTIONS.update(
-    {
-        "eager": eager_attention_forward,
-        "flash_attention_3": wrapped_flash_attention_3,
-    }
-)
