@@ -41,7 +41,7 @@ def forward(x: Tensor, freqs: Tensor, *, head_dim: int) -> tuple[Tensor, SavedSt
     if x.numel() == 0:
         return x, SavedState((freqs,), _Meta(True, head_dim))
 
-    shaped = x.reshape(*x.shape[:2], -1, head_dim)
+    shaped = x.reshape(*x.shape[:2], -1, head_dim).contiguous()
     rotated = torch.view_as_complex(shaped.to(torch.float64).reshape(*shaped.shape[:3], -1, 2))
     output = torch.view_as_real(rotated * freqs).flatten(2).to(x.dtype)
     return output, SavedState((freqs,), _Meta(False, head_dim))
@@ -55,7 +55,7 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None]:
     if meta.empty:
         return grad_output, None
 
-    shaped = grad_output.reshape(*grad_output.shape[:2], -1, meta.head_dim)
+    shaped = grad_output.reshape(*grad_output.shape[:2], -1, meta.head_dim).contiguous()
     rotated = torch.view_as_complex(shaped.to(torch.float64).reshape(*shaped.shape[:3], -1, 2))
     dx = torch.view_as_real(rotated * freqs.conj()).flatten(2).to(grad_output.dtype)
     return dx, None

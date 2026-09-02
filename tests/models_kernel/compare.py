@@ -75,7 +75,7 @@ def named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {name: param for name, param in model.named_parameters() if param.requires_grad}
 
 
-def assert_no_ops_or_old_models_import(*modules) -> None:
+def assert_no_ops_or_old_models_import(*modules, require_loss_utils: bool = True) -> None:
     for module in modules:
         source = module.__file__
         assert source is not None
@@ -85,7 +85,8 @@ def assert_no_ops_or_old_models_import(*modules) -> None:
         assert "veomni.ops" not in text
         assert "from veomni.models." not in text
         assert "from veomni.models import" not in text
-        assert "from veomni.models_kernel.utils.loss_utils import" in text
+        if require_loss_utils:
+            assert "from veomni.models_kernel.utils.loss_utils import" in text
 
 
 def assert_eager_matches_hf(
@@ -125,6 +126,54 @@ def assert_eager_matches_hf(
     ours_grads = named_trainable(ours)
     assert hf_grads.keys() == ours_grads.keys()
     for name, param in hf_grads.items():
+        if param.grad is None:
+            assert ours_grads[name].grad is None, name
+            continue
+        assert ours_grads[name].grad is not None, name
+        torch.testing.assert_close(ours_grads[name].grad, param.grad, atol=grad_atol, rtol=grad_rtol, msg=name)
+
+
+def _as_tensors(value: object) -> list[torch.Tensor]:
+    if torch.is_tensor(value):
+        return [value]
+    if isinstance(value, (tuple, list)):
+        return [item for item in value if torch.is_tensor(item)]
+    raise TypeError(f"unsupported output type: {type(value)!r}")
+
+
+def assert_outputs_and_grads_match(
+    official: torch.nn.Module,
+    ours: torch.nn.Module,
+    call,
+    *,
+    atol: float = EAGER_ATOL,
+    rtol: float = EAGER_RTOL,
+    grad_atol: float = EAGER_GRAD_ATOL,
+    grad_rtol: float = EAGER_GRAD_RTOL,
+) -> None:
+    """Compare a test-local official snapshot against models_kernel eager."""
+    official.train()
+    ours.train()
+
+    official_out = call(official)
+    ours_out = call(ours)
+    official_tensors = _as_tensors(official_out)
+    ours_tensors = _as_tensors(ours_out)
+    assert len(official_tensors) == len(ours_tensors)
+    for left, right in zip(ours_tensors, official_tensors, strict=True):
+        torch.testing.assert_close(left, right, atol=atol, rtol=rtol)
+
+    official.zero_grad(set_to_none=True)
+    ours.zero_grad(set_to_none=True)
+    official_loss = sum(tensor.float().sum() for tensor in official_tensors)
+    ours_loss = sum(tensor.float().sum() for tensor in ours_tensors)
+    official_loss.backward()
+    ours_loss.backward()
+
+    official_grads = named_trainable(official)
+    ours_grads = named_trainable(ours)
+    assert official_grads.keys() == ours_grads.keys()
+    for name, param in official_grads.items():
         if param.grad is None:
             assert ours_grads[name].grad is None, name
             continue
