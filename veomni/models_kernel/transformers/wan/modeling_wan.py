@@ -100,6 +100,7 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
 
 
 def rope_apply(x, **kwargs):
+    """``rope`` / ``wan``. Impl from ``rotary_pos_emb_implementation``, else eager."""
     freqs = kwargs.pop("freqs")
     head_dim = kwargs.pop("head_dim")
     rope = VeomniKernel("rope", "wan", resolve_kernel_impl("rotary_pos_emb_implementation"))
@@ -115,6 +116,8 @@ def pad_freqs(original_tensor, target_len):
 
 
 class RMSNorm(nn.Module):
+    """``rms_norm`` / ``standard``. Impl from ``rms_norm_implementation``, else eager."""
+
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.eps = eps
@@ -122,10 +125,17 @@ class RMSNorm(nn.Module):
         self.veomni_rms_norm = VeomniKernel("rms_norm", "standard", resolve_kernel_impl("rms_norm_implementation"))
 
     def forward(self, x):
+        """Apply the interned ``rms_norm`` handle."""
         return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
 
 class AttentionModule(nn.Module):
+    """``attention`` / ``standard``. Impl from ``attn_implementation``, else eager.
+
+    ``sageattention`` maps to ``veomni_sage_attention``. FA3 self-attn with a
+    finite ``last_loss`` uses the local fp8 helper.
+    """
+
     def __init__(self, config, num_heads, head_dim):
         super().__init__()
         self.num_heads = num_heads
@@ -139,6 +149,7 @@ class AttentionModule(nn.Module):
         self.config = config
 
     def forward(self, query_states, key_states, value_states, **kwargs):
+        """Run the interned attention handle, or Wan FA3 fp8 when that policy hits."""
         query_states = rearrange(query_states, "b s (n d) -> b n s d", d=self.head_dim)
         key_states = rearrange(key_states, "b s (n d) -> b n s d", d=self.head_dim)
         value_states = rearrange(value_states, "b s (n d) -> b n s d", d=self.head_dim)

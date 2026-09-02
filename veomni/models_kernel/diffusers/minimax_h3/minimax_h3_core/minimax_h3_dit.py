@@ -58,6 +58,8 @@ def unpack_audio(rows: torch.Tensor, audio_channel: int, steps: int, latent_dim:
 
 
 class VeomniRMSNorm(nn.Module):
+    """``rms_norm`` / ``standard``. Impl from ``rms_norm_implementation``, else eager."""
+
     def __init__(self, size: int, *, eps: float):
         super().__init__()
         self.eps = eps
@@ -65,6 +67,7 @@ class VeomniRMSNorm(nn.Module):
         self.veomni_rms_norm = VeomniKernel("rms_norm", "standard", resolve_kernel_impl("rms_norm_implementation"))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the interned ``rms_norm`` handle."""
         return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
 

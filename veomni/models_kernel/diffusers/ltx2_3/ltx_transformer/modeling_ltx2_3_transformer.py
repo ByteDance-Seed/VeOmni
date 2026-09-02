@@ -8,6 +8,13 @@ import os
 from dataclasses import dataclass, replace
 
 import torch
+from transformers import PreTrainedModel
+from transformers.modeling_outputs import ModelOutput
+
+
+# isort: off
+# Bind this tree before any ``import ltx_core``.
+import veomni.models_kernel.diffusers.ltx2_3.ltx_core  # noqa: F401
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core.model.transformer.attention import Attention
@@ -16,10 +23,7 @@ from ltx_core.model.transformer.model import LTXModel, LTXModelType
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection
 from ltx_core.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
-from transformers import PreTrainedModel
-from transformers.modeling_outputs import ModelOutput
-
-import veomni.models_kernel.diffusers.ltx2_3.ltx_core  # noqa: F401
+# isort: on
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -476,7 +480,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
-        raise NotImplementedError("models_kernel LTX from_pretrained is not staged. Use the models/ copy.")
+        raise NotImplementedError("LTXVideoTransformerModel.from_pretrained is not supported on this wrapper.")
 
 
 def compute_ltx2_loss(

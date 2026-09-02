@@ -71,7 +71,7 @@ def _loss_hidden_weight(
     ignore_index: int,
     num_items_in_batch: int | Tensor | None,
 ) -> Tensor:
-    """Ops eager path: ``F.linear`` then ``fixed_cross_entropy``."""
+    """Project ``hidden`` with ``F.linear`` then ``fixed_cross_entropy``."""
     hidden_flat, labels_flat = flatten_tokens(hidden, labels)
     logits = F.linear(hidden_flat, weight).float()
     return cross_entropy_from_logits(
@@ -85,7 +85,7 @@ def _loss_logits(
     ignore_index: int,
     num_items_in_batch: int | Tensor | None,
 ) -> Tensor:
-    """Ops eager path when ``hidden`` is already logits."""
+    """Token CE when ``hidden`` is already logits."""
     hidden_flat, labels_flat = flatten_tokens(hidden, labels)
     return cross_entropy_from_logits(
         hidden_flat, labels_flat, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch

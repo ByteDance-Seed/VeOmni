@@ -12,17 +12,15 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""LTX 2.3 models_kernel consume tests.
-
-Direct-import staged helpers. Do not register or use
-``build_foundation_model``. Compare ``rms_norm`` against official
-``torch.nn.functional.rms_norm``.
-"""
+"""LTX 2.3 models_kernel consume tests."""
 
 from __future__ import annotations
 
+import importlib
+import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -71,3 +69,46 @@ def test_ltx2_3_unweighted_rms_norm_matches_official():
     ours.sum().backward()
     official.sum().backward()
     torch.testing.assert_close(x.grad, official_x.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_from_pretrained_does_not_point_at_models_copy():
+    from veomni.models_kernel.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import (
+        LTXVideoTransformerModel,
+    )
+
+    with pytest.raises(NotImplementedError, match="not supported on this wrapper") as excinfo:
+        LTXVideoTransformerModel.from_pretrained("unused")
+    assert "models/" not in str(excinfo.value)
+
+
+def test_ltx_core_rebinds_away_from_another_copy(tmp_path):
+    fake_root = tmp_path / "fake_ltx"
+    fake_pkg = fake_root / "ltx_core"
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / "__init__.py").write_text("")
+    (fake_pkg / "utils.py").write_text("MARKER = 'fake'\n")
+
+    saved_path = list(sys.path)
+    saved_modules = {
+        name: sys.modules[name] for name in list(sys.modules) if name == "ltx_core" or name.startswith("ltx_core.")
+    }
+    sys.path.insert(0, str(fake_root))
+    try:
+        for name in list(saved_modules):
+            sys.modules.pop(name, None)
+        fake_utils = importlib.import_module("ltx_core.utils")
+        assert fake_utils.MARKER == "fake"
+
+        binder = importlib.import_module("veomni.models_kernel.diffusers.ltx2_3.ltx_core")
+        importlib.reload(binder)
+        bound_utils = importlib.import_module("ltx_core.utils")
+        package_utils = importlib.import_module("veomni.models_kernel.diffusers.ltx2_3.ltx_core.utils")
+        assert bound_utils.__file__ == package_utils.__file__
+        assert "VeomniKernel" in bound_utils.rms_norm.__doc__
+        assert not hasattr(bound_utils, "MARKER")
+    finally:
+        sys.path[:] = saved_path
+        for name in list(sys.modules):
+            if name == "ltx_core" or name.startswith("ltx_core."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)

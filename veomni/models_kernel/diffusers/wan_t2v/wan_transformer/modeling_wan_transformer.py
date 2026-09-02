@@ -143,6 +143,8 @@ def _assert_wan_flash_attention_bf16(
 
 
 class WanSPAttnProcessor(WanAttnProcessor):
+    """``attention`` / ``standard``. Impl from ``attn_implementation``, else eager."""
+
     def __init__(self, attn_implementation: str):
         self.attn_implementation = attn_implementation
         # build config for veomni_flash_attention_forward
@@ -159,6 +161,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Run the interned ``attention`` handle. Cross-attn and image tokens skip Ulysses."""
         is_cross_attention = encoder_hidden_states is not None
 
         # I2V: the first part of encoder_hidden_states holds image context.

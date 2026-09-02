@@ -145,6 +145,8 @@ class AdaLayerNorm(torch.nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
+    """``rms_norm`` / ``standard`` or ``unweighted``. Impl from ``rms_norm_implementation``, else eager."""
+
     def __init__(self, dim, eps, elementwise_affine=True):
         super().__init__()
         self.eps = eps
@@ -157,6 +159,7 @@ class RMSNorm(torch.nn.Module):
         self.veomni_rms_norm = VeomniKernel("rms_norm", variant, resolve_kernel_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states):
+        """Apply the interned ``rms_norm`` handle."""
         if self.weight is None:
             return self.veomni_rms_norm(hidden_states, eps=self.eps)
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.eps)

@@ -43,7 +43,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 def _wan_reference_rope_apply(x: Tensor, freqs: Tensor, head_dim: int) -> Tensor:
     """Wan2.1 reference RoPE. transformers has no Wan.
 
-    Copied from Wan-Video/Wan2.1 ``wan/modules/model.py`` ``rope_apply``:
+    Copied from https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py ``rope_apply``:
     ``view_as_complex(x.float64.reshape(..., 2)) * freqs`` then ``view_as_real``.
     Upstream already receives ``[S, N, D]`` per sample. This only unpacks VeOmni's
     packed ``[B, S, N*D]``.

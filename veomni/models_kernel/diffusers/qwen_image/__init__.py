@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen Image modeling that calls local VeomniKernel handles. Not on ``MODELING_REGISTRY``."""
+"""Qwen Image modeling staged under models_kernel. Not on ``MODELING_REGISTRY``."""
