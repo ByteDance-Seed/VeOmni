@@ -17,8 +17,7 @@ Patch configuration for SeedOss NPU VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.seed_oss.seed_oss_npu_patch_gen_config -o veomni/models_kernel/transformers/seed_oss/generated --diff
 
-Mirrors the GPU consume. The models/ NPU path imported ``veomni.ops.kernels``
-directly for RoPE / RMSNorm; those become local VeomniKernel calls.
+Mirrors the GPU package. RoPE and RMSNorm call local VeomniKernel.
 """
 
 from veomni.models_kernel.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (

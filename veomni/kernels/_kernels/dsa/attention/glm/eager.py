@@ -37,11 +37,14 @@ def wrapper(
     topk_indices: Tensor,
     *,
     softmax_scale: float | None = None,
+    attention_mask: Tensor | None = None,
 ) -> Tensor:
     """Official GLM eager attention on the FlashMLA packed face.
 
     ``q_pe`` / ``q_nope_absorbed`` are ``[B, S, H, D]``. ``k_pe`` and
     ``kv_cache`` are MQA ``[B, S_kv, 1, D]``.
+    ``attention_mask`` is the official additive causal / padding mask,
+    broadcastable to ``[B, 1, S, T]``.
     """
     query = torch.cat((q_nope_absorbed, q_pe), dim=-1)
     key = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1)
@@ -63,6 +66,8 @@ def wrapper(
     key_h = key.unsqueeze(1).expand(-1, heads, -1, -1)
     value_h = value.unsqueeze(1).expand(-1, heads, -1, -1)
     attn_weights = torch.matmul(query_h, key_h.transpose(2, 3)) * scale + index_mask
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask[..., :kv_len]
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_h.dtype)
     out = torch.matmul(attn_weights, value_h)
     return out.transpose(1, 2).contiguous()

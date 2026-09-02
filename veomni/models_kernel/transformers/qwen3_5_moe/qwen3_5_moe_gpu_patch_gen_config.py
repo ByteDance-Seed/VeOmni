@@ -17,8 +17,7 @@ Patch configuration for Qwen3_5Moe VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_5_moe/generated --diff
 
-Keeps the models/ VeOmni patches. Only OpSlot guards become local VeomniKernel calls.
-Reuses consumed GDN / vision helpers from models_kernel qwen3_5 via name_map.
+Reuses GDN / vision helpers from models_kernel qwen3_5 via name_map.
 """
 
 from copy import copy

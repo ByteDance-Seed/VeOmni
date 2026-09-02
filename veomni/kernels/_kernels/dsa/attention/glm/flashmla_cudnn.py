@@ -27,12 +27,16 @@ def wrapper(
     topk_indices: Tensor,
     *,
     softmax_scale: float | None = None,
+    attention_mask: Tensor | None = None,
 ) -> Tensor:
     """FlashMLA sparse prefill with cuDNN backward. Same face as eager.
 
     ``q_pe`` / ``q_nope_absorbed`` are ``[B, S, H, D]``. ``k_pe`` and
     ``kv_cache`` are MQA ``[B, S_kv, 1, D]``.
+    ``attention_mask`` is accepted for call-face parity with eager. The
+    fused row applies causality through top-k.
     """
+    del attention_mask
     from ....vendor.flashmla_cudnn import flash_mla_sparse_attention_with_cudnn_backward
 
     return flash_mla_sparse_attention_with_cudnn_backward(

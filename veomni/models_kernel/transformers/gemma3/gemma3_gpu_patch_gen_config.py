@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 """
-Patch configuration for the text-only Gemma 3 VeomniKernel consume.
+Patch configuration for the text-only Gemma 3 VeomniKernel replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.gemma3.gemma3_gpu_patch_gen_config -o veomni/models_kernel/transformers/gemma3/generated --diff

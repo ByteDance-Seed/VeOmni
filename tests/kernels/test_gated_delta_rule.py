@@ -298,3 +298,68 @@ def test_chunk_gated_delta_rule_flash_qla_matches_eager():
     assert torch.allclose(q_e.grad, q_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
     assert torch.allclose(k_e.grad, k_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
     assert torch.allclose(v_e.grad, v_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
+
+
+@pytest.mark.parametrize(
+    "lengths,chunk_size,num_heads",
+    [
+        ([128, 256], 64, 4),
+        ([64, 128, 32], 64, 8),
+    ],
+)
+def test_precompute_varlen_metadata_matches_ensure(
+    lengths: list[int],
+    chunk_size: int,
+    num_heads: int,
+) -> None:
+    from veomni.kernels._kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as m
+
+    cu_seqlens = torch.cumsum(torch.tensor((0,) + tuple(lengths), dtype=torch.long), dim=0)
+    cu_seqlens_list, chunk_indices, chunk_indices_list = m.precompute_varlen_metadata(
+        cu_seqlens=cu_seqlens,
+        num_heads=num_heads,
+        chunk_size=chunk_size,
+    )
+    g = torch.zeros(1, sum(lengths), num_heads)
+    _, ref_list, ref_tensor, ref_list_dict = m._ensure_varlen_metadata(g, cu_seqlens, chunk_size)
+
+    assert cu_seqlens_list == ref_list
+    assert set(chunk_indices) == set(ref_tensor)
+    assert set(chunk_indices_list) == set(ref_list_dict)
+    for key, pre_t in chunk_indices.items():
+        ref_t = ref_tensor[key]
+        if pre_t is None:
+            assert ref_t is None
+        else:
+            assert ref_t is not None
+            assert pre_t.tolist() == ref_t.tolist()
+    for key, pre_l in chunk_indices_list.items():
+        assert pre_l == ref_list_dict[key]
+
+
+def test_ensure_varlen_metadata_reuses_precomputed_tables() -> None:
+    from veomni.kernels._kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as m
+
+    cu_seqlens = torch.cumsum(torch.tensor((0, 64, 192), dtype=torch.long), dim=0)
+    num_heads = 4
+    g = torch.zeros(1, 192, num_heads)
+    cu_seqlens_list, chunk_indices, chunk_indices_list = m.precompute_varlen_metadata(
+        cu_seqlens=cu_seqlens,
+        num_heads=num_heads,
+    )
+    _, got_list, got_tensor, got_list_dict = m._ensure_varlen_metadata(
+        g,
+        cu_seqlens,
+        64,
+        cu_seqlens_list=cu_seqlens_list,
+        chunk_indices=chunk_indices,
+        chunk_indices_list=chunk_indices_list,
+    )
+    assert got_list == cu_seqlens_list
+    for key, tensor in chunk_indices.items():
+        if tensor is None:
+            assert got_tensor[key] is None
+        else:
+            assert got_tensor[key] is tensor
+    for key, values in chunk_indices_list.items():
+        assert got_list_dict[key] == values

@@ -39,6 +39,7 @@ def wrapper(
     ratio: int = 1,
     qhead_per_kv_head: int | None = None,
     sm_scale: float = 1.0,
+    attention_mask: Tensor | None = None,
 ) -> Tensor:
     """Official GLM indexer scores. Same face as cuDNN ``indexer_select_topk``.
 
@@ -55,5 +56,7 @@ def wrapper(
     scores = torch.einsum("bshd,btd->bsht", q.float(), k.float()) * sm_scale
     scores = F.relu(scores)
     index_scores = torch.einsum("bsht,bsh->bst", scores, w.float())
+    if attention_mask is not None:
+        index_scores = index_scores + attention_mask
     top_k = min(int(top_k), index_scores.shape[-1])
     return index_scores.topk(top_k, dim=-1).indices.to(torch.long)

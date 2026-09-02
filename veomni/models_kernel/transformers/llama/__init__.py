@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Llama VeomniKernel consume. Not registered on ``MODELING_REGISTRY`` yet."""
+"""Llama modeling that calls local VeomniKernel handles. Not on ``MODELING_REGISTRY``."""

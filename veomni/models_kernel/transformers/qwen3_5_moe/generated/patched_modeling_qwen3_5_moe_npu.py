@@ -1915,15 +1915,13 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
         if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
-            import importlib
+            from veomni.kernels._kernels.gated_delta_rule.chunk_gated_delta_rule.standard.npu_ascendc import (
+                precompute_varlen_metadata,
+            )
 
-            precompute_varlen_metadata = importlib.import_module(
-                "veomni." + "ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule"
-            ).precompute_varlen_metadata
-
-            # Use the Ulysses-local head count so that the precomputed cumsum-block
-            # key matches the per-layer _ensure_varlen_metadata computation (which
-            # derives h from g.shape[-1], i.e. the local head count after SP split).
+            # Use the Ulysses-local head count so the precomputed cumsum-block key
+            # matches per-layer metadata (h comes from g.shape[-1], i.e. the local
+            # head count after SP split).
             num_v_heads = self.config.linear_num_value_heads
             if get_parallel_state().sp_enabled:
                 num_v_heads //= get_parallel_state().sp_size

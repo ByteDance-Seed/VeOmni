@@ -1355,7 +1355,7 @@
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-@@ -1329,6 +1911,31 @@
+@@ -1329,6 +1911,29 @@
              position_ids=text_position_ids,
          )
          linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
@@ -1363,15 +1363,13 @@
 +        # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
 +        cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
 +        if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
-+            import importlib
++            from veomni.kernels._kernels.gated_delta_rule.chunk_gated_delta_rule.standard.npu_ascendc import (
++                precompute_varlen_metadata,
++            )
 +
-+            precompute_varlen_metadata = importlib.import_module(
-+                "veomni." + "ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule"
-+            ).precompute_varlen_metadata
-+
-+            # Use the Ulysses-local head count so that the precomputed cumsum-block
-+            # key matches the per-layer _ensure_varlen_metadata computation (which
-+            # derives h from g.shape[-1], i.e. the local head count after SP split).
++            # Use the Ulysses-local head count so the precomputed cumsum-block key
++            # matches per-layer metadata (h comes from g.shape[-1], i.e. the local
++            # head count after SP split).
 +            num_v_heads = self.config.linear_num_value_heads
 +            if get_parallel_state().sp_enabled:
 +                num_v_heads //= get_parallel_state().sp_size
@@ -1387,7 +1385,7 @@
 
          hidden_states = inputs_embeds
          position_embeddings = self.rotary_emb(hidden_states, position_ids)
-@@ -1353,19 +1960,42 @@
+@@ -1353,19 +1958,42 @@
              past_key_values=past_key_values,
          )
 
@@ -1441,7 +1439,7 @@
 
 
  @auto_docstring
-@@ -1376,7 +2006,19 @@
+@@ -1376,7 +2004,19 @@
      config: Qwen3_5MoeConfig
      _no_split_modules = ["Qwen3_5MoeDecoderLayer", "Qwen3_5MoeVisionBlock"]
 
@@ -1461,7 +1459,7 @@
          super().__init__(config)
          self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
          self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
-@@ -1561,64 +2203,43 @@
+@@ -1561,64 +2201,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1551,7 +1549,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1684,6 +2305,7 @@
+@@ -1684,6 +2303,7 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1559,7 +1557,7 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeModelOutputWithPast:
          r"""
-@@ -1691,6 +2313,10 @@
+@@ -1691,6 +2311,10 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1570,7 +1568,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1698,29 +2324,170 @@
+@@ -1698,29 +2322,170 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1751,7 +1749,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1730,6 +2497,17 @@
+@@ -1730,6 +2495,17 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1769,7 +1767,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1737,6 +2515,7 @@
+@@ -1737,6 +2513,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1777,7 +1775,7 @@
              **kwargs,
          )
 
-@@ -1828,6 +2607,12 @@
+@@ -1828,6 +2605,12 @@
      return overall_loss * num_experts
 
 
@@ -1790,7 +1788,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1836,6 +2621,7 @@
+@@ -1836,6 +2619,7 @@
      config: Qwen3_5MoeTextConfig
      _keys_to_ignore_on_load_unexpected = [r"^mtp.*", r"^model.visual.*"]
 
@@ -1798,7 +1796,7 @@
      def __init__(self, config):
          super().__init__(config)
          self.model = Qwen3_5MoeTextModel(config)
-@@ -1844,8 +2630,14 @@
+@@ -1844,8 +2628,14 @@
          self.router_aux_loss_coef = config.router_aux_loss_coef
          self.num_experts = config.num_experts
          self.num_experts_per_tok = config.num_experts_per_tok
@@ -1815,7 +1813,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -1860,14 +2652,17 @@
+@@ -1860,14 +2650,17 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -1834,7 +1832,7 @@
 
          Example:
 
-@@ -1899,30 +2694,43 @@
+@@ -1899,30 +2692,43 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -1891,7 +1889,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1930,7 +2738,14 @@
+@@ -1930,7 +2736,14 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1907,7 +1905,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -1940,11 +2755,19 @@
+@@ -1940,11 +2753,19 @@
      config: Qwen3_5MoeConfig
      _tp_plan = {"lm_head": "colwise_gather_output"}
 
@@ -1928,7 +1926,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1990,105 +2813,66 @@
+@@ -1990,105 +2811,66 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2063,7 +2061,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2314,6 +3098,30 @@
+@@ -2314,6 +3096,30 @@
 
          return input_ids, model_kwargs
 

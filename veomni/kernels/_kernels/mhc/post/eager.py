@@ -28,8 +28,8 @@ def wrapper(
 ) -> Tensor:
     """Mix *output* back into the residual streams. Regular autograd.
 
-    Matches DeepSeek-V4 decoder-layer residual update when the TileLang slot
-    is off. *post* is ``[B, S, H]``; *comb* is ``[B, S, H, H]``.
+    Matches DeepSeek-V4 decoder-layer residual update. *post* is
+    ``[B, S, H]``; *comb* is ``[B, S, H, H]``.
     """
     dtype = residual.dtype
     return post.to(dtype).unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(

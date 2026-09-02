@@ -17,7 +17,7 @@ Patch configuration for Llama GPU VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.llama.llama_gpu_patch_gen_config -o veomni/models_kernel/transformers/llama/generated --diff
 
-Keeps the models/ Llama patches. Only the kernel guards become local VeomniKernel calls.
+RMSNorm, RoPE, SwiGLU, and CE call local VeomniKernel.
 """
 
 from functools import partial

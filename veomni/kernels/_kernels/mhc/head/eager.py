@@ -34,9 +34,8 @@ def wrapper(
 ) -> Tensor:
     """Collapse the residual streams. Regular autograd.
 
-    Matches DeepSeek-V4 ``DeepseekV4HyperHead.forward`` when the TileLang slot
-    is off. *hc_mult* is accepted for the modeling call face; the mix width
-    comes from *fn*.
+    Matches DeepSeek-V4 ``DeepseekV4HyperHead.forward``. *hc_mult* is
+    accepted for the modeling call face; the mix width comes from *fn*.
     """
     del hc_mult
     flat = unweighted_rms(hidden_streams.flatten(2).float(), norm_eps)

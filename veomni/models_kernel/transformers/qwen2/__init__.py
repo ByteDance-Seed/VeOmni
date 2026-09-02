@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Qwen2 VeomniKernel consume. Not registered on ``MODELING_REGISTRY`` yet."""
+"""Qwen2 modeling that calls local VeomniKernel handles. Not on ``MODELING_REGISTRY``."""

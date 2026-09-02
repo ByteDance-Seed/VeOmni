@@ -15,8 +15,7 @@
 
 Copied from MindSpeed-MM. The verbatim kernels keep their upstream headers.
 Treat them as a drop-in vendor blob so they stay diff-able against upstream —
-do not hand-edit kernel logic. The ops tree has its own copy. Do not import
-``veomni.ops``.
+do not hand-edit kernel logic.
 
 - ``triton/`` — original ``triton-ascend`` kernels for ``npu`` (chunk and conv)
 - ``triton_core/`` — newer generation used as glue around ``fla_npu``

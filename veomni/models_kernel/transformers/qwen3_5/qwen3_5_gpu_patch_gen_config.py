@@ -17,8 +17,7 @@ Patch configuration for Qwen3_5 VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_5/generated --diff
 
-Keeps the models/ VeOmni patches (SP, vision, GDN varlen, fused loss).
-Only the OpSlot guards become local VeomniKernel calls.
+Sequence parallel, vision, GDN, and fused loss call local VeomniKernel.
 """
 
 from copy import copy
@@ -116,8 +115,8 @@ config.add_post_import_block(
     """
     # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
     # used to come from `try: from fla.modules import ... except ImportError`
-    # at module import time. Kernel consume constructs VeomniKernel handles
-    # on GatedDeltaNet instead. These None placeholders only exist so:
+    # at module import time. GatedDeltaNet constructs VeomniKernel handles
+    # instead. These None placeholders only exist so:
     #   (1) the upstream HF module-level
     #       `is_fast_path_available = all((causal_conv1d_fn, ...))`
     #       resolves to False (legacy warning behaviour preserved); and

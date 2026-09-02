@@ -35,7 +35,7 @@ class _Meta:
 def token_mask(gate_logits: Tensor, attention_mask: Tensor) -> Tensor | None:
     """Expand ``[batch, seq]`` across concatenated layers to ``[N]``.
 
-    ``gate_logits`` is ops-style ``[N, E]`` after ``torch.cat`` of per-layer
+    ``gate_logits`` is ``[N, E]`` after ``torch.cat`` of per-layer
     ``[tokens, E]``. Empty ``attention_mask`` means every token counts.
     ``N`` must be a multiple of ``batch * seq``.
     """
@@ -59,9 +59,9 @@ def token_mask(gate_logits: Tensor, attention_mask: Tensor) -> Tensor | None:
 def forward(gate_logits: Tensor, attention_mask: Tensor, *, top_k: int) -> tuple[Tensor, SavedState]:
     """Switch Transformer load-balancing loss on concatenated layer logits.
 
-    ``gate_logits`` is ``[N, num_experts]``, the same tensor ops builds with
-    ``torch.cat`` of the per-layer tuple. Empty ``attention_mask`` means every
-    token counts. Top-k counts are treated as constants in backward.
+    ``gate_logits`` is ``[N, num_experts]`` after ``torch.cat`` of the
+    per-layer tuple. Empty ``attention_mask`` means every token counts.
+    Top-k counts are treated as constants in backward.
     """
     if gate_logits.ndim != 2:
         raise ValueError(f"gate_logits must be [N, E], got {tuple(gate_logits.shape)}")

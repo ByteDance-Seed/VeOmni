@@ -47,7 +47,7 @@ Covers the thinker training path (text + vision + audio, dense — no MoE):
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen2_5_omni.qwen2_5_omni_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen2_5_omni/generated --diff
 
-Keeps the models/ VeOmni thinker patches. Only the OpSlot CE guard becomes a local VeomniKernel call.
+Thinker CausalLM uses ``ForCausalLMLoss``. Talker and token2wav stay excluded.
 """
 
 import copy

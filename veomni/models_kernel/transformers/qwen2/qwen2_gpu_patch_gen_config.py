@@ -17,7 +17,7 @@ Patch configuration for Qwen2 GPU VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen2.qwen2_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen2/generated --diff
 
-Keeps the models/ VeOmni SP patch. Only OpSlot guards become local VeomniKernel calls.
+Sequence parallel, RMSNorm, RoPE, SwiGLU, and CE call local VeomniKernel.
 """
 
 from functools import partial

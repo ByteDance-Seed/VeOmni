@@ -14,9 +14,7 @@
 
 """Installed kernel-impl config.
 
-One process-global object. ``apply_ops_config`` still writes it. Modeling
-reads ``get_kernels_config``. ``get_ops_config`` is the same store for
-unconsumed OpSlot models.
+One process-global object. Modeling reads ``get_kernels_config``.
 """
 
 from __future__ import annotations

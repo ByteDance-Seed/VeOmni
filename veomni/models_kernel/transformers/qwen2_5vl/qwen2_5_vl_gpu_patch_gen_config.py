@@ -17,7 +17,7 @@ Patch configuration for Qwen2.5-VL transformers>=5.9.0 code generation.
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen2_5vl.qwen2_5_vl_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen2_5vl/generated --diff
 
-Keeps the models/ VeOmni VLM patches. Only the OpSlot CE guard becomes a local VeomniKernel call.
+CausalLM uses ``ForCausalLMLoss``. Vision and sequence-parallel patches stay.
 """
 
 import copy

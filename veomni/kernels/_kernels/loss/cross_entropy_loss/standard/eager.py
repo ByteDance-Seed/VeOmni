@@ -103,8 +103,7 @@ def forward(
     """Token-level CE. Empty ``weight`` means ``hidden`` is already logits.
 
     Label shift and SP reduction stay in the caller. Grads are taken through
-    the same ``F.linear`` + ``F.cross_entropy`` ops path, then scaled in
-    backward.
+    ``F.linear`` + ``F.cross_entropy``, then scaled in backward.
     """
     has_weight = weight.numel() > 0
     if has_weight:

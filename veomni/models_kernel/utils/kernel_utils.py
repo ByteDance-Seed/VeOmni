@@ -12,10 +12,10 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Helpers for modeling consume of ``VeomniKernel``.
+"""Helpers for constructing ``VeomniKernel`` handles.
 
-Read impl names from ``get_kernels_config`` at construct time. Do not bind
-``OpSlot``. ``npu`` on cross-entropy maps to ``chunk_loss``.
+Read impl names from ``get_kernels_config`` at construct time. ``npu`` on
+cross-entropy maps to ``chunk_loss``.
 """
 
 from __future__ import annotations
@@ -29,11 +29,11 @@ from veomni.kernels.config import get_kernels_config
 def resolve_kernel_impl(field: str, *, npu_as: str | None = None) -> str:
     """Return the impl name on the installed kernel config, or ``eager``.
 
-    ``npu_as`` remaps the legacy ``npu`` CE alias. Missing config is eager so
-    unit tests can construct a module without ``set_kernels_config``.
+    ``npu_as`` remaps the ``npu`` CE name to ``chunk_loss``. Missing config
+    is eager so unit tests can construct a module without ``set_kernels_config``.
     """
     cfg = get_kernels_config()
-    impl = "eager" if cfg is None else getattr(cfg, field)
+    impl = "eager" if cfg is None else getattr(cfg, field, "eager")
     if npu_as is not None and impl == "npu":
         return npu_as
     return impl
@@ -52,8 +52,8 @@ def attention_kernel() -> VeomniKernel:
 def resolve_moe_impl() -> str:
     """Map ``moe_implementation`` onto a ``moe_experts`` registry impl.
 
-    YAML still uses the ops names ``fused_triton`` / ``fused_quack`` /
-    ``fused_npu``. Registry rows are ``triton`` / ``quack`` / ``npu``.
+    Config may use ``fused_triton`` / ``fused_quack`` / ``fused_npu``.
+    Registry rows are ``triton`` / ``quack`` / ``npu``.
     """
     impl = resolve_kernel_impl("moe_implementation")
     if impl.startswith("fused_"):

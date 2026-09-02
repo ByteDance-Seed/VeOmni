@@ -28,12 +28,16 @@ def wrapper(
     ratio: int = 1,
     qhead_per_kv_head: int | None = None,
     sm_scale: float = 1.0,
+    attention_mask: Tensor | None = None,
 ) -> Tensor:
     """cuDNN FE indexer top-k. Same face as the eager row.
 
     ``q`` is ``[B, S, H, D]``, ``k`` is ``[B, T, D]`` or ``[B, T, 1, D]``,
     ``w`` is ``[B, S, H]``. Returns ``[B, S, top_k]`` long indices.
+    ``attention_mask`` is accepted for call-face parity with eager. cuDNN
+    applies causality through ``ratio``.
     """
+    del attention_mask
     from ....vendor.flashmla_cudnn import indexer_select_topk
 
     return indexer_select_topk(

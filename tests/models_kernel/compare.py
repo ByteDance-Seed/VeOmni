@@ -36,6 +36,8 @@ def eager_kernels_config() -> SimpleNamespace:
         rms_norm_gated_implementation="eager",
         causal_conv1d_implementation="eager",
         chunk_gated_delta_rule_implementation="eager",
+        dsa_indexer_implementation="eager",
+        dsa_attention_implementation="eager",
     )
 
 

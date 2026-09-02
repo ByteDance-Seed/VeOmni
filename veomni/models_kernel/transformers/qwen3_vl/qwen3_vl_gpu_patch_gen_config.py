@@ -17,8 +17,7 @@ Patch configuration for Qwen3-VL VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_vl/generated --diff
 
-Keeps the models/ VeOmni VLM patches (SP, deepstack, vision, fused loss).
-Only the OpSlot guards become local VeomniKernel calls.
+Sequence parallel, deepstack, vision, and fused loss call local VeomniKernel.
 """
 
 import copy

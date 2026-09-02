@@ -35,8 +35,8 @@ def wrapper(
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Return ``(post, comb, collapsed)``. Regular autograd.
 
-    Matches DeepSeek-V4 ``DeepseekV4HyperConnection.forward`` when the
-    TileLang slot is off. *fn* / *scale* / *base* are the module parameters.
+    Matches DeepSeek-V4 ``DeepseekV4HyperConnection.forward``. *fn* /
+    *scale* / *base* are the module parameters.
     """
     hc = hc_mult
     flat = unweighted_rms(hidden_streams.flatten(start_dim=2).float(), norm_eps)

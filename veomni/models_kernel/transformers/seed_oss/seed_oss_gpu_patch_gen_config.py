@@ -17,8 +17,7 @@ Patch configuration for SeedOss GPU VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.seed_oss.seed_oss_gpu_patch_gen_config -o veomni/models_kernel/transformers/seed_oss/generated --diff
 
-The models/ GPU path hardcoded Liger class swaps for RMS / SwiGLU / RoPE.
-Those become local VeomniKernel calls. Residual dropout after SwiGLU stays.
+RMSNorm, SwiGLU, and RoPE call local VeomniKernel. Residual dropout after SwiGLU stays.
 """
 
 from functools import partial

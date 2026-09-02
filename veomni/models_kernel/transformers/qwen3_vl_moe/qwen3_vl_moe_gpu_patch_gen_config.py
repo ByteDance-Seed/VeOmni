@@ -15,7 +15,7 @@
 Patch configuration for Qwen3-VL-MoE VeomniKernel replacements.
 
 Reuses the qwen3_vl VLM patches via `name_map={"Qwen3VL": "Qwen3VLMoe"}`
-and layers MoE-specific kernel consume on top.
+and adds MoE-specific VeomniKernel calls on top.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_vl_moe/generated --diff

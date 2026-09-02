@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Unregistered kernel-consumed transformer models."""
+"""Transformer modeling that calls local ``VeomniKernel`` handles."""

@@ -11,4 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Low-level Triton kernels backing the vendored gated delta-rule ops."""
+"""Low-level Triton kernels for vendored gated delta-rule."""

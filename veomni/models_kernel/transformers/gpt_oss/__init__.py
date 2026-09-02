@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""GPT-OSS VeomniKernel consume. Not registered on ``MODELING_REGISTRY`` yet."""
+"""GPT-OSS modeling that calls local VeomniKernel handles. Not on ``MODELING_REGISTRY``."""

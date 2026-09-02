@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""standard cross-entropy chunked impl (ops ``ChunkLoss`` math)."""
+"""standard cross-entropy chunked impl."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _ce_loss_func(
     num_items_in_batch: int | Tensor,
     ignore_index: int,
 ) -> Tensor:
-    """Per-chunk body from ops ``chunk_loss_function``: linear then eager CE."""
+    """Per-chunk body: linear then eager CE."""
     labels_flat = labels.reshape(-1)
     hidden_flat = hidden_states.reshape(-1, hidden_states.size(-1))
     logits = F.linear(hidden_flat, weight).float()
@@ -51,11 +51,10 @@ def forward(
 ) -> tuple[Tensor, SavedState]:
     """Chunked fused linear + CE. ``weight`` must be present.
 
-    Same inner loop as ops ``ChunkLoss``: split the sequence, run
-    ``torch.func.grad_and_value`` on ``F.linear`` + eager CE, accumulate.
-    Does not shift labels or reduce across SP. When ``num_items_in_batch``
-    is omitted, the shared denominator is the valid-token count, matching
-    ops.
+    Split the sequence, run ``torch.func.grad_and_value`` on ``F.linear``
+    plus eager CE, and accumulate. Does not shift labels or reduce across
+    SP. When ``num_items_in_batch`` is omitted, the shared denominator is
+    the valid-token count.
     """
     if weight.numel() == 0:
         raise RuntimeError("chunk_loss requires a nonempty ``weight`` (fused-linear path)")
@@ -93,6 +92,6 @@ def forward(
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None, Tensor]:
-    """Return ``(grad_hidden, None, grad_weight)``. Same scale as ops ``ChunkLoss``."""
+    """Return ``(grad_hidden, None, grad_weight)``."""
     grad_hidden, grad_weight = saved.tensors
     return grad_hidden * grad_output, None, grad_weight * grad_output

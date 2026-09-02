@@ -115,8 +115,8 @@ from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAu
 # Additional import blocks for patches
 # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
 # used to come from `try: from fla.modules import ... except ImportError`
-# at module import time. Kernel consume constructs VeomniKernel handles
-# on GatedDeltaNet instead. These None placeholders only exist so:
+# at module import time. GatedDeltaNet constructs VeomniKernel handles
+# instead. These None placeholders only exist so:
 #   (1) the upstream HF module-level
 #       `is_fast_path_available = all((causal_conv1d_fn, ...))`
 #       resolves to False (legacy warning behaviour preserved); and

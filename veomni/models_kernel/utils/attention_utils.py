@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Attention helpers for models_kernel consume."""
+"""Attention helpers for models_kernel."""
 
 VARLEN_ATTENTION_TYPES = (
     "flash_attention_2",

@@ -31,7 +31,7 @@ Covers the thinker training path (text + vision + audio + MoE):
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_omni_moe/generated --diff
 
-Keeps the models/ VeOmni thinker patches. Only OpSlot guards become local VeomniKernel calls.
+Thinker MoE, CE, and load-balancing loss call local VeomniKernel.
 """
 
 import copy

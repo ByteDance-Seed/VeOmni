@@ -12,7 +12,8 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Kernel-consumed modeling, unregistered until the kernels switch.
+"""Transformer modeling that calls local ``VeomniKernel`` handles.
 
-Import classes directly from ``transformers.<model>.generated``.
+Import classes from ``transformers.<model>.generated``. Packages are not
+on ``MODELING_REGISTRY``.
 """

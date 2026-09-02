@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Gemma 3 text VeomniKernel consume. Not registered on ``MODELING_REGISTRY`` yet."""
+"""Gemma 3 text modeling that calls local VeomniKernel handles. Not on ``MODELING_REGISTRY``."""

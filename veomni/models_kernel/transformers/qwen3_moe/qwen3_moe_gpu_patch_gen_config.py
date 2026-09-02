@@ -17,8 +17,7 @@ Patch configuration for Qwen3Moe VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_moe/generated --diff
 
-Keeps the models/ VeOmni patches (router replay, fused loss, parallel plan).
-Only the OpSlot guards become local VeomniKernel calls.
+Router replay, fused loss, and the parallel plan call local VeomniKernel.
 """
 
 from functools import partial

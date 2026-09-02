@@ -19,6 +19,6 @@ This is a distinct, newer kernel generation from the sibling ``triton/`` package
 (e.g. a rewritten ``solve_tril``, an autotuned ``chunk_scaled_dot_kkt``) — the
 name ``triton_core`` refers to that kernel generation, not to the ``fla_npu``
 runtime package. These kernels are used by the ``npu_ascendc`` chunk path as
-glue *around* the heavy ``fla_npu`` ``torch.ops.npu.*`` fused ops:
+glue *around* the heavy ``fla_npu`` ``torch.ops.npu.*`` fused kernels:
 ``chunk_scaled_dot_kkt``, ``l2norm``, ``solve_tril`` (arch35 only), and ``utils``.
 """

@@ -17,8 +17,8 @@ Patch configuration for GPT-OSS GPU VeomniKernel replacements.
 Regen command:
 patchgen veomni.models_kernel.transformers.gpt_oss.gpt_oss_gpu_patch_gen_config -o veomni/models_kernel/transformers/gpt_oss/generated --diff
 
-Keeps the models/ FA4 allowlist, hub-decorator drop, and EP plan. Only the
-MoE / CE / LB guards become local VeomniKernel calls.
+FA4 allowlist, hub-decorator drop, and EP plan stay. MoE, CE, and
+load-balancing loss call local VeomniKernel.
 """
 
 from functools import partial
@@ -49,7 +49,7 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 config = PatchConfig(
     source_module="transformers.models.gpt_oss.modeling_gpt_oss",
     target_file="patched_modeling_gpt_oss_gpu.py",
-    description="GPT-OSS with VeOmni FA4-compatible attention dispatch and VeomniKernel consume",
+    description="GPT-OSS with VeOmni FA4-compatible attention dispatch and VeomniKernel replacements",
 )
 
 config.add_import("functools", names=["partial"])

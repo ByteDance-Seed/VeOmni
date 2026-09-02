@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""SeedOss modeling that calls local VeomniKernel handles. Not on ``MODELING_REGISTRY``."""
+"""GLM-MoE-DSA modeling that calls local VeomniKernel handles. Not on ``MODELING_REGISTRY``."""

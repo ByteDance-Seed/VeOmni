@@ -14,9 +14,8 @@
 
 """standard MoE experts MLU Apex group-gemm implementation.
 
-Adapted from ``veomni/ops/kernels/moe/mlu_group_gemm.py`` after
-ByteDance-Seed/VeOmni#903. Apex is imported lazily so GPU hosts can
-register this row without ``apex`` / ``torch_mlu``.
+Apex grouped GEMM. Apex is imported lazily so GPU hosts can register
+this row without ``apex`` / ``torch_mlu``. See ByteDance-Seed/VeOmni#903.
 """
 
 from __future__ import annotations

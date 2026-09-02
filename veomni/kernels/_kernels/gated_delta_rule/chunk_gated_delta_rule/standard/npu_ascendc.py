@@ -15,9 +15,9 @@
 """standard chunk_gated_delta_rule AscendC pair.
 
 Heavy compute is ``torch.ops.npu.*`` from ``fla_npu``. Glue around those
-ops lives in ``vendor/triton_core`` and ``vendor/triton``.
-The kernel contract is FLA ``[B, T, H, D]``; the fused ops want
-``[B, H, T, D]``.
+kernels lives in ``vendor/triton_core`` and ``vendor/triton``.
+The kernel contract is FLA ``[B, T, H, D]``; the fused ``torch.ops.npu``
+path wants ``[B, H, T, D]``.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ class _Meta:
 
 
 def _l2norm(x: Tensor, dim: int = -1, eps: float = 1e-6) -> Tensor:
-    """Match the FLA / vendored eager ``l2norm`` used before the fused ops."""
+    """Match the FLA / vendored eager ``l2norm`` used before the fused kernels."""
     original_dtype = x.dtype
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return (x * inv_norm).to(original_dtype)
@@ -126,22 +126,55 @@ def _ensure_varlen_metadata(
     g: Tensor,
     cu_seqlens: Tensor,
     chunk_size: int,
+    cu_seqlens_list: list[int] | None = None,
+    chunk_indices: dict[str, Tensor | None] | Tensor | None = None,
+    chunk_indices_list: dict[str, list[int] | None] | list[int] | Tensor | None = None,
 ) -> tuple[Tensor, list[int], dict[str, Tensor | None], dict[str, list[int] | None]]:
     cu_seqlens = cu_seqlens.to(device=g.device, dtype=torch.int64)
-    cu_seqlens_list = _as_int_list(cu_seqlens)
+    cu_seqlens_list = _as_int_list(cu_seqlens_list) or _as_int_list(cu_seqlens)
     assert cu_seqlens_list is not None
 
-    tensor_indices = _as_chunk_dict(None, chunk_size)
-    list_indices = _as_chunk_list_dict(None, chunk_size)
+    tensor_indices = _as_chunk_dict(chunk_indices, chunk_size)
+    list_indices = _as_chunk_list_dict(chunk_indices_list, chunk_size)
     required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES)
     required_sizes.add(int(chunk_size))
     required_sizes.add(_cumsum_block_t(g, chunk_size))
 
     for size in required_sizes:
         key = str(size)
-        tensor_indices[key] = _prepare_chunk_indices(cu_seqlens, size)
-        list_indices[key] = _prepare_chunk_indices_list(cu_seqlens_list, size)
+        if key not in tensor_indices or tensor_indices[key] is None:
+            tensor_indices[key] = _prepare_chunk_indices(cu_seqlens, size)
+        if key not in list_indices or list_indices[key] is None:
+            list_indices[key] = _prepare_chunk_indices_list(cu_seqlens_list, size)
     return cu_seqlens, cu_seqlens_list, tensor_indices, list_indices
+
+
+def precompute_varlen_metadata(
+    cu_seqlens: Tensor,
+    num_heads: int,
+    chunk_size: int = 64,
+    device: torch.device | str | None = None,
+) -> tuple[list[int], dict[str, Tensor | None], dict[str, list[int] | None]]:
+    """Build host-side varlen tables once for every GDN layer.
+
+    Hoists ``cu_seqlens.tolist()`` and chunk-index construction so later
+    layers can reuse the same tables.
+    """
+    if cu_seqlens.device.type != "cpu":
+        cu_seqlens = cu_seqlens.cpu()
+    cu_seqlens_list = _as_int_list(cu_seqlens)
+    assert cu_seqlens_list is not None
+    cumsum_block_size = _next_power_of_2((1 << 17) // max(1, int(num_heads) * int(chunk_size)))
+    required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES) | {int(chunk_size), cumsum_block_size}
+    chunk_indices: dict[str, Tensor | None] = {}
+    chunk_indices_list: dict[str, list[int] | None] = {}
+    for size in required_sizes:
+        key = str(size)
+        chunk_indices[key] = _prepare_chunk_indices(cu_seqlens, size)
+        chunk_indices_list[key] = _prepare_chunk_indices_list(cu_seqlens_list, size)
+    if device is not None:
+        chunk_indices = {k: v.to(device=device) if v is not None else None for k, v in chunk_indices.items()}
+    return cu_seqlens_list, chunk_indices, chunk_indices_list
 
 
 def _chunk_tensor(
@@ -417,7 +450,7 @@ def forward(
     Empty or omitted *initial_state* / *cu_seqlens* are unused. Unused final
     state is an empty tensor so the registry output stays tensors-only. The
     fused backward does not produce ``dh0``. Extra NPU varlen tables are
-    accepted; this path rebuilds them from ``cu_seqlens``.
+    accepted; missing keys are filled from ``cu_seqlens``.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -462,11 +495,15 @@ def forward(
         )
 
     cu_opt = optional_tensor(cu_seqlens)
-    cu_seqlens_list: list[int] | None = None
-    chunk_indices: dict[str, Tensor | None] | None = None
-    chunk_indices_list: dict[str, list[int] | None] | None = None
     if cu_opt is not None:
-        cu_opt, cu_seqlens_list, chunk_indices, chunk_indices_list = _ensure_varlen_metadata(g, cu_opt, chunk_size)
+        cu_opt, cu_seqlens_list, chunk_indices, chunk_indices_list = _ensure_varlen_metadata(
+            g,
+            cu_opt,
+            chunk_size,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices=chunk_indices,
+            chunk_indices_list=chunk_indices_list,
+        )
         if query_h.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {query_h.shape[0]} when using cu_seqlens. "
