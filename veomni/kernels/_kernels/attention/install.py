@@ -32,19 +32,21 @@ from .mask.sdpa import sdpa_attention_mask_builder
 from .standard.flash import flash_attention_forward
 from .standard.flex import flex_attention_forward
 from .standard.magi import magi_attention_forward
+from .standard.sage import sage_attention_forward
 from .standard.sdpa import sdpa_attention_forward
 
 
 logger = logging.get_logger(__name__)
 
-# Every ``veomni_*`` attention name has a matching mask builder. Flash still
-# returns ``None``; causal / sliding / varlen stay attention kwargs.
+# Every ``veomni_*`` attention name has a matching mask builder. Flash and
+# Sage return ``None``; causal stays the ``is_causal`` kwarg.
 _VEOMNI_HF_PATCHES: tuple[tuple[str, Callable[..., Any], Callable[..., Any]], ...] = (
     ("veomni_flash_attention_2", flash_attention_forward, flash_attention_mask_builder),
     ("veomni_flash_attention_3", flash_attention_forward, flash_attention_mask_builder),
     ("veomni_flash_attention_4", flash_attention_forward, flash_attention_mask_builder),
     ("veomni_flex_attention", flex_attention_forward, flex_attention_mask_builder),
     ("veomni_magi_attention", magi_attention_forward, magi_attention_mask_builder),
+    ("veomni_sage_attention", sage_attention_forward, flash_attention_mask_builder),
     ("veomni_sdpa", sdpa_attention_forward, sdpa_attention_mask_builder),
 )
 

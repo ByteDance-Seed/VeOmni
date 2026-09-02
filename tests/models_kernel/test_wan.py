@@ -81,6 +81,14 @@ def _wan_inputs(in_dim: int, text_len: int, text_dim: int) -> dict[str, torch.Te
     }
 
 
+def test_wan_sage_constructs_veomni_sage_attention():
+    sage_cfg = eager_kernels_config()
+    sage_cfg.attn_implementation = "sageattention"
+    model = _build_ours(_tiny_ours_config(), sage_cfg)
+    assert model.blocks[0].self_attn.attn.veomni_attn.kernel == "attention"
+    assert model.blocks[0].self_attn.attn.veomni_attn.impl == "veomni_sage_attention"
+
+
 def test_wan_constructs_local_kernels():
     model = _build_ours(_tiny_ours_config())
     block = model.blocks[0]

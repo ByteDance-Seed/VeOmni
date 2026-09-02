@@ -31,6 +31,7 @@ from veomni.kernels._kernels.attention.install import apply_veomni_attention_pat
 from veomni.kernels._kernels.attention.standard.flash import flash_attention_forward
 from veomni.kernels._kernels.attention.standard.flex import flex_attention_forward
 from veomni.kernels._kernels.attention.standard.magi import magi_attention_forward
+from veomni.kernels._kernels.attention.standard.sage import sage_attention_forward
 from veomni.kernels._kernels.attention.standard.sdpa import sdpa_attention_forward
 from veomni.kernels._kernels.attention.ulysses import should_apply_ulysses
 
@@ -41,6 +42,7 @@ _VEOMNI_FORWARDS = {
     "veomni_flash_attention_4": flash_attention_forward,
     "veomni_flex_attention": flex_attention_forward,
     "veomni_magi_attention": magi_attention_forward,
+    "veomni_sage_attention": sage_attention_forward,
     "veomni_sdpa": sdpa_attention_forward,
 }
 

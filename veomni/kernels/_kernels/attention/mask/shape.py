@@ -33,7 +33,14 @@ from .magi import MagiAttentionMask, magi_attention_mask_builder
 from .sdpa import _packed_segment_ids, sdpa_attention_mask_builder
 
 
+# Flash-like kernels keep causal visibility in ``is_causal`` / varlen kwargs,
+# not a dense mask object. Official ``sageattn`` is flash-like for causal /
+# full on every SM: the public dispatcher takes ``is_causal`` and no dense
+# ``attention_mask``. That is a Sage API fact, not a Wan leftover.
+# Sliding-window and packed patterns are flash-only.
 _FLASH = frozenset({"flash_attention_2", "flash_attention_3", "flash_attention_4"})
+_SAGE = frozenset({"sage_attention"})
+_FLASH_LIKE_CAUSAL = _FLASH | _SAGE
 _SDPA = frozenset({"sdpa", "native-sparse"})
 _EAGER = frozenset({"eager"})
 
@@ -141,7 +148,7 @@ def causal_mask(
     """Build a causal mask for ``impl``, or ``None`` when flash uses kwargs."""
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
-    if backend in _FLASH:
+    if backend in _FLASH_LIKE_CAUSAL:
         return flash_attention_mask_builder()
     if backend in _SDPA or backend in _EAGER:
         return _sdpa_or_eager_mask(backend, batch_size, q_len, kv_len, device, extra)
@@ -174,6 +181,8 @@ def sliding_window_mask(
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
     cu_seqlens = extra.pop("cu_seqlens", None)
+    if backend in _SAGE:
+        raise ValueError("veomni_sage_attention does not support sliding_window_mask")
     if backend in _FLASH:
         return flash_attention_mask_builder()
     if backend in _SDPA or backend in _EAGER:
@@ -215,6 +224,8 @@ def packed_causal_mask(
     """Packed causal mask from ``cu_seqlens``. Flash returns ``None``."""
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
+    if backend in _SAGE:
+        raise ValueError("veomni_sage_attention does not support packed_causal_mask")
     if backend in _FLASH:
         return flash_attention_mask_builder()
     if backend in _SDPA or backend in _EAGER:

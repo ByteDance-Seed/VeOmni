@@ -39,11 +39,20 @@ from veomni.kernels.mask import (
 
 def test_flash_shapes_are_none():
     assert causal_mask(8, 8, impl="veomni_flash_attention_2", device="cpu") is None
+    assert causal_mask(8, 8, impl="veomni_sage_attention", device="cpu") is None
     assert sliding_window_mask(8, 8, impl="flash_attention_2", device="cpu", sliding_window=4) is None
     assert (
         packed_causal_mask(8, 8, impl="veomni_flash_attention_3", device="cpu", cu_seqlens=torch.tensor([0, 8]))
         is None
     )
+
+
+def test_sage_mask_builder_is_flash_like_for_causal_only():
+    assert causal_mask(8, 8, impl="veomni_sage_attention", device="cpu") is None
+    with pytest.raises(ValueError, match="does not support sliding_window_mask"):
+        sliding_window_mask(8, 8, impl="veomni_sage_attention", device="cpu", sliding_window=4)
+    with pytest.raises(ValueError, match="does not support packed_causal_mask"):
+        packed_causal_mask(8, 8, impl="veomni_sage_attention", device="cpu", cu_seqlens=torch.tensor([0, 8]))
 
 
 @pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))

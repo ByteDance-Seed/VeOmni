@@ -12,9 +12,9 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Flash mask builder. Causal / sliding / varlen stay attention kwargs."""
+"""Flash / Sage mask builder. Causal stays the ``is_causal`` kwarg."""
 
 
 def flash_attention_mask_builder(*_args, **_kwargs) -> None:
-    """Flash does not take a mask object."""
+    """Flash and Sage do not take a dense mask object."""
     return None

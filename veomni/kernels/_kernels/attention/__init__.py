@@ -99,6 +99,7 @@ _STANDARD_IMPLS = (
     "veomni_flash_attention_4",
     "veomni_flex_attention",
     "veomni_magi_attention",
+    "veomni_sage_attention",
     "veomni_sdpa",
 )
 

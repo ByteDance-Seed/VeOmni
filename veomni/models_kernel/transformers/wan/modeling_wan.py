@@ -50,14 +50,6 @@ except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
 
 
-try:
-    from sageattention import sageattn
-
-    SAGE_ATTN_AVAILABLE = True
-except ModuleNotFoundError:
-    SAGE_ATTN_AVAILABLE = False
-
-
 def stochastic_round_tensor(x: torch.Tensor) -> torch.Tensor:
     """
     Perform stochastic rounding on a tensor
@@ -143,21 +135,6 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
-
-
-def wrapped_sageattention(
-    module: nn.Module,
-    query_states: torch.Tensor,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
-    **kwargs,
-):
-    assert SAGE_ATTN_AVAILABLE
-    head_dim = query_states.shape[-1]
-    rerange_type_head_seq = "b n s d -> b s n d"
-    attn_output = sageattn(query_states, key_states, value_states)
-    attn_output = rearrange(attn_output, rerange_type_head_seq, d=head_dim)
-    return attn_output
 
 
 def wrapped_flash_attention_3(
@@ -261,8 +238,11 @@ class AttentionModule(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.veomni_attn = attention_kernel()
-        self.wan_attention_functions = WAN_ATTENTION_FUNCTIONS
+        impl = resolve_kernel_impl("attn_implementation")
+        if impl in {"sageattention", "veomni_sage_attention"}:
+            self.veomni_attn = VeomniKernel("attention", "standard", "veomni_sage_attention")
+        else:
+            self.veomni_attn = attention_kernel()
         self.is_causal = False
         self.config = config
 
@@ -641,11 +621,12 @@ class WanModel(PreTrainedModel):
             #     all-to-alls K/V to their full GLOBAL length on every rank (its
             #     own unpad call is a no-op here since it's told the padded, not
             #     true, length), so every rank needs the full mask as-is.
-            # Only `eager_attention_forward` reads this today -- the
-            # flash_attention_3/sageattention wrappers ignore `attention_mask`
-            # entirely, so this is a strict improvement where supported and a
-            # no-op (unchanged prior behavior) elsewhere. See PR #1139 for the
-            # scope of what remains unmasked.
+            # Only `eager_attention_forward` reads this today. Official
+            # ``sageattn`` has no dense mask, so ``veomni_sage_attention``
+            # raises if one is passed. Sage is inference-only; training
+            # should use FlashAttention. FA3 historically dropped the mask.
+            # SP+sage therefore cannot honor this pad mask.
+            # See PR #1139 for the scope of what remains unmasked.
             if pad_size > 0:
                 self_attn_mask = torch.zeros(1, 1, 1, padded_seq_len, dtype=x.dtype, device=x.device)
                 self_attn_mask[..., padded_seq_len - pad_size :] = torch.finfo(x.dtype).min
@@ -686,6 +667,5 @@ WAN_ATTENTION_FUNCTIONS.update(
     {
         "eager": eager_attention_forward,
         "flash_attention_3": wrapped_flash_attention_3,
-        "sageattention": wrapped_sageattention,
     }
 )
