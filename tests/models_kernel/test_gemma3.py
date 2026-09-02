@@ -151,3 +151,39 @@ def test_gemma3_eager_matches_hf_softcap():
             rtol=EAGER_GRAD_RTOL,
             msg=name,
         )
+
+
+def test_gemma3_packed_eager_matches_independent_samples():
+    """Packed ``cu_seq_lens_q`` uses ``packed_causal_mask`` / ``sliding_window_mask``."""
+    torch.manual_seed(123)
+    config = _tiny_config()
+    ours = _build_ours(config).eval()
+    first_input_ids = torch.tensor([[5, 6, 7]])
+    second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
+    packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
+
+    with torch.no_grad():
+        packed_logits = ours(
+            input_ids=packed_input_ids,
+            attention_mask=torch.ones_like(packed_input_ids),
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+            cu_seq_lens_q=torch.tensor([0, 3, 8], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        first_logits = ours(
+            input_ids=first_input_ids,
+            attention_mask=torch.ones_like(first_input_ids),
+            position_ids=torch.arange(3).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        second_logits = ours(
+            input_ids=second_input_ids,
+            attention_mask=torch.ones_like(second_input_ids),
+            position_ids=torch.arange(5).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+
+    torch.testing.assert_close(packed_logits[:, :3], first_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    torch.testing.assert_close(packed_logits[:, 3:], second_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)

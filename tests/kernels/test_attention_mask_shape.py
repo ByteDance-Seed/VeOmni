@@ -111,6 +111,27 @@ def test_eager_sliding_is_additive_like_hf():
     assert shaped.dtype == torch.float32
 
 
+def test_eager_packed_with_long_padding_mask_is_additive():
+    cu_seqlens = torch.tensor([0, 2, 4])
+    attention_mask = torch.ones(1, 4, dtype=torch.long)
+    shaped = packed_causal_mask(
+        4,
+        4,
+        impl="eager",
+        device="cpu",
+        cu_seqlens=cu_seqlens,
+        attention_mask=attention_mask,
+        dtype=torch.float32,
+    )
+    assert shaped.dtype == torch.float32
+    keep = torch.zeros(4, 4, dtype=torch.bool)
+    keep[:2, :2] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    keep[2:, 2:] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    torch.testing.assert_close(shaped[0, 0][keep], torch.zeros(keep.sum(), dtype=torch.float32))
+    blocked = shaped[0, 0][~keep]
+    torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
+
+
 def test_sdpa_packed_aligns_with_hf_builder():
     cu_seqlens = torch.tensor([0, 2, 4])
     built = sdpa_attention_mask_builder(

@@ -65,6 +65,8 @@ def _to_eager_additive(mask: torch.Tensor | None, dtype: torch.dtype) -> torch.T
         return None
     if mask.dtype.is_floating_point:
         return mask
+    if mask.dtype != torch.bool:
+        mask = mask != 0
     min_dtype = torch.finfo(dtype).min
     return torch.where(mask, torch.zeros((), device=mask.device, dtype=dtype), min_dtype)
 

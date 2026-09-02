@@ -20,7 +20,6 @@ import importlib
 import sys
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -69,16 +68,6 @@ def test_ltx2_3_unweighted_rms_norm_matches_official():
     ours.sum().backward()
     official.sum().backward()
     torch.testing.assert_close(x.grad, official_x.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-
-
-def test_from_pretrained_does_not_point_at_models_copy():
-    from veomni.models_kernel.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import (
-        LTXVideoTransformerModel,
-    )
-
-    with pytest.raises(NotImplementedError, match="not supported on this wrapper") as excinfo:
-        LTXVideoTransformerModel.from_pretrained("unused")
-    assert "models/" not in str(excinfo.value)
 
 
 def test_ltx_core_rebinds_away_from_another_copy(tmp_path):

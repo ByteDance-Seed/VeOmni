@@ -14,7 +14,7 @@
 
 """Llama models_kernel consume tests.
 
-Direct-import the generated class. Do not register or use
+Direct-import the generated classes. Do not register or use
 ``build_foundation_model``. Compare a toy CausalLM against HuggingFace.
 """
 
@@ -34,37 +34,45 @@ from veomni.kernels import VeomniKernel
 from veomni.kernels.config import get_kernels_config, set_kernels_config
 
 
-def _tiny_config() -> LlamaConfig:
-    return LlamaConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        max_position_embeddings=64,
-        rms_norm_eps=1e-6,
-        hidden_act="silu",
-        attention_dropout=0.0,
-        attention_bias=False,
-        mlp_bias=False,
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        tie_word_embeddings=False,
-        attn_implementation="eager",
+def _tiny_config(**overrides) -> LlamaConfig:
+    kwargs = {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "hidden_act": "silu",
+        "attention_dropout": 0.0,
+        "attention_bias": False,
+        "mlp_bias": False,
+        "pad_token_id": 0,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "tie_word_embeddings": False,
+        "attn_implementation": "eager",
+    }
+    kwargs.update(overrides)
+    return LlamaConfig(**kwargs)
+
+
+def _llama_classes():
+    from veomni.models_kernel.transformers.llama.generated.patched_modeling_llama_gpu import (
+        LlamaForCausalLM,
+        LlamaForSequenceClassification,
     )
+
+    return LlamaForCausalLM, LlamaForSequenceClassification
 
 
 def _build_ours(config: LlamaConfig, kernels: SimpleNamespace | None = None):
-    from veomni.models_kernel.transformers.llama.generated.patched_modeling_llama_gpu import (
-        LlamaForCausalLM,
-    )
-
     previous = get_kernels_config()
     set_kernels_config(kernels if kernels is not None else eager_kernels_config())
     try:
-        return LlamaForCausalLM(config)
+        causal_cls, _ = _llama_classes()
+        return causal_cls(config)
     finally:
         set_kernels_config(previous)
 
@@ -100,3 +108,22 @@ def test_llama_eager_matches_hf():
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
     assert_eager_matches_hf(hf, ours, input_ids=input_ids)
+
+
+def test_llama_seq_cls_forward():
+    _, seq_cls = _llama_classes()
+    previous = get_kernels_config()
+    set_kernels_config(eager_kernels_config())
+    try:
+        model = seq_cls(_tiny_config(num_labels=4))
+    finally:
+        set_kernels_config(previous)
+    assert model.veomni_ce.impl == "eager"
+
+    input_ids = torch.randint(3, 128, (2, 6))
+    labels = torch.full((2, 6), -100, dtype=torch.long)
+    labels[:, -1] = torch.tensor([1, 2])
+    out = model(input_ids=input_ids, labels=labels, use_cache=False)
+    assert out.loss.ndim == 0
+    assert torch.isfinite(out.loss)
+    assert out.logits is not None

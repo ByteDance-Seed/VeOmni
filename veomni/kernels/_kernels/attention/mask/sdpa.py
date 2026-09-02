@@ -52,6 +52,8 @@ def sdpa_attention_mask_builder(
     cu_seqlens_k = kwargs.pop("cu_seqlens_k", None)
     if cu_seqlens_k is None:
         cu_seqlens_k = kwargs.pop("cu_seq_lens_k", None)
+    if attention_mask is not None and attention_mask.dtype != torch.bool:
+        attention_mask = attention_mask != 0
     device = kwargs.get("device", attention_mask.device if attention_mask is not None else "cpu")
 
     if sliding_window is not None:
