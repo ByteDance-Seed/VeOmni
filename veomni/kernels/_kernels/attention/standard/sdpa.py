@@ -44,6 +44,7 @@ def sdpa_attention_forward(
     scaling: Optional[float] = None,
     sliding_window: Optional[int] = None,
     softcap: Optional[float] = None,
+    skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run Transformers SDPA with optional Ulysses exchange.
@@ -54,6 +55,9 @@ def sdpa_attention_forward(
     Uses memory-efficient SDPA so a dense bool / additive mask stays valid.
     Flash is not tried. Use ``veomni_flash_attention_*`` when the pattern can
     stay in attention kwargs.
+
+    ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
+    on the SP mesh. Async Ulysses stays outside attention.
     """
     del sliding_window, softcap
 
@@ -61,7 +65,7 @@ def sdpa_attention_forward(
         raise ValueError("SDPA does not support query/key/value tensors with zero dimensions.")
 
     parallel_state = get_parallel_state()
-    ulysses_enabled = should_apply_ulysses()
+    ulysses_enabled = should_apply_ulysses() and not skip_ulysses
     if ulysses_enabled:
         query, key, value, query_head_count = prepare_ulysses_qkv(
             query.transpose(1, 2),

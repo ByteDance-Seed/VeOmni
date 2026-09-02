@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -137,3 +138,32 @@ def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch)
     assert calls[0][4:] == (group, 2)
     torch.testing.assert_close(calls[2][-1]["s_aux"], auxiliary[:2])
     assert output.shape == (1, 5, 2, 8)
+
+
+def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkeypatch):
+    captured = {}
+
+    def fake_flash(query, key, value, attention_mask, **kwargs):
+        captured["kwargs"] = kwargs
+        return query
+
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(
+        flash_backend,
+        "prepare_ulysses_qkv",
+        lambda *args, **kwargs: pytest.fail("skip_ulysses must not exchange QKV"),
+    )
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
+    query = torch.randn(1, 4, 5, 8, dtype=torch.float16)
+
+    assert inspect.signature(flash_backend.flash_attention_forward).parameters["skip_ulysses"].default is False
+    flash_backend.flash_attention_forward(
+        _FakeAttentionModule("veomni_flash_attention_2"),
+        query,
+        query[:, :2],
+        query[:, :2],
+        attention_mask=None,
+        skip_ulysses=True,
+        contract_marker=object(),
+    )
+    assert "skip_ulysses" not in captured["kwargs"]

@@ -211,7 +211,6 @@ def _qwen3_vl_async_ulysses_attention_forward(
         attention_mask,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
-        skip_ulysses=True,
         **kwargs,
     )
 

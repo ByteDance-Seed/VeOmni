@@ -166,6 +166,33 @@ def test_magi_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     assert lse.shape == (1, 4, 8)
 
 
+def test_magi_attention_skip_ulysses_uses_local_sequence(monkeypatch):
+    monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state(ulysses_size=2))
+    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(
+        magi_backend,
+        "prepare_ulysses_qkv",
+        lambda *args, **kwargs: pytest.fail("skip_ulysses must not exchange QKV"),
+    )
+    query = torch.randn(1, 4, 8, 16)
+    captured = {}
+
+    def fake_backend(query, key, value, q_ranges, k_ranges, attn_type_map, **kwargs):
+        captured["query_shape"] = tuple(query.shape)
+        return query, SimpleNamespace(lse=None)
+
+    monkeypatch.setattr(magi_backend, "_magi_attention_forward", fake_backend)
+    magi_backend.magi_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        query[:, :2],
+        query[:, :2],
+        _causal_mask(8),
+        skip_ulysses=True,
+    )
+    assert captured["query_shape"] == (8, 4, 16)
+
+
 def test_magi_attention_rejects_global_ranges_when_ulysses_is_off(monkeypatch):
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
     monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda: False)

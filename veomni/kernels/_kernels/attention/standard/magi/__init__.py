@@ -104,9 +104,14 @@ def magi_attention_forward(
     scaling: Optional[float] = None,
     sliding_window: Optional[int] = None,
     softcap: Optional[float] = None,
+    skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run MagiAttention FFA for CP1 with optional VeOmni Ulysses exchange."""
+    """Run MagiAttention FFA for CP1 with optional VeOmni Ulysses exchange.
+
+    ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
+    on the SP mesh. Async Ulysses stays outside attention.
+    """
     del module, kwargs
 
     if not isinstance(attention_mask, MagiAttentionMask):
@@ -129,7 +134,7 @@ def magi_attention_forward(
     if parallel_state.cp_size != 1:
         raise ValueError(f"MagiAttention FFA currently supports cp_size == 1, got cp_size={parallel_state.cp_size}.")
 
-    ulysses_enabled = should_apply_ulysses()
+    ulysses_enabled = should_apply_ulysses() and not skip_ulysses
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)

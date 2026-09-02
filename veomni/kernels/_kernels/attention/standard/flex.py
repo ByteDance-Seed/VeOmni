@@ -39,9 +39,14 @@ def flex_attention_forward(
     scaling: Optional[float] = None,
     sliding_window: Optional[int] = None,
     softcap: Optional[float] = None,
+    skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run the Transformers FlexAttention adapter with optional Ulysses exchange."""
+    """Run the Transformers FlexAttention adapter with optional Ulysses exchange.
+
+    ``skip_ulysses`` opts a call out of sync Ulysses when its tokens are not
+    on the SP mesh. Async Ulysses stays outside attention.
+    """
     if not isinstance(attention_mask, BlockMask):
         raise TypeError(f"FlexAttention requires a BlockMask, got {type(attention_mask).__name__}.")
 
@@ -66,7 +71,7 @@ def flex_attention_forward(
     kernel_options.setdefault("BACKEND", "TRITON")
 
     parallel_state = get_parallel_state()
-    ulysses_enabled = should_apply_ulysses()
+    ulysses_enabled = should_apply_ulysses() and not skip_ulysses
     if ulysses_enabled:
         # Local head indices restart at zero on every Ulysses rank, so head-specific
         # masks require rank-aware slicing and rebasing before they can be supported.

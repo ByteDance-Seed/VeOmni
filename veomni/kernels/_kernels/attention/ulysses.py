@@ -30,7 +30,9 @@ def should_apply_ulysses() -> bool:
 
     Sync Ulysses belongs inside attention only when the Ulysses axis is
     greater than 1 and async Ulysses is off. Async SP gathers outside
-    attention. ``ulysses_size == 1`` is a no-op.
+    attention. ``ulysses_size == 1`` is a no-op. A per-call
+    ``skip_ulysses`` on the adapter is a separate opt-out for tokens
+    that are not on the SP mesh.
     """
     parallel_state = get_parallel_state()
     if parallel_state.ulysses_size <= 1:

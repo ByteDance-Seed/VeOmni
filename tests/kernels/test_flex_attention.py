@@ -244,6 +244,32 @@ def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     assert lse.shape == (1, 2, 8)
 
 
+def test_flex_attention_skip_ulysses_skips_exchange(monkeypatch):
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(
+        flex_backend,
+        "prepare_ulysses_qkv",
+        lambda *args, **kwargs: pytest.fail("skip_ulysses must not exchange QKV"),
+    )
+    captured = {}
+
+    def fake_backend(module, query, key, value, attention_mask, **kwargs):
+        captured["kwargs"] = kwargs
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
+    query = torch.randn(1, 4, 8, 8)
+    flex_backend.flex_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        query[:, :2],
+        query[:, :2],
+        _causal_block_mask(8, query.device),
+        skip_ulysses=True,
+    )
+    assert "skip_ulysses" not in captured["kwargs"]
+
+
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlexAttention numerical comparison requires CUDA")
 @pytest.mark.parametrize("mask_case", ("causal", "bagel_mixed"))
 def test_flex_attention_matches_math_sdpa(mask_case):

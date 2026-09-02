@@ -42,6 +42,7 @@ def flash_attention_forward(
     scaling: Optional[float] = None,
     sliding_window: Optional[int] = None,
     softcap: Optional[float] = None,
+    skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     """
@@ -58,7 +59,9 @@ def flash_attention_forward(
     2. **Ulysses sequence-parallelism** — when Ulysses SP is on and async is
        off, the full Q/K/V sequence is gathered across SP ranks before the
        kernel call and the output is scattered back afterwards. Async SP and
-       ``ulysses_size == 1`` leave the layout unchanged.
+       ``ulysses_size == 1`` leave the layout unchanged. ``skip_ulysses`` is
+       an opt-out for a call whose tokens are not on the SP mesh, such as
+       Wan cross-attn. Async Ulysses stays outside attention.
 
     3. **FA backend selection** — the implementation name stored in
        ``module.config._attn_implementation`` is mapped to the token that
@@ -114,7 +117,7 @@ def flash_attention_forward(
 
     # Ulysses patch
     parallel_state = get_parallel_state()
-    ulysses_enabled = should_apply_ulysses()
+    ulysses_enabled = should_apply_ulysses() and not skip_ulysses
     if ulysses_enabled:
         query, key, value, query_head_count = prepare_ulysses_qkv(
             query,
