@@ -53,15 +53,14 @@ class TextEncoderPreprocessor(ModulePreprocessorBase):
         **kwargs: Any,
     ):
         """Build straight from the checkpoint dir — no model instance needed."""
-        del kwargs
-        return cls(cls.build_chat_template(module_path, config_overrides=config_overrides))
+        return cls(cls.build_chat_template(module_path, config_overrides=config_overrides), **kwargs)
 
     def _tokenize_conversation_kwargs(self, inference: bool, **kwargs: Any) -> dict[str, Any]:
         """Extra kwargs forwarded to :meth:`TextEncoderChatTemplate.tokenize_conversation`."""
         del kwargs
         return {"add_generation_prompt": inference}
 
-    def __call__(
+    def preprocess_conversations(
         self,
         conversation_list: list[list[ConversationItem]],
         inference: bool = False,

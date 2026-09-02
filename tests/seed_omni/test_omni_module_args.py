@@ -138,6 +138,28 @@ def test_build_module_runtime_args_resolves_relative_model_paths():
     assert modules["janus_siglip"].model_path.startswith("/tmp/janus")
 
 
+def test_packed_modules_yaml_sets_text_encoder_processor_config():
+    args = _omni_args(model_path="/tmp/janus")
+    modules = build_module_runtime_args(
+        args._to_module_global_args(),
+        "/tmp/janus",
+        str(_janus_cfg_dir() / "modules_train_packed.yaml"),
+    )
+    encoder = modules["janus_text_encoder"]
+    assert encoder.processor_config == {"packed_preprocess": True}
+    assert not encoder.model_config.get("packed_preprocess")
+
+    entry = encoder.to_hf_config("janus_text_encoder")
+    cfg = OmniConfig(
+        modules={"janus_text_encoder": entry},
+        training_graph=[{"from": "janus_text_encoder", "to": "end"}],
+        generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
+    )
+    assert cfg.module_processor_config("janus_text_encoder") == {"packed_preprocess": True}
+    exported = cfg.copy_for_hf_export()
+    assert "processor_config" not in exported.modules["janus_text_encoder"]
+
+
 def test_build_module_runtime_args_merges_module_optimizer():
     """Global ``model.optimizer`` is the base; per-module YAML can override."""
     from veomni.arguments import OptimizerConfig

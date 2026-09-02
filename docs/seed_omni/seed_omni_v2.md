@@ -166,8 +166,8 @@ defaults; `generate` / FSM inference lives natively on `modeling.py` (see
 | Hook | When | Purpose |
 |------|------|---------|
 | `forward(**kwargs)` | training | the node's main compute; may return one `_loss` |
-| `pre_forward(method, **kwargs)` | training | prep inputs (read from conversation list) |
-| `post_forward(method, **outputs)` | training | write results back onto conversation list |
+| `pre_forward(method, **kwargs)` | training | prep inputs (conversation list, or packed tensors for Janus `pack_*` nodes) |
+| `post_forward(method, **outputs)` | training | write results back (conversation list, or packed features / losses) |
 | `freeze_model()` | build | freeze a parameter subset |
 | `get_parallel_plan()` | build | per-module FSDP/SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
@@ -505,7 +505,9 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
      own `ParallelState`.
    - `graph_train.yaml` — the `training_graph` (a flat list of edges whose
      endpoints are `module[.method]` strings). Remember: edges only declare
-     order; modules move data via the conversation list.
+     order; conversation graphs move data via the conversation list. Janus
+     packed graphs (`graph_train_packed.yaml`) use `pack_*` methods and
+     packed tensors on the batch dict instead.
    - `modules_infer.yaml` (optional) — per-module inference overrides.
    - `graph_infer_*.yaml` — one `generation_graph` (FSM) per scenario, mapped
      under `infer.infer_graph`. `OmniConfig` loads **all** of them into
@@ -514,8 +516,9 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 
 5. **Honour the contracts:**
    - Return at most one scalar `_loss` per node (token-mean reduced).
-   - Read inputs in `pre_forward`, write results in `post_forward`, always
-     returning `{"conversation_list": ...}` so the carrier flows on.
+   - Read inputs in `pre_forward`, write results in `post_forward`. Conversation
+     nodes return `{"conversation_list": ...}` so the carrier flows on; packed
+     Janus nodes return packed tensors / `_loss` instead.
    - Implement `dummy_inputs()` for any encoder whose modality can be absent
      from a micro-batch.
    - For inference modules, emit `module_signal` strings to drive FSM

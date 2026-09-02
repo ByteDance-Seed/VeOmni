@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.fsdp import FSDPModule
 
 from ....distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from ....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
@@ -41,6 +42,7 @@ from .dispatch import unwrap_module_chain
 
 
 if TYPE_CHECKING:
+    from ....arguments.arguments_types import AcceleratorConfig
     from ....arguments.omni_arguments_types import OmniModuleRuntimeArguments, OmniTrainingArguments
     from ....trainer.callbacks import TrainerState
 
@@ -93,6 +95,12 @@ class ModuleRuntime(VeOmniModelRuntime):
     mistyped runtime attribute silently reads the model rather than raising.
     """
 
+    # Class default so ``__new__``-constructed tests and ``__getattr__``
+    # forwarding to the inner ``nn.Module`` never confuse this flag with a
+    # missing model attribute.
+    _defer_parallelize: bool = False
+    _mesh_accelerator: Optional["AcceleratorConfig"] = None
+
     args: "OmniModuleRuntimeArguments"
     train: Optional["OmniTrainingArguments"] = None
     _has_trainable_parameters: Optional[bool] = None
@@ -104,35 +112,47 @@ class ModuleRuntime(VeOmniModelRuntime):
         *,
         train: Optional["OmniTrainingArguments"] = None,
         for_inference: bool = False,
+        global_accelerator: Optional["AcceleratorConfig"] = None,
     ):
         self.args = args
         self.model_name = module_name
         self.train = train
         self.optimizer = None
         self.lr_scheduler = None
-
-        if for_inference and args.accelerator.fsdp_config.fsdp_mode == "eager":
-            self._init_eager_inference()
-            return
+        self._defer_parallelize = False
 
         if for_inference:
-            args.accelerator.fsdp_config.mixed_precision.enable = False
-
-        self.setup()
-
-        with self._scoped():
-            self.build_model()
-            self.build_model_assets()
-            if not for_inference:
+            if args.accelerator.fsdp_config.fsdp_mode == "eager":
+                self._init_eager_inference()
+            else:
+                args.accelerator.fsdp_config.mixed_precision.enable = False
+                self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
+                self._mesh_accelerator = (
+                    global_accelerator
+                    if self._defer_parallelize and global_accelerator is not None
+                    else args.accelerator
+                )
+                self.setup()
+                with self._scoped():
+                    self.build_model()
+                    self.build_model_assets()
+                    self.build_parallelized_model()
+                self.model.eval()
+        else:
+            self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
+            self._mesh_accelerator = (
+                global_accelerator if self._defer_parallelize and global_accelerator is not None else args.accelerator
+            )
+            self.setup()
+            with self._scoped():
+                self.build_model()
+                self.build_model_assets()
                 self.freeze_model()
-            self.build_parallelized_model()
-            if not for_inference:
-                self._scope_recompute_to_parallel_state()
-                self.build_optimizer()
-                self.build_checkpoint()
-
-        if for_inference:
-            self.model.eval()
+                self.build_parallelized_model()
+                if not self._defer_parallelize:
+                    self._scope_recompute_to_parallel_state()
+                    self.build_optimizer()
+                    self.build_checkpoint()
 
     @property
     def module_name(self) -> str:
@@ -203,11 +223,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
         from ....models import build_foundation_model
 
+        acc = self._mesh_accelerator or args.accelerator
         self.model = build_foundation_model(
             config_path=args.model_path,
             weights_path=args.model_path,
-            torch_dtype="float32" if args.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-            init_device=args.accelerator.init_device,
+            torch_dtype="float32" if acc.fsdp_config.mixed_precision.enable else "bfloat16",
+            init_device=acc.init_device,
             ops_implementation=args.ops_implementation,
             config_kwargs=args.model_config,
         )
@@ -282,9 +303,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         rest of this class already handles: no optimizer, no lr-scheduler, no
         checkpoint manager, and an HF weight load rather than a DCP restore.
 
-        A config that targets *nothing anywhere* is still an error, but only the
-        composer can see that; it is raised in
-        :meth:`OmniModelRuntime.from_model_runtime`.
+        A config that targets *nothing anywhere* **and** leaves the composed
+        model with no trainable parameters is still an error; only the composer
+        can see that. It is raised in :meth:`OmniModelRuntime.from_model_runtime`.
         """
         logger.info_rank0(
             f"ModuleRuntime '{self.module_name}': the LoRA config matched no parameters here; "
@@ -318,7 +339,18 @@ class ModuleRuntime(VeOmniModelRuntime):
         overriding :meth:`customized_build_parallelize_model` — e.g. a huge MoE
         backbone that streams EP-sharded experts to CPU, which the generic
         GPU-materializing loader has no hook for.
+
+        When ``fsdp_scope='model'``, this is a no-op: the module stays on meta
+        (freeze already applied) so :class:`OmniModelRuntime` can wrap the
+        composed parent once, then :meth:`finish_deferred_parallelize` builds
+        the optimizer on the now-DTensor parameters.
         """
+        if self._defer_parallelize:
+            logger.info_rank0(
+                f"ModuleRuntime '{self.module_name}': deferring FSDP wrap to the composed "
+                "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
+            )
+            return
         customized_model = self.customized_build_parallelize_model(
             weights_path=self.args.model_path,
             args=self.args,
@@ -328,7 +360,35 @@ class ModuleRuntime(VeOmniModelRuntime):
             return
         super().build_parallelized_model()
 
+    def finish_deferred_parallelize(self, *, for_inference: bool = False) -> None:
+        """Optimizer / checkpoint / GC recompute after the parent OmniModel wrap.
+
+        No-op when this module wrapped itself, or when this is an eager-inference
+        module that never entered :meth:`setup`.
+        """
+        if not self._defer_parallelize:
+            return
+        if for_inference:
+            with self._scoped():
+                self._scope_recompute_to_parallel_state()
+                self.model.eval()
+        else:
+            with self._scoped():
+                self._scope_recompute_to_parallel_state()
+                self.build_optimizer()
+                self.build_checkpoint()
+
     # ── Parallel state (per-module device mesh) ────────────────────────────────
+
+    def setup(self) -> None:
+        """Register this module's ParallelState.
+
+        Under ``fsdp_scope='model'`` the mesh comes from the top-level
+        accelerator, not the module YAML overlay.
+        """
+        from ....distributed.parallel_state import init_parallel_state_from_accelerator
+
+        init_parallel_state_from_accelerator(self._mesh_accelerator, self.model_name)
 
     def _scoped(self):
         """Context manager making this module's ParallelState current.
@@ -454,20 +514,17 @@ class ModuleRuntime(VeOmniModelRuntime):
         params). This method only *applies* that intent to this module — trading
         param memory for communication.
 
-        Read the **module's own** ``fsdp_config`` (not the orchestrator's): each
-        OmniModule has its own merged ``accelerator``, so ``fsdp_mode`` /
-        ``reshard_after_backward`` may differ per module — a DDP module has no
-        FSDP2 units to toggle (skipped by the ``isinstance`` check), and a module
-        that keeps ``reshard_after_backward=True`` opts out here. No
+        Read the wrap-time ``fsdp_config`` (not the orchestrator's): under
+        ``fsdp_scope='model'`` that is the top-level accelerator so a module
+        YAML ``ddp`` overlay does not skip reshard on an FSDP-wrapped child;
+        otherwise it is the module's own merged ``accelerator``. A DDP module
+        has no FSDP2 units to toggle (skipped by the ``isinstance`` check), and
+        a module that keeps ``reshard_after_backward=True`` opts out here. No
         ``ParallelState`` is read (unlike :meth:`clip_grad_norm`), so this needs no
         scoping — ``set_reshard_after_backward`` just flips a flag on the unit.
         """
-        fsdp_cfg = self.args.accelerator.fsdp_config
+        fsdp_cfg = (self._mesh_accelerator or self.args.accelerator).fsdp_config
         if fsdp_cfg.fsdp_mode != "fsdp2" or fsdp_cfg.reshard_after_backward:
-            return
-        try:
-            from torch.distributed.fsdp import FSDPModule
-        except ImportError:
             return
         # ``set_reshard_after_backward`` recurses into every nested FSDP unit by
         # default, so one call on the root-sharded model covers them all (the

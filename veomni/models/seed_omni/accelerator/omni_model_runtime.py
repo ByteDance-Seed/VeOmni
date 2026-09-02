@@ -18,9 +18,8 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
-
-import torch.nn as nn
 
 from ....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
 from ....utils.logging import get_logger
@@ -34,7 +33,7 @@ from .utils import iter_named_omni_modules, save_module_subdirectory
 
 if TYPE_CHECKING:
     from ....arguments import OmniGraphProfileArguments
-    from ....arguments.omni_arguments_types import OmniModelRuntimeArguments
+    from ....arguments.omni_arguments_types import OmniModelRuntimeArguments, OmniTrainingArguments
     from ....trainer.callbacks import TrainerState
     from .module_runtime import ModuleRuntime
 
@@ -46,19 +45,15 @@ _LOSS_KEY = "_loss"
 
 
 def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, "ModuleRuntime"], train: Any = None) -> None:
-    """Fail a LoRA run that adapted no module at all.
+    """Fail a LoRA run that left the composed model with nothing to train.
 
-    A single module the config did not target is normal — that is how a composed
-    config picks which model to adapt, so ``ModuleRuntime.on_lora_matched_nothing``
-    only logs. But a config that matched *nowhere* would train nothing, and the
-    run would look healthy until the loss failed to move; only the composer can
-    tell the two apart.
+    A single module whose targets missed is normal — ``ModuleRuntime`` already
+    logs and stays frozen. A sibling doing full-parameter SFT still trains.
+    Raise only when LoRA was requested and **every** module is frozen, which
+    would look like a healthy run whose loss never moves.
 
-    An ``offline_cache`` job is exempt: it freezes every module by design (which
-    is why ``OmniTrainer`` builds its ``MultiOptimizer`` with ``allow_empty``),
-    so "nothing is trainable" there says nothing about the LoRA config — and a
-    cache pass is usually run from the training YAML with only
-    ``--train.train_type`` overridden, carrying its ``lora_config`` along.
+    ``offline_cache`` is exempt: it freezes every module by design (and is
+    usually the training YAML with only ``--train.train_type`` overridden).
     """
     if getattr(train, "train_type", None) == "offline_cache":
         return
@@ -66,11 +61,12 @@ def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, "ModuleRunti
     requested = [name for name, runtime in module_runtimes.items() if bool(runtime.args.lora_config)]
     if not requested:
         return
-    if any(module_runtimes[name].has_trainable_parameters for name in requested):
+    if any(runtime.has_trainable_parameters for runtime in module_runtimes.values()):
         return
     raise ValueError(
-        f"LoRA was configured for module(s) {requested} but produced no trainable adapters in any of them. "
-        "Select at least one Linear or MoE target that the module actually declares."
+        f"LoRA was configured for module(s) {requested} but produced no trainable "
+        "adapters, and no other module has trainable parameters. "
+        "Select at least one Linear or MoE target that a module actually declares."
     )
 
 
@@ -104,19 +100,21 @@ class OmniModelRuntime:
         *,
         module_runtimes: Mapping[str, ModuleRuntime] | None = None,
         module_parallel_state_names: Iterable[str] | None = None,
+        omni_model_runtime_args: OmniModelRuntimeArguments | None = None,
     ) -> None:
         self.model = model
         self.module_runtimes = dict(module_runtimes or {})
         self._module_parallel_state_names = set(module_parallel_state_names or ())
+        self.omni_model_runtime_args = omni_model_runtime_args
         self._step_profiler: GraphProfiler | None = None
         self._losses: dict[str, Any] = {}
 
     @classmethod
     def from_model_runtime(
         cls,
-        model_runtime: OmniModelRuntimeArguments,
+        omni_model_runtime_args: OmniModelRuntimeArguments,
         *,
-        train: Any = None,
+        train: OmniTrainingArguments = None,
         for_inference: bool = False,
     ) -> OmniModelRuntime:
         """Compose a VeOmni-managed model from a resolved :class:`OmniModelRuntimeArguments`.
@@ -127,10 +125,9 @@ class OmniModelRuntime:
         """
         from .module_runtime import ModuleRuntime
 
-        omni_config = model_runtime.to_hf_config()
-        module_runtime_args = model_runtime.modules
+        omni_config = omni_model_runtime_args.to_hf_config()
+        module_runtime_args = omni_model_runtime_args.modules
         module_runtimes: dict[str, ModuleRuntime] = {}
-        modules: dict[str, nn.Module] = {}
         for name in omni_config.module_names:
             module_args = module_runtime_args[name]
             module_runtime = ModuleRuntime(
@@ -138,20 +135,100 @@ class OmniModelRuntime:
                 module_name=name,
                 train=train,
                 for_inference=for_inference,
+                global_accelerator=omni_model_runtime_args.accelerator,
             )
             module_runtime.checkpoint_subfolder = omni_config.module_checkpoint_subfolder(name)
             module_runtimes[name] = module_runtime
-            modules[name] = module_runtime.model
             logger.info_rank0(f"OmniModelRuntime: built ModuleRuntime '{name}' from {module_args.model_path}")
 
-        logger.info_rank0(f"OmniModelRuntime: composed OmniModel with {len(modules)} module(s) ({list(modules)}).")
+        logger.info_rank0(
+            f"OmniModelRuntime: composed OmniModel with {len(module_runtimes)} module(s) ({list(module_runtimes)})."
+        )
         if not for_inference:
             _reject_lora_that_matched_nothing(module_runtimes, train)
-        return cls(
-            OmniModel(omni_config, modules),
+        runtime = cls(
+            OmniModel(omni_config, {name: rt.model for name, rt in module_runtimes.items()}),
             module_runtimes=module_runtimes,
             module_parallel_state_names=[name for name in module_runtimes if is_parallel_state_registered(name)],
+            omni_model_runtime_args=omni_model_runtime_args,
         )
+        runtime._parallelize_composed_model(for_inference=for_inference)
+        return runtime
+
+    def _parallelize_composed_model(self, *, for_inference: bool = False) -> None:
+        """``fully_shard`` the composed :class:`OmniModel` when ``fsdp_scope='model'``.
+
+        Each :class:`ModuleRuntime` has already meta-initialized, frozen, and
+        bound assets, but skipped its own wrap. One FSDP2 tree over the parent
+        matches a monolithic ``train_janus`` wrap: layer ``fully_shard`` on
+        every child's ``_no_split_modules`` (aggregated onto OmniModel by
+        ``post_init``), then each OmniModule child, then the OmniModel root. Child classes must be FSDP units because the
+        training graph calls ``child(**kwargs)`` (via ``call_graph_endpoint``),
+        never ``OmniModel.forward()`` — leftover params (VQVAE, SigLIP aligner,
+        LLaMA final norm) live on the child FSDP unit and only unshard when
+        that child is invoked. Weights still load per split-checkpoint subfolder.
+        """
+        args = self.omni_model_runtime_args
+        acc = args.accelerator
+        if acc.fsdp_config.fsdp_scope != "model" or acc.fsdp_config.fsdp_mode == "eager":
+            return
+
+        modules = self.module_runtimes
+        basic_modules: list[str] = list(getattr(self.model, "_no_split_modules", None) or [])
+        for runtime in modules.values():
+            basic_modules.extend(runtime.args.basic_modules or [])
+            # Nested FSDP unit so graph dispatch on the child unshards leftover params.
+            basic_modules.append(type(runtime.model).__name__)
+
+        kwargs: dict[str, Any] = {
+            "cpu_load_param_name": None,
+            "module_skip_hf_weight_load": {name: runtime.skip_hf_weight_load for name, runtime in modules.items()},
+            "module_is_peft_model": {name: bool(runtime.args.lora_config) for name, runtime in modules.items()},
+            "module_adapter_path": {
+                name: (runtime.args.lora_config or {}).get("lora_adapter") for name, runtime in modules.items()
+            },
+        }
+        if any(kwargs["module_is_peft_model"].values()):
+            kwargs["is_peft_model"] = True
+
+        from ....distributed.torch_compile import CompileConfig
+        from ....distributed.torch_parallelize import build_parallelize_model
+
+        compile_config = CompileConfig(
+            **{field.name: getattr(acc.torch_compile, field.name) for field in fields(CompileConfig)}
+        )
+        opt = args.optimizer
+        muon_expert_zero_comm = bool(opt) and opt.type == "muon" and opt.muon_expert_zero_comm
+        weights_path = {name: runtime.args.model_path for name, runtime in modules.items()}
+
+        logger.info_rank0(f"OmniModelRuntime: wrapping composed OmniModel (fsdp_scope='model') over {list(modules)}.")
+        # Trainer registered ``base`` from the same top-level accelerator.
+        scope = use_parallel_state("base") if is_parallel_state_registered("base") else nullcontext()
+        with scope:
+            self.model = build_parallelize_model(
+                self.model,
+                init_device=acc.init_device,
+                weights_path=weights_path,
+                should_skip_hf_weight_load=False,
+                enable_reshard_after_forward=acc.fsdp_config.reshard_after_forward,
+                mixed_precision=acc.fsdp_config.mixed_precision,
+                enable_gradient_checkpointing=False,
+                basic_modules=list(dict.fromkeys(basic_modules)),
+                enable_reentrant=acc.gradient_checkpointing.enable_reentrant,
+                early_stop=acc.gradient_checkpointing.early_stop,
+                enable_forward_prefetch=acc.fsdp_config.forward_prefetch,
+                enable_fsdp_offload=acc.fsdp_config.offload,
+                fsdp_offload_pin_memory=acc.fsdp_config.offload_pin_memory,
+                broadcast_model_weights_from_rank0=acc.broadcast_model_weights_from_rank0,
+                ep_sharded_stream_load=acc.ep_sharded_stream_load,
+                max_load_broadcast_size=acc.fsdp_config.max_load_broadcast_size,
+                muon_expert_zero_comm=muon_expert_zero_comm,
+                compile_config=compile_config,
+                **kwargs,
+            )
+
+        for runtime in modules.values():
+            runtime.finish_deferred_parallelize(for_inference=for_inference)
 
     def __getattr__(self, name: str) -> Any:
         """Forward undshadowed :class:`OmniModel` APIs."""

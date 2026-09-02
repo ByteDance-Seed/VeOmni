@@ -67,7 +67,7 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         self._dtype = dtype
         self._dummy_pixel_values = torch.zeros(cfg.num_channels, cfg.image_size, cfg.image_size, dtype=dtype)
 
-    def __call__(
+    def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent

@@ -188,19 +188,19 @@ OmniInferencer                       -> tasks/omni/infer_omni.py
 
 V2 reuses lower-level libraries (`distributed/`, `optim/`, `models/`, `data/`, `checkpoint/`) and does **not** inherit `BaseTrainer` — but `ModuleRuntime` **does** subclass `VeOmniModelRuntime`, because a module *is* one model's training unit; the composed-model and job layers are what V2 replaces.
 
-`ModuleRuntime(VeOmniModelRuntime)` inherits the whole build sequence (meta-init, freeze/LoRA, FSDP2/DDP wrap + weight load, optimizer, lr-scheduler, `ParallelState` registration) and overrides only where a *module* differs from a standalone model:
+`ModuleRuntime(VeOmniModelRuntime)` inherits the whole build sequence (meta-init, freeze/LoRA, FSDP2/DDP wrap + weight load, optimizer, lr-scheduler, `ParallelState` registration) and overrides only where a *module* differs from a standalone model. `accelerator.fsdp_config.fsdp_scope` (`module` default, or `model`) chooses whether each module wraps itself or `OmniModelRuntime` `fully_shard`s the composed `OmniModel` once after all modules are meta-initialized. Under `model` scope, each OmniModule class is still a nested FSDP unit because the graph invokes children, not `OmniModel.forward()`.
 
 | Override | Why a module differs |
 |----------|----------------------|
 | `build_model` | reads `model_path`, not `config_path` — the latter is inherited from the composed model and points at the Omni root, whose `config.json` is the `OmniConfig` |
 | `build_model_assets` | binds the preprocessor onto the model (`bind_module_assets`), because the graph calls the module; HF export reads it back off the live model |
 | `freeze_model` | heads the base's parameter table and VRAM reading with the module's name — N modules build in sequence, so an unattributed report says nothing about which one moved the number |
-| `build_parallelized_model` | a custom runtime subclass may own the wrap via `customized_build_parallelize_model` (e.g. EP-sharded CPU streaming) |
+| `build_parallelized_model` | a custom runtime subclass may own the wrap via `customized_build_parallelize_model` (e.g. EP-sharded CPU streaming). `fsdp_scope='model'` makes this a no-op so the composer can wrap `OmniModel` |
 | `build_optimizer` / `build_lr_scheduler` | no-op for a fully-frozen module; both scope to the module's own mesh |
 | `build_checkpoint` | per-module `OmniModuleCheckpointManager` under `<save_path>/global_step_N/<module>/`, and **none at all** when frozen — which is why `load` / `save_dcp` / `save_hf_or_lora` tolerate a missing manager |
 | `clip_grad_norm` | returns *this* module's norm (`veomni_omni_module_clip_grad_norm`); the orchestrator combines them |
 | `skip_hf_weight_load` | a frozen module with persistent state has no DCP payload to restore, so it must veto the skip |
-| `on_lora_matched_nothing` | `lora_config` is a `BaseModelArguments` field, so it reaches **every** module — "no targets here" is how a config picks which model to adapt, and the module just stays frozen. A config that matched nowhere is still an error, raised once by the composer (`_reject_lora_that_matched_nothing`, which exempts an `offline_cache` pass since that freezes everything by design) |
+| `on_lora_matched_nothing` | `lora_config` is a `BaseModelArguments` field, so it reaches **every** module — "no targets here" is how a config picks which model to adapt, and the module just stays frozen. The composer (`_reject_lora_that_matched_nothing`) only errors when LoRA was requested **and** the composed model has no trainable parameters anywhere (a sibling doing full SFT is enough). `offline_cache` is exempt. |
 | `save_model_assets` | raises: per-module sidecars go out through `collect_hf_export_assets`, the composed root's through `OmniTrainer.save_model_assets` |
 | `__call__` | a direct forward enters the module's own `ParallelState`, since attention resolves its all-to-all group from the current state; gated on registration like `OmniModelRuntime.module_context`, because an eager-inference module never ran `setup` |
 
@@ -211,7 +211,7 @@ Config split:
 | Layer | Config source | Owns |
 |-------|---------------|------|
 | **OmniModel** | `OmniConfig`, projected from `OmniModelRuntimeArguments.to_hf_config()` | graph topology, module wiring |
-| **ModuleRuntime** | slim `OmniModuleRuntimeArguments` (`model` + `accelerator` + `optimizer`) + launcher `train` | FSDP, optimizer, checkpoint per module |
+| **ModuleRuntime** | slim `OmniModuleRuntimeArguments` (`model` + `accelerator` + `optimizer`) + launcher `train` | FSDP (or deferred wrap when `fsdp_scope='model'`), optimizer, checkpoint per module |
 | **OmniModelRuntime** | `OmniModelRuntimeArguments` via `from_model_runtime()` | graph loops, module runtimes, graph trace, metering |
 | **OmniTrainer** | launcher YAML + `OmniArguments` | dist init, dataloader, train loop, multi-opt |
 

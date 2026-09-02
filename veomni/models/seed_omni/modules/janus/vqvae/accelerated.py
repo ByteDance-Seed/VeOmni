@@ -18,6 +18,7 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from .configuration import JanusVqvaeConfig
 from .modeling import JanusVqvae
+from .packed import PackedTrainingMixin
 from .processing import JanusVqvaeProcessor
 
 
@@ -199,7 +200,7 @@ class MeterMixin(MetricMeterMixin):
         return 0.0
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, MeterMixin):
     """``generate()`` / ``finalize()`` and the VQ-buffer inference state already
     live on the native :class:`~.modeling.JanusVqvae` (via its own
     :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.

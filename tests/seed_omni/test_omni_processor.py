@@ -10,8 +10,8 @@ class _RecordingPreprocessor:
         self._tag = tag
         self._store = store
 
-    def __call__(self, conversation_list, inference=False, **kwargs) -> None:
-        del inference, kwargs
+    def __call__(self, batch, inference=False, **kwargs) -> None:
+        del batch, inference, kwargs
         self._store.append(self._tag)
 
 
@@ -51,14 +51,14 @@ def test_omni_processor_preprocess_batch_runs_with_inference_false():
     calls: list[tuple[str, bool]] = []
 
     class _FlagPreprocessor:
-        def __call__(self, conversation_list, inference=False, **kwargs) -> None:
-            del conversation_list, kwargs
+        def __call__(self, batch, inference=False, **kwargs) -> None:
+            del batch, kwargs
             calls.append(("batch", inference))
 
     processor = OmniProcessor({"a": _FlagPreprocessor()})
     batches = [[ConversationItem(type="text", value="hi", role="user")]]
 
-    processor.preprocess_batch(batches, inference=False)
+    processor.preprocess_batch({"conversation_list": batches}, inference=False)
 
     assert calls == [("batch", False)]
 
@@ -114,4 +114,31 @@ def test_omni_processor_from_config_forwards_module_model_config_overrides(mock_
 
     fake_mod_cls.preprocessor_class.from_pretrained.assert_called_once_with(
         "/tmp/checkpoint_root/encoder", config_overrides={"enable_image": True}
+    )
+
+
+@patch("veomni.models.seed_omni.processing_omni.OMNI_MODEL_REGISTRY")
+@patch("veomni.models.seed_omni.processing_omni.read_model_type", return_value="encoder_type")
+def test_omni_processor_from_config_forwards_module_processor_config(mock_read_model_type, mock_registry):
+    """YAML ``processor_config:`` is splatted as kwargs, matching ``build_processor``."""
+    del mock_read_model_type
+    fake_mod_cls = MagicMock()
+    mock_registry.__getitem__.return_value = MagicMock(return_value=fake_mod_cls)
+    config = OmniConfig(
+        modules={
+            "encoder": {
+                "subfolder": "encoder",
+                "processor_config": {"packed_preprocess": True},
+            }
+        },
+        training_graph=[{"from": "encoder", "to": "end"}],
+        generation_graphs={"infer_gen": {"initial": "run", "states": {}}},
+    )
+
+    OmniProcessor.from_config(config, checkpoint_root="/tmp/checkpoint_root")
+
+    fake_mod_cls.preprocessor_class.from_pretrained.assert_called_once_with(
+        "/tmp/checkpoint_root/encoder",
+        config_overrides={},
+        packed_preprocess=True,
     )

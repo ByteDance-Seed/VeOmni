@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +43,9 @@ MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 
 
 logger = logging.get_logger(__name__)
+
+if TYPE_CHECKING:
+    from ..models.seed_omni.processing_omni import OmniProcessor
 
 _LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
 
@@ -589,7 +592,7 @@ class SeedOmniCollator(DataCollator):
 
     Example::
 
-        collator = SeedOmniCollator()
+        collator = SeedOmniCollator(processor=processor)
         batch = collator([
             {"conversation_list": [{"type": "text", "value": "hi", ...}]},
             {"conversation_list": [{"type": "image", "value": <Tensor>, ...}]},
@@ -599,16 +602,14 @@ class SeedOmniCollator(DataCollator):
     ``processor`` is an :class:`~veomni.models.seed_omni.processing_omni.OmniProcessor` built
     via :meth:`~veomni.models.seed_omni.processing_omni.OmniProcessor.from_config` from the
     active graph modules' config (see ``OmniTrainer._build_train_dataloader``). Its preprocessor
-    chain runs, in order, over the grouped ``conversation_list`` so the heavy per-module CPU
-    input-prep (tokenize / image normalize) executes inside the DataLoader worker and
-    overlaps with GPU compute via prefetch, instead of blocking the main process inside each
-    module's ``pre_forward``. Default ``None`` => pure grouping (all other behaviour unchanged).
-
-    ``preprocessors`` is a legacy escape hatch for tests; prefer ``processor``.
+    chain runs, in order, over the grouped batch (``conversation_list`` plus any extra
+    keys) so the heavy per-module CPU input-prep (tokenize / image normalize, and
+    for Janus packed training the packed-tensor write-back) executes inside the
+    DataLoader worker and overlaps with GPU compute via prefetch, instead of
+    blocking the main process inside each module's ``pre_forward``.
     """
 
-    processor: Any = None
-    preprocessors: Sequence[Callable[[List[List[Any]]], None]] = ()
+    processor: "OmniProcessor"
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if not features:
@@ -633,16 +634,9 @@ class SeedOmniCollator(DataCollator):
 
         batch = {key: [f[key] for f in features] for key in first_keys}
 
-        # Run each active module's worker-side CPU input-prep (tokenize / image
-        # normalize) over the grouped conversation_list. Mutates items in place;
-        # the modules' thin pre_forward then only moves to device.
-        #
-        # Order is FIXED and SERIAL: preprocessors run one-by-one in config
-        # ``modules:`` declaration order (see :class:`OmniProcessor`).
-        if self.processor is not None:
-            self.processor.preprocess_batch(batch["conversation_list"], inference=False)
-        else:
-            for preprocess in self.preprocessors:
-                preprocess(batch["conversation_list"])
-
+        # Worker-side CPU input-prep (tokenize / image normalize) over the grouped
+        # batch. Mutates items in place; the modules' thin pre_forward then only
+        # moves to device. Order is FIXED and SERIAL: ``config.modules:``
+        # declaration order (see :class:`OmniProcessor`).
+        self.processor.preprocess_batch(batch, inference=False)
         return batch

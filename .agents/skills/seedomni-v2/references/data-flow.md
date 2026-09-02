@@ -13,9 +13,9 @@ raw data transforms, or request preprocessing.
    - Input: list of per-sample dicts.
    - Output: `{"conversation_list": [[...], ...]}` plus aligned extra keys.
    - No tensor stacking, sequence padding, or SP slicing happens here.
-3. `SeedOmniCollator` runs ordered `Preprocessor`s:
-   - The trainer collects them from active graph modules.
-   - They run serially in module declaration order.
+3. `SeedOmniCollator` always runs the bound `OmniProcessor`:
+   - Built from active graph modules (`OmniProcessor.from_config`).
+   - Preprocessors run serially in module declaration order.
    - They mutate `ConversationItem.value`, `source`, and `meta` in place.
 4. Module `pre_forward` becomes thin:
    - Select items by `type`, `role`, and usually `source`.
@@ -23,6 +23,14 @@ raw data transforms, or request preprocessing.
 5. Module forward/modeling runs GPU work and returns a dict.
 6. `post_forward` scatters outputs back to carrier items and returns
    `{"conversation_list": conversation}` or scalar `*_loss` values.
+
+Janus packed training (`graph_train_packed.yaml`) is an optional second
+path: after step 3 the text-encoder preprocessor also writes packed tensors
+onto the collator batch dict. Packed graph nodes (`pack_encode` /
+`pack_forward` / `pack_decode`) read those tensors and `masked_scatter`
+embeddings onto `packed_features` instead of walking `conversation_list`.
+Dummy FSDP-anchor images stay off the packed sequence and are folded with
+`mean() * 0`.
 
 ## Preprocessor Contract
 
@@ -33,7 +41,8 @@ Rules:
 - It must be picklable and weight-free.
 - It must use CPU-safe assets only: tokenizer, image processor, config values,
   special token IDs. Never store the `nn.Module`.
-- It mutates `conversation_list` in place.
+- It mutates `batch["conversation_list"]` in place. Packed Janus writes tensors
+  onto the same `batch` dict instead of walking items.
 - It must not allocate CUDA tensors.
 - It is shared by training and inference:
   - Training: run by `SeedOmniCollator` inside DataLoader workers.

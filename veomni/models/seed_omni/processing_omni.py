@@ -120,10 +120,10 @@ class OmniProcessor:
         its checkpoint subfolder — no model instance is built at all (not even a
         ``meta``-device one). ``config.module_model_config(name)`` (the module's
         YAML ``model_config:`` block) is forwarded as ``config_overrides`` so a
-        preprocessor that reads a behavior-affecting config field (e.g.
-        ``enable_image``, ``cache_mode``) agrees with what the live model is
-        actually configured with, instead of silently falling back to the
-        on-disk ``config.json`` default.
+        preprocessor that reads a behavior-affecting model field (e.g.
+        ``enable_image``) agrees with the live model. ``config.module_processor_config(name)``
+        (YAML ``processor_config:``) is splatted as kwargs, matching
+        ``build_processor(path, **processor_config)``.
         """
         root = checkpoint_root if checkpoint_root is not None else getattr(config, "_name_or_path", None)
         root = None if root is None else str(root)
@@ -136,7 +136,9 @@ class OmniProcessor:
             if preprocessor_cls is None:
                 continue
             preprocessor = preprocessor_cls.from_pretrained(
-                module_path, config_overrides=config.module_model_config(name)
+                module_path,
+                config_overrides=config.module_model_config(name),
+                **config.module_processor_config(name),
             )
             if preprocessor is not None:
                 preprocessors[name] = preprocessor
@@ -165,8 +167,8 @@ class OmniProcessor:
     ) -> dict[str, Any]:
         """Build and preprocess a single inference request.
 
-        Returns a dict suitable for :meth:`OmniModel.generate` — currently
-        ``{"conversation_list": [...]}``.
+        Returns a dict suitable for :meth:`OmniModel.generate` —
+        ``{"conversation_list": [...]}`` (a single conversation).
         """
         del videos  # video inputs follow the same path once callers pass PIL/VideoInputs
 
@@ -182,23 +184,33 @@ class OmniProcessor:
         **generation_kwargs: Any,
     ) -> dict[str, Any]:
         """Run the module preprocessor chain on an existing ``conversation_list``."""
-        self.preprocess_batch([conversation], inference=inference, **generation_kwargs)
-        return {"conversation_list": conversation}
+        batch = {"conversation_list": [conversation]}
+        self.preprocess_batch(batch, inference=inference, **generation_kwargs)
+        return {"conversation_list": batch["conversation_list"][0]}
 
     def preprocess_batch(
         self,
-        conversation_batches: Sequence[list[Any]],
+        batch: dict[str, Any],
         *,
         inference: bool = False,
         **generation_kwargs: Any,
     ) -> None:
-        """Run the module preprocessor chain over a batched ``conversation_list``.
+        """Run the module preprocessor chain over a collated batch.
 
-        Training passes ``inference=False`` (default); single-request inference uses
-        :meth:`preprocess` / :meth:`__call__` with ``inference=True``.
+        ``batch`` must contain ``conversation_list`` as
+        ``list[list[ConversationItem]]``. Training collator passes the full
+        feature dict; :meth:`preprocess` builds ``{"conversation_list": [conversation]}``.
+        Packed Janus writes extra tensors onto this same dict.
+
+        Training passes ``inference=False`` (default); single-request inference
+        uses :meth:`preprocess` / :meth:`__call__` with ``inference=True``.
         """
         for preprocessor in self._preprocessors.values():
-            preprocessor(conversation_batches, inference=inference, generation_kwargs=generation_kwargs or None)
+            preprocessor(
+                batch,
+                inference=inference,
+                generation_kwargs=generation_kwargs or None,
+            )
 
 
 __all__ = [

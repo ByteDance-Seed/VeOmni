@@ -164,8 +164,8 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
   already-resolved `ModuleRuntime.model_config` taken straight from the live model in
   memory — no disk re-read, no re-applying config overrides — instead of the model
   constructing dummy inputs at init time and threading them into the processor.
-- **Training:** the bound `OmniProcessor` (or its per-module preprocessors) is run inside
-  `SeedOmniCollator` (DataLoader worker).
+- **Training:** the bound `OmniProcessor` is run inside `SeedOmniCollator`
+  (DataLoader worker).
 - **Inference:** run by `OmniInferencer._preprocess_request` over the request once,
   before the FSM — **module `generate` no longer processes raw input** (only
   packs → encodes → scatters; mid-FSM-generated items are the one exception).

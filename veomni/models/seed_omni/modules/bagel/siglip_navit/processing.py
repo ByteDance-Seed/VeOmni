@@ -364,7 +364,7 @@ class BagelSiglipNavitPreprocessor(ModulePreprocessorBase):
         self._dtype = dtype
         self._dummy_pixel_values = torch.zeros(1, patch_dim, dtype=dtype)
 
-    def __call__(
+    def preprocess_conversations(
         self,
         conversation_list: list[list[ConversationItem]],
         *,

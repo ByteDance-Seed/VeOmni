@@ -14,6 +14,7 @@
 
 
 import types
+from collections.abc import Mapping
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -101,7 +102,7 @@ def _has_extra_parallel_plan(model: nn.Module) -> bool:
 
 def _materialize_and_load_weights(
     model: nn.Module,
-    weights_path: Optional[str],
+    weights_path: Optional[str | Mapping[str, str]],
     materialize_device: str,
     *,
     should_skip_hf_weight_load: bool,
@@ -112,13 +113,57 @@ def _materialize_and_load_weights(
     max_load_broadcast_size: float = 20.0,
     fqn_to_index_mapping: Optional[dict] = None,
     ep_sharded_stream_load: bool = False,
+    module_skip_hf_weight_load: Optional[Mapping[str, bool]] = None,
+    module_is_peft_model: Optional[Mapping[str, bool]] = None,
+    module_adapter_path: Optional[Mapping[str, Optional[str]]] = None,
 ) -> None:
     """Move meta-initialized parameters onto a real device and fill them in.
 
     Shared by the FSDP2 and DDP paths: both build the model on ``meta`` and are
     the only place that materializes it, so the choice between random init, an
     HF snapshot and a checkpoint resume has to be made identically for each.
+
+    ``weights_path`` is ``None`` (random init), a single HF snapshot for the
+    whole ``model``, or a ``{child_name: snapshot_path}`` mapping for a composed
+    model whose children each have their own split-checkpoint subfolder (SeedOmni
+    ``fsdp_scope='model'``). Per-child skip / LoRA flags override the scalars
+    when the mapping form is used.
     """
+    if isinstance(weights_path, Mapping):
+        children = dict(model.named_children())
+        missing = [name for name in weights_path if name not in children]
+        if missing:
+            raise KeyError(
+                f"weights_path mapping has unknown child module(s) {missing}; model children are {sorted(children)}."
+            )
+        skip_map = dict(module_skip_hf_weight_load or {})
+        peft_map = dict(module_is_peft_model or {})
+        adapter_map = dict(module_adapter_path or {})
+        for name, path in weights_path.items():
+            _materialize_and_load_weights(
+                children[name],
+                path,
+                materialize_device,
+                should_skip_hf_weight_load=bool(skip_map.get(name, should_skip_hf_weight_load)),
+                is_peft_model=bool(peft_map.get(name, is_peft_model)),
+                adapter_path=adapter_map.get(name, adapter_path),
+                broadcast_from_rank0=broadcast_from_rank0,
+                cpu_load_param_name=cpu_load_param_name,
+                max_load_broadcast_size=max_load_broadcast_size,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+                ep_sharded_stream_load=ep_sharded_stream_load,
+            )
+        leftover_meta = [
+            name
+            for name, child in children.items()
+            if name not in weights_path and any(param.is_meta for param in child.parameters())
+        ]
+        if leftover_meta:
+            raise ValueError(
+                "weights_path mapping left meta-initialized children unmaterialized: "
+                f"{leftover_meta}; mapped={sorted(weights_path)}."
+            )
+        return
     # A full non-LoRA checkpoint will overwrite the model, so its resume path can
     # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
     # and still need the HF base weights.
@@ -312,7 +357,7 @@ def _can_shard_extra_parallel_dim0(
 
 def parallelize_model_fsdp2(
     model: "nn.Module",
-    weights_path: Optional[str] = None,
+    weights_path: Optional[str | Mapping[str, str]] = None,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
@@ -683,6 +728,9 @@ def parallelize_model_fsdp2(
         max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
         fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
+        module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
+        module_is_peft_model=kwargs.pop("module_is_peft_model", None),
+        module_adapter_path=kwargs.pop("module_adapter_path", None),
     )
 
     if materialize_device == "cpu":
@@ -802,7 +850,7 @@ def parallelize_model_ddp(
 
 def build_parallelize_model(
     model: "nn.Module",
-    weights_path: Optional[str] = None,
+    weights_path: Optional[str | Mapping[str, str]] = None,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
@@ -815,10 +863,11 @@ def build_parallelize_model(
     """Apply parallel strategies to the model.
 
     Args:
-        weights_path: ``None`` for random init, or a single HF snapshot for the
-            whole ``model``. The single-model trainers (BaseTrainer / VLMTrainer
-            / TextTrainer / DiTTrainer) pass ``args.model.model_path``; SeedOmni
-            V2 calls this once per ``ModuleRuntime``, with that module's path.
+        weights_path: ``None`` for random init, a single HF snapshot for the
+            whole ``model``, or ``{child_name: snapshot_path}`` for a composed
+            model (SeedOmni ``fsdp_scope='model'``). The single-model trainers
+            pass ``args.model.model_path``; per-module SeedOmni wrap passes that
+            module's path; the composed wrap passes one path per child.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """

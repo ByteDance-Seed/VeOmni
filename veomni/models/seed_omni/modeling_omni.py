@@ -88,6 +88,7 @@ class OmniModel(PreTrainedModel):
     base_model_prefix = "omni"
     main_input_name = "conversation_list"
     supports_gradient_checkpointing = False
+    _no_split_modules = []
 
     def __init__(self, config: OmniConfig, modules: Mapping[str, nn.Module]):
         super().__init__(config)
@@ -95,6 +96,11 @@ class OmniModel(PreTrainedModel):
         self._module_names: list[str] = list(config.module_names)
         for name in self._module_names:
             self.add_module(name, modules[name])
+
+        # ``PreTrainedModel.post_init`` unions children's ``_no_split_modules``
+        # (FSDP unit class names) onto the composite model. ``super().__init__``
+        # ran it before the children existed.
+        self.post_init()
 
         self.training_graph = TrainingGraph(config.training_graph)
         self.generation_graph = GenerationGraph(config.generation_graph)

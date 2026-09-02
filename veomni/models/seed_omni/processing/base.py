@@ -25,8 +25,8 @@ Terminology (three different "processor" layers)
 * **Module CPU worker — ``XxxPreprocessor(ModulePreprocessorBase)``** (same file):
   Picklable, weight-free object run inside DataLoader workers (training) or
   once before the generation FSM (inference).  Usually *wraps* the HF asset
-  (``self._image_processor``, ``self._tokenizer``, …) and mutates
-  ``conversation_list`` in place via ``__call__``.
+  (``self._image_processor``, ``self._tokenizer``, …) and mutates the collator
+  ``batch`` dict in place via ``__call__``.
 
 * **Omni orchestrator — ``OmniProcessor``** (``processing_omni.py``):
   Composes one ``XxxPreprocessor`` per active graph module — the SeedOmni
@@ -62,10 +62,12 @@ class ModulePreprocessorBase:
     * **CPU only.** Workers must not touch the training CUDA device; build CPU
       tensors (no ``device=``).  The main process's thin ``pre_forward`` does the
       single ``.to(device)``.
-    * **In-place mutation.** ``__call__`` receives the batched
-      ``conversation_list`` (``list[list[ConversationItem]]``) and mutates items'
-      ``value`` / ``meta`` in place, tagging the module ``source`` so the thin
-      ``pre_forward`` / ``generate`` reads the heavy work back uniformly.
+    * **In-place mutation.** ``__call__`` receives the collator ``batch`` dict
+      (must contain ``conversation_list`` as ``list[list[ConversationItem]]``).
+      The default path mutates those items' ``value`` / ``meta`` in place and
+      tags the module ``source`` so the thin ``pre_forward`` / ``generate``
+      reads the heavy work back uniformly. A packed preprocessor may write
+      tensors onto the same dict instead of walking items.
     * **Shared by training + inference.** Training runs it inside
       :class:`~veomni.data.data_collator.SeedOmniCollator` (DataLoader worker);
       inference runs it once over the request in
@@ -90,10 +92,17 @@ class ModulePreprocessorBase:
       there.
     """
 
-    def __call__(self, conversation_list: list[list[Any]], inference: bool = False, **kwargs: Any) -> None:
+    def __call__(self, batch: dict[str, Any], inference: bool = False, **kwargs: Any) -> None:
+        """Run CPU prep on a collated ``batch`` dict (mutates it in place)."""
+        self.preprocess_conversations(batch["conversation_list"], inference=inference, **kwargs)
+
+    def preprocess_conversations(
+        self, conversation_list: list[list[Any]], inference: bool = False, **kwargs: Any
+    ) -> None:
         raise NotImplementedError(
             f"{type(self).__name__} must implement "
-            "__call__(conversation_list, inference=False, **kwargs) and mutate it in place."
+            "preprocess_conversations(conversation_list, inference=False, **kwargs) "
+            "and mutate it in place."
         )
 
     @classmethod

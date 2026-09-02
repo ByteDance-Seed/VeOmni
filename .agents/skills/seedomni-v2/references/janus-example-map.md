@@ -14,6 +14,7 @@ Use current Janus files instead of synthetic module examples.
 | Base text encoder shared behavior | `veomni/models/seed_omni/modules/base/text_encoder/` |
 | AR backbone | `veomni/models/seed_omni/modules/janus/llama/` |
 | VQ codec encode/decode | `veomni/models/seed_omni/modules/janus/vqvae/` |
+| Packed training (CPU pack + mask scatter) | `veomni/models/seed_omni/modules/janus/packing.py` + per-module `packed.py` |
 | Split checkpoint conversion | `veomni/models/seed_omni/modules/janus/convert_model.py` |
 
 ## Configs
@@ -25,6 +26,9 @@ Use current Janus files instead of synthetic module examples.
 | Eager inference module overrides | `configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml` |
 | Distributed inference module overrides | `configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml` |
 | Training graph | `configs/seed_omni/Janus/janus_1.3b/graph_train.yaml` |
+| Packed training graph | `configs/seed_omni/Janus/janus_1.3b/graph_train_packed.yaml` |
+| Packed training launcher | `configs/seed_omni/Janus/janus_1.3b/base_packed.yaml` |
+| Model-level FSDP launcher | `configs/seed_omni/Janus/janus_1.3b/base_model_fsdp.yaml` |
 | Text-to-image FSM | `configs/seed_omni/Janus/janus_1.3b/graph_infer_gen.yaml` |
 | Image understanding FSM | `configs/seed_omni/Janus/janus_1.3b/graph_infer_und.yaml` |
 | Interleave FSM | `configs/seed_omni/Janus/janus_1.3b/graph_infer_interleave.yaml` |

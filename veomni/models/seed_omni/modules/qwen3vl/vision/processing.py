@@ -123,7 +123,7 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
         self._dummy_pixel_values = torch.zeros(t * h * w, pixel_row, dtype=dtype)
         self._dummy_grid = [t, h, w]
 
-    def __call__(
+    def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent

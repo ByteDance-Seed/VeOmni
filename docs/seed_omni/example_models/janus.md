@@ -19,7 +19,11 @@ drives the inferencer.
 |------|------|
 | `base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. References the module/graph files below. |
 | `modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
+| `modules_train_packed.yaml` | Same as `modules_train.yaml` plus `janus_text_encoder.processor_config.packed_preprocess: true`. |
 | `graph_train.yaml` | Training DAG — the file *is* the flat edge list. |
+| `graph_train_packed.yaml` | Packed training DAG (`pack_encode` / `pack_forward` / `pack_decode`). |
+| `base_packed.yaml` | Packed-training launcher (`modules_train_packed.yaml` + packed graph). |
+| `base_model_fsdp.yaml` | Conversation DAG with `fsdp_scope: model` (one FSDP tree over OmniModel). |
 | `data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
 | `modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager (base.yaml's default `infer.modules`). |
 | `modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager` (single-process replica). |
@@ -81,6 +85,17 @@ or multi-node). Pass the task and config after it.
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Janus/janus_1.3b/base.yaml
+```
+
+Packed training (CPU-built packed tokens/masks; modules only `masked_scatter`) uses
+`base_packed.yaml`. A single FSDP2 tree over the composed OmniModel (old
+`train_janus`-style wrap) uses `base_model_fsdp.yaml`, or add
+`--accelerator.fsdp_config.fsdp_scope model` to either launcher. Combined:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Janus/janus_1.3b/base_packed.yaml \
+  --accelerator.fsdp_config.fsdp_scope model
 ```
 
 Key knobs (override on the CLI, e.g. `--train.global_batch_size 32`):

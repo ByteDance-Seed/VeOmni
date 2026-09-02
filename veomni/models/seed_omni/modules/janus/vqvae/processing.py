@@ -120,7 +120,7 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         self._dtype = dtype
         self._dummy_pixel_values = torch.zeros(cfg.in_channels, height, width, dtype=dtype)
 
-    def __call__(
+    def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent

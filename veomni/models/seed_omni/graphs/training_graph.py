@@ -27,8 +27,10 @@ queue.
 
 Each active node executes **exactly once** per forward pass.  Edges declare
 **topology only** (execution order) — there is no per-node input routing: every
-node receives the same shared ``batch`` and all cross-node state flows through
-the single ``conversation_list`` carrier, mutated/replaced in place as it goes.
+node receives the same shared ``batch``. Conversation graphs move state through
+the ``conversation_list`` carrier; packed graphs (Janus ``pack_encode`` /
+``pack_forward`` / ``pack_decode``) read packed tensors already written onto
+that batch dict.
 
 Single-loss protocol
 --------------------

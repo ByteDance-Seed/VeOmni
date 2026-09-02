@@ -125,9 +125,9 @@ class OmniConfig(PretrainedConfig):
     """Configuration for OmniModel V2.
 
     All nested dicts are stored as plain Python dicts for JSON serialisability.
-    Typed accessors (``module_model_config``, ``module_subfolder``,
-    ``training_edges``) provide a stable surface for the runtime / visualisation
-    tools.
+        Typed accessors (``module_model_config``, ``module_processor_config``,
+        ``module_subfolder``, ``training_edges``) provide a stable surface for the
+        runtime / visualisation tools.
 
     Tokenizers and processors are per-module assets saved alongside each
     module's checkpoint (e.g. ``janus_text_encoder/tokenizer.json``).
@@ -288,6 +288,13 @@ class OmniConfig(PretrainedConfig):
             return {}
         overrides = model_block.get("model_config")
         return dict(overrides or {})
+
+    def module_processor_config(self, name: str) -> Dict[str, Any]:
+        """Per-module ``processor_config`` kwargs for preprocessor ``from_pretrained``."""
+        entry = self.modules.get(name)
+        if not isinstance(entry, dict):
+            return {}
+        return dict(entry.get("processor_config") or {})
 
     def module_ops_implementation(self, name: str) -> Dict[str, Any]:
         """Per-module VeOmni kernel options persisted in the checkpoint."""

@@ -15,8 +15,9 @@
 """Who decides that a LoRA config was a mistake.
 
 A composed ``lora_config`` reaches every module, so a module it did not target
-just stays frozen (``ModuleRuntime.on_lora_matched_nothing``). Only the composer
-can see that it targeted *nothing anywhere*, which would train nothing at all.
+just stays frozen (``ModuleRuntime.on_lora_matched_nothing``). A sibling doing
+full-parameter SFT still trains. Only the composer can see that LoRA was
+requested and *nothing anywhere* is trainable.
 """
 
 from types import SimpleNamespace
@@ -48,16 +49,15 @@ def test_lora_that_adapted_its_module_passes():
     )
 
 
-def test_a_sibling_trainable_for_other_reasons_does_not_excuse_the_lora_config():
-    """The check reads only the modules LoRA was asked for: a fully-trained VAE
-    beside an LLM whose targets all missed still means the adapter did nothing."""
-    with pytest.raises(ValueError, match=r"module\(s\) \['llm'\]"):
-        _reject_lora_that_matched_nothing(
-            {
-                "llm": _runtime(lora=True, trainable=False),
-                "vae": _runtime(lora=False, trainable=True),
-            }
-        )
+def test_a_sibling_doing_full_sft_does_not_fail_the_lora_miss():
+    """A LoRA miss on the LLM is already logged by that module; a fully-trained
+    VAE beside it means the job still has parameters to train."""
+    _reject_lora_that_matched_nothing(
+        {
+            "llm": _runtime(lora=True, trainable=False),
+            "vae": _runtime(lora=False, trainable=True),
+        }
+    )
 
 
 def test_lora_that_matched_nowhere_is_rejected():

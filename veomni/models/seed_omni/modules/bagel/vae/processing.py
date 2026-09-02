@@ -461,7 +461,7 @@ class BagelVAEPreprocessor(ModulePreprocessorBase):
         self._dummy_pixel_values = torch.zeros(int(config.in_channels), size, size, dtype=dtype)
         self._dummy_pixel_shape = torch.tensor([size, size], dtype=torch.long)
 
-    def __call__(
+    def preprocess_conversations(
         self,
         conversation_list: list[list[ConversationItem]],
         *,

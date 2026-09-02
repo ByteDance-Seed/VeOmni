@@ -505,6 +505,23 @@ class FSDPConfig:
             )
         },
     )
+    fsdp_scope: Literal["module", "model"] = field(
+        default="module",
+        metadata={
+            "help": (
+                "Where to apply FSDP2/DDP wrap for a SeedOmni composed model. "
+                "'module' (default) wraps each OmniModule independently. "
+                "'model' wraps the composed OmniModel once (one FSDP tree over every "
+                "sub-module, matching a monolithic train_janus-style wrap). "
+                "When 'model', per-module fsdp_mode / extra_parallel / init_device "
+                "/ SP-CP-TP-PP overlays are left as written but unused for mesh, init, "
+                "and wrap: every module is initialized unwrapped using the top-level "
+                "accelerator topology, and the composer fully_shards the parent. "
+                "Inference fsdp_mode='eager' still takes the per-module eager path "
+                "and returns before the composed wrap."
+            )
+        },
+    )
     reshard_after_forward: bool = field(
         default=True,
         metadata={"help": "Enable reshard after forward for FSDP2."},
@@ -542,6 +559,8 @@ class FSDPConfig:
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
                 "'ddp', or 'eager'."
             )
+        if self.fsdp_scope not in ("module", "model"):
+            raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
 
 
 @dataclass

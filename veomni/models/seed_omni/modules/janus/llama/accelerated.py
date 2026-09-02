@@ -22,6 +22,7 @@ from ....utils.conversation import ConversationItem, is_dummy
 from ...base.llm_packing import pack_llm_conversations_for_forward, scatter_llm_hidden_states
 from .configuration import JanusLlamaConfig
 from .modeling import JanusLlama
+from .packed import PackedTrainingMixin
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -155,7 +156,7 @@ class MeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, MeterMixin):
     """``generate()`` (incl. CFG decode) and inference-state reset already live on
     the native :class:`~.modeling.JanusLlama` (via its own
     :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.

@@ -13,6 +13,7 @@ from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, 
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from .configuration import JanusSiglipConfig
 from .modeling import JanusSiglip
+from .packed import PackedTrainingMixin
 from .processing import JanusSiglipProcessor
 
 
@@ -98,7 +99,7 @@ class MeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, MeterMixin):
     config: JanusSiglipConfig
     _image_processor: JanusSiglipProcessor
 

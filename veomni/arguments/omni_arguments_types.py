@@ -122,6 +122,7 @@ class OmniModuleRuntimeArguments(ModelRuntimeArguments):
         return {
             "subfolder": module_name,
             "model": model_block,
+            "processor_config": deepcopy(self.processor_config or {}),
         }
 
 

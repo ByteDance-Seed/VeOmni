@@ -9,6 +9,11 @@ extra parallel dimensions, or distributed/eager inference configs.
 - A module may override with its own `accelerator:` block in a modules YAML.
 - Same topology should reuse the global `ParallelState`.
 - Different topology gets a module-local `ParallelState`.
+- `accelerator.fsdp_config.fsdp_scope: model` wraps the composed `OmniModel`
+  once instead of each module. Module YAML is not rewritten: mesh, init
+  device, and FSDP wrap knobs come from the top-level accelerator. Every
+  OmniModule class is still a nested FSDP unit (the graph calls children,
+  not `OmniModel.forward()`).
 
 ## Common Patterns
 

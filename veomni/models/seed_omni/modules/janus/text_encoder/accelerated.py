@@ -20,6 +20,7 @@ from ...base.text_encoder.accelerated import (
 from .chat_template import JanusChatTemplate
 from .configuration import JanusTextEncoderConfig
 from .modeling import JanusTextEncoder
+from .packed import PackedTrainingMixin
 
 
 class TrainingMixin(BaseTrainingMixin):
@@ -52,7 +53,7 @@ class TrainingMixin(BaseTrainingMixin):
         return super().decode_post(**outputs)
 
 
-class VeOmniMixin(TrainingMixin, BaseVeOmniMixin):
+class VeOmniMixin(PackedTrainingMixin, TrainingMixin, BaseVeOmniMixin):
     """Janus ``TextEncoder`` accelerated wrapper — chat-template binding only.
 
     The encode/decode plumbing and the T2I-aware ``generate`` FSM (BOS

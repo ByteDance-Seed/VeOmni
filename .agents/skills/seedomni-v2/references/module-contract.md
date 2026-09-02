@@ -47,7 +47,8 @@ modules/<family>/<submodule>/
   has multiple graph call-sites.
 - Loss keys end in `_loss` and are scalar tensors after the correct reduction.
 - Module outputs should flow by mutating/returning `conversation_list` unless
-  the current source file explicitly uses another supported carrier.
+  the current source file explicitly uses another supported carrier (Janus
+  packed training writes `packed_*` tensors on the batch dict).
 - Tokenizers and processors are module-owned assets.
 - Do not add a top-level tokenizer path.
 

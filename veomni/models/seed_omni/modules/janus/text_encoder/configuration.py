@@ -31,6 +31,3 @@ class JanusTextEncoderConfig(TextEncoderConfig):
     """
 
     model_type = "janus_text_encoder"
-
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)

@@ -356,3 +356,27 @@ def test_omni_model_resolve_generation_kwargs_uses_config_defaults():
         "temperature": 0.2,
     }
     assert model.resolve_generation_kwargs({"max_new_tokens": 8}) == {"max_new_tokens": 8}
+
+
+def test_omni_model_post_init_unions_child_no_split_modules():
+    """HF ``post_init`` (re-run after children are attached) is the aggregator."""
+
+    class _Encoder(nn.Module):
+        _no_split_modules = ["EncoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+
+    class _Decoder(nn.Module):
+        _no_split_modules = ["DecoderLayer", "EncoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+
+    config = OmniConfig(
+        modules={"encoder": {"subfolder": "encoder"}, "decoder": {"subfolder": "decoder"}},
+        training_graph=[{"from": "encoder", "to": "decoder"}, {"from": "decoder", "to": "end"}],
+        generation_graphs=_minimal_generation_graphs(),
+    )
+    model = OmniModel(config, {"encoder": _Encoder(), "decoder": _Decoder()})
+    assert model._no_split_modules == {"EncoderLayer", "DecoderLayer"}

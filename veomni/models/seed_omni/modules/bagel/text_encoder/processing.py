@@ -99,15 +99,6 @@ class BagelTextEncoderPreprocessor(TextEncoderPreprocessor):
             "generation_kwargs": kwargs.get("generation_kwargs"),
         }
 
-    def __call__(
-        self,
-        conversation_list: list[list[ConversationItem]],
-        *,
-        inference: bool = False,
-        generation_kwargs: dict[str, Any] | None = None,
-    ) -> None:
-        super().__call__(conversation_list, inference=inference, generation_kwargs=generation_kwargs)
-
 
 __all__ = [
     "apply_image_marker",
