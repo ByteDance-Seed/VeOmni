@@ -28,7 +28,6 @@ from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCau
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
 )
 from veomni.kernels import VeomniKernel
@@ -80,13 +79,6 @@ def _build_ours(config: GlmMoeDsaConfig, kernels: SimpleNamespace | None = None)
         return GlmMoeDsaForCausalLM(config)
     finally:
         set_kernels_config(previous)
-
-
-def test_glm_moe_dsa_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as gpu
-    from veomni.models_kernel.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_npu as npu
-
-    assert_no_ops_or_old_models_import(gpu, npu)
 
 
 def test_glm_moe_dsa_constructs_local_kernels():

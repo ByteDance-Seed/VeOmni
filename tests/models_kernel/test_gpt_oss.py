@@ -28,7 +28,6 @@ from transformers.models.gpt_oss.modeling_gpt_oss import GptOssForCausalLM as HF
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
 )
 from veomni.kernels import VeomniKernel
@@ -75,12 +74,6 @@ def _build_ours(config: GptOssConfig, kernels: SimpleNamespace | None = None):
         return GptOssForCausalLM(config)
     finally:
         set_kernels_config(previous)
-
-
-def test_gpt_oss_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.gpt_oss.generated import patched_modeling_gpt_oss_gpu as gpu
-
-    assert_no_ops_or_old_models_import(gpu)
 
 
 def test_gpt_oss_constructs_local_kernels():

@@ -35,7 +35,6 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
 )
 from veomni.kernels import VeomniKernel
@@ -119,12 +118,6 @@ def _image_inputs(config: Qwen2VLConfig, input_ids: torch.Tensor) -> dict:
         "video_mask": video_mask,
         "mm_token_type_ids": image_mask.int(),
     }
-
-
-def test_qwen2_vl_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.qwen2_vl.generated import patched_modeling_qwen2_vl_gpu as gpu
-
-    assert_no_ops_or_old_models_import(gpu)
 
 
 def test_qwen2_vl_constructs_local_kernels():

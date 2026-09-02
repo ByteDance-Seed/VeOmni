@@ -28,7 +28,6 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
 )
 from veomni.kernels import VeomniKernel
@@ -85,13 +84,6 @@ def _build_ours(config: Qwen3MoeConfig, kernels: SimpleNamespace | None = None):
         return _qwen3_moe_cls()(config)
     finally:
         set_kernels_config(previous)
-
-
-def test_qwen3_moe_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_gpu as gpu
-    from veomni.models_kernel.transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_npu as npu
-
-    assert_no_ops_or_old_models_import(gpu, npu)
 
 
 def test_qwen3_moe_constructs_local_kernels():

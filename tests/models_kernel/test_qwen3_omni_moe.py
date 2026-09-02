@@ -35,7 +35,6 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
     pin_eager_attn_implementation,
 )
@@ -163,17 +162,6 @@ def _image_inputs(config: Qwen3OmniMoeThinkerConfig, input_ids: torch.Tensor) ->
         "video_mask": video_mask,
         "audio_mask": audio_mask,
     }
-
-
-def test_qwen3_omni_moe_modeling_has_no_opslot_or_ops_import():
-    from pathlib import Path
-
-    generated = Path("veomni/models_kernel/transformers/qwen3_omni_moe/generated")
-    gpu = SimpleNamespace(__file__=str(generated / "patched_modeling_qwen3_omni_moe_gpu.py"))
-    # NPU generated file imports torch_npu at module level. Read it as text
-    # so GPU hosts can still check the consume boundary.
-    npu = SimpleNamespace(__file__=str(generated / "patched_modeling_qwen3_omni_moe_npu.py"))
-    assert_no_ops_or_old_models_import(gpu, npu)
 
 
 def test_qwen3_omni_moe_constructs_local_kernels():

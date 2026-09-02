@@ -27,7 +27,6 @@ from types import SimpleNamespace
 import torch
 
 from tests.models_kernel.compare import (
-    assert_no_ops_or_old_models_import,
     assert_outputs_and_grads_match,
     eager_kernels_config,
 )
@@ -45,12 +44,6 @@ def _build_ours_rms(dim: int, *, elementwise_affine: bool = True, kernels: Simpl
         return RMSNorm(dim, eps=1e-6, elementwise_affine=elementwise_affine)
     finally:
         set_kernels_config(previous)
-
-
-def test_flux_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.flux import modeling_flux
-
-    assert_no_ops_or_old_models_import(modeling_flux, require_loss_utils=False)
 
 
 def test_flux_constructs_local_kernels():

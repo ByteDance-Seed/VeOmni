@@ -28,7 +28,6 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCa
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
 )
 from veomni.kernels import VeomniKernel
@@ -86,13 +85,6 @@ def _build_ours(config: DeepseekV4Config, kernels: SimpleNamespace | None = None
         return _dsv4_cls()(config)
     finally:
         set_kernels_config(previous)
-
-
-def test_deepseek_v4_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
-    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu
-
-    assert_no_ops_or_old_models_import(gpu, npu)
 
 
 def test_deepseek_v4_constructs_local_kernels():

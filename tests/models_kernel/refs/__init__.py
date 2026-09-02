@@ -12,14 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Copied or adapted official eager math for first-party models_kernel toys.
-
-These snapshots live under ``tests/`` so consume tests do not import
-``veomni.models``. ``models/`` will be deleted after the switch.
-
-Each file states ``Source`` at the top:
-
-- Wan: adapted from ``veomni/models/transformers/wan/modeling_wan.py`` (Wan2.1 lineage)
-- Flux: adapted from ``veomni/models/transformers/flux/modeling_flux.py`` (Black Forest Labs lineage)
-- MoVQGAN: copied from ``veomni/models/transformers/movqgan/`` (no upstream URL in that snapshot)
-"""
+"""Eager snapshots for first-party consume tests. See each file's module docstring."""

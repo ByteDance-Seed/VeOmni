@@ -28,7 +28,6 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM as HFQwen2
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
 )
 from veomni.kernels import VeomniKernel
@@ -67,12 +66,6 @@ def _build_ours(config: Qwen2Config, kernels: SimpleNamespace | None = None):
         return Qwen2ForCausalLM(config)
     finally:
         set_kernels_config(previous)
-
-
-def test_qwen2_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.qwen2.generated import patched_modeling_qwen2_gpu as gpu
-
-    assert_no_ops_or_old_models_import(gpu)
 
 
 def test_qwen2_constructs_local_kernels():

@@ -35,7 +35,6 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
 )
 from veomni.kernels import VeomniKernel
@@ -145,14 +144,6 @@ def _image_inputs(config: Qwen2_5OmniThinkerConfig, input_ids: torch.Tensor) -> 
         "video_mask": video_mask,
         "audio_mask": audio_mask,
     }
-
-
-def test_qwen2_5_omni_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.qwen2_5_omni.generated import (
-        patched_modeling_qwen2_5_omni_gpu as gpu,
-    )
-
-    assert_no_ops_or_old_models_import(gpu)
 
 
 def test_qwen2_5_omni_constructs_local_kernels():

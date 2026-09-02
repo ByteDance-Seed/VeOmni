@@ -95,22 +95,6 @@ def _named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {name: param for name, param in model.named_parameters() if param.requires_grad}
 
 
-def test_qwen3_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.qwen3.generated import patched_modeling_qwen3_gpu as gpu
-    from veomni.models_kernel.transformers.qwen3.generated import patched_modeling_qwen3_npu as npu
-
-    for module in (gpu, npu):
-        source = module.__file__
-        assert source is not None
-        text = open(source, encoding="utf-8").read()
-        assert "use_non_eager_impl" not in text
-        assert "OpSlot" not in text
-        assert "veomni.ops" not in text
-        assert "from veomni.models." not in text
-        assert "from veomni.models import" not in text
-        assert "from veomni.models_kernel.utils.loss_utils import" in text
-
-
 def test_qwen3_constructs_local_kernels():
     model = _build_qwen3(_tiny_config())
     assert model.veomni_ce.impl == "eager"

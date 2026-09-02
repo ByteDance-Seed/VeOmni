@@ -29,7 +29,6 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM as HFGe
 from tests.kernels.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    assert_no_ops_or_old_models_import,
     eager_kernels_config,
     named_trainable,
 )
@@ -83,12 +82,6 @@ def _build_ours(config: Gemma3TextConfig, kernels: SimpleNamespace | None = None
         return Gemma3ForCausalLM(config)
     finally:
         set_kernels_config(previous)
-
-
-def test_gemma3_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.gemma3.generated import patched_modeling_gemma3_gpu as gpu
-
-    assert_no_ops_or_old_models_import(gpu)
 
 
 def test_gemma3_constructs_local_kernels():

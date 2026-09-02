@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Adapted from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py"""
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange

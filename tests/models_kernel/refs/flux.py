@@ -13,17 +13,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Adapted official Flux eager math for models_kernel toys.
-
-Source:
-- Kind: adapted
-- From: ``veomni/models/transformers/flux/modeling_flux.py``
-  (``RMSNorm``, ``RoPEEmbedding``, ``FluxJointAttention``, ``flash_attention``)
-- Upstream: https://github.com/black-forest-labs/flux (Black Forest Labs copyright on the VeOmni file)
-- Not from: HuggingFace ``transformers.models`` or a live ``veomni.models`` import
-- Changes: eager RMSNorm only. Attention is SDPA. Dropped Liger class-swap, FA2/FA3,
-  Ulysses, and ip-adapter.
-"""
+"""Adapted from https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/layers.py"""
 
 from __future__ import annotations
 

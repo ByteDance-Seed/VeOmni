@@ -13,17 +13,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Adapted official Wan eager math for models_kernel toys.
-
-Source:
-- Kind: adapted
-- From: ``veomni/models/transformers/wan/modeling_wan.py`` and ``config_wan.py``
-- Upstream: https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py
-- Not from: HuggingFace ``transformers.models`` (no Wan) or a live ``veomni.models`` import
-- Changes: single-process eager only. Dropped Ulysses SP, FA3/sage, ``VeomniKernel``,
-  and Diffusers ``save_pretrained``. ``rope_apply`` keeps VeOmni's packed ``[B, S, N*D]``
-  face, not Wan2.1's per-sample ``grid_sizes`` loop.
-"""
+"""Adapted from https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py"""
 
 from __future__ import annotations
 

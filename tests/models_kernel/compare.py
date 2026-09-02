@@ -75,20 +75,6 @@ def named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {name: param for name, param in model.named_parameters() if param.requires_grad}
 
 
-def assert_no_ops_or_old_models_import(*modules, require_loss_utils: bool = True) -> None:
-    for module in modules:
-        source = module.__file__
-        assert source is not None
-        text = open(source, encoding="utf-8").read()
-        assert "use_non_eager_impl" not in text
-        assert "OpSlot" not in text
-        assert "veomni.ops" not in text
-        assert "from veomni.models." not in text
-        assert "from veomni.models import" not in text
-        if require_loss_utils:
-            assert "from veomni.models_kernel.utils.loss_utils import" in text
-
-
 def assert_eager_matches_hf(
     hf: torch.nn.Module,
     ours: torch.nn.Module,

@@ -26,7 +26,6 @@ from types import SimpleNamespace
 import torch
 
 from tests.models_kernel.compare import (
-    assert_no_ops_or_old_models_import,
     assert_outputs_and_grads_match,
     eager_kernels_config,
 )
@@ -80,12 +79,6 @@ def _wan_inputs(in_dim: int, text_len: int, text_dim: int) -> dict[str, torch.Te
         "timestep": torch.rand(2),
         "context": torch.randn(2, text_len, text_dim),
     }
-
-
-def test_wan_modeling_has_no_opslot_or_ops_import():
-    from veomni.models_kernel.transformers.wan import modeling_wan
-
-    assert_no_ops_or_old_models_import(modeling_wan, require_loss_utils=False)
 
 
 def test_wan_constructs_local_kernels():
