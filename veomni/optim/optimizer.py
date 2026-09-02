@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,10 @@ from torch.optim.optimizer import Optimizer
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
+
+
+if TYPE_CHECKING:
+    from ..arguments import OptimizerConfig
 
 
 def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
@@ -397,6 +401,33 @@ def get_parameter_names(model, forbidden_layer_types, forbidden_param_names):
     return result
 
 
+def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
+    """Pull Muon-specific hyperparameters out of ``OptimizerConfig``.
+
+    ``lr`` is forwarded unresolved (``None`` when unset) so that the Muon-vs-AdamW
+    LR policy lives in one place, ``_build_muon_with_adamw``. It is coerced here
+    because YAML resolves exponent literals without a decimal point (``3e-4``) to
+    a string, which would otherwise reach the LR scheduler untouched.
+    """
+    return {
+        "lr": None if optimizer_cfg.muon_lr is None else float(optimizer_cfg.muon_lr),
+        "momentum": optimizer_cfg.muon_momentum,
+        "nesterov": optimizer_cfg.muon_nesterov,
+        "weight_decay": optimizer_cfg.muon_weight_decay,
+        "ns_steps": optimizer_cfg.muon_ns_steps,
+        "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
+        "eps": optimizer_cfg.muon_eps,
+        "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
+        "ns_implementation": optimizer_cfg.muon_ns_implementation,
+        "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
+        # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
+        "head_group_size": int(optimizer_cfg.muon_head_group_size),
+        "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
+        # Surface for startup summary only; not a DistributedMuon ctor kwarg.
+        "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
+    }
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -409,8 +440,21 @@ def build_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
+    optimizer_config: Optional["OptimizerConfig"] = None,
 ) -> "torch.optim.Optimizer":
+    """Build the optimizer.
+
+    ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
+    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
+    here rather than unpacked by every trainer. It does *not* supply ``lr``,
+    ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
+    because callers such as the VLM trainer drive the AdamW side from their own
+    param groups. ``muon_kwargs`` overrides the config key by key, for callers
+    that build Muon without an ``OptimizerConfig`` at all.
+    """
     if optimizer_type == "muon":
+        if optimizer_config is not None:
+            muon_kwargs = {**_collect_muon_kwargs(optimizer_config), **(muon_kwargs or {})}
         if param_groups is not None:
             logger.warning_rank0(
                 "build_optimizer(optimizer_type='muon') ignores the provided "
@@ -532,9 +576,9 @@ def _build_muon_with_adamw(
     dict keys and grad-clipping metadata stay keyed by mesh.
     """
     muon_kwargs = dict(muon_kwargs or {})
-    # Summary-only keys collected by the trainer; not DistributedMuon ctor args.
+    # Summary-only keys; not DistributedMuon ctor args.
     expert_zero_comm = bool(muon_kwargs.pop("expert_zero_comm", False))
-    adamw_lr = float(muon_kwargs.pop("adamw_lr", lr))
+    adamw_lr = float(lr)
     head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
     head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
     if head_group_size < 0:
@@ -543,16 +587,16 @@ def _build_muon_with_adamw(
         raise ValueError(
             f"muon_head_group_size={head_group_size} requires muon_head_split_modules: there is no "
             "default list, because which attention projections benefit from head splitting depends "
-            "on the architecture. List the leaf module names to split, e.g. ['q_b_proj'] for "
-            "DeepSeek V4/V3 MLA up-projections or ['q_proj', 'k_proj', 'v_proj'] for GQA attention."
+            "on the architecture. List the modules to split as leaf names or dotted path suffixes, "
+            "e.g. ['self_attn.q_b_proj'] for DeepSeek V4/V3 MLA up-projections or "
+            "['q_proj', 'k_proj', 'v_proj'] for GQA attention."
         )
-    muon_lr_explicit = bool(
-        muon_kwargs.pop("muon_lr_explicit", "lr" in muon_kwargs and muon_kwargs.get("lr") is not None)
-    )
-    if muon_kwargs.get("lr") is None:
+    # The single owner of the Muon-vs-AdamW LR policy: an unset Muon LR either
+    # inherits the AdamW LR (match_rms_adamw) or takes the Moonlight-style 25x.
+    muon_lr_explicit = muon_kwargs.get("lr") is not None
+    if not muon_lr_explicit:
         adjust_lr_fn = muon_kwargs.get("adjust_lr_fn", "match_rms_adamw")
-        muon_kwargs["lr"] = float(adamw_lr) if adjust_lr_fn == "match_rms_adamw" else 25.0 * float(adamw_lr)
-        muon_lr_explicit = False
+        muon_kwargs["lr"] = adamw_lr if adjust_lr_fn == "match_rms_adamw" else 25.0 * adamw_lr
     muon_params, adamw_params, muon_names, adamw_names = split_muon_adamw_params(
         model,
         no_decay_modules=no_decay_modules,

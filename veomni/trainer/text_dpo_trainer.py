@@ -138,8 +138,6 @@ class TextDPOTrainer:
     reference_model: PreTrainedModel
 
     def __init__(self, args: VeOmniDPOArguments):
-        if args.train.chunk_mbs_config.enable:
-            raise ValueError("ChunkMBS is not supported by the DPO trainer yet.")
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
@@ -404,8 +402,8 @@ class TextDPOTrainer:
         # segments (chosen, rejected) but carries one source metadata entry.
         self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics)
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         args: VeOmniDPOArguments = self.base.args
@@ -413,6 +411,7 @@ class TextDPOTrainer:
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
+        self.base._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
 
         self.base.sync_before_train_step()
@@ -437,6 +436,16 @@ class TextDPOTrainer:
         self.base.optimizer.step()
         self.base.lr_scheduler.step()
         self.base.optimizer.zero_grad()
+
+        # The other trainers may report the sum of their micro batches' losses
+        # because ``mean_global_loss`` has already scaled each one by its share of
+        # the step's tokens, so the sum is the step's mean. Nothing above carries
+        # that weight: ``forward_backward_step`` builds ``loss_dict`` out of plain
+        # per-micro-batch means, so the sums are averaged here instead. Reporting
+        # them raw scaled every value by ``gradient_accumulation_steps`` -- most
+        # visibly ``reward_accuracy``, a fraction of pairs that read above 1.
+        total_loss /= num_micro_steps
+        total_loss_dict = {key: value / num_micro_steps for key, value in total_loss_dict.items()}
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 

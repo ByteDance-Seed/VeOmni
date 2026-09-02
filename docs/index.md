@@ -51,8 +51,11 @@ hardware_support/precision_analysis.md
 hardware_support/profiling_analysis.md
 hardware_support/AscendDockerUsage/build_a2_docker.md
 hardware_support/AscendDockerUsage/build_a3_docker.md
+hardware_support/AscendDockerUsage/overview.md
+hardware_support/AscendDockerUsage/supported_tags.md
 hardware_support/FAQ.md
 hardware_support/rocm/README.md
+hardware_support/mlu/README.md
 ```
 
 ```{toctree}
@@ -95,6 +98,7 @@ design/local_parallel_state.md
 design/patchgen.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
+design/deepseek_v4_context_parallel.md
 ```
 
 ```{toctree}

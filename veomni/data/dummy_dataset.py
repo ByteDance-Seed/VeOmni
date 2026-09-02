@@ -222,105 +222,6 @@ class DummyQwen3OmniMoeDataset(DummyQwenOmniDataset):
         return output_lengths
 
 
-class DummyUGDataset(Dataset):
-    def __init__(
-        self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
-    ):
-        """
-        Args:
-            size (int): Nums of datasets
-            seq_length (int, optional): seq_length
-            dummy_data:
-            [input_ids, input_image_token, input_audio_token, input_video_token, output_image_token]
-        """
-        self.size = size
-        self.seq_length = seq_length
-        self.vocab_size = 1024
-
-        h, w = 18, 18
-        image_t = 2
-        video_t = 10
-        channel_size = 3
-
-        self.input_image_size = [image_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
-        self.input_image_grid_thw = torch.tensor([[1, h, w]] * image_t, dtype=torch.long)
-        self.input_image_seq_length = image_t * h * w // (merge_size**2)
-
-        audio_token_num = 100
-        audio_num = 2
-        self.input_audio_size = [4 * audio_token_num * audio_num, 128]
-        self.input_audio_feature_lengths = torch.tensor([4 * audio_token_num] * audio_num, dtype=torch.long)
-        self.input_audio_seq_length = audio_num * audio_token_num
-
-        output_image_token_num = 1024
-        output_image_num = 1
-        self.output_image_size = [output_image_num, 3, 256, 256]
-        self.output_image_seq_length = output_image_num * output_image_token_num
-
-        rest_seq_length = self.seq_length - (
-            self.input_image_seq_length + self.input_audio_seq_length + self.output_image_seq_length
-        )
-
-        self.input_video_size = [video_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
-        self.input_video_grid_thw = torch.tensor([[video_t, h, w]], dtype=torch.long)
-        self.video_seq_length = video_t * h * w // (merge_size**2)
-
-        self.text_seq_length = rest_seq_length - self.video_seq_length
-
-        self.seq_length = (
-            self.text_seq_length
-            + self.input_image_seq_length
-            + self.input_audio_seq_length
-            + self.video_seq_length
-            + self.output_image_seq_length
-        )
-        mask = torch.zeros((self.seq_length,), dtype=torch.bool)
-        start_index = self.text_seq_length
-        self.image_input_mask = mask.clone()
-        self.image_input_mask[start_index : start_index + self.input_image_seq_length] = 1
-        self.audio_input_mask = mask.clone()
-        start_index += self.input_image_seq_length
-        self.audio_input_mask[start_index : start_index + self.input_audio_seq_length] = 1
-        self.video_input_mask = mask.clone()
-        start_index += self.input_audio_seq_length
-        self.video_input_mask[start_index : start_index + self.video_seq_length] = 1
-        self.image_output_mask = mask.clone()
-        start_index += self.video_seq_length
-        self.image_output_mask[start_index : start_index + self.output_image_seq_length] = 1
-
-    def __len__(self) -> int:
-        return self.size
-
-    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,))
-        attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
-        labels = input_ids.clone()
-        position_ids = torch.arange(0, self.seq_length).unsqueeze(0).repeat(3, 1)
-        image_input_features = torch.rand(self.input_image_size, dtype=torch.float32)
-        audio_input_features = torch.rand(self.input_audio_size, dtype=torch.float32)
-        video_input_features = torch.rand(self.input_video_size, dtype=torch.float32)
-        image_output_features = torch.rand(self.output_image_size, dtype=torch.float32)
-        return [
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "position_ids": position_ids,
-                "image_input_features": image_input_features,
-                "audio_input_features": audio_input_features,
-                "video_input_features": video_input_features,
-                "image_output_features": image_output_features,
-                "image_input_mask": self.image_input_mask,
-                "audio_input_mask": self.audio_input_mask,
-                "video_input_mask": self.video_input_mask,
-                "image_output_mask": self.image_output_mask,
-                "image_input_grid_thw": self.input_image_grid_thw,
-                "video_input_grid_thw": self.input_video_grid_thw,
-                "audio_input_feature_lengths": self.input_audio_feature_lengths,
-            }
-        ]
-
-
 class WanT2VDataset(Dataset):
     """
     Generates ready-to-use WAN T2V transformer inputs for CI/SP-alignment testing.
@@ -435,8 +336,6 @@ def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset
         return DummyQwenOmniDataset(size=size, seq_length=max_seq_len, patch_size=14)
     elif task_type == "qwen3omni":
         return DummyQwen3OmniMoeDataset(size=size, seq_length=max_seq_len, patch_size=16)
-    elif task_type == "ug":
-        return DummyUGDataset(size=size, seq_length=max_seq_len)
     elif task_type == "wan_t2v":
         return WanT2VDataset(size=size)
     elif task_type == "qwen_image":

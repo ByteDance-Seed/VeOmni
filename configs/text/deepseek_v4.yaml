@@ -12,7 +12,7 @@ model:
     mhc_implementation: tilelang
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel
-    rotary_pos_emb_implementation: eager
+    rotary_pos_emb_implementation: triton
 
 data:
   train_path: tulu-3-sft-mixture
@@ -63,8 +63,11 @@ train:
     # Head-split Muon: heads per Newton-Schulz block (0 = full matrix), plus the
     # projections to split. q_b_proj benefits most: its [num_heads * qk_head_dim,
     # q_lora_rank] stack is rank-capped by q_lora_rank as a single matrix.
+    # The DSA indexer's up-projection is also called q_b_proj, so the entry has to
+    # be qualified; a bare [q_b_proj] is rejected. Add indexer.q_b_proj to split
+    # the indexer's index_n_heads as well.
     # muon_head_group_size: 1
-    # muon_head_split_modules: [q_b_proj]
+    # muon_head_split_modules: [self_attn.q_b_proj]
     # MoE + EP: whole-expert Shard(0) when (num_experts/ep_size) % ep_fsdp_size == 0
     muon_expert_zero_comm: true
   init_device: meta

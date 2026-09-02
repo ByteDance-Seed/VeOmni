@@ -196,6 +196,19 @@ class _Slice(torch.autograd.Function):
 
 
 class _Gather(torch.autograd.Function):
+    """All-gather + concat over the SP group; backward slices the incoming
+    full-sequence grad back to this rank's local segment.
+
+    ``sum_grad`` selects the backward semantics:
+    - True (default): all-reduce the grad first. After a mid-model gather each
+      rank consumed a DIFFERENT segment of the full sequence downstream, so its
+      grads only cover its own rows — summing reconstructs the full grad.
+    - False: no all-reduce. Used at the model output, where the downstream loss
+      (e.g. the MiniMaxH3 wrapper's MSE over the full output) is identical on
+      every SP rank, so the incoming grad is already the true full grad and a
+      sum would multiply it by the SP world size.
+    """
+
     @staticmethod
     def forward(
         ctx: Any,
@@ -203,11 +216,13 @@ class _Gather(torch.autograd.Function):
         local_input: Tensor,
         dim: int,
         grad_scale: Optional[bool] = False,
+        sum_grad: Optional[bool] = True,
     ) -> Tensor:
         ctx.group = group
         ctx.rank = dist.get_rank(group)
         ctx.dim = dim
         ctx.grad_scale = grad_scale
+        ctx.sum_grad = sum_grad
         seq_world_size = dist.get_world_size(group)
         ctx.seq_world_size = seq_world_size
         output, size_list = _all_gather(local_input.contiguous(), group=ctx.group)
@@ -215,15 +230,33 @@ class _Gather(torch.autograd.Function):
         return torch.cat(output, dim=dim)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor]:
+    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None, None, None]:
         if ctx.grad_scale:
             grad_output = grad_output * ctx.seq_world_size
 
-        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
+        # ``grad_output`` arrives as whatever view the gathered tensor's consumer
+        # produced, and the in-place all_reduce below rejects a non-contiguous one
+        # with "Tensors must be contiguous". Two callers reach that: one reducing
+        # the gathered output with a bare ``.sum()`` (no elementwise op in between
+        # to materialise a real buffer), which hands back a stride-0 broadcast
+        # view; and DeepSeek-V4's context-parallel attention, which gathers ``kv``
+        # ``[B, 1, S, D]`` straight into ``torch.cat([kv, compressed_kv], dim=2)``
+        # and so passes that cat's gradient narrowed on dim 2 -- a row range of a
+        # wider buffer, contiguous only while the leading dims collapse at batch 1
+        # and not at batch 2. This buys contiguity and nothing else: an
+        # already-contiguous gradient is returned unchanged, so the reduce still
+        # writes into autograd's own buffer, which is also why it protects against
+        # scribbling in place on a tensor autograd may still own.
+        # ``_GatherConcatSP.backward`` adds a ``.clone()`` for that; reconciling
+        # the two is out of scope here.
+        grad_output = grad_output.contiguous()
+        if ctx.sum_grad:
+            dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
 
         return (
             None,
             grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous(),
+            None,
             None,
             None,
         )

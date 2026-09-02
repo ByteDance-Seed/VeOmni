@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import inspect
 import sys
 import types
 from types import SimpleNamespace
@@ -226,6 +227,90 @@ def _sparse_attention_reference(q, kv, sinks, indices, scale):
     return numerator / denominator.unsqueeze(-1)
 
 
+def test_tilelang_sparse_attention_forward_pipelines_the_gather_without_changing_output():
+    """Pipelining the forward's sparse gather must stay legal, real, and exact.
+
+    Legality is load-bearing on the gather reading its row index straight from global
+    memory. Indexing a register fragment there instead puts the gather in pipeline
+    stage 0 while the fragment's producer lands in a later stage, which is a hard
+    TileLang failure -- so a future change of that shape breaks compilation here rather
+    than silently losing the overlap. The async-copy check is what distinguishes "still
+    pipelined" from "compiles but the pipelining was dropped".
+
+    Pipelining is off by default because it is a loss at the production shape, so this
+    only pins that it remains available and exact when asked for.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+
+    torch.manual_seed(4)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 64, 8, 512, 128, 640
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16)
+    sinks = torch.randn(heads, device=DEVICE)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    # topk=640 is 10 gather tiles, so the loop has a real steady state; plant sentinels
+    # in every tile so a one-tile skew between the mask and the gather cannot hide.
+    indices[..., ::64] = -1
+    indices[..., 63::64] = kv_len
+    scale = dim**-0.5
+
+    pipelined = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=1)
+    serial = sparse_mqa_fwd(heads, dim, topk, scale, num_stages=0)
+    assert "cp_async_gs" in pipelined.get_kernel_source()
+    assert "cp_async_gs" not in serial.get_kernel_source()
+
+    expected_out, expected_lse = serial(q, kv, sinks, indices)
+    for out, lse in (
+        pipelined(q, kv, sinks, indices),
+        sparse_mqa_fwd_interface(q, kv, sinks, indices, scale, num_stages=1),
+    ):
+        assert torch.equal(out, expected_out)
+        assert torch.equal(lse, expected_lse)
+
+    # The depth is bounded by shared memory, so it is derived from the device rather than
+    # left to surface as an opaque launch failure. Walk the depth up until the guard
+    # refuses, then show the deepest depth it did allow really launches: that measures the
+    # bound against the device instead of against a copy of its own formula, and it holds
+    # on any opt-in shared-memory limit rather than assuming Hopper's 227 KB.
+    wide_heads = 64
+    wide_q = torch.randn(batch, seqlen, wide_heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    wide_sinks = torch.randn(wide_heads, device=DEVICE)
+    deepest = None
+    for depth in range(1, 9):
+        try:
+            candidate = sparse_mqa_fwd(wide_heads, dim, topk, scale, num_stages=depth)
+        except AssertionError as exc:
+            assert "shared memory per block" in str(exc)
+            break
+        deepest = candidate
+    else:
+        pytest.fail("the shared-memory guard never rejected a gather depth")
+
+    assert deepest is not None, "the guard rejected even a single-stage gather"
+    deep_out, _ = deepest(wide_q, kv, wide_sinks, indices)
+    # Reading the result into a Python bool is the synchronization point: a launch that
+    # could not get its shared memory surfaces here rather than staying pending.
+    assert torch.isfinite(deep_out).all().item()
+
+
+def test_tilelang_sparse_attention_forward_defaults_to_no_pipelining():
+    """The shipped gather depth is a performance choice that no output can reveal.
+
+    Both depths are bitwise identical, so the numerics test above cannot catch a flipped
+    default -- and the depth it would flip to cost 5% of a production step. This lives
+    outside that test because it needs no GPU, while the test it would otherwise sit in
+    skips below SM90 and therefore never runs on CI's L20 runners.
+    """
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.deepseek_v4.tilelang_sparse_mla_fwd import sparse_mqa_fwd, sparse_mqa_fwd_interface
+
+    for entry in (sparse_mqa_fwd, sparse_mqa_fwd_interface):
+        # tilelang.jit re-exports the kernel as (*args, **kwargs), hiding its defaults.
+        params = inspect.signature(getattr(entry, "func", entry)).parameters
+        assert params["num_stages"].default == 0
+
+
 def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
@@ -252,6 +337,82 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
         assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+    # dAttnSink is accumulated by an atomic under a replicated T.Parallel loop, so a
+    # lost replication guard would scale it by the warp count -- which cosine, being
+    # scale-invariant, cannot see.
+    torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "block_H, block_size, expected",
+    [
+        (16, 32, 128),
+        (32, 32, 256),
+        (64, 32, 256),
+        # block_size is a bwd parameter, so the bound has to follow it: at 16 the
+        # column split halves and block_H=32 no longer affords 8 warps.
+        (32, 16, 128),
+        (64, 16, 256),
+        # The one tile where the derived width drops below the historical 128, which
+        # was in fact illegal there -- two warps is all this tile can partition.
+        (16, 16, 64),
+    ],
+)
+def test_tilelang_bwd_cta_threads_respects_warp_tile_bound(block_H, block_size, expected):
+    """``cta_threads`` must stay inside the GEMM warp tile it derives its bound from.
+
+    A width above ``block_size * block_H // 4`` is a TileLang compile-time assertion
+    rather than a slow kernel, so this pins both the chosen values and the warp split
+    they come from. The production tile is (64, 32); (16, 32) is what every other
+    TileLang test in this file exercises, which is why it must stay at 128.
+    """
+    pytest.importorskip("tilelang")
+    from veomni.ops.kernels.deepseek_v4 import tilelang_sparse_mla_bwd
+
+    threads = tilelang_sparse_mla_bwd.cta_threads(block_H, block_size)
+
+    assert threads == expected
+    assert threads % 32 == 0 and threads & (threads - 1) == 0
+    # Restate TileLang's own partition rather than the closed form above: it splits the
+    # columns over at most block_size // 8 warps and gives the rest to the rows, and an
+    # MMA row tile below 16 is a hard compile error.
+    num_warps = threads // 32
+    column_warps = min(num_warps, block_size // 8)
+    assert block_H // (num_warps // column_warps) >= 16
+
+
+def test_tilelang_sparse_attention_backward_matches_reference_on_wide_head_tile():
+    """Cover the head tile that gets the widened CTA; the rest of this file does not.
+
+    ``bwd`` derives its CTA width from ``block_H = min(64, max(next_power_of_2(H), 16))``,
+    and every other TileLang test here uses 8 heads, i.e. block_H=16, which keeps the
+    historical 128 threads. 32 heads is the smallest tile that actually widens to 256,
+    so without this case the wide path is never run.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+
+    torch.manual_seed(6)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 16, 32, 512, 64, 64
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
+    indices[..., -1] = -1
+    scale = dim**-0.5
+
+    actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+    expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+    grad = torch.randn_like(actual)
+    expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+    actual.backward(grad)
+    for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+        assert actual_grad is not None and torch.isfinite(actual_grad).all()
+        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+    # The CTA width sets the replicate extent of the T.Parallel loop that atomically
+    # accumulates dAttnSink, so a lost replication guard would scale it by the warp
+    # count while leaving every cosine above intact.
+    torch.testing.assert_close(sinks.grad, expected_grads[2], rtol=2e-2, atol=2e-2)
 
 
 def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monkeypatch):
@@ -508,10 +669,11 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
             packed_compression_metadata=packed_metadata,
             return_topk_indices=True,
         )
-        compact_kv, compact_bias, compact_indices = compact_result
+        compact_kv, compact_bias, compact_candidates = compact_result
         torch.testing.assert_close(compact_kv, packed_kv)
         torch.testing.assert_close(compact_bias, packed_bias)
         if compressor_cls is modeling.DeepseekV4CSACompressor:
+            compact_indices = compact_candidates.topk_indices
             assert compact_indices is not None
             valid = compact_indices >= 0
             safe_indices = compact_indices.clamp_min(0).unsqueeze(1)
@@ -539,7 +701,8 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
                 expected_indices = torch.where(full_bias[0, 0, query_idx] == 0)[0].to(torch.int32)
                 torch.testing.assert_close(actual_indices, expected_indices)
         else:
-            assert compact_indices is None
+            assert compact_candidates.topk_indices is None
+            assert compact_candidates.range_starts is not None
 
         segment_outputs = []
         segment_biases = []
@@ -604,6 +767,150 @@ def test_deepseek_v4_compact_sparse_indices_match_attention_mask():
         actual_indices = actual_indices[actual_indices >= 0].sort().values
         expected_indices = torch.where(attention_mask[0, 0, query_idx] == 0)[0].to(torch.int32)
         torch.testing.assert_close(actual_indices, expected_indices)
+
+
+def test_deepseek_v4_mask_free_sparse_indices_match_dense_mask_path():
+    """Candidates built from packed metadata must equal what the dense mask allows."""
+    from transformers import AutoConfig
+    from transformers.masking_utils import create_sliding_window_causal_mask
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+    from veomni.models.transformers.deepseek_v4.packed_utils import (
+        build_packed_compression_metadata,
+        build_packed_sparse_attention_indices,
+        build_sparse_attention_indices,
+        isolate_packed_causal_mask_,
+        mask_sparse_attention_indices,
+    )
+
+    torch.manual_seed(7)
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    segment_lengths = (64, 96)
+    total_len = sum(segment_lengths)
+    sequence_slices = ((0, segment_lengths[0]), (segment_lengths[0], total_len))
+    hidden_states = torch.randn(1, total_len, config.hidden_size)
+    q_residual = torch.randn(1, total_len, config.q_lora_rank)
+    position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0)
+
+    # The production oracle: the exact mask DeepseekV4Model.forward used to build.
+    sliding_mask = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=hidden_states,
+        attention_mask=torch.ones(1, total_len, dtype=torch.long),
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    sliding_mask = isolate_packed_causal_mask_(sliding_mask, sequence_slices)
+
+    packed_metadata = build_packed_compression_metadata(
+        hidden_states,
+        position_ids,
+        sequence_slices,
+        tuple(config.compress_rates.values()),
+        block_bias_rates=(config.compress_rates["heavily_compressed_attention"],),
+    )
+
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+    for compressor_cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor):
+        compressor = compressor_cls(config)
+        with torch.no_grad():
+            torch.nn.init.zeros_(compressor.position_bias)
+            indexer = getattr(compressor, "indexer", None)
+            if indexer is not None:
+                torch.nn.init.zeros_(indexer.position_bias)
+
+        packed_kwargs = {
+            "packed_sequence_slices": sequence_slices,
+            "packed_compression_metadata": packed_metadata,
+            "return_topk_indices": True,
+        }
+        dense_kv, dense_bias, _ = compressor(hidden_states, q_residual, position_ids, None, 0, **packed_kwargs)
+        free_kv, free_bias, candidates = compressor(
+            hidden_states, q_residual, position_ids, None, 0, build_block_bias=False, **packed_kwargs
+        )
+        assert free_bias is None
+        torch.testing.assert_close(free_kv, dense_kv)
+
+        compressed_len = dense_kv.shape[2]
+        expected = mask_sparse_attention_indices(
+            torch.cat((sliding_mask, dense_bias), dim=-1),
+            build_sparse_attention_indices(
+                batch_size=1,
+                seq_len=total_len,
+                sliding_window=config.sliding_window,
+                compressed_len=compressed_len,
+                compressed_indices=candidates.topk_indices,
+                device=hidden_states.device,
+            ),
+        )
+        actual = build_packed_sparse_attention_indices(
+            position_ids=position_ids,
+            sliding_window=config.sliding_window,
+            compressed_len=compressed_len,
+            candidates=candidates,
+        )
+        # Width is load-bearing: the TileLang kernel specializes on the last dim,
+        # so a narrower "compacted" list would trigger endless recompilation.
+        assert actual.shape == expected.shape
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="mask-free sparse dispatch requires bf16 CUDA tensors")
+def test_deepseek_v4_packed_model_forward_skips_dense_mask(monkeypatch):
+    """Packed TileLang forwards must never materialize an O(S^2) mask."""
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    torch.manual_seed(11)
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    segment_lengths = (24, 40)
+    total_len = sum(segment_lengths)
+    model = modeling.DeepseekV4Model(config).to(device=DEVICE, dtype=torch.bfloat16).eval()
+
+    def fail_on_dense_mask(*args, **kwargs):
+        raise AssertionError("packed TileLang forward must not build a dense causal mask")
+
+    monkeypatch.setattr(modeling, "create_sliding_window_causal_mask", fail_on_dense_mask)
+
+    captured = []
+
+    def fake_sparse_attn(query, key, sinks, topk_indices, scaling):
+        captured.append(topk_indices)
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(modeling, "sparse_attn_tilelang", fake_sparse_attn)
+
+    position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0).to(DEVICE)
+    cu_seq_lens = torch.tensor([0, segment_lengths[0], total_len], dtype=torch.int32, device=DEVICE)
+
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+    modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+    try:
+        with torch.no_grad():
+            model(
+                input_ids=torch.randint(0, config.vocab_size, (1, total_len), device=DEVICE),
+                position_ids=position_ids,
+                use_cache=False,
+                cu_seq_lens_q=cu_seq_lens,
+                cu_seq_lens_k=cu_seq_lens,
+            )
+    finally:
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+
+    assert len(captured) == config.num_hidden_layers
+    # position_ids restart per sample, so this is each query's own segment start.
+    segment_starts = (torch.arange(total_len, device=DEVICE) - position_ids[0]).to(torch.int32)
+    queries = torch.arange(total_len, device=DEVICE, dtype=torch.int32)
+    for topk_indices in captured:
+        sliding = topk_indices[0, :, :]
+        is_sliding = (sliding >= 0) & (sliding < total_len)
+        assert is_sliding.any(), "no sliding candidate survived"
+        within_sample = sliding >= segment_starts[:, None]
+        causal = sliding <= queries[:, None]
+        assert (within_sample | ~is_sliding).all(), "sliding candidate crossed a packed boundary"
+        assert (causal | ~is_sliding).all(), "sliding candidate is not causal"
 
 
 def test_deepseek_v4_packed_causal_mask_blocks_previous_samples():
@@ -855,3 +1162,210 @@ def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
     # divide by, so the pairing has to be rejected instead of drifting.
     with pytest.raises(AssertionError, match="powers of two"):
         fp8_weight_quant(torch.empty(128, 128, device=DEVICE, dtype=torch.bfloat16), scale_dtype=torch.float8_e8m0fnu)
+
+
+# Mirrors the real DeepSeek-V4 RoPE call sites. ``transposed`` marks the ones
+# that reach the op as a ``[B, S, H, D].transpose(1, 2)`` view (Q, MQA KV, the
+# attention output) rather than a contiguous tensor (compressor entries).
+_ROPE_CALL_SITES = [
+    pytest.param(1, 8, 37, 512, 64, True, id="query"),
+    pytest.param(2, 1, 64, 512, 64, True, id="mqa_kv"),
+    pytest.param(1, 1, 13, 512, 64, False, id="compressed_entries"),
+    pytest.param(2, 4, 33, 128, 64, True, id="indexer_query"),
+    pytest.param(1, 2, 16, 64, 64, False, id="rope_spans_full_head"),
+    pytest.param(2, 3, 33, 48, 24, True, id="rope_dim_not_power_of_two"),
+]
+
+
+def _rope_inputs(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype, device=None):
+    device = device or DEVICE
+    if transposed:
+        x = torch.randn(batch, seqlen, heads, head_dim, device=device, dtype=dtype).transpose(1, 2)
+    else:
+        x = torch.randn(batch, heads, seqlen, head_dim, device=device, dtype=dtype)
+    # One angle per interleaved pair, as ``DeepseekV4RotaryEmbedding`` emits.
+    angle = torch.randn(batch, seqlen, rope_dim // 2, device=device, dtype=dtype)
+    return x, angle.cos(), angle.sin()
+
+
+# The eager backward rounds each of its two branches to the activation dtype
+# before summing them, so individual elements can cancel to exactly zero where
+# the fused kernel's single rounding leaves a residue. That makes a relative
+# comparison meaningless per element; bound the absolute error at ~2 ULP of the
+# operand scale instead.
+_ROPE_GRAD_TOLERANCE = {
+    torch.bfloat16: {"rtol": 1.6e-2, "atol": 1e-2},
+    torch.float32: {"rtol": 1.3e-6, "atol": 1e-6},
+}
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="fused DeepSeek-V4 RoPE is a CUDA Triton kernel")
+@pytest.mark.parametrize("batch, heads, seqlen, head_dim, rope_dim, transposed", _ROPE_CALL_SITES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_deepseek_v4_triton_rope_matches_eager(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype):
+    """The fused kernel must agree with the eager reference in both directions."""
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as eager_rope
+
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _rope_inputs(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype)
+    grad = torch.randn(batch, heads, seqlen, head_dim, device=DEVICE, dtype=dtype)
+
+    expected_input = x.detach().clone().requires_grad_(True)
+    actual_input = x.detach().clone().requires_grad_(True)
+    expected = eager_rope(expected_input, cos, sin)
+    actual = apply_rotary_pos_emb_triton(actual_input, cos, sin)
+
+    assert actual.shape == expected.shape
+    # The eager path ends in ``torch.cat``, so callers may rely on contiguity.
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected)
+
+    expected.backward(grad)
+    actual.backward(grad)
+    torch.testing.assert_close(actual_input.grad, expected_input.grad, **_ROPE_GRAD_TOLERANCE[dtype])
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="fused DeepSeek-V4 RoPE is a CUDA Triton kernel")
+def test_deepseek_v4_triton_rope_inverse_rotation_round_trips():
+    """``DeepseekV4Attention.forward`` un-rotates the attention output with -sin."""
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _rope_inputs(1, 4, 32, 512, 64, True, torch.float32)
+
+    round_tripped = apply_rotary_pos_emb_triton(apply_rotary_pos_emb_triton(x, cos, sin), cos, -sin)
+
+    torch.testing.assert_close(round_tripped, x.contiguous(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="fused DeepSeek-V4 RoPE is a CUDA Triton kernel")
+def test_deepseek_v4_triton_rope_keeps_no_activations_for_backward():
+    """RoPE is orthogonal, so the backward only needs cos/sin — never ``x``."""
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _rope_inputs(1, 4, 32, 512, 64, True, torch.bfloat16)
+
+    out = apply_rotary_pos_emb_triton(x.detach().requires_grad_(True), cos, sin)
+
+    saved = out.grad_fn.saved_tensors
+    assert [tensor.shape for tensor in saved] == [cos.shape, sin.shape]
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="fused DeepSeek-V4 RoPE is a CUDA Triton kernel")
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda x, cos, sin: (x, cos, sin, 2), id="unsqueeze_dim_not_one"),
+        pytest.param(lambda x, cos, sin: (x[0], cos, sin, 1), id="x_not_4d"),
+        pytest.param(lambda x, cos, sin: (x, cos.requires_grad_(True), sin, 1), id="cos_requires_grad"),
+        pytest.param(lambda x, cos, sin: (x, cos[:, :-1], sin[:, :-1], 1), id="cos_seqlen_mismatch"),
+        # An odd nope_dim breaks the ``rd ^ 1`` interleaved-partner indexing, so
+        # the kernel would silently compute garbage rather than fail. This is the
+        # only guard standing between that layout and wrong numbers.
+        pytest.param(lambda x, cos, sin: (x[..., :-1], cos, sin, 1), id="odd_nope_dim"),
+        pytest.param(lambda x, cos, sin: (x, cos[..., :0], sin[..., :0], 1), id="empty_rope_dim"),
+        pytest.param(lambda x, cos, sin: (x, cos.cpu(), sin.cpu(), 1), id="cos_on_other_device"),
+    ],
+)
+def test_deepseek_v4_triton_rope_falls_back_when_unsupported(monkeypatch, mutate):
+    """Unsupported layouts must reach eager instead of the kernel.
+
+    Only dispatch is under test here: several of these mutations are malformed
+    for *any* implementation, so the eager reference is stubbed out rather than
+    executed. ``..._fallback_matches_eager`` covers a fallback that has to
+    produce a real answer.
+    """
+    from transformers.models.deepseek_v4 import modeling_deepseek_v4
+
+    from veomni.ops.kernels.rotary import triton_deepseek_v4
+
+    torch.manual_seed(7)
+    x, cos, sin, unsqueeze_dim = mutate(*_rope_inputs(1, 4, 32, 512, 64, True, torch.float32))
+
+    monkeypatch.setattr(
+        triton_deepseek_v4,
+        "_rotary_launch",
+        lambda *a, **k: pytest.fail("unsupported input reached the Triton kernel"),
+    )
+    reached_eager = False
+
+    def record_eager(tensor, *args, **kwargs):
+        nonlocal reached_eager
+        reached_eager = True
+        return tensor
+
+    monkeypatch.setattr(modeling_deepseek_v4, "apply_rotary_pos_emb", record_eager)
+
+    triton_deepseek_v4.apply_rotary_pos_emb_triton(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+    assert reached_eager
+
+
+def test_deepseek_v4_triton_rope_fallback_matches_eager():
+    """The unconditional bind means CPU tensors must still get a correct answer."""
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import apply_rotary_pos_emb as eager_rope
+
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _rope_inputs(1, 4, 32, 512, 64, True, torch.float32, device="cpu")
+
+    torch.testing.assert_close(apply_rotary_pos_emb_triton(x, cos, sin), eager_rope(x, cos, sin))
+
+
+def test_deepseek_v4_device_patch_selects_rotary_backend(monkeypatch):
+    """``rotary_pos_emb_implementation`` must actually reach DeepSeek-V4."""
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.models.transformers.deepseek_v4.device_patch import apply_veomni_deepseek_v4_device_patch
+    from veomni.ops.config import singleton
+    from veomni.ops.kernels.rotary.triton_deepseek_v4 import apply_rotary_pos_emb_triton
+
+    def generated_module():
+        module = types.ModuleType("fake_deepseek_v4")
+        module.apply_rotary_pos_emb = _unpatched_rope
+        return module
+
+    def use(value):
+        monkeypatch.setattr(
+            singleton, "_ops_config", OpsImplementationConfig(rotary_pos_emb_implementation=value), raising=False
+        )
+
+    use("eager")
+    module = generated_module()
+    apply_veomni_deepseek_v4_device_patch(module)
+    assert module.apply_rotary_pos_emb is _unpatched_rope
+
+    use("triton")
+    module = generated_module()
+    apply_veomni_deepseek_v4_device_patch(module)
+    assert module.apply_rotary_pos_emb is apply_rotary_pos_emb_triton
+
+    # Liger implements neither the partial rope slice nor the interleaved layout.
+    use("liger_kernel")
+    with pytest.raises(ValueError, match="explicitly disabled"):
+        apply_veomni_deepseek_v4_device_patch(generated_module())
+
+
+def test_deepseek_v4_device_patch_disables_wrong_signature_backends(monkeypatch):
+    """Neither registry default may bind: both take ``(q, k, cos, sin)``.
+
+    ``npu`` is asserted on the declared mapping rather than through dispatch,
+    because ``OpsImplementationConfig`` rejects ``npu`` at construction on a GPU
+    host, so the disabled branch is only reachable on Ascend.
+    """
+    from veomni.models.transformers.deepseek_v4 import device_patch
+
+    captured = {}
+    monkeypatch.setattr(device_patch, "apply_per_model_patches", lambda **kwargs: captured.update(kwargs))
+    device_patch.apply_veomni_deepseek_v4_device_patch(types.ModuleType("fake_deepseek_v4"))
+
+    backends = captured["extra_backends"]["rotary_pos_emb"]
+    assert backends["liger_kernel"] is None
+    assert backends["npu"] is None
+
+
+def _unpatched_rope(*args, **kwargs):
+    raise AssertionError("sentinel for the generated module's eager definition")
