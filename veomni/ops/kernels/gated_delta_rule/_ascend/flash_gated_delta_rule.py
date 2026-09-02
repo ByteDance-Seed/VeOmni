@@ -19,10 +19,6 @@ from typing import Dict, Optional
 import torch
 import torch_npu
 
-# Load-bearing despite being unused: importing fla_npu registers the fused
-# torch.ops.npu.* GDN ops this file dispatches to. Do not prune.
-import fla_npu  # noqa: F401
-
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton.cumsum import chunk_local_cumsum
@@ -34,6 +30,26 @@ if is_arch35():
     from .triton_core.solve_tril import solve_tril
 else:
     from .triton.solve_tril import solve_tril
+
+
+# ``fla_npu`` registers the fused ``torch.ops.npu.*`` GDN ops that the fwd/bwd
+# functions in this module dispatch to; the import is deferred to those
+# functions (see ``_ensure_fla_npu_registered`` below) so that consumers of the
+# fla_npu-free helpers exported here (``precompute_varlen_metadata``,
+# ``prepare_chunk_indices``, ``prepare_chunk_indices_list``, ``l2norm``) — most
+# importantly the Qwen3.5 patchgen-generated NPU forward, which imports
+# ``precompute_varlen_metadata`` unconditionally regardless of the selected
+# ``chunk_gated_delta_rule_implementation`` — can load this module on NPU
+# images that only manually install ``fla_npu`` when the ``npu_ascendc``
+# backend is used.
+def _ensure_fla_npu_registered() -> None:
+    """Import ``fla_npu`` for its ``torch.ops.npu.*`` registration side effect.
+
+    Idempotent — Python caches the module in ``sys.modules`` on first import,
+    so calling this at the top of every dispatch site is essentially free.
+    """
+    import fla_npu  # noqa: F401
+
 
 _disable_compile = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
 _DEFAULT_VARLEN_CHUNK_SIZES = (16, 32, 64, 128, 608 * 2)
@@ -179,6 +195,8 @@ def flash_chunk_gated_delta_rule_fwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
+    _ensure_fla_npu_registered()
+
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
@@ -281,6 +299,8 @@ def flash_chunk_gated_delta_rule_bwd(
     chunk_indices_list: Optional[Dict[str, Optional[list[int]]]] = None,
     chunk_size: int = 64,
 ):
+    _ensure_fla_npu_registered()
+
     g = g.transpose(1, 2).contiguous()
     beta = beta.transpose(1, 2).contiguous().float()
 

@@ -151,3 +151,97 @@ class TestPrecomputeVarlenMetadataContract:
             else:
                 assert ref_l is not None
                 assert pre_l == ref_l, f"mismatch at key={key}"
+
+
+# ---------------------------------------------------------------------------
+# precompute_varlen_metadata is importable/usable without fla_npu
+# ---------------------------------------------------------------------------
+
+
+class TestPrecomputeVarlenMetadataWithoutFlaNpu:
+    """Contract: ``flash_gated_delta_rule`` must import (and its fla_npu-free
+    helpers must run) on hosts that do not ship ``fla_npu``.
+
+    This locks in the fix for the Qwen3.5 patchgen-generated NPU forward, which
+    imports ``precompute_varlen_metadata`` unconditionally regardless of the
+    selected ``chunk_gated_delta_rule_implementation`` — a module-level
+    ``import fla_npu`` in ``flash_gated_delta_rule`` would break every non-
+    ``npu_ascendc`` NPU training config (all Qwen3.5 NPU configs today).
+
+    Runs in a subprocess because the sibling class above installs a MagicMock
+    stub for ``fla_npu`` in the parent interpreter's ``sys.modules``; that
+    stub would mask a regression here otherwise.
+    """
+
+    def test_import_and_precompute_without_fla_npu(self) -> None:
+        import subprocess
+        import sys as _sys
+        import textwrap
+
+        script = textwrap.dedent(
+            """
+            import importlib.machinery
+            import sys
+            from unittest.mock import MagicMock
+
+            def _stub(name):
+                m = MagicMock(__path__=[])
+                # Give the module a real ModuleSpec so importlib.util.find_spec
+                # (used by accelerate.is_npu_available and friends) doesn't
+                # raise "X.__spec__ is not set" on a bare MagicMock spec.
+                m.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+                return m
+
+            # Match the mocks in TestPrecomputeVarlenMetadataContract EXCEPT
+            # fla_npu — this test asserts that the module loads without it.
+            _TL = _stub("triton.language")
+            _TRITON = _stub("triton")
+            _TRITON.language = _TL
+            _TRITON.__version__ = "3.2.0"
+            sys.modules.setdefault("torch_npu", _stub("torch_npu"))
+            sys.modules.setdefault("triton", _TRITON)
+            sys.modules.setdefault("triton.language", _TL)
+            for sub in (
+                "triton.language.extra",
+                "triton.language.extra.libdevice",
+                "triton.language.extra.cann",
+                "triton.language.extra.cann.extension",
+                "triton.runtime",
+                "triton.runtime.driver",
+            ):
+                sys.modules.setdefault(sub, _stub(sub))
+
+            assert "fla_npu" not in sys.modules, "fla_npu must not be pre-installed"
+
+            from veomni.ops.kernels.gated_delta_rule._ascend.flash_gated_delta_rule import (
+                precompute_varlen_metadata,
+            )
+
+            # Import alone must not have pulled in fla_npu (top-level import is
+            # deferred to the fwd/bwd dispatch sites).
+            assert "fla_npu" not in sys.modules, (
+                "flash_gated_delta_rule must not import fla_npu at module load time"
+            )
+
+            import torch
+
+            cu = torch.cumsum(torch.tensor([0, 128, 256], dtype=torch.long), dim=0)
+            cu_list, ci, cil = precompute_varlen_metadata(
+                cu_seqlens=cu, num_heads=4, chunk_size=64
+            )
+            assert cu_list == cu.tolist()
+            assert isinstance(ci, dict) and isinstance(cil, dict)
+            print("OK")
+            """
+        )
+
+        result = subprocess.run(
+            [_sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"subprocess exited {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
+        assert result.stdout.strip().endswith("OK")
