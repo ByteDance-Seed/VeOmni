@@ -34,6 +34,24 @@ def _mhc_head_tile_kernels_factory():
 
     return mhc_head_tile_kernels
 
+def _mhc_pre_npu_factory():
+    from .npu import mhc_pre_npu
+
+    return mhc_pre_npu
+
+
+def _mhc_post_npu_factory():
+    from .npu import mhc_post_npu
+
+    return mhc_post_npu
+
+
+def _mhc_head_npu_factory():
+    from .npu import mhc_head_npu
+
+    return mhc_head_npu
+
+
 
 for variant, factory, description in (
     ("pre", _mhc_pre_tile_kernels_factory, "TileKernels DeepSeek V4 mHC pre/Sinkhorn/collapse"),
@@ -52,4 +70,20 @@ for variant, factory, description in (
     )
 
 
+
+for variant, factory, description in (
+    ("pre", _mhc_pre_npu_factory, "Ascend fused DeepSeek V4 mHC pre/Sinkhorn/collapse"),
+    ("post", _mhc_post_npu_factory, "Ascend fused DeepSeek V4 mHC residual post-mix"),
+    ("head", _mhc_head_npu_factory, "DeepSeek V4 final mHC collapse on Ascend"),
+):
+    KERNEL_REGISTRY.register(
+        KernelSpec(
+            name="npu",
+            op_name="mhc",
+            variant=variant,
+            factory=factory,
+            hardware=HardwareRequirement(device_type="npu"),
+            description=description,
+        )
+    )
 __all__ = []
