@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import builtins
 import copy
+import importlib
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +28,8 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 _REGISTRY_MODULE = "veomni.ops.kernel_registry"
+_NPU_GROUP_GEMM_MODULE = "veomni.ops.kernels.moe.npu_group_gemm"
+_NPU_GROUP_GEMM_KERNEL_MODULE = "veomni.ops.kernels.moe._kernels.kernel.npu_group_gemm"
 
 
 class _RecordingSlot:
@@ -38,6 +42,80 @@ class _RecordingSlot:
     def __call__(self, *args):
         self.args = args
         return self.output
+
+
+@pytest.fixture
+def npu_group_gemm_module(monkeypatch):
+    module_names = (_NPU_GROUP_GEMM_MODULE, _NPU_GROUP_GEMM_KERNEL_MODULE)
+    previous_modules = {name: sys.modules.pop(name, None) for name in module_names}
+    parent_module = sys.modules["veomni.ops.kernels.moe"]
+    missing_parent_attribute = object()
+    previous_parent_attribute = getattr(parent_module, "npu_group_gemm", missing_parent_attribute)
+    fake_torch_npu = ModuleType("torch_npu")
+    fake_moe_package = ModuleType("veomni.distributed.moe")
+    fake_moe_package.__path__ = []
+    fake_comm = ModuleType("veomni.distributed.moe.comm")
+    fake_comm.all_to_all = object()
+    fake_moe_utils = ModuleType("veomni.distributed.moe.moe_utils")
+    fake_moe_utils.sort_chunks_by_idxs = object()
+    fake_group_gemm = ModuleType(_NPU_GROUP_GEMM_KERNEL_MODULE)
+    fake_group_gemm.npu_group_gemm = object()
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    monkeypatch.setitem(sys.modules, "veomni.distributed.moe", fake_moe_package)
+    monkeypatch.setitem(sys.modules, "veomni.distributed.moe.comm", fake_comm)
+    monkeypatch.setitem(sys.modules, "veomni.distributed.moe.moe_utils", fake_moe_utils)
+    monkeypatch.setitem(sys.modules, _NPU_GROUP_GEMM_KERNEL_MODULE, fake_group_gemm)
+    module = importlib.import_module(_NPU_GROUP_GEMM_MODULE)
+
+    try:
+        yield module, fake_torch_npu
+    finally:
+        for name in module_names:
+            sys.modules.pop(name, None)
+            if previous_modules[name] is not None:
+                sys.modules[name] = previous_modules[name]
+        if previous_parent_attribute is missing_parent_attribute:
+            delattr(parent_module, "npu_group_gemm")
+        else:
+            parent_module.npu_group_gemm = previous_parent_attribute
+
+
+def test_deepseek_v4_npu_swiglu_dispatches_by_limit(monkeypatch, npu_group_gemm_module):
+    module, fake_torch_npu = npu_group_gemm_module
+    x = torch.empty((2, 16), dtype=torch.bfloat16)
+    clamped_output = object()
+    unclamped_output = object()
+    calls = []
+
+    def fake_clamped_swiglu(actual_x, limit):
+        calls.append(("clamped", actual_x is x, limit))
+        return clamped_output
+
+    def fake_npu_swiglu(actual_x, *, dim):
+        calls.append(("unclamped", actual_x is x, dim))
+        return unclamped_output
+
+    monkeypatch.setattr(module, "_clamped_swiglu", fake_clamped_swiglu)
+    fake_torch_npu.npu_swiglu = fake_npu_swiglu
+
+    assert module._swiglu(x, 7.0) is clamped_output
+    assert module._swiglu(x, None) is unclamped_output
+    assert calls == [("clamped", True, 7.0), ("unclamped", True, -1)]
+
+
+def test_deepseek_v4_npu_clamped_swiglu_missing_triton_is_actionable(monkeypatch, npu_group_gemm_module):
+    module, _ = npu_group_gemm_module
+    real_import = builtins.__import__
+
+    def missing_triton(name, *args, **kwargs):
+        if name.endswith("npu_clamped_swiglu"):
+            raise ModuleNotFoundError("No module named 'triton'", name="triton")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_triton)
+
+    with pytest.raises(RuntimeError, match="requires triton-ascend"):
+        module._clamped_swiglu(torch.empty((1, 2)), 7.0)
 
 
 def test_deepseek_v4_declares_liger_opslots():

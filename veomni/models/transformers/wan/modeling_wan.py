@@ -26,6 +26,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_outputs,
     gather_seq_scatter_heads,
+    get_ulysses_sequence_parallel_rank,
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor_scale_grad,
 )
@@ -33,6 +34,7 @@ from veomni.distributed.sequence_parallel.async_ulysses_dit import (
     async_ulysses_output_projection,
     async_ulysses_qkv_projection,
 )
+from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
 
 from ....utils import logging
 from .config_wan import WanConfig
@@ -312,7 +314,17 @@ class SelfAttention(nn.Module):
         self.attn = AttentionModule(config, self.num_heads, self.head_dim)
         self.sp_async = False
 
-    def forward(self, x, freqs, cos, sin, last_loss):
+    def forward(self, x, freqs, cos, sin, last_loss, self_attn_mask=None):
+        if self_attn_mask is not None and not self.sp_async:
+            # The sync path attends only over this rank's local SP shard (see
+            # AttentionModule), so the global tail-padding mask built in
+            # WanModel.forward must be narrowed to this rank's own segment --
+            # every shard is equal-size since it was padded to a multiple of
+            # sp_size before slicing.
+            sp_rank = get_ulysses_sequence_parallel_rank()
+            local_len = x.shape[1]
+            self_attn_mask = self_attn_mask[..., sp_rank * local_len : (sp_rank + 1) * local_len]
+
         if not self.sp_async:
             q = self.norm_q(self.q(x))
             k = self.norm_k(self.k(x))
@@ -336,7 +348,7 @@ class SelfAttention(nn.Module):
         q = rope_apply(q, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
         k = rope_apply(k, freqs=freqs, cos=cos, sin=sin, head_dim=self.head_dim)
 
-        x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True)
+        x = self.attn(q, k, v, last_loss=last_loss, isSelfAttn=True, attention_mask=self_attn_mask)
 
         if not self.sp_async:
             x = self.o(x)
@@ -436,12 +448,12 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs, cos, sin, last_loss):
+    def forward(self, x, context, t_mod, freqs, cos, sin, last_loss, self_attn_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
         ).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, cos, sin, last_loss))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, cos, sin, last_loss, self_attn_mask=self_attn_mask))
         x = x + self.cross_attn(self.norm3(x), context, skip_ulysses=True)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -603,7 +615,44 @@ class WanModel(PreTrainedModel):
             .to(x.device)
         )
 
+        # f*h*w is not guaranteed to be divisible by the Ulysses SP size (e.g. a
+        # 21x60x45 grid under sp_size=8 has 56700 tokens, and 56700 % 8 == 4).
+        # `slice_input_tensor_scale_grad` floor-divides internally
+        # (`dim_size // seq_world_size`), so an un-padded call silently drops the
+        # remainder tokens instead of distributing them to any rank. Pad both `x`
+        # and `freqs` up to a multiple of sp_size first, and strip the padding
+        # back off after the post-block gather using the true `f*h*w` length.
+        unpadded_seq_len = x.shape[1]
+        self_attn_mask = None
         if get_parallel_state().ulysses_enabled:
+            sp_size = get_ulysses_sequence_parallel_world_size()
+            pad_size = (sp_size - unpadded_seq_len % sp_size) % sp_size
+            padded_seq_len = unpadded_seq_len + pad_size
+
+            x = padding_tensor_for_seqeunce_parallel(x, dim=1)
+            freqs = padding_tensor_for_seqeunce_parallel(freqs, dim=0)
+
+            # Build one GLOBAL additive mask over the padded tail, identical on
+            # every rank, marking the pad positions so they can't influence real
+            # tokens' attention output. `SelfAttention.forward` adapts it to
+            # whichever shape its attention call actually needs:
+            #   - sync path (`sp_async=False`, the only path Wan uses today):
+            #     each attention backend here runs on the LOCAL SP shard only,
+            #     so only the LAST rank's shard ever contains padding --
+            #     `SelfAttention` slices this mask down to its own local segment.
+            #   - async path (`sp_async=True`): `async_ulysses_qkv_projection`
+            #     all-to-alls K/V to their full GLOBAL length on every rank (its
+            #     own unpad call is a no-op here since it's told the padded, not
+            #     true, length), so every rank needs the full mask as-is.
+            # Only `eager_attention_forward` reads this today -- the
+            # flash_attention_3/sageattention wrappers ignore `attention_mask`
+            # entirely, so this is a strict improvement where supported and a
+            # no-op (unchanged prior behavior) elsewhere. See PR #1139 for the
+            # scope of what remains unmasked.
+            if pad_size > 0:
+                self_attn_mask = torch.zeros(1, 1, 1, padded_seq_len, dtype=x.dtype, device=x.device)
+                self_attn_mask[..., padded_seq_len - pad_size :] = torch.finfo(x.dtype).min
+
             x = slice_input_tensor_scale_grad(x, dim=1)
             freqs = slice_input_tensor_scale_grad(freqs, dim=0)
 
@@ -621,14 +670,15 @@ class WanModel(PreTrainedModel):
                     cos,
                     sin,
                     last_loss=last_loss,
+                    self_attn_mask=self_attn_mask,
                 )
             else:
-                x = block(x, context, t_mod, freqs, cos, sin, last_loss=last_loss)
+                x = block(x, context, t_mod, freqs, cos, sin, last_loss=last_loss, self_attn_mask=self_attn_mask)
 
         x = self.head(x, t)
 
         if get_parallel_state().ulysses_enabled:
-            x = gather_outputs(x, gather_dim=1)
+            x = gather_outputs(x, gather_dim=1, padding_dim=1, unpad_dim_size=unpadded_seq_len)
         x = self.unpatchify(x, (f, h, w))
         return x
 

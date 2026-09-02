@@ -396,7 +396,10 @@ supported fused backend preserves V4's clamped SwiGLU pre-activation semantics.
 On Ascend, `fused_npu` keeps the existing `torch_npu.npu_swiglu` path when no
 limit is configured and uses a forward/backward `triton-ascend` kernel for the
 clamped DeepSeek-V4 path. The import stays lazy, so other NPU MoE models do not
-gain a Triton dependency.
+gain a Triton dependency. VeOmni's supported Ascend images include
+`triton-ascend`; a bare NPU environment must install a release compatible with
+its CANN and `torch_npu` stack. Selecting the clamped path without that package
+raises an actionable runtime error.
 
 ### Key files
 

@@ -107,30 +107,6 @@ def _eager_clamped_swiglu(x, limit):
 
 
 class TestNPUClampedSwiGLU:
-    def test_production_swiglu_dispatches_by_limit(self, monkeypatch):
-        import importlib
-
-        module = importlib.import_module("veomni.ops.kernels.moe.npu_group_gemm")
-        x = torch.empty((2, 16), device=DEVICE, dtype=torch.bfloat16)
-        clamped_output = object()
-        unclamped_output = object()
-        calls = []
-
-        def fake_clamped_swiglu(actual_x, limit):
-            calls.append(("clamped", actual_x is x, limit))
-            return clamped_output
-
-        def fake_npu_swiglu(actual_x, *, dim):
-            calls.append(("unclamped", actual_x is x, dim))
-            return unclamped_output
-
-        monkeypatch.setattr(module, "_clamped_swiglu", fake_clamped_swiglu)
-        monkeypatch.setattr(module.torch_npu, "npu_swiglu", fake_npu_swiglu)
-
-        assert module._swiglu(x, 7.0) is clamped_output
-        assert module._swiglu(x, None) is unclamped_output
-        assert calls == [("clamped", True, 7.0), ("unclamped", True, -1)]
-
     @pytest.mark.parametrize("shape", [(3, 34), (2, 3, 256)])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_forward_backward_matches_eager(self, shape, dtype):
