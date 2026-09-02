@@ -32,23 +32,29 @@ else:
     from .triton.solve_tril import solve_tril
 
 
-# ``fla_npu`` registers the fused ``torch.ops.npu.*`` GDN ops that the fwd/bwd
-# functions in this module dispatch to; the import is deferred to those
-# functions (see ``_ensure_fla_npu_registered`` below) so that consumers of the
-# fla_npu-free helpers exported here (``precompute_varlen_metadata``,
-# ``prepare_chunk_indices``, ``prepare_chunk_indices_list``, ``l2norm``) — most
-# importantly the Qwen3.5 patchgen-generated NPU forward, which imports
-# ``precompute_varlen_metadata`` unconditionally regardless of the selected
-# ``chunk_gated_delta_rule_implementation`` — can load this module on NPU
-# images that only manually install ``fla_npu`` when the ``npu_ascendc``
-# backend is used.
 def _ensure_fla_npu_registered() -> None:
-    """Import ``fla_npu`` for its ``torch.ops.npu.*`` registration side effect.
+    """Import ``fla_npu`` for its ``torch.ops.npu.*`` GDN op registration side
+    effect. Deferred off module top so that ``precompute_varlen_metadata`` (and
+    the other fla_npu-free helpers here) can be imported on NPU images that
+    only install ``fla_npu`` for the ``npu_ascendc`` backend.
 
     Idempotent — Python caches the module in ``sys.modules`` on first import,
-    so calling this at the top of every dispatch site is essentially free.
+    so calling this at every dispatch site is essentially free. Re-raises a
+    missing ``fla_npu`` as an actionable ``RuntimeError`` naming the backend,
+    matching the message ``_npu_ascendc_chunk_gated_delta_rule_factory`` used
+    to raise at bind time before this import moved off module top.
     """
-    import fla_npu  # noqa: F401
+    try:
+        import fla_npu  # noqa: F401
+    except ModuleNotFoundError as e:
+        if e.name != "fla_npu":
+            raise
+        raise RuntimeError(
+            "chunk_gated_delta_rule 'npu_ascendc' backend requires the 'fla_npu' package, "
+            "which is not installed. Install fla_npu manually on NPU "
+            "(https://github.com/flashserve/flash-linear-attention-npu), or set "
+            "chunk_gated_delta_rule_implementation to 'npu' (vendored Triton) or 'eager'."
+        ) from e
 
 
 _disable_compile = getattr(getattr(torch, "compiler", None), "disable", lambda fn: fn)
