@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+from veomni.utils.device import MOE_TRITON_DEVICE_TYPES
 
 
 def _deepseek_v4_experts_reference(
@@ -35,11 +36,19 @@ def _deepseek_v4_experts_reference(
     return output
 
 
-@pytest.mark.parametrize(("device_type", "expected_moe"), [("cuda", "fused_triton"), ("npu", "fused_npu")])
-def test_deepseek_v4_test_overrides_follow_active_device(monkeypatch, device_type, expected_moe):
+@pytest.mark.parametrize(
+    ("device_type", "triton_available", "expected_moe"),
+    [
+        (MOE_TRITON_DEVICE_TYPES[0], False, "fused_triton"),
+        ("npu", True, "fused_npu"),
+        ("npu", False, "eager"),
+    ],
+)
+def test_deepseek_v4_test_overrides_follow_active_device(monkeypatch, device_type, triton_available, expected_moe):
     from tests.tools import training_utils
 
     monkeypatch.setattr(training_utils, "get_device_type", lambda: device_type)
+    monkeypatch.setattr(training_utils, "is_package_available", lambda _package: triton_available)
     overrides = training_utils.resolve_ops_overrides("deepseek_v4")
 
     assert "--model.ops_implementation.attn_implementation=eager" in overrides

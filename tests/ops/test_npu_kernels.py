@@ -29,6 +29,7 @@ import torch
 import veomni.ops  # noqa: F401 — trigger KERNEL_REGISTRY registrations
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
+from veomni.utils.import_utils import is_package_available
 
 
 pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU kernels require torch_npu")
@@ -106,6 +107,7 @@ def _eager_clamped_swiglu(x, limit):
     return torch.nn.functional.silu(gate) * up
 
 
+@pytest.mark.skipif(not is_package_available("triton"), reason="clamped SwiGLU requires triton-ascend")
 class TestNPUClampedSwiGLU:
     @pytest.mark.parametrize("shape", [(3, 34), (2, 3, 256)])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
