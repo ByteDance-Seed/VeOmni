@@ -64,10 +64,10 @@ def npu_group_gemm_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "veomni.distributed.moe", fake_moe_package)
     monkeypatch.setitem(sys.modules, "veomni.distributed.moe.comm", fake_comm)
     monkeypatch.setitem(sys.modules, "veomni.distributed.moe.moe_utils", fake_moe_utils)
-    monkeypatch.setitem(sys.modules, _NPU_GROUP_GEMM_KERNEL_MODULE, fake_group_gemm)
-    module = importlib.import_module(_NPU_GROUP_GEMM_MODULE)
+    sys.modules[_NPU_GROUP_GEMM_KERNEL_MODULE] = fake_group_gemm
 
     try:
+        module = importlib.import_module(_NPU_GROUP_GEMM_MODULE)
         yield module, fake_torch_npu
     finally:
         for name in module_names:
@@ -75,7 +75,8 @@ def npu_group_gemm_module(monkeypatch):
             if previous_modules[name] is not None:
                 sys.modules[name] = previous_modules[name]
         if previous_parent_attribute is missing_parent_attribute:
-            delattr(parent_module, "npu_group_gemm")
+            if hasattr(parent_module, "npu_group_gemm"):
+                delattr(parent_module, "npu_group_gemm")
         else:
             parent_module.npu_group_gemm = previous_parent_attribute
 
