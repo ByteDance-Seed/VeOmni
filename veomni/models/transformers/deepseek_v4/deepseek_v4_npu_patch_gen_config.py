@@ -111,6 +111,7 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_model_forward_patched,
     deepseek_v4_rms_norm_forward_patched,
     deepseek_v4_rotary_embedding_forward_patched,
+    deepseek_v4_sparse_moe_block_init_patched,
     deepseek_v4_topk_router_forward_patched,
     deepseek_v4_unweighted_rmsnorm_forward_patched,
 )
@@ -291,6 +292,12 @@ config.replace_class(
     "DeepseekV4Experts",
     replacement=PatchedDeepseekV4Experts,
     description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path (fused_npu backend)",
+)
+
+config.override_method(
+    "DeepseekV4SparseMoeBlock.__init__",
+    replacement=deepseek_v4_sparse_moe_block_init_patched,
+    description="Flag routed experts to use the conservative max_M bound under non-distinct hash routing",
 )
 
 config.override_method(
