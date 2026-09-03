@@ -51,8 +51,11 @@ SKIP_ROOTS = frozenset({".git", ".venv", ".pr-drafts", ".agents_workspace"})
 INLINE_CODE = re.compile(r"`([^`\n]+)`")
 # [label](target)
 LINK_TARGET = re.compile(r"\]\(([^)\s]+)\)")
-# /skill-name, as used in the dispatch tables and cross-references
-SKILL_REF = re.compile(r"(?<![\w/])/(veomni-[a-z0-9-]+|create-pr)\b")
+# /skill-name, as used in the dispatch tables and cross-references. The
+# lookbehind also rejects `.`, so a relative path to a sibling checkout
+# (`../veomni-a`) is not mistaken for a skill -- the repo is called VeOmni, so
+# those paths turn up in docs.
+SKILL_REF = re.compile(r"(?<![\w/.])/(veomni-[a-z0-9-]+|create-pr)\b")
 # "`<name>` skill" / "skill `<name>`" -- prose references to a skill
 SKILL_PROSE = re.compile(r"`([a-z][a-z0-9-]{2,})`\s+skill\b|\bskill\s+`([a-z][a-z0-9-]{2,})`")
 
@@ -196,9 +199,13 @@ def main() -> int:
         print(f"error: .agents directory not found under {repo_root}", file=sys.stderr)
         return 2
 
+    # scan() already checks skill refs inside the doc globs, so the repo-wide
+    # pass re-reports those. Deduplicate on the whole message: keying on the
+    # file alone would drop a genuine skill error just because that file
+    # happened to have an unrelated path error.
     errors = scan(repo_root)
-    doc_paths = {error.split(":", 1)[0] for error in errors}
-    errors += [error for error in scan_skill_refs(repo_root) if error.split(":", 1)[0] not in doc_paths]
+    seen = set(errors)
+    errors += [error for error in scan_skill_refs(repo_root) if error not in seen]
     if errors:
         print("Agent docs reference paths or skills that do not exist:\n", file=sys.stderr)
         for message in errors:
