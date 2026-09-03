@@ -113,8 +113,6 @@ veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
 veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
-veomni_dsa_indexer_loss = OpsConfigSlot("dsa_indexer_loss", default=False)
-veomni_dsa_indexer_loss_coef = OpsConfigSlot("dsa_indexer_loss_coef", default=1.0)
 
 
 # ======================================================================
@@ -129,6 +127,25 @@ def _indexer_loss_enabled(module) -> bool:
     configuration below would otherwise train the indexer on a wrong signal, or
     on none, while the loss curve looked entirely reasonable.
 
+    Read off ``module.config``, where the objective and its weight are declared,
+    beside the ``output_router_logits`` / ``router_aux_loss_coef`` pair this model's
+    other auxiliary objective is configured through and folded in from. ``module`` is
+    therefore anything holding the model config -- a ``DeepseekV4Attention`` or the
+    ``DeepseekV4Model`` itself. Per-instance rather than module-global, so two models
+    built from this one generated module (a DPO policy and its reference) can differ.
+
+    ``getattr`` with a default, not attribute access: ``MODELING_BACKEND=hf`` skips
+    ``MODEL_CONFIG_REGISTRY`` and hands the patched classes an upstream
+    ``DeepseekV4Config``, which declares neither field. Undeclared is not the same as
+    absent, though, and the difference is exactly what the subclass buys. Keys found
+    in a ``config.json`` are ``setattr``ed by ``from_dict`` whether the class declared
+    them or not, so a flag-on checkpoint carries the objective into an upstream config
+    unaided; a *kwarg* is applied only if the attribute already exists, so enabling the
+    objective from YAML on a base checkpoint that never had the key is the one path
+    that silently drops without the declaration. What the default here covers is the
+    remaining case -- neither declared nor on disk -- where off is the only safe
+    reading of a config that cannot express the objective.
+
     A non-positive coefficient counts as off, matching Megatron's
     ``coeff is not None and coeff > 0`` (``training/training.py:3317``). It is read
     here rather than only at the fold-in because this predicate is what decides the
@@ -138,17 +155,24 @@ def _indexer_loss_enabled(module) -> bool:
     ``_apply_ortho`` decays whatever it steps (``:1005-1006``), which is weight decay
     on 226M otherwise-frozen parameters, at the full cost of the teacher kernel.
     Gating here makes ``dsa_indexer_loss_coef: 0.0`` cost exactly what
-    ``dsa_indexer_loss: false`` costs, which is what ``arguments_types.py`` has always
-    promised.
+    ``dsa_indexer_loss: false`` costs.
 
     Before the refusals below, not after: a user who switched the term off with the
     coefficient has not asked for a TileLang indexer, and refusing their run over the
     configuration of a feature they just disabled would be advice about the wrong
     thing.
+
+    ``check_indexer_loss_prerequisites`` refuses the two implementation fields at
+    model-build time, before any rank reads a weight, so a launched run is told there
+    rather than here. These stay because this predicate also covers the paths that
+    never pass through ``build_foundation_model`` -- a model constructed straight from
+    ``_from_config`` -- and because the parallel-state refusals below have no earlier
+    home: the state is installed by then, but a model-agnostic gate cannot know that
+    *this* model has no context-parallel indexer path.
     """
-    if not veomni_dsa_indexer_loss.value:
+    if not getattr(module.config, "dsa_indexer_loss", False):
         return False
-    if veomni_dsa_indexer_loss_coef.value <= 0:
+    if getattr(module.config, "dsa_indexer_loss_coef", 1.0) <= 0:
         return False
     if veomni_dsa_indexer_implementation.value != "tilelang":
         raise ValueError(
@@ -187,6 +211,12 @@ def _builds_indexer_kl(module) -> bool:
     four-unpack the two-tuple every sliding and HCA layer returns, which is three
     of the four layers of the reference checkpoint.
 
+    The attention forward also hands its answer *down*, to the compressor and the
+    indexer, whose returns change arity by the same decision (``_split_indexer_output``).
+    They are passed it rather than calling this because neither keeps the model config
+    the predicate reads, and because one evaluation per layer per forward is one fewer
+    thing that can disagree with itself mid-call.
+
     ``_indexer_loss_enabled`` comes first so that its refusals fire on every layer
     type rather than only on the ones carrying an indexer: a model configured for
     the loss but built without a single CSA layer would otherwise accept the flag
@@ -207,25 +237,26 @@ def _builds_indexer_kl(module) -> bool:
     return _indexer_loss_enabled(module) and module.layer_type == "compressed_sparse_attention"
 
 
-def _split_indexer_output(module, indexer_output):
-    """Unpack ``DeepseekV4Indexer.forward``'s return, whose arity follows the gate.
+def _split_indexer_output(indexer_output, build_indexer_loss: bool):
+    """Unpack ``DeepseekV4Indexer.forward``'s return, whose arity follows the flag.
 
     The indexer returns ``(top_k_indices, index_score)`` only when the loss is on, so
     that a flag-off forward keeps exactly the arity every existing caller unpacks. The
     two compressor call sites read it through here rather than through an
-    ``isinstance(..., tuple)`` test, so that the compressor and the indexer decide by
-    the same gate and a mismatch surfaces as an unpacking error at the call rather than
-    as a silently missing student distribution much later.
+    ``isinstance(..., tuple)`` test, so that a disagreement surfaces as an unpacking
+    error at the call rather than as a silently missing student distribution much
+    later.
 
-    Deliberately ``_indexer_loss_enabled`` and not ``_builds_indexer_kl``: this side
-    is about the indexer's own arity, which does not depend on the layer type, while
-    the attention side adds that test because only a CSA layer has a KL to return. The
-    two therefore disagree for any layer that runs an indexer without being CSA, and
-    the disagreement costs a scores tensor that nothing reads rather than an arity
-    mismatch. Tightening this one to match would couple the indexer's contract to a
-    consumer two frames up, which is the direction that goes stale.
+    ``build_indexer_loss`` is the same value the compressor passed *into* the indexer
+    on the line above, which is the point: neither the indexer nor the compressor
+    evaluates the predicate. ``DeepseekV4Attention.forward`` evaluates it once per
+    layer per forward and hands it down, so the producer's arity and the consumer's
+    unpacking cannot disagree -- there is only one answer, and it arrives by argument.
+    Neither module holds the model config to re-derive it from in any case: the
+    compressor and the indexer take a config in ``__init__`` and keep only scalars off
+    it.
     """
-    if not _indexer_loss_enabled(module):
+    if not build_indexer_loss:
         return indexer_output, None
     top_k_indices, index_score = indexer_output
     return top_k_indices, index_score
@@ -711,6 +742,13 @@ class DeepseekV4HCACompressor(nn.Module):
         packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
         return_topk_indices: bool = False,
         build_block_bias: bool = True,
+        # Accepted and ignored, matching the GPU config's HCA compressor: the shared
+        # ``DeepseekV4Attention.forward`` holds one compressor whose class is chosen by
+        # layer type and calls it through a single call site, so both compressors have to
+        # take the same arguments. Only the CSA one owns a Lightning Indexer. Dead on NPU
+        # either way -- ``_indexer_loss_enabled`` refuses anything but the TileLang
+        # indexer, which is CUDA-only -- but the signature has to line up with the call.
+        build_indexer_loss: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
@@ -864,6 +902,7 @@ class DeepseekV4Indexer(nn.Module):
         layer_idx: int,
         packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
         packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
+        build_indexer_loss: bool = False,
     ) -> torch.LongTensor | tuple[torch.LongTensor, torch.Tensor]:
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
@@ -876,11 +915,12 @@ class DeepseekV4Indexer(nn.Module):
         # gradient; from here on this detach is the only thing keeping the auxiliary
         # objective from reaching the language-modelling one.
         #
-        # Read once, so the detach, the return arity and the eager refusal below cannot
-        # disagree inside a single call, and so the gate's own refusals land before this
-        # module does any work rather than after it.
-        indexer_loss_enabled = _indexer_loss_enabled(self)
-        if indexer_loss_enabled:
+        # ``build_indexer_loss`` arrives from ``DeepseekV4Attention.forward``, which owns
+        # the model config and evaluated ``_builds_indexer_kl`` once for this layer. This
+        # module keeps only scalars off the config it was constructed with, and deriving
+        # the answer a second time here is what would let the detach, the return arity and
+        # the compressor's unpacking disagree inside a single call.
+        if build_indexer_loss:
             hidden_states = hidden_states.detach()
             q_residual = q_residual.detach()
         # --- Patch.2 ---
@@ -989,7 +1029,7 @@ class DeepseekV4Indexer(nn.Module):
             # Names ``dsa_indexer_loss`` when that is what selected the implementation:
             # the objective requires ``tilelang``, so a user who enabled it and then lands
             # here would otherwise get an error about a flag they never chose.
-            chosen_by = " (required by dsa_indexer_loss)" if veomni_dsa_indexer_loss.value else ""
+            chosen_by = " (required by dsa_indexer_loss)" if build_indexer_loss else ""
             raise ValueError(
                 f"dsa_indexer_implementation='tilelang'{chosen_by} was requested but the TileLang indexer "
                 f"does not support this call: is_cuda={hidden_states.is_cuda}, num_heads={self.num_heads}, "
@@ -1041,7 +1081,7 @@ class DeepseekV4Indexer(nn.Module):
             # exclusive, because ``_indexer_loss_enabled`` refuses ``ulysses_size > 1``
             # outright (a head shard would make the teacher's head sum partial), so a
             # partitioned score can never be the one being returned.
-            if indexer_loss_enabled:
+            if build_indexer_loss:
                 return top_k_indices.to(torch.long), index_score
             # --- Patch.2 ---
             return top_k_indices.to(torch.long)
@@ -1129,9 +1169,29 @@ class DeepseekV4CSACompressor(nn.Module):
         packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
         return_topk_indices: bool = False,
         build_block_bias: bool = True,
+        # Accepted, refused, and never forwarded on this backend. The shared attention
+        # forward passes ``_builds_indexer_kl``'s answer down here, so the parameter
+        # exists because the call site is shared -- ``tests/models/
+        # test_generated_call_site_signatures.py`` is what enforces that. The two indexer
+        # call sites below stay on their bare-tensor return and this file needs no
+        # ``_split_indexer_output``.
+        build_indexer_loss: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
+        if build_indexer_loss:
+            # Reachable: ``dsa_indexer_implementation`` is a plain ``Literal`` with no
+            # hardware gate, so ``tilelang`` parses on NPU and ``_indexer_loss_enabled``
+            # then admits the objective. Everything after this point would quietly
+            # disagree with it -- the indexer is called without the flag and returns bare
+            # top-k indices, and the attention forward eventually fails its own wiring
+            # check with a message about an internal invariant rather than about the two
+            # lines of YAML that caused it. Say the true thing here instead.
+            raise NotImplementedError(
+                "dsa_indexer_loss is not implemented on NPU: the objective's student "
+                "distribution is the TileLang Lightning Indexer's per-slot scores, and that "
+                "kernel is CUDA-only. Set dsa_indexer_loss: false under model.model_config."
+            )
         batch, seq_len, _ = hidden_states.shape
         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
         kv = self.kv_proj(hidden_states)
@@ -1564,6 +1624,15 @@ class DeepseekV4Attention(nn.Module):
         # metadata is sufficient to validate candidates on its own, so its absence is
         # the signal to take the mask-free path and skip every O(S^2) intermediate.
         mask_free_sparse = use_compact_sparse_indices and attention_mask is None
+        # --- Patch.3 ---
+        # Evaluated before the compressor rather than beside its consumer below, because
+        # the compressor and the indexer under it change return arity on this same answer
+        # and are handed it rather than deriving it. It is also where the gate's refusals
+        # come from, so an unsupported configuration is rejected before this layer does
+        # any work. The decoder layer above and the model loop above that read the same
+        # predicate to decide how many values to unpack; see its docstring.
+        build_indexer_loss = _builds_indexer_kl(self)
+        # --- Patch.3 ---
         if self.compressor is not None:
             compressor_output = self.compressor(
                 compressor_hidden,
@@ -1575,6 +1644,9 @@ class DeepseekV4Attention(nn.Module):
                 packed_compression_metadata=kwargs.get("packed_compression_metadata"),
                 return_topk_indices=use_compact_sparse_indices,
                 build_block_bias=not mask_free_sparse,
+                # --- Patch.3 ---
+                build_indexer_loss=build_indexer_loss,
+                # --- Patch.3 ---
             )
             if use_compact_sparse_indices:
                 compressed_kv, block_bias, compressed_candidates = compressor_output
@@ -1609,9 +1681,6 @@ class DeepseekV4Attention(nn.Module):
                 device=q.device,
             )
         # --- Patch.3 ---
-        # The decoder layer above and the model loop above that read this same
-        # predicate to decide how many values to unpack; see its docstring.
-        build_indexer_loss = _builds_indexer_kl(self)
         if build_indexer_loss:
             index_score = compressed_candidates.indexer_scores if compressed_candidates is not None else None
             if index_score is None:
@@ -2828,7 +2897,9 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                 # counts. This entry rides the aux-metric path, so it needs no such
                 # assumption.
                 aux_metrics["lm_loss_before_indexer_kl"] = loss.detach()
-                loss = loss + veomni_dsa_indexer_loss_coef.value * indexer_kl.to(loss.device)
+                # Read off ``self.config``, four lines below where ``self.router_aux_loss_coef``
+                # weights this model's other auxiliary objective, and from the same place.
+                loss = loss + self.config.dsa_indexer_loss_coef * indexer_kl.to(loss.device)
         # --- Patch.3 ---
 
         return MoeCausalLMOutputWithLogProbs(

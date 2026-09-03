@@ -1199,26 +1199,6 @@ class OpsImplementationConfig:
         default="eager",
         metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
     )
-    dsa_indexer_loss: bool = field(
-        default=False,
-        metadata={
-            "help": "Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) "
-            "sparse KL objective. Requires dsa_indexer_implementation='tilelang', "
-            "dsa_attention_implementation='tilelang', and ulysses_size == 1. Only DeepSeek-V4 "
-            "implements it; any other model refuses the flag at model-build time rather than "
-            "ignoring it. Reports training/indexer_kl, training/indexer_kl_uniform, "
-            "training/indexer_kl_captured and training/lm_loss_before_indexer_kl."
-        },
-    )
-    dsa_indexer_loss_coef: float = field(
-        default=1.0,
-        metadata={
-            "help": "Weight on the indexer KL when folding it into the total loss. A value of 0.0 "
-            "switches the objective off entirely: the teacher distribution is not recomputed, no "
-            "gradient reaches the Lightning Indexer and no metric is reported, so it costs exactly "
-            "what dsa_indexer_loss=false costs."
-        },
-    )
     mhc_implementation: Literal["eager", "tilelang"] = field(
         default="eager",
         metadata={
@@ -1377,53 +1357,6 @@ class OpsImplementationConfig:
                         f"Set to one of {allowed}; 'eager' is the universal fallback "
                         f"for ops with no MLU kernel for the current model."
                     )
-
-        # The indexer KL is scaled by this weight before it is added to the
-        # total loss, so a negative value trains the Lightning Indexer away
-        # from its teacher and a non-finite one destroys every other term in
-        # the sum. Both surface as a loss curve rather than as an error, so the
-        # bound is checked here, before the value reaches a model.
-        if not math.isfinite(self.dsa_indexer_loss_coef) or self.dsa_indexer_loss_coef < 0:
-            raise ValueError(
-                f"dsa_indexer_loss_coef={self.dsa_indexer_loss_coef!r} must be finite and non-negative: "
-                "a negative weight flips the sign of the indexer KL and a non-finite one destroys the "
-                "total loss. Use 0.0 to switch the term off."
-            )
-
-        # The one configuration where both flags are set and nothing happens. It is a
-        # legitimate way to disable the objective without editing the flag, so it is
-        # not an error -- but a run whose config says ``dsa_indexer_loss: true`` and
-        # which reports no indexer metric at all is exactly the sort of thing someone
-        # spends an afternoon on, and this is the only place that can say so once
-        # rather than once per layer per forward.
-        if self.dsa_indexer_loss and self.dsa_indexer_loss_coef == 0:
-            logger.warning_rank0(
-                "dsa_indexer_loss is enabled but dsa_indexer_loss_coef is 0.0, so the indexer KL is "
-                "switched off entirely: no teacher is computed, the Lightning Indexer receives no "
-                "gradient, and no indexer metric is reported. Set a positive coefficient to train it."
-            )
-
-        # The objective's two same-dataclass prerequisites. The model refuses these
-        # again on its first forward, which is where a check keyed on the parallel
-        # state has to live -- but these two are fields sitting beside the flag, and
-        # waiting for the forward means every rank has already built a model and read
-        # the checkpoint (54.8 GB for DeepSeek-V4-Flash) before being told that three
-        # lines of YAML disagree with each other. A zero coefficient is off, so it is
-        # not held to prerequisites it no longer has.
-        if self.dsa_indexer_loss and self.dsa_indexer_loss_coef > 0:
-            for field_name, reason in (
-                (
-                    "dsa_indexer_implementation",
-                    "the eager indexer discards the per-slot scores the KL trains against",
-                ),
-                (
-                    "dsa_attention_implementation",
-                    "the teacher distribution is derived from the TileLang attention's log-sum-exp",
-                ),
-            ):
-                value = getattr(self, field_name)
-                if value != "tilelang":
-                    raise ValueError(f"dsa_indexer_loss requires {field_name}='tilelang', got {value!r}: {reason}.")
 
         # The Triton load-balancing-loss kernel imports ``triton`` at module
         # top — surface a missing package here with an actionable message

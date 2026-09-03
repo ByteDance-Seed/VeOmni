@@ -1,7 +1,7 @@
 # DeepSeek-V4-Flash SFT with the Lightning Indexer KL objective (DeepSeek-V3.2 eq. 4).
 #
 # Sibling of configs/text/deepseek_v4.yaml. One line turns the feature on
-# (model.ops_implementation.dsa_indexer_loss); max_seq_len and dyn_bsz are the two non-obvious
+# (model.model_config.dsa_indexer_loss); max_seq_len and dyn_bsz are the two non-obvious
 # values and each has a section below; the rest scales the job down to a smoke run on the
 # 4-layer checkpoint.
 #
@@ -40,6 +40,13 @@ model:
   # layer to train an indexer on. Named as the sibling config names its own checkpoint;
   # point it at wherever yours lives.
   model_path: DeepSeek-V4-Flash-Base-4L
+  # The feature. Off by default. These are fields of DeepSeek-V4's own config, beside the
+  # output_router_logits / router_aux_loss_coef pair the model's other auxiliary objective is
+  # configured through -- an objective is a property of the model, not a kernel selection --
+  # so they go under model_config and not under ops_implementation below.
+  model_config:
+    dsa_indexer_loss: true
+    # dsa_indexer_loss_coef: 1.0  # default; weight on the KL when it is folded into the loss
   ops_implementation:
     attn_implementation: eager
     moe_implementation: fused_triton
@@ -47,12 +54,9 @@ model:
     # The indexer loss refuses anything but TileLang on both of these: the eager indexer
     # discards the per-slot scores the student needs, and the eager attention has no LSE to
     # build the teacher from. They are already the sibling config's values; they are repeated
-    # here because the flag below depends on them.
+    # here because the flag above depends on them, and the disagreement is refused at launch.
     dsa_attention_implementation: tilelang
     dsa_indexer_implementation: tilelang
-    # The feature. Off by default everywhere else.
-    dsa_indexer_loss: true
-    # dsa_indexer_loss_coef: 1.0  # default; weight on the KL when it is folded into the loss
     mhc_implementation: tilelang
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel

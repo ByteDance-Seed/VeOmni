@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import json
 import warnings
 from pathlib import Path
 
@@ -379,59 +380,105 @@ def test_sparse_attn_returns_non_differentiable_lse():
     assert q.grad is not None and torch.isfinite(q.grad).all()
 
 
-# Run in a fresh interpreter by
-# ``test_indexer_loss_slots_are_off_before_anything_binds_them``. It has to be a
-# subprocess: the slots are module globals, so the only place their *unbound* value
-# can be observed is a process where nothing has bound them yet, and in-process that
-# depends on what else the session ran.
-_UNBOUND_SLOT_PROBE = """
-from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_two_fields_are_declared_on_the_model_config():
+    """The objective is reachable from YAML only because ``DeepseekV4Config`` declares
+    these two fields, and that is silent to break.
 
-loss = modeling.veomni_dsa_indexer_loss
-coef = modeling.veomni_dsa_indexer_loss_coef
-assert loss.value is False, f"unbound {loss.field_name} reads {loss.value!r}, expected False"
-assert coef.value == 1.0, f"unbound {coef.field_name} reads {coef.value!r}, expected 1.0"
-assert isinstance(coef.value, float), f"unbound {coef.field_name} is a {type(coef.value).__name__}, expected float"
-assert modeling._indexer_loss_enabled(object()) is False, "the gate is enabled with nothing bound"
-print("UNBOUND_SLOTS_OK")
-"""
+    ``model.model_config`` entries arrive as ``**kwargs`` to
+    ``PreTrainedConfig.from_dict``, which constructs the config from the on-disk JSON
+    and then applies only those keys the result already answers ``hasattr`` for --
+    dropping the rest with no error and no warning. Delete either declaration and
+    ``dsa_indexer_loss: true`` still parses, still launches, and trains the
+    language-model objective alone while reporting no indexer metric: the exact
+    silent no-op every other gate in this feature exists to refuse.
 
-
-def test_indexer_loss_slots_are_off_before_anything_binds_them():
-    """``OpsConfigSlot``'s own constructor default is the string ``"eager"``, so the
-    two slots added for the indexer loss pass an explicit ``default=``.
-
-    That deviation is load-bearing and silent: delete both ``default=`` arguments and
-    an unbound ``dsa_indexer_loss`` reads ``"eager"``, which is truthy, so the gate
-    turns *on* for a model whose config never asked for the loss — while the
-    coefficient becomes a string that would raise only once something multiplied by
-    it. Nothing else observes this, because every test that touches the gate binds
-    the slots first, which is exactly what erases the state under test.
-
-    Hence the subprocess: a process where nothing has bound anything is the only
-    honest way to read an unbound slot, and it does not depend on which tests ran
-    before this one. The expected values are written out here rather than read from
-    ``OpsImplementationConfig``'s field defaults — the point is that the two
-    declarations agree, so deriving one from the other would pin nothing.
+    Asserted through ``from_dict`` rather than the constructor, because the
+    constructor is not where the hole is -- ``PreTrainedConfig.__post_init__``
+    ``setattr``s whatever it is handed, so an *undeclared* field reaches a
+    directly-constructed config just fine and only the ``from_pretrained`` path that
+    every real run takes loses it. The upstream class is checked alongside as the
+    control: it is the same call, and it drops both.
     """
-    import subprocess
-    import sys
-    from pathlib import Path
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
 
-    repo_root = Path(__file__).resolve().parents[2]
-    result = subprocess.run(
-        [sys.executable, "-c", _UNBOUND_SLOT_PROBE],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        timeout=600,
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    base = UpstreamConfig(num_hidden_layers=2, layer_types=["compressed_sparse_attention"] * 2).to_dict()
+
+    overridden = DeepseekV4Config.from_dict(dict(base), dsa_indexer_loss=True, dsa_indexer_loss_coef=0.25)
+    assert overridden.dsa_indexer_loss is True, (
+        "model_config could not switch the objective on; the field is no longer declared and "
+        "from_dict dropped it silently"
     )
-    assert result.returncode == 0 and "UNBOUND_SLOTS_OK" in result.stdout, (
-        "the indexer-loss slots are not off before binding; "
-        f"probe exited {result.returncode}\n"
-        f"--- stdout (tail) ---\n{result.stdout[-500:]}\n"
-        f"--- stderr (tail) ---\n{result.stderr[-4000:]}"
+    assert overridden.dsa_indexer_loss_coef == 0.25
+
+    dropped = UpstreamConfig.from_dict(dict(base), dsa_indexer_loss=True)
+    assert not hasattr(dropped, "dsa_indexer_loss"), (
+        "the upstream config kept an undeclared override, so from_dict no longer drops unknown "
+        "keys and the declarations above are no longer what makes the YAML reach the model"
     )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_defaults_leave_the_objective_off():
+    """Both defaults, pinned: the objective is opt-in, and a checkpoint whose
+    ``config.json`` predates it must read as off rather than as on at weight 1.0."""
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    config = DeepseekV4Config(num_hidden_layers=2, layer_types=["compressed_sparse_attention"] * 2)
+    assert config.dsa_indexer_loss is False
+    assert config.dsa_indexer_loss_coef == 1.0
+
+
+@contextlib.contextmanager
+def _ops_config_installed(**overrides):
+    """Install an ``OpsImplementationConfig`` singleton, and restore the previous one.
+
+    ``check_indexer_loss_prerequisites`` reads the installed singleton because the two
+    fields it checks live there while the flag it gates on lives on the model config;
+    this is the only place that holds both. The singleton is process-wide, so it is
+    saved and restored for the same reason the ops slots are.
+
+    ``load_balancing_loss_implementation`` is pinned to eager only so these tests do
+    not depend on ``triton`` being installed; it is unrelated to anything under test.
+    """
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.ops.config.singleton import get_ops_config, set_ops_config
+
+    previous = get_ops_config()
+    installed = OpsImplementationConfig(load_balancing_loss_implementation="eager", **overrides)
+    set_ops_config(installed)
+    try:
+        yield installed
+    finally:
+        set_ops_config(previous)
+
+
+def _config_asking_for_the_loss(coef=1.0, **overrides):
+    """A ``DeepseekV4Config`` with the objective on, for the model-build gate."""
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    return DeepseekV4Config(
+        num_hidden_layers=2,
+        layer_types=["compressed_sparse_attention"] * 2,
+        dsa_indexer_loss=True,
+        dsa_indexer_loss_coef=coef,
+        **overrides,
+    )
+
+
+def _strip_indexer_loss_keys(path):
+    """Rewrite a saved ``config.json`` without either objective key.
+
+    Stands in for a base checkpoint published before the objective existed, which is
+    what the two fields' declaration has to work against.
+    """
+    config_json = Path(path) / "config.json"
+    saved = json.loads(config_json.read_text())
+    saved.pop("dsa_indexer_loss", None)
+    saved.pop("dsa_indexer_loss_coef", None)
+    config_json.write_text(json.dumps(saved))
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -440,29 +487,93 @@ def test_indexer_loss_coef_rejects_negative_and_non_finite(coef):
     """The coefficient is multiplied into the indexer KL before it joins the total
     loss, so a negative value trains the indexer *away* from the teacher and a
     non-finite one wipes out every other term in the sum. Both would show up as a
-    loss curve rather than as an error, which is why the bound is checked where the
-    rest of ``OpsImplementationConfig`` validates itself — at config-parse time,
-    before any of it reaches a model.
+    loss curve rather than as an error.
 
-    ``load_balancing_loss_implementation`` is pinned to eager only so this test does
-    not depend on ``triton`` being installed; the field is unrelated to the bound
-    under test.
+    Checked at model build rather than in the config's ``__post_init__``, and that is
+    forced rather than chosen: ``from_dict`` constructs the config from the on-disk
+    JSON and only then ``setattr``s the ``model_config`` overrides, so a bound checked
+    in ``__post_init__`` would read ``config.json`` and never the YAML line that
+    contradicts it. ``check_indexer_loss_prerequisites`` runs on the finished config,
+    before any rank reads a weight.
     """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.models.auto import check_indexer_loss_prerequisites
 
     with pytest.raises(ValueError, match="dsa_indexer_loss_coef"):
-        OpsImplementationConfig(load_balancing_loss_implementation="eager", dsa_indexer_loss_coef=coef)
+        check_indexer_loss_prerequisites(_config_asking_for_the_loss(coef=coef))
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
-@pytest.mark.parametrize("coef", [0.0, 0.5, 1.0, 100.0])
-def test_indexer_loss_coef_accepts_finite_non_negative_weights(coef):
-    """The other half of the bound: zero is a legitimate way to switch the term off
-    without changing the flag, and the check must not reject the ordinary weights."""
-    from veomni.arguments.arguments_types import OpsImplementationConfig
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("dsa_indexer_loss", "false"),
+        ("dsa_indexer_loss", "true"),
+        ("dsa_indexer_loss", 1),
+        ("dsa_indexer_loss_coef", "0.5"),
+        ("dsa_indexer_loss_coef", None),
+    ],
+)
+def test_the_two_fields_are_refused_when_they_arrive_with_the_wrong_type(field, value):
+    """``model_config`` is an untyped ``Dict`` the whole way from YAML to ``setattr``,
+    so nothing between the two coerces anything and a quoted value stays a string.
 
-    config = OpsImplementationConfig(load_balancing_loss_implementation="eager", dsa_indexer_loss_coef=coef)
-    assert config.dsa_indexer_loss_coef == coef
+    Worth its own refusal because the failure is *truthy*: ``dsa_indexer_loss: "false"``
+    reads as on and would switch the objective on for a user who wrote it to switch the
+    objective off. A quoted coefficient fails differently and no better -- it reaches
+    ``math.isfinite`` and raises ``TypeError: must be real number, not str`` from inside
+    the validator whose job was to explain the problem.
+
+    ``1`` is in the list because ``bool`` is the one case ``isinstance(x, int)`` would
+    wave through, and a config field that silently accepts ints is one that has stopped
+    being a bool.
+    """
+    from veomni.models.auto import check_indexer_loss_prerequisites
+
+    config = _config_asking_for_the_loss()
+    setattr(config, field, value)
+    with pytest.raises(TypeError, match=field):
+        check_indexer_loss_prerequisites(config)
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it():
+    """``dsa_indexer_implementation`` is a plain ``Literal`` with no hardware gate, so
+    ``tilelang`` parses on NPU and ``_indexer_loss_enabled`` admits the objective there.
+
+    The NPU CSA compressor takes ``build_indexer_loss`` only because it shares a call
+    site with the GPU one, and it cannot honour it: the student distribution is the
+    TileLang indexer's per-slot scores and that kernel is CUDA-only. Dropping the
+    argument would leave the run to fail several frames later on the attention
+    forward's own wiring check, which reports an internal invariant rather than the
+    two lines of YAML behind it.
+
+    Called with no tensors at all: the refusal is the first thing past the
+    slices/metadata pairing check, before ``hidden_states`` is touched, which is
+    itself part of the claim -- an NPU run should not build a layer's worth of
+    activations before being told the objective is unavailable.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu
+
+    with pytest.raises(NotImplementedError, match="dsa_indexer_loss is not implemented on NPU"):
+        npu.DeepseekV4CSACompressor.forward(
+            None,
+            hidden_states=None,
+            q_residual=None,
+            position_ids=None,
+            past_key_values=None,
+            layer_idx=0,
+            build_indexer_loss=True,
+        )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+@pytest.mark.parametrize("coef", [0.5, 1.0, 100.0])
+def test_indexer_loss_coef_accepts_finite_positive_weights(coef):
+    """The other half of the bound: the check must not reject the ordinary weights."""
+    from veomni.models.auto import check_indexer_loss_prerequisites
+
+    with _ops_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
+        check_indexer_loss_prerequisites(_config_asking_for_the_loss(coef=coef))
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -477,21 +588,26 @@ def test_indexer_loss_coef_accepts_finite_non_negative_weights(coef):
         ),
     ],
 )
-def test_the_two_same_dataclass_prerequisites_are_refused_at_parse_time(overrides, expected):
+def test_the_two_ops_config_prerequisites_are_refused_at_model_build(overrides, expected):
     """The model refuses these again on its first forward, and that refusal is not
     what this is about: getting there means every rank has already built a model and
     read the checkpoint -- 54.8 GB for DeepSeek-V4-Flash -- to be told that three
-    lines of YAML disagree with each other. Both fields sit on the same dataclass as
-    the flag, so nothing has to be constructed to know.
+    lines of YAML disagree with each other.
+
+    The flag is on the model config and the two implementations are on
+    ``OpsImplementationConfig``, so neither dataclass can see the disagreement alone
+    and neither ``__post_init__`` is a possible home. This gate is the earliest point
+    that holds both.
 
     Parametrised over which of the two is wrong, because a check written as one
     condition over both would pass this test while naming the wrong field in its
     message, and the message is the entire value of failing early.
     """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.models.auto import check_indexer_loss_prerequisites
 
-    with pytest.raises(ValueError, match=expected):
-        OpsImplementationConfig(load_balancing_loss_implementation="eager", dsa_indexer_loss=True, **overrides)
+    with _ops_config_installed(**overrides):
+        with pytest.raises(ValueError, match=expected):
+            check_indexer_loss_prerequisites(_config_asking_for_the_loss())
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -500,15 +616,36 @@ def test_a_zero_coefficient_is_not_held_to_the_prerequisites():
     the objective any more and must not be refused over one.
 
     The runtime gate reads the coefficient before its own refusals for exactly this
-    reason; the parse-time check has to agree, or the two would disagree about what
-    "off" means and a config that trains fine would fail to launch.
+    reason; this one has to agree, or the two would disagree about what "off" means
+    and a config that trains fine would fail to launch. It is also what makes the
+    coefficient a usable escape hatch on a checkpoint whose ``config.json`` carries
+    ``dsa_indexer_loss: true`` from the run that produced it.
     """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.models.auto import check_indexer_loss_prerequisites
 
-    config = OpsImplementationConfig(
-        load_balancing_loss_implementation="eager", dsa_indexer_loss=True, dsa_indexer_loss_coef=0.0
-    )
-    assert config.dsa_indexer_implementation == "eager"
+    with _ops_config_installed():
+        check_indexer_loss_prerequisites(_config_asking_for_the_loss(coef=0.0))
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_a_config_that_cannot_ask_for_the_objective_is_left_alone():
+    """No allow-list, and no model type named anywhere in the gate.
+
+    The flag being a ``DeepseekV4Config`` field is what does the model gating: a
+    config class that never declared it cannot be asked for the objective, so there
+    is nothing to refuse and nothing to enumerate. This is the test that would have
+    to change if the gate ever grew a model-type check again -- and the reason the
+    previous allow-list, which existed only because the flag sat on a model-agnostic
+    dataclass, could be deleted rather than extended.
+    """
+    from transformers import AutoConfig
+
+    from veomni.models.auto import check_indexer_loss_prerequisites
+
+    other = AutoConfig.for_model("llama", num_hidden_layers=2)
+    assert not hasattr(other, "dsa_indexer_loss")
+    with _ops_config_installed():
+        check_indexer_loss_prerequisites(other)
 
 
 @contextlib.contextmanager
@@ -551,6 +688,30 @@ def _ops_config_slots_bound(pre_state):
             slot.bind(SimpleNamespace(**{slot.field_name: value}))
 
 
+def _gate_module(*, enabled=True, coef=1.0):
+    """A stand-in for the module ``_indexer_loss_enabled`` reads its config off.
+
+    The gate takes a ``DeepseekV4Attention`` or the ``DeepseekV4Model`` and reads
+    ``module.config``, so the module half can be a namespace -- there is nothing to
+    it but the attribute. The config half is the real ``DeepseekV4Config`` rather
+    than a namespace carrying two fields, for the reason
+    ``test_indexer_loss_refuses_every_sequence_parallel_mode`` gives about the
+    parallel state: a duck-typed stand-in would keep these tests green through a
+    rename that the production read raises on.
+    """
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    config = DeepseekV4Config(
+        num_hidden_layers=2,
+        layer_types=["compressed_sparse_attention"] * 2,
+        dsa_indexer_loss=enabled,
+        dsa_indexer_loss_coef=coef,
+    )
+    return SimpleNamespace(config=config)
+
+
 class TestIndexerLossGate:
     """``_indexer_loss_enabled``: the three refusals, the flag-off path, and the one
     configuration that enables the loss.
@@ -558,18 +719,20 @@ class TestIndexerLossGate:
     Each refusal guards a configuration that would otherwise train the indexer on a
     wrong signal or on none while the loss curve looked entirely reasonable, so a
     test here has to fail when *its own* refusal is deleted. Two things are needed
-    for that, and both are easy to get wrong because the gate reads three module
-    globals in sequence:
+    for that:
 
-    * every test binds *all* the slots the gate reads, so a deleted refusal falls
-      through to a supported configuration rather than into the next refusal, and
+    * every test pins *everything* the gate reads -- the flag and weight on the
+      config it is handed, the two implementations on the ops slots -- so a deleted
+      refusal falls through to a supported configuration rather than into the next
+      refusal, and
     * every ``match=`` names the field its own refusal is about. ``tilelang`` alone
       does not: it appears in the indexer refusal and the attention refusal both.
 
-    The first of those is enforced by the fixture below rather than left to each
-    test: it binds all three slots to a known pre-state, so a test that binds two of
-    them reads the third from that pre-state instead of from whatever the session
-    left behind.
+    The slot half of the first point is enforced by the fixture below rather than
+    left to each test: it binds both implementation slots to a known pre-state, so a
+    test that binds one reads the other from that pre-state instead of from whatever
+    the session left behind. The config half needs no such protection -- each test
+    builds its own config and nothing is shared.
 
     The class exists to scope the autouse fixture below to this group.
     """
@@ -585,10 +748,8 @@ class TestIndexerLossGate:
     # moved out of the generated module fails the fixture's setup assertion instead
     # of quietly dropping out of the collected set.
     _GATE_SLOT_PRE_STATE = {
-        "dsa_indexer_loss": False,
         "dsa_indexer_implementation": "eager",
         "dsa_attention_implementation": "eager",
-        "dsa_indexer_loss_coef": 1.0,
     }
 
     @pytest.fixture(autouse=True)
@@ -644,7 +805,6 @@ class TestIndexerLossGate:
         sizes = {"ulysses_size": 2} if mode == "ulysses" else {"cp_size": 2}
         state = ParallelState(dp_size=1, device_type="cpu", device_mesh=MagicMock(), **sizes)
 
-        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
         with mock.patch(
@@ -652,7 +812,7 @@ class TestIndexerLossGate:
             return_value=state,
         ):
             with pytest.raises(ValueError, match=expected):
-                modeling._indexer_loss_enabled(object())
+                modeling._indexer_loss_enabled(_gate_module())
 
     def test_indexer_loss_refuses_eager_indexer(self):
         """The eager indexer discards its scores, so there would be no student to
@@ -666,11 +826,10 @@ class TestIndexerLossGate:
 
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
         with pytest.raises(ValueError, match="dsa_indexer_implementation"):
-            modeling._indexer_loss_enabled(object())
+            modeling._indexer_loss_enabled(_gate_module())
 
     def test_indexer_loss_refuses_eager_attention(self):
         """The teacher is read off the TileLang attention LSE, which the eager
@@ -685,11 +844,10 @@ class TestIndexerLossGate:
 
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
         with pytest.raises(ValueError, match="dsa_attention_implementation"):
-            modeling._indexer_loss_enabled(object())
+            modeling._indexer_loss_enabled(_gate_module())
 
     def test_indexer_loss_off_by_default(self):
         """With the flag off, none of the refusals above fire: eager everything is a
@@ -698,10 +856,65 @@ class TestIndexerLossGate:
 
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=False))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
-        assert modeling._indexer_loss_enabled(object()) is False
+        assert modeling._indexer_loss_enabled(_gate_module(enabled=False)) is False
+
+    def test_a_config_without_the_fields_reads_as_off(self):
+        """``MODELING_BACKEND=hf`` skips ``MODEL_CONFIG_REGISTRY``, so the patched
+        classes can be handed an upstream ``DeepseekV4Config``, which declares
+        neither field.
+
+        The gate reads both through ``getattr`` with a default for exactly that, and
+        off is the only safe reading: a config that cannot express the objective
+        cannot have asked for it. Written as plain attribute access instead, this
+        raises ``AttributeError`` from inside the first forward of a configuration
+        that has nothing to do with the objective.
+        """
+        from types import SimpleNamespace
+
+        from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        upstream = UpstreamConfig(num_hidden_layers=2, layer_types=["compressed_sparse_attention"] * 2)
+        assert not hasattr(upstream, "dsa_indexer_loss")
+        assert modeling._indexer_loss_enabled(SimpleNamespace(config=upstream)) is False
+
+    def test_undeclared_is_not_the_same_as_absent(self, tmp_path):
+        """The case above is a *missing key*, not merely an undeclaring class, and the
+        difference is the whole reason ``MODEL_CONFIG_REGISTRY`` and the subclass exist.
+
+        Three behaviours of ``from_pretrained``, pinned here because the design rests on
+        them and none is obvious: a key present in ``config.json`` is ``setattr``ed
+        whether or not the class declared it; a *kwarg* is applied only when the
+        attribute already exists, so it overrides a flag-on checkpoint but is dropped on
+        a config that has neither the declaration nor the key; and the subclass is what
+        turns that last drop into an override.
+
+        The dropped one is not a corner: it is the primary use case, switching the
+        objective on from YAML against a base checkpoint that never carried the field.
+        Without the declaration a user's ``dsa_indexer_loss: true`` would vanish between
+        the YAML and the model, and the run would train the language-model objective
+        alone while reporting nothing amiss.
+        """
+        from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
+
+        from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+        _config_asking_for_the_loss(coef=1.0).save_pretrained(tmp_path)
+
+        # On disk, so it arrives even in a class that never declared it.
+        assert UpstreamConfig.from_pretrained(tmp_path).dsa_indexer_loss is True
+        # ...and a kwarg overrides it, because by then the attribute exists.
+        assert UpstreamConfig.from_pretrained(tmp_path, dsa_indexer_loss=False).dsa_indexer_loss is False
+
+        _strip_indexer_loss_keys(tmp_path)
+
+        # Neither declared nor on disk: the kwarg is dropped without a word.
+        assert not hasattr(UpstreamConfig.from_pretrained(tmp_path, dsa_indexer_loss=True), "dsa_indexer_loss")
+        # Declared: the same kwarg lands. This one line is what the subclass is for.
+        assert DeepseekV4Config.from_pretrained(tmp_path, dsa_indexer_loss=True).dsa_indexer_loss is True
 
     def test_indexer_loss_enabled_on_the_supported_configuration(self):
         """The one configuration this whole flag exists for, and the only test that
@@ -726,7 +939,6 @@ class TestIndexerLossGate:
         from veomni.distributed.parallel_state import ParallelState
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
         state = ParallelState(dp_size=1, ulysses_size=1, device_type="cpu")
@@ -735,7 +947,7 @@ class TestIndexerLossGate:
             "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
             return_value=state,
         ):
-            assert modeling._indexer_loss_enabled(object()) is True
+            assert modeling._indexer_loss_enabled(_gate_module()) is True
 
     @pytest.mark.parametrize("coef", [0.0, -0.0, 0, -1.0])
     def test_a_non_positive_coefficient_switches_the_objective_off(self, coef):
@@ -755,19 +967,17 @@ class TestIndexerLossGate:
         compressor's, the teacher recompute in the attention forward, and only then
         the fold-in. Gating the fold-in alone would leave the teacher running.
 
-        The negative case cannot be reached through ``OpsImplementationConfig``,
-        which refuses it at parse time, but the slot is bindable directly and a
-        ``> 0`` gate should not read a sign flip as "on".
+        The negative case cannot be reached through a launched run, whose model-build
+        gate refuses it before any weight is read, but a config carrying it is
+        constructible and a ``> 0`` gate should not read a sign flip as "on".
         """
         from types import SimpleNamespace
 
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
-        modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
-        assert modeling._indexer_loss_enabled(object()) is False
+        assert modeling._indexer_loss_enabled(_gate_module(coef=coef)) is False
 
     def test_a_coefficient_of_zero_does_not_refuse_an_unsupported_configuration(self):
         """Off is off, all the way: at ``coef=0`` the three refusals must not fire.
@@ -781,11 +991,9 @@ class TestIndexerLossGate:
 
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
-        modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=0.0))
-        assert modeling._indexer_loss_enabled(object()) is False
+        assert modeling._indexer_loss_enabled(_gate_module(coef=0.0)) is False
 
     @pytest.mark.parametrize("coef", [1e-8, 0.5, 1.0])
     def test_a_positive_coefficient_leaves_the_objective_on(self, coef):
@@ -801,19 +1009,17 @@ class TestIndexerLossGate:
         from veomni.distributed.parallel_state import ParallelState
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=True))
         modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
-        modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
         state = ParallelState(dp_size=1, ulysses_size=1, device_type="cpu")
         with mock.patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=state):
-            assert modeling._indexer_loss_enabled(object()) is True
+            assert modeling._indexer_loss_enabled(_gate_module(coef=coef)) is True
 
 
 _TOY_CONFIG_DIR = Path(__file__).resolve().parents[1] / "toy_config" / "deepseek_v4_toy"
 
 
-def _dsv4_indexer_test_config():
+def _dsv4_indexer_test_config(indexer_loss=False, coef=1.0):
     """The toy DeepSeek-V4 config, re-geometried to the 4-layer checkpoint's indexer.
 
     ``index_n_heads=64`` / ``index_head_dim=128`` / ``index_topk=512`` over the CSA
@@ -827,13 +1033,28 @@ def _dsv4_indexer_test_config():
     ``hidden_size`` (256) and ``q_lora_rank`` (64) stay at the toy config's values
     rather than the checkpoint's 4096 / 1024: nothing under test reads them beyond the
     widths of the indexer's two input projections.
-    """
-    from transformers import AutoConfig
 
-    config = AutoConfig.from_pretrained(str(_TOY_CONFIG_DIR))
+    Loaded through VeOmni's ``DeepseekV4Config`` rather than ``AutoConfig``, and the
+    two objective fields are passed as ``from_pretrained`` overrides rather than
+    ``setattr``ed afterwards. That is the path ``model.model_config`` takes, and it is
+    the path that silently drops a field the class does not declare -- so the modules
+    these tests drive are configured the way a run configures them, and a lost
+    declaration fails here instead of training nothing in production.
+    """
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    config = DeepseekV4Config.from_pretrained(
+        str(_TOY_CONFIG_DIR),
+        dsa_indexer_loss=indexer_loss,
+        dsa_indexer_loss_coef=coef,
+    )
     config.index_n_heads = 64
     config.index_head_dim = 128
     config.index_topk = 512
+    assert config.dsa_indexer_loss is indexer_loss, (
+        "the objective override did not survive from_pretrained; the field is no longer declared "
+        "on VeOmni's DeepseekV4Config and every test below is now testing the flag-off path"
+    )
     return config
 
 
@@ -887,29 +1108,30 @@ def _run_indexer(indexer, hidden_states, q_residual, position_ids=None, **kwargs
     return indexer(hidden_states, q_residual, position_ids, None, 0, **kwargs)
 
 
-def _bind_indexer_loss(*, enabled, coef=1.0, indexer_implementation="tilelang"):
-    """Bind every slot ``_indexer_loss_enabled`` reads, defaulting the two
-    implementation slots to the one configuration the loss supports.
+def _bind_indexer_implementations(*, indexer_implementation="tilelang"):
+    """Bind both implementation slots, defaulting to the one configuration the loss
+    supports.
 
-    All four, always: a test that left one unbound would read it from whatever ran
-    before, and a deleted guard would then fall into a neighbouring refusal instead of
-    through to the behaviour under test. The coefficient is one of the four because
-    the gate treats ``coef <= 0`` as off, so a test that left it to the session could
-    find the whole objective disabled by whatever ran before it.
+    Both, always: a test that left one unbound would read it from whatever ran before,
+    and a deleted guard would then fall into a neighbouring refusal instead of through
+    to the behaviour under test.
 
     ``indexer_implementation`` is overridable for the two tests about the eager
     scorer: requesting ``tilelang`` and missing its per-call gate is refused rather
     than fallen back from, so ``eager`` is the only way to reach that scorer at all --
     with the objective off to run it, and with the objective on to be refused for it.
+
+    The objective's own flag and weight are no longer here. They are fields of
+    ``DeepseekV4Config``, and the modules these tests drive receive the decision as
+    the ``build_indexer_loss`` argument their real caller passes them, so a test says
+    what it means at the call rather than by arranging module state first.
     """
     from types import SimpleNamespace
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-    modeling.veomni_dsa_indexer_loss.bind(SimpleNamespace(dsa_indexer_loss=enabled))
     modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation=indexer_implementation))
     modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
-    modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
 
 
 @contextlib.contextmanager
@@ -964,9 +1186,14 @@ class TestIndexerScoresAndDecoupling:
     one group because they are one change: before it, the indexer's forward returned
     integer indices and the graph was severed by accident.
 
-    Every test here binds all three of the gate's slots through ``_bind_indexer_loss``
-    and pins the parallel state, and the class-scoped fixture restores every slot
-    afterwards, so nothing leaks into the rest of the session.
+    Every test here binds both implementation slots through
+    ``_bind_indexer_implementations`` and pins the parallel state, and the
+    class-scoped fixture restores every slot afterwards, so nothing leaks into the
+    rest of the session. Whether the objective is on is passed at the call as
+    ``build_indexer_loss``, which is how the real caller passes it: the compressor and
+    the indexer keep only scalars off the config they were constructed with, so
+    ``DeepseekV4Attention.forward`` evaluates the predicate once for the layer and
+    hands the answer down.
     """
 
     # Every test here imports the generated modeling module; see the note on
@@ -976,7 +1203,6 @@ class TestIndexerScoresAndDecoupling:
     # Supported but off, matching ``TestIndexerLossGate``: a test that failed to bind a
     # slot reads it from here rather than from whatever the session left behind.
     _SLOT_PRE_STATE = {
-        "dsa_indexer_loss": False,
         "dsa_indexer_implementation": "eager",
         "dsa_attention_implementation": "eager",
     }
@@ -1007,7 +1233,7 @@ class TestIndexerScoresAndDecoupling:
         nothing.
         """
         _require_tilelang_cuda()
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
 
         seq_len = 2048
         indexer, config = _build_test_indexer(device=DEVICE)
@@ -1017,7 +1243,7 @@ class TestIndexerScoresAndDecoupling:
         )
 
         with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
-            top_k_indices, index_score = _run_indexer(indexer, hidden, q_residual)
+            top_k_indices, index_score = _run_indexer(indexer, hidden, q_residual, build_indexer_loss=True)
         assert len(kernel_calls) == 1, "the TileLang scorer is the only path that has scores to return"
 
         # The contract Task 5 reads: one score per selected slot, in fp32.
@@ -1039,11 +1265,15 @@ class TestIndexerScoresAndDecoupling:
 
         This is the only test that pins the off side of that branch. Invert it and the
         two-tuple leaks into every flag-off forward: ``DeepseekV4CSACompressor`` would
-        keep working, because it unpacks by the same gate, so the break would surface
-        wherever something calls the indexer without going through that gate.
+        keep working, because it unpacks by the same argument, so the break would
+        surface wherever something calls the indexer without passing through it.
+
+        The argument is left at its default rather than passed as ``False``, because
+        the default is what every pre-existing caller relies on and is the thing worth
+        pinning.
         """
         _require_tilelang_cuda()
-        _bind_indexer_loss(enabled=False)
+        _bind_indexer_implementations()
 
         seq_len = 2048
         indexer, config = _build_test_indexer(device=DEVICE)
@@ -1063,35 +1293,61 @@ class TestIndexerScoresAndDecoupling:
         with the objective on is the worst outcome available: the loss would train on
         nothing at all while its curve looked entirely reasonable.
 
-        The indexer carries no refusal of its own for that, and this test is what
-        makes the absence safe by closing both routes to it.
+        The indexer carries no refusal of its own for that, and what makes the absence
+        safe is that both routes to it are closed elsewhere.
 
-        The first is a configuration that passes every construction-time check and
-        then misses the kernel at runtime. ``_indexer_loss_enabled`` admits the
-        objective only under ``dsa_indexer_implementation='tilelang'``, and that value
-        is refused outright whenever the per-call gate declines rather than demoted to
-        the eager scorer. The miss staged here is the device -- CPU tensors -- but an
-        fp32 activation dtype or a head count outside the kernel's range lands at the
-        same line. Narrowing that refusal to a warning or a fallback would leave the
-        objective silently untrained.
+        This test closes the one that is the indexer's own: a configuration that passes
+        every construction-time check and then misses the kernel at runtime. TileLang
+        having been asked for, a per-call gate that declines is refused outright rather
+        than demoted to the eager scorer. The miss staged here is the device -- CPU
+        tensors -- but an fp32 activation dtype or a head count outside the kernel's
+        range lands at the same line. Narrowing this to a warning or a fallback would
+        leave the objective silently untrained.
 
-        The second is asking for the eager scorer outright while the objective is on,
-        which the gate refuses. That leg is what makes the first one's premise hold:
-        without it, loosening the gate's ``tilelang`` requirement would reach the
-        eager scorer with the loss on and nothing here would notice.
+        The other route -- asking for the eager scorer outright while the objective is
+        on -- is refused a frame up, by the predicate in ``DeepseekV4Attention.forward``
+        that produces ``build_indexer_loss`` in the first place
+        (``TestIndexerLossGate.test_indexer_loss_refuses_eager_indexer``), and again at
+        model build before any weight is read. Neither is reachable from here: this
+        module is handed the answer and does not derive it, so an eager scorer under
+        the objective cannot be staged by calling the indexer.
+
+        The message is matched on its per-call half rather than on ``tilelang`` alone,
+        which appears in the refusals a frame up as well.
         """
+        _bind_indexer_implementations()
+
         indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
         hidden = torch.randn(1, 32, config.hidden_size)
         q_residual = torch.randn(1, 32, config.q_lora_rank)
 
         with _single_rank_parallel_state():
-            _bind_indexer_loss(enabled=True)
             with pytest.raises(ValueError, match="TileLang indexer does not support this call"):
-                _run_indexer(indexer, hidden, q_residual)
+                _run_indexer(indexer, hidden, q_residual, build_indexer_loss=True)
 
-            _bind_indexer_loss(enabled=True, indexer_implementation="eager")
-            with pytest.raises(ValueError, match="dsa_indexer_loss requires dsa_indexer_implementation"):
+    def test_the_refusal_names_the_objective_when_the_objective_is_what_chose_tilelang(self):
+        """A user who enabled the objective never wrote ``dsa_indexer_implementation``
+        themselves -- the objective requires it -- so a refusal that named only the
+        implementation would be an error about a flag they did not set.
+
+        The same per-call miss without the objective must *not* claim that, or the
+        message would misattribute an ordinary TileLang request. Both halves are here
+        because the attribution is a conditional and either branch alone would pass a
+        test of the other.
+        """
+        _bind_indexer_implementations()
+
+        indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
+        hidden = torch.randn(1, 32, config.hidden_size)
+        q_residual = torch.randn(1, 32, config.q_lora_rank)
+
+        with _single_rank_parallel_state():
+            with pytest.raises(ValueError, match=r"required by dsa_indexer_loss"):
+                _run_indexer(indexer, hidden, q_residual, build_indexer_loss=True)
+
+            with pytest.raises(ValueError) as without_objective:
                 _run_indexer(indexer, hidden, q_residual)
+        assert "required by dsa_indexer_loss" not in str(without_objective.value)
 
     def test_the_eager_scorer_still_runs_when_it_is_the_one_asked_for(self):
         """The refusals above are about running the eager scorer *under the objective*,
@@ -1102,11 +1358,10 @@ class TestIndexerScoresAndDecoupling:
         DeepSeek-V4 model in the tree -- while the suite stayed green on the enabled
         path, because that path never reaches the eager scorer.
 
-        The objective is bound off here rather than left to the gate: with it on, this
-        implementation is refused outright rather than silently demoted, which is the
-        leg above.
+        Called with the objective off, which is the only way to reach this scorer: with
+        it on, an eager indexer is refused a frame up rather than silently demoted.
         """
-        _bind_indexer_loss(enabled=False, indexer_implementation="eager")
+        _bind_indexer_implementations(indexer_implementation="eager")
 
         indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
         hidden = torch.randn(1, 32, config.hidden_size)
@@ -1129,12 +1384,13 @@ class TestIndexerScoresAndDecoupling:
         other.
 
         The flag-off half is not a bonus. It pins that the compressor unpacks by the
-        same gate the indexer returns by, and the index comparison pins that turning
-        the loss on leaves the selection the model attends over untouched: a detach
-        cannot change a forward value, so exact equality is the right bar and any
-        tolerance would hide a real perturbation of the LM path.
+        same argument it passed the indexer, and the index comparison pins that
+        turning the loss on leaves the selection the model attends over untouched: a
+        detach cannot change a forward value, so exact equality is the right bar and
+        any tolerance would hide a real perturbation of the LM path.
         """
         _require_tilelang_cuda()
+        _bind_indexer_implementations()
 
         seq_len = 2048
         compressor, config = _build_test_csa_compressor(device=DEVICE)
@@ -1157,19 +1413,24 @@ class TestIndexerScoresAndDecoupling:
             position_ids = torch.arange(seq_len, device=DEVICE).unsqueeze(0)
             packed_kwargs = {}
 
-        def _candidates():
+        def _candidates(**loss_kwargs):
             with _single_rank_parallel_state():
                 _, _, candidates = compressor(
-                    hidden, q_residual, position_ids, None, 0, return_topk_indices=True, **packed_kwargs
+                    hidden,
+                    q_residual,
+                    position_ids,
+                    None,
+                    0,
+                    return_topk_indices=True,
+                    **loss_kwargs,
+                    **packed_kwargs,
                 )
             return candidates
 
-        _bind_indexer_loss(enabled=False)
         without_loss = _candidates()
         assert without_loss.indexer_scores is None, "the scores must not appear with the loss off"
 
-        _bind_indexer_loss(enabled=True)
-        with_loss = _candidates()
+        with_loss = _candidates(build_indexer_loss=True)
         scores = with_loss.indexer_scores
         assert scores is not None, "the compressor dropped the indexer scores on the floor"
         assert scores.shape == with_loss.topk_indices.shape
@@ -1182,9 +1443,21 @@ class TestIndexerScoresAndDecoupling:
         assert torch.equal(with_loss.topk_indices, without_loss.topk_indices)
 
 
-def _build_test_attention(device=DEVICE, seq_len=4096, layer_type="compressed_sparse_attention", seed=0):
+def _build_test_attention(
+    device=DEVICE,
+    seq_len=4096,
+    layer_type="compressed_sparse_attention",
+    seed=0,
+    indexer_loss=True,
+    coef=1.0,
+):
     """One ``DeepseekV4Attention`` of the requested layer type, plus the kwargs its
     real call site hands it.
+
+    ``indexer_loss`` / ``coef`` go onto the layer's own config, which is where the
+    objective is configured and where ``_indexer_loss_enabled`` reads it. Per-layer
+    rather than per-process, so a test needs no teardown for them and two layers in
+    one test can differ.
 
     The kwargs mirror ``DeepseekV4Model.forward``'s call into the decoder layer,
     which forwards them verbatim to ``self_attn``: the ``position_embeddings`` dict
@@ -1211,7 +1484,7 @@ def _build_test_attention(device=DEVICE, seq_len=4096, layer_type="compressed_sp
     """
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-    config = _dsv4_indexer_test_config()
+    config = _dsv4_indexer_test_config(indexer_loss=indexer_loss, coef=coef)
     if layer_type not in config.layer_types:
         # The 4-layer checkpoint this config mirrors has no sliding layer, and the
         # gate has to keep one on its two-value return just as it does an HCA layer.
@@ -1567,8 +1840,10 @@ class TestAttentionForwardIndexerKL:
     """The attention forward assembling the KL: the teacher it builds, the slice it
     takes, the student it pairs with, and the arity it returns.
 
-    Every test binds all three of the gate's slots through ``_bind_indexer_loss`` and
-    pins the parallel state, and the fixture restores every slot afterwards.
+    Every test binds both implementation slots through ``_bind_indexer_implementations``
+    and pins the parallel state, and the fixture restores every slot afterwards. The
+    objective itself is set on the layer's config by ``_build_test_attention``, which
+    defaults it on -- this class is about the enabled path.
     """
 
     # Every test here imports the generated modeling module; see the note on
@@ -1577,7 +1852,6 @@ class TestAttentionForwardIndexerKL:
 
     # Supported but off, matching the two classes above.
     _SLOT_PRE_STATE = {
-        "dsa_indexer_loss": False,
         "dsa_indexer_implementation": "eager",
         "dsa_attention_implementation": "eager",
     }
@@ -1612,7 +1886,7 @@ class TestAttentionForwardIndexerKL:
         _require_tilelang_cuda()
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
         seq_len = self._RANKING_SEQ_LEN
         attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
@@ -1689,7 +1963,7 @@ class TestAttentionForwardIndexerKL:
         """
         _require_tilelang_cuda()
 
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
         seq_len = self._RANKING_SEQ_LEN
         attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
@@ -1756,7 +2030,7 @@ class TestAttentionForwardIndexerKL:
 
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
         seq_len = self._CHEAP_SEQ_LEN
         attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
         # The mask builder dispatches on the config's attention implementation, and a
@@ -1810,8 +2084,8 @@ class TestAttentionForwardIndexerKL:
         """
         _require_tilelang_cuda()
 
-        _bind_indexer_loss(enabled=False)
-        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, indexer_loss=False)
         with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
             result = attn(**inputs)
 
@@ -1828,14 +2102,20 @@ class TestAttentionForwardIndexerKL:
         here would hide a real perturbation of the LM objective. This is the
         forward-value half of the decoupling; the gradient half is
         ``test_the_kl_gradient_reaches_the_indexer_and_stops_there``.
+
+        One layer, its config flipped between the two calls, rather than two layers
+        built with the flag already set: two layers would have to be shown to hold the
+        same weights before the outputs could mean anything, and ``_build_test_attention``
+        seeds them identically only by construction. Flipping the field on the one
+        config is also what the layer actually reads, so nothing is bypassed.
         """
         _require_tilelang_cuda()
 
-        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, indexer_loss=False)
         with _single_rank_parallel_state():
-            _bind_indexer_loss(enabled=False)
             output_off, weights_off = attn(**inputs)
-            _bind_indexer_loss(enabled=True)
+            attn.config.dsa_indexer_loss = True
             output_on, weights_on, kl_sum, _ = attn(**inputs)
 
         assert torch.equal(output_off, output_on), "the indexer loss moved the attention output"
@@ -1863,7 +2143,7 @@ class TestAttentionForwardIndexerKL:
         """
         _require_tilelang_cuda()
 
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
         attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
         assert attn.layer_type != "compressed_sparse_attention", "this test is about the layers the gate excludes"
         assert getattr(attn.compressor, "indexer", None) is None, "this layer type is supposed to have no indexer"
@@ -1884,7 +2164,7 @@ class TestAttentionForwardIndexerKL:
         _require_tilelang_cuda()
         from unittest import mock
 
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
         attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
         real_forward = attn.compressor.forward
 
@@ -1914,7 +2194,7 @@ class TestAttentionForwardIndexerKL:
         _require_tilelang_cuda()
         from unittest import mock
 
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
         attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
         real_forward = attn.compressor.forward
 
@@ -1943,7 +2223,7 @@ class TestAttentionForwardIndexerKL:
         _require_tilelang_cuda()
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
         # fp32 is the realistic way to lose the dispatch: the kernel is bf16-only, and
         # the attention forward hands it whatever dtype the module was built in.
         query = torch.randn(1, 4, 8, 64, device=DEVICE)
@@ -1972,7 +2252,7 @@ class TestAttentionForwardIndexerKL:
         """
         _require_tilelang_cuda()
 
-        _bind_indexer_loss(enabled=True)
+        _bind_indexer_implementations()
         attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._RANKING_SEQ_LEN)
         with _single_rank_parallel_state():
             _, _, kl_sum, _ = attn(**inputs)
@@ -2014,8 +2294,10 @@ class TestAttentionForwardIndexerKL:
         _require_tilelang_cuda()
         from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
-        _bind_indexer_loss(enabled=enabled)
-        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(
+            device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type, indexer_loss=enabled
+        )
         with _single_rank_parallel_state():
             verdict = modeling._builds_indexer_kl(attn)
             result = attn(**inputs)
@@ -2088,9 +2370,9 @@ def _4layer_test_config():
     the separation guard reads, and the toy config's 32 is the *least* favourable of
     the widths tried -- the fixture is not tuned to make that guard pass.
     """
-    from transformers import AutoConfig
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
-    config = AutoConfig.from_pretrained(str(_TOY_CONFIG_4L))
+    config = DeepseekV4Config.from_pretrained(str(_TOY_CONFIG_4L))
     config.layer_types = list(_LAYER_SCHEDULE_4L)
     config.compress_rates = {"compressed_sparse_attention": 4, "heavily_compressed_attention": 128}
     config.index_topk = 512
@@ -2140,11 +2422,10 @@ def _build_4layer_test_model(
 ):
     """Returns ``(model, batch)`` for the 4-layer CSA checkpoint's configuration.
 
-    Builds the config above (skipping when the checkpoint is absent), binds
-    ``dsa_indexer_loss`` / ``dsa_indexer_implementation`` / ``dsa_attention_implementation``
-    / ``dsa_indexer_loss_coef``, enables gradient checkpointing with the given
-    ``enable_reentrant``, and seeds both the model init and the batch from ``seed`` so
-    two calls with the same seed are comparable.
+    Builds the config above, puts ``dsa_indexer_loss`` / ``dsa_indexer_loss_coef`` on
+    it, binds the two implementation slots, enables gradient checkpointing with the
+    given ``enable_reentrant``, and seeds both the model init and the batch from
+    ``seed`` so two calls with the same seed are comparable.
 
     ``seq_len=4096`` is not incidental: at the CSA compression rate of 4 it gives
     ``compressed_len == 1024 > index_topk == 512``, so the top-k actually ranks. At
@@ -2177,7 +2458,9 @@ def _build_4layer_test_model(
     config = _4layer_test_config()
     if layer_types is not None:
         config.layer_types = list(layer_types)
-    _bind_indexer_loss(enabled=indexer_loss, coef=coef)
+    config.dsa_indexer_loss = indexer_loss
+    config.dsa_indexer_loss_coef = coef
+    _bind_indexer_implementations()
 
     torch.manual_seed(seed)
     with torch.device(device):
@@ -2272,10 +2555,8 @@ class TestFourLayerModelIndexerKL:
     # test that took it from the session rather than from here would be reading
     # whatever ran before it.
     _SLOT_PRE_STATE = {
-        "dsa_indexer_loss": False,
         "dsa_indexer_implementation": "eager",
         "dsa_attention_implementation": "eager",
-        "dsa_indexer_loss_coef": 1.0,
     }
 
     @pytest.fixture(autouse=True)
@@ -2610,13 +2891,11 @@ class TestFourLayerModelIndexerKL:
         leg that pins the coefficient being applied at all.
         """
         _require_tilelang_cuda()
-        from types import SimpleNamespace
-
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
         def loss_at(indexer_loss, coef):
-            model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=indexer_loss, seed=0)
-            modeling.veomni_dsa_indexer_loss_coef.bind(SimpleNamespace(dsa_indexer_loss_coef=coef))
+            model, batch = _build_4layer_test_model(
+                device=DEVICE, seq_len=4096, indexer_loss=indexer_loss, coef=coef, seed=0
+            )
             with _single_rank_parallel_state():
                 out = model(**batch)
             return out
@@ -2936,28 +3215,29 @@ class TestFourLayerModelIndexerKL:
         assert out.aux_metrics is not None and out.aux_metrics["indexer_kl"] > 0
 
 
-class TestModelBuildRefusesModelsThatDoNotImplementIt:
-    """``dsa_indexer_loss`` lives on the model-agnostic ``OpsImplementationConfig``,
-    but only DeepSeek-V4 implements it.
+class TestModelBuildRefusesUnsupportedPrerequisites:
+    """The prerequisite check being *wired into* ``build_foundation_model``, which is
+    what makes it a launch-time refusal rather than a function nothing calls.
 
-    GLM MoE DSA has a Lightning Indexer of its own and declares
-    ``dsa_indexer_implementation`` and ``dsa_attention_implementation``, so a GLM
-    user setting ``dsa_indexer_loss: true`` reads as an entirely reasonable thing to
-    do -- and gets no error, no metric and no training. That is the silent-no-op
-    class this feature refuses everywhere else, and it is refused here at model-build
-    time, before anything is constructed.
-
-    Neither of the two gates inside the model can do this: they are in DeepSeek-V4's
-    own patched forward, which a GLM run never reaches. So it has to be refused from
-    outside the model, at the one place every model build goes through.
+    The refusals themselves are covered above, on
+    ``check_indexer_loss_prerequisites`` directly. What only this group can see is
+    that the call happens, that it happens before the loader runs, and that it does
+    not refuse the configurations it has no business refusing -- a gate that raised
+    on every build, or on none, would pass every test above.
     """
 
     @staticmethod
-    def _build(config_path, indexer_loss, loader, coef=1.0):
+    def _build(config_path, loader, indexer_loss=True, coef=1.0, implementation="tilelang"):
         """``build_foundation_model`` with nothing built, returning the loader's calls.
 
         ``build_foundation_model`` is the whole surface: it is the one construction
         path in the tree, so a gate installed there covers every model build.
+
+        The objective goes in as a ``config_kwargs`` override, which is the path
+        ``model.model_config`` takes from YAML, and the two implementations go on the
+        ops config, which is where they live. Together they are the disagreement the
+        gate exists to catch, and staging it this way means the test would also fail
+        if the override stopped reaching the config at all.
         """
         from types import SimpleNamespace
         from unittest import mock
@@ -2966,58 +3246,85 @@ class TestModelBuildRefusesModelsThatDoNotImplementIt:
 
         parallel_state = SimpleNamespace(cp_enabled=False, sp_enabled=False, global_rank=0)
         ops_config = SimpleNamespace(
-            attn_implementation="eager", dsa_indexer_loss=indexer_loss, dsa_indexer_loss_coef=coef
+            attn_implementation="eager",
+            dsa_indexer_implementation=implementation,
+            dsa_attention_implementation=implementation,
         )
+        config = build_config(config_path, dsa_indexer_loss=indexer_loss, dsa_indexer_loss_coef=coef)
         with (
             mock.patch("veomni.models.auto.get_parallel_state", return_value=parallel_state),
             mock.patch("veomni.ops.config.singleton.get_ops_config", return_value=ops_config),
             mock.patch("veomni.models.auto.get_loader", return_value=loader),
         ):
-            build_foundation_model(config_path=build_config(config_path), init_device="meta")
+            build_foundation_model(config_path=config, init_device="meta")
         return loader.calls
 
-    def test_a_model_with_its_own_lightning_indexer_is_still_refused(self):
-        """GLM MoE DSA: the case from the review, and the one most likely to be tried."""
+    def test_an_unsupported_implementation_is_refused_before_the_model_is_built(self):
+        """The point of checking at build time at all: the answer has to arrive before
+        every rank has read a checkpoint -- 54.8 GB for DeepSeek-V4-Flash -- to be told
+        that three lines of YAML disagree with each other.
+
+        ``loader.calls == 0`` is the assertion that matters here; the message content
+        is pinned where the check itself is tested.
+        """
         loader = _StubLoader()
-        with pytest.raises(NotImplementedError, match="dsa_indexer_loss") as raised:
-            self._build("tests/toy_config/glm_moe_dsa_toy", indexer_loss=True, loader=loader)
-        message = str(raised.value)
-        assert "'glm_moe_dsa'" in message, message
-        # Naming the way out, as the context-parallel gate beside it does: a refusal
-        # that does not say what to set instead reads as a bug in the feature.
-        assert "dsa_indexer_loss=false" in message, message
+        with pytest.raises(ValueError, match="dsa_indexer_loss requires"):
+            self._build("tests/toy_config/deepseek_v4_toy", loader=loader, implementation="eager")
         assert loader.calls == 0, "the refusal must come before the model is constructed"
 
-    def test_deepseek_v4_is_not_refused(self):
-        """The one model that implements it builds as usual.
+    def test_the_supported_configuration_builds(self):
+        """The one configuration the objective exists for.
 
         Without this leg a gate stuck at "refuse everything" would look correct.
         """
         loader = _StubLoader()
-        assert self._build("tests/toy_config/deepseek_v4_toy", indexer_loss=True, loader=loader) == 1
+        assert self._build("tests/toy_config/deepseek_v4_toy", loader=loader) == 1
 
-    def test_the_flag_off_admits_every_model(self):
-        """The gate is keyed on the flag, not on the model: the default changes nothing.
+    def test_the_flag_off_admits_an_unsupported_implementation(self):
+        """The flag-off inertness guarantee at build time: with the objective off, the
+        two implementations are nobody's prerequisite and an eager run is ordinary.
 
-        This is the flag-off inertness guarantee at build time -- every model in the
-        tree goes through this line on every build.
+        Every model in the tree goes through this line on every build.
         """
         loader = _StubLoader()
-        assert self._build("tests/toy_config/glm_moe_dsa_toy", indexer_loss=False, loader=loader) == 1
+        assert (
+            self._build("tests/toy_config/deepseek_v4_toy", loader=loader, indexer_loss=False, implementation="eager")
+            == 1
+        )
 
-    def test_a_zero_coefficient_admits_every_model_too(self):
+    def test_a_model_that_cannot_declare_the_field_is_untouched(self):
+        """A model whose config never declared the field cannot be asked for the
+        objective, so the gate has nothing to say about it -- no allow-list, and no
+        model type named anywhere.
+
+        GLM MoE DSA is the case from the earlier review: it has a Lightning Indexer of
+        its own and declares both DSA implementation fields, so it is the model most
+        likely to be pointed at this objective by mistake. Under the previous design,
+        where the flag was a field of the model-agnostic ``OpsImplementationConfig``,
+        that mistake had to be refused by an explicit allow-list. Now the flag is a
+        ``DeepseekV4Config`` field, so there is no ``dsa_indexer_loss`` for a GLM run
+        to set and nothing to enumerate: this build is refused by nothing and reaches
+        the loader with an eager DSA stack, exactly as it would have before the
+        objective existed.
+        """
+        loader = _StubLoader()
+        assert (
+            self._build("tests/toy_config/glm_moe_dsa_toy", loader=loader, indexer_loss=False, implementation="eager")
+            == 1
+        )
+
+    def test_a_zero_coefficient_admits_an_unsupported_implementation(self):
         """The coefficient-only switch has to mean the same thing here as everywhere
         else, or it is not a switch.
 
-        ``OpsImplementationConfig`` and the runtime gate both read the weight before
-        anything else and treat zero as off, and ``arguments.md`` documents it as the
-        way to disable the term without editing the flag. A build gate that ignored
-        the coefficient would refuse a shared config on every other model type -- for
-        enabling something that config had just switched off, which is advice about
-        the opposite of what the user did.
+        The runtime gate reads the weight before anything else and treats zero as off,
+        and ``arguments.md`` documents it as the way to disable the term without
+        editing the flag. It is also the escape hatch for a checkpoint whose
+        ``config.json`` carries ``dsa_indexer_loss: true`` from the run that produced
+        it and which someone now wants to serve on an eager stack.
         """
         loader = _StubLoader()
-        assert self._build("tests/toy_config/glm_moe_dsa_toy", indexer_loss=True, coef=0.0, loader=loader) == 1
+        assert self._build("tests/toy_config/deepseek_v4_toy", loader=loader, coef=0.0, implementation="eager") == 1
 
 
 class _StubLoader:

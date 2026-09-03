@@ -200,8 +200,6 @@ config.add_post_import_block(
     veomni_mhc_head = OpSlot("mhc", "head")
     veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
     veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
-    veomni_dsa_indexer_loss = OpsConfigSlot("dsa_indexer_loss", default=False)
-    veomni_dsa_indexer_loss_coef = OpsConfigSlot("dsa_indexer_loss_coef", default=1.0)
     """
 )
 
@@ -423,6 +421,13 @@ def deepseek_v4_hca_compressor_forward_patched(
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
     build_block_bias: bool = True,
+    # Accepted and ignored, matching the GPU config's HCA compressor: the shared
+    # ``DeepseekV4Attention.forward`` holds one compressor whose class is chosen by
+    # layer type and calls it through a single call site, so both compressors have to
+    # take the same arguments. Only the CSA one owns a Lightning Indexer. Dead on NPU
+    # either way -- ``_indexer_loss_enabled`` refuses anything but the TileLang
+    # indexer, which is CUDA-only -- but the signature has to line up with the call.
+    build_indexer_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
@@ -515,9 +520,29 @@ def deepseek_v4_csa_compressor_forward_patched(
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
     build_block_bias: bool = True,
+    # Accepted, refused, and never forwarded on this backend. The shared attention
+    # forward passes ``_builds_indexer_kl``'s answer down here, so the parameter
+    # exists because the call site is shared -- ``tests/models/
+    # test_generated_call_site_signatures.py`` is what enforces that. The two indexer
+    # call sites below stay on their bare-tensor return and this file needs no
+    # ``_split_indexer_output``.
+    build_indexer_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
+    if build_indexer_loss:
+        # Reachable: ``dsa_indexer_implementation`` is a plain ``Literal`` with no
+        # hardware gate, so ``tilelang`` parses on NPU and ``_indexer_loss_enabled``
+        # then admits the objective. Everything after this point would quietly
+        # disagree with it -- the indexer is called without the flag and returns bare
+        # top-k indices, and the attention forward eventually fails its own wiring
+        # check with a message about an internal invariant rather than about the two
+        # lines of YAML that caused it. Say the true thing here instead.
+        raise NotImplementedError(
+            "dsa_indexer_loss is not implemented on NPU: the objective's student "
+            "distribution is the TileLang Lightning Indexer's per-slot scores, and that "
+            "kernel is CUDA-only. Set dsa_indexer_loss: false under model.model_config."
+        )
     batch, seq_len, _ = hidden_states.shape
     cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
     kv = self.kv_proj(hidden_states)

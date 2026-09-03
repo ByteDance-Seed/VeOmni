@@ -45,7 +45,11 @@ Five call sites in three functions, because the objective changes return arities
 3. `DeepseekV4Attention.forward` asks the attention interface for the teacher over
    the trailing compressed slice, computes the per-query KL and the
    zero-information reference beside it, and returns both as 0-d sums over *local*
-   query rows.
+   query rows. It is also where the decision is made: it holds the model config, so
+   it evaluates `_builds_indexer_kl` once for the layer and hands the answer *down*
+   to (1) and (2) as `build_indexer_loss`. Neither of those keeps the config, and
+   neither re-derives the answer — the producer's arity and the consumer's unpacking
+   come from one evaluation, passed by argument.
 4. `DeepseekV4DecoderLayer.forward` passes them up; `DeepseekV4Model.forward` sums
    over the CSA layers and counts them.
 5. `DeepseekV4ForCausalLM.forward` takes the per-token mean, folds `coef * kl` into
@@ -87,10 +91,9 @@ distinguish the correct teacher from Megatron's.
 
 | constraint | enforced at | if violated |
 |----|----|----|
-| `dsa_indexer_loss_coef` finite and non-negative | `TrainingArguments` validation | `ValueError` at launch |
-| the model type implements the objective | `check_indexer_loss_supported`, from `build_foundation_model` | `NotImplementedError` at model build |
-| `dsa_indexer_implementation == "tilelang"` | `OpsImplementationConfig` validation, and `_indexer_loss_enabled` again | `ValueError` at launch |
-| `dsa_attention_implementation == "tilelang"` | `OpsImplementationConfig` validation, and `_indexer_loss_enabled` again | `ValueError` at launch |
+| `dsa_indexer_loss_coef` finite and non-negative | `check_indexer_loss_prerequisites`, from `build_foundation_model` | `ValueError` at model build |
+| `dsa_indexer_implementation == "tilelang"` | `check_indexer_loss_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
+| `dsa_attention_implementation == "tilelang"` | `check_indexer_loss_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
 | `ulysses_size == 1` and `cp_size == 1` | `_indexer_loss_enabled` | `ValueError` on the first forward |
 | at least one `compressed_sparse_attention` layer | `DeepseekV4Model.forward` | `RuntimeError` on the first forward |
 | the compressor handed over its scores | `DeepseekV4Attention.forward` | `RuntimeError` on the first forward |
@@ -98,21 +101,33 @@ distinguish the correct teacher from Megatron's.
 | a layer's return arity matches the shared gate | `DeepseekV4Model.forward` | `RuntimeError` on the first forward |
 | the top-k actually binds | not enforced | the dense eq. (3) objective, silently |
 
-Every one of these is keyed on the objective being *on*, and a coefficient of
-`0.0` is off. That reading is the same in all three places that make it —
-`OpsImplementationConfig`, `check_indexer_loss_supported` and
-`_indexer_loss_enabled` — because `arguments.md` documents the coefficient as the
-way to disable the term without editing the flag, and a gate that disagreed would
-refuse a shared config for enabling something that config had just switched off.
-A negative coefficient is not a third state: the row above rejects it at launch,
-so the `<= 0` the gates are written with never sees one.
+There is no model-type row, and no allow-list. `dsa_indexer_loss` is a field of
+`DeepseekV4Config`, so a config that does not declare it cannot be asked for the
+objective and there is nothing to enumerate: `check_indexer_loss_prerequisites`
+returns on a `getattr(config, "dsa_indexer_loss", False)` and never names a model.
+A second model gaining the objective declares the field on its own config and
+needs no edit to the gate.
 
-The model-type gate is an allow-list (`INDEXER_LOSS_MODEL_TYPES`) for the same
-reason CP's is, and against a specific run: GLM MoE DSA has a Lightning Indexer of
-its own and declares the two neighbouring DSA slots, so `dsa_indexer_loss: true`
-on a GLM run is a reasonable thing to write and would produce no error, no metric
-and no training. It can only be refused from outside the model, because such a run
-never reaches DeepSeek-V4's patched forward where the other three gates live.
+Every constraint is keyed on the objective being *on*, and a coefficient of `0.0`
+is off. Both places that make that reading —
+`check_indexer_loss_prerequisites` and `_indexer_loss_enabled` — read the weight
+before anything else, because `arguments.md` documents the coefficient as the way
+to disable the term without editing the flag, and a gate that disagreed would
+refuse a run for enabling something its config had just switched off. That is not
+hypothetical: the two fields are serialised into `config.json`, so every
+checkpoint from a flag-on run carries `dsa_indexer_loss: true`, and the
+coefficient is what lets one be served on an eager DSA stack.
+
+The coefficient bound is checked at model build rather than in a `__post_init__`,
+and that is forced rather than chosen. `PreTrainedConfig.from_dict` constructs the
+config from the on-disk JSON and only then `setattr`s the `model.model_config`
+overrides, so a bound checked in `DeepseekV4Config.__post_init__` would read
+`config.json` and never the YAML line contradicting it. The two implementation
+fields cannot live there either: they are `OpsImplementationConfig` fields, and
+neither dataclass can see the disagreement alone.
+`check_indexer_loss_prerequisites` is the earliest point that holds the finished
+config and the installed ops config together, and it runs before any rank reads a
+weight.
 
 The last row is not enforceable from here and is the one most likely to bite; it
 needs a sequence length, a compression rate and a *per-sample* length
@@ -147,15 +162,60 @@ explicit return is correct under both modes;
 projections' gradients under both settings, not on `kl.grad_fn`, because the proxy
 is exactly what a refactor could satisfy while delivering nothing.
 
+**The two flags are fields of `DeepseekV4Config`, not of
+`OpsImplementationConfig`.** They started on the ops config next to
+`dsa_indexer_implementation`, which reads naturally — the objective needs those
+two kernels — but conflates a training objective with a kernel backend, and the
+model already had the right precedent one field away: `output_router_logits` /
+`router_aux_loss_coef` configure this model's other auxiliary objective, live on
+its config, and are folded into the loss from `self.config` in the same forward.
+Three things followed from moving them:
+
+- The model-type allow-list became unnecessary and was deleted. A flag on a
+  model-agnostic dataclass can be set on any model, so it had to be refused for
+  every model that does not implement it; a field on `DeepseekV4Config` cannot be
+  set on GLM MoE DSA at all.
+- `OpsConfigSlot` went back to holding only implementation strings. The slots are
+  module-level globals on the generated modeling module, so two models built from
+  it — a DPO policy and its reference — shared one value, and the second `bind`
+  decided for both. `self.config` is per-instance.
+- Declaring the fields is load-bearing, not tidiness. `model.model_config`
+  overrides reach the config as `from_dict` kwargs, which are applied only for
+  keys the constructed config already answers `hasattr` for and dropped silently
+  otherwise. An undeclared `dsa_indexer_loss: true` would parse, launch, and train
+  the LM objective alone. `test_the_two_fields_are_declared_on_the_model_config`
+  pins it against the upstream class as a control.
+
+Adding the fields *through patchgen*, which is where a reader might look for them,
+is not available: `PatchConfig` targets `modeling_*` modules and there is no
+precedent or mechanism for patching a `transformers` configuration class. VeOmni's
+mechanism is `MODEL_CONFIG_REGISTRY` with a hand-written subclass, as
+`qwen3_omni_moe` already does, and that is what
+`veomni/models/transformers/deepseek_v4/configuration_deepseek_v4.py` is.
+
 **One predicate, read by every site that has to agree.** `_indexer_loss_enabled`
-answers "is the objective on", `_builds_indexer_kl` narrows it to "does *this*
-layer return a KL", and `_split_indexer_output` applies it to the indexer's own
-return. Three functions act on the answer, and a copy that goes stale in any one
-of them is an arity mismatch — gating the decoder layer on
+answers "is the objective on" off the model config, `_builds_indexer_kl` narrows it
+to "does *this* layer return a KL", and `_split_indexer_output` applies the answer
+to the indexer's own return. Three functions act on it, and a copy that goes stale
+in any one of them is an arity mismatch — gating the decoder layer on
 `_indexer_loss_enabled` alone would three-unpack the two-tuple that every sliding
 and HCA layer returns, three of the four layers of the reference checkpoint.
 `test_the_shared_gate_predicts_the_attention_return_arity` and
 `test_a_layer_that_disagrees_with_the_shared_gate_is_refused` pin it.
+
+The indexer and the compressor are *passed* the answer rather than reading the
+predicate, because neither keeps the model config: both take a config in
+`__init__` and retain only scalars off it. Giving them one means patching
+`__init__`, and the only route patchgen offers is `override_method` on it —
+restating the whole upstream body for one attribute, as the NPU config does for
+its `position_bias` sharding. (`modify_init` reads like the tool for this and is
+not: it is declared in `patch_spec.py` and unimplemented in the generator, so it
+silently produces nothing.) Threading the decision is both smaller and stronger:
+one evaluation per layer per forward cannot disagree with itself mid-call, and the
+HCA compressor takes the same parameter and ignores it only because its shared
+call site demands one signature —
+`tests/models/test_generated_call_site_signatures.py` is what enforces that, and
+it is what caught the NPU compressors missing it.
 
 The layer gate keys on `layer_type` rather than on `module.compressor.indexer`
 existing, because the two fail in opposite directions: `layer_types` comes from
@@ -170,10 +230,10 @@ parameter — and Muon skips only `p.grad is None` while `_apply_ortho` decays
 whatever it steps. That is weight decay on 226M otherwise-frozen parameters, at
 the full cost of the teacher kernel, for a term the user switched off. Gating at
 the predicate makes a zero coefficient cost exactly what `dsa_indexer_loss: false`
-costs, which is what the argument's help text has always promised. The refusals
-come *after* the coefficient check for the same reason: a user who switched the
-term off has not asked for a TileLang indexer, and refusing their run over the
-configuration of a feature they just disabled is advice about the wrong thing.
+costs, which is what `arguments.md` documents. The refusals come *after* the
+coefficient check for the same reason: a user who switched the term off has not
+asked for a TileLang indexer, and refusing their run over the configuration of a
+feature they just disabled is advice about the wrong thing.
 
 **Detaching the indexer's input is a change this made, not a property it
 inherited.** V3.2 §2.1 detaches the indexer input for separate optimisation. Until

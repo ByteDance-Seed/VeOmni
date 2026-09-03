@@ -196,6 +196,13 @@ class TextDPOTrainer:
             torch_dtype=args.dpo_config.refer_model_precision,
             init_device=args.train.init_device,
             ops_implementation=args.model.ops_implementation,
+            # The same overrides the policy model is built with. Without this the
+            # reference reads only ``config.json`` and the two architectures can
+            # diverge on anything set under ``model_config`` -- which is where a
+            # model-level training objective such as DeepSeek-V4's
+            # ``dsa_indexer_loss`` is switched off, so the policy would honour the
+            # override and its reference would not.
+            config_kwargs=args.model.model_config,
         )
 
         self.reference_model.requires_grad_(False)
