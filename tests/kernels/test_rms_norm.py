@@ -68,14 +68,15 @@ def _fused_weight(variant: str, hidden: int, device: str, dtype: torch.dtype) ->
 
 
 @pytest.mark.parametrize("variant", ["standard", "qwen3_5"])
-def test_eager_matches_hf(variant: str):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_eager_matches_hf(variant: str, dtype: torch.dtype):
     torch.manual_seed(0)
     hidden = 64
     eps = 1e-6
-    x = torch.randn(2, 16, hidden, dtype=torch.float32, requires_grad=True)
-    weight = torch.randn(hidden, dtype=torch.float32, requires_grad=True)
+    x = torch.randn(2, 16, hidden, dtype=dtype, requires_grad=True)
+    weight = torch.randn(hidden, dtype=dtype, requires_grad=True)
 
-    module = _hf_rms_norm(variant, hidden, eps)
+    module = _hf_rms_norm(variant, hidden, eps).to(dtype=dtype)
     with torch.no_grad():
         module.weight.copy_(weight)
 
@@ -84,13 +85,13 @@ def test_eager_matches_hf(variant: str):
 
     x_e, w_e = _clone_inputs(x, weight)
     out_e = resolve_kernel("rms_norm", variant, "eager").wrapper(x_e, w_e, eps=eps)
-    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    assert torch.allclose(out_e.float(), out_h.float(), atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
     out_h.backward(go)
     out_e.backward(go)
-    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(w_e.grad, module.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(x_e.grad.float(), x_h.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(w_e.grad.float(), module.weight.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 def test_unweighted_eager_matches_hf():

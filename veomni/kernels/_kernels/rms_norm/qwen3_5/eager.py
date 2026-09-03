@@ -38,18 +38,20 @@ def _batch_dims(tensor: Tensor) -> tuple[int, ...]:
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
-    """Affine RMSNorm with offset 1. Scale is ``1 + weight`` (gemma-style).
+    """Affine RMSNorm with offset 1. Scale is ``1 + weight`` in fp32.
 
-    The reduction and the scale both run in fp32, then cast back to ``x.dtype``.
-    Empty ``x`` returns ``x * (1 + weight)``.
+    Matches HuggingFace ``Qwen3_5RMSNorm``: reduce in fp32, then
+    ``norm * (1 + weight.float())``, then cast back to ``x.dtype``.
+    Adding in the input dtype first rounds ``1 + weight`` too early.
+    Empty ``x`` returns ``x * (1 + weight)`` with the same fp32 scale.
     """
-    scale = 1.0 + weight
+    scale = 1.0 + weight.float()
     if x.numel() == 0:
-        return x * scale, SavedState((x, weight), _Meta(True, eps))
+        return (x.float() * scale).to(x.dtype), SavedState((x, weight), _Meta(True, eps))
 
     x_f = x.float()
     rstd = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + eps)
-    output = (scale.float() * (x_f * rstd)).to(x.dtype)
+    output = (scale * (x_f * rstd)).to(x.dtype)
     return output, SavedState((x, weight, rstd), _Meta(False, eps))
 
 
@@ -64,8 +66,8 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     (rstd,) = optional_rstd
     x_f = x.float()
     n = x.shape[-1]
-    scale = 1.0 + weight
-    scaled_grad = grad_output.float() * scale.float()
+    scale = 1.0 + weight.float()
+    scaled_grad = grad_output.float() * scale
     grad_weight = (grad_output.float() * (x_f * rstd)).sum(dim=_batch_dims(x)).to(weight.dtype)
     grad_x = rstd * scaled_grad - (rstd.pow(3) / n) * x_f * (scaled_grad * x_f).sum(dim=-1, keepdim=True)
     return grad_x.to(x.dtype), grad_weight.to(weight.dtype)

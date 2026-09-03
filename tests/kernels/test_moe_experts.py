@@ -31,10 +31,20 @@ from tests.kernels.tol import (
     EAGER_GRAD_RTOL,
     EAGER_RTOL,
     MOE_FUSED_ATOL,
-    MOE_FUSED_GRAD_ATOL,
-    MOE_FUSED_GRAD_RTOL,
+    MOE_FUSED_GRAD_FC1_ATOL,
+    MOE_FUSED_GRAD_FC1_RTOL,
+    MOE_FUSED_GRAD_FC2_ATOL,
+    MOE_FUSED_GRAD_FC2_RTOL,
+    MOE_FUSED_GRAD_HIDDEN_ATOL,
+    MOE_FUSED_GRAD_HIDDEN_RTOL,
     MOE_FUSED_RTOL,
     MOE_FUSED_SWIGLU_ATOL,
+    MOE_FUSED_SWIGLU_GRAD_FC1_ATOL,
+    MOE_FUSED_SWIGLU_GRAD_FC1_RTOL,
+    MOE_FUSED_SWIGLU_GRAD_FC2_ATOL,
+    MOE_FUSED_SWIGLU_GRAD_FC2_RTOL,
+    MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL,
+    MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL,
     MOE_FUSED_SWIGLU_RTOL,
 )
 from veomni.kernels import KERNEL_REGISTRY, resolve_kernel
@@ -387,34 +397,29 @@ def _run_fused_vs_eager(
         hidden_o, routing_o, fc1_1_o, fc1_2_o, fc2_o = map(_clone, (hidden, routing, fc1_1, fc1_2, fc2))
         out_e = eager(hidden_e, routing_e, selected, fc1_1_e, fc1_2_e, fc2_e, empty, **kwargs)
         out_o = other(hidden_o, routing_o, selected, fc1_1_o, fc1_2_o, fc2_o, empty, **kwargs)
-    fwd_atol, fwd_rtol = (
-        (MOE_FUSED_SWIGLU_ATOL, MOE_FUSED_SWIGLU_RTOL)
-        if swiglu_limit is not None
-        else (MOE_FUSED_ATOL, MOE_FUSED_RTOL)
-    )
+    if swiglu_limit is not None:
+        fwd_atol, fwd_rtol = MOE_FUSED_SWIGLU_ATOL, MOE_FUSED_SWIGLU_RTOL
+        hidden_atol, hidden_rtol = MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL, MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL
+        fc1_atol, fc1_rtol = MOE_FUSED_SWIGLU_GRAD_FC1_ATOL, MOE_FUSED_SWIGLU_GRAD_FC1_RTOL
+        fc2_atol, fc2_rtol = MOE_FUSED_SWIGLU_GRAD_FC2_ATOL, MOE_FUSED_SWIGLU_GRAD_FC2_RTOL
+    else:
+        fwd_atol, fwd_rtol = MOE_FUSED_ATOL, MOE_FUSED_RTOL
+        hidden_atol, hidden_rtol = MOE_FUSED_GRAD_HIDDEN_ATOL, MOE_FUSED_GRAD_HIDDEN_RTOL
+        fc1_atol, fc1_rtol = MOE_FUSED_GRAD_FC1_ATOL, MOE_FUSED_GRAD_FC1_RTOL
+        fc2_atol, fc2_rtol = MOE_FUSED_GRAD_FC2_ATOL, MOE_FUSED_GRAD_FC2_RTOL
     assert torch.allclose(out_e.float(), out_o.float(), atol=fwd_atol, rtol=fwd_rtol)
 
     go = torch.randn_like(out_e)
     out_e.backward(go)
     out_o.backward(go)
-    assert torch.allclose(
-        hidden_e.grad.float(), hidden_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL
-    )
-    assert torch.allclose(
-        routing_e.grad.float(), routing_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL
-    )
-    assert torch.allclose(fc2_e.grad.float(), fc2_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL)
+    assert torch.allclose(hidden_e.grad.float(), hidden_o.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
+    assert torch.allclose(routing_e.grad.float(), routing_o.grad.float(), atol=hidden_atol, rtol=hidden_rtol)
+    assert torch.allclose(fc2_e.grad.float(), fc2_o.grad.float(), atol=fc2_atol, rtol=fc2_rtol)
     if merged:
-        assert torch.allclose(
-            fc1_12_e.grad.float(), fc1_12_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL
-        )
+        assert torch.allclose(fc1_12_e.grad.float(), fc1_12_o.grad.float(), atol=fc1_atol, rtol=fc1_rtol)
     else:
-        assert torch.allclose(
-            fc1_1_e.grad.float(), fc1_1_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL
-        )
-        assert torch.allclose(
-            fc1_2_e.grad.float(), fc1_2_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL
-        )
+        assert torch.allclose(fc1_1_e.grad.float(), fc1_1_o.grad.float(), atol=fc1_atol, rtol=fc1_rtol)
+        assert torch.allclose(fc1_2_e.grad.float(), fc1_2_o.grad.float(), atol=fc1_atol, rtol=fc1_rtol)
 
 
 def test_npu_fc1_layout_matches_eager_contract():
@@ -529,15 +534,35 @@ def test_gpt_oss_quack_matches_eager():
     out_e.backward(go)
     out_o.backward(go)
     assert torch.allclose(
-        hidden_e.grad.float(), hidden_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL
+        hidden_e.grad.float(),
+        hidden_o.grad.float(),
+        atol=MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL,
+        rtol=MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL,
     )
     assert torch.allclose(
-        routing_e.grad.float(), routing_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL
+        routing_e.grad.float(),
+        routing_o.grad.float(),
+        atol=MOE_FUSED_SWIGLU_GRAD_HIDDEN_ATOL,
+        rtol=MOE_FUSED_SWIGLU_GRAD_HIDDEN_RTOL,
     )
-    assert torch.allclose(gu_e.grad.float(), gu_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL)
-    assert torch.allclose(gub_e.grad.float(), gub_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL)
-    assert torch.allclose(dn_e.grad.float(), dn_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL)
-    assert torch.allclose(dnb_e.grad.float(), dnb_o.grad.float(), atol=MOE_FUSED_GRAD_ATOL, rtol=MOE_FUSED_GRAD_RTOL)
+    assert torch.allclose(
+        gu_e.grad.float(), gu_o.grad.float(), atol=MOE_FUSED_SWIGLU_GRAD_FC1_ATOL, rtol=MOE_FUSED_SWIGLU_GRAD_FC1_RTOL
+    )
+    assert torch.allclose(
+        gub_e.grad.float(),
+        gub_o.grad.float(),
+        atol=MOE_FUSED_SWIGLU_GRAD_FC1_ATOL,
+        rtol=MOE_FUSED_SWIGLU_GRAD_FC1_RTOL,
+    )
+    assert torch.allclose(
+        dn_e.grad.float(), dn_o.grad.float(), atol=MOE_FUSED_SWIGLU_GRAD_FC2_ATOL, rtol=MOE_FUSED_SWIGLU_GRAD_FC2_RTOL
+    )
+    assert torch.allclose(
+        dnb_e.grad.float(),
+        dnb_o.grad.float(),
+        atol=MOE_FUSED_SWIGLU_GRAD_FC2_ATOL,
+        rtol=MOE_FUSED_SWIGLU_GRAD_FC2_RTOL,
+    )
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU fused MoE needs torch_npu")
