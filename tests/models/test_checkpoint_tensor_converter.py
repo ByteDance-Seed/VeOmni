@@ -983,6 +983,37 @@ class TestQwen3VLMoeConverterConvert:
             )
 
 
+class TestQwen3VLMoeConverterAmbiguousShapes:
+    """Configs where the HF and VeOmni layouts are indistinguishable by shape.
+
+    The dispatch reads dim-1 and transposes on an HF match. When the HF and v5
+    expectations coincide, that check cannot tell the two apart and would
+    transpose an already-converted tensor, corrupting it silently. These are
+    not exotic ratios: `tests/toy_config/glm_moe_dsa_toy` is 2:1.
+    """
+
+    def test_gate_up_raises_when_hidden_is_twice_intermediate(self):
+        # hidden == 2 * intermediate -> both layouts expect dim-1 == 12.
+        converter = Qwen3VLMoeCheckpointTensorConverter(num_experts=4, hidden_size=12, intermediate_size=6)
+        with pytest.raises(RuntimeError, match="cannot distinguish HF from VeOmni layout"):
+            converter.convert("l.mlp.experts.gate_up_proj", torch.randn(4, 12, 12))
+
+    def test_down_proj_raises_when_intermediate_equals_hidden(self):
+        # intermediate == hidden -> both layouts expect dim-1 == 8.
+        converter = Qwen3VLMoeCheckpointTensorConverter(num_experts=4, hidden_size=8, intermediate_size=8)
+        with pytest.raises(RuntimeError, match="cannot distinguish HF from VeOmni layout"):
+            converter.convert("l.mlp.experts.down_proj", torch.randn(4, 8, 8))
+
+    def test_unambiguous_config_still_dispatches(self):
+        # The guard must not fire for the normal case: a v5 tensor passes
+        # through untouched and an HF tensor is transposed.
+        converter = Qwen3VLMoeCheckpointTensorConverter(num_experts=4, hidden_size=12, intermediate_size=5)
+        v5 = torch.randn(4, 10, 12)  # dim-1 == 2 * intermediate
+        assert torch.equal(converter.convert("l.mlp.experts.gate_up_proj", v5).tensor, v5)
+        hf = torch.randn(4, 12, 10)  # dim-1 == hidden
+        assert converter.convert("l.mlp.experts.gate_up_proj", hf).tensor.shape == (4, 10, 12)
+
+
 class TestQwen3VLMoeConverterFinalize:
     def test_finalize_is_noop(self):
         converter = Qwen3VLMoeCheckpointTensorConverter(
