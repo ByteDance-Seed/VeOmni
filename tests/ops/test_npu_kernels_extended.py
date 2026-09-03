@@ -27,44 +27,18 @@ edge cases, and a few more kernel-specific coverage tests.  Designed to:
     on the kernel changes without an NPU device.
 
 Tests are skipped on non-NPU hosts so the same test suite runs in any CI runner.
-
-Tolerance notes:
-  NPU bf16 RoPE kernels can drift by 1-2 bf16 ULPs from the eager
-  reference.  On a 4096-dim reduction this stacks to ~5e-2.
-  We use 5e-2 atol for the largest reductions; the eager reference
-  itself is fp32 so the comparison is well-conditioned.
 """
 
 import pytest
 import torch
 
 import veomni.ops  # noqa: F401 -- trigger KERNEL_REGISTRY registrations
-from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
 
 pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU kernels require torch_npu")
 
 DEVICE = get_device_type()
-
-
-# ---------------------------------------------------------------------------
-# Eager reference implementations (shared with the main npu_kernels test)
-# ---------------------------------------------------------------------------
-
-
-def _rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _eager_partial_rope(q, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    q_embed = (q_rot * cos) + (_rotate_half(q_rot) * sin)
-    return torch.cat([q_embed, q_pass], dim=-1)
 
 
 def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
@@ -77,89 +51,6 @@ def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     fused_input = torch.cat([gate, normed], dim=-1)
     half = fused_input.shape[-1] // 2
     return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
-
-
-# ---------------------------------------------------------------------------
-# Extended RoPE tests -- different shapes, position_ids path, fp16
-# ---------------------------------------------------------------------------
-
-
-class TestNPURotaryPosEmbExtended:
-    """Larger shapes, fp16, and odd head dims for the NPU RoPE kernel."""
-
-    @pytest.mark.parametrize("B,H,S,D", [(1, 8, 256, 128), (2, 16, 64, 64)])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_full_production_shape(self, B, H, S, D, dtype):
-        slot = OpSlot("rotary_pos_emb", "full")
-        slot.bind("npu")
-        torch.manual_seed(3)
-        q = torch.randn(B, H, S, D, device=DEVICE, dtype=dtype)
-        k = torch.randn(B, H, S, D, device=DEVICE, dtype=dtype)
-        half = torch.randn(B, S, D // 2, device=DEVICE, dtype=dtype)
-        cos = torch.cat([half, half], dim=-1)
-        half_s = torch.randn(B, S, D // 2, device=DEVICE, dtype=dtype)
-        sin = torch.cat([half_s, half_s], dim=-1)
-        q_k, k_k = slot(q, k, cos, sin)
-        cos_u = cos.unsqueeze(1)
-        sin_u = sin.unsqueeze(1)
-        q_e = (q * cos_u) + (_rotate_half(q) * sin_u)
-        k_e = (k * cos_u) + (_rotate_half(k) * sin_u)
-        # bf16 RoPE on NPU drifts to ~5e-2 on large head dims; fp16 is tighter.
-        atol = 5e-2 if dtype == torch.bfloat16 else 1e-2
-        assert torch.allclose(q_k, q_e, atol=atol, rtol=atol)
-        assert torch.allclose(k_k, k_e, atol=atol, rtol=atol)
-
-    def test_full_position_ids_path(self):
-        """Passing position_ids must not change the numerical result."""
-        slot = OpSlot("rotary_pos_emb", "full")
-        slot.bind("npu")
-        torch.manual_seed(4)
-        B, H, S, D = 1, 2, 8, 32
-        q = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        k = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        half = torch.randn(B, S, D // 2, device=DEVICE, dtype=torch.bfloat16)
-        cos = torch.cat([half, half], dim=-1)
-        half_s = torch.randn(B, S, D // 2, device=DEVICE, dtype=torch.bfloat16)
-        sin = torch.cat([half_s, half_s], dim=-1)
-        position_ids = torch.arange(S, device=DEVICE).unsqueeze(0).expand(B, -1)
-        q_with, k_with = slot(q, k, cos, sin, position_ids=position_ids)
-        q_without, k_without = slot(q, k, cos, sin)
-        assert torch.equal(q_with, q_without)
-        assert torch.equal(k_with, k_without)
-
-    @pytest.mark.parametrize("D,rotary_dim", [(128, 64), (256, 128)])
-    def test_partial_production_shape(self, D, rotary_dim):
-        slot = OpSlot("rotary_pos_emb", "partial")
-        slot.bind("npu")
-        torch.manual_seed(5)
-        B, H, S = 2, 4, 16
-        q = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        k = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        half = torch.randn(B, S, rotary_dim // 2, device=DEVICE, dtype=torch.bfloat16)
-        cos = torch.cat([half, half], dim=-1)
-        half_s = torch.randn(B, S, rotary_dim // 2, device=DEVICE, dtype=torch.bfloat16)
-        sin = torch.cat([half_s, half_s], dim=-1)
-        q_k, k_k = slot(q, k, cos, sin)
-        q_e = _eager_partial_rope(q, cos, sin)
-        k_e = _eager_partial_rope(k, cos, sin)
-        assert torch.allclose(q_k, q_e, atol=5e-2, rtol=5e-2)
-        assert torch.allclose(k_k, k_e, atol=5e-2, rtol=5e-2)
-
-    def test_partial_pass_through_preserved(self):
-        """The non-rotated tail of Q/K must be exactly preserved."""
-        slot = OpSlot("rotary_pos_emb", "partial")
-        slot.bind("npu")
-        torch.manual_seed(6)
-        B, H, S, D, rotary_dim = 1, 2, 4, 64, 32
-        q = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        k = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        half = torch.randn(B, S, rotary_dim // 2, device=DEVICE, dtype=torch.bfloat16)
-        cos = torch.cat([half, half], dim=-1)
-        half_s = torch.randn(B, S, rotary_dim // 2, device=DEVICE, dtype=torch.bfloat16)
-        sin = torch.cat([half_s, half_s], dim=-1)
-        q_k, k_k = slot(q, k, cos, sin)
-        assert torch.equal(q_k[..., rotary_dim:], q[..., rotary_dim:])
-        assert torch.equal(k_k[..., rotary_dim:], k[..., rotary_dim:])
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,8 @@ from tests.kernels.tol import (
     ROPE_FUSED_GRAD_RTOL,
     ROPE_FUSED_RTOL,
     ROPE_NPU_ATOL,
+    ROPE_NPU_PROD_BF16_ATOL,
+    ROPE_NPU_PROD_FP16_ATOL,
     ROPE_NPU_RTOL,
 )
 from veomni.kernels import resolve_kernel
@@ -238,6 +240,68 @@ def test_vision_npu_matches_eager():
     assert torch.allclose(k_e.grad.float(), k_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
 
 
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RoPE needs NPU")
+@pytest.mark.parametrize("batch, heads, seqlen, head_dim", [(1, 8, 256, 128), (2, 16, 64, 64)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_full_npu_production_shape(batch: int, heads: int, seqlen: int, head_dim: int, dtype: torch.dtype):
+    eager = resolve_kernel("rope", "full", "eager").wrapper
+    other = resolve_kernel("rope", "full", "npu").wrapper
+    torch.manual_seed(3)
+    q = torch.randn(batch, heads, seqlen, head_dim, device="npu", dtype=dtype)
+    k = torch.randn(batch, heads, seqlen, head_dim, device="npu", dtype=dtype)
+    half = torch.randn(batch, seqlen, head_dim // 2, device="npu", dtype=dtype)
+    cos = torch.cat((half, half), dim=-1)
+    half_s = torch.randn(batch, seqlen, head_dim // 2, device="npu", dtype=dtype)
+    sin = torch.cat((half_s, half_s), dim=-1)
+    atol = ROPE_NPU_PROD_BF16_ATOL if dtype == torch.bfloat16 else ROPE_NPU_PROD_FP16_ATOL
+    out_e = eager(q, k, cos, sin, unsqueeze_dim=1)
+    out_o = other(q, k, cos, sin, unsqueeze_dim=1)
+    _assert_pair(
+        (out_e[0].float(), out_e[1].float()),
+        (out_o[0].float(), out_o[1].float()),
+        atol=atol,
+        rtol=atol,
+    )
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RoPE needs NPU")
+@pytest.mark.parametrize("head_dim, rotary_dim", [(128, 64), (256, 128)])
+def test_partial_npu_production_shape(head_dim: int, rotary_dim: int):
+    eager = resolve_kernel("rope", "partial", "eager").wrapper
+    other = resolve_kernel("rope", "partial", "npu").wrapper
+    torch.manual_seed(5)
+    q = torch.randn(2, 4, 16, head_dim, device="npu", dtype=torch.bfloat16)
+    k = torch.randn(2, 4, 16, head_dim, device="npu", dtype=torch.bfloat16)
+    half = torch.randn(2, 16, rotary_dim // 2, device="npu", dtype=torch.bfloat16)
+    cos = torch.cat((half, half), dim=-1)
+    half_s = torch.randn(2, 16, rotary_dim // 2, device="npu", dtype=torch.bfloat16)
+    sin = torch.cat((half_s, half_s), dim=-1)
+    out_e = eager(q, k, cos, sin, unsqueeze_dim=1)
+    out_o = other(q, k, cos, sin, unsqueeze_dim=1)
+    _assert_pair(
+        (out_e[0].float(), out_e[1].float()),
+        (out_o[0].float(), out_o[1].float()),
+        atol=ROPE_NPU_PROD_BF16_ATOL,
+        rtol=ROPE_NPU_PROD_BF16_ATOL,
+    )
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RoPE needs NPU")
+def test_partial_npu_pass_through_preserved():
+    other = resolve_kernel("rope", "partial", "npu").wrapper
+    torch.manual_seed(6)
+    rotary_dim = 32
+    q = torch.randn(1, 2, 4, 64, device="npu", dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 4, 64, device="npu", dtype=torch.bfloat16)
+    half = torch.randn(1, 4, rotary_dim // 2, device="npu", dtype=torch.bfloat16)
+    cos = torch.cat((half, half), dim=-1)
+    half_s = torch.randn(1, 4, rotary_dim // 2, device="npu", dtype=torch.bfloat16)
+    sin = torch.cat((half_s, half_s), dim=-1)
+    out_q, out_k = other(q, k, cos, sin, unsqueeze_dim=1)
+    assert torch.equal(out_q[..., rotary_dim:], q[..., rotary_dim:])
+    assert torch.equal(out_k[..., rotary_dim:], k[..., rotary_dim:])
+
+
 def test_deepseek_v4_eager_matches_hf():
     torch.manual_seed(0)
     x = torch.randn(2, 4, 16, 128, dtype=torch.float32, requires_grad=True)
@@ -277,12 +341,13 @@ def _dsv4_rope_inputs(
     rope_dim: int,
     transposed: bool,
     dtype: torch.dtype,
+    device: str = "cuda",
 ) -> tuple[Tensor, Tensor, Tensor]:
     if transposed:
-        x = torch.randn(batch, seqlen, heads, head_dim, device="cuda", dtype=dtype).transpose(1, 2)
+        x = torch.randn(batch, seqlen, heads, head_dim, device=device, dtype=dtype).transpose(1, 2)
     else:
-        x = torch.randn(batch, heads, seqlen, head_dim, device="cuda", dtype=dtype)
-    angle = torch.randn(batch, seqlen, rope_dim // 2, device="cuda", dtype=dtype)
+        x = torch.randn(batch, heads, seqlen, head_dim, device=device, dtype=dtype)
+    angle = torch.randn(batch, seqlen, rope_dim // 2, device=device, dtype=dtype)
     return x, angle.cos(), angle.sin()
 
 
@@ -331,6 +396,65 @@ def test_deepseek_v4_triton_inverse_rotation_round_trips():
     round_tripped = rope(rope(x, cos, sin, unsqueeze_dim=1), cos, -sin, unsqueeze_dim=1)
 
     torch.testing.assert_close(round_tripped, x.contiguous(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
+def test_deepseek_v4_triton_saves_only_cos_sin():
+    pytest.importorskip("triton")
+    rope = resolve_kernel("rope", "deepseek_v4", "triton").wrapper
+    torch.manual_seed(7)
+    x, cos, sin = _dsv4_rope_inputs(1, 4, 32, 512, 64, True, torch.bfloat16)
+    out = rope(x.detach().requires_grad_(True), cos, sin, unsqueeze_dim=1)
+    assert [tensor.shape for tensor in out.grad_fn.saved_tensors] == [cos.shape, sin.shape]
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda x, cos, sin: (x, cos, sin, 2), id="unsqueeze_dim_not_one"),
+        pytest.param(lambda x, cos, sin: (x[0], cos, sin, 1), id="x_not_4d"),
+        pytest.param(lambda x, cos, sin: (x, cos.requires_grad_(True), sin, 1), id="cos_requires_grad"),
+        pytest.param(lambda x, cos, sin: (x, cos[:, :-1], sin[:, :-1], 1), id="cos_seqlen_mismatch"),
+        pytest.param(lambda x, cos, sin: (x[..., :-1], cos, sin, 1), id="odd_nope_dim"),
+        pytest.param(lambda x, cos, sin: (x, cos[..., :0], sin[..., :0], 1), id="empty_rope_dim"),
+        pytest.param(lambda x, cos, sin: (x, cos.cpu(), sin.cpu(), 1), id="cos_on_other_device"),
+    ],
+)
+def test_deepseek_v4_triton_falls_back_when_unsupported(monkeypatch, mutate):
+    pytest.importorskip("triton")
+    from veomni.kernels._kernels.rope.deepseek_v4 import triton as dsv4_triton
+    from veomni.kernels.registry import SavedState
+
+    torch.manual_seed(7)
+    x, cos, sin, unsqueeze_dim = mutate(*_dsv4_rope_inputs(1, 4, 32, 512, 64, True, torch.float32))
+
+    monkeypatch.setattr(
+        dsv4_triton,
+        "_rotary_launch",
+        lambda *a, **k: pytest.fail("unsupported input reached the Triton kernel"),
+    )
+    reached_eager = False
+
+    def record_eager(tensor, *args, **kwargs):
+        nonlocal reached_eager
+        reached_eager = True
+        return tensor, SavedState((cos, sin), dsv4_triton._Meta(False, unsqueeze_dim))
+
+    monkeypatch.setattr(dsv4_triton._eager, "forward", record_eager)
+    resolve_kernel("rope", "deepseek_v4", "triton").wrapper(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    assert reached_eager
+
+
+def test_deepseek_v4_triton_fallback_matches_eager():
+    from veomni.kernels._kernels.rope.deepseek_v4 import eager as dsv4_eager
+    from veomni.kernels._kernels.rope.deepseek_v4 import triton as dsv4_triton
+
+    torch.manual_seed(7)
+    x, cos, sin = _dsv4_rope_inputs(1, 4, 32, 512, 64, True, torch.float32, device="cpu")
+    out_e, _ = dsv4_eager.forward(x, cos, sin, unsqueeze_dim=1)
+    out_o, _ = dsv4_triton.forward(x, cos, sin, unsqueeze_dim=1)
+    torch.testing.assert_close(out_o, out_e)
 
 
 def test_wan_eager_matches_reference():

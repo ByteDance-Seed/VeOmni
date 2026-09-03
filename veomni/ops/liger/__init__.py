@@ -12,31 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-LigerKernel-based kernel registrations (RoPE, SwiGLU).
+LigerKernel-based kernel registrations (SwiGLU).
 
 Registrations are executed at import time via ``veomni.ops.__init__``.
-RMSNorm lives in ``veomni.kernels``.
+RMSNorm and RoPE live in ``veomni.kernels``.
 """
 
 from __future__ import annotations
 
 from ..kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
-
-
-# ── Liger Rotary Positional Embedding ─────────────────────────────────────────
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger_kernel",
-        op_name="rotary_pos_emb",
-        variant="full",
-        factory=lambda: (
-            __import__("liger_kernel.transformers.rope", fromlist=["liger_rotary_pos_emb"]).liger_rotary_pos_emb
-        ),
-        hardware=HardwareRequirement(device_type="gpu"),
-        description="LigerKernel fused RoPE (full head_dim only)",
-    )
-)
 
 
 # ── Liger SwiGLU MLP ─────────────────────────────────────────────────────────

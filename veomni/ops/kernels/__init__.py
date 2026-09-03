@@ -27,6 +27,5 @@ from . import (  # noqa: F401
     load_balancing_loss,
     mhc,
     moe,
-    rotary,
     swiglu,
 )

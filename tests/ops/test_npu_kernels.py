@@ -36,43 +36,6 @@ pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU kernels requir
 DEVICE = get_device_type()
 
 
-# ---------------------------------------------------------------------------
-# Reference (eager) implementations — same as test_kernel_registry_numerical.py
-# ---------------------------------------------------------------------------
-
-
-def _rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _eager_rope(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
-
-
-def _eager_partial_rope(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_embed = (q_rot * cos) + (_rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (_rotate_half(k_rot) * sin)
-    return torch.cat([q_embed, q_pass], dim=-1), torch.cat([k_embed, k_pass], dim=-1)
-
-
-def _eager_rope_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    q, k = q.unsqueeze(0), k.unsqueeze(0)
-    cos = cos.unsqueeze(0).unsqueeze(2).float()
-    sin = sin.unsqueeze(0).unsqueeze(2).float()
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    q_embed, k_embed = q_embed.squeeze(0), k_embed.squeeze(0)
-    return q_embed, k_embed
-
-
 def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     """Eager reference: RMSNorm + concatenate gate + SiLU gating."""
     dtype = hidden_states.dtype
@@ -83,68 +46,6 @@ def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     fused_input = torch.cat([gate, normed], dim=-1)
     half = fused_input.shape[-1] // 2
     return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
-
-
-# ---------------------------------------------------------------------------
-# Rotary positional embedding tests
-# ---------------------------------------------------------------------------
-
-
-class TestNPURotaryPosEmb:
-    """Tests for the ``rotary_pos_emb`` NPU kernel (full, vision, partial variants)."""
-
-    @pytest.mark.parametrize("B,H,S,D", [(2, 4, 16, 64), (1, 2, 8, 32)])
-    def test_full_matches_eager_bf16(self, B, H, S, D):
-        slot = OpSlot("rotary_pos_emb", "full")
-        slot.bind("npu")
-        q = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        k = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        # HF RoPE convention: cos/sin are duplicated across the two halves of head_dim.
-        half = torch.randn(B, S, D // 2, device=DEVICE, dtype=torch.bfloat16)
-        cos = torch.cat([half, half], dim=-1)
-        half_s = torch.randn(B, S, D // 2, device=DEVICE, dtype=torch.bfloat16)
-        sin = torch.cat([half_s, half_s], dim=-1)
-        q_k, k_k = slot(q, k, cos, sin)
-        q_e, k_e = _eager_rope(q, k, cos, sin)
-        # Cast to fp32 because torch.allclose lowers to aclnnIsClose on NPU,
-        # which only supports DT_FLOAT (raises EZ1001 on bf16 inputs).
-        # bf16 RoPE compounds two rounds (q*cos) + (rotate_half(q)*sin); on
-        # larger shapes (e.g. (2,4,16,64)) the bf16 ULP drift stacks to ~2e-2.
-        assert torch.allclose(q_k.float(), q_e.float(), atol=2e-2, rtol=2e-2)
-        assert torch.allclose(k_k.float(), k_e.float(), atol=2e-2, rtol=2e-2)
-
-    @pytest.mark.parametrize("S,H,D", [(16, 4, 64), (8, 2, 32)])
-    def test_vision_matches_eager_bf16(self, S, H, D):
-        slot = OpSlot("rotary_pos_emb_vision", "full")
-        slot.bind("npu")
-        q = torch.randn(S, H, D, device=DEVICE, dtype=torch.bfloat16)
-        k = torch.randn(S, H, D, device=DEVICE, dtype=torch.bfloat16)
-        half = torch.randn(S, D // 2, device=DEVICE, dtype=torch.bfloat16)
-        cos = torch.cat([half, half], dim=-1)
-        half_s = torch.randn(S, D // 2, device=DEVICE, dtype=torch.bfloat16)
-        sin = torch.cat([half_s, half_s], dim=-1)
-        q_k, k_k = slot(q, k, cos, sin)
-        q_e, k_e = _eager_rope_vision(q, k, cos, sin)
-        # Cast to fp32 + 2e-2 tolerance (see comment in test_full_matches_eager_bf16).
-        assert torch.allclose(q_k.float(), q_e.float(), atol=2e-2, rtol=2e-2)
-        assert torch.allclose(k_k.float(), k_e.float(), atol=2e-2, rtol=2e-2)
-
-    @pytest.mark.parametrize("B,H,S,D,rotary_dim", [(2, 4, 16, 128, 64), (1, 2, 8, 64, 32)])
-    def test_partial_matches_eager_bf16(self, B, H, S, D, rotary_dim):
-        slot = OpSlot("rotary_pos_emb", "partial")
-        slot.bind("npu")
-        q = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        k = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-        # cos/sin only cover the rotary portion of head_dim
-        half = torch.randn(B, S, rotary_dim // 2, device=DEVICE, dtype=torch.bfloat16)
-        cos = torch.cat([half, half], dim=-1)
-        half_s = torch.randn(B, S, rotary_dim // 2, device=DEVICE, dtype=torch.bfloat16)
-        sin = torch.cat([half_s, half_s], dim=-1)
-        q_k, k_k = slot(q, k, cos, sin)
-        q_e, k_e = _eager_partial_rope(q, k, cos, sin)
-        # Cast to fp32 + 2e-2 tolerance (see comment in test_full_matches_eager_bf16).
-        assert torch.allclose(q_k.float(), q_e.float(), atol=2e-2, rtol=2e-2)
-        assert torch.allclose(k_k.float(), k_e.float(), atol=2e-2, rtol=2e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -290,9 +191,6 @@ class TestNPUKernelRegistry:
     @pytest.mark.parametrize(
         "op_name,variant",
         [
-            ("rotary_pos_emb", "full"),
-            ("rotary_pos_emb_vision", "full"),
-            ("rotary_pos_emb", "partial"),
             ("rms_norm_gated", "standard"),
             ("moe_experts", "standard"),
         ],

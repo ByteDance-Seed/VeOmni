@@ -42,39 +42,6 @@ def _fresh_slot(op_name, variant, impl_name):
     return slot
 
 
-def _rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _eager_rope(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
-
-
-def test_rotary_pos_emb_liger_matches_eager():
-    pytest.importorskip("liger_kernel")
-    slot = _fresh_slot("rotary_pos_emb", "full", "liger_kernel")
-    B, H, S, D = 2, 4, 16, 64
-    q = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-    k = torch.randn(B, H, S, D, device=DEVICE, dtype=torch.bfloat16)
-    # HF RoPE convention: cos/sin are duplicated across the two halves of head_dim.
-    half = torch.randn(B, S, D // 2, device=DEVICE, dtype=torch.bfloat16)
-    cos = torch.cat([half, half], dim=-1)
-    half_s = torch.randn(B, S, D // 2, device=DEVICE, dtype=torch.bfloat16)
-    sin = torch.cat([half_s, half_s], dim=-1)
-    q_k, k_k = slot(q, k, cos, sin)
-    q_e, k_e = _eager_rope(q, k, cos, sin)
-    # Compound bf16 op: (q * cos) + (rotate_half(q) * sin) — two muls + one add
-    # per element, each carrying a bf16 rounding; near values of magnitude 1,
-    # 3 ULPs can stack to ~3e-2. 1e-2 is the tightest atol that holds on every
-    # element of this kernel across seeds; verifies the kernel is within one
-    # bf16 rounding per op of the eager reference.
-    assert torch.allclose(q_k, q_e, atol=1e-2, rtol=1e-2)
-    assert torch.allclose(k_k, k_e, atol=1e-2, rtol=1e-2)
-
-
 def test_swiglu_mlp_liger_matches_eager():
     pytest.importorskip("liger_kernel")
     slot = _fresh_slot("swiglu_mlp", "standard", "liger_kernel")
