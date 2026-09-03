@@ -15,7 +15,14 @@
 from functools import partial
 
 from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+from ...loader import CONTEXT_PARALLEL, MODEL_CAPABILITY_REGISTRY, MODELING_REGISTRY
+
+
+# The generated modeling module shards the sequence and gathers it again around
+# attention, which is what ``cp_size > 1`` requires of a forward and what no other
+# model in the tree implements yet. Declared here rather than listed in
+# ``veomni/models/auto.py`` so that the claim sits with the code backing it.
+MODEL_CAPABILITY_REGISTRY.register("deepseek_v4", frozenset({CONTEXT_PARALLEL}))
 
 
 @MODELING_REGISTRY.register("deepseek_v4")

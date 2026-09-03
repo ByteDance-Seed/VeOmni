@@ -29,7 +29,15 @@ from ..distributed.parallel_state import get_parallel_state, is_parallel_state_i
 from ..ops.dispatch import OpsConfigSlot, OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
-from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
+from .loader import (
+    CONTEXT_PARALLEL,
+    BaseModelLoader,
+    get_loader,
+    get_model_config,
+    get_model_processor,
+    model_supports,
+    model_types_supporting,
+)
 
 
 if TYPE_CHECKING:
@@ -37,23 +45,28 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-# Models whose forward implements context parallelism. An allow-list rather than
-# a deny-list so that a model has to be ported deliberately: CP is enabled
-# model-agnostically (``ParallelState`` and ``TrainingArguments`` both admit
-# ``cp_size > 1`` for anything), and nothing downstream would notice a model that
-# has not been. ``SequenceParallelCollator`` shards the sequence on
-# ``sp_enabled``, which CP alone turns on, while every unported model gates its
-# sequence-parallel collectives on ``ulysses_enabled``, which CP alone leaves
-# false — so the shards are never gathered, each rank attends only within its own
-# 1/cp_size of the sequence, and the run trains to a plausible loss curve while
-# being silently wrong.
-CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
-
 
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
-    """Raise unless this model type implements context parallelism.
+    """Raise unless this model type declared that it implements context parallelism.
 
     A no-op when context parallelism is off, which is every other configuration.
+
+    An allow-list rather than a deny-list, so that a model has to be ported
+    deliberately. CP is enabled model-agnostically -- ``ParallelState`` and
+    ``TrainingArguments`` both admit ``cp_size > 1`` for anything -- and nothing
+    downstream would notice a model that has not been:
+    ``SequenceParallelCollator`` shards the sequence on ``sp_enabled``, which CP
+    alone turns on, while every unported model gates its sequence-parallel
+    collectives on ``ulysses_enabled``, which CP alone leaves false. The shards are
+    never gathered, each rank attends only within its own ``1/cp_size`` of the
+    sequence, and the run trains to a plausible loss curve while being silently
+    wrong. That is the failure this exists to convert into an error.
+
+    Which models qualify is read from ``MODEL_CAPABILITY_REGISTRY`` rather than
+    listed here, so the claim sits in the model package with the forward that backs
+    it. The registry direction is the one that matters: an unregistered model type
+    is refused, so forgetting to declare a capability costs a run that will not
+    start rather than one that is quietly incorrect.
     """
     # ``build_foundation_model`` runs this for every model, including in processes
     # that never installed a parallel state -- tests that spawn a multi-rank world
@@ -71,10 +84,10 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
         raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
 
     model_type = getattr(config, "model_type", None)
-    if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
+    if model_supports(model_type, CONTEXT_PARALLEL):
         return
 
-    supported = ", ".join(sorted(CONTEXT_PARALLEL_MODEL_TYPES))
+    supported = ", ".join(model_types_supporting(CONTEXT_PARALLEL)) or "no model type"
     raise NotImplementedError(
         f"Context parallelism is not implemented for model type {model_type!r}; "
         f"only {supported} supports it. Set cp_size=1 to disable it, or use "

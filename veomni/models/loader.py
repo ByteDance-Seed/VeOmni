@@ -16,6 +16,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_loader/loader.py
 
 from abc import ABC, abstractmethod
+from typing import List, Optional
 
 import torch
 from transformers import (
@@ -50,7 +51,49 @@ MODELING_REGISTRY = Registry("Modeling")
 MODEL_CONFIG_REGISTRY = Registry("ModelConfig")
 MODEL_PROCESSOR_REGISTRY = Registry("ModelProcessor")
 
+# What a model's VeOmni implementation can do beyond loading and a plain forward,
+# declared by the model package that implements it. Keyed by ``model_type`` and
+# holding a set of capability names.
+#
+# Registered rather than detected because the capabilities worth declaring here are
+# exactly the ones nothing downstream would notice the absence of -- see
+# ``check_context_parallel_supported``, whose whole reason for existing is that an
+# unported model under ``cp_size > 1`` trains to a plausible loss curve rather than
+# raising. A registry cannot be forgotten in the direction that matters: an
+# unregistered model is refused, so the failure mode of forgetting to declare a
+# capability is a run that will not start, not one that is silently wrong.
+MODEL_CAPABILITY_REGISTRY = Registry("ModelCapability")
+
+CONTEXT_PARALLEL = "context_parallel"
+
 logger = logging.get_logger(__name__)
+
+
+def model_supports(model_type: Optional[str], capability: str) -> bool:
+    """Whether *model_type* declared *capability*.
+
+    ``False`` for an unregistered model type, including ``None``. Callers gate on
+    this to refuse, so absence has to be the safe answer rather than an error --
+    ``Registry.__getitem__`` raises on an unknown key, which would turn every
+    unported model into a traceback about the registry instead of a message about
+    the feature the user asked for.
+    """
+    if model_type is None or model_type not in MODEL_CAPABILITY_REGISTRY.valid_keys():
+        return False
+    return capability in MODEL_CAPABILITY_REGISTRY[model_type]
+
+
+def model_types_supporting(capability: str) -> List[str]:
+    """Every registered model type declaring *capability*, sorted.
+
+    For error messages: a refusal that names what the user could switch to is worth
+    more than one that only names what failed.
+    """
+    return sorted(
+        model_type
+        for model_type in MODEL_CAPABILITY_REGISTRY.valid_keys()
+        if capability in MODEL_CAPABILITY_REGISTRY[model_type]
+    )
 
 
 def raise_unsupported_veomni_modeling(model_name: str) -> None:
