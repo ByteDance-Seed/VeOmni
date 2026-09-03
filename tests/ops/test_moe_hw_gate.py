@@ -12,28 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hardware-gate tests for MoE kernel selection.
+"""Hardware-gate tests for leftover ``apply_veomni_fused_moe_patch``.
 
-Covers the two dispatch paths that select a fused MoE kernel from
-``OpsImplementationConfig.moe_implementation`` and verifies that a
-kernel-vs-hardware mismatch raises with a clear message at model-build time
-rather than silently falling back to another backend.
-
-Two paths:
-1. Legacy: ``apply_veomni_fused_moe_patch`` (qwen3_moe, deepseek_v3, etc.)
-2. OpSlot: ``KERNEL_REGISTRY.resolve`` via ``HardwareRequirement`` (qwen3_5_moe)
-
-We mock the hardware-detection helpers so the same test suite runs on any
-CI host.
+``moe_experts`` OpSlot rows are gone. Production ``models/`` still binds the
+legacy pointer. Kernels resolve gates live in ``tests/kernels/test_moe_experts.py``.
 """
 
 from unittest.mock import patch
 
 import pytest
 
-import veomni.ops  # noqa: F401 — trigger KERNEL_REGISTRY registrations
-from veomni.ops.dispatch import OpsConfigSlot, OpSlot
-from veomni.ops.kernel_registry import KERNEL_REGISTRY
+from veomni.ops.dispatch import OpsConfigSlot
 from veomni.ops.kernels.moe import apply_veomni_fused_moe_patch
 
 
@@ -73,111 +62,6 @@ def test_legacy_fused_npu_on_gpu_raises(_mock_npu):
 def test_legacy_invalid_kernel_name_raises():
     with pytest.raises(ValueError, match="Invalid fused_moe_kernel"):
         apply_veomni_fused_moe_patch(fused_moe_kernel="bogus")
-
-
-# ---------------------------------------------------------------------------
-# 2) OpSlot path — KERNEL_REGISTRY.resolve → HardwareRequirement.is_satisfied
-# ---------------------------------------------------------------------------
-
-_REGISTRY_MODULE = "veomni.ops.kernel_registry"
-
-
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
-@patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_opslot_fused_quack_on_sm80_raises(_mock_cc):
-    """A100-class GPU (SM80) should fail the SM90 min_compute_capability gate."""
-    slot = OpSlot("moe_experts", "standard")
-    with pytest.raises(RuntimeError, match="compute_capability>=90"):
-        slot.bind("quack")
-
-
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", False)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", True)
-def test_opslot_fused_quack_on_npu_raises():
-    slot = OpSlot("moe_experts", "standard")
-    with pytest.raises(RuntimeError, match="device_type='gpu'"):
-        slot.bind("quack")
-
-
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", False)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", True)
-@patch(f"{_REGISTRY_MODULE}.IS_MLU_AVAILABLE", False)
-def test_opslot_fused_triton_on_npu_raises():
-    slot = OpSlot("moe_experts", "standard")
-    with pytest.raises(RuntimeError, match=r"\['gpu', 'mlu'\]"):
-        slot.bind("triton")
-
-
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
-def test_opslot_fused_npu_on_gpu_raises():
-    slot = OpSlot("moe_experts", "standard")
-    with pytest.raises(RuntimeError, match="device_type='npu'"):
-        slot.bind("npu")
-
-
-def test_opslot_eager_skips_hw_check():
-    """'eager' resolves to None without touching HardwareRequirement."""
-    slot = OpSlot("moe_experts", "standard")
-    slot.bind("eager")
-    assert not slot.use_non_eager_impl
-
-
-def test_opslot_unknown_kernel_name_raises():
-    slot = OpSlot("moe_experts", "standard")
-    with pytest.raises(KeyError, match="Unknown kernel 'bogus'"):
-        slot.bind("bogus")
-
-
-# ---------------------------------------------------------------------------
-# 3) End-to-end — _bind_veomni_ops wires config → OpSlot so the
-#    HardwareRequirement gate sees the requested impl_name.
-# ---------------------------------------------------------------------------
-
-
-# ``OpsImplementationConfig.__post_init__`` runs ``_validate_implementations``
-# which calls ``veomni.utils.import_utils.is_torch_npu_available`` directly —
-# the registry-level IS_NPU_AVAILABLE patches above don't reach it. Mock the
-# validator's NPU detection so this GPU-scenario test can construct a config
-# with ``quack`` on the NPU CI runner without the validator firing
-# before the bind step we actually want to exercise.
-@patch("veomni.utils.import_utils.is_torch_npu_available", return_value=False)
-@patch("veomni.utils.import_utils.is_torch_mlu_available", return_value=False)
-@patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
-@patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
-@patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=80)
-def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc, _mock_npu, _mock_mlu):
-    """Reproducer for the silent-fallback regression:
-
-    User sets ``moe_implementation='quack'`` on an A100. The binding
-    must look up ``quack`` and raise at bind time, not silently stay eager.
-    """
-    from types import SimpleNamespace
-
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models.auto import _bind_veomni_ops
-
-    # Start from all-eager so this test exercises only the moe_experts
-    # OpSlot binding, not the GPU-optimal defaults (which would require
-    # liger-kernel + triton in the test environment).
-    ops_config = OpsImplementationConfig(
-        attn_implementation="eager",
-        moe_implementation="quack",
-        cross_entropy_loss_implementation="eager",
-        rms_norm_implementation="eager",
-        swiglu_mlp_implementation="eager",
-        rotary_pos_emb_implementation="eager",
-        load_balancing_loss_implementation="eager",
-        rms_norm_gated_implementation="eager",
-        causal_conv1d_implementation="eager",
-        chunk_gated_delta_rule_implementation="eager",
-    )
-    # Simulate a patchgen'd modeling module with a moe_experts OpSlot.
-    fake_module = SimpleNamespace(veomni_moe_experts_forward=OpSlot("moe_experts", "standard"))
-
-    with pytest.raises(RuntimeError, match="compute_capability>=90"):
-        _bind_veomni_ops(fake_module, ops_config)
 
 
 def test_bind_veomni_ops_binds_model_registered_config_slots():
@@ -234,10 +118,3 @@ def test_bind_veomni_ops_rejects_unknown_config_slot():
 
     with pytest.raises(AttributeError, match="missing_backend"):
         _bind_veomni_ops(fake_module, ops_config)
-
-
-# KERNEL_REGISTRY is a module-level singleton. Assert the registrations the
-# tests rely on are present so a future registry reshuffle trips this early.
-@pytest.mark.parametrize("impl_name", ["triton", "quack", "npu"])
-def test_moe_experts_registry_has_kernel(impl_name):
-    assert impl_name in KERNEL_REGISTRY.list_available("moe_experts", "standard")

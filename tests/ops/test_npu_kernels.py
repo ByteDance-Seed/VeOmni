@@ -192,7 +192,6 @@ class TestNPUKernelRegistry:
         "op_name,variant",
         [
             ("rms_norm_gated", "standard"),
-            ("moe_experts", "standard"),
         ],
     )
     def test_npu_kernel_registered(self, op_name, variant):

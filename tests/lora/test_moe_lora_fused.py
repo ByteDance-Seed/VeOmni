@@ -90,7 +90,7 @@ _TOY = "qwen3_moe_toy"  # Default for tests that don't parametrise on toy.
 # overall tensor stays accurate to <1% in L2. Element-wise allclose flags this
 # as a divergence; L2-relative is the standard gradient-parity metric used in
 # kernel correctness tests (matches what
-# ``tests/ops/test_fused_moe_split_vs_merged.py`` is implicitly tolerating
+# ``tests/kernels/test_moe_experts.py`` is implicitly tolerating
 # with its ``rtol=3e-2, atol=3e-2`` bounds, but expressed directly).
 _FWD_L2REL_TOL = 0.02  # 2% — forward is one chain of group-gemm + add + matmul.
 _GRAD_L2REL_TOL = 0.02  # 2% — backward stacks a bf16 matmul on top of the dgrad.
