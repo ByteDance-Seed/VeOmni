@@ -95,27 +95,61 @@ ships a `device_patch.py`.
 
 2. **Implement each kernel variant** in its own file (e.g. `triton_kernel.py`, `eager.py`, `npu_kernel.py`). Each variant declares a concrete function with the kernel's canonical signature.
 
-3. **Register the kernel** in `veomni/ops/kernels/<op_name>/__init__.py`:
+3. **Register the kernel** in `veomni/ops/kernels/<op_name>/__init__.py`. One
+   `KERNEL_REGISTRY.register(KernelSpec(...))` call per implementation —
+   `register()` takes a single `KernelSpec` and returns `None`, so it is not a
+   decorator:
    ```python
-   from veomni.ops.kernel_registry import KERNEL_REGISTRY
+   from veomni.ops.kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
 
-   from .eager import my_op_eager
-   from .triton_kernel import my_op_triton
 
-   KERNEL_REGISTRY.register(slot="my_op", variant="eager")(my_op_eager)
-   KERNEL_REGISTRY.register(slot="my_op", variant="triton")(my_op_triton)
+   def _my_op_triton_factory():
+       from .triton_kernel import my_op_triton  # imported only when selected
+
+       return my_op_triton
+
+
+   KERNEL_REGISTRY.register(
+       KernelSpec(
+           name="triton",              # impl name the user selects in the config
+           op_name="my_op",            # the logical op — matches the OpSlot
+           variant="standard",         # op shape, when one op has several
+           factory=_my_op_triton_factory,
+           hardware=HardwareRequirement(device_type="gpu"),
+           description="Triton my_op",
+       )
+   )
    ```
 
-   Then declare a matching `OpSlot` in the patchgen config of every model that uses it:
+   `factory` is a **zero-argument callable returning the kernel**, not the
+   kernel itself. Keeping it lazy is what stops an optional dependency (Liger,
+   Triton, `torch_npu`) from being imported just because the module was loaded.
+   `hardware` is enforced at `resolve()` time, so an unavailable kernel fails
+   with a clear error instead of at first use.
+
+   Mind the two axes: `(op_name, variant)` identifies the *slot*, `name`
+   identifies the *implementation* within it. Kernels in different variants
+   never collide.
+
+   Then declare a matching `OpSlot` in the patchgen config of every model that
+   uses it — the arguments are `(op_name, variant)`, not an implementation:
    ```python
    from veomni.ops.dispatch import OpSlot
-   veomni_my_op = OpSlot("my_op", "eager")  # default variant
+   veomni_my_op = OpSlot("my_op", "standard")
    ```
-   `_bind_veomni_ops()` will swap this for the registry entry selected by `OpsImplementationConfig`.
+   `_bind_veomni_ops()` calls `slot.bind(impl_name)` with the implementation
+   selected by `OpsImplementationConfig`. See
+   `veomni/ops/kernels/rotary/__init__.py` for a live example, and
+   `veomni/ops/README.md` for the op/variant/impl table.
 
-4. **Wire the config field** (if the user needs to choose a variant):
+4. **Wire the config field** (if the user needs to choose an implementation):
    - Add a field to `OpsImplementationConfig` in `veomni/arguments/arguments_types.py`.
-   - In `veomni/ops/config/registry.py`, map the new config field to the `(slot, variant)` tuple consumed by `_bind_veomni_ops()`.
+   - Call `register_op(OpSpec(name=..., config_field=..., scope=..., default=..., backends={...}))`
+     from the same `veomni/ops/kernels/<op_name>/__init__.py` — the mapping
+     lives next to the kernel, not inside `veomni/ops/config/registry.py`,
+     which only defines `OpSpec` / `BackendSpec` / `register_op`. See
+     `veomni/ops/kernels/rms_norm/__init__.py`, which registers both an
+     `OpSpec` and its `KernelSpec`s.
 
 5. **For legacy global ops** (only when needed): add the public function to `veomni/ops/__init__.py` and rebind it from `apply_ops_config(ops_config)`.
 
