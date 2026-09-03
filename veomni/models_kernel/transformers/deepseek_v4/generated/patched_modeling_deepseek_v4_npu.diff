@@ -197,8 +197,6 @@
 +        nn.Module.__init__(self)
          self.eps = eps
 +        impl = resolve_kernel_impl("rms_norm_implementation")
-+        if impl in {"npu", "triton"}:
-+            impl = "eager"
 +        self.veomni_unweighted_rms_norm = VeomniKernel("rms_norm", "unweighted", impl)
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1163,6 +1161,7 @@
 -
 -
 -@use_experts_implementation
++        self.limit = config.swiglu_limit
 +        self.veomni_swiglu_mlp = VeomniKernel(
 +            "swiglu_mlp", "standard", resolve_kernel_impl("swiglu_mlp_implementation")
 +        )
@@ -1176,6 +1175,7 @@
 +            linear_bias(self.up_proj),
 +            self.down_proj.weight,
 +            linear_bias(self.down_proj),
++            swiglu_limit=self.limit,
 +        )
 +
 +

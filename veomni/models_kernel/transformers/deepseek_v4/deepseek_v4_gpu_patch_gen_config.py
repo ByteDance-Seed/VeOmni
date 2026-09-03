@@ -154,8 +154,6 @@ def deepseek_v4_unweighted_rmsnorm_init_patched(self, eps: float = 1.0e-6) -> No
     nn.Module.__init__(self)
     self.eps = eps
     impl = resolve_kernel_impl("rms_norm_implementation")
-    if impl in {"npu", "triton"}:
-        impl = "eager"
     self.veomni_unweighted_rms_norm = VeomniKernel("rms_norm", "unweighted", impl)
 
 
@@ -1129,8 +1127,8 @@ class PatchedDeepseekV4Experts(nn.Module):
 
 
 # ================================================================
-# Patch: DeepseekV4MLP — shared experts. HuggingFace's MLP has no clamp;
-# the kernel is still called so a later swiglu impl swap stays local.
+# Patch: DeepseekV4MLP — shared experts. Pass ``swiglu_limit`` so the
+# kernel applies the same gate/up clamp as routed experts.
 # ================================================================
 @config.override_method(
     "DeepseekV4MLP.__init__",
@@ -1145,6 +1143,7 @@ def deepseek_v4_mlp_init_patched(self, config):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
     self.act_fn = ACT2FN[config.hidden_act]
+    self.limit = config.swiglu_limit
     self.veomni_swiglu_mlp = VeomniKernel("swiglu_mlp", "standard", resolve_kernel_impl("swiglu_mlp_implementation"))
 
 
@@ -1161,6 +1160,7 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
         linear_bias(self.up_proj),
         self.down_proj.weight,
         linear_bias(self.down_proj),
+        swiglu_limit=self.limit,
     )
 
 

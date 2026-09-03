@@ -147,8 +147,6 @@ class DeepseekV4UnweightedRMSNorm(nn.Module):
         nn.Module.__init__(self)
         self.eps = eps
         impl = resolve_kernel_impl("rms_norm_implementation")
-        if impl in {"npu", "triton"}:
-            impl = "eager"
         self.veomni_unweighted_rms_norm = VeomniKernel("rms_norm", "unweighted", impl)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1324,6 +1322,7 @@ class DeepseekV4MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.limit = config.swiglu_limit
         self.veomni_swiglu_mlp = VeomniKernel(
             "swiglu_mlp", "standard", resolve_kernel_impl("swiglu_mlp_implementation")
         )
@@ -1337,6 +1336,7 @@ class DeepseekV4MLP(nn.Module):
             linear_bias(self.up_proj),
             self.down_proj.weight,
             linear_bias(self.down_proj),
+            swiglu_limit=self.limit,
         )
 
 
