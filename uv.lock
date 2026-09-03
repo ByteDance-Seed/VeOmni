@@ -3990,8 +3990,8 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.16.0.dev0"
-source = { git = "https://github.com/huggingface/transformers.git?rev=42ca97014c85d71a88ad60d55f08cb9fb4d26e2c#42ca97014c85d71a88ad60d55f08cb9fb4d26e2c" }
+version = "5.16.0"
+source = { git = "https://github.com/huggingface/transformers.git?rev=93d1bcfbd2af5798e2f66bf7955e31a537902b64#93d1bcfbd2af5798e2f66bf7955e31a537902b64" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy" },
@@ -4378,7 +4378,7 @@ test = [
     { name = "pytest" },
     { name = "rich" },
 ]
-transformers-stable = [{ name = "transformers", git = "https://github.com/huggingface/transformers.git?rev=42ca97014c85d71a88ad60d55f08cb9fb4d26e2c" }]
+transformers-stable = [{ name = "transformers", git = "https://github.com/huggingface/transformers.git?rev=93d1bcfbd2af5798e2f66bf7955e31a537902b64" }]
 
 [[package]]
 name = "virtualenv"
