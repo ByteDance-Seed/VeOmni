@@ -83,7 +83,7 @@ Title: `[{modules}] {type}: {description}`
 2. Update related documentation: `docs/`, `README.md`, `.agents/knowledge/`, config examples — if the change introduces, modifies, or removes any API, config field, or workflow.
 3. Run `make quality` before every commit.
 4. Each fix -> immediate commit. Do not batch unrelated changes.
-5. **Commit messages describe the change, not the tool that produced it** — no agent or model names, and no `Co-Authored-By` trailers.
+5. **Commit messages describe the change, not the tool that produced it** — do not name the assistant or agent that wrote it, and no `Co-Authored-By` trailers. (Naming a *model being added* is expected — that is the change.)
 6. **Skill gap check**: If the task didn't match any existing skill, briefly assess after completion: Was this a one-off, or a repeatable pattern? If repeatable, suggest creating a new skill to the user.
 
 The subagent review gate is **per PR, not per commit** — see **PR Guidelines**.
