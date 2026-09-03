@@ -252,9 +252,8 @@ def apply_veomni_loss_unpatch():
 
 
 def apply_veomni_moe_unpatch():
-    from veomni.ops.kernels import moe
-
-    moe._fused_moe_forward = None
+    """Leftover ``ops/kernels/moe`` pointer is gone. Keep the hook for old suites."""
+    return
 
 
 def _build_ops_config_for_mode(model_mode: ModelMode) -> OpsImplementationConfig:

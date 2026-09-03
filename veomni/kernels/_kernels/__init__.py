@@ -25,6 +25,7 @@ from . import gated_delta_rule as _gated_delta_rule  # noqa: F401
 from . import loss as _loss  # noqa: F401
 from . import mhc as _mhc  # noqa: F401
 from . import moe_experts as _moe_experts  # noqa: F401
+from . import moe_experts_lora as _moe_experts_lora  # noqa: F401
 from . import rms_norm as _rms_norm  # noqa: F401
 from . import rope as _rope  # noqa: F401
 from . import rope_vision as _rope_vision  # noqa: F401

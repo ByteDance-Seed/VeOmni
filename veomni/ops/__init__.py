@@ -21,20 +21,18 @@ from ..utils.env import get_env
 
 # Eagerly import kernel packages so that every op registers itself with the
 # registry.  Order does not matter; each ``register_op`` call is idempotent.
-from . import kernels, liger  # noqa: F401  triggers all register_op() calls
+from . import kernels  # noqa: F401  triggers all register_op() calls
 from .config.registry import apply_global_ops
 from .config.singleton import set_ops_config
 from .dispatch import OpSlot
-from .kernels import attention, cross_entropy, load_balancing_loss, moe  # noqa: F401
+from .kernels import attention, cross_entropy, load_balancing_loss  # noqa: F401
 from .kernels.load_balancing_loss import load_balancing_loss_func
-from .kernels.moe import fused_moe_forward
 
 
 if TYPE_CHECKING:
     from ..arguments.arguments_types import OpsImplementationConfig
 
 __all__ = [
-    "fused_moe_forward",
     "OpSlot",
     "load_balancing_loss_func",
 ]
@@ -44,7 +42,6 @@ logger = logging.get_logger(__name__)
 
 def build_ALL_OPS():
     return [
-        ("_fused_moe_forward", moe._fused_moe_forward),
         ("_flash_attention_forward", attention.flash._flash_attention_forward),
         ("_flex_attention_forward", attention.flex._flex_attention_forward),
         ("_magi_attention_forward", attention.magi._magi_attention_forward),
@@ -84,10 +81,7 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
     3. Populates the ops-config singleton so per-model ``device_patch.py`` and
        ``OpSlot.bind`` can read the user's selections.
 
-    MoE dispatch is applied in ``build_foundation_model`` (via
-    ``moe_implementation`` ∈ {``eager``, ``triton``, ``quack``, ``npu``,
-    ``mlu``}); per-model kernels are applied by each model's
-    ``device_patch.py``.
+    Per-model kernels are applied by each model's ``device_patch.py``.
     """
     set_ops_config(ops_config)
 

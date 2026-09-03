@@ -114,7 +114,7 @@ def dispatch_to_ep_class(
 
     Args:
         ep_class: Caller-owned EP autograd ``Function``. Typical classes live
-            in ``veomni.kernels`` (Triton) or ``veomni.lora.ops.moe_group_gemm``.
+            in ``veomni.kernels._kernels.moe_experts`` or ``moe_experts_lora``.
             ``ep_class.apply`` must accept ``(permute_tokens, cumsum, *ep_class_args)``
             in that order and return a ``[T_local, H]`` permuted-output tensor.
         num_experts: total expert count ``E`` for this MoE layer (global on EP).

@@ -202,7 +202,7 @@ jobs:
         #   - veomni_lora_moe_native: CPU MoE-LoRA injection/save-load + init_lora_parameter
         #     preserve/partial/fresh reset contract (catches to_empty clobber regressions)
         #   - moe_lora_eager: wrapper layout + autograd parity (Mode 1 + Mode 2, all v5 MoE configs)
-        #   - moe_lora_fused: triton kernel parity vs eager (forward + backward, EP autograd classes)
+        #   - moe_experts_lora: Triton fused-vs-eager + EP class parity in tests/kernels
         #   - moe_lora_trainer: production save/load/resume round-trip (DCP shard + HF adapter,
         #     bit-exact LoRA reload, also covers linear LoRA on q_proj/v_proj since the
         #     yaml enables both lora_modules and target_parameters)
@@ -215,7 +215,7 @@ jobs:
           uv run --frozen pytest -s -x tests/lora/test_veomni_lora_moe_native.py
           uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py
-          uv run --frozen pytest -s -x tests/lora/test_moe_lora_fused.py
+          uv run --frozen pytest -s -x tests/kernels/test_moe_experts_lora.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py

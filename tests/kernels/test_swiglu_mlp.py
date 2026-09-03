@@ -58,10 +58,10 @@ def _mlp_args(mlp: nn.Module, x: Tensor) -> tuple[Tensor, ...]:
     )
 
 
-def _tiny_qwen3_mlp() -> Qwen3MLP:
+def _tiny_qwen3_mlp(hidden_size: int = 64, intermediate_size: int = 128) -> Qwen3MLP:
     config = Qwen3Config(
-        hidden_size=64,
-        intermediate_size=128,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
         num_hidden_layers=1,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -194,18 +194,19 @@ def test_eager_matches_swiglu_limit():
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs CUDA")
-def test_liger_matches_eager():
+@pytest.mark.parametrize("hidden, intermediate", [(64, 128), (128, 256)])
+def test_liger_matches_eager(hidden: int, intermediate: int):
     pytest.importorskip("liger_kernel")
     eager = resolve_kernel("swiglu_mlp", "standard", "eager").wrapper
     other = resolve_kernel("swiglu_mlp", "standard", "liger_kernel").wrapper
     torch.manual_seed(0)
-    mlp = _tiny_qwen3_mlp().to(device="cuda", dtype=torch.bfloat16)
+    mlp = _tiny_qwen3_mlp(hidden, intermediate).to(device="cuda", dtype=torch.bfloat16)
     x = torch.randn(2, 16, mlp.hidden_size, device="cuda", dtype=torch.bfloat16)
 
     x_e = x.detach().requires_grad_(True)
     x_o = x.detach().requires_grad_(True)
-    mlp_e = _tiny_qwen3_mlp().to(device="cuda", dtype=torch.bfloat16)
-    mlp_o = _tiny_qwen3_mlp().to(device="cuda", dtype=torch.bfloat16)
+    mlp_e = _tiny_qwen3_mlp(hidden, intermediate).to(device="cuda", dtype=torch.bfloat16)
+    mlp_o = _tiny_qwen3_mlp(hidden, intermediate).to(device="cuda", dtype=torch.bfloat16)
     mlp_e.load_state_dict(mlp.state_dict())
     mlp_o.load_state_dict(mlp.state_dict())
     out_e = eager(*_mlp_args(mlp_e, x_e))
