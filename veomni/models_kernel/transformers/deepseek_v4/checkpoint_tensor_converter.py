@@ -49,7 +49,7 @@ import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightRenaming, rename_source_key
 
-from veomni.models_kernel.loader.convert import ConvertedCheckpointTensor, export_weights
+from veomni.models_kernel.checkpoint.convert import ConvertedCheckpointTensor, export_weights
 from veomni.utils import logging
 
 

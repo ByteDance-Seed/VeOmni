@@ -20,7 +20,7 @@ from typing import List, Optional
 import pytest
 import torch
 
-from veomni.models_kernel.loader.convert import (
+from veomni.models_kernel.checkpoint.convert import (
     ConvertedCheckpointTensor,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,

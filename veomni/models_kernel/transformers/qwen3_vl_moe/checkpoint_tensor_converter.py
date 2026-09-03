@@ -40,7 +40,7 @@ from typing import List, Optional
 
 import torch
 
-from veomni.models_kernel.loader.convert import ConvertedCheckpointTensor
+from veomni.models_kernel.checkpoint.convert import ConvertedCheckpointTensor
 
 
 # Matches fused-expert keys like: ...mlp.experts.{gate_up_proj|down_proj}

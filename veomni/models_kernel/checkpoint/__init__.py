@@ -12,11 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Checkpoint convert protocol and fused-expert FQN helpers.
-
-Weight I/O (``load_model_weights`` / save / EP stream) stays on the existing
-loader until that module moves here.
-"""
+"""Checkpoint convert protocol, fused-expert FQN helpers, and weight I/O."""
 
 from .convert import (
     CheckpointTensorConverter,
@@ -37,6 +33,14 @@ from .moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
     convert_per_expert_fqn_mapping_to_fused,
 )
+from .weights import (
+    init_empty_weights,
+    load_model_weights,
+    load_model_weights_ep_sharded,
+    rank0_load_and_broadcast_weights,
+    save_model_assets,
+    save_model_weights,
+)
 
 
 __all__ = [
@@ -49,10 +53,16 @@ __all__ = [
     "export_weights",
     "get_checkpoint_tensor_converter",
     "get_fqn_to_index_mapping_converter",
+    "init_empty_weights",
+    "load_model_weights",
+    "load_model_weights_ep_sharded",
     "maybe_convert_checkpoint_tensor",
     "maybe_convert_fqn_to_index_mapping",
     "parse_fqn_to_index_mapping_from_json",
     "prepare_fqn_to_index_mapping_for_model",
+    "rank0_load_and_broadcast_weights",
     "resolve_fqn_to_index_mapping_for_save",
+    "save_model_assets",
+    "save_model_weights",
     "shard_index_from_filename",
 ]

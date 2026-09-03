@@ -44,8 +44,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from veomni.models_kernel.loader.convert import ConvertedCheckpointTensor
-from veomni.models_kernel.loader.moe_map import (
+from veomni.models_kernel.checkpoint.convert import ConvertedCheckpointTensor
+from veomni.models_kernel.checkpoint.moe_map import (
     PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
     convert_per_expert_fqn_mapping_to_fused,
 )

@@ -15,5 +15,38 @@
 """Transformer modeling that calls local ``VeomniKernel`` handles.
 
 Import classes from ``transformers.<model>.generated``. Packages are not
-on ``MODELING_REGISTRY``.
+registered until each ``transformers/<model>/__init__.py`` is filled in.
 """
+
+from .auto import build_foundation_model, build_processor, build_tokenizer
+from .checkpoint.weights import (
+    init_empty_weights,
+    load_model_weights,
+    load_model_weights_ep_sharded,
+    rank0_load_and_broadcast_weights,
+    save_model_assets,
+    save_model_weights,
+)
+from .registry import (
+    MODEL_CONFIG_REGISTRY,
+    MODEL_PROCESSOR_REGISTRY,
+    MODELING_REGISTRY,
+    get_model_class,
+)
+
+
+__all__ = [
+    "MODEL_CONFIG_REGISTRY",
+    "MODEL_PROCESSOR_REGISTRY",
+    "MODELING_REGISTRY",
+    "build_foundation_model",
+    "build_processor",
+    "build_tokenizer",
+    "get_model_class",
+    "init_empty_weights",
+    "load_model_weights",
+    "load_model_weights_ep_sharded",
+    "rank0_load_and_broadcast_weights",
+    "save_model_assets",
+    "save_model_weights",
+]
