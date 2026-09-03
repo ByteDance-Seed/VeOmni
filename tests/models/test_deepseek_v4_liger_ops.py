@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import builtins
 import copy
 import importlib
 import sys
@@ -30,6 +29,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 _REGISTRY_MODULE = "veomni.ops.kernel_registry"
 _NPU_GROUP_GEMM_MODULE = "veomni.ops.kernels.moe.npu_group_gemm"
 _NPU_GROUP_GEMM_KERNEL_MODULE = "veomni.ops.kernels.moe._kernels.kernel.npu_group_gemm"
+_NPU_CLAMPED_SWIGLU_MODULE = "veomni.ops.kernels.moe._kernels.kernel.npu_clamped_swiglu"
 
 
 class _RecordingSlot:
@@ -104,19 +104,47 @@ def test_deepseek_v4_npu_swiglu_dispatches_by_limit(monkeypatch, npu_group_gemm_
     assert calls == [("clamped", True, 7.0), ("unclamped", True, -1)]
 
 
-def test_deepseek_v4_npu_clamped_swiglu_missing_triton_is_actionable(monkeypatch, npu_group_gemm_module):
+def test_deepseek_v4_npu_clamped_swiglu_missing_triton_uses_eager(monkeypatch, npu_group_gemm_module):
     module, _ = npu_group_gemm_module
-    real_import = builtins.__import__
+    monkeypatch.setattr(module, "_is_triton_ascend_available", lambda: False)
+    source = torch.tensor([[8.0, -7.0, 9.0, -9.0]], requires_grad=True)
+    expected_input = source.detach().clone().requires_grad_()
 
-    def missing_triton(name, *args, **kwargs):
-        if name.endswith("npu_clamped_swiglu"):
-            raise ModuleNotFoundError("No module named 'triton'", name="triton")
-        return real_import(name, *args, **kwargs)
+    actual = module._clamped_swiglu(source, 7.0)
+    expected_gate, expected_up = expected_input.chunk(2, dim=-1)
+    expected = torch.nn.functional.silu(expected_gate.clamp(max=7.0)) * expected_up.clamp(min=-7.0, max=7.0)
+    grad_output = torch.tensor([[0.25, -0.5]])
+    actual.backward(grad_output)
+    expected.backward(grad_output)
 
-    monkeypatch.setattr(builtins, "__import__", missing_triton)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(source.grad, expected_input.grad, rtol=0, atol=0)
 
-    with pytest.raises(RuntimeError, match="requires triton-ascend"):
-        module._clamped_swiglu(torch.empty((1, 2)), 7.0)
+
+def test_deepseek_v4_npu_clamped_swiglu_requires_ascend_backend(monkeypatch, npu_group_gemm_module):
+    module, _ = npu_group_gemm_module
+    fake_triton = ModuleType("triton")
+    fake_triton.__path__ = []
+    fake_triton_c = ModuleType("triton._C")
+    fake_triton_c.libtriton = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "triton", fake_triton)
+    monkeypatch.setitem(sys.modules, "triton._C", fake_triton_c)
+
+    assert not module._is_triton_ascend_available()
+    fake_triton_c.libtriton.ascend = object()
+    assert module._is_triton_ascend_available()
+
+
+def test_deepseek_v4_npu_clamped_swiglu_dispatches_to_ascend_triton(monkeypatch, npu_group_gemm_module):
+    module, _ = npu_group_gemm_module
+    x = torch.empty((1, 2))
+    output = object()
+    fake_kernel = ModuleType(_NPU_CLAMPED_SWIGLU_MODULE)
+    fake_kernel.npu_triton_clamped_swiglu = lambda actual_x, limit: output if actual_x is x and limit == 7.0 else None
+    monkeypatch.setitem(sys.modules, _NPU_CLAMPED_SWIGLU_MODULE, fake_kernel)
+    monkeypatch.setattr(module, "_is_triton_ascend_available", lambda: True)
+
+    assert module._clamped_swiglu(x, 7.0) is output
 
 
 def test_deepseek_v4_declares_liger_opslots():

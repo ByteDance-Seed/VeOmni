@@ -24,7 +24,6 @@ from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
 from veomni.utils.env import get_env
-from veomni.utils.import_utils import is_package_available
 from veomni.utils.loss_utils import count_loss_token
 
 from ..tools.common_utils import print_device_mem_info
@@ -469,10 +468,7 @@ def test_models_patch_fwd_bwd(
     # backend: DeepSeek-V4 forwards ``swiglu_limit`` into fused_triton/fused_npu.
     if case_id == "deepseek_v4":
         hf_model_modes = [ModelMode("hf", "eager")]
-        if get_device_type() == "npu":
-            moe_impl = "fused_npu" if is_package_available("triton") else "eager"
-        else:
-            moe_impl = "fused_triton"
+        moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
         veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
 
     # Qwen3.5 compatibility:

@@ -17,6 +17,7 @@ from typing import List, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import torch_npu
 
 from ....distributed.moe.comm import all_to_all
@@ -26,16 +27,29 @@ from ....utils.device import stream_synchronize
 from ._kernels.kernel.npu_group_gemm import npu_group_gemm
 
 
-def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
-    """Run DeepSeek-V4's clamp-aware SwiGLU as one Ascend Triton op."""
-    try:
-        from ._kernels.kernel.npu_clamped_swiglu import npu_triton_clamped_swiglu
-    except ModuleNotFoundError as exc:
-        if not (exc.name or "").startswith("triton"):
-            raise
-        raise RuntimeError("DeepSeek-V4 fused_npu clamped SwiGLU requires triton-ascend") from exc
+def _eager_clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    return F.silu(gate) * up
 
-    return npu_triton_clamped_swiglu(x, limit)
+
+def _is_triton_ascend_available() -> bool:
+    try:
+        from triton._C import libtriton
+    except ImportError:
+        return False
+    return hasattr(libtriton, "ascend")
+
+
+def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """Use Ascend Triton when available and preserve the eager training fallback."""
+    if _is_triton_ascend_available():
+        from ._kernels.kernel.npu_clamped_swiglu import npu_triton_clamped_swiglu
+
+        return npu_triton_clamped_swiglu(x, limit)
+
+    return _eager_clamped_swiglu(x, limit)
 
 
 def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:

@@ -13,7 +13,6 @@ from typing import Dict, List, Optional
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.utils.device import get_device_type
-from veomni.utils.import_utils import is_package_available
 
 from .launch_utils import find_free_port
 
@@ -46,9 +45,8 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v4": {
         # DeepSeek-V4 attention, RMSNorm, and partial RoPE remain eager-only on NPU.
         # The generic NPU rotary backend is incompatible with V4's partial layout.
-        # Routed experts use fused_npu only when its optional Ascend Triton
-        # activation is installed; _npu_overrides keeps generic CI on eager
-        # otherwise.
+        # Routed experts keep fused_npu; its clamp-aware activation uses Ascend
+        # Triton when available and preserves the eager training fallback otherwise.
         "attn_implementation": "eager",
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
@@ -132,8 +130,6 @@ def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:
     merged = dict(_NPU_OPS_DEFAULTS)
     if model_name is not None:
         merged.update(_NPU_PER_MODEL_OVERRIDES.get(model_name, {}))
-    if model_name == "deepseek_v4" and not is_package_available("triton"):
-        merged["moe_implementation"] = "eager"
     return merged
 
 

@@ -29,7 +29,6 @@ import torch
 import veomni.ops  # noqa: F401 — trigger KERNEL_REGISTRY registrations
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
-from veomni.utils.import_utils import is_package_available
 
 
 pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU kernels require torch_npu")
@@ -107,8 +106,16 @@ def _eager_clamped_swiglu(x, limit):
     return torch.nn.functional.silu(gate) * up
 
 
-@pytest.mark.skipif(not is_package_available("triton"), reason="clamped SwiGLU requires triton-ascend")
 class TestNPUClampedSwiGLU:
+    @pytest.fixture(autouse=True)
+    def require_triton_ascend(self):
+        try:
+            from triton._C import libtriton
+        except ImportError:
+            pytest.skip("clamped SwiGLU requires triton-ascend")
+        if not hasattr(libtriton, "ascend"):
+            pytest.skip("clamped SwiGLU requires the Triton Ascend backend")
+
     @pytest.mark.parametrize("shape", [(3, 34), (2, 3, 256)])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_forward_backward_matches_eager(self, shape, dtype):
@@ -125,8 +132,21 @@ class TestNPUClampedSwiGLU:
         actual.backward(grad_output)
         expected.backward(grad_output)
 
-        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
-        torch.testing.assert_close(actual_input.grad.float(), expected_input.grad.float(), rtol=2e-2, atol=2e-2)
+        # Triton evaluates in FP32 before storing, while the production eager fallback
+        # keeps the input dtype. BF16 can therefore differ by a few low-precision ULPs;
+        # FP16 stays closer. Exact zero-gradient masks below guard the clamp semantics
+        # independently of this numerical allowance.
+        tolerance = 5e-3 if dtype == torch.float16 else 2e-2
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=tolerance, atol=tolerance)
+        torch.testing.assert_close(
+            actual_input.grad.float(), expected_input.grad.float(), rtol=tolerance, atol=tolerance
+        )
+
+        hidden_size = actual_input.shape[-1] // 2
+        gate, up = actual_input.detach().split(hidden_size, dim=-1)
+        gate_grad, up_grad = actual_input.grad.split(hidden_size, dim=-1)
+        assert torch.count_nonzero(gate_grad[gate > 7.0]) == 0
+        assert torch.count_nonzero(up_grad[(up < -7.0) | (up > 7.0)]) == 0
 
     def test_clamp_boundaries_match_eager_gradients(self):
         from veomni.ops.kernels.moe._kernels.kernel.npu_clamped_swiglu import npu_triton_clamped_swiglu
