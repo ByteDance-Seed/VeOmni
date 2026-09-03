@@ -199,7 +199,7 @@
 +    configuration of a feature they just disabled would be advice about the wrong
 +    thing.
 +
-+    ``check_indexer_loss_prerequisites`` refuses the two implementation fields at
++    ``DeepseekV4Config.validate_build_prerequisites`` refuses the two implementation fields at
 +    model-build time, before any rank reads a weight, so a launched run is told there
 +    rather than here. These stay because this predicate also covers the paths that
 +    never pass through ``build_foundation_model`` -- a model constructed straight from

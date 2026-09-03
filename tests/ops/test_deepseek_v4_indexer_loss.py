@@ -435,9 +435,9 @@ def test_the_defaults_leave_the_objective_off():
 def _ops_config_installed(**overrides):
     """Install an ``OpsImplementationConfig`` singleton, and restore the previous one.
 
-    ``check_indexer_loss_prerequisites`` reads the installed singleton because the two
-    fields it checks live there while the flag it gates on lives on the model config;
-    this is the only place that holds both. The singleton is process-wide, so it is
+    ``DeepseekV4Config.validate_build_prerequisites`` reads the installed singleton
+    because the two fields it checks live there while the flag it gates on is one of
+    its own; reading it is how a model config sees the rest of the run. The singleton is process-wide, so it is
     saved and restored for the same reason the ops slots are.
 
     ``load_balancing_loss_implementation`` is pinned to eager only so these tests do
@@ -493,13 +493,11 @@ def test_indexer_loss_coef_rejects_negative_and_non_finite(coef):
     forced rather than chosen: ``from_dict`` constructs the config from the on-disk
     JSON and only then ``setattr``s the ``model_config`` overrides, so a bound checked
     in ``__post_init__`` would read ``config.json`` and never the YAML line that
-    contradicts it. ``check_indexer_loss_prerequisites`` runs on the finished config,
-    before any rank reads a weight.
+    contradicts it. ``validate_build_prerequisites`` runs on the finished config,
+    called from ``build_foundation_model`` before any rank reads a weight.
     """
-    from veomni.models.auto import check_indexer_loss_prerequisites
-
     with pytest.raises(ValueError, match="dsa_indexer_loss_coef"):
-        check_indexer_loss_prerequisites(_config_asking_for_the_loss(coef=coef))
+        _config_asking_for_the_loss(coef=coef).validate_build_prerequisites()
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -527,12 +525,10 @@ def test_the_two_fields_are_refused_when_they_arrive_with_the_wrong_type(field, 
     wave through, and a config field that silently accepts ints is one that has stopped
     being a bool.
     """
-    from veomni.models.auto import check_indexer_loss_prerequisites
-
     config = _config_asking_for_the_loss()
     setattr(config, field, value)
     with pytest.raises(TypeError, match=field):
-        check_indexer_loss_prerequisites(config)
+        config.validate_build_prerequisites()
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -570,10 +566,8 @@ def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it():
 @pytest.mark.parametrize("coef", [0.5, 1.0, 100.0])
 def test_indexer_loss_coef_accepts_finite_positive_weights(coef):
     """The other half of the bound: the check must not reject the ordinary weights."""
-    from veomni.models.auto import check_indexer_loss_prerequisites
-
     with _ops_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
-        check_indexer_loss_prerequisites(_config_asking_for_the_loss(coef=coef))
+        _config_asking_for_the_loss(coef=coef).validate_build_prerequisites()
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -603,11 +597,9 @@ def test_the_two_ops_config_prerequisites_are_refused_at_model_build(overrides, 
     condition over both would pass this test while naming the wrong field in its
     message, and the message is the entire value of failing early.
     """
-    from veomni.models.auto import check_indexer_loss_prerequisites
-
     with _ops_config_installed(**overrides):
         with pytest.raises(ValueError, match=expected):
-            check_indexer_loss_prerequisites(_config_asking_for_the_loss())
+            _config_asking_for_the_loss().validate_build_prerequisites()
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
@@ -621,31 +613,52 @@ def test_a_zero_coefficient_is_not_held_to_the_prerequisites():
     coefficient a usable escape hatch on a checkpoint whose ``config.json`` carries
     ``dsa_indexer_loss: true`` from the run that produced it.
     """
-    from veomni.models.auto import check_indexer_loss_prerequisites
-
     with _ops_config_installed():
-        check_indexer_loss_prerequisites(_config_asking_for_the_loss(coef=0.0))
+        _config_asking_for_the_loss(coef=0.0).validate_build_prerequisites()
 
 
 @_HDFS_STDENV_DEPRECATION_FILTER
 def test_a_config_that_cannot_ask_for_the_objective_is_left_alone():
-    """No allow-list, and no model type named anywhere in the gate.
+    """No allow-list, and no model type named anywhere in the generic builder.
 
-    The flag being a ``DeepseekV4Config`` field is what does the model gating: a
-    config class that never declared it cannot be asked for the objective, so there
-    is nothing to refuse and nothing to enumerate. This is the test that would have
-    to change if the gate ever grew a model-type check again -- and the reason the
-    previous allow-list, which existed only because the flag sat on a model-agnostic
-    dataclass, could be deleted rather than extended.
+    Two things do the model gating and neither enumerates anything. The flag being a
+    ``DeepseekV4Config`` field means a config class that never declared it cannot be
+    asked for the objective; the check being a method on that class means
+    ``build_foundation_model`` does not know the objective exists. A model with
+    neither passes through ``check_model_build_prerequisites`` untouched, which is what
+    this pins -- along with the hook tolerating its absence rather than requiring every
+    config class to declare an empty one.
+
+    This is the test that would have to change if either gate grew a model-type check
+    again, and it is why the previous allow-list -- which existed only because the flag
+    sat on a model-agnostic dataclass -- could be deleted rather than extended.
     """
     from transformers import AutoConfig
 
-    from veomni.models.auto import check_indexer_loss_prerequisites
+    from veomni.models.auto import check_model_build_prerequisites
 
     other = AutoConfig.for_model("llama", num_hidden_layers=2)
     assert not hasattr(other, "dsa_indexer_loss")
+    assert not hasattr(other, "validate_build_prerequisites")
     with _ops_config_installed():
-        check_indexer_loss_prerequisites(other)
+        check_model_build_prerequisites(other)
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_generic_hook_reaches_the_model_that_implements_it():
+    """The other half: ``build_foundation_model`` calls the hook on a config that has
+    one, and the refusal that arrives is DeepSeek-V4's own.
+
+    Worth pinning separately from the method's own tests because a hook wired to the
+    wrong attribute name, or guarded by an ``isinstance`` that no longer matches, fails
+    exactly this way -- silently, with the objective launching unchecked on a stack
+    that cannot train it.
+    """
+    from veomni.models.auto import check_model_build_prerequisites
+
+    with _ops_config_installed(dsa_indexer_implementation="eager"):
+        with pytest.raises(ValueError, match="dsa_indexer_implementation"):
+            check_model_build_prerequisites(_config_asking_for_the_loss())
 
 
 @contextlib.contextmanager
@@ -3220,7 +3233,7 @@ class TestModelBuildRefusesUnsupportedPrerequisites:
     what makes it a launch-time refusal rather than a function nothing calls.
 
     The refusals themselves are covered above, on
-    ``check_indexer_loss_prerequisites`` directly. What only this group can see is
+    ``DeepseekV4Config.validate_build_prerequisites`` directly. What only this group can see is
     that the call happens, that it happens before the loader runs, and that it does
     not refuse the configurations it has no business refusing -- a gate that raised
     on every build, or on none, would pass every test above.

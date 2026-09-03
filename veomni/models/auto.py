@@ -14,7 +14,6 @@
 
 
 import functools
-import math
 import sys
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
@@ -51,102 +50,28 @@ logger = logging.get_logger(__name__)
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
 
 
-def check_indexer_loss_prerequisites(config: PretrainedConfig) -> None:
-    """Refuse a Lightning Indexer KL objective this run cannot actually train.
+def check_model_build_prerequisites(config: PretrainedConfig) -> None:
+    """Let a model config refuse a run it cannot serve, before any weight is read.
 
-    No allow-list, and no mention of a model type. ``dsa_indexer_loss`` is a field
-    of ``DeepseekV4Config``, so a config that does not declare it cannot be asked
-    for the objective in the first place and this function has nothing to say
-    about it -- the ``getattr`` default below is the whole of the model gating,
-    and a second model gaining the objective needs no edit here.
+    A hook rather than a body: any config class may define
+    ``validate_build_prerequisites`` and this calls it. Nothing here knows which
+    models do, which is the point -- the alternative is a list of model names in the
+    generic builder, and a list is a thing the next model has to be remembered into.
 
-    What it does check is the pair of prerequisites that live in a *different*
-    dataclass. The KL needs the TileLang indexer, whose per-slot scores are the
-    student distribution, and the TileLang sparse attention, whose log-sum-exp is
-    the teacher; both are ``OpsImplementationConfig`` fields, so neither the model
-    config nor the ops config can see the disagreement on its own. This is the one
-    place that holds both -- and it holds them after ``from_dict`` has applied the
-    ``model_config`` overrides, which a ``__post_init__`` on either dataclass would
-    not (``from_dict`` constructs, then ``setattr``s).
+    What a config cannot see on its own is the rest of the run, so the convention is
+    that the hook reads whatever singletons it needs (the installed
+    ``OpsImplementationConfig``, the parallel state) and takes no arguments. Kept as a
+    plain ``getattr`` for the same reason: a config that has nothing to refuse should
+    not have to say so.
 
-    ``DeepseekV4Attention.forward`` refuses the same two on its first forward, and
-    that gate stays: it is what covers the paths that never come through here, such
-    as a test building a model straight from ``_from_config``. This one exists so
-    that the answer arrives before every rank has built a model and read a
-    checkpoint -- 54.8 GB for DeepSeek-V4-Flash -- to be told that three lines of
-    YAML disagree with each other.
+    ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
+    today. It refuses a Lightning Indexer KL objective configured without the TileLang
+    indexer and attention it is defined in terms of -- a disagreement between a model
+    field and two kernel selections, which no single dataclass can see.
     """
-    from ..ops.config.singleton import get_ops_config
-
-    enabled = getattr(config, "dsa_indexer_loss", False)
-    if not isinstance(enabled, bool):
-        # Checked before the early return, because the failure it catches is a
-        # *truthy* one: YAML quotes make ``dsa_indexer_loss: "false"`` the string
-        # "false", which switches the objective on and would sail through the
-        # falsiness test below on its way to a run nobody asked for.
-        raise TypeError(
-            f"dsa_indexer_loss must be a bool, got {enabled!r} ({type(enabled).__name__}). "
-            "Values under model.model_config are passed through as written, so quote nothing: "
-            "write dsa_indexer_loss: false, not dsa_indexer_loss: 'false'."
-        )
-    if not enabled:
-        return
-
-    # The weight is checked before the prerequisites, not after: a user who
-    # switched the term off with the coefficient has not asked for a TileLang
-    # indexer, and refusing their run over the configuration of a feature they
-    # just disabled would be advice about the wrong thing. Same ordering as
-    # ``_indexer_loss_enabled`` in the patched forward, for the same reason.
-    coef = getattr(config, "dsa_indexer_loss_coef", 1.0)
-    if isinstance(coef, bool) or not isinstance(coef, (int, float)):
-        # ``model_config`` is an untyped ``Dict`` all the way from YAML to
-        # ``from_dict``, which ``setattr``s whatever it was handed. A quoted
-        # ``dsa_indexer_loss_coef: "0.5"`` would otherwise reach ``math.isfinite``
-        # and raise ``TypeError: must be real number, not str`` from inside a
-        # validator whose whole job is to explain what is wrong.
-        raise TypeError(
-            f"dsa_indexer_loss_coef must be a number, got {coef!r} ({type(coef).__name__}). "
-            "Values under model.model_config are passed through as written, so quote nothing: "
-            "write dsa_indexer_loss_coef: 0.5, not dsa_indexer_loss_coef: '0.5'."
-        )
-    if not math.isfinite(coef) or coef < 0:
-        raise ValueError(
-            f"dsa_indexer_loss_coef={coef!r} must be finite and non-negative: a negative weight "
-            "flips the sign of the indexer KL and trains the Lightning Indexer away from its "
-            "teacher, and a non-finite one destroys every other term in the total loss. Both "
-            "surface as a loss curve rather than as an error. Use 0.0 to switch the term off."
-        )
-    if coef == 0:
-        # A legitimate way to disable the objective without editing the flag, so not
-        # an error -- but a run whose config says ``dsa_indexer_loss: true`` and which
-        # then reports no indexer metric at all is the sort of thing someone spends an
-        # afternoon on, and this is the only place that can say so once rather than
-        # once per layer per forward.
-        logger.warning_rank0(
-            "dsa_indexer_loss is enabled but dsa_indexer_loss_coef is 0.0, so the indexer KL is "
-            "switched off entirely: no teacher is computed, the Lightning Indexer receives no "
-            "gradient, and no indexer metric is reported. Set a positive coefficient to train it."
-        )
-        return
-
-    ops_config = get_ops_config()
-    if ops_config is None:
-        return
-
-    for field_name, reason in (
-        ("dsa_indexer_implementation", "the eager indexer discards the per-slot scores the KL trains against"),
-        (
-            "dsa_attention_implementation",
-            "the teacher distribution is derived from the TileLang attention's log-sum-exp",
-        ),
-    ):
-        value = getattr(ops_config, field_name, None)
-        if value != "tilelang":
-            raise ValueError(
-                f"dsa_indexer_loss requires {field_name}='tilelang', got {value!r}: {reason}. "
-                "Set it under model.ops_implementation, or switch the objective off with "
-                "dsa_indexer_loss: false / dsa_indexer_loss_coef: 0.0 under model.model_config."
-            )
+    validate = getattr(config, "validate_build_prerequisites", None)
+    if callable(validate):
+        validate()
 
 
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
@@ -338,7 +263,7 @@ def build_foundation_model(
         config = build_config(config_path, **config_kwargs)
 
     check_context_parallel_supported(config)
-    check_indexer_loss_prerequisites(config)
+    check_model_build_prerequisites(config)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":

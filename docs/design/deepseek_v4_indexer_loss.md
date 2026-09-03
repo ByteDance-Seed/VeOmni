@@ -91,9 +91,9 @@ distinguish the correct teacher from Megatron's.
 
 | constraint | enforced at | if violated |
 |----|----|----|
-| `dsa_indexer_loss_coef` finite and non-negative | `check_indexer_loss_prerequisites`, from `build_foundation_model` | `ValueError` at model build |
-| `dsa_indexer_implementation == "tilelang"` | `check_indexer_loss_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
-| `dsa_attention_implementation == "tilelang"` | `check_indexer_loss_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
+| `dsa_indexer_loss_coef` finite and non-negative | `DeepseekV4Config.validate_build_prerequisites`, from `build_foundation_model` | `ValueError` at model build |
+| `dsa_indexer_implementation == "tilelang"` | `validate_build_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
+| `dsa_attention_implementation == "tilelang"` | `validate_build_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
 | `ulysses_size == 1` and `cp_size == 1` | `_indexer_loss_enabled` | `ValueError` on the first forward |
 | at least one `compressed_sparse_attention` layer | `DeepseekV4Model.forward` | `RuntimeError` on the first forward |
 | the compressor handed over its scores | `DeepseekV4Attention.forward` | `RuntimeError` on the first forward |
@@ -101,16 +101,18 @@ distinguish the correct teacher from Megatron's.
 | a layer's return arity matches the shared gate | `DeepseekV4Model.forward` | `RuntimeError` on the first forward |
 | the top-k actually binds | not enforced | the dense eq. (3) objective, silently |
 
-There is no model-type row, and no allow-list. `dsa_indexer_loss` is a field of
-`DeepseekV4Config`, so a config that does not declare it cannot be asked for the
-objective and there is nothing to enumerate: `check_indexer_loss_prerequisites`
-returns on a `getattr(config, "dsa_indexer_loss", False)` and never names a model.
-A second model gaining the objective declares the field on its own config and
-needs no edit to the gate.
+There is no model-type row, and no allow-list. Two things do the model gating and
+neither enumerates anything. `dsa_indexer_loss` is a field of `DeepseekV4Config`, so
+a config that does not declare it cannot be asked for the objective; and the check is
+a *method* on that class, so `build_foundation_model` does not know the objective
+exists. All it does is `getattr(config, "validate_build_prerequisites", None)` and
+call whatever it finds, which `check_model_build_prerequisites` in
+`veomni/models/auto.py` is the whole of. A second model gaining the objective
+declares the field and the method on its own config and needs no edit to the builder.
 
 Every constraint is keyed on the objective being *on*, and a coefficient of `0.0`
 is off. Both places that make that reading —
-`check_indexer_loss_prerequisites` and `_indexer_loss_enabled` — read the weight
+`validate_build_prerequisites` and `_indexer_loss_enabled` — read the weight
 before anything else, because `arguments.md` documents the coefficient as the way
 to disable the term without editing the flag, and a gate that disagreed would
 refuse a run for enabling something its config had just switched off. That is not
@@ -125,9 +127,11 @@ overrides, so a bound checked in `DeepseekV4Config.__post_init__` would read
 `config.json` and never the YAML line contradicting it. The two implementation
 fields cannot live there either: they are `OpsImplementationConfig` fields, and
 neither dataclass can see the disagreement alone.
-`check_indexer_loss_prerequisites` is the earliest point that holds the finished
-config and the installed ops config together, and it runs before any rank reads a
-weight.
+`validate_build_prerequisites` is the earliest point that holds the finished config
+and the installed ops config together, and it runs before any rank reads a weight. It
+reads the ops config off the installed singleton rather than taking it as an argument,
+which is what keeps the builder's hook a no-argument call that any config can
+implement.
 
 The last row is not enforceable from here and is the one most likely to bite; it
 needs a sequence length, a compression rate and a *per-sample* length
@@ -192,6 +196,40 @@ precedent or mechanism for patching a `transformers` configuration class. VeOmni
 mechanism is `MODEL_CONFIG_REGISTRY` with a hand-written subclass, as
 `qwen3_omni_moe` already does, and that is what
 `veomni/models/transformers/deepseek_v4/configuration_deepseek_v4.py` is.
+
+**The check moved onto the config class, and the builder kept only a hook.** It
+was first written as `check_indexer_loss_prerequisites` in `veomni/models/auto.py`,
+called from `build_foundation_model` — which worked, and left a generic model
+builder holding a function about one model's training objective. Two of the three
+things that function reads are `DeepseekV4Config` fields, and the third is which
+kernels those fields require, so the knowledge is entirely the model's.
+
+What replaced it is `check_model_build_prerequisites`, which does nothing but
+`getattr(config, "validate_build_prerequisites", None)` and call what it finds.
+`DeepseekV4Config.validate_build_prerequisites` is the only implementation today.
+The absent case is deliberately a no-op rather than a required empty method: a
+model with nothing to refuse should not have to say so, and
+`test_a_config_that_cannot_ask_for_the_objective_is_left_alone` pins that.
+
+The hook takes no arguments, which is the one part that needed deciding. The check
+needs the installed `OpsImplementationConfig`, so the alternative was a signature
+carrying it — and then the next hook would need the parallel state, and the one
+after that something else, until the builder's hook signature enumerates
+everything any model might want. Reading the singleton inside the method keeps the
+contract at "a config may refuse the run it is about to be built into", which is
+the same reason `_indexer_loss_enabled` reads the parallel state rather than
+receiving it.
+
+This is what a second model gaining the objective now costs: declare the two
+fields, implement the method. No edit to `veomni/models/auto.py`, which no longer
+knows the objective exists.
+
+`check_context_parallel_supported` in that same file is the remaining gate of this
+shape, and it does not move the same way. Its allow-list has to refuse models that
+are *absent* from it, so a per-model hook would invert the safety property — a
+model implementing nothing would silently be granted CP. Turning it into a
+capability the model declares (absent still meaning refused) is the equivalent
+change and is tracked separately.
 
 **One predicate, read by every site that has to agree.** `_indexer_loss_enabled`
 answers "is the objective on" off the model config, `_builds_indexer_kl` narrows it
