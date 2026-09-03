@@ -167,7 +167,7 @@ patchgen = [
 # Kept out of [project.dependencies] so pip users are not forced onto the
 # internal-validation revision.
 transformers-stable = [
-  "transformers"
+  "transformers==5.16.0"
 ]
 
 [tool.uv]
@@ -211,7 +211,7 @@ conflicts = [
 patchgen = { path = "patchgen-pkg", editable = true }
 # TEMPORARY: Qwen4-Exp is not in the current stable Transformers release.
 # Internal validation only; replace with a released version before merging.
-transformers = { git = "https://github.com/huggingface/transformers.git", rev = "42ca97014c85d71a88ad60d55f08cb9fb4d26e2c" }
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "93d1bcfbd2af5798e2f66bf7955e31a537902b64" }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 # MagiAttention upstream designates this contributor-maintained support branch
 # for its arbitrary-mask FA4 packages and SM90 ffa-fa3 overlay. Dao-AILab does

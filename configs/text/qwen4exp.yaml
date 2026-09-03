@@ -1,7 +1,7 @@
 # Internal validation only. Qwen4-Exp currently requires the temporary
 # Transformers git revision pinned in pyproject.toml.
 model:
-  model_path: /mnt/hdfs/byte_mlsys_ssd_lfrz_search/ecom/models/Qwen/Qwen3.8-Flash-Next/Qwen3___8-Flash-Next
+  model_path: Qwen/Qwen3.8-Flash-Next
   ops_implementation:
     # QSA has no production FlashAttention adapter yet.
     attn_implementation: sdpa
@@ -37,7 +37,7 @@ train:
   wandb:
     enable: false
     project: VeOmni
-    name: qwen4-exp-vlm-sft-internal
+    name: qwen4-exp-sft-internal
   freeze_vit: false
   optimizer:
     lr: 1.0e-5
@@ -54,6 +54,6 @@ train:
   broadcast_model_weights_from_rank0: false
   ep_sharded_stream_load: true
   checkpoint:
-    output_dir: qwen4-exp-vlm-sft-internal
+    output_dir: qwen4-exp-sft-internal
     manager: dcp
     save_hf_weights: false
