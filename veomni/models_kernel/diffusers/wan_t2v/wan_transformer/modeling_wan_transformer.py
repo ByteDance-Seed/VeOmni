@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -116,6 +115,9 @@ def _get_wan_full_sequence_varlen_kwargs(
     }
 
 
+_WAN_FLASH2_IMPLS = frozenset({"flash_attention_2", "veomni_flash_attention_2"})
+
+
 def _assert_wan_flash_attention_bf16(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -143,14 +145,43 @@ def _assert_wan_flash_attention_bf16(
 
 
 class WanSPAttnProcessor(WanAttnProcessor):
-    """``attention`` / ``standard``. Impl from ``attn_implementation``, else eager."""
+    """Video self-attn / text cross-attn through the interned ``attention`` kernel."""
 
-    def __init__(self, attn_implementation: str):
-        self.attn_implementation = attn_implementation
-        # build config for veomni_flash_attention_forward
-        self.config = SimpleNamespace(_attn_implementation=attn_implementation)
+    def __init__(self):
         self.veomni_attn = attention_kernel()
+        impl = self.veomni_attn.impl
+        self._use_flash2 = impl in _WAN_FLASH2_IMPLS
+        self.config = SimpleNamespace(_attn_implementation=impl)
         super().__init__()
+
+    def _run_attention(
+        self,
+        module: WanAttentionKernelModule,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        skip_ulysses: bool,
+        query_length: int | None = None,
+        key_length: int | None = None,
+    ) -> torch.Tensor:
+        kwargs = {}
+        if self._use_flash2:
+            kwargs = _get_wan_full_sequence_varlen_kwargs(
+                query, key, value, query_length=query_length, key_length=key_length
+            )
+        return self.veomni_attn(
+            module,
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attention_mask=attention_mask,
+            dropout=0.0,
+            is_causal=False,
+            skip_ulysses=skip_ulysses,
+            **kwargs,
+        )[0]
 
     def __call__(
         self,
@@ -161,7 +192,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Run the interned ``attention`` handle. Cross-attn and image tokens skip Ulysses."""
+        """Project, rope, then run the interned kernel. Cross-attn and image tokens skip Ulysses."""
         is_cross_attention = encoder_hidden_states is not None
 
         # I2V: the first part of encoder_hidden_states holds image context.
@@ -199,72 +230,51 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
-        # DiT trainer feeds full per-sample sequences. Passing explicit sequence
-        # boundaries selects HF's varlen FA2 path without changing attention
-        # semantics or relying on a synthetic padding mask.
-        attention_interface: Callable = self.veomni_attn
-        use_flash_attention = self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
-        if use_flash_attention:
+        if self._use_flash2:
             _assert_wan_flash_attention_bf16(query, key, value, attn)
 
         kernel_module = WanAttentionKernelModule(self.config, attn)
 
-        # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
             key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
             key_img = attn.norm_added_k(key_img)
-
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
-            if use_flash_attention:
+            if self._use_flash2:
                 assert key_img.dtype == torch.bfloat16 and value_img.dtype == torch.bfloat16, (
                     "Wan image flash-attention expects bf16 added K/V tensors, "
                     f"got key={key_img.dtype}, value={value_img.dtype}."
                 )
-            image_attention_kwargs = (
-                _get_wan_full_sequence_varlen_kwargs(query, key_img, value_img) if use_flash_attention else {}
+            hidden_states_img = (
+                self._run_attention(
+                    kernel_module,
+                    query,
+                    key_img,
+                    value_img,
+                    skip_ulysses=True,
+                )
+                .flatten(2, 3)
+                .type_as(query)
             )
-            hidden_states_img = attention_interface(
-                kernel_module,
-                query.transpose(1, 2),
-                key_img.transpose(1, 2),
-                value_img.transpose(1, 2),
-                attention_mask=None,
-                dropout=0.0,
-                is_causal=False,
-                skip_ulysses=True,
-                **image_attention_kwargs,
-            )[0]
-            hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
         query_length = query.shape[1]
         key_length = key.shape[1]
         if use_sp:
-            # Wan forward slices hidden_states/rotary_emb before the blocks.
-            # The shared VeOmni FA wrapper gathers those local slices back to
-            # the full sequence before calling FA2, so cu_seqlens must describe
-            # the post-gather length rather than this rank's local length.
+            # Outer forward already sliced tokens. The FA wrapper gathers before
+            # FA2, so cu_seqlens must describe the post-gather length.
             query_length *= get_parallel_state().ulysses_size
             key_length *= get_parallel_state().ulysses_size
-        attention_kwargs = (
-            _get_wan_full_sequence_varlen_kwargs(query, key, value, query_length=query_length, key_length=key_length)
-            if use_flash_attention
-            else {}
-        )
-        hidden_states_out = attention_interface(
+        hidden_states_out = self._run_attention(
             kernel_module,
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
+            query,
+            key,
+            value,
             attention_mask=attention_mask,
-            dropout=0.0,
-            is_causal=False,
             skip_ulysses=is_cross_attention,
-            **attention_kwargs,
-        )[0]
-
-        hidden_states_out = hidden_states_out.flatten(2, 3)
+            query_length=query_length,
+            key_length=key_length,
+        ).flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
         if hidden_states_img is not None:
@@ -404,7 +414,7 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
         self.config: WanTransformer3DModelConfig = config
         self.config.tie_word_embeddings = False
 
-        sp_processor = WanSPAttnProcessor(attn_implementation=config._attn_implementation)
+        sp_processor = WanSPAttnProcessor()
         for block in self.blocks:
             block.attn1.set_processor(sp_processor)
             block.attn2.set_processor(sp_processor)
@@ -461,10 +471,8 @@ def apply_veomni_wan_transformer_patch() -> None:
     2. **Sequence gather** before the output head – all ranks see the full output
        so that the loss is identical across SP ranks.
 
-    Slicing only takes effect when BOTH ``ulysses_enabled`` is True AND an SP-aware
-    attention implementation (``veomni_flash_attention_*_with_sp``) is configured.
-    Without the SP attention processor the required AllToAll in self-attention
-    would be absent, making sequence slicing incorrect.
+    Slicing only takes effect when ``sp_enabled``. Self-attn gathers inside the
+    interned attention kernel. Cross-attn and image tokens pass ``skip_ulysses``.
     """
     _WanTransformer3DModel.forward = WanTransformer3DModel_forward
     # Newer diffusers (resolved under transformers v5) gate FA2 with a strict

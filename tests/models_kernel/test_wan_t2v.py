@@ -113,3 +113,46 @@ def test_wan_t2v_eager_matches_official():
         return output[0] if isinstance(output, tuple) else output
 
     assert_outputs_and_grads_match(official, ours, call)
+
+
+def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs():
+    kernels = eager_kernels_config()
+    kernels.attn_implementation = "veomni_flash_attention_2"
+    model = _build_ours(_tiny_ours_config(), kernels).to(dtype=torch.bfloat16)
+    attn = model.blocks[0].attn1
+    processor = attn.processor
+    assert processor.veomni_attn.impl == "veomni_flash_attention_2"
+    assert processor._use_flash2
+
+    captured: dict = {}
+
+    def record(_module, query, _key, _value, attention_mask=None, **kwargs):
+        captured.update(kwargs)
+        return query.transpose(1, 2), None
+
+    processor.veomni_attn = record
+    hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)
+    processor(attn, hidden, encoder_hidden_states=None, attention_mask=None, rotary_emb=None)
+
+    assert captured["max_length_q"] == 8
+    assert captured["max_length_k"] == 8
+    assert captured["cu_seq_lens_q"].tolist() == [0, 8, 16]
+    assert captured["cu_seq_lens_k"].tolist() == [0, 8, 16]
+
+
+def test_wan_t2v_eager_skips_full_sequence_varlen_kwargs():
+    model = _build_ours(_tiny_ours_config()).to(dtype=torch.bfloat16)
+    attn = model.blocks[0].attn1
+    captured: dict = {}
+
+    def record(_module, query, _key, _value, attention_mask=None, **kwargs):
+        captured.update(kwargs)
+        return query.transpose(1, 2), None
+
+    assert not attn.processor._use_flash2
+    attn.processor.veomni_attn = record
+    hidden = torch.randn(2, 8, attn.to_q.in_features, dtype=torch.bfloat16)
+    attn.processor(attn, hidden, encoder_hidden_states=None, attention_mask=None, rotary_emb=None)
+
+    assert "cu_seq_lens_q" not in captured
+    assert "max_length_q" not in captured
