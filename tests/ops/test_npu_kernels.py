@@ -41,20 +41,6 @@ DEVICE = get_device_type()
 # ---------------------------------------------------------------------------
 
 
-def _eager_rms_norm_standard(x, weight, eps):
-    dtype = x.dtype
-    x_f = x.to(torch.float32)
-    variance = x_f.pow(2).mean(-1, keepdim=True)
-    x_f = x_f * torch.rsqrt(variance + eps)
-    return (weight * x_f.to(dtype)).to(dtype)
-
-
-def _eager_rms_norm_qwen3_5(x, weight, eps):
-    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-    x_norm = x.to(torch.float32) * torch.rsqrt(variance + eps)
-    return ((1.0 + weight.to(torch.float32)) * x_norm).to(x.dtype)
-
-
 def _rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -97,60 +83,6 @@ def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     fused_input = torch.cat([gate, normed], dim=-1)
     half = fused_input.shape[-1] // 2
     return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
-
-
-# ---------------------------------------------------------------------------
-# RMSNorm tests
-# ---------------------------------------------------------------------------
-
-
-class TestNPURmsNorm:
-    """Tests for the ``rms_norm`` NPU kernel (standard + qwen3_5 variants)."""
-
-    @pytest.mark.parametrize("batch,seq,hidden", [(2, 16, 128), (1, 8, 64)])
-    def test_standard_matches_eager_bf16(self, batch, seq, hidden):
-        slot = OpSlot("rms_norm", "standard")
-        slot.bind("npu")
-        x = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
-        w = torch.randn(hidden, device=DEVICE, dtype=torch.bfloat16)
-        out_kernel = slot(x, w, 1e-6)
-        out_eager = _eager_rms_norm_standard(x, w, 1e-6)
-        # bf16 RMSNorm on Ascend 910 drifts by 1-2 bf16 ULPs from the eager
-        # reference due to rounding in the final elementwise mul.  The ULP at
-        # value 4.0 is 0.031, so 1e-2 atol + 1e-2 rtol covers the worst case
-        # (1 ULP at any value <= 4) while still being 50x smaller than the 0.5
-        # gap a wrong kernel variant (e.g. qwen3_5 bound into a standard slot)
-        # would produce.
-        atol = 1e-2
-        rtol = 1e-2
-        assert torch.allclose(out_kernel, out_eager, atol=atol, rtol=rtol)
-
-    @pytest.mark.parametrize("batch,seq,hidden", [(2, 16, 128), (1, 8, 64)])
-    def test_standard_matches_eager_fp32(self, batch, seq, hidden):
-        slot = OpSlot("rms_norm", "standard")
-        slot.bind("npu")
-        x = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.float32)
-        w = torch.randn(hidden, device=DEVICE, dtype=torch.float32)
-        out_kernel = slot(x, w, 1e-6)
-        out_eager = _eager_rms_norm_standard(x, w, 1e-6)
-        # fp32 should be very close
-        assert torch.allclose(out_kernel, out_eager, atol=1e-4, rtol=1e-4)
-
-    @pytest.mark.parametrize("batch,seq,hidden", [(2, 16, 128), (1, 8, 64)])
-    def test_qwen3_5_matches_eager_bf16(self, batch, seq, hidden):
-        slot = OpSlot("rms_norm", "qwen3_5")
-        slot.bind("npu")
-        x = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
-        w = torch.zeros(hidden, device=DEVICE, dtype=torch.bfloat16)  # Qwen3.5 init to zeros
-        w += 0.01 * torch.randn_like(w)
-        # bf16 RMSNorm on Ascend 910 drifts by 1-2 bf16 ULPs from the eager
-        # reference even after up-casting to fp32, because the rounding happens
-        # in the bf16 multiply before the cast.  1e-2 atol + 1e-2 rtol covers
-        # 1 ULP at any normalized value while staying well below the gap a
-        # wrong kernel variant would produce.
-        out_kernel = slot(x, w, 1e-6).to(torch.float32)
-        out_eager = _eager_rms_norm_qwen3_5(x, w, 1e-6).to(torch.float32)
-        assert torch.allclose(out_kernel, out_eager, atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +290,6 @@ class TestNPUKernelRegistry:
     @pytest.mark.parametrize(
         "op_name,variant",
         [
-            ("rms_norm", "standard"),
-            ("rms_norm", "qwen3_5"),
             ("rotary_pos_emb", "full"),
             ("rotary_pos_emb_vision", "full"),
             ("rotary_pos_emb", "partial"),

@@ -12,100 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-LigerKernel-based kernel registrations (RMSNorm, RoPE, SwiGLU).
+LigerKernel-based kernel registrations (RoPE, SwiGLU).
 
 Registrations are executed at import time via ``veomni.ops.__init__``.
+RMSNorm lives in ``veomni.kernels``.
 """
 
 from __future__ import annotations
 
 from ..kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
-
-
-# ── Liger RMSNorm ─────────────────────────────────────────────────────────────
-
-
-def _liger_rms_norm_factory():
-    """Return a functional RMSNorm kernel (standard formulation, offset=0.0).
-
-    Matches LigerRMSNorm in:
-    https://github.com/linkedin/Liger-Kernel/blob/v0.7.0/src/liger_kernel/transformers/rms_norm.py
-    """
-    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
-
-    def liger_rms_norm(hidden_states, weight, eps):
-        return LigerRMSNormFunction.apply(
-            hidden_states,
-            weight,
-            eps,
-            0.0,  # offset — standard RMSNorm (no weight shift)
-            "llama",  # casting_mode
-            False,  # in_place
-            None,  # row_mode
-        )
-
-    return liger_rms_norm
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger_kernel",
-        op_name="rms_norm",
-        variant="standard",
-        factory=_liger_rms_norm_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
-        description="LigerKernel fused RMSNorm",
-    )
-)
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger_kernel",
-        op_name="rms_norm",
-        variant="unweighted",
-        factory=_liger_rms_norm_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
-        description="LigerKernel fused unweighted RMSNorm",
-    )
-)
-
-
-# ── Liger RMSNorm (Qwen3.5 variant: offset=1.0, zeros init) ──────────────────
-
-
-def _liger_rms_norm_qwen3_5_factory():
-    """Return a functional RMSNorm kernel for Qwen3.5 (1+weight centered formulation).
-
-    Uses LigerRMSNormFunction.apply directly with offset=1.0 and casting_mode="gemma".
-    Matches LigerRMSNormForQwen3Next in:
-    https://github.com/linkedin/Liger-Kernel/blob/v0.7.0/src/liger_kernel/transformers/rms_norm.py
-    """
-    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
-
-    def liger_rms_norm_qwen3_5(hidden_states, weight, eps):
-        return LigerRMSNormFunction.apply(
-            hidden_states,
-            weight,
-            eps,
-            1.0,  # offset — Qwen3.5 uses (1 + weight) formulation
-            "gemma",  # casting_mode — full fp32
-            False,  # in_place
-            None,  # row_mode
-        )
-
-    return liger_rms_norm_qwen3_5
-
-
-KERNEL_REGISTRY.register(
-    KernelSpec(
-        name="liger_kernel",
-        op_name="rms_norm",
-        variant="qwen3_5",
-        factory=_liger_rms_norm_qwen3_5_factory,
-        hardware=HardwareRequirement(device_type="gpu"),
-        description="LigerKernel fused RMSNorm for Qwen3.5 (1+weight, zeros init, gemma casting)",
-    )
-)
 
 
 # ── Liger Rotary Positional Embedding ─────────────────────────────────────────

@@ -29,8 +29,8 @@ edge cases, and a few more kernel-specific coverage tests.  Designed to:
 Tests are skipped on non-NPU hosts so the same test suite runs in any CI runner.
 
 Tolerance notes:
-  NPU bf16 RMSNorm / RoPE kernels can drift by 1-2 bf16 ULPs from the
-  eager reference.  On a 4096-dim reduction this stacks to ~5e-2.
+  NPU bf16 RoPE kernels can drift by 1-2 bf16 ULPs from the eager
+  reference.  On a 4096-dim reduction this stacks to ~5e-2.
   We use 5e-2 atol for the largest reductions; the eager reference
   itself is fp32 so the comparison is well-conditioned.
 """
@@ -51,20 +51,6 @@ DEVICE = get_device_type()
 # ---------------------------------------------------------------------------
 # Eager reference implementations (shared with the main npu_kernels test)
 # ---------------------------------------------------------------------------
-
-
-def _eager_rms_norm_standard(x, weight, eps):
-    dtype = x.dtype
-    x_f = x.to(torch.float32)
-    variance = x_f.pow(2).mean(-1, keepdim=True)
-    x_f = x_f * torch.rsqrt(variance + eps)
-    return (weight * x_f.to(dtype)).to(dtype)
-
-
-def _eager_rms_norm_qwen3_5(x, weight, eps):
-    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-    x_norm = x.to(torch.float32) * torch.rsqrt(variance + eps)
-    return ((1.0 + weight.to(torch.float32)) * x_norm).to(x.dtype)
 
 
 def _rotate_half(x):
@@ -91,89 +77,6 @@ def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
     fused_input = torch.cat([gate, normed], dim=-1)
     half = fused_input.shape[-1] // 2
     return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
-
-
-# ---------------------------------------------------------------------------
-# Extended RMSNorm tests -- bigger shapes, fp16, and degenerate inputs
-# ---------------------------------------------------------------------------
-
-
-# bf16 RMSNorm on NPU accumulates in fp32 and casts back; the kernel
-# is exact for small hidden sizes and drifts to ~3e-2 atol for the
-# 2048-dim reduction.  fp16 is tighter.
-# bf16 RMSNorm on NPU accumulates in fp32 and casts back; the kernel
-# is exact for small hidden sizes and drifts to ~5e-2 atol for the
-# 2048-dim reduction.  Empirically the NPU Ascend 910 npu_rms_norm
-# is also slightly noisy on the smaller 256-dim case, so we use 1e-2
-# even for 256.
-_RMSNORM_BF16_ATOL = {256: 1e-2, 1024: 2e-2, 2048: 5e-2}
-_RMSNORM_FP16_ATOL = {256: 5e-3, 1024: 1e-2, 2048: 2e-2}
-
-
-class TestNPURmsNormExtended:
-    """Larger-shape and dtype coverage for the NPU RMSNorm kernel."""
-
-    @pytest.mark.parametrize("hidden", [256, 1024, 2048])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_standard_production_shape(self, hidden, dtype):
-        slot = OpSlot("rms_norm", "standard")
-        slot.bind("npu")
-        torch.manual_seed(0)
-        x = torch.randn(2, 64, hidden, device=DEVICE, dtype=dtype)
-        w = torch.randn(hidden, device=DEVICE, dtype=dtype)
-        out_kernel = slot(x, w, 1e-6)
-        out_eager = _eager_rms_norm_standard(x, w, 1e-6)
-        atol = _RMSNORM_BF16_ATOL[hidden] if dtype == torch.bfloat16 else _RMSNORM_FP16_ATOL[hidden]
-        assert torch.allclose(out_kernel, out_eager, atol=atol, rtol=atol)
-
-    def test_standard_zero_input_keeps_zero(self):
-        """All-zero input -> all-zero output (regardless of weight)."""
-        slot = OpSlot("rms_norm", "standard")
-        slot.bind("npu")
-        x = torch.zeros(1, 4, 64, device=DEVICE, dtype=torch.float32)
-        w = torch.randn(64, device=DEVICE, dtype=torch.float32)
-        out_kernel = slot(x, w, 1e-6)
-        out_eager = _eager_rms_norm_standard(x, w, 1e-6)
-        assert torch.allclose(out_kernel, out_eager, atol=1e-6, rtol=1e-6)
-        assert out_kernel.abs().max().item() < 1e-5
-
-    def test_standard_uniform_weight_is_mean_preserving(self):
-        """When weight is constant 1, kernel must match reference (algebraic invariant)."""
-        slot = OpSlot("rms_norm", "standard")
-        slot.bind("npu")
-        torch.manual_seed(42)
-        x = torch.randn(2, 8, 128, device=DEVICE, dtype=torch.float32)
-        w = torch.ones(128, device=DEVICE, dtype=torch.float32)
-        out_kernel = slot(x, w, 1e-6)
-        out_eager = _eager_rms_norm_standard(x, w, 1e-6)
-        assert torch.allclose(out_kernel, out_eager, atol=1e-5, rtol=1e-5)
-
-    @pytest.mark.parametrize("hidden", [512, 1024])
-    def test_qwen3_5_production_shape(self, hidden):
-        slot = OpSlot("rms_norm", "qwen3_5")
-        slot.bind("npu")
-        torch.manual_seed(1)
-        x = torch.randn(2, 32, hidden, device=DEVICE, dtype=torch.bfloat16)
-        w = torch.zeros(hidden, device=DEVICE, dtype=torch.bfloat16)  # Qwen3.5 init
-        w += 0.01 * torch.randn_like(w)
-        out_kernel = slot(x, w, 1e-6).to(torch.float32)
-        out_eager = _eager_rms_norm_qwen3_5(x, w, 1e-6).to(torch.float32)
-        # Qwen3.5 multiplies by (1 + w), so the bf16 round is in the
-        # (1 + w) term; tol matches the standard kernel at the same size.
-        atol = _RMSNORM_BF16_ATOL.get(hidden, 5e-2)
-        assert torch.allclose(out_kernel, out_eager, atol=atol, rtol=atol)
-
-    def test_eps_robustness(self):
-        """Different eps values must all pass."""
-        slot = OpSlot("rms_norm", "standard")
-        slot.bind("npu")
-        torch.manual_seed(2)
-        x = torch.randn(1, 4, 64, device=DEVICE, dtype=torch.float32)
-        w = torch.randn(64, device=DEVICE, dtype=torch.float32)
-        for eps in [1e-3, 1e-5, 1e-8]:
-            out_kernel = slot(x, w, eps)
-            out_eager = _eager_rms_norm_standard(x, w, eps)
-            assert torch.allclose(out_kernel, out_eager, atol=1e-5, rtol=1e-5), f"eps={eps} failed"
 
 
 # ---------------------------------------------------------------------------

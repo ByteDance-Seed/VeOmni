@@ -42,20 +42,6 @@ def _fresh_slot(op_name, variant, impl_name):
     return slot
 
 
-def _eager_rms_norm_standard(x, weight, eps):
-    dtype = x.dtype
-    x_f = x.to(torch.float32)
-    variance = x_f.pow(2).mean(-1, keepdim=True)
-    x_f = x_f * torch.rsqrt(variance + eps)
-    return (weight * x_f.to(dtype)).to(dtype)
-
-
-def _eager_rms_norm_qwen3_5(x, weight, eps):
-    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-    x_norm = x.to(torch.float32) * torch.rsqrt(variance + eps)
-    return ((1.0 + weight.to(torch.float32)) * x_norm).to(x.dtype)
-
-
 def _rotate_half(x):
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -65,31 +51,6 @@ def _eager_rope(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
-
-
-def test_rms_norm_standard_liger_matches_eager():
-    pytest.importorskip("liger_kernel")
-    slot = _fresh_slot("rms_norm", "standard", "liger_kernel")
-    x = torch.randn(2, 16, 128, device=DEVICE, dtype=torch.bfloat16)
-    w = torch.randn(128, device=DEVICE, dtype=torch.bfloat16)
-    # bf16 RMSNorm is a single-pass reduction + elementwise mul; kernel vs eager
-    # diverge only by the order of the bf16 cast. 2e-3 covers worst-case bf16
-    # rounding without being so loose that a wrong kernel (e.g. standard bound
-    # into a qwen3_5 slot, diff ~0.5) would slip through.
-    assert torch.allclose(slot(x, w, 1e-6), _eager_rms_norm_standard(x, w, 1e-6), atol=2e-3, rtol=2e-3)
-
-
-def test_rms_norm_qwen3_5_liger_matches_eager():
-    pytest.importorskip("liger_kernel")
-    slot = _fresh_slot("rms_norm", "qwen3_5", "liger_kernel")
-    x = torch.randn(2, 16, 128, device=DEVICE, dtype=torch.bfloat16)
-    w = torch.zeros(128, device=DEVICE, dtype=torch.bfloat16)  # Qwen3.5 initializes to zeros
-    w += 0.01 * torch.randn_like(w)
-    # Both sides up-cast to fp32 before the comparison, so the tolerance is
-    # much tighter than the bf16 cases.
-    out_kernel = slot(x, w, 1e-6).to(torch.float32)
-    out_eager = _eager_rms_norm_qwen3_5(x, w, 1e-6).to(torch.float32)
-    assert torch.allclose(out_kernel, out_eager, atol=1e-4, rtol=1e-4)
 
 
 def test_rotary_pos_emb_liger_matches_eager():
