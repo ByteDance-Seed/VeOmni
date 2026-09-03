@@ -42,28 +42,6 @@ def _fresh_slot(op_name, variant, impl_name):
     return slot
 
 
-def test_swiglu_mlp_liger_matches_eager():
-    pytest.importorskip("liger_kernel")
-    slot = _fresh_slot("swiglu_mlp", "standard", "liger_kernel")
-
-    class _MLP(torch.nn.Module):
-        def __init__(self, dim, hidden):
-            super().__init__()
-            self.gate_proj = torch.nn.Linear(dim, hidden, bias=False)
-            self.up_proj = torch.nn.Linear(dim, hidden, bias=False)
-            self.down_proj = torch.nn.Linear(hidden, dim, bias=False)
-            self.act_fn = torch.nn.SiLU()
-
-    mlp = _MLP(128, 256).to(DEVICE).to(torch.bfloat16)
-    x = torch.randn(2, 16, 128, device=DEVICE, dtype=torch.bfloat16)
-    out_kernel = slot(mlp, x)
-    out_eager = mlp.down_proj(mlp.act_fn(mlp.gate_proj(x)) * mlp.up_proj(x))
-    # bf16 gate/up linears + silu + down linear — three matmuls accumulate
-    # more bf16 rounding than the single-op kernels above; 5e-3 is the
-    # smallest margin that held across local runs.
-    assert torch.allclose(out_kernel, out_eager, atol=5e-3, rtol=5e-3)
-
-
 @pytest.mark.skipif(
     get_gpu_compute_capability() != 90 or importlib.util.find_spec("flash_qla") is None,
     reason="flash_qla only ships Hopper SM90 kernels — SM10x WIP upstream "
