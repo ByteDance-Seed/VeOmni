@@ -82,7 +82,7 @@ Title: `[{modules}] {type}: {description}`
 4. **safe** -> commit. **risky** -> report to user, wait for approval.
 5. Each fix -> immediate commit. Do not batch unrelated changes.
 6. Run `make quality` before every commit.
-7. **Commit messages describe the change, not the tool that produced it** — no agent or model names, and no `Co-Authored-By` trailers.
+7. **Commit messages describe the change, not the tool that produced it** — do not name the assistant or agent that wrote it, and no `Co-Authored-By` trailers. (Naming a *model being added* is expected — that is the change.)
 8. **Skill gap check**: If the task didn't match any existing skill, briefly assess after completion: Was this a one-off, or a repeatable pattern? If repeatable, suggest creating a new skill to the user.
 
 ---

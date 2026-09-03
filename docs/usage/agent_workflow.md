@@ -26,7 +26,10 @@ adding another alias is just another symlink.
 
 ### For AI Agent Users
 
-The workflow activates automatically:
+How much of this is automatic depends on the agent. Reading `AGENTS.md` on
+session start and auto-discovering skills from their `description` are both
+capabilities the agent has to implement; where it does not, everything below
+still works by invoking `/skill-name` explicitly.
 
 1. The agent reads `AGENTS.md` on session start.
 2. For each task, the agent selects the appropriate skill from the dispatch table (or auto-discovers it via the `description` frontmatter).
@@ -128,5 +131,5 @@ Code Change -> /veomni-review (subagent) -> Verdict
 
 Additional gates:
 - `make quality` must pass (ruff check + format)
-- Commit messages describe the change, not the tool that produced it
+- Commit messages describe the change, not the tool that produced it — no assistant or agent names, no `Co-Authored-By` trailers
 - PR title must follow `[{modules}] {type}: {description}` format
