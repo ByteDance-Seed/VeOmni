@@ -234,11 +234,21 @@ class _Gather(torch.autograd.Function):
         if ctx.grad_scale:
             grad_output = grad_output * ctx.seq_world_size
 
-        # A caller that reduces the gathered output with a bare ``.sum()`` (no
-        # elementwise op in between to materialise a real buffer) hands back a
-        # stride-0 broadcast view here, which NCCL's in-place all_reduce rejects
-        # with "Tensors must be contiguous". ``.contiguous()`` also protects
-        # against scribbling in place on a tensor autograd may still own.
+        # ``grad_output`` arrives as whatever view the gathered tensor's consumer
+        # produced, and the in-place all_reduce below rejects a non-contiguous one
+        # with "Tensors must be contiguous". Two callers reach that: one reducing
+        # the gathered output with a bare ``.sum()`` (no elementwise op in between
+        # to materialise a real buffer), which hands back a stride-0 broadcast
+        # view; and DeepSeek-V4's context-parallel attention, which gathers ``kv``
+        # ``[B, 1, S, D]`` straight into ``torch.cat([kv, compressed_kv], dim=2)``
+        # and so passes that cat's gradient narrowed on dim 2 -- a row range of a
+        # wider buffer, contiguous only while the leading dims collapse at batch 1
+        # and not at batch 2. This buys contiguity and nothing else: an
+        # already-contiguous gradient is returned unchanged, so the reduce still
+        # writes into autograd's own buffer, which is also why it protects against
+        # scribbling in place on a tensor autograd may still own.
+        # ``_GatherConcatSP.backward`` adds a ``.clone()`` for that; reconciling
+        # the two is out of scope here.
         grad_output = grad_output.contiguous()
         if ctx.sum_grad:
             dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)

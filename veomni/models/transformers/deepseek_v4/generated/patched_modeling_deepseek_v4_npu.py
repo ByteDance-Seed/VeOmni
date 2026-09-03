@@ -74,6 +74,14 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
+from veomni.distributed.context_parallel import (
+    all_gather_compressed_rows,
+    all_gather_kv,
+    empty_compressed_rows,
+    exchange_compressor_halos,
+    local_window_token_indices,
+    plan_compressor_shard,
+)
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -90,6 +98,7 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     mask_sparse_attention_indices,
     packed_compressed_block_bias,
     packed_compressed_causal_ranges,
+    shard_packed_compression_metadata,
 )
 
 # Additional imports for patches
@@ -886,7 +895,10 @@ class DeepseekV4Indexer(nn.Module):
     #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
     #    position layouts fall outside what that kernel accepts, and having been asked
     #    for it explicitly this refuses rather than demoting to the eager scorer.
-    # 2. Under ``dsa_indexer_loss``, hand the per-slot index scores back next to the
+    # 2. Context parallelism: compress this shard's own windows and all-gather the
+    #    compressed rows, so the keys stay global while the queries stay local, and
+    #    drop the Ulysses query partitioning, which has nothing left to do.
+    # 3. Under ``dsa_indexer_loss``, hand the per-slot index scores back next to the
     #    selection so the auxiliary KL has a student to train, and detach the inputs so
     #    that KL cannot reach the main model. The eager scorer discards those scores and
     #    so cannot serve the objective, but needs no refusal of its own here: the gate
@@ -930,8 +942,58 @@ class DeepseekV4Indexer(nn.Module):
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
 
-        if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
+        # --- Patch.2 ---
+        # Under context parallelism the queries arrive already sharded, but a top-k
+        # value names a slot in the enclosing CSA compressor's compressed KV, which is
+        # replicated. So the compressed *keys* have to stay global, and the indexer
+        # runs the same own-your-windows-then-all-gather compression its compressor
+        # does -- it cannot reuse that result, because it summarises the same windows
+        # through its own projections at ``index_head_dim``. Only the query axis is
+        # local, and ``query_offset`` is what keeps a local query row addressing its
+        # absolute position.
+        parallel_state = get_parallel_state()
+        cp_enabled = parallel_state.cp_enabled and cache_layer is None
+        query_offset = 0
+        if cp_enabled:
+            cp_group = parallel_state.cp_group
+            cp_rank = parallel_state.cp_rank
+            local_seq_len = seq_len
+            rate = self.compress_rate
+            query_offset = cp_rank * local_seq_len
+            shard = plan_compressor_shard(
+                role="DeepSeek V4 Lightning Indexer",
+                rate=rate,
+                local_seq_len=local_seq_len,
+                cp_rank=cp_rank,
+                cp_size=parallel_state.cp_size,
+                packed_compression_metadata=packed_compression_metadata,
+                device=kv.device,
+            )
+            # Every guard is above this line, so no rank enters a collective while its
+            # peers are still deciding whether to raise.
+            kv, gate = exchange_compressor_halos(kv, gate, rate, cp_group)
+
+        # The caller hands over the *global* packed metadata alongside a local shard,
+        # exactly as the attention forward hands it to the compressors: only the module
+        # holding the hidden states knows they are one shard, so only it can shard the
+        # metadata. Both the compression below and the per-query ranges further down
+        # read the sharded copy.
+        rate_metadata = None
+        if cache_layer is None and packed_compression_metadata is not None:
             rate_metadata = packed_compression_metadata[self.compress_rate]
+            if cp_enabled:
+                rate_metadata = shard_packed_compression_metadata(
+                    rate_metadata,
+                    window_begin=shard.begin,
+                    window_end=shard.end,
+                    local_seq_len=local_seq_len,
+                    cp_rank=cp_rank,
+                    halo=rate,
+                )
+        # --- Patch.2 ---
+
+        prior_kv = prior_gate = None
+        if rate_metadata is not None:
             compressed = compress_packed_windows(
                 kv,
                 gate,
@@ -948,14 +1010,33 @@ class DeepseekV4Indexer(nn.Module):
             )
             chunk_kv = chunk_gate = None
             first_window_position = 0
+        elif cp_enabled:
+            # This rank's own windows, out of the haloed buffer in window order.
+            # Mirrors the CSA compressor, which windows the same tokens at the model
+            # head dim.
+            window_indices, first_window_position = local_window_token_indices(
+                shard, rate=rate, local_seq_len=local_seq_len, cp_rank=cp_rank, device=kv.device
+            )
+            flat_indices = window_indices.reshape(-1)
+            chunk_kv, chunk_gate = kv[:, flat_indices], gate[:, flat_indices]
+            if first_window_position >= rate:
+                # The window before the first owned one, read out of the left halo. It
+                # fills the very slots the decode path fills from the cache. Global
+                # window 0 has no predecessor, so rank 0 leaves that slot at zero-kv /
+                # -inf-gate and never reads the halo's zeros.
+                previous_indices = window_indices[0] - rate
+                prior_kv = kv[:, previous_indices, : self.head_dim]
+                prior_gate = gate[:, previous_indices, : self.head_dim] + self.position_bias[:, : self.head_dim].to(
+                    gate.dtype
+                )
         elif cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
             chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
         else:
             chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights("indexer", kv, gate)
 
-        if packed_compression_metadata is not None and cache_layer is None:
-            pass
+        if chunk_kv is None:
+            pass  # The packed branch above already produced ``compressed``.
         elif chunk_kv.shape[1] > 0:
             n_windows = chunk_kv.shape[1] // self.compress_rate
             ratio = self.compress_rate
@@ -971,9 +1052,9 @@ class DeepseekV4Indexer(nn.Module):
                 new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, : self.head_dim]
             if cache_layer is not None:
                 prior_kv, prior_gate = cache_layer.update_overlap_state("indexer", chunk_kv, chunk_gate, self.head_dim)
-                if prior_kv is not None:
-                    new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
-                    new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+            if prior_kv is not None:
+                new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+                new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
 
             # See the HCA compressor above: `sum` needs an explicit `dtype` under autocast.
             compressed = self.kv_norm(
@@ -987,8 +1068,10 @@ class DeepseekV4Indexer(nn.Module):
             cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
-            compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+            compressed = empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
 
+        if cp_enabled:
+            compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
         compressed_kv = (
             compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
         )
@@ -1007,10 +1090,12 @@ class DeepseekV4Indexer(nn.Module):
                 "DeepSeek-V4 does not support "
                 f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
             )
-        canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
-        packed_ranges = None
-        if packed_compression_metadata is not None and cache_layer is None:
-            packed_ranges = packed_compressed_causal_ranges(packed_compression_metadata[self.compress_rate])
+        # A local query row ``i`` is global row ``query_offset + i``; off the context
+        # parallel path ``query_offset`` is zero and this is the arange it always was.
+        canonical_positions = (
+            (torch.arange(seq_len, device=position_ids.device) + query_offset).unsqueeze(0).expand_as(position_ids)
+        )
+        packed_ranges = None if rate_metadata is None else packed_compressed_causal_ranges(rate_metadata)
         # Operand dtypes are the kernel's contract and are enforced by
         # ``v4_lighting_indexer`` itself, which reports the offending dtype. Only
         # structural conditions belong here.
@@ -1041,8 +1126,19 @@ class DeepseekV4Indexer(nn.Module):
             query_weights = weights.transpose(0, 1).contiguous()
             query_range_starts = None if packed_ranges is None else packed_ranges[0]
             query_range_ends = None if packed_ranges is None else packed_ranges[1]
-            parallel_state = get_parallel_state()
-            if parallel_state.ulysses_enabled:
+            # Either sequence-parallel mode has to spell out each query's visible
+            # compressed interval, because the kernel's default derives it from the
+            # query's *row*, which is no longer its position.
+            if cp_enabled and query_range_starts is None:
+                query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+                query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32) + query_offset
+                query_range_ends = (query_positions + 1) // self.compress_rate
+            # Ulysses partitions the full-sequence queries here and stitches the
+            # selection back together below; CP received them already partitioned and
+            # wants the result per shard, so both halves fall away together. One flag
+            # for both, so a slice can never happen without its matching all-gather.
+            ulysses_query_partition = parallel_state.ulysses_enabled and not cp_enabled
+            if ulysses_query_partition:
                 if query_range_starts is None and query_range_ends is None:
                     query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
                     query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32)
@@ -1070,7 +1166,7 @@ class DeepseekV4Indexer(nn.Module):
                 cu_seqlen_ks=query_range_starts,
                 cu_seqlen_ke=query_range_ends,
             )
-            if parallel_state.ulysses_enabled:
+            if ulysses_query_partition:
                 top_k_indices = gather_outputs(
                     top_k_indices,
                     gather_dim=1,
@@ -1545,7 +1641,10 @@ class DeepseekV4Attention(nn.Module):
     # 2. Ulysses SP: all-to-all Q heads, sequence all-gather for MQA KV and
     #    compressor inputs (windows/indexers need the full sequence), then
     #    scatter attention outputs back to the local sequence shard.
-    # 3. Under ``dsa_indexer_loss`` on a CSA layer, return the indexer KL and its
+    # 3. Context parallelism: shard the queries instead of the heads and
+    #    replicate the MQA KV, so both Ulysses all-to-alls disappear and the
+    #    sparse indices keep addressing global KV rows.
+    # 4. Under ``dsa_indexer_loss`` on a CSA layer, return the indexer KL and its
     #    zero-information reference as third and fourth values. The return
     #    annotation states that arity, so a caller reads the contract off the
     #    signature rather than off a comment -- keep the two in step.
@@ -1576,12 +1675,40 @@ class DeepseekV4Attention(nn.Module):
         if past_key_values is not None:
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
 
-        ulysses_enabled = get_parallel_state().ulysses_enabled
+        parallel_state = get_parallel_state()
+        ulysses_enabled = parallel_state.ulysses_enabled
+        cp_enabled = parallel_state.cp_enabled
         compressor_hidden = hidden_states
         compressor_q_residual = q_residual
         compressor_position_ids = position_ids
         s_aux = self.sinks
-        if ulysses_enabled:
+        # Query rows and KV rows coincide off the CP path, which is what the sparse
+        # index builders assume by default.
+        query_offset = 0
+        kv_full_len = None
+        if cp_enabled:
+            if past_key_values is not None:
+                raise NotImplementedError("DeepSeek V4 context parallelism does not support a KV cache")
+            # Queries stay sharded with every head; KV is replicated so every sparse
+            # index keeps addressing the same global row the kernels expect.
+            local_seq_len = hidden_states.shape[1]
+            query_offset = parallel_state.cp_rank * local_seq_len
+            kv_full_len = local_seq_len * parallel_state.cp_size
+            # The caller builds the mask over the full sequence, as it does under
+            # Ulysses; only this rank's query rows are computed here. Checked before
+            # the all-gather: shards are equally sized, so every rank sees the same
+            # mismatch and all of them raise before any enters a collective.
+            if isinstance(attention_mask, torch.Tensor):
+                if attention_mask.shape[-2] != kv_full_len:
+                    raise ValueError(
+                        "DeepSeek V4 context parallelism needs an attention mask spanning the full "
+                        f"sequence, so {kv_full_len} query rows, not this rank's shard; got "
+                        f"{attention_mask.shape[-2]}. That length assumes every cp rank holds an "
+                        "equally sized shard, which is what the collator's padding guarantees."
+                    )
+                attention_mask = attention_mask.narrow(-2, query_offset, local_seq_len)
+            kv = all_gather_kv(kv, parallel_state.cp_group)
+        elif ulysses_enabled:
             if past_key_values is not None:
                 raise RuntimeError("DeepSeek-V4 Ulysses SP does not support KV-cache decode")
             ulysses_group = get_parallel_state().ulysses_group
@@ -1664,21 +1791,28 @@ class DeepseekV4Attention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
         kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
+        # Not ``kv.shape[-2] - q.shape[-2]``: that assumed the query and
+        # full-resolution KV lengths are equal, which is what CP breaks.
+        compressed_len = compressed_kv.shape[2] if self.compressor is not None else 0
         if mask_free_sparse:
             kwargs["sparse_topk_indices"] = build_packed_sparse_attention_indices(
                 position_ids=compressor_position_ids,
                 sliding_window=self.sliding_window,
-                compressed_len=kv.shape[-2] - q.shape[-2],
+                compressed_len=compressed_len,
                 candidates=compressed_candidates,
+                query_offset=query_offset,
+                kv_full_len=kv_full_len,
             )
         elif use_compact_sparse_indices:
             kwargs["sparse_topk_indices"] = build_sparse_attention_indices(
                 batch_size=q.shape[0],
                 seq_len=q.shape[-2],
                 sliding_window=self.sliding_window,
-                compressed_len=kv.shape[-2] - q.shape[-2],
+                compressed_len=compressed_len,
                 compressed_indices=compressed_candidates.topk_indices if compressed_candidates is not None else None,
                 device=q.device,
+                query_offset=query_offset,
+                kv_full_len=kv_full_len,
             )
         # --- Patch.3 ---
         if build_indexer_loss:
@@ -1749,8 +1883,9 @@ class DeepseekV4Attention(nn.Module):
             attn_output, attn_weights = attention_outputs
         # --- Patch.3 ---
 
-        if ulysses_enabled:
+        if ulysses_enabled and not cp_enabled:
             # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
+            # CP took the branch above instead, so its output is already [B, S_local, H, D].
             attn_output = gather_heads_scatter_seq(
                 attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
             )
@@ -2336,11 +2471,15 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     # Patch: DeepseekV4Model.forward
     # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
     # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
-    # 3. Under Ulysses SP the collator keeps full ``attention_mask`` /
-    #    ``cu_seq_lens_*`` while slicing ``input_ids`` / local ``position_ids``.
-    #    Build the sliding-window mask and packed compression metadata on the full
-    #    sequence length so attention matches non-SP semantics after the all-gather
-    #    inside ``DeepseekV4Attention``.
+    # 3. Under either sequence-parallel mode -- Ulysses or context parallelism --
+    #    the collator keeps full ``attention_mask`` / ``cu_seq_lens_*`` while
+    #    slicing ``input_ids`` / local ``position_ids``. Build the sliding-window
+    #    mask and packed compression metadata on the full sequence length so
+    #    attention matches non-SP semantics after the all-gather inside
+    #    ``DeepseekV4Attention``.
+    # 4. Refuse ``position_ids=None`` under either sequence-parallel mode instead
+    #    of defaulting to ``arange`` over the shard, which the layers below would
+    #    read as global positions.
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -2366,19 +2505,66 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         return_cache = past_key_values if use_cache else None
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        # Both sequence-parallel modes hand this forward one shard of a longer
+        # sequence, and everything below has to keep describing the whole of it: the
+        # packed compression metadata is indexed by global positions, and the
+        # sliding-window mask covers every query row before ``DeepseekV4Attention``
+        # narrows it to this rank's. Ulysses gets there by all-gathering the queries;
+        # context parallelism never does, so the global length and positions have to
+        # be reconstructed here either way.
+        #
+        # The contract, which the context-parallel path leans on everywhere and no
+        # single rank can check: rank ``r`` of ``sp_size`` receives rows
+        # ``[r*L, (r+1)*L)`` of the global sequence -- contiguous and equally sized --
+        # carrying their *global* ``position_ids`` (for packed data the per-sample
+        # positions, which is what makes them global), while ``cu_seq_lens_q`` still
+        # spans the whole packed batch. ``DeepseekV4Attention``, the compressors'
+        # ``shard_packed_compression_metadata`` and ``DeepseekV4Indexer`` each rebuild
+        # the shard's origin as ``cp_rank * local_seq_len`` out of nothing but that.
+        # ``SequenceParallelCollator`` supplies it: ``sp_slice`` narrows on
+        # ``sp_rank`` without renumbering and derives the cu-seqlens before slicing,
+        # and a CP-only mesh flattens ``sp`` onto ``cp`` so the two ranks agree.
+        # The packed length check below is the one part of it visible from here.
+        parallel_state = get_parallel_state()
+        # Never both -- ``ParallelState`` refuses the hybrid. Each group and size is
+        # read only through the flag that selected it, so a parallel-state stub
+        # carrying just the two flags still takes the single-rank path.
+        if parallel_state.cp_enabled:
+            sp_group, sp_size = parallel_state.cp_group, parallel_state.cp_size
+        elif parallel_state.ulysses_enabled:
+            sp_group, sp_size = parallel_state.ulysses_group, parallel_state.ulysses_size
+        else:
+            sp_group, sp_size = None, 1
+        sp_enabled = sp_size > 1
+
         if position_ids is None:
+            # ``arange(local_seq_len)`` is only the global sequence's positions when
+            # this rank holds all of it. Under either sequence-parallel mode it would
+            # tell every rank that its shard starts at position 0, and the contract
+            # above -- which ``shard_packed_compression_metadata``, the attention
+            # forward and the indexer all read as *global* -- would be violated
+            # silently: shapes stay self-consistent while every rank above 0
+            # compresses the wrong rows, and the indexer's canonical-position check
+            # admits the TileLang kernel on rank 0 alone, so the ranks disagree about
+            # causality. No local shard carries what it would take to reconstruct the
+            # global positions (packed data renumbers them per sample), so refuse
+            # instead of guessing. Ahead of the all-gather below, so a rank that
+            # refuses does not strand its peers in a collective.
+            if sp_enabled:
+                raise ValueError(
+                    "DeepSeek V4 requires explicit position_ids under sequence parallelism: "
+                    "this forward holds one shard of the sequence and cannot reconstruct the "
+                    "global positions the compressors, the attention forward and the indexer "
+                    "read. Pass the position_ids the collator sliced, which stay global."
+                )
             past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
             position_ids = position_ids.unsqueeze(0)
 
-        ulysses_enabled = get_parallel_state().ulysses_enabled
-        ulysses_group = get_parallel_state().ulysses_group if ulysses_enabled else None
-        ulysses_size = get_parallel_state().ulysses_size if ulysses_enabled else 1
         local_seq_len = inputs_embeds.shape[1]
-        full_seq_len = local_seq_len * ulysses_size if ulysses_enabled else local_seq_len
-        full_position_ids = (
-            gather_outputs(position_ids, gather_dim=-1, group=ulysses_group) if ulysses_enabled else position_ids
-        )
+        full_seq_len = local_seq_len * sp_size
+        full_position_ids = gather_outputs(position_ids, gather_dim=-1, group=sp_group) if sp_enabled else position_ids
 
         # The TileLang sparse kernel reads a compact candidate list, and packed
         # metadata already pins down every constraint a dense mask would encode, so
@@ -2449,9 +2635,12 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         else:
             mask_embeds = inputs_embeds
             mask_position_ids = position_ids
-            if ulysses_enabled:
+            if sp_enabled:
                 # SP collator keeps the full 2D attention_mask while slicing
                 # input_ids; build the 4D sliding-window mask on the full length.
+                # Under CP the attention forward additionally *requires* the full
+                # length, and refuses a shard-width mask rather than attending to
+                # the wrong rows.
                 mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
                 mask_position_ids = full_position_ids
             causal_mask = create_sliding_window_causal_mask(
