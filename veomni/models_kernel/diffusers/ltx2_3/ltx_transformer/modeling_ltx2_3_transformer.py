@@ -43,14 +43,6 @@ AUDIO_MEL_BINS = 16
 AUDIO_CHANNELS = 8
 DEFAULT_FPS = 24
 
-_VEOMNI_SP_ATTN_IMPLS = frozenset(
-    {
-        "veomni_flash_attention_2_with_sp",
-        "veomni_flash_attention_3_with_sp",
-        "veomni_flash_attention_4_with_sp",
-    }
-)
-
 
 def LTXSPAttention_forward(
     self: Attention,

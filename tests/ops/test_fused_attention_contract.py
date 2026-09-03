@@ -302,7 +302,7 @@ def test_veomni_ops_config_rewrites_flex_to_sp_aware_registration(monkeypatch):
 
     config = OpsImplementationConfig(attn_implementation="flex_attention")
 
-    assert config.attn_implementation == _FLEX_IMPLEMENTATION
+    assert config.attn_implementation == "veomni_flex_attention"
 
 
 def test_veomni_ops_config_rewrites_magi_to_sp_aware_registration(monkeypatch):
@@ -310,4 +310,20 @@ def test_veomni_ops_config_rewrites_magi_to_sp_aware_registration(monkeypatch):
 
     config = OpsImplementationConfig(attn_implementation="magi_attention")
 
-    assert config.attn_implementation == _MAGI_IMPLEMENTATION
+    assert config.attn_implementation == "veomni_magi_attention"
+
+
+def test_veomni_ops_config_rewrites_flash_to_veomni_name(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+    config = OpsImplementationConfig(attn_implementation="flash_attention_2")
+
+    assert config.attn_implementation == "veomni_flash_attention_2"
+
+
+def test_veomni_ops_config_aliases_legacy_with_sp_name(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+
+    config = OpsImplementationConfig(attn_implementation="veomni_flash_attention_2_with_sp")
+
+    assert config.attn_implementation == "veomni_flash_attention_2"

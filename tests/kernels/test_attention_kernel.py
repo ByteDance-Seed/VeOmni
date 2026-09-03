@@ -74,6 +74,14 @@ def test_apply_veomni_attention_patch_is_idempotent():
         assert ALL_ATTENTION_FUNCTIONS[name] is forward
 
 
+def test_apply_kernel_patch_registers_kernels_names():
+    from veomni.kernels import apply_kernel_patch
+
+    apply_kernel_patch()
+    for name, forward in _VEOMNI_FORWARDS.items():
+        assert ALL_ATTENTION_FUNCTIONS[name] is forward
+
+
 def eager_attention_forward(module, query, key, value, attention_mask, **kwargs):
     del module, key, value, attention_mask, kwargs
     return query.transpose(1, 2), "eager-local"

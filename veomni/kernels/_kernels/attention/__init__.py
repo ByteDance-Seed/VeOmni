@@ -15,7 +15,7 @@
 """Attention family.
 
 Triplet rows forward to ``ALL_ATTENTION_FUNCTIONS``. ``veomni_*`` adapters
-are registered on that dict by ``install.apply_veomni_attention_patch``.
+are registered on that dict by ``apply_kernel_patch``.
 Mask builders live under ``mask/`` and are not kernel rows.
 """
 
@@ -27,7 +27,6 @@ import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ...registry import register_kernel
-from .install import apply_veomni_attention_patch
 
 
 def _module_eager_forward(module: torch.nn.Module) -> Callable | None:
@@ -105,5 +104,3 @@ _STANDARD_IMPLS = (
 
 for _impl in _STANDARD_IMPLS:
     register_kernel("attention", "standard", _impl, wrapper=lookup(_impl))
-
-apply_veomni_attention_patch()

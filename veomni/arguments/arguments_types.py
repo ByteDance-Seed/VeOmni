@@ -1098,10 +1098,21 @@ class OpsImplementationConfig:
             "flex_attention",
             "magi_attention",
             "native-sparse",
+            "veomni_flash_attention_2",
+            "veomni_flash_attention_3",
+            "veomni_flash_attention_4",
+            "veomni_flex_attention",
+            "veomni_magi_attention",
+            "veomni_sage_attention",
+            "veomni_sdpa",
         ]
     ] = field(
         default="flash_attention_2",
-        metadata={"help": "Attention implementation."},
+        metadata={
+            "help": "Attention implementation. Stock names (flash_attention_2, flex_attention, "
+            "magi_attention, ...) rewrite to the matching veomni_* adapter when "
+            "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
+        },
     )
     moe_implementation: str = field(
         default="triton",
@@ -1210,11 +1221,16 @@ class OpsImplementationConfig:
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
             replacements = {
-                "flash_attention_2": "veomni_flash_attention_2_with_sp",
-                "flash_attention_3": "veomni_flash_attention_3_with_sp",
-                "flash_attention_4": "veomni_flash_attention_4_with_sp",
-                "flex_attention": "veomni_flex_attention_with_sp",
-                "magi_attention": "veomni_magi_attention_with_sp",
+                "flash_attention_2": "veomni_flash_attention_2",
+                "flash_attention_3": "veomni_flash_attention_3",
+                "flash_attention_4": "veomni_flash_attention_4",
+                "flex_attention": "veomni_flex_attention",
+                "magi_attention": "veomni_magi_attention",
+                "veomni_flash_attention_2_with_sp": "veomni_flash_attention_2",
+                "veomni_flash_attention_3_with_sp": "veomni_flash_attention_3",
+                "veomni_flash_attention_4_with_sp": "veomni_flash_attention_4",
+                "veomni_flex_attention_with_sp": "veomni_flex_attention",
+                "veomni_magi_attention_with_sp": "veomni_magi_attention",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
