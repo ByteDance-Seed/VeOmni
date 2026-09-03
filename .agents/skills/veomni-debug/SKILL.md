@@ -75,12 +75,30 @@ Phase 5: Knowledge capture           -> pending
    the main environment instead of the two you just created, which is the
    opposite of what this is for. (`UV_PROJECT_ENVIRONMENT` works too.)
 
-   Then run the same reproducer in both envs to confirm the version is the
-   root cause. **If the suspect package is transformers, use two worktrees
-   rather than two venvs**: `generated/` modeling lives in the checkout, not
-   the venv, so regenerating it for Env B silently changes what Env A runs.
-   It is produced against the pinned version, and a stale `generated/` is
-   itself a source of failures.
+   Then run the same reproducer in both envs, each with its own env
+   *activated* — the `VIRTUAL_ENV=` prefixes above apply only to the `uv sync`
+   lines they are attached to, not to whatever you run next:
+   ```bash
+   (source .venv-a/bin/activate && <reproducer>)
+   (source .venv-b/bin/activate && <reproducer>)
+   ```
+
+   **If the suspect package is transformers, you need two worktrees *and* two
+   venvs — one venv per worktree.** They isolate different things and neither
+   substitutes for the other: a venv isolates the installed packages, a
+   worktree isolates the checkout. `generated/` modeling lives in the
+   checkout, so two venvs in one worktree share a single `generated/` and
+   regenerating it for Env B silently changes what Env A runs. Two worktrees
+   without separate venvs share one transformers install, which defeats the
+   bisect outright.
+   ```bash
+   git worktree add ../bisect-a HEAD && (cd ../bisect-a && uv venv .venv && VIRTUAL_ENV=.venv uv sync --active --extra gpu --dev)
+   git worktree add ../bisect-b HEAD && (cd ../bisect-b && uv venv .venv && VIRTUAL_ENV=.venv uv sync --active --extra gpu --dev && VIRTUAL_ENV=.venv uv pip install "transformers==<other-version>")
+   ```
+   Regenerate `generated/` inside each worktree against its own pin
+   (`make patchgen`) before running the reproducer — it is produced against
+   the pinned version, and a stale `generated/` is itself a source of
+   failures.
 
 ### Phase 3: Hypothesis and Testing
 

@@ -17,8 +17,16 @@ branch you took, so the reader knows a review happened or why it didn't.
 
 ## Steps
 
-1. Run `git diff HEAD` to capture the full diff — plain `git diff` omits
-   anything already staged, which is exactly what is about to be committed.
+1. Capture the full diff, including files git does not track yet:
+   ```bash
+   git add -N .    # intent-to-add: makes new files visible to diff, stages no content
+   git diff HEAD
+   ```
+   Both halves matter. Plain `git diff` omits anything already staged — which
+   is exactly what is about to be committed. `git diff HEAD` on its own still
+   omits untracked files, so a brand-new module or test would be reviewed as
+   if it did not exist, and "add a new file" is one of the most common changes
+   there is. `git add -N` respects `.gitignore`, so build artifacts stay out.
 2. Read `.agents/knowledge/constraints.md` for known constraints.
 3. **Launch a review subagent** with your agent's subagent/task mechanism (see
    the prompt below). The subagent receives only the diff + constraints — NOT
