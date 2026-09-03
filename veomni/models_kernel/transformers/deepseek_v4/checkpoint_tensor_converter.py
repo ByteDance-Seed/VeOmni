@@ -409,7 +409,7 @@ class DeepseekV4CheckpointTensorConverter:
             scale_fmt, scale_dtype = (
                 ("ue8m0", torch.float8_e8m0fnu) if expert_dtype == "fp4" else (None, torch.float32)
             )
-            from veomni.kernels._kernels.weight_quant.deepseek_v4.act_quant import fp4_act_quant, fp8_weight_quant
+            from veomni.models_kernel.transformers.deepseek_v4.export_quant import fp4_act_quant, fp8_weight_quant
 
             param = param.to(torch.bfloat16)
             if fp4_quantize:
