@@ -1,0 +1,59 @@
+# Internal validation only. Qwen4-Exp currently requires the temporary
+# Transformers git revision pinned in pyproject.toml.
+model:
+  model_path: /mnt/hdfs/byte_mlsys_ssd_lfrz_search/ecom/models/Qwen/Qwen3.8-Flash-Next/Qwen3___8-Flash-Next
+  ops_implementation:
+    # QSA has no production FlashAttention adapter yet.
+    attn_implementation: sdpa
+    # This is the GPU default; OpsImplementationConfig resolves the same value
+    # to fused_npu when torch_npu is available.
+    moe_implementation: fused_triton
+
+data:
+  train_path: tulu-3-sft-mixture/data
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 16384
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  accelerator:
+    # PLE/QSA sequence parallelism is intentionally blocked in the initial port.
+    ulysses_size: 1
+    cp_size: 1
+    ep_size: 4
+    # Persistently shard the 128 checkpoint-native PLE tables over two axes:
+    # ple_size owns vocabulary rows and the complementary ple_fsdp ranks own
+    # embedding columns. The launch world size must be divisible by ple_size.
+    extra_parallel_names: [ple]
+    extra_parallel_sizes: [8]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable: true
+  wandb:
+    enable: false
+    project: VeOmni
+    name: qwen4-exp-vlm-sft-internal
+  freeze_vit: false
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  num_train_epochs: 2
+  micro_batch_size: 1
+  # Derive the global batch from the DP world size so the same smoke config can
+  # scale beyond 16 ranks without failing batch-size validation.
+  global_batch_size: null
+  max_steps: 10
+  init_device: meta
+  # Required for checkpoint-native PLE streaming: every rank reads only its
+  # local row x column rectangle instead of materializing a 95 GiB tensor.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  checkpoint:
+    output_dir: qwen4-exp-vlm-sft-internal
+    manager: dcp
+    save_hf_weights: false

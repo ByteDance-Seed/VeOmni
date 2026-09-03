@@ -24,7 +24,8 @@ dependencies = [
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
   # transformers is pinned by the `transformers-stable` dependency group for
-  # uv users; pip users should `pip install transformers==5.9.0` themselves.
+  # uv users. The current git revision is a temporary internal-validation pin
+  # for Qwen4-Exp and must be reverted to a release before upstream merge.
   "psutil",
   "timm",
   "wandb",
@@ -162,11 +163,11 @@ test = [
 patchgen = [
   "patchgen>=0.1.0",
 ]
-# In default-groups so `uv sync` always installs transformers==5.9.0.
-# Kept out of [project.dependencies] so pip users are not forced into a
-# specific 5.x patch release.
+# In default-groups so `uv sync` installs the temporary Qwen4-Exp git pin.
+# Kept out of [project.dependencies] so pip users are not forced onto the
+# internal-validation revision.
 transformers-stable = [
-  "transformers==5.9.0"
+  "transformers"
 ]
 
 [tool.uv]
@@ -208,6 +209,9 @@ conflicts = [
 
 [tool.uv.sources]
 patchgen = { path = "patchgen-pkg", editable = true }
+# TEMPORARY: Qwen4-Exp is not in the current stable Transformers release.
+# Internal validation only; replace with a released version before merging.
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "42ca97014c85d71a88ad60d55f08cb9fb4d26e2c" }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 # MagiAttention upstream designates this contributor-maintained support branch
 # for its arbitrary-mask FA4 packages and SM90 ffa-fa3 overlay. Dao-AILab does

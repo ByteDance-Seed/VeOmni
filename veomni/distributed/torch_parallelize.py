@@ -380,6 +380,40 @@ def parallelize_model_fsdp2(
         fqn2spec_info = parallel_plan.apply(model, parallel_state.extra_parallel_fsdp_device_mesh)
 
         model._fqn2spec_info = fqn2spec_info
+        persistent_extra_parallel_params = {
+            param
+            for fqn, param in model.named_parameters()
+            if fqn2spec_info[fqn].persistent_fsdp_shard_dim is not None
+        }
+        persistent_para_names = {
+            spec_info.para_name
+            for spec_info in fqn2spec_info.values()
+            if spec_info.persistent_fsdp_shard_dim is not None
+        }
+        if persistent_extra_parallel_params:
+            if parallel_state.dp_replicate_enabled:
+                raise NotImplementedError("Persistent ExtraParallel parameters do not support HSDP replicas yet.")
+            if parallel_state.sp_enabled:
+                raise NotImplementedError(
+                    "Persistent ExtraParallel parameters do not support sequence parallelism yet."
+                )
+            for para in persistent_para_names:
+                para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
+                flat_mesh = parallel_state.extra_parallel_flat_device_mesh[para]
+                if (
+                    para_mesh is None
+                    or para_mesh.ndim != 2
+                    or para_mesh.size() != parallel_state.world_size
+                    or flat_mesh is None
+                ):
+                    raise NotImplementedError(
+                        f"Persistent {para} parameters currently require a 2D ({para}_fsdp, {para}) mesh "
+                        "covering the complete world."
+                    )
+                logger.info_rank0(
+                    f"Persistent {para} 2D layout: rows={para_mesh.size(1)} ({para}), "
+                    f"columns={para_mesh.size(0)} ({para}_fsdp); parameter all-gather is disabled."
+                )
         _extra_parallel_mesh = {}
         _extra_parallel_map = {}
         for para in parallel_state.extra_parallel_names:
@@ -405,6 +439,8 @@ def parallelize_model_fsdp2(
     else:
         parallel_plan = None
         fqn2spec_info = None
+        persistent_extra_parallel_params = set()
+        persistent_para_names = set()
         _extra_parallel_mesh = None
         _extra_parallel_map = None
 
@@ -476,6 +512,11 @@ def parallelize_model_fsdp2(
         "reshard_after_forward": enable_reshard_after_forward,
         "shard_placement_fn": _veomni_shard_placement_fn,
     }
+    if persistent_extra_parallel_params:
+        # These params already carry their complete 2D DTensor placement. Every
+        # ancestor FSDP group must ignore them or the parent layer/root would
+        # absorb them and reintroduce a parameter all-gather.
+        fsdp_kwargs["ignored_params"] = persistent_extra_parallel_params
     # prepare mp_policy kwargs
     if mixed_precision.enable:
         mp_policy = MixedPrecisionPolicy(
@@ -489,6 +530,11 @@ def parallelize_model_fsdp2(
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False)
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
+        if persistent_extra_parallel_params:
+            raise NotImplementedError(
+                "FSDP CPU offload is not supported with persistent ExtraParallel parameters: "
+                "FSDP does not manage or stage ignored parameters."
+            )
         logger.info_rank0("Enable FSDP2 CPU offload for parameters, gradients, and optimizer states.")
         # ``CPUOffloadPolicy`` defaults to ``pin_memory=True``: the offloaded CPU
         # param shards are page-locked, which (a) is accounted as non-reclaimable
@@ -600,6 +646,11 @@ def parallelize_model_fsdp2(
             for _para_mod in extra_parallel_mod[para]:
                 if isinstance(_para_mod, FSDPModule):
                     continue
+                if any(param in persistent_extra_parallel_params for param in _para_mod.parameters()):
+                    # Persistent params remain on the complete 2D mesh. Any
+                    # non-persistent siblings are picked up by the enclosing
+                    # decoder/root FSDP group through the normal bottom-up walk.
+                    continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
                 fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
@@ -645,6 +696,11 @@ def parallelize_model_fsdp2(
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
+    # Persistent ExtraParallel parameters are ignored by every FSDP group and
+    # retain their original 2D DTensor identity. Record them after wrapping so
+    # gradient clipping can reduce their unique local shards once over the
+    # flattened 2D mesh instead of traversing the two mesh axes separately.
+    model._persistent_extra_parallel_param_ids = {id(param) for param in persistent_extra_parallel_params}
 
     # configure manual prefetching when needed
     need_manual_prefetch = (

@@ -99,6 +99,12 @@ Core entry points:
    - Device mesh: `init_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
 
+8a. **Persistent 2D ExtraParallel parameters have a distinct precision and norm-reduction boundary**
+   - Qwen4-Exp PLE weights remain FP32 DTensors with placements `[Shard(1), Shard(0)]` and are ignored by FSDP2. Cast the sparse lookup result to the activation dtype before the result all-to-all; do not cast or gather the persistent parameter.
+   - Their local gradient shards are unique across both mesh axes. Gradient clipping must reduce their norm statistic exactly once over `extra_parallel_flat_group(para)`, not through the ordinary sequential `para_fsdp` and `para` groups.
+   - Record persistent parameter identities after FSDP wrapping so the ExtraParallel clipper can keep this bucket separate from ordinary sharded and Para-replicated parameters.
+   - Persistent PLE may coexist with ordinary EP because their parameters use independent meshes. Every parameter must match at most one enabled ExtraParallel plan; overlapping patterns are rejected before sharding.
+
 ## Data Pipeline
 
 Core files:

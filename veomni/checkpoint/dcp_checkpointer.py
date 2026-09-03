@@ -156,6 +156,13 @@ def _apply_extra_parallel_dim(
         if not isinstance(spec_info.placement, Shard):
             continue
 
+        # Persistent ExtraParallel parameters already use their complete
+        # runtime placement (for example PLE ``[Shard(1), Shard(0)]`` on
+        # ``(ple_fsdp, ple)``). They are not managed by FSDP2, so there is no
+        # temporary ExtraParallel dimension to drop or restore around DCP.
+        if getattr(spec_info, "persistent_fsdp_shard_dim", None) is not None:
+            continue
+
         tensor = state_dict[name]
         if not torch.is_tensor(tensor):
             continue

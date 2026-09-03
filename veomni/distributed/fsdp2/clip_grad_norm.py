@@ -93,6 +93,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
     - For finite p: sum p-th powers across the appropriate groups, then take 1/p.
       • non-ExtraParallel: all-reduce over FSDP group.
       • ExtraParallel: all-reduce over Para-FSDP (e.g. ep_fsdp, emb_fsdp) group, then over Para (e.g. ep, emb) group.
+      • persistent 2D ExtraParallel: all-reduce once over the flattened Para-FSDP × Para mesh.
     - For inf-norm: take elementwise MAX with the same reduction groups (MAX).
     - Use a single global clip coefficient for both groups.
     """
@@ -122,11 +123,12 @@ def extra_parallel_fsdp2_clip_grad_norm(
     # ``ep`` group (only the ``ep_fsdp`` reduction stays — that one is a no-op
     # at ``ep_fsdp_size=1`` but is the right shape if it grows in the future).
     ep_replicated_ids: set[int] = getattr(model, "_ep_replicated_lora_param_ids", set())
+    persistent_ids: set[int] = getattr(model, "_persistent_extra_parallel_param_ids", set())
     extra_parallel_params = {
         para: [
             p
             for p in model._extra_parallel_param_groups.get(para, [])
-            if p.grad is not None and id(p) not in ep_replicated_ids
+            if p.grad is not None and id(p) not in ep_replicated_ids and id(p) not in persistent_ids
         ]
         for para in ps.extra_parallel_names
     }
@@ -134,7 +136,15 @@ def extra_parallel_fsdp2_clip_grad_norm(
         para: [
             p
             for p in model._extra_parallel_param_groups.get(para, [])
-            if p.grad is not None and id(p) in ep_replicated_ids
+            if p.grad is not None and id(p) in ep_replicated_ids and id(p) not in persistent_ids
+        ]
+        for para in ps.extra_parallel_names
+    }
+    persistent_extra_parallel_params = {
+        para: [
+            p
+            for p in model._extra_parallel_param_groups.get(para, [])
+            if p.grad is not None and id(p) in persistent_ids
         ]
         for para in ps.extra_parallel_names
     }
@@ -193,6 +203,23 @@ def extra_parallel_fsdp2_clip_grad_norm(
             extra_parallel_replicated_total[para] = para_total
             logger.debug_rank0(f"{para} replicated total grad norm: {para_total}")
 
+    # Persistent 2D ExtraParallel parameters are not managed by FSDP. Their
+    # local DTensor shards are unique across both mesh axes, so reduce their
+    # norm statistic exactly once over the pre-created flattened mesh.
+    persistent_extra_parallel_total = {
+        para: torch.tensor(0.0, device=torch.device(get_device_type()), dtype=torch.float32)
+        for para in ps.extra_parallel_names
+    }
+    for para in ps.extra_parallel_names:
+        if len(persistent_extra_parallel_params[para]) > 0:
+            para_total = _fsdp2_reduce_group(
+                params=persistent_extra_parallel_params[para],
+                norm_type=norm_type,
+                reduce_groups=[(f"{para}_flat", ps.extra_parallel_flat_group(para))],
+            )
+            persistent_extra_parallel_total[para] = para_total
+            logger.debug_rank0(f"{para} persistent 2D total grad norm: {para_total}")
+
     if math.isinf(norm_type):
         # ``torch.maximum`` is a 2-arg elementwise op, not variadic. Unpacking
         # ``*extra_parallel_total.values(), *extra_parallel_replicated_total.values()``
@@ -203,13 +230,18 @@ def extra_parallel_fsdp2_clip_grad_norm(
         # shared-LoRA case where both ``extra_parallel_total["ep"]`` and
         # ``extra_parallel_replicated_total["ep"]`` are populated.
         total_norm = non_extra_parallel_total
-        for t in itertools.chain(extra_parallel_total.values(), extra_parallel_replicated_total.values()):
+        for t in itertools.chain(
+            extra_parallel_total.values(),
+            extra_parallel_replicated_total.values(),
+            persistent_extra_parallel_total.values(),
+        ):
             total_norm = torch.maximum(total_norm, t)
     else:
         total_norm = _finalize_total_norm(
             non_extra_parallel_total
             + sum(extra_parallel_total.values())
-            + sum(extra_parallel_replicated_total.values()),
+            + sum(extra_parallel_replicated_total.values())
+            + sum(persistent_extra_parallel_total.values()),
             norm_type,
         )
 
@@ -220,6 +252,9 @@ def extra_parallel_fsdp2_clip_grad_norm(
         torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
         torch.nn.utils.clip_grads_with_norm_(
             extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach
+        )
+        torch.nn.utils.clip_grads_with_norm_(
+            persistent_extra_parallel_params[para], max_norm, total_norm, foreach=foreach
         )
     torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
 
