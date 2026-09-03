@@ -20,7 +20,7 @@ matters for downstream kernels.
 import pytest
 import torch
 
-from veomni.ops.kernels.moe._scatter import compute_expert_scatter_index
+from veomni.kernels._kernels.moe_experts.shared.scatter import compute_expert_scatter_index
 
 
 def _reference_scatter_index(expert_index: torch.Tensor) -> torch.Tensor:

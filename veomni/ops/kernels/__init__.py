@@ -26,5 +26,4 @@ from . import (  # noqa: F401
     gated_delta_rule,
     load_balancing_loss,
     mhc,
-    moe,
 )

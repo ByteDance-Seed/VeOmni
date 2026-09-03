@@ -77,12 +77,14 @@ from veomni.lora.moe_layers import (
     apply_independent_moe_lora,
     apply_shared_moe_lora,
 )
+from veomni.utils.device import IS_CUDA_AVAILABLE
 
 from .utils import (
     build_toy,
     experts_module_globs,
     find_all_matching_modules,
     find_first_matching_module,
+    fused_triton_moe_ops,
     load_lora_config,
 )
 
@@ -207,6 +209,51 @@ def test_layout_validate_and_wrap(toy_dir: str, mode: str):
                 f"{fqn}/{mode}/{spec_name}: expected lora_A ndim={expected_lora_ndim}, "
                 f"got {a_w.ndim} (shape={tuple(a_w.shape)})"
             )
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_wrapper_selects_kernel_impl(mode: str):
+    """Wrapper constructs ``moe_experts_lora`` from kernels ``moe_implementation``."""
+    from veomni.kernels.config import get_kernels_config, set_kernels_config
+
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, _ = find_first_matching_module(model, experts_module_globs(patterns))
+    _apply(
+        mode,
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper_e = model.get_submodule(sample_fqn)
+    assert wrapper_e.veomni_moe_lora.kernel == "moe_experts_lora"
+    assert wrapper_e.veomni_moe_lora.variant == mode
+    assert wrapper_e.veomni_moe_lora.impl == "eager"
+
+    if not IS_CUDA_AVAILABLE:
+        return
+    saved_cfg = get_kernels_config()
+    try:
+        torch.manual_seed(0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model_f = build_toy("qwen3_moe_toy", ops=fused_triton_moe_ops())
+        lora_cfg_f = resolve_fused_moe_lora_targets(model_f, load_lora_config("qwen3_moe_toy"))
+        fqn_f, _ = find_first_matching_module(model_f, experts_module_globs(lora_cfg_f["target_parameters"]))
+        _apply(
+            mode,
+            model_f,
+            target_parameter_patterns=lora_cfg_f["target_parameters"],
+            r=lora_cfg_f["rank"],
+            lora_alpha=lora_cfg_f["alpha"],
+            freeze_base_model=True,
+        )
+        wrapper_f = model_f.get_submodule(fqn_f)
+        assert wrapper_f.veomni_moe_lora.impl == "triton"
+    finally:
+        set_kernels_config(saved_cfg)
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
