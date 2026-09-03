@@ -11,9 +11,10 @@ extra parallel dimensions, or distributed/eager inference configs.
 - Different topology gets a module-local `ParallelState`.
 - `accelerator.fsdp_config.fsdp_scope: model` wraps the composed `OmniModel`
   once instead of each module. Module YAML is not rewritten: mesh, init
-  device, and FSDP wrap knobs come from the top-level accelerator. Every
-  OmniModule class is still a nested FSDP unit (the graph calls children,
-  not `OmniModel.forward()`).
+  device, and FSDP wrap knobs come from the top-level accelerator. Wrap
+  targets are each child's `_no_split_modules` scoped as `{child}.{ClassName}`,
+  so a class name applies only under its own child; leftover params unshard
+  on `OmniModel.forward()` (the FSDP root).
 
 ## Common Patterns
 

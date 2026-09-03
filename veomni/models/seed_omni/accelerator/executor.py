@@ -8,21 +8,24 @@ endpoint.
 
 For a profiler-free eager path (HF ``from_pretrained`` / single-process), use
 :class:`~veomni.models.seed_omni.modeling_omni.OmniModel` directly — its
-``generate`` calls each FSM endpoint without any of the machinery here. That
-model is inference-only; its ``forward`` raises, so training always goes through
-``execute_train_node``.
+``generate`` and ``forward`` call each endpoint without any of the machinery
+here. The dependency only ever points this way: training enters
+:meth:`OmniModel.forward` (the FSDP root), and the runtime hands it a
+:class:`TrainNodeRunner` as ``node_runner`` so the modeling itself stays
+portable to other frameworks.
 """
 
 from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Dict, Optional
 
 from ..graphs.base import NodeDef
+from ..modeling_omni import LOSS_KEY
 from ..utils.graph_profiler import GraphProfiler
 from .dispatch import call_graph_endpoint, unwrap_graph_module
 
 
 def execute_train_node(
-    modules: Dict[str, Any],
+    wrapped: Any,
     node: NodeDef,
     batch: Dict[str, Any],
     *,
@@ -31,38 +34,71 @@ def execute_train_node(
 ) -> Dict[str, Any]:
     """Run one training node under VeOmni (unwrap + scope + profile + meter).
 
-    Resolves ``node.module``, scopes its :class:`ParallelState` (via ``scope_fn``
-    — vocab-parallel ``emb`` / MoE EP groups), and runs ``pre_forward`` → method
-    → ``post_forward``, dispatching through the **wrapped** module so DDP/FSDP
-    hooks fire (non-``forward`` methods via the ``call_graph_endpoint``
-    trampoline).     ``raw`` (the graph hook owner) owns ``pre_forward`` / ``post_forward``;
-    FSDP2 is in-place (``raw is wrapped``) while DDP wraps (``raw =
-    wrapped.module``).
+    Not part of the package surface: :class:`TrainNodeRunner` is the only entry
+    point callers get, so per-step state (profiler, ``scope_fn``) is bound once
+    instead of being threaded through every call site.
+
+    ``wrapped`` is ``node.module``'s attribute on the ``OmniModel`` — i.e. the
+    DDP/FSDP wrapper when there is one. Scopes its :class:`ParallelState` (via
+    ``scope_fn`` — vocab-parallel ``emb`` / MoE EP groups), and runs
+    ``pre_forward`` → method → ``post_forward``, dispatching through the
+    **wrapped** module so DDP/FSDP hooks fire (non-``forward`` methods via the
+    ``call_graph_endpoint`` trampoline). ``raw`` (the graph hook owner) owns
+    ``pre_forward`` / ``post_forward``; FSDP2 is in-place (``raw is wrapped``)
+    while DDP wraps (``raw = wrapped.module``).
 
     Returns the (mutated) ``batch``.
     """
     method = node.method
-    wrapped = modules.get(node.module)
-    if wrapped is None:
-        raise KeyError(
-            f"execute_train_node: module '{node.module}' (node '{node.name}') missing "
-            f"from modules dict. Provided: {sorted(modules)}."
-        )
     raw = unwrap_graph_module(wrapped, module_name=node.module)
 
     module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
     profile_context = profiler.node(f"forward:{node.name}") if profiler is not None else nullcontext()
     with module_context, profile_context:
-        kwargs = raw.pre_forward(method=method, **batch)
+        inputs = raw.pre_forward(method=method, **batch)
 
         if hasattr(raw, "metric_meter_add"):
-            raw.metric_meter_add(method, kwargs)
+            raw.metric_meter_add(method, inputs)
 
-        out = call_graph_endpoint(wrapped, raw, method=method, kwargs=kwargs)
-        out = raw.post_forward(method=method, **out)
+        outputs = call_graph_endpoint(wrapped, raw, method=method, kwargs=inputs)
+        outputs = raw.post_forward(method=method, **outputs)
 
-    batch.update(out)
+    batch.update(outputs)
     return batch
+
+
+class TrainNodeRunner:
+    """The ``node_runner`` VeOmni injects into :meth:`OmniModel.forward`.
+
+    :meth:`OmniModel.forward` owns the graph walk and knows nothing about this
+    package; everything VeOmni-specific about running a node — wrapper unwrap,
+    ``ParallelState`` scoping, metering, graph profiling — lives here. State is
+    per-forward (``_prev_node`` only exists to label node transitions), so the
+    runtime builds one per step rather than reusing it.
+    """
+
+    def __init__(
+        self,
+        *,
+        profiler: Optional[GraphProfiler] = None,
+        scope_fn: Optional[Callable[[str], ContextManager]] = None,
+    ) -> None:
+        self.profiler = profiler
+        self.scope_fn = scope_fn
+        self._prev_node: Optional[NodeDef] = None
+
+    def __call__(self, wrapped: Any, node: NodeDef, batch: Dict[str, Any]) -> None:
+        profiler = self.profiler
+        if profiler is not None and self._prev_node is not None:
+            profiler.record(f"transition: -> {node.name}")
+
+        execute_train_node(wrapped, node, batch, profiler=profiler, scope_fn=self.scope_fn)
+
+        # ``OmniModel.forward`` pops the loss right after this returns, so the
+        # per-node loss marker has to be recorded while the key is still here.
+        if profiler is not None and LOSS_KEY in batch:
+            profiler.record(f"loss:{node.name}")
+        self._prev_node = node
 
 
 def execute_generation_node(
@@ -99,16 +135,16 @@ def execute_generation_node(
         else nullcontext()
     )
     with module_context, profile_context:
-        out = call_graph_endpoint(
+        outputs = call_graph_endpoint(
             wrapped,
             raw,
             method=method,
             kwargs={**ctx, "generation_kwargs": generation_kwargs},
         )
-    if not isinstance(out, dict):
-        raise TypeError(f"FSM node '{node.name}'.{method} must return a dict; got {type(out).__name__}.")
-    ctx.update(out)
+    if not isinstance(outputs, dict):
+        raise TypeError(f"FSM node '{node.name}'.{method} must return a dict; got {type(outputs).__name__}.")
+    ctx.update(outputs)
     return ctx
 
 
-__all__ = ["execute_train_node", "execute_generation_node"]
+__all__ = ["TrainNodeRunner", "execute_generation_node"]

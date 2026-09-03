@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
 
     from ..arguments import ModelRuntimeArguments, TrainingArguments
+    from ..arguments.arguments_types import AcceleratorConfig
     from ..data.chat_template import ChatTemplate
     from ..trainer.callbacks import TrainerState
     from .checkpoint_manager import ModelCheckpointManager
@@ -163,17 +164,28 @@ class VeOmniModelRuntime:
 
     # ── Model runtime property accessors ────────────────────────────────
 
+    @property
+    def mesh_accelerator(self) -> "AcceleratorConfig":
+        """The accelerator config that decides mesh, init device and wrap.
+
+        Its own by default. A composed runtime whose wrap happens one level up
+        overrides this so mesh and init follow the owner of the wrap rather than
+        the model's local overlay (see
+        :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`).
+        """
+        return self.args.accelerator
+
     def setup(self) -> None:
         """Build this model's device mesh and register it under :attr:`model_name`.
 
         The process group itself is job-bound and must already be initialised by
         :meth:`BaseTrainer.setup_distributed`; this only derives the model's own
-        mesh from its accelerator config, which is why sibling models in one job
+        mesh from :attr:`mesh_accelerator`, which is why sibling models in one job
         can hold different ones.
         """
         from ..distributed.parallel_state import init_parallel_state_from_accelerator
 
-        init_parallel_state_from_accelerator(self.args.accelerator, self.model_name)
+        init_parallel_state_from_accelerator(self.mesh_accelerator, self.model_name)
 
     @property
     def parallel_state(self):

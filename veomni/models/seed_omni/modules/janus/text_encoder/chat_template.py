@@ -120,7 +120,12 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                 out.append(self._build_conversation_item("text", text, role))
                 prev_was_user_image = False
             elif item.type == "image" and role != "dummy":
-                out.append(self._build_conversation_item("text", self.chat_markers.boi_token, role))
+                # ``<boi>`` stays out of the text CE: Janus was never trained to emit
+                # it (upstream VeOmni masks ``image_start_id`` for the same reason), so
+                # supervising it costs tens of nats and swamps the real text loss.
+                # ``<eoi>`` is supervised — after a fixed-length image span the model
+                # predicts it near-perfectly, and the reference stack scores it too.
+                out.append(self._build_conversation_item("text", self.chat_markers.boi_token, role, loss_mask=0))
                 out.append(item)  # media row passed through verbatim (keeps value/source/meta)
                 out.append(self._build_conversation_item("text", self.chat_markers.eoi_token, role))
                 prev_was_user_image = role == "user"
@@ -129,7 +134,16 @@ class JanusChatTemplate(TextEncoderChatTemplate):
             else:
                 raise ValueError(f"Unsupported part type: {item.type}")
         if prev_role == "assistant":
-            out.append(self._build_conversation_item("text", self.chat_markers.eos_token, "assistant"))
+            # Janus leaves the eos that follows a generated image untrained (upstream
+            # VeOmni masks it for the same reason), so scoring it on a T2I turn only
+            # adds noise. A text answer -- I2T caption or text-only SFT -- does
+            # supervise its eos; that is how the model learns to stop.
+            eos_loss_mask = 0 if self._ends_on_generated_image(sample) else None
+            out.append(
+                self._build_conversation_item(
+                    "text", self.chat_markers.eos_token, "assistant", loss_mask=eos_loss_mask
+                )
+            )
         out.extend(dummy_parts)
         return out
 
@@ -158,3 +172,12 @@ class JanusChatTemplate(TextEncoderChatTemplate):
     def _sample_has_user_image(sample: list[ConversationItem]) -> bool:
         """Return True when the raw conversation includes a user ``image`` row."""
         return any(item.type == "image" and item.role == "user" for item in sample)
+
+    @staticmethod
+    def _ends_on_generated_image(sample: list[ConversationItem]) -> bool:
+        """Return True when the assistant's last row is an ``image`` (a T2I turn)."""
+        for item in reversed(sample):
+            if item.role == "dummy":
+                continue
+            return item.type == "image" and item.role == "assistant"
+        return False

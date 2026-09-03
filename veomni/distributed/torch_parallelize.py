@@ -14,7 +14,7 @@
 
 
 import types
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -355,6 +355,34 @@ def _can_shard_extra_parallel_dim0(
     return True
 
 
+def _is_fsdp_wrap_target(fqn: str, class_name: str, targets: Collection[str]) -> bool:
+    """Whether ``fqn`` / ``class_name`` should be an FSDP wrap unit.
+
+    A bare name (``LlamaDecoderLayer``, the HF convention) matches that class
+    anywhere in the tree. A scoped name (``janus_text_encoder.Embedding``)
+    matches it only under that child: ``fqn == prefix`` or
+    ``fqn.startswith(prefix + ".")``.
+
+    Scoping exists because a class name alone is ambiguous on a composed model.
+    ``Embedding`` is a legitimate wrap unit under the text encoder (whose tied
+    head gathers the weight explicitly), but wrapping the same class under the
+    VQVAE makes ``JanusVQVAEVectorQuantizer.forward`` read a sharded codebook —
+    it touches ``self.embedding.weight`` directly, never through the
+    embedding's own ``__call__``, so no unshard hook fires.
+    """
+    for target in targets:
+        if not isinstance(target, str):
+            continue
+        prefix, _, name = target.rpartition(".")
+        if name != class_name:
+            continue
+        if not prefix:
+            return True
+        if fqn == prefix or fqn.startswith(prefix + "."):
+            return True
+    return False
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
@@ -402,7 +430,9 @@ def parallelize_model_fsdp2(
     # Thus, target module A could include target module B.
     #   e.g. `decoder` includes `decoder.embed_tokens`
     target_modules: List[Tuple[str, nn.Module]] = [
-        (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
+        (fqn, mod)
+        for fqn, mod in model.named_modules()
+        if _is_fsdp_wrap_target(fqn, mod.__class__.__name__, target_classes)
     ]
     logger.info_rank0(f"target classes to shard: {target_classes}")
 

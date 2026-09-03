@@ -88,6 +88,49 @@ def test_apply_chat_template_preserves_dummy_source():
     assert dummy_rows[0].source == "janus_vqvae"
 
 
+def _supervised_text(tmpl: JanusChatTemplate, parts: list[ConversationItem]) -> str:
+    """The text the CE head is asked to predict (``FakeTokenizer`` ids are codepoints)."""
+    tmpl.tokenize(parts)
+    return "".join(
+        chr(label) for part in parts if part.type == "text" for label in part.meta["labels"].tolist() if label != -100
+    )
+
+
+def test_t2i_supervises_only_eoi():
+    """A generated-image turn scores ``<eoi>`` alone — matching the reference stack.
+
+    Janus never learned to emit ``<boi>`` or the eos that follows a generated
+    image, so supervising either costs tens of nats and swamps the text loss
+    (the image tokens themselves are scored by the VQ head, not here).
+    """
+    sample = [
+        ConversationItem(type="text", value="a cat on the moon", role="user"),
+        ConversationItem(type="image", value=None, role="assistant", source="janus_vqvae"),
+    ]
+    tmpl = _template()
+    assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "<eoi>"
+
+
+def test_i2t_supervises_answer_and_eos():
+    """A text answer keeps its eos supervised so the model still learns to stop."""
+    sample = [
+        ConversationItem(type="image", value=None, role="user"),
+        ConversationItem(type="text", value="describe", role="user"),
+        ConversationItem(type="text", value="a cat", role="assistant"),
+    ]
+    tmpl = _template()
+    assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "a cat</s>"
+
+
+def test_text_only_supervises_answer_and_eos():
+    sample = [
+        ConversationItem(type="text", value="hello", role="user"),
+        ConversationItem(type="text", value="hi", role="assistant"),
+    ]
+    tmpl = _template()
+    assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "hi</s>"
+
+
 def test_expand_text_only_t2i_skips_system_prompt():
     """T2I-style user text (no user image) matches official empty system_prompt."""
     sample = [

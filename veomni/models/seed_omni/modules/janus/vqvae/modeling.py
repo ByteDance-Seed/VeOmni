@@ -29,6 +29,7 @@ from transformers.models.janus.modeling_janus import (
     JanusVQVAE,
     JanusVQVAEAlignerMLP,
     JanusVQVAEHead,
+    JanusVQVAEVectorQuantizer,
 )
 
 from veomni.utils import helper
@@ -175,6 +176,47 @@ class InferenceMixin:
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
+class JanusVqvaeVectorQuantizer(JanusVQVAEVectorQuantizer):
+    """Janus codebook lookup, done in the l2-normalised space the codebook lives in.
+
+    Janus trains its VQ codebook under ``codebook_l2_norm=True``: the reference
+    quantiser l2-normalises BOTH the encoder latent and the codebook rows before
+    the nearest-neighbour search, i.e. it matches by cosine similarity.  HF's
+    ``JanusVQVAEVectorQuantizer.forward`` searches in the raw space and only
+    normalises on the decode side (``get_codebook_entry``), so its encode and
+    decode disagree: on ImageNet only ~42% of the token ids it returns match the
+    reference tokenizer's.  Those ids are the LM's *targets* AND (via
+    ``generation_embeddings``) its inputs, so a wrong-but-self-consistent id
+    stream is off-distribution for the pretrained model — measured frozen-model
+    image cross-entropy sat near ``ln(16384) = 9.7`` (chance) instead of ~7.2.
+
+    Overriding ``forward`` restores exact agreement with the reference ids.
+    """
+
+    def forward(self, hidden_state: torch.Tensor):
+        hidden_state = hidden_state.permute(0, 2, 3, 1).contiguous()
+        flat_state = F.normalize(hidden_state.view(-1, self.embedding_dim), p=2, dim=-1)
+        embedding = F.normalize(self.embedding.weight, p=2, dim=-1)
+
+        # (z - e)^2 = z^2 + e^2 - 2 e * z, over the normalised vectors.
+        distances = (
+            flat_state.pow(2).sum(dim=1, keepdim=True)
+            + embedding.pow(2).sum(dim=1)
+            - 2 * flat_state @ embedding.transpose(0, 1)
+        )
+        min_encoding_indices = distances.argmin(dim=1)
+
+        normalized_state = flat_state.view(hidden_state.shape)
+        quantized = embedding[min_encoding_indices].view(hidden_state.shape)
+        loss = torch.mean((quantized.detach() - normalized_state) ** 2) + self.beta * torch.mean(
+            (quantized - normalized_state.detach()) ** 2
+        )
+        quantized = normalized_state + (quantized - normalized_state).detach()  # straight-through
+        quantized = quantized.permute(0, 3, 1, 2).contiguous()
+
+        return quantized, loss, min_encoding_indices
+
+
 class JanusVqvae(InferenceMixin, OmniPreTrainedModel):
     """VQVAE + generation head for Janus VQ image generation.
 
@@ -189,12 +231,15 @@ class JanusVqvae(InferenceMixin, OmniPreTrainedModel):
     preprocessor_class = JanusVqvaePreprocessor
     base_model_prefix = "janus_vqvae"
     main_input_name = "pixel_values"
-    _no_split_modules: list = []
+    # Mirrors HF ``JanusVQVAE._no_split_modules`` with our quantiser subclass in
+    # place of theirs, so the FSDP wrap plan is unchanged by the swap below.
+    _no_split_modules = ["JanusVQVAEAttnBlock", "JanusVQVAEResnetBlock", "JanusVqvaeVectorQuantizer"]
 
     def __init__(self, config: JanusVqvaeConfig):
         super().__init__(config)
         self.config = config
         self.vqmodel = JanusVQVAE._from_config(config.vq_config)
+        self.vqmodel.quantize = JanusVqvaeVectorQuantizer(config.vq_config)
         self.generation_embeddings = nn.Embedding(config.vq_config.num_embeddings, config.vq_config.embed_dim)
         self.generation_aligner = JanusVQVAEAlignerMLP(config.vq_config)
         self.generation_head = JanusVQVAEHead(config.vq_config)

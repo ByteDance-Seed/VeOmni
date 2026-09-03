@@ -227,9 +227,10 @@ Training writes rank-0 graph traces only when any detail switch is enabled,
 under `train.checkpoint.output_dir/graph_trace`.
 
 Execution is driven by the runtime, not the module's `pre_forward`.
-`OmniModelRuntime.forward` loops `TrainingGraph.iter_nodes()` (which selects nodes
-and advances via `maybe_transition`), draining each node's `_loss` as it goes, and
-`execute_train_node` runs one node end-to-end, which:
+`OmniModel.forward` loops `TrainingGraph.iter_nodes()` (which selects nodes and
+advances via `maybe_transition`), draining each node's `_loss` as it goes, and
+hands each node to the `node_runner` the runtime injected — `TrainNodeRunner`,
+which calls `execute_train_node` to run one node end-to-end, which:
 
 1. runs the module's `pre_forward` → real input tensors (and, for metered
    modules, `metric_meter_set_seqlens(method, seqlens)` stashes the token lengths);
@@ -374,21 +375,23 @@ What each node does to the shared carrier:
 5. **`janus_text_encoder.decode`** / **`janus_vqvae.decode`** — read hidden
    states + labels off the carrier and each return one `_loss`.
 
-The runtime loop (simplified from `OmniModel.forward` + `TrainingGraph.iter_nodes`,
+The loop (simplified from `OmniModel.forward` + `TrainingGraph.iter_nodes`,
 which mirrors `OmniModel.generate` + `GenerationGraph.iter_nodes`):
 
 ```python
+# In OmniModel.forward — no VeOmni import in sight, so this modeling stays
+# portable. The graph only SELECTS nodes (profiler-free — it is model-bound).
 training_graph.reset()
-profiler = GraphProfiler()
-# The graph only SELECTS nodes (profiler-free — it is model-bound); execution is
-# external (execute_train_node) and the profiler lives at the call site.
 for node in training_graph.iter_nodes():
-    # execute_train_node runs the selected node end-to-end: unwrap the wrapped
-    # sub-module (held by OmniModel), scope its ParallelState (scope_fn), pre_forward →
-    # call (through the FSDP/DDP wrapper) → post_forward, merge conversation_list
-    # + _loss back into the shared batch (edges are topology only, no input routing).
-    execute_train_node(modules, node, batch, profiler=profiler, scope_fn=scope_fn)
-    self._collect_training_loss(batch, node.name, profiler)   # pop _loss → self._losses[node]
+    # run_node is `node_runner` when the runtime passed one, else the modeling's
+    # own eager `_run_train_node`. VeOmni passes TrainNodeRunner, which delegates
+    # to execute_train_node: unwrap the wrapped sub-module (held by OmniModel),
+    # scope its ParallelState, pre_forward → call (through the FSDP/DDP wrapper)
+    # → post_forward, merge conversation_list + _loss back into the shared batch
+    # (edges are topology only, no input routing), and record profiler markers.
+    run_node(self.get_module(node.module), node, batch)
+    loss = batch.pop("_loss", None)          # → self._losses[node.name]
+    ...
 total_loss = sum(self._losses.values())
 ```
 

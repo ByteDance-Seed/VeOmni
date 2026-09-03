@@ -122,6 +122,6 @@ for each node:
 # 全图一次 loss.backward()；FSDP2 在含 sp 的 mesh 上规约梯度
 ```
 
-- 入口：`veomni/models/seed_omni/accelerator/executor.py::execute_train_node`（`pre_forward → endpoint → post_forward`；`TrainingGraph` 只负责选节点。SP 收在模块 `pre_forward` / `post_forward` 的 `if sp_size>1` 分支里）。
+- 入口：`veomni/models/seed_omni/accelerator/executor.py::execute_train_node`（`pre_forward → endpoint → post_forward`；`TrainingGraph` 只负责选节点，`OmniModel.forward` 走图并通过 `node_runner`（`TrainNodeRunner`）调到这里。SP 收在模块 `pre_forward` / `post_forward` 的 `if sp_size>1` 分支里）。
 - 原语：`slice_input_tensor` / `sp_pad` / `sp_pad_and_slice` / `gather_outputs`（`sequence_parallel/data.py`）。
 - 细节见 `.agents/knowledge/constraints.md` §7-outer / §7a / §7b / §7c / §7d / §7e。

@@ -876,18 +876,19 @@ def _text_only_batch():
     ]
 
 
-def test_siglip_appends_one_dummy_per_sample_when_no_user_image():
+def test_siglip_appends_one_batch_anchor_when_no_user_image():
     pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "janus_siglip")
-    assert len(dummies) == len(batch)
-    for d in dummies:
-        assert d.type == "image" and d.role == "dummy"
-        assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
-        assert d.source == "janus_siglip"
+    assert len(dummies) == 1
+    assert dummies[0] is batch[0][-1]
+    d = dummies[0]
+    assert d.type == "image" and d.role == "dummy"
+    assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
+    assert d.source == "janus_siglip"
 
 
 def test_siglip_no_dummy_when_user_image_present():
@@ -900,7 +901,7 @@ def test_siglip_no_dummy_when_user_image_present():
     assert batch[0][0].value.dtype == torch.bfloat16  # real image normalized instead
 
 
-def test_siglip_appends_dummy_for_missing_samples_in_mixed_batch():
+def test_siglip_no_dummy_when_any_sample_in_batch_has_a_user_image():
     pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
@@ -910,25 +911,24 @@ def test_siglip_appends_dummy_for_missing_samples_in_mixed_batch():
     ]
     pre(_b(batch))
 
-    dummies = _worker_dummies(batch, "janus_siglip")
-    assert len(dummies) == 1
-    assert len(batch[0]) == 1
-    assert dummies[0] is batch[1][-1]
-    assert dummies[0].source == "janus_siglip"
+    # The real image already anchors the tower for the whole micro-batch.
+    assert _worker_dummies(batch, "janus_siglip") == []
+    assert len(batch[0]) == 1 and len(batch[1]) == 1
 
 
-def test_vqvae_appends_dummy_only_when_no_assistant_image():
+def test_vqvae_appends_one_batch_anchor_when_no_assistant_image():
     pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "janus_vqvae")
-    assert len(dummies) == len(batch)
-    assert all(d.source == "janus_vqvae" and d.value.shape == (3, 4, 4) for d in dummies)
+    assert len(dummies) == 1
+    assert dummies[0] is batch[0][-1]
+    assert dummies[0].source == "janus_vqvae" and dummies[0].value.shape == (3, 4, 4)
 
 
-def test_vqvae_appends_dummy_for_missing_samples_in_mixed_batch():
+def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
     pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
@@ -938,14 +938,11 @@ def test_vqvae_appends_dummy_for_missing_samples_in_mixed_batch():
     ]
     pre(_b(batch))
 
-    dummies = _worker_dummies(batch, "janus_vqvae")
-    assert len(dummies) == 1
-    assert len(batch[0]) == 1
-    assert dummies[0] is batch[1][-1]
-    assert dummies[0].source == "janus_vqvae"
+    assert _worker_dummies(batch, "janus_vqvae") == []
+    assert len(batch[0]) == 1 and len(batch[1]) == 1
 
 
-def test_qwen3vl_vision_appends_dummy_with_grid_when_no_visual():
+def test_qwen3vl_vision_appends_one_batch_anchor_with_grid_when_no_visual():
     proc = FakeQwen3VLImageProcessor()
     pre = Qwen3VLVisionPreprocessor(
         proc,
@@ -957,13 +954,14 @@ def test_qwen3vl_vision_appends_dummy_with_grid_when_no_visual():
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "qwen3vl_vision")
-    assert len(dummies) == len(batch)
-    for d in dummies:
-        assert d.value.shape == (4, 8) and d.value.dtype == torch.bfloat16
-        assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.source == "qwen3vl_vision"
+    assert len(dummies) == 1
+    assert dummies[0] is batch[0][-1]
+    d = dummies[0]
+    assert d.value.shape == (4, 8) and d.value.dtype == torch.bfloat16
+    assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.source == "qwen3vl_vision"
 
 
-def test_qwen3vl_vision_appends_dummy_for_missing_samples_in_mixed_batch():
+def test_qwen3vl_vision_no_dummy_when_any_sample_in_batch_has_a_visual():
     pre = Qwen3VLVisionPreprocessor(
         FakeQwen3VLImageProcessor(),
         None,
@@ -977,12 +975,8 @@ def test_qwen3vl_vision_appends_dummy_for_missing_samples_in_mixed_batch():
     ]
     pre(_b(batch))
 
-    dummies = _worker_dummies(batch, "qwen3vl_vision")
-    assert len(dummies) == 1
-    assert len(batch[0]) == 1
-    assert dummies[0] is batch[1][-1]
-    assert dummies[0].meta[_OMNI_GRID] == [1, 2, 2]
-    assert dummies[0].source == "qwen3vl_vision"
+    assert _worker_dummies(batch, "qwen3vl_vision") == []
+    assert len(batch[0]) == 1 and len(batch[1]) == 1
 
 
 def test_worker_dummy_routes_to_dummy_parts_in_text_template():

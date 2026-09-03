@@ -138,5 +138,22 @@ class ModulePreprocessorBase:
         del config, dtype
         return None
 
+    @staticmethod
+    def append_batch_anchor(conversation_list: list[list[Any]], item: Any) -> None:
+        """Attach ``item`` as this micro-batch's single FSDP anchor row.
+
+        The anchor exists so a module whose real inputs are absent this step still
+        runs forward and backward, keeping its FSDP2 collectives in step with the
+        other ranks. One row does that: the module's graph hooks batch every row
+        tagged with their ``source`` and flag the batch all-dummy, and every
+        downstream consumer filters dummies out. Appending one per *sample*
+        instead would put a full-size dummy image per sample through the tower —
+        on a batch with no real images for this module that was the single largest
+        term in the step (a 48-sample Janus T2I micro-batch spent more time in the
+        all-dummy SigLIP pass than in the language model).
+        """
+        if conversation_list:
+            conversation_list[0].append(item)
+
 
 __all__ = ["ModulePreprocessorBase"]

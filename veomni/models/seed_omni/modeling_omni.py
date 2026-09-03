@@ -1,19 +1,26 @@
 """
 OmniModel V2 — composable multi-modal model driven by config-specified graphs.
 
-This file holds the **clean modeling definition** — FSM inference via
-:meth:`OmniModel.generate` and checkpoint compose/load/save.  It is profiler-free
-and parallel-infra-free so it can be loaded with HF ``from_pretrained`` /
-``from_config`` and run eager single-process inference without VeOmni.
+This file holds the **clean modeling definition** — training graph via
+:meth:`OmniModel.forward`, FSM inference via :meth:`OmniModel.generate`, and
+checkpoint compose/load/save.  It must import nothing from VeOmni's runtime
+(``accelerator`` / ``distributed`` / trainer), at module scope or inside a
+function, so this modeling can be lifted into another framework as-is and so
+HF ``from_pretrained`` / ``from_config`` keeps working for eager
+single-process inference. ``tests/seed_omni/test_graph.py`` asserts this.
 
-Training and distributed execution belong in ``accelerator/``; this module
-imports nothing from there.
+``forward`` is the FSDP2 root entry: leftover params unshard on ``__call__``,
+then the training graph runs each child. Everything runtime-specific about
+running a node arrives through the optional ``node_runner`` argument, which
+:class:`~veomni.models.seed_omni.accelerator.omni_model_runtime.OmniModelRuntime`
+supplies.
 
 Architecture
 ------------
 ``OmniModel`` carries:
 
 * sub-modules — each graph participant is a direct attribute from the registry.
+* ``training_graph`` — :class:`TrainingGraph` (DAG).
 * ``generation_graph`` — :class:`GenerationGraph` (FSM).
 
 Inference
@@ -26,7 +33,7 @@ endpoint directly (no pre/post hooks).  Stop when ``is_done()`` or
 from __future__ import annotations
 
 import os
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -41,6 +48,9 @@ from .modules import OMNI_MODEL_REGISTRY, read_model_type
 
 
 logger = helper.create_logger(__name__)
+
+# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits.
+LOSS_KEY = "_loss"
 
 # HF hub kwargs forwarded to :meth:`OmniConfig.from_pretrained`.
 _CONFIG_LOAD_KWARG_NAMES = frozenset(
@@ -98,8 +108,18 @@ class OmniModel(PreTrainedModel):
             self.add_module(name, modules[name])
 
         # ``PreTrainedModel.post_init`` unions children's ``_no_split_modules``
-        # (FSDP unit class names) onto the composite model. ``super().__init__``
-        # ran it before the children existed.
+        # (FSDP unit class names) and parallel plans onto the composite model.
+        # ``super().__init__`` ran it before the children existed.
+        #
+        # It also runs ``init_weights()``, whose ``smart_apply`` dispatches each
+        # child PreTrainedModel's *own* ``_init_weights`` — real random init for
+        # any module not flagged ``_is_hf_initialized``. A child handed to us has
+        # already been built and possibly loaded (VeOmni materializes a module
+        # before composing, and its loader does not set that flag the way HF's
+        # ``from_pretrained`` does), so let the children keep what they hold.
+        for name in self._module_names:
+            for module in getattr(self, name).modules():
+                module._is_hf_initialized = True
         self.post_init()
 
         self.training_graph = TrainingGraph(config.training_graph)
@@ -107,6 +127,7 @@ class OmniModel(PreTrainedModel):
 
         self._last_printed_state: str | None = None
         self._generated: list[dict[str, Any]] = []
+        self._losses: dict[str, Any] = {}
 
         self.reset()
 
@@ -339,12 +360,58 @@ class OmniModel(PreTrainedModel):
         """Back-compat dict view of the sub-modules."""
         return {name: getattr(self, name) for name in self._module_names}
 
-    def forward(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Training is not supported on the bare :class:`OmniModel`."""
-        raise NotImplementedError(
-            "OmniModel.forward() is not available on the native eager model. "
-            "Training requires OmniModelRuntime (see OmniTrainer)."
-        )
+    def _run_train_node(
+        self,
+        module: nn.Module,
+        node: NodeDef,
+        batch: dict[str, Any],
+    ) -> None:
+        """Run one training node — ``pre_forward`` → endpoint → ``post_forward``."""
+        method = node.method
+        fn = getattr(module, method, None)
+        if fn is None:
+            raise AttributeError(f"Node method {type(module).__name__}.{method}() is not implemented.")
+        inputs = module.pre_forward(method=method, **batch)
+        outputs = fn(**inputs)
+        outputs = module.post_forward(method=method, **outputs)
+        batch.update(outputs)
+
+    def forward(
+        self,
+        batch: dict[str, Any],
+        *args: Any,
+        node_runner: Callable[[nn.Module, NodeDef, dict[str, Any]], None] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Run the training DAG; this is the FSDP2 root ``forward``.
+
+        Each node is ``pre_forward`` → endpoint → ``post_forward``. Nested wrap
+        units (decoder layers, ``Embedding``, …) unshard on their own
+        ``__call__``; leftover params on this module unshard because training
+        enters here.
+
+        ``node_runner`` replaces :meth:`_run_train_node` for every node. It is
+        the seam that keeps this modeling free of any training-framework import:
+        the default runs each endpoint eagerly (correct for an unwrapped,
+        single-process model), while VeOmni injects
+        :class:`~veomni.models.seed_omni.accelerator.executor.TrainNodeRunner`
+        to add wrapper unwrap, ``ParallelState`` scoping, metering and graph
+        profiling. The graph walk, loss collection and return contract stay here
+        so a port to another framework only has to supply a runner.
+        """
+        del args, kwargs
+        run_node = node_runner if node_runner is not None else self._run_train_node
+
+        self.training_graph.reset()
+        self._losses.clear()
+
+        for node in self.training_graph.iter_nodes():
+            run_node(self.get_module(node.module), node, batch)
+            loss = batch.pop(LOSS_KEY, None)
+            if loss is not None:
+                self._losses[node.name] = loss
+
+        return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -491,6 +558,16 @@ class OmniModel(PreTrainedModel):
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
+def _sum_losses(losses: dict[str, Any]) -> Any | None:
+    if not losses:
+        return None
+    it = iter(losses.values())
+    total = next(it)
+    for v in it:
+        total = total + v
+    return total
+
+
 def merge_generation_kwargs(
     defaults: Mapping[str, Any] | None,
     overrides: Mapping[str, Any] | None,
@@ -501,4 +578,4 @@ def merge_generation_kwargs(
     return merged
 
 
-__all__ = ["OmniModel", "merge_generation_kwargs"]
+__all__ = ["LOSS_KEY", "OmniModel", "merge_generation_kwargs"]

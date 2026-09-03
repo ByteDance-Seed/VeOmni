@@ -223,8 +223,8 @@ def _omni_runtime_args(*, accelerator=None, optimizer=None):
     )
 
 
-def test_composed_wrap_fully_shards_each_omni_module_class(monkeypatch: pytest.MonkeyPatch):
-    """Graph calls children, so each OmniModule class must be an FSDP unit."""
+def test_composed_wrap_scopes_child_no_split_modules(monkeypatch: pytest.MonkeyPatch):
+    """Each child's ``_no_split_modules`` is prefixed with that child's name."""
     from unittest.mock import MagicMock
 
     from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
@@ -254,10 +254,56 @@ def test_composed_wrap_fully_shards_each_omni_module_class(monkeypatch: pytest.M
     omni.omni_model_runtime_args = _omni_runtime_args()
     omni._parallelize_composed_model()
 
-    assert "_ChildA" in captured["basic_modules"]
-    assert "_ChildB" in captured["basic_modules"]
-    assert "LayerA" in captured["basic_modules"]
+    assert captured["basic_modules"] == ["a.LayerA"]
+    assert omni.model._no_split_modules == ["a.LayerA"]
     assert captured["weights_path"] == {"a": "/tmp/a", "b": "/tmp/b"}
+    assert "_ChildA" not in captured["basic_modules"]
+    assert "_ChildB" not in captured["basic_modules"]
+
+
+def test_composed_wrap_scopes_embedding_to_owning_child(monkeypatch: pytest.MonkeyPatch):
+    """TextEncoder ``Embedding`` must not also match a sibling VQ codebook."""
+    from unittest.mock import MagicMock
+
+    from veomni.models.seed_omni.accelerator.omni_model_runtime import OmniModelRuntime
+
+    class _TextEnc(torch.nn.Module):
+        _no_split_modules = ["Embedding"]
+
+    class _Vqvae(torch.nn.Module):
+        _no_split_modules = ["JanusVQVAEVectorQuantizer"]
+
+    class _Llama(torch.nn.Module):
+        _no_split_modules = ["LlamaDecoderLayer"]
+
+    captured: dict = {}
+
+    def _fake_build(model, **kwargs):
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr("veomni.distributed.torch_parallelize.build_parallelize_model", _fake_build)
+
+    omni = OmniModelRuntime.__new__(OmniModelRuntime)
+    omni.model = MagicMock()
+    omni.model._no_split_modules = ["Embedding", "JanusVQVAEVectorQuantizer"]
+    omni.module_runtimes = {
+        "text": _defer_runtime("text", _TextEnc()),
+        "vqvae": _defer_runtime("vqvae", _Vqvae()),
+        "llama": _defer_runtime("llama", _Llama()),
+    }
+    omni.omni_model_runtime_args = _omni_runtime_args()
+    omni._parallelize_composed_model()
+
+    assert captured["basic_modules"] == [
+        "text.Embedding",
+        "vqvae.JanusVQVAEVectorQuantizer",
+        "llama.LlamaDecoderLayer",
+    ]
+    assert omni.model._no_split_modules == captured["basic_modules"]
+    assert "Embedding" not in captured["basic_modules"]
+    assert "_TextEnc" not in captured["basic_modules"]
+    assert "_Vqvae" not in captured["basic_modules"]
 
 
 def test_composed_wrap_does_not_inspect_module_level_sp():
@@ -309,6 +355,20 @@ def test_composed_wrap_uses_composer_accelerator_not_module_overlay(monkeypatch:
 
     assert captured["init_device"] == "meta"
     assert captured["muon_expert_zero_comm"] is True
+
+
+def test_fsdp_wrap_target_scopes_class_to_child_prefix():
+    """A scoped target wraps its class under that child only; bare stays global."""
+    from veomni.distributed.torch_parallelize import _is_fsdp_wrap_target
+
+    targets = {"text.Embedding", "llama.LlamaDecoderLayer"}
+    assert _is_fsdp_wrap_target("text.embed_tokens", "Embedding", targets)
+    assert _is_fsdp_wrap_target("llama.language_model.layers.0", "LlamaDecoderLayer", targets)
+    # The VQ codebook is the same class under a different child.
+    assert not _is_fsdp_wrap_target("vqvae.vqmodel.quantize.embedding", "Embedding", targets)
+    # A prefix must match on a path boundary, not a string prefix.
+    assert not _is_fsdp_wrap_target("text_encoder.embed_tokens", "Embedding", targets)
+    assert _is_fsdp_wrap_target("layers.0", "LlamaDecoderLayer", {"LlamaDecoderLayer"})
 
 
 def test_composed_wrap_skips_when_fsdp_scope_is_module(monkeypatch: pytest.MonkeyPatch):

@@ -63,6 +63,9 @@ def test_omni_fsdp_pipeline(nproc, tmp_path):
 
     import math
 
+    # Without this the zip() below would pass vacuously on an empty metrics file.
+    assert metrics["grad_norm_encoder"], "worker recorded no steps"
+
     for i, (gne, gnl, opt_ok) in enumerate(
         zip(metrics["grad_norm_encoder"], metrics["grad_norm_llm"], metrics["optimizer_state_ok"])
     ):

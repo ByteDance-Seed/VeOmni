@@ -80,10 +80,9 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
     Holds only the (picklable) HF image / video processors + a CPU zero-patch
     template — never the model. Runs them on **CPU** (bf16, to halve IPC), writes
     the per-item normalized patches onto ``item.value`` and stashes ``grid_thw`` on
-    ``meta``. For each sample without a user image/video, appends a
-    ``role="dummy"`` placeholder
-    carrying the zero patches + grid (the merger still runs on it in the GPU
-    forward for the FSDP gradient anchor).
+    ``meta``. When a whole micro-batch has no user image/video, appends one
+    ``role="dummy"`` placeholder carrying the zero patches + grid (the merger still
+    runs on it in the GPU forward for the FSDP gradient anchor).
     """
 
     def __init__(
@@ -127,6 +126,7 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
+        saw_real_media = False
         for sample in conversation_list:
             sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
             sample_video_items = list(iter_desired_items([sample], types=["video"], roles=["user"]))
@@ -140,21 +140,25 @@ class Qwen3VLVisionPreprocessor(ModulePreprocessorBase):
                         videos=frames, video_metadata=_video_metadata(sample_video_items, frames), return_tensors="pt"
                     )
                     self._store(sample_video_items, out["pixel_values_videos"], out["video_grid_thw"])
-            elif not inference:
-                if self._dummy_pixel_values is None:
-                    raise RuntimeError(
-                        f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                        "before training use (pure inference never reaches this branch)."
-                    )
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=self._dummy_pixel_values,
-                        role="dummy",
-                        source=_SOURCE,
-                        meta={_OMNI_GRID: self._dummy_grid},
-                    )
-                )
+                saw_real_media = True
+
+        if inference or saw_real_media:
+            return
+        if self._dummy_pixel_values is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                "before training use (pure inference never reaches this branch)."
+            )
+        self.append_batch_anchor(
+            conversation_list,
+            ConversationItem(
+                type="image",
+                value=self._dummy_pixel_values,
+                role="dummy",
+                source=_SOURCE,
+                meta={_OMNI_GRID: self._dummy_grid},
+            ),
+        )
 
     def _store(self, items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> None:
         _store_patches(items, pixel_values, grid_thw, self._dtype)

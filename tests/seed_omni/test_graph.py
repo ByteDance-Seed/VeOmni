@@ -11,7 +11,11 @@ import torch.nn as nn
 from veomni.arguments import OmniGraphProfileArguments
 from veomni.models.seed_omni import EdgeDef, NodeDef
 from veomni.models.seed_omni.accelerator import OmniModelRuntime
-from veomni.models.seed_omni.accelerator.executor import execute_generation_node, execute_train_node
+from veomni.models.seed_omni.accelerator.executor import (
+    TrainNodeRunner,
+    execute_generation_node,
+    execute_train_node,
+)
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.base import END
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
@@ -274,7 +278,7 @@ def test_plan_loop_flows_carrier_in_topological_order():
     profiler = GraphProfiler()
     g.reset()
     for node in g.iter_nodes():
-        execute_train_node(modules, node, batch, profiler=profiler)
+        execute_train_node(modules[node.module], node, batch, profiler=profiler)
     # run_ar runs last; both encoders precede it.
     trace = profiler.save_records()
     assert batch["conversation_list"][-1] == "run_ar.forward"
@@ -318,9 +322,91 @@ def test_omni_model_runtime_forward_matches_manual_executor():
     runtime.forward(batch_runtime, profiler=profiler)
     g.reset()
     for node in g.iter_nodes():
-        execute_train_node(modules, node, batch_manual, profiler=GraphProfiler())
+        execute_train_node(modules[node.module], node, batch_manual, profiler=GraphProfiler())
 
     assert batch_runtime == batch_manual
+
+
+def test_omni_model_runtime_forward_enters_composed_model_call(monkeypatch: pytest.MonkeyPatch):
+    """FSDP leftover unshard requires ``OmniModel.__call__``, not an out-of-band graph loop."""
+    edges = _understanding_only_edges()
+    g = TrainingGraph(edges)
+    modules = _fake_modules(g)
+    config = OmniConfig(
+        modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
+        training_graph=edges,
+        generation_graphs=_minimal_generation_graphs(),
+    )
+    model = OmniModel(config, modules)
+    runtime = OmniModelRuntime(model)
+
+    called: list[int] = []
+    orig_call = nn.Module.__call__
+
+    def _tracking_call(self, *args, **kwargs):
+        called.append(id(self))
+        return orig_call(self, *args, **kwargs)
+
+    monkeypatch.setattr(nn.Module, "__call__", _tracking_call)
+    runtime.forward({"conversation_list": []})
+
+    assert called and called[0] == id(model)
+
+
+def test_omni_model_forward_runs_graph_without_a_runner():
+    """Without an injected runner the graph runs on the modeling's own eager path."""
+    edges = _understanding_only_edges()
+    g = TrainingGraph(edges)
+    modules = _fake_modules(g)
+    config = OmniConfig(
+        modules={name: {"subfolder": name} for name in {g.module_of(n) for n in g.execution_order}},
+        training_graph=edges,
+        generation_graphs=_minimal_generation_graphs(),
+    )
+    model = OmniModel(config, modules)
+
+    batch: dict = {"conversation_list": []}
+    out = model(batch)
+
+    assert batch["conversation_list"] == [f"{g.module_of(n)}.forward" for n in g.execution_order]
+    assert out == {"loss": None, "losses": {}}
+
+
+def test_modeling_omni_imports_no_veomni_runtime_package():
+    """``modeling_omni`` must stay liftable into another framework.
+
+    Everything runtime-specific about running a node (wrapper unwrap,
+    ParallelState scoping, metering, profiling) reaches ``OmniModel.forward``
+    through its ``node_runner`` argument, so the modeling needs no import from
+    VeOmni's accelerator / distributed / trainer layers — not even a lazy one
+    inside a function body.
+    """
+    import ast
+    import pathlib
+
+    from veomni.models.seed_omni import modeling_omni
+
+    forbidden = {"accelerator", "distributed", "trainer"}
+
+    def _veomni_paths(stmt: ast.stmt) -> list[list[str]]:
+        """Segments of each imported first-party path, ``veomni.`` prefix stripped."""
+        if isinstance(stmt, ast.Import):
+            return [a.name.split(".")[1:] for a in stmt.names if a.name.startswith("veomni.")]
+        if isinstance(stmt, ast.ImportFrom):
+            base = (stmt.module or "").split(".")
+            if stmt.level == 0:  # absolute: only veomni is first-party
+                if base[:1] != ["veomni"]:
+                    return []
+                base = base[1:]
+            return [[*base, a.name] for a in stmt.names]
+        return []
+
+    tree = ast.parse(pathlib.Path(modeling_omni.__file__).read_text(encoding="utf-8"))
+    offenders = [
+        ".".join(path) for stmt in ast.walk(tree) for path in _veomni_paths(stmt) if forbidden.intersection(path)
+    ]
+
+    assert not offenders, f"modeling_omni must not import VeOmni runtime code: {sorted(set(offenders))}"
 
 
 def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
@@ -413,7 +499,7 @@ def test_execute_train_node_dispatches_non_forward_method_via_wrapper():
     g = TrainingGraph([{"from": "vq_decoder.encode", "to": "end"}])
     modules = _fake_modules(g)
     node = next(g.iter_nodes())
-    batch = execute_train_node(modules, node, {"conversation_list": []})
+    batch = execute_train_node(modules[node.module], node, {"conversation_list": []})
     assert batch["conversation_list"] == ["vq_decoder.encode"]
     # forward restored after the aliased call.
     assert modules["vq_decoder"].forward.__name__ == "forward"
@@ -432,7 +518,7 @@ def test_execute_train_node_unwraps_ddp_style_wrapper():
     g = TrainingGraph([{"from": "run_ar", "to": "end"}])
     inner = _FakeOmniModule("run_ar")
     node = next(g.iter_nodes())
-    batch = execute_train_node({"run_ar": _DDPWrap(inner)}, node, {"conversation_list": []})
+    batch = execute_train_node(_DDPWrap(inner), node, {"conversation_list": []})
     assert batch["conversation_list"] == ["run_ar.forward"]
 
 
@@ -515,7 +601,7 @@ def test_execute_train_node_applies_module_scope():
 
     g = TrainingGraph([{"from": "run_ar", "to": "end"}])
     node = next(g.iter_nodes())
-    execute_train_node(_fake_modules(g), node, {"conversation_list": []}, scope_fn=scope_fn)
+    execute_train_node(_fake_modules(g)[node.module], node, {"conversation_list": []}, scope_fn=scope_fn)
     assert scoped == ["run_ar"]
 
 
@@ -528,15 +614,34 @@ def test_execute_train_node_merges_loss_into_batch():
 
     g = TrainingGraph([{"from": "run_ar", "to": "end"}])
     node = next(g.iter_nodes())
-    batch = execute_train_node({"run_ar": _LossModule("run_ar")}, node, {"conversation_list": []})
+    batch = execute_train_node(_LossModule("run_ar"), node, {"conversation_list": []})
     assert batch["_loss"] == 1.5
 
 
-def test_execute_train_node_raises_for_missing_module():
-    g = TrainingGraph([{"from": "run_ar", "to": "end"}])
-    node = next(g.iter_nodes())
-    with pytest.raises(KeyError, match="missing from modules dict"):
-        execute_train_node({}, node, {"conversation_list": []})
+def test_train_node_runner_records_transitions_and_losses():
+    """The runner, not ``OmniModel.forward``, owns the profiler markers."""
+
+    class _LossModule(_FakeOmniModule):
+        def forward(self, **kwargs):
+            out = super().forward(**kwargs)
+            out["_loss"] = 1.5
+            return out
+
+    g = TrainingGraph(_understanding_only_edges())
+    modules = {name: _LossModule(name) for name in {g.module_of(n) for n in g.execution_order}}
+    profiler = GraphProfiler()
+    runner = TrainNodeRunner(profiler=profiler)
+
+    batch: dict = {"conversation_list": []}
+    g.reset()
+    for node in g.iter_nodes():
+        runner(modules[node.module], node, batch)
+        batch.pop("_loss", None)
+
+    trace = profiler.save_records()
+    # No transition before the first node; one per node boundary after that.
+    assert [t for t in trace if t.startswith("transition:")] == [f"transition: -> {n}" for n in g.execution_order[1:]]
+    assert [t for t in trace if t.startswith("loss:")] == [f"loss:{n}" for n in g.execution_order]
 
 
 # ── Mermaid visualisation ────────────────────────────────────────────────────

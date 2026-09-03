@@ -41,7 +41,8 @@ veomni/
 │       └── accelerator/          VeOmni runtime (graph loops + per-module FSDP)
 │           ├── omni_model_runtime.py  OmniModelRuntime (composed graph loops)
 │           ├── module_runtime.py      ModuleRuntime(VeOmniModelRuntime) — per sub-module
-│           ├── executor.py            execute_train_node / execute_generation_node
+│           ├── executor.py            TrainNodeRunner (OmniModel.forward's node_runner),
+│           │                          execute_train_node / execute_generation_node
 │           └── dispatch.py            unwrap FSDP/DDP/LoRA wrappers, call_graph_endpoint
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
@@ -174,7 +175,7 @@ There are exactly **two** ways to build a SeedOmni model, and the trainer / infe
 | **Bare HF** — `OmniModel.from_pretrained(root)` / `from_config(cfg)` | `OmniModel` (a `PreTrainedModel`) | plain `PreTrainedModel` | non-VeOmni users; all-`eager` inference |
 | **VeOmni** — `OmniModelRuntime.from_runtime_config(cfg)` | `OmniModelRuntime` | one `ModuleRuntime` each | training; distributed inference |
 
-`OmniModelRuntime` composes an `OmniModel` and forwards everything it does not define (`config`, `modules_dict`, `save_pretrained`, `nn.Module` reads) to it, so shared callbacks read `trainer.model` either way. Training **requires** the runtime — only it runs the graph with ParallelState scoping, graph tracing and metric metering.
+`OmniModelRuntime` composes an `OmniModel` and forwards everything it does not define (`config`, `modules_dict`, `save_pretrained`, `nn.Module` reads) to it, so shared callbacks read `trainer.model` either way. Training **requires** the runtime — only it adds ParallelState scoping, graph tracing and metric metering, which it injects into `OmniModel.forward` as a `node_runner` (`TrainNodeRunner`). The graph walk itself lives in `modeling_omni.py`, which imports nothing from `accelerator/` / `distributed/` / the trainer so it can be lifted into another framework (guarded by `tests/seed_omni/test_graph.py::test_modeling_omni_imports_no_veomni_runtime_package`).
 
 ```
 OmniTrainer (orchestrator)           -> tasks/omni/train_omni.py
@@ -188,7 +189,7 @@ OmniInferencer                       -> tasks/omni/infer_omni.py
 
 V2 reuses lower-level libraries (`distributed/`, `optim/`, `models/`, `data/`, `checkpoint/`) and does **not** inherit `BaseTrainer` — but `ModuleRuntime` **does** subclass `VeOmniModelRuntime`, because a module *is* one model's training unit; the composed-model and job layers are what V2 replaces.
 
-`ModuleRuntime(VeOmniModelRuntime)` inherits the whole build sequence (meta-init, freeze/LoRA, FSDP2/DDP wrap + weight load, optimizer, lr-scheduler, `ParallelState` registration) and overrides only where a *module* differs from a standalone model. `accelerator.fsdp_config.fsdp_scope` (`module` default, or `model`) chooses whether each module wraps itself or `OmniModelRuntime` `fully_shard`s the composed `OmniModel` once after all modules are meta-initialized. Under `model` scope, each OmniModule class is still a nested FSDP unit because the graph invokes children, not `OmniModel.forward()`.
+`ModuleRuntime(VeOmniModelRuntime)` inherits the whole build sequence (meta-init, freeze/LoRA, FSDP2/DDP wrap + weight load, optimizer, lr-scheduler, `ParallelState` registration) and overrides only where a *module* differs from a standalone model. `accelerator.fsdp_config.fsdp_scope` (`module` default, or `model`) chooses whether each module wraps itself or `OmniModelRuntime` `fully_shard`s the composed `OmniModel` once after all modules are meta-initialized. Under `model` scope, wrap targets are each child's `_no_split_modules` prefixed with that child's name (`janus_llama.LlamaDecoderLayer`, `janus_text_encoder.Embedding`), so a class name applies only under the child that declared it — `Embedding` is a valid unit under the text encoder but would shard the VQ codebook. Leftover params live on the OmniModel root and unshard via `OmniModel.forward()`.
 
 | Override | Why a module differs |
 |----------|----------------------|

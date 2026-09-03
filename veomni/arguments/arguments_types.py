@@ -513,6 +513,8 @@ class FSDPConfig:
                 "'module' (default) wraps each OmniModule independently. "
                 "'model' wraps the composed OmniModel once (one FSDP tree over every "
                 "sub-module, matching a monolithic train_janus-style wrap). "
+                "Wrap targets are each child's _no_split_modules scoped as "
+                "'{child}.{ClassName}'; leftover params unshard on OmniModel.forward. "
                 "When 'model', per-module fsdp_mode / extra_parallel / init_device "
                 "/ SP-CP-TP-PP overlays are left as written but unused for mesh, init, "
                 "and wrap: every module is initialized unwrapped using the top-level "

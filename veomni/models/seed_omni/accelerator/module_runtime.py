@@ -99,7 +99,7 @@ class ModuleRuntime(VeOmniModelRuntime):
     # forwarding to the inner ``nn.Module`` never confuse this flag with a
     # missing model attribute.
     _defer_parallelize: bool = False
-    _mesh_accelerator: Optional["AcceleratorConfig"] = None
+    _global_accelerator: Optional["AcceleratorConfig"] = None
 
     args: "OmniModuleRuntimeArguments"
     train: Optional["OmniTrainingArguments"] = None
@@ -120,6 +120,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.optimizer = None
         self.lr_scheduler = None
         self._defer_parallelize = False
+        self._global_accelerator = global_accelerator
 
         if for_inference:
             if args.accelerator.fsdp_config.fsdp_mode == "eager":
@@ -127,11 +128,6 @@ class ModuleRuntime(VeOmniModelRuntime):
             else:
                 args.accelerator.fsdp_config.mixed_precision.enable = False
                 self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
-                self._mesh_accelerator = (
-                    global_accelerator
-                    if self._defer_parallelize and global_accelerator is not None
-                    else args.accelerator
-                )
                 self.setup()
                 with self._scoped():
                     self.build_model()
@@ -140,9 +136,6 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self.model.eval()
         else:
             self._defer_parallelize = args.accelerator.fsdp_config.fsdp_scope == "model"
-            self._mesh_accelerator = (
-                global_accelerator if self._defer_parallelize and global_accelerator is not None else args.accelerator
-            )
             self.setup()
             with self._scoped():
                 self.build_model()
@@ -153,6 +146,19 @@ class ModuleRuntime(VeOmniModelRuntime):
                     self._scope_recompute_to_parallel_state()
                     self.build_optimizer()
                     self.build_checkpoint()
+
+    @property
+    def mesh_accelerator(self) -> "AcceleratorConfig":
+        """The top-level accelerator once the composed model owns the wrap.
+
+        Under ``fsdp_scope='model'`` the mesh, init device and wrap all belong to
+        :class:`OmniModelRuntime`, so this module's YAML overlay (its own DDP /
+        emb-parallel block) must not decide them — a module meta-initialized on
+        a different mesh than the one it is later sharded over would not load.
+        """
+        if self._defer_parallelize and self._global_accelerator is not None:
+            return self._global_accelerator
+        return self.args.accelerator
 
     @property
     def module_name(self) -> str:
@@ -223,7 +229,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         logger.info_rank0(f"ModuleRuntime '{self.module_name}': build module model")
         from ....models import build_foundation_model
 
-        acc = self._mesh_accelerator or args.accelerator
+        acc = self.mesh_accelerator
         self.model = build_foundation_model(
             config_path=args.model_path,
             weights_path=args.model_path,
@@ -380,16 +386,6 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     # ── Parallel state (per-module device mesh) ────────────────────────────────
 
-    def setup(self) -> None:
-        """Register this module's ParallelState.
-
-        Under ``fsdp_scope='model'`` the mesh comes from the top-level
-        accelerator, not the module YAML overlay.
-        """
-        from ....distributed.parallel_state import init_parallel_state_from_accelerator
-
-        init_parallel_state_from_accelerator(self._mesh_accelerator, self.model_name)
-
     def _scoped(self):
         """Context manager making this module's ParallelState current.
 
@@ -523,7 +519,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``ParallelState`` is read (unlike :meth:`clip_grad_norm`), so this needs no
         scoping — ``set_reshard_after_backward`` just flips a flag on the unit.
         """
-        fsdp_cfg = (self._mesh_accelerator or self.args.accelerator).fsdp_config
+        fsdp_cfg = self.mesh_accelerator.fsdp_config
         if fsdp_cfg.fsdp_mode != "fsdp2" or fsdp_cfg.reshard_after_backward:
             return
         # ``set_reshard_after_backward`` recurses into every nested FSDP unit by

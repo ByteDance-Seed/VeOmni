@@ -668,6 +668,13 @@ def test_fsdp_no_split_modules_preserved():
     js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg()))
     assert "JanusVisionEncoderLayer" in (js._no_split_modules or set())
 
+    from transformers.models.janus.modeling_janus import JanusVQVAE
+
+    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvaeConfig = _config_cls("janus_vqvae")
+    jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
+    assert set(JanusVQVAE._no_split_modules) <= set(jv._no_split_modules or [])
+
 
 # ── janus_1.3b/{train,infer_*}.yaml smoke load ────────────────────────────────
 

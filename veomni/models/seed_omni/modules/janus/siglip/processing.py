@@ -40,9 +40,9 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
     Holds only the (picklable) HF image processor + a CPU zero-pixel template —
     never the model. Runs the same normalize as ``JanusSiglip._pixels_from_raw_images``
     but on **CPU** (bf16, to halve worker→main IPC); writes the pixel tensor back into
-    each ``user``-image item. For each sample without a user image, appends a
-    ``role="dummy"`` placeholder carrying the zero pixels, so the GPU
-    forward never builds dummy inputs (the FSDP gradient anchor still runs there).
+    each ``user``-image item. When a whole micro-batch has no user image, appends one
+    ``role="dummy"`` placeholder carrying the zero pixels, so the GPU forward never
+    builds dummy inputs (the FSDP gradient anchor still runs there).
     """
 
     def __init__(
@@ -71,6 +71,7 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
+        saw_real_image = False
         for sample in conversation_list:
             sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
             if sample_image_items:
@@ -83,20 +84,24 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
                     it.source = _SOURCE
-            elif not inference:
-                if self._dummy_pixel_values is None:
-                    raise RuntimeError(
-                        f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                        "before training use (pure inference never reaches this branch)."
-                    )
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=self._dummy_pixel_values,
-                        role="dummy",
-                        source=_SOURCE,
-                    )
-                )
+                saw_real_image = True
+
+        if inference or saw_real_image:
+            return
+        if self._dummy_pixel_values is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                "before training use (pure inference never reaches this branch)."
+            )
+        self.append_batch_anchor(
+            conversation_list,
+            ConversationItem(
+                type="image",
+                value=self._dummy_pixel_values,
+                role="dummy",
+                source=_SOURCE,
+            ),
+        )
 
 
 __all__ = ["JanusSiglipProcessor", "JanusSiglipPreprocessor"]

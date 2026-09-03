@@ -146,6 +146,7 @@ def main() -> None:
         "loss": [],
         "grad_norm_encoder": [],
         "grad_norm_llm": [],
+        "optimizer_state_ok": [],
         "lr": [],
     }
 
@@ -202,6 +203,7 @@ def main() -> None:
             results["loss"].append(loss_val)
             results["grad_norm_encoder"].append(gnorm_enc)
             results["grad_norm_llm"].append(gnorm_llm)
+            results["optimizer_state_ok"].append(len(optimizer.state) > 0)
             results["lr"].append(cur_lr)
 
     # ── Assertions ────────────────────────────────────────────────────────────

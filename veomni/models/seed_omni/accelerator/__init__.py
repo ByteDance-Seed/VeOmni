@@ -20,12 +20,12 @@ to avoid pulling trainer/distributed setup into every ``seed_omni`` import.
 Per-module checkpoint I/O lives in ``veomni.models.seed_omni.utils.checkpoint``.
 """
 
-from .executor import execute_generation_node, execute_train_node
+from .executor import TrainNodeRunner, execute_generation_node
 from .omni_model_runtime import OmniModelRuntime
 
 
 __all__ = [
     "OmniModelRuntime",
-    "execute_train_node",
+    "TrainNodeRunner",
     "execute_generation_node",
 ]

@@ -458,7 +458,7 @@ configured and never round-trip through a saved config.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | fsdp_mode | `Literal["ddp", "fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"eager"` skips every wrapper for the single-process Omni inference path (`_init_eager_inference`). |
-| fsdp_scope | `Literal["module", "model"]` | `"module"` | SeedOmni: `"module"` wraps each OmniModule independently; `"model"` wraps the composed `OmniModel` once (one FSDP tree). Per-module DDP / ExtraParallel / `init_device` / SP-CP-TP-PP overlays are unused under `"model"` (module YAML is not rewritten); the top-level accelerator topology is used. |
+| fsdp_scope | `Literal["module", "model"]` | `"module"` | SeedOmni: `"module"` wraps each OmniModule independently; `"model"` wraps the composed `OmniModel` once (one FSDP tree). Wrap targets are each child's `_no_split_modules` scoped as `{child}.{ClassName}`; leftover params unshard on `OmniModel.forward()`. Per-module DDP / ExtraParallel / `init_device` / SP-CP-TP-PP overlays are unused under `"model"` (module YAML is not rewritten); the top-level accelerator topology is used. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |

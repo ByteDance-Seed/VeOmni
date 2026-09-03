@@ -110,14 +110,15 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 - **Gone:** `OmniModel.set_node_executors`, `OmniModel._node_executors`,
   `OmniModel._run_node`, and `OmniModuleTrainer.forward` (the old executor callable).
 - **Now:** `OmniModel.forward` loops the graph exactly like `OmniModel.generate`.
-  The graph only *selects* nodes; execution is external (`execute_train_node`,
-  in `accelerator/executor.py`) — see the current form below:
+  The graph only *selects* nodes; running one is injected via `node_runner`
+  (VeOmni passes `TrainNodeRunner` → `execute_train_node`, both in
+  `accelerator/executor.py`, so the modeling imports no runtime code) — see the
+  current form below:
   ```python
   training_graph.reset()
-  profiler = GraphProfiler()
   for node in training_graph.iter_nodes():   # selection only, profiler-free
-      execute_train_node(modules, node, batch, profiler=profiler, scope_fn=scope_fn)
-      self._collect_training_loss(batch, node.name, profiler)  # pop _loss → self._losses
+      run_node(self.get_module(node.module), node, batch)
+      loss = batch.pop("_loss", None)        # → self._losses[node.name]
   ```
   `TrainingGraph` gained `reset()` / `is_done()` / `current_node_name` /
   `maybe_transition()` / `iter_nodes()` (mirrors `GenerationGraph`, whose per-iteration

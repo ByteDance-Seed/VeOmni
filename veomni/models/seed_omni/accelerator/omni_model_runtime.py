@@ -23,11 +23,10 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 from ....distributed.parallel_state import is_parallel_state_registered, use_parallel_state
 from ....utils.logging import get_logger
-from ..graphs.base import NodeDef
 from ..mixins.metric_meter_mixin import MetricMeterResult
 from ..modeling_omni import OmniModel
 from ..utils.graph_profiler import GraphProfiler
-from .executor import execute_generation_node, execute_train_node
+from .executor import TrainNodeRunner, execute_generation_node
 from .utils import iter_named_omni_modules, save_module_subdirectory
 
 
@@ -40,8 +39,29 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits.
-_LOSS_KEY = "_loss"
+
+def _scoped_no_split_modules(module_runtimes: Mapping[str, "ModuleRuntime"]) -> list[str]:
+    """Prefix each child's ``_no_split_modules`` with that child's name.
+
+    A bare class name is ambiguous once the children share one FSDP tree:
+    ``Embedding`` is a valid unit under the text encoder (its tied head gathers
+    the weight explicitly in ``EmbParallelMixin.emb_local_weight``) but not under
+    the VQVAE, whose ``JanusVQVAEVectorQuantizer.forward`` reads
+    ``self.embedding.weight`` directly and so never fires the embedding's own
+    unshard hook. ``{child}.{ClassName}`` keeps each child's list applying to
+    that child only (see ``_is_fsdp_wrap_target``). Child ``basic_modules``
+    overlays are scoped the same way.
+
+    OmniModule class names are deliberately not added: leftover params unshard
+    on :meth:`OmniModel.forward`, the FSDP root entry.
+    """
+    scoped: list[str] = []
+    for name, runtime in module_runtimes.items():
+        for cls_name in getattr(runtime.model, "_no_split_modules", None) or []:
+            scoped.append(f"{name}.{cls_name}")
+        for cls_name in runtime.args.basic_modules or []:
+            scoped.append(f"{name}.{cls_name}")
+    return list(dict.fromkeys(scoped))
 
 
 def _reject_lora_that_matched_nothing(module_runtimes: Mapping[str, "ModuleRuntime"], train: Any = None) -> None:
@@ -83,15 +103,17 @@ class OmniModelRuntime:
       :class:`~veomni.models.seed_omni.accelerator.module_runtime.ModuleRuntime`
       (FSDP2/DDP wrap, weight load, optimizer, checkpoint manager) and the
       composed model is *this* class. ``OmniTrainer.model`` /
-      ``OmniInferencer.model`` hold it; training requires it because only this
-      class runs the graph with ParallelState scoping, graph tracing and metric
-      metering.
+      ``OmniInferencer.model`` hold it. Training enters the wrapped
+      :class:`OmniModel` so FSDP root hooks fire; this class supplies
+      ParallelState scoping, graph tracing and metric metering.
 
     Both are used through the single ``self.model`` handle on the trainer /
     inferencer. APIs that need no wrapper handling are forwarded via
     :meth:`__getattr__` (``config``, ``modules_dict``, …).
-    :meth:`forward`, :meth:`generate`, :meth:`save_pretrained`, :meth:`reset`,
-    and :meth:`named_omni_modules` are implemented here instead.
+    :meth:`forward` enters the (possibly FSDP-wrapped) :class:`OmniModel` so
+    root leftover params unshard, then :meth:`OmniModel.forward` runs the
+    training graph. :meth:`generate`, :meth:`save_pretrained`, :meth:`reset`,
+    and :meth:`named_omni_modules` stay on this wrapper.
     """
 
     def __init__(
@@ -107,7 +129,6 @@ class OmniModelRuntime:
         self._module_parallel_state_names = set(module_parallel_state_names or ())
         self.omni_model_runtime_args = omni_model_runtime_args
         self._step_profiler: GraphProfiler | None = None
-        self._losses: dict[str, Any] = {}
 
     @classmethod
     def from_model_runtime(
@@ -159,14 +180,16 @@ class OmniModelRuntime:
         """``fully_shard`` the composed :class:`OmniModel` when ``fsdp_scope='model'``.
 
         Each :class:`ModuleRuntime` has already meta-initialized, frozen, and
-        bound assets, but skipped its own wrap. One FSDP2 tree over the parent
-        matches a monolithic ``train_janus`` wrap: layer ``fully_shard`` on
-        every child's ``_no_split_modules`` (aggregated onto OmniModel by
-        ``post_init``), then each OmniModule child, then the OmniModel root. Child classes must be FSDP units because the
-        training graph calls ``child(**kwargs)`` (via ``call_graph_endpoint``),
-        never ``OmniModel.forward()`` — leftover params (VQVAE, SigLIP aligner,
-        LLaMA final norm) live on the child FSDP unit and only unshard when
-        that child is invoked. Weights still load per split-checkpoint subfolder.
+        bound assets, but skipped its own wrap. One FSDP2 tree over the parent:
+        wrap each child's ``_no_split_modules`` **scoped to that child**
+        (``janus_llama.LlamaDecoderLayer``, ``janus_text_encoder.Embedding``, …),
+        then ``fully_shard`` the OmniModel root.
+
+        HF ``post_init``'s union is replaced rather than reused: it is a flat
+        class-name set, so the text encoder's ``Embedding`` would also match the
+        VQ codebook (see :func:`_scoped_no_split_modules`). Leftover params
+        (aligner, final norm, anything not in a nested unit) unshard on
+        :meth:`OmniModel.forward`.
         """
         args = self.omni_model_runtime_args
         acc = args.accelerator
@@ -174,11 +197,8 @@ class OmniModelRuntime:
             return
 
         modules = self.module_runtimes
-        basic_modules: list[str] = list(getattr(self.model, "_no_split_modules", None) or [])
-        for runtime in modules.values():
-            basic_modules.extend(runtime.args.basic_modules or [])
-            # Nested FSDP unit so graph dispatch on the child unshards leftover params.
-            basic_modules.append(type(runtime.model).__name__)
+        wrap_units = _scoped_no_split_modules(modules)
+        self.model._no_split_modules = wrap_units
 
         kwargs: dict[str, Any] = {
             "cpu_load_param_name": None,
@@ -213,7 +233,7 @@ class OmniModelRuntime:
                 enable_reshard_after_forward=acc.fsdp_config.reshard_after_forward,
                 mixed_precision=acc.fsdp_config.mixed_precision,
                 enable_gradient_checkpointing=False,
-                basic_modules=list(dict.fromkeys(basic_modules)),
+                basic_modules=wrap_units,
                 enable_reentrant=acc.gradient_checkpointing.enable_reentrant,
                 early_stop=acc.gradient_checkpointing.early_stop,
                 enable_forward_prefetch=acc.fsdp_config.forward_prefetch,
@@ -302,36 +322,22 @@ class OmniModelRuntime:
         *,
         profiler: GraphProfiler | None = None,
     ) -> dict[str, Any]:
-        """Run the training DAG with VeOmni per-node execution.
+        """Run the training DAG through the composed model's FSDP ``forward``.
 
         ``profiler`` defaults to :attr:`step_profiler` — the trainer only has to
         open the trace window (:meth:`OmniTrainer.init_graph_profile`) once per step.
+
+        Must go through ``self.model(batch)`` (``nn.Module.__call__``), not
+        ``self.model.forward(...)``, so FSDP2 root pre-forward hooks unshard
+        leftover params before the graph calls each child.
+
+        The model walks the graph; :class:`TrainNodeRunner` — passed in as
+        ``node_runner``, fresh per step because it labels node transitions — is
+        what makes each node VeOmni-aware (unwrap, ParallelState scope, profile).
         """
         profiler = profiler if profiler is not None else self._step_profiler
-        model = self.model
-        model.training_graph.reset()
-        self._losses.clear()
-        modules = model.modules_dict
-
-        prev_node: NodeDef | None = None
-        for node in model.training_graph.iter_nodes():
-            if prev_node is not None and profiler is not None:
-                profiler.record(f"transition: -> {node.name}")
-            execute_train_node(
-                modules,
-                node,
-                batch,
-                profiler=profiler,
-                scope_fn=self.module_context,
-            )
-            loss = batch.pop(_LOSS_KEY, None)
-            if loss is not None:
-                self._losses[node.name] = loss
-                if profiler is not None:
-                    profiler.record(f"loss:{node.name}")
-            prev_node = node
-
-        return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
+        runner = TrainNodeRunner(profiler=profiler, scope_fn=self.module_context)
+        return self.model(batch, node_runner=runner)
 
     def generate(
         self,
@@ -467,16 +473,6 @@ class OmniModelRuntime:
         """Export every module's HF weights / LoRA adapter."""
         for module_runtime in self.module_runtimes.values():
             module_runtime.save_hf_or_lora(state)
-
-
-def _sum_losses(losses: dict[str, Any]) -> Any | None:
-    if not losses:
-        return None
-    it = iter(losses.values())
-    total = next(it)
-    for v in it:
-        total = total + v
-    return total
 
 
 __all__ = ["OmniModelRuntime"]
