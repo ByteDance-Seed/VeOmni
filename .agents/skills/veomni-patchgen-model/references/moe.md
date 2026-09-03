@@ -103,11 +103,21 @@ format). Dispatch on the `dim-1` shape:
 - `gate_up_proj`: HF has `dim-1 == hidden_size`, v5 has `dim-1 == 2 * intermediate_size`.
 - `down_proj`:    HF has `dim-1 == intermediate_size`, v5 has `dim-1 == hidden_size`.
 
-For any realistic config, these four numbers are pairwise distinct, so the
-dispatch is unambiguous. Transpose only when dim-1 matches the HF expectation;
-pass through when it matches v5; **raise on anything else** rather than
-silently corrupting weights. See `qwen3_vl_moe/checkpoint_tensor_converter.py`
-for the canonical implementation.
+Transpose only when dim-1 matches the HF expectation; pass through when it
+matches v5; **raise on anything else** rather than silently corrupting weights.
+See `qwen3_vl_moe/checkpoint_tensor_converter.py` for the canonical
+implementation.
+
+**This dispatch only works while the two expectations differ**, and they
+coincide more easily than they look — `gate_up_proj` when
+`hidden_size == 2 * intermediate_size`, `down_proj` when
+`intermediate_size == hidden_size`. The 2:1 case is ordinary, not exotic:
+`tests/toy_config/glm_moe_dsa_toy` is `hidden=256, moe_intermediate=128`.
+When they coincide the shape carries no layout information at all, so the
+converter must **raise rather than guess** — guessing transposes a v5-saved
+checkpoint and corrupts the weights with no error. Check this before choosing
+the fused-key template for a new model; if your config is 2:1, you need an
+explicit layout marker instead of shape dispatch.
 
 **Validation**: on a toy checkpoint with per-expert keys, the converter emits
 exactly one `experts.gate_up_proj` and one `experts.down_proj` per layer and
