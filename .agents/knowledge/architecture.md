@@ -45,8 +45,10 @@ veomni/
 │   │                   ep_fsdp mesh.
 │   └── lr_scheduler.py LR scheduler construction
 ├── ops/                Optimized kernels and dispatch
-│   ├── kernel_registry.py  KERNEL_REGISTRY: (op, variant, impl) -> KernelSpec.
-│   │                   The mechanism new kernels should use.
+│   ├── kernel_registry.py  KERNEL_REGISTRY: (op_name, variant) ->
+│   │                   {impl_name: KernelSpec}. register() takes one
+│   │                   KernelSpec; it is not a decorator. The mechanism
+│   │                   new kernels should use.
 │   ├── dispatch.py     OpSlot placeholders declared in patchgen-generated
 │   │                   modeling; bound by _bind_veomni_ops() in models/auto.py
 │   ├── config/         Legacy per-model / global dispatch, still live
@@ -213,7 +215,7 @@ tests/
 | `veomni/optim/` | `pytest tests/optim/` |
 | Full regression | `pytest tests/` |
 
-Distributed tests (`tests/parallel/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
+Distributed tests (`tests/parallel/`, `tests/distributed/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
 
 **A passing local run does not mean CI runs it.**
 `.github/workflows/gpu_unit_tests.yml` and `npu_unit_tests.yml` enumerate most
