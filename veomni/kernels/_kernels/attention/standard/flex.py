@@ -71,7 +71,7 @@ def flex_attention_forward(
     kernel_options.setdefault("BACKEND", "TRITON")
 
     parallel_state = get_parallel_state()
-    ulysses_enabled = should_apply_ulysses() and not skip_ulysses
+    ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
     if ulysses_enabled:
         # Local head indices restart at zero on every Ulysses rank, so head-specific
         # masks require rank-aware slicing and rebasing before they can be supported.

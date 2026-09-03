@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from transformers.masking_utils import (
@@ -26,6 +28,9 @@ from transformers.masking_utils import (
 )
 
 from tests.kernels.attention_cases import flex_visible
+from veomni.kernels._kernels.attention.mask import flex as flex_mask
+from veomni.kernels._kernels.attention.mask import magi as magi_mask
+from veomni.kernels._kernels.attention.mask import sdpa as sdpa_mask
 from veomni.kernels.mask import (
     MagiAttentionMask,
     causal_mask,
@@ -200,3 +205,29 @@ def test_magi_packed_aligns_with_from_cu_seqlens():
 def test_magi_sliding_window_is_unsupported():
     with pytest.raises(ValueError, match="sliding windows in ranges"):
         sliding_window_mask(4, 4, impl="magi_attention", device="cpu", sliding_window=2)
+
+
+@pytest.mark.parametrize(
+    ("impl", "module"),
+    (
+        ("flex_attention", flex_mask),
+        ("sdpa", sdpa_mask),
+        ("magi_attention", magi_mask),
+    ),
+)
+def test_causal_mask_forwards_skip_ulysses(monkeypatch, impl, module):
+    state = SimpleNamespace(ulysses_size=2, async_enabled=False)
+    monkeypatch.setattr(module, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
+    monkeypatch.setattr(module, "get_parallel_state", lambda: state)
+    if impl == "magi_attention":
+        expanded = causal_mask(4, 4, impl=impl, device="cpu")
+        skipped = causal_mask(4, 4, impl=impl, device="cpu", skip_ulysses=True)
+        assert expanded.q_ranges.tolist() == [[0, 8]]
+        assert skipped.q_ranges.tolist() == [[0, 4]]
+        return
+    expanded = causal_mask(4, 4, impl=impl, device="cpu", attention_mask=torch.ones(1, 8, dtype=torch.bool))
+    skipped = causal_mask(
+        4, 4, impl=impl, device="cpu", skip_ulysses=True, attention_mask=torch.ones(1, 4, dtype=torch.bool)
+    )
+    assert tuple(expanded.shape[-2:]) == (8, 8)
+    assert tuple(skipped.shape[-2:]) == (4, 4)

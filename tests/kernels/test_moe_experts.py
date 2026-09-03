@@ -365,14 +365,16 @@ def _run_fused_vs_eager(
     selected: Tensor | None = None,
     routing: Tensor | None = None,
     seed: int = 0,
+    device: torch.device | None = None,
 ):
     torch.manual_seed(seed)
-    if impl == "npu":
-        device = torch.device("npu")
-    elif impl in {"mlu", "mlu_triton"}:
-        device = torch.device("mlu")
-    else:
-        device = torch.device("cuda")
+    if device is None:
+        if impl == "npu":
+            device = torch.device("npu")
+        elif impl == "mlu":
+            device = torch.device("mlu")
+        else:
+            device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, num_experts, hidden_dim, ffn_dim, top_k = shape
     hidden = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
@@ -573,14 +575,12 @@ def test_npu_matches_eager():
 def test_mlu_rows_are_registered():
     registered = KERNEL_REGISTRY.list_registered("moe_experts", "standard")
     assert "mlu" in registered
-    assert "mlu_triton" in registered
+    assert "triton" in registered
+    assert "mlu_triton" not in registered
     if not IS_MLU_AVAILABLE:
         assert "mlu" not in KERNEL_REGISTRY.list_available("moe_experts", "standard")
-        assert "mlu_triton" not in KERNEL_REGISTRY.list_available("moe_experts", "standard")
-        with pytest.raises(RuntimeError, match="MluKernelRequirement"):
+        with pytest.raises(RuntimeError, match="not registered for device"):
             resolve_kernel("moe_experts", "standard", "mlu")
-        with pytest.raises(RuntimeError, match="MluKernelRequirement"):
-            resolve_kernel("moe_experts", "standard", "mlu_triton")
 
 
 @pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="MLU fused MoE needs torch_mlu")
@@ -589,8 +589,8 @@ def test_mlu_matches_eager():
 
 
 @pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="MLU Triton fused MoE needs torch_mlu")
-def test_mlu_triton_matches_eager():
-    _run_fused_vs_eager("mlu_triton")
+def test_triton_matches_eager_on_mlu():
+    _run_fused_vs_eager("triton", device=torch.device("mlu"))
 
 
 @pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="MLU fused MoE needs torch_mlu")

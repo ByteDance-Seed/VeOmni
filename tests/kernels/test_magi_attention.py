@@ -107,7 +107,7 @@ def test_magi_attention_rejects_batch_and_cp_greater_than_one(monkeypatch):
 
 def test_magi_attention_rejects_invalid_gqa_before_ulysses(monkeypatch):
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state(ulysses_size=2))
-    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(
         magi_backend,
         "prepare_ulysses_qkv",
@@ -142,7 +142,7 @@ def test_magi_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
         return output[:, :8].repeat_interleave(2, dim=2)
 
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(magi_backend, "prepare_ulysses_qkv", fake_prepare)
     monkeypatch.setattr(magi_backend, "_magi_attention_forward", fake_backend)
     monkeypatch.setattr(magi_backend, "restore_ulysses_output", fake_restore)
@@ -168,7 +168,7 @@ def test_magi_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
 
 def test_magi_attention_skip_ulysses_uses_local_sequence(monkeypatch):
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state(ulysses_size=2))
-    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(
         magi_backend,
         "prepare_ulysses_qkv",
@@ -195,7 +195,7 @@ def test_magi_attention_skip_ulysses_uses_local_sequence(monkeypatch):
 
 def test_magi_attention_rejects_global_ranges_when_ulysses_is_off(monkeypatch):
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
-    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda: False)
+    monkeypatch.setattr(magi_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 4, 4, 16)
     with pytest.raises(ValueError, match="post-exchange query length \\(4\\)"):
         magi_backend.magi_attention_forward(

@@ -66,7 +66,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
     # The eager Qwen3-MoE expert path is not EP-aware; use fused MoE here.
     ops_cfg = OpsImplementationConfig(
         attn_implementation="eager",
-        moe_implementation="fused_triton",
+        moe_implementation="triton",
         cross_entropy_loss_implementation="eager",
         rms_norm_implementation="eager",
         swiglu_mlp_implementation="eager",

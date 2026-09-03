@@ -25,15 +25,17 @@ from ....distributed.sequence_parallel.ulysses import (
 )
 
 
-def should_apply_ulysses() -> bool:
-    """Return whether attention should gather/scatter Ulysses itself.
+def should_apply_ulysses(*, skip_ulysses: bool = False) -> bool:
+    """Return whether this call should gather/scatter Ulysses itself.
 
     Sync Ulysses belongs inside attention only when the Ulysses axis is
     greater than 1 and async Ulysses is off. Async SP gathers outside
-    attention. ``ulysses_size == 1`` is a no-op. A per-call
-    ``skip_ulysses`` on the adapter is a separate opt-out for tokens
-    that are not on the SP mesh.
+    attention. ``ulysses_size == 1`` is a no-op. ``skip_ulysses`` opts a
+    call out when its tokens are not on the SP mesh.
     """
+    if skip_ulysses:
+        return False
+
     parallel_state = get_parallel_state()
     if parallel_state.ulysses_size <= 1:
         return False

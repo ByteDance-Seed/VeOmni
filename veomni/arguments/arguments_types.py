@@ -1017,7 +1017,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "swiglu_mlp_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset({"triton"}),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
-    "moe_implementation": frozenset({"fused_npu"}),
+    "moe_implementation": frozenset({"npu"}),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
@@ -1025,7 +1025,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "cross_entropy_loss_implementation": frozenset({"npu"}),
-    "moe_implementation": frozenset({"fused_npu"}),
+    "moe_implementation": frozenset({"npu"}),
 }
 
 _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
@@ -1035,21 +1035,21 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
     "swiglu_mlp_implementation": "eager",
     "load_balancing_loss_implementation": "eager",
     "cross_entropy_loss_implementation": "npu",
-    "moe_implementation": "fused_npu",
+    "moe_implementation": "npu",
 }
 
 # MLU compatibility tables for ``_validate_implementations``.
+# ``triton`` is the same group-gemm as on GPU; ``mlu`` is Apex grouped-GEMM.
 _MLU_ALLOWED: Dict[str, frozenset] = {
-    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
+    "moe_implementation": frozenset({"mlu", "triton"}),
 }
 
-_MLU_DEFAULT_FALLBACK: Dict[str, str | frozenset] = {
+_MLU_DEFAULT_FALLBACK: Dict[str, str] = {
     "rms_norm_implementation": "eager",
     "rotary_pos_emb_implementation": "eager",
     "swiglu_mlp_implementation": "eager",
     "load_balancing_loss_implementation": "eager",
     "cross_entropy_loss_implementation": "eager",
-    "moe_implementation": frozenset({"fused_mlu", "fused_mlu_triton"}),
 }
 
 
@@ -1057,7 +1057,7 @@ _MLU_DEFAULT_FALLBACK: Dict[str, str | frozenset] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton / fused_triton). On NPU, values
+    Defaults are GPU-optimal (Liger / Triton). On NPU, values
     still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
     are automatically mapped to NPU-compatible or eager implementations;
     explicit non-default overrides are validated and unsupported values raise.
@@ -1104,13 +1104,13 @@ class OpsImplementationConfig:
         metadata={"help": "Attention implementation."},
     )
     moe_implementation: str = field(
-        default="fused_triton",
+        default="triton",
         metadata={
-            "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'fused_mlu' (MLU) | 'fused_mlu_triton' (MLU) | 'eager'. "
-            "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
-            "incompatible non-default overrides raise. Legacy 'fused' "
-            "auto-resolves to fused_quack/fused_npu with a deprecation warning."
+            "help": "MoE experts forward. 'triton' (default, GPU SM70+ or MLU) | "
+            "'quack' (GPU SM90+) | 'npu' (NPU) | 'mlu' (MLU Apex grouped-GEMM) | 'eager'. "
+            "On NPU, a default-valued 'triton' selection maps to 'npu'; "
+            "incompatible non-default overrides raise. Legacy 'fused' auto-resolves to "
+            "quack/npu/mlu-or-triton with a deprecation warning."
         },
     )
     cross_entropy_loss_implementation: str = field(
@@ -1222,21 +1222,18 @@ class OpsImplementationConfig:
                 self.attn_implementation = new_impl
 
         # Legacy alias: ``moe_implementation='fused'`` resolves to a
-        # hardware-appropriate fused kernel — Quack on GPU, NPU group-gemm on
-        # Ascend, MLU group-gemm or triton on Cambricon MLU. Kept for back-compat with pre-#678 YAMLs; warn so users
-        # migrate to the explicit name.
+        # hardware-appropriate kernel — Quack on GPU, NPU group-gemm on
+        # Ascend, Apex or Triton on Cambricon MLU. Kept for back-compat with
+        # pre-#678 YAMLs; warn so users migrate to the explicit name.
         if self.moe_implementation == "fused":
             from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
 
             if is_torch_npu_available():
-                resolved = "fused_npu"
+                resolved = "npu"
             elif is_torch_mlu_available():
-                if is_apex_mlu_available():
-                    resolved = "fused_mlu"
-                else:
-                    resolved = "fused_mlu_triton"
+                resolved = "mlu" if is_apex_mlu_available() else "triton"
             else:
-                resolved = "fused_quack"
+                resolved = "quack"
 
             logger.warning_rank0(
                 f"moe_implementation='fused' is a deprecated alias; resolving to '{resolved}' on this host. "
@@ -1280,7 +1277,7 @@ class OpsImplementationConfig:
         user overrides (non-default values) are left untouched and will be
         caught by ``_validate_implementations`` if unsupported.
         """
-        from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
+        from ..utils.import_utils import is_torch_mlu_available
 
         if not is_torch_mlu_available():
             return
@@ -1292,8 +1289,6 @@ class OpsImplementationConfig:
 
             current = getattr(self, field_name)
             if current == gpu_defaults[field_name]:
-                if field_name == "moe_implementation":
-                    mlu_value = "fused_mlu" if is_apex_mlu_available() else "fused_mlu_triton"
                 setattr(self, field_name, mlu_value)
                 logger.info_rank0(
                     f"{field_name}: auto-resolved GPU default {current!r} -> {mlu_value!r} on Cambricon MLU."
@@ -1348,8 +1343,8 @@ class OpsImplementationConfig:
             if value == "eager":
                 continue
             if on_mlu:
-                if value == "fused_mlu" and not is_apex_mlu_available():
-                    raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
+                if value == "mlu" and not is_apex_mlu_available():
+                    raise ValueError("moe_implementation='mlu' requires apex_mlu installed on Cambricon MLU.")
                 if value not in mlu_ok:
                     allowed = sorted(mlu_ok | {"eager"})
                     raise ValueError(

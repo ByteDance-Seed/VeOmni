@@ -131,8 +131,8 @@ def test_opslot_unknown_kernel_name_raises():
 
 
 # ---------------------------------------------------------------------------
-# 3) End-to-end — _bind_veomni_ops wires config → OpSlot with fused_ prefix
-#    stripped, so the HardwareRequirement gate sees the right impl_name.
+# 3) End-to-end — _bind_veomni_ops wires config → OpSlot so the
+#    HardwareRequirement gate sees the requested impl_name.
 # ---------------------------------------------------------------------------
 
 
@@ -140,7 +140,7 @@ def test_opslot_unknown_kernel_name_raises():
 # which calls ``veomni.utils.import_utils.is_torch_npu_available`` directly —
 # the registry-level IS_NPU_AVAILABLE patches above don't reach it. Mock the
 # validator's NPU detection so this GPU-scenario test can construct a config
-# with ``fused_quack`` on the NPU CI runner without the validator firing
+# with ``quack`` on the NPU CI runner without the validator firing
 # before the bind step we actually want to exercise.
 @patch("veomni.utils.import_utils.is_torch_npu_available", return_value=False)
 @patch("veomni.utils.import_utils.is_torch_mlu_available", return_value=False)
@@ -150,9 +150,8 @@ def test_opslot_unknown_kernel_name_raises():
 def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc, _mock_npu, _mock_mlu):
     """Reproducer for the silent-fallback regression:
 
-    User sets ``moe_implementation='fused_quack'`` on an A100. The binding
-    must route ``fused_quack`` → KERNEL_REGISTRY lookup ``quack`` and raise
-    at bind time, not silently stay eager.
+    User sets ``moe_implementation='quack'`` on an A100. The binding
+    must look up ``quack`` and raise at bind time, not silently stay eager.
     """
     from types import SimpleNamespace
 
@@ -164,7 +163,7 @@ def test_bind_veomni_ops_translates_moe_implementation_and_checks_hw(_mock_cc, _
     # liger-kernel + triton in the test environment).
     ops_config = OpsImplementationConfig(
         attn_implementation="eager",
-        moe_implementation="fused_quack",
+        moe_implementation="quack",
         cross_entropy_loss_implementation="eager",
         rms_norm_implementation="eager",
         swiglu_mlp_implementation="eager",

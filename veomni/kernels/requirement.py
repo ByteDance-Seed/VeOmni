@@ -14,21 +14,27 @@
 
 """Hardware requirements for kernel rows.
 
-A requirement is not part of the ``(kernel, variant, impl)`` key. Rows are
-always registered. ``resolve_kernel`` calls ``check()``. ``list_available``
-keeps only rows whose ``matches()`` is true.
+``device`` is the fourth registry key. Rows are always registered.
+``resolve_kernel`` fills the current device into the public triple, then
+calls ``check()``. ``list_available`` keeps rows whose ``matches()`` is true.
+A row with no requirement is stored under ``ANY_DEVICE``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 from ..utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 
 
+ANY_DEVICE = "any"
+
+
 class KernelRequirement(Protocol):
     """Predicate that decides whether this machine can run a registered row."""
+
+    device: str
 
     def matches(self) -> bool:
         """Return whether this machine can run the row."""
@@ -43,6 +49,7 @@ class KernelRequirement(Protocol):
 class CudaKernelRequirement:
     """CUDA plus optional compute-capability bounds (``min_cc`` / ``max_cc``)."""
 
+    device: ClassVar[str] = "cuda"
     min_cc: int | None = None
     max_cc: int | None = None
 
@@ -73,6 +80,8 @@ class CudaKernelRequirement:
 class NpuKernelRequirement:
     """torch_npu device is available."""
 
+    device: ClassVar[str] = "npu"
+
     def matches(self) -> bool:
         """Return whether a torch_npu device is available."""
         return IS_NPU_AVAILABLE
@@ -87,6 +96,8 @@ class NpuKernelRequirement:
 @dataclass(frozen=True)
 class MluKernelRequirement:
     """torch_mlu device is available."""
+
+    device: ClassVar[str] = "mlu"
 
     def matches(self) -> bool:
         """Return whether a torch_mlu device is available."""

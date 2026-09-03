@@ -8,7 +8,7 @@ VeOmni now supports MLU-specific kernel code in its OSS tree. On MLU it runs thr
 
 VeOmni supports a wide range of models on Cambricon MLU, across modalities (text / VLM / Omni / DiT) and architectures (dense / MoE+EP), including llama / qwen3 / qwen3_vl / qwen3.5 / qwen-image / wan2.1.
 
-The MoE expert layer is accelerated by the `fused_moe_kernel`. On MLU there are two interchangeable `moe_implementation` backends. The faster one is **`fused_mlu`**, which requires `torch_mlu` plus `apex` (specifically `apex.contrib.grouped_gemm`) and runs the Apex grouped-GEMM kernel for better performance. When `apex` is not available, you can use **`fused_mlu_triton`** instead: it requires only `torch_mlu` plus `triton` and runs the Triton grouped-GEMM kernel with no apex dependency. Both backends cover the same MoE path; pick `fused_mlu` for speed when the apex stack is present, otherwise `fused_mlu_triton` runs everywhere `triton` does.
+The MoE expert layer is accelerated by the fused MoE kernel. On MLU there are two interchangeable `moe_implementation` backends. The faster one is **`mlu`**, which requires `torch_mlu` plus `apex` (specifically `apex.contrib.grouped_gemm`) and runs the Apex grouped-GEMM kernel for better performance. When `apex` is not available, use **`triton`**: it requires only `torch_mlu` plus `triton` and runs the same Triton grouped-GEMM kernel as on GPU. Both backends cover the same MoE path; pick `mlu` for speed when the apex stack is present, otherwise `triton` runs everywhere Triton does.
 
 Other ops on MLU (RMSNorm, RoPE, SwiGLU, load balancing loss, cross entropy loss) currently fall back to the `eager` (huggingface reference) implementation; more fused kernels will be supported soon for better performance.
 
@@ -72,4 +72,4 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
 ## Known Limitations
 
 - **CUDA-only kernels fall back.** (FA3/FA4/Quack/FlashMLA/DSA, e.g. `gpt_oss`) fall back to triton/eager on MLU, or are skipped.
-- **MoE speed depends on apex.** `fused_mlu` (apex grouped-GEMM) is the faster path; without `apex` the `fused_mlu_triton` Triton path is used instead.
+- **MoE speed depends on apex.** `mlu` (apex grouped-GEMM) is the faster path; without `apex` the `triton` path is used instead.

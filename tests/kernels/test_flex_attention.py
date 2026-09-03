@@ -155,7 +155,7 @@ def test_flex_attention_rejects_unsupported_masks(monkeypatch):
         device=query.device,
         BLOCK_SIZE=128,
     )
-    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     with pytest.raises(ValueError, match="requires a head-broadcast BlockMask"):
         flex_backend.flex_attention_forward(module, query, query, query, head_specific_mask)
 
@@ -169,7 +169,7 @@ def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypa
         return query.transpose(1, 2), None
 
     monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
-    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda: False)
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 4, 8, 8)
     block_mask = create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: (query_idx >= key_idx) & (query_idx - key_idx < 4),
@@ -217,7 +217,7 @@ def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
         return output
 
     monkeypatch.setattr(flex_backend, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(flex_backend, "prepare_ulysses_qkv", fake_prepare)
     monkeypatch.setattr(flex_backend, "slice_ulysses_head_auxiliary", fake_slice)
     monkeypatch.setattr(flex_backend, "hf_flex_attention_forward", fake_backend)
@@ -245,7 +245,7 @@ def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
 
 
 def test_flex_attention_skip_ulysses_skips_exchange(monkeypatch):
-    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(flex_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(
         flex_backend,
         "prepare_ulysses_qkv",

@@ -21,6 +21,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, causal_mask_function
 
 from .....distributed.parallel_state import get_parallel_state
+from ..ulysses import should_apply_ulysses
 
 
 def flex_attention_mask_builder(
@@ -31,16 +32,23 @@ def flex_attention_mask_builder(
     kv_offset: int = 0,
     mask_function: Callable = causal_mask_function,
     attention_mask: torch.Tensor | None = None,
+    skip_ulysses: bool = False,
     **kwargs,
 ) -> BlockMask:
-    """Build a Transformers FlexAttention mask with Ulysses-global sequence dimensions."""
-    parallel_state = get_parallel_state()
-    if parallel_state.ulysses_enabled:
+    """Build a Transformers FlexAttention mask.
+
+    Expand local lengths to the Ulysses-global sequence only when the
+    adapter would gather Q/K/V itself: sync Ulysses and not
+    ``skip_ulysses``. Async Ulysses keeps local tokens, so the mask stays
+    local too.
+    """
+    if should_apply_ulysses(skip_ulysses=skip_ulysses):
         if q_offset != 0 or kv_offset != 0:
             raise ValueError("FlexAttention with Ulysses does not support cached mask offsets.")
         if attention_mask is None or attention_mask.ndim != 2:
             raise ValueError("FlexAttention with Ulysses requires a full-sequence 2D attention mask.")
 
+        parallel_state = get_parallel_state()
         full_sequence_length = q_length * parallel_state.ulysses_size
         if attention_mask.shape[-1] != full_sequence_length:
             raise ValueError(

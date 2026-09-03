@@ -61,7 +61,7 @@ model:
     rms_norm_implementation: "npu"
     rotary_pos_emb_implementation: "npu"
     swiglu_mlp_implementation: "eager"
-    moe_implementation: "fused_npu"
+    moe_implementation: "npu"
 ```
 
 > **Configuration Location**: See the [operator implementation arguments](../usage/arguments.md#opsimplementationconfig).

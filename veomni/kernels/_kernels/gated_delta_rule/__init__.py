@@ -28,7 +28,7 @@ Eager has no varlen path.
 """
 
 from ...registry import register_kernel
-from ...requirement import CudaKernelRequirement, NpuKernelRequirement
+from ...requirement import CudaKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 from .causal_conv1d.standard import eager as conv_eager
 from .causal_conv1d.standard import fla as conv_fla
 from .causal_conv1d.standard import npu as conv_npu
@@ -55,6 +55,14 @@ register_kernel(
 register_kernel(
     "rms_norm_gated",
     "standard",
+    "fla",
+    wrapper=rms_fla.wrapper,
+    requirement=MluKernelRequirement(),
+)
+
+register_kernel(
+    "rms_norm_gated",
+    "standard",
     "npu",
     wrapper=rms_npu.wrapper,
     requirement=NpuKernelRequirement(),
@@ -68,6 +76,14 @@ register_kernel(
     "fla",
     wrapper=conv_fla.wrapper,
     requirement=CudaKernelRequirement(),
+)
+
+register_kernel(
+    "causal_conv1d",
+    "standard",
+    "fla",
+    wrapper=conv_fla.wrapper,
+    requirement=MluKernelRequirement(),
 )
 
 register_kernel(
@@ -87,6 +103,14 @@ register_kernel(
     "fla",
     wrapper=chunk_fla.wrapper,
     requirement=CudaKernelRequirement(),
+)
+
+register_kernel(
+    "chunk_gated_delta_rule",
+    "standard",
+    "fla",
+    wrapper=chunk_fla.wrapper,
+    requirement=MluKernelRequirement(),
 )
 
 register_kernel(

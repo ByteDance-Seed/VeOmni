@@ -36,12 +36,22 @@ from tests.kernels.tol import (
     GDN_FUSED_GRAD_RTOL,
     GDN_FUSED_RTOL,
 )
-from veomni.kernels import resolve_kernel
+from veomni.kernels import KERNEL_REGISTRY, resolve_kernel
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
 def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
     return tuple(t.detach().requires_grad_(True) for t in tensors)
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    ("rms_norm_gated", "causal_conv1d", "chunk_gated_delta_rule"),
+)
+def test_fla_is_registered_for_cuda_and_mlu(kernel):
+    assert (kernel, "standard", "fla", "cuda") in KERNEL_REGISTRY._entries
+    assert (kernel, "standard", "fla", "mlu") in KERNEL_REGISTRY._entries
+    assert KERNEL_REGISTRY.list_registered(kernel, "standard").count("fla") == 1
 
 
 def test_rms_norm_gated_eager_matches_hf():

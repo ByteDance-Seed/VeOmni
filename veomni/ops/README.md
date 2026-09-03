@@ -54,7 +54,7 @@ depending on when and where the kernel is bound:
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
 | mHC | `mhc_implementation` | build-time `OpSlot` | `eager` | `tilelang` (DeepSeek V4, SM90+; provided by `tile-kernels`) |
-| Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `fused_triton` (group-gemm, SM70+), `fused_quack` (CUTLASS/CuTe, SM90+), `fused_npu` (Ascend). Mismatches raise instead of falling back. |
+| Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `triton` (group-gemm, SM70+ GPU or MLU), `quack` (CUTLASS/CuTe, SM90+), `npu` (Ascend), `mlu` (Apex grouped-GEMM). Mismatches raise instead of falling back. |
 
 \* The `triton` backend is registered per-model via `extra_backends`: DeepSeek
 V3 exposes a batch-invariant RMSNorm + deterministic RoPE, and Wan exposes its
@@ -71,9 +71,10 @@ own Triton RMSNorm/rotary. See the per-model table below.
 | `flash_attention_2/3/4` | `flash-attn` / `flash-attn-interface` / `flash-attn.cute` | Validated in `OpsImplementationConfig.__post_init__` |
 | `flex_attention` | PyTorch FlexAttention | Native `BlockMask`; compiled CUDA execution for training |
 | `magi_attention` | `magi-attention==1.1.1`, NVIDIA SM90+ | Native `MagiAttentionMask`; CP1 FFA with optional Ulysses through the SM90 CUTLASS overlay or SM100+ CUTE DSL/JIT backend. |
-| `moe_implementation=fused_triton` | Triton, SM70+ | `is_fused_moe_available()` |
-| `moe_implementation=fused_quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
-| `moe_implementation=fused_npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
+| `moe_implementation=triton` | Triton, SM70+ GPU or MLU | `is_fused_moe_available()` |
+| `moe_implementation=quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
+| `moe_implementation=npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
+| `moe_implementation=mlu` | `apex` grouped-GEMM on MLU | `is_apex_mlu_available()` |
 | `mhc_implementation=tilelang` | `tile-kernels==1.0.0`, BF16, NVIDIA SM90+ | `KernelSpec(HardwareRequirement(..., min_compute_capability=90))` |
 
 #### Installing MagiAttention

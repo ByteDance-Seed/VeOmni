@@ -651,7 +651,7 @@ class LoraSharedExperts(nn.Module):
         self._ensure_ep_grad_sync_hooks()
         # Fused-kernel path: available when the user opted into a non-eager
         # ``moe_implementation`` whose patch function bound a LoRA-aware
-        # kernel ('fused_triton' on GPU, 'fused_npu' on NPU; Quack leaves
+        # kernel ('triton' on GPU, 'npu' on NPU; Quack leaves
         # ``_fused_lora_moe_forward = None`` so we transparently fall back to
         # eager). The bound kernel handles the EP branch internally (Triton via
         # ``preprocess`` / ``token_pre_all2all`` / ``EPMergedFc1SharedLoRAGroupGemm``
@@ -671,7 +671,7 @@ class LoraSharedExperts(nn.Module):
         if get_parallel_state().ep_enabled:
             raise RuntimeError(
                 "LoraSharedExperts: eager forward does not support expert parallelism (EP). "
-                "Set ops_implementation.moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
+                "Set ops_implementation.moe_implementation='triton' (GPU) or 'npu' (NPU) "
                 "to use the EP-aware fused LoRA path, or disable EP."
             )
         return self._eager_forward(hidden_states, top_k_index, top_k_weights)
@@ -1013,7 +1013,7 @@ class LoraIndependentExperts(nn.Module):
     ) -> torch.Tensor:
         # Mirrors LoraSharedExperts.forward: prefer the fused branch whenever
         # the active ``moe_implementation`` bound a Mode 1 LoRA-aware kernel
-        # ('fused_triton' on GPU, 'fused_npu' on NPU; Quack leaves the pointer
+        # ('triton' on GPU, 'npu' on NPU; Quack leaves the pointer
         # as ``None`` so we transparently fall back). The bound kernel handles
         # the EP branch internally (Triton via ``preprocess`` /
         # ``token_pre_all2all`` / ``EPMergedFc1IndependentLoRAGroupGemm`` /
@@ -1028,7 +1028,7 @@ class LoraIndependentExperts(nn.Module):
         if get_parallel_state().ep_enabled:
             raise RuntimeError(
                 "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
-                "Set ops_implementation.moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
+                "Set ops_implementation.moe_implementation='triton' (GPU) or 'npu' (NPU) "
                 "to use the EP-aware fused LoRA path, or disable EP."
             )
         return self._eager_forward(hidden_states, top_k_index, top_k_weights)

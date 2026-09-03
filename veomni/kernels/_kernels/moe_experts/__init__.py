@@ -43,6 +43,14 @@ register_kernel(
 register_kernel(
     "moe_experts",
     "standard",
+    "triton",
+    wrapper=standard_triton.wrapper,
+    requirement=MluKernelRequirement(),
+)
+
+register_kernel(
+    "moe_experts",
+    "standard",
     "quack",
     wrapper=standard_quack.wrapper,
     requirement=CudaKernelRequirement(min_cc=90),
@@ -61,14 +69,6 @@ register_kernel(
     "standard",
     "mlu",
     wrapper=standard_mlu.wrapper,
-    requirement=MluKernelRequirement(),
-)
-
-register_kernel(
-    "moe_experts",
-    "standard",
-    "mlu_triton",
-    wrapper=standard_triton.wrapper,
     requirement=MluKernelRequirement(),
 )
 

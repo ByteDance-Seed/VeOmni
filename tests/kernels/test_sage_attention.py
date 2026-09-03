@@ -47,7 +47,7 @@ def test_sage_attention_hnd_layout_and_is_causal(monkeypatch):
         return query + 1
 
     monkeypatch.setattr(sage_backend, "sageattn", fake_sage)
-    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda: False)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(2, 4, 5, 8)
     key = torch.randn(2, 2, 5, 8)
     value = torch.randn(2, 2, 5, 8)
@@ -74,7 +74,7 @@ def test_sage_attention_hnd_layout_and_is_causal(monkeypatch):
 
 
 def test_sage_attention_skip_ulysses_skips_exchange(monkeypatch):
-    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(
         sage_backend,
         "prepare_ulysses_qkv",
@@ -94,7 +94,7 @@ def test_sage_attention_skip_ulysses_skips_exchange(monkeypatch):
 
 def test_sage_attention_rejects_dense_mask(monkeypatch):
     monkeypatch.setattr(sage_backend, "sageattn", lambda query, key, value, **kwargs: query)
-    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda: False)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 2, 4, 8)
     with pytest.raises(ValueError, match="does not take a dense attention_mask"):
         sage_backend.sage_attention_forward(
@@ -108,7 +108,7 @@ def test_sage_attention_rejects_dense_mask(monkeypatch):
 
 def test_sage_attention_requires_package(monkeypatch):
     monkeypatch.setattr(sage_backend, "sageattn", None)
-    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda: False)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 2, 4, 8)
     with pytest.raises(ImportError, match="sageattention"):
         sage_backend.sage_attention_forward(
@@ -122,7 +122,7 @@ def test_sage_attention_requires_package(monkeypatch):
 
 def test_sage_attention_rejects_training_graph(monkeypatch):
     monkeypatch.setattr(sage_backend, "sageattn", lambda query, key, value, **kwargs: pytest.fail("sageattn"))
-    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda: False)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 2, 4, 8, requires_grad=True)
     with pytest.raises(RuntimeError, match="inference-only"):
         sage_backend.sage_attention_forward(
@@ -142,7 +142,7 @@ def test_sage_attention_allows_no_grad_even_if_inputs_require_grad(monkeypatch):
         return query
 
     monkeypatch.setattr(sage_backend, "sageattn", fake_sage)
-    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda: False)
+    monkeypatch.setattr(sage_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
     query = torch.randn(1, 2, 4, 8, requires_grad=True)
     with torch.no_grad():
         sage_backend.sage_attention_forward(

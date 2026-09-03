@@ -129,7 +129,7 @@ def full_eager_ops() -> OpsImplementationConfig:
 def fused_triton_moe_ops() -> OpsImplementationConfig:
     """Eager everywhere *except* MoE, which uses the Triton group-gemm backend.
 
-    Selecting ``moe_implementation="fused_triton"`` triggers
+    Selecting ``moe_implementation="triton"`` triggers
     ``apply_veomni_fused_moe_patch("triton")`` during ``build_foundation_model``,
     which is what installs ``veomni.lora.ops._fused_lora_moe_forward``.
     The fused MoE-LoRA tests need that pointer to be non-``None`` to actually
@@ -137,7 +137,7 @@ def fused_triton_moe_ops() -> OpsImplementationConfig:
     """
     return OpsImplementationConfig(
         attn_implementation="eager",
-        moe_implementation="fused_triton",
+        moe_implementation="triton",
         cross_entropy_loss_implementation="eager",
         rms_norm_implementation="eager",
         swiglu_mlp_implementation="eager",
@@ -149,13 +149,13 @@ def fused_triton_moe_ops() -> OpsImplementationConfig:
 def fused_npu_moe_ops() -> OpsImplementationConfig:
     """Eager everywhere *except* MoE, which uses the Ascend NPU group-gemm backend.
 
-    Selecting ``moe_implementation="fused_npu"`` triggers
+    Selecting ``moe_implementation="npu"`` triggers
     ``apply_veomni_fused_moe_patch("npu")``, which binds both the base fused MoE
     pointer and the LoRA-aware NPU kernels in ``veomni.lora.ops``.
     """
     return OpsImplementationConfig(
         attn_implementation="eager",
-        moe_implementation="fused_npu",
+        moe_implementation="npu",
         cross_entropy_loss_implementation="eager",
         rms_norm_implementation="eager",
         swiglu_mlp_implementation="eager",

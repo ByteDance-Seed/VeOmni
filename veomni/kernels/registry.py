@@ -15,8 +15,9 @@
 """Kernel registry.
 
 ``KERNEL_REGISTRY`` stores ``KernelEntry`` rows keyed by
-``(kernel, variant, impl)``. Authors register raw ``forward`` / ``backward``
-(or an opaque ``wrapper``). ``resolve_kernel`` returns the entry.
+``(kernel, variant, impl, device)``. Authors register with the public
+triple; ``requirement.device`` (or ``ANY_DEVICE``) fills the fourth key.
+``resolve_kernel`` still takes the triple and adds the current device.
 ``VeomniKernel`` is a local handle that calls ``entry.wrapper``.
 """
 
@@ -28,7 +29,8 @@ from typing import Any, Callable
 import torch
 from torch import Tensor
 
-from .requirement import KernelRequirement
+from ..utils.device import get_device_type
+from .requirement import ANY_DEVICE, KernelRequirement
 
 
 Output = Tensor | tuple[Tensor, ...]
@@ -121,39 +123,61 @@ class KernelEntry:
             self.wrapper = _make_autograd_fn(self.forward, self.backward)
 
 
+def _entry_device(entry: KernelEntry) -> str:
+    """Return the fourth key for ``entry``."""
+    if entry.requirement is None:
+        return ANY_DEVICE
+    return entry.requirement.device
+
+
 class KernelRegistry:
-    """Global ``KernelEntry`` table keyed by ``(kernel, variant, impl)``."""
+    """Global ``KernelEntry`` table keyed by ``(kernel, variant, impl, device)``."""
 
     def __init__(self) -> None:
         """Create an empty registry table."""
-        self._entries: dict[tuple[str, str, str], KernelEntry] = {}
+        self._entries: dict[tuple[str, str, str, str], KernelEntry] = {}
 
     def _requirement_matches(self, entry: KernelEntry) -> bool:
         """Return whether ``entry.requirement`` is missing or matches this machine."""
         return entry.requirement is None or entry.requirement.matches()
 
     def register(self, entry: KernelEntry) -> None:
-        """Insert ``entry``. Duplicate ``(kernel, variant, impl)`` keys raise."""
+        """Insert ``entry``. Duplicate ``(kernel, variant, impl, device)`` keys raise."""
         if not isinstance(entry, KernelEntry):
             raise TypeError(f"KERNEL_REGISTRY.register expects KernelEntry, got {type(entry).__name__}")
 
-        key = (entry.kernel, entry.variant, entry.impl)
+        device = _entry_device(entry)
+        key = (entry.kernel, entry.variant, entry.impl, device)
         if key in self._entries:
             raise ValueError(
                 f"Duplicate kernel registration: kernel={entry.kernel!r}, "
-                f"variant={entry.variant!r}, impl={entry.impl!r}"
+                f"variant={entry.variant!r}, impl={entry.impl!r}, device={device!r}"
             )
         self._entries[key] = entry
 
     def resolve(self, kernel: str, variant: str, impl: str) -> KernelEntry:
-        """Return the row for ``(kernel, variant, impl)``.
+        """Return the row for ``(kernel, variant, impl)`` on this device.
 
-        Unknown triples raise ``KeyError``. A registered row whose
-        ``requirement`` does not match this machine raises ``RuntimeError``.
+        Looks up ``(kernel, variant, impl, current_device)``, then
+        ``ANY_DEVICE``. Unknown triples raise ``KeyError``. A row that
+        exists only for other devices, or whose ``requirement`` does not
+        match, raises ``RuntimeError``.
         """
-        key = (kernel, variant, impl)
-        entry = self._entries.get(key)
+        device = get_device_type()
+        entry = self._entries.get((kernel, variant, impl, device))
         if entry is None:
+            entry = self._entries.get((kernel, variant, impl, ANY_DEVICE))
+        if entry is None:
+            devices = [
+                entry_device
+                for (entry_kernel, entry_variant, entry_impl, entry_device) in self._entries
+                if entry_kernel == kernel and entry_variant == variant and entry_impl == impl
+            ]
+            if devices:
+                raise RuntimeError(
+                    f"Kernel {kernel!r} variant={variant!r} impl={impl!r} "
+                    f"is not registered for device {device!r} (have {sorted(devices)})"
+                )
             raise KeyError(f"Unknown kernel {kernel!r} variant={variant!r} impl={impl!r}")
         if entry.requirement is not None:
             try:
@@ -165,20 +189,27 @@ class KernelRegistry:
         return entry
 
     def list_registered(self, kernel: str, variant: str) -> list[str]:
-        """Return every registered impl name for ``(kernel, variant)``."""
-        return [
-            impl
-            for (entry_kernel, entry_variant, impl) in self._entries
-            if entry_kernel == kernel and entry_variant == variant
-        ]
+        """Return unique registered impl names for ``(kernel, variant)``."""
+        seen: list[str] = []
+        for entry_kernel, entry_variant, impl, _device in self._entries:
+            if entry_kernel == kernel and entry_variant == variant and impl not in seen:
+                seen.append(impl)
+        return seen
 
     def list_available(self, kernel: str, variant: str) -> list[str]:
         """Return impl names for ``(kernel, variant)`` that match this machine."""
-        return [
-            impl
-            for (entry_kernel, entry_variant, impl), entry in self._entries.items()
-            if entry_kernel == kernel and entry_variant == variant and self._requirement_matches(entry)
-        ]
+        device = get_device_type()
+        seen: list[str] = []
+        for (entry_kernel, entry_variant, impl, entry_device), entry in self._entries.items():
+            if entry_kernel != kernel or entry_variant != variant:
+                continue
+            if entry_device not in (device, ANY_DEVICE):
+                continue
+            if not self._requirement_matches(entry):
+                continue
+            if impl not in seen:
+                seen.append(impl)
+        return seen
 
 
 KERNEL_REGISTRY = KernelRegistry()
@@ -196,8 +227,9 @@ def register_kernel(
 ) -> None:
     """Register one row on ``KERNEL_REGISTRY``.
 
-    Pass a raw pair or an opaque ``wrapper``, not both. ``requirement`` is
-    stored on the row and checked by ``resolve_kernel``.
+    Pass a raw pair or an opaque ``wrapper``, not both. ``requirement.device``
+    (or ``ANY_DEVICE``) is the fourth key. ``resolve_kernel`` still takes the
+    public triple.
     """
     KERNEL_REGISTRY.register(
         KernelEntry(

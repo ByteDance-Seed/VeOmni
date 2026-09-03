@@ -134,7 +134,7 @@ def fused_lora_moe_forward(
     if _fused_lora_moe_forward is None:
         raise NotImplementedError(
             "No fused MoE-LoRA kernel is bound. Set ops_implementation.moe_implementation "
-            "to a backend that ships a LoRA variant ('fused_triton' on GPU, 'fused_npu' on NPU) "
+            "to a backend that ships a LoRA variant ('triton' on GPU, 'npu' on NPU) "
             "or fall back to the eager LoRA forward."
         )
 
@@ -197,7 +197,7 @@ def fused_independent_lora_moe_forward(
     if _fused_independent_lora_moe_forward is None:
         raise NotImplementedError(
             "No fused independent MoE-LoRA kernel is bound. Set ops_implementation.moe_implementation "
-            "to a backend that ships a LoRA variant ('fused_triton' on GPU, 'fused_npu' on NPU) "
+            "to a backend that ships a LoRA variant ('triton' on GPU, 'npu' on NPU) "
             "or fall back to the eager LoRA forward."
         )
 

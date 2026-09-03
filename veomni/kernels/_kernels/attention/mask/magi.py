@@ -27,6 +27,7 @@ from transformers.masking_utils import (
 
 from .....distributed.parallel_state import get_parallel_state
 from ..helper import require_all
+from ..ulysses import should_apply_ulysses
 
 
 @dataclass(frozen=True)
@@ -98,9 +99,14 @@ def magi_attention_mask_builder(
     kv_offset: int = 0,
     mask_function: Callable = causal_mask_function,
     attention_mask: torch.Tensor | None = None,
+    skip_ulysses: bool = False,
     **kwargs,
 ) -> MagiAttentionMask:
-    """HF-signature Magi mask for unpacked causal / bidirectional attention."""
+    """HF-signature Magi mask for unpacked causal / bidirectional attention.
+
+    Expand local lengths only when the adapter would gather Q/K/V itself:
+    sync Ulysses and not ``skip_ulysses``.
+    """
     if batch_size != 1:
         raise ValueError(f"MagiAttention mask creation requires physical batch size 1, got {batch_size}.")
     if q_offset != 0 or kv_offset != 0:
@@ -125,7 +131,7 @@ def magi_attention_mask_builder(
         raise ValueError("MagiAttention mask creation requires a device or tensor metadata.")
     device = torch.device(device)
 
-    full_q_length, full_kv_length = _full_sequence_lengths(q_length, kv_length)
+    full_q_length, full_kv_length = _full_sequence_lengths(q_length, kv_length, skip_ulysses=skip_ulysses)
     if attention_mask is not None and attention_mask.shape[-1] != full_kv_length:
         raise ValueError(
             "MagiAttention attention_mask must describe the full post-Ulysses key sequence, "
@@ -141,9 +147,10 @@ def magi_attention_mask_builder(
     )
 
 
-def _full_sequence_lengths(q_length: int, kv_length: int) -> tuple[int, int]:
-    parallel_state = get_parallel_state()
-    scale = parallel_state.ulysses_size if parallel_state.ulysses_enabled else 1
+def _full_sequence_lengths(q_length: int, kv_length: int, *, skip_ulysses: bool) -> tuple[int, int]:
+    if not should_apply_ulysses(skip_ulysses=skip_ulysses):
+        return q_length, kv_length
+    scale = get_parallel_state().ulysses_size
     return q_length * scale, kv_length * scale
 
 

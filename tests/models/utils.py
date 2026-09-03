@@ -27,7 +27,7 @@ _USE_LIGER_KERNEL = [True, False] if is_liger_kernel_available() else [False]
 _LOAD_BALANCING_LOSS_IMPL = "triton" if is_package_available("triton") else "eager"
 # Pick the fused-MoE backend that matches the test hardware. On NPU the NPU
 # kernel is the only option; on GPU default to Triton (SM70+).
-_FUSED_MOE_IMPL = "fused_npu" if is_torch_npu_available() else "fused_triton"
+_FUSED_MOE_IMPL = "npu" if is_torch_npu_available() else "triton"
 
 
 @dataclass(frozen=True)

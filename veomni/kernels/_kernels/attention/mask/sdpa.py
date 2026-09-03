@@ -29,6 +29,7 @@ from transformers.masking_utils import (
 )
 
 from .....distributed.parallel_state import get_parallel_state
+from ..ulysses import should_apply_ulysses
 
 
 def sdpa_attention_mask_builder(
@@ -39,13 +40,16 @@ def sdpa_attention_mask_builder(
     kv_offset: int = 0,
     mask_function: Callable = causal_mask_function,
     attention_mask: torch.Tensor | None = None,
+    skip_ulysses: bool = False,
     **kwargs,
 ) -> Tensor | None:
     """HF-signature SDPA mask for ``sdpa`` / ``veomni_sdpa``.
 
-    Expands Ulysses-local lengths, then calls Transformers' ``sdpa`` builder.
-    Cached decode (``q_length != kv_length``) cannot use SDPA ``is_causal`` skip.
-    Optional ``sliding_window`` / ``cu_seqlens`` compose onto ``mask_function``.
+    Expand Ulysses-local lengths only when the adapter would gather Q/K/V
+    itself: sync Ulysses and not ``skip_ulysses``. Then call Transformers'
+    ``sdpa`` builder. Cached decode (``q_length != kv_length``) cannot use
+    SDPA ``is_causal`` skip. Optional ``sliding_window`` / ``cu_seqlens``
+    compose onto ``mask_function``.
     """
     sliding_window = kwargs.pop("sliding_window", None)
     cu_seqlens = kwargs.pop("cu_seqlens", None)
@@ -73,12 +77,12 @@ def sdpa_attention_mask_builder(
             ),
         )
 
-    parallel_state = get_parallel_state()
-    if parallel_state.ulysses_enabled:
+    if should_apply_ulysses(skip_ulysses=skip_ulysses):
         if q_offset != 0 or kv_offset != 0:
             raise ValueError("SDPA with Ulysses does not support cached mask offsets.")
         if attention_mask is None or attention_mask.ndim != 2:
             raise ValueError("SDPA with Ulysses requires a full-sequence 2D attention mask.")
+        parallel_state = get_parallel_state()
         full_sequence_length = q_length * parallel_state.ulysses_size
         if attention_mask.shape[-1] != full_sequence_length:
             raise ValueError(

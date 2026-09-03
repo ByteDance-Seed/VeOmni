@@ -117,7 +117,7 @@ def flash_attention_forward(
 
     # Ulysses patch
     parallel_state = get_parallel_state()
-    ulysses_enabled = should_apply_ulysses() and not skip_ulysses
+    ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
     if ulysses_enabled:
         query, key, value, query_head_count = prepare_ulysses_qkv(
             query,

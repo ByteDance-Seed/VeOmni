@@ -28,7 +28,7 @@ def _bind_gpt_oss_moe(impl: str) -> None:
     """Rebind GPT-OSS' module-level MoE OpSlot before each comparison forward."""
     from veomni.models.transformers.gpt_oss.generated import patched_modeling_gpt_oss_gpu as gpt_oss_gen
 
-    gpt_oss_gen.veomni_moe_experts_forward.bind("eager" if impl == "eager" else impl.removeprefix("fused_"))
+    gpt_oss_gen.veomni_moe_experts_forward.bind(impl)
 
 
 @pytest.fixture(autouse=True)
@@ -110,7 +110,7 @@ def test_gpt_oss_rejects_triton_moe_backend(monkeypatch):
             "tests/toy_config/gpt_oss_toy",
             torch_dtype="float32",
             init_device="cpu",
-            ops_implementation=_ops_config(moe_implementation="fused_triton"),
+            ops_implementation=_ops_config(moe_implementation="triton"),
         )
 
 
@@ -128,7 +128,7 @@ def test_gpt_oss_fused_quack_without_sm90_raises(monkeypatch):
             "tests/toy_config/gpt_oss_toy",
             torch_dtype="float32",
             init_device="cpu",
-            ops_implementation=_ops_config(moe_implementation="fused_quack"),
+            ops_implementation=_ops_config(moe_implementation="quack"),
         )
 
 
@@ -155,7 +155,7 @@ def test_gpt_oss_fused_moe_matches_eager_cuda(monkeypatch):
         "tests/toy_config/gpt_oss_toy",
         torch_dtype="bfloat16",
         init_device=device,
-        ops_implementation=_ops_config(moe_implementation="fused_quack"),
+        ops_implementation=_ops_config(moe_implementation="quack"),
     ).eval()
     fused_model.load_state_dict(eager_model.state_dict())
 
@@ -163,7 +163,7 @@ def test_gpt_oss_fused_moe_matches_eager_cuda(monkeypatch):
     with torch.no_grad():
         _bind_gpt_oss_moe("eager")
         eager_logits = eager_model(input_ids=input_ids, use_cache=False).logits
-        _bind_gpt_oss_moe("fused_quack")
+        _bind_gpt_oss_moe("quack")
         fused_logits = fused_model(input_ids=input_ids, use_cache=False).logits
 
     torch.testing.assert_close(fused_logits, eager_logits, atol=8e-3, rtol=8e-3)
@@ -198,11 +198,11 @@ def test_gpt_oss_quack_fused_moe_matches_eager_cuda(monkeypatch):
         "tests/toy_config/gpt_oss_toy",
         torch_dtype="bfloat16",
         init_device=device,
-        ops_implementation=_ops_config(moe_implementation="fused_quack"),
+        ops_implementation=_ops_config(moe_implementation="quack"),
     )
     fused_model.load_state_dict(eager_model.state_dict())
 
-    _bind_gpt_oss_moe("fused_quack")
+    _bind_gpt_oss_moe("quack")
     fused_loss = fused_model(input_ids=input_ids, labels=labels, use_cache=False).loss
     torch.testing.assert_close(fused_loss, eager_loss, atol=8e-3, rtol=8e-3)
 

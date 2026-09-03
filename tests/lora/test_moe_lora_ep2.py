@@ -116,7 +116,7 @@ __all__ = [
 # (LoraSharedExperts / LoraIndependentExperts raise under ep_enabled if
 # the eager path is selected -- only the fused triton kernel implements
 # the EP dispatch via ``dispatch_to_ep_class``).
-_FUSED_OPS_OVERRIDE = "--model.ops_implementation.moe_implementation=fused_triton"
+_FUSED_OPS_OVERRIDE = "--model.ops_implementation.moe_implementation=triton"
 
 # Two different log lines fire during EP plan application; we grep for
 # both so the assertion catches every Shard(0) target regardless of

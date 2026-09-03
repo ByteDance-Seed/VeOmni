@@ -371,8 +371,8 @@ Each MoE-LoRA wrapper dispatches based on `model.ops_implementation.moe_implemen
 
 | `moe_implementation` | non-EP | EP | Notes |
 |---|---|---|---|
-| `fused_triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
-| `fused_npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
+| `triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
+| `npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
 | `eager` | eager loop (reference) | not supported (raises) | Portable reference path. |
 
 The fused GPU path lives in `veomni/lora/ops/moe_group_gemm.py` and reuses the same
@@ -383,7 +383,7 @@ LoRA fused pointers are bound by `veomni.ops.kernels.moe.apply_veomni_fused_moe_
 
 ### 5.4 Expert Parallelism (EP)
 
-Both `fused_triton` and `fused_npu` support the EP path; `fused_npu` uses the
+Both `triton` and `npu` support the EP path; `npu` uses the
 Ascend GroupGEMM implementation in `veomni/lora/ops/npu_moe_group_gemm.py`.
 
 When `train.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
@@ -400,7 +400,7 @@ When `train.accelerator.ep_size > 1`, base experts are sharded along the expert 
   EP all-reduce for these replicated params so the global grad-norm matches EP=1.
 
 Both modes work with FSDP2 + EP. EP requires a fused forward path:
-`fused_triton` on GPU or `fused_npu` on Ascend NPU; `eager` raises.
+`triton` on GPU or `npu` on Ascend NPU; `eager` raises.
 
 ### 5.5 Save / load artefacts
 
@@ -559,7 +559,7 @@ model:
   model_path: Qwen3-30B-A3B-merge
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: eager           # EP (ep_size > 1) REQUIRES fused_triton
+    moe_implementation: eager           # EP (ep_size > 1) REQUIRES triton
   lora_config:
     rank: 16
     alpha: 32
@@ -571,7 +571,7 @@ train:
   init_device: meta
   accelerator:
     ulysses_size: 1
-    ep_size: 1                          # set >1 to enable EP; also set moe_implementation: fused_triton
+    ep_size: 1                          # set >1 to enable EP; also set moe_implementation: triton
     fsdp_config:
       fsdp_mode: fsdp2
 ```

@@ -14,7 +14,7 @@
 
 """standard MoE experts Triton implementation.
 
-Also registered as ``mlu_triton`` (same wrapper, ``MluKernelRequirement``).
+Registered as ``triton`` on CUDA and MLU. Device is the registry 4th key.
 """
 
 from __future__ import annotations

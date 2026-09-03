@@ -51,7 +51,7 @@ def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch, impl
         return query + 1
 
     monkeypatch.setattr(flash_backend, "_flash_attention_forward", replacement_backend)
-    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda: False)
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
 
     module = _FakeAttentionModule(implementation)
     query = torch.randn(2, 4, 3, 4, dtype=torch.float16)
@@ -116,7 +116,7 @@ def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch)
         return query
 
     monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", fake_prepare)
     monkeypatch.setattr(flash_backend, "slice_ulysses_head_auxiliary", fake_slice)
     monkeypatch.setattr(flash_backend, "restore_ulysses_output", fake_restore)
@@ -147,7 +147,7 @@ def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkey
         captured["kwargs"] = kwargs
         return query
 
-    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(
         flash_backend,
         "prepare_ulysses_qkv",

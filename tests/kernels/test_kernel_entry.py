@@ -22,7 +22,7 @@ from torch import Tensor
 
 from veomni.kernels import KERNEL_REGISTRY, VeomniKernel, register_kernel, resolve_kernel
 from veomni.kernels.registry import KernelEntry, SavedState
-from veomni.kernels.requirement import CudaKernelRequirement, MluKernelRequirement, NpuKernelRequirement
+from veomni.kernels.requirement import ANY_DEVICE, CudaKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 
 
 @pytest.fixture
@@ -100,7 +100,7 @@ class TestRegisterAndResolve:
         with pytest.raises(ValueError, match="Duplicate kernel registration"):
             register_kernel("add", "standard", "eager", _add_forward, _add_backward)
 
-    def test_same_impl_conflicts_across_requirements(self):
+    def test_same_impl_can_register_per_device(self):
         KERNEL_REGISTRY.register(
             KernelEntry(
                 kernel="add",
@@ -111,7 +111,31 @@ class TestRegisterAndResolve:
                 requirement=CudaKernelRequirement(),
             )
         )
-        with pytest.raises(ValueError, match="Duplicate kernel registration"):
+        KERNEL_REGISTRY.register(
+            KernelEntry(
+                kernel="add",
+                variant="standard",
+                impl="fused",
+                forward=_add_forward,
+                backward=_add_backward,
+                requirement=NpuKernelRequirement(),
+            )
+        )
+        KERNEL_REGISTRY.register(
+            KernelEntry(
+                kernel="add",
+                variant="standard",
+                impl="fused",
+                forward=_add_forward,
+                backward=_add_backward,
+                requirement=MluKernelRequirement(),
+            )
+        )
+        assert KERNEL_REGISTRY.list_registered("add", "standard") == ["fused"]
+        assert ("add", "standard", "fused", "cuda") in KERNEL_REGISTRY._entries
+        assert ("add", "standard", "fused", "mlu") in KERNEL_REGISTRY._entries
+        assert ("add", "standard", "fused", "npu") in KERNEL_REGISTRY._entries
+        with pytest.raises(ValueError, match="device='cuda'"):
             KERNEL_REGISTRY.register(
                 KernelEntry(
                     kernel="add",
@@ -119,20 +143,31 @@ class TestRegisterAndResolve:
                     impl="fused",
                     forward=_add_forward,
                     backward=_add_backward,
-                    requirement=NpuKernelRequirement(),
+                    requirement=CudaKernelRequirement(),
                 )
             )
-        with pytest.raises(ValueError, match="Duplicate kernel registration"):
-            KERNEL_REGISTRY.register(
-                KernelEntry(
-                    kernel="add",
-                    variant="standard",
-                    impl="fused",
-                    forward=_add_forward,
-                    backward=_add_backward,
-                    requirement=MluKernelRequirement(),
-                )
-            )
+
+    def test_resolve_uses_current_device_then_any(self, monkeypatch):
+        def cuda_wrapper(x: Tensor) -> Tensor:
+            return x + 1
+
+        def mlu_wrapper(x: Tensor) -> Tensor:
+            return x + 2
+
+        def any_wrapper(x: Tensor) -> Tensor:
+            return x + 3
+
+        register_kernel("add", "standard", "fused", wrapper=cuda_wrapper, requirement=CudaKernelRequirement())
+        register_kernel("add", "standard", "fused", wrapper=mlu_wrapper, requirement=MluKernelRequirement())
+        register_kernel("add", "standard", "eager", wrapper=any_wrapper)
+        monkeypatch.setattr("veomni.kernels.registry.get_device_type", lambda: "mlu")
+        monkeypatch.setattr("veomni.kernels.requirement.IS_MLU_AVAILABLE", True)
+        assert resolve_kernel("add", "standard", "fused").wrapper is mlu_wrapper
+        assert resolve_kernel("add", "standard", "eager").wrapper is any_wrapper
+        monkeypatch.setattr("veomni.kernels.registry.get_device_type", lambda: "cpu")
+        with pytest.raises(RuntimeError, match="not registered for device 'cpu'"):
+            resolve_kernel("add", "standard", "fused")
+        assert ("add", "standard", "eager", ANY_DEVICE) in KERNEL_REGISTRY._entries
 
     def test_unmatched_requirement_is_registered_but_not_resolvable(self):
         register_kernel(

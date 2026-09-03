@@ -102,7 +102,7 @@ Qwen3.5-35B-A3B. 8X80GB GPU will likely OOM due to the model size. Use 8X192GB G
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-35B-A3B \
-    --model.ops_implementation.moe_implementation fused_triton \
+    --model.ops_implementation.moe_implementation triton \
     --data.train_path ${HOME}/tulu-first2000.parquet \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
@@ -218,7 +218,7 @@ Drop `chunk_gated_delta_rule_implementation` to `npu` if `fla_npu` is not instal
 
 ### Qwen3.5 MoE 35B VL Training
 
-A ready-to-run MoE-VL config wired for `npu_ascendc` (plus `fused_npu` MoE, NPU RMSNorm/RoPE and
+A ready-to-run MoE-VL config wired for `npu_ascendc` (plus `npu` MoE, NPU RMSNorm/RoPE and
 Ulysses SP) is provided at
 [`configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml`](../../configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_ascendc.yaml):
 

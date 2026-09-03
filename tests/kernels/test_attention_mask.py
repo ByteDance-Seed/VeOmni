@@ -108,10 +108,19 @@ def test_magi_2d_mask_length_aligns_with_full_kv():
         magi_attention_mask_builder(1, 4, 4, attention_mask=torch.ones(1, 3, dtype=torch.bool), device="cpu")
 
 
+def _sync_ulysses_state(*, size: int = 2) -> SimpleNamespace:
+    return SimpleNamespace(ulysses_size=size, async_enabled=False)
+
+
+def _patch_mask_ulysses(monkeypatch, *modules, apply: bool, size: int = 2) -> None:
+    state = _sync_ulysses_state(size=size)
+    for module in modules:
+        monkeypatch.setattr(module, "should_apply_ulysses", lambda *, skip_ulysses=False: apply and not skip_ulysses)
+        monkeypatch.setattr(module, "get_parallel_state", lambda: state)
+
+
 def test_flex_and_magi_ulysses_2d_mask_lengths_align(monkeypatch):
-    state = SimpleNamespace(ulysses_enabled=True, ulysses_size=2)
-    monkeypatch.setattr(flex_mask, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(magi_mask, "get_parallel_state", lambda: state)
+    _patch_mask_ulysses(monkeypatch, flex_mask, magi_mask, apply=True)
     full_2d = torch.ones(1, 8, dtype=torch.bool)
     flex = flex_attention_mask_builder(1, 4, 4, attention_mask=full_2d, device="cpu")
     magi = magi_attention_mask_builder(1, 4, 4, attention_mask=full_2d, device="cpu")
@@ -140,24 +149,46 @@ def test_flex_and_magi_ulysses_2d_mask_lengths_align(monkeypatch):
     ],
 )
 def test_flex_and_sdpa_ulysses_reject_incomplete_2d_mask(monkeypatch, builder, module, attention_mask, match):
-    monkeypatch.setattr(
-        module,
-        "get_parallel_state",
-        lambda: SimpleNamespace(ulysses_enabled=True, ulysses_size=2),
-    )
+    _patch_mask_ulysses(monkeypatch, module, apply=True)
     with pytest.raises(ValueError, match=match):
         builder(1, 4, 4, attention_mask=attention_mask, device="cpu")
 
 
 def test_magi_hf_builder_expands_ulysses_local_lengths(monkeypatch):
-    monkeypatch.setattr(
-        magi_mask,
-        "get_parallel_state",
-        lambda: SimpleNamespace(ulysses_enabled=True, ulysses_size=2),
-    )
+    _patch_mask_ulysses(monkeypatch, magi_mask, apply=True)
     mask = magi_attention_mask_builder(1, 4, 4, device="cpu")
     assert mask.q_ranges.tolist() == [[0, 8]]
     assert mask.k_ranges.tolist() == [[0, 8]]
+
+
+@pytest.mark.parametrize(
+    ("builder", "module", "kwargs"),
+    [
+        (flex_attention_mask_builder, flex_mask, {"attention_mask": torch.ones(1, 4, dtype=torch.bool)}),
+        (
+            sdpa_attention_mask_builder,
+            sdpa_mask,
+            {"attention_mask": torch.ones(1, 4, dtype=torch.bool), "allow_is_causal_skip": False},
+        ),
+        (magi_attention_mask_builder, magi_mask, {}),
+    ],
+)
+def test_mask_builders_keep_local_lengths_when_async_or_skipped(monkeypatch, builder, module, kwargs):
+    _patch_mask_ulysses(monkeypatch, module, apply=False)
+    local = builder(1, 4, 4, device="cpu", **kwargs)
+    _patch_mask_ulysses(monkeypatch, module, apply=True)
+    skipped = builder(1, 4, 4, device="cpu", skip_ulysses=True, **kwargs)
+    if builder is magi_attention_mask_builder:
+        assert local.q_ranges.tolist() == [[0, 4]]
+        assert local.k_ranges.tolist() == [[0, 4]]
+        assert skipped.q_ranges.tolist() == [[0, 4]]
+        assert skipped.k_ranges.tolist() == [[0, 4]]
+    elif builder is flex_attention_mask_builder:
+        assert tuple(local.shape[-2:]) == (4, 4)
+        assert tuple(skipped.shape[-2:]) == (4, 4)
+    else:
+        assert local.shape[-2:] == (4, 4)
+        assert skipped.shape[-2:] == (4, 4)
 
 
 @pytest.mark.parametrize(

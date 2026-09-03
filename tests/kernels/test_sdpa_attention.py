@@ -86,7 +86,7 @@ def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
         return output
 
     monkeypatch.setattr(sdpa_backend, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(sdpa_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(sdpa_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(sdpa_backend, "prepare_ulysses_qkv", fake_prepare)
     monkeypatch.setattr(sdpa_backend, "slice_ulysses_head_auxiliary", fake_slice)
     monkeypatch.setattr(sdpa_backend, "hf_sdpa_attention_forward", fake_backend)
@@ -111,7 +111,7 @@ def test_sdpa_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
 
 
 def test_sdpa_attention_skip_ulysses_skips_exchange(monkeypatch):
-    monkeypatch.setattr(sdpa_backend, "should_apply_ulysses", lambda: True)
+    monkeypatch.setattr(sdpa_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     monkeypatch.setattr(
         sdpa_backend,
         "prepare_ulysses_qkv",

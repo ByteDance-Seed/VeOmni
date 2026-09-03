@@ -153,7 +153,7 @@ def test_qwen3_vl_moe_constructs_local_kernels():
 def test_qwen3_vl_moe_instances_keep_distinct_impls():
     eager = _build_ours(_tiny_config(), eager_kernels_config())
     fused_cfg = eager_kernels_config()
-    fused_cfg.moe_implementation = "fused_triton"
+    fused_cfg.moe_implementation = "triton"
     fused = _build_ours(_tiny_config(), fused_cfg)
 
     assert eager.model.language_model.layers[0].mlp.experts.veomni_moe.impl == "eager"

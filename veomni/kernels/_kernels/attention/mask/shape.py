@@ -145,11 +145,17 @@ def causal_mask(
     impl: str,
     device: torch.device | str,
     batch_size: int = 1,
+    skip_ulysses: bool = False,
     **kwargs: Any,
 ):
-    """Build a causal mask for ``impl``, or ``None`` when flash uses kwargs."""
+    """Build a causal mask for ``impl``, or ``None`` when flash uses kwargs.
+
+    ``skip_ulysses`` is forwarded to the Flex / SDPA / Magi builders so
+    local lengths stay local when attention will not gather.
+    """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
+    extra["skip_ulysses"] = skip_ulysses
     if backend in _FLASH_LIKE_CAUSAL:
         return flash_attention_mask_builder()
     if backend in _SDPA or backend in _EAGER:
@@ -177,11 +183,16 @@ def sliding_window_mask(
     device: torch.device | str,
     sliding_window: int,
     batch_size: int = 1,
+    skip_ulysses: bool = False,
     **kwargs: Any,
 ):
-    """Sliding-window causal mask. Flash returns ``None``."""
+    """Sliding-window causal mask. Flash returns ``None``.
+
+    ``skip_ulysses`` is forwarded to the Flex / SDPA builders.
+    """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
+    extra["skip_ulysses"] = skip_ulysses
     cu_seqlens = extra.pop("cu_seqlens", None)
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support sliding_window_mask")
@@ -221,11 +232,17 @@ def packed_causal_mask(
     device: torch.device | str,
     cu_seqlens: torch.Tensor,
     batch_size: int = 1,
+    skip_ulysses: bool = False,
     **kwargs: Any,
 ):
-    """Packed causal mask from ``cu_seqlens``. Flash returns ``None``."""
+    """Packed causal mask from ``cu_seqlens``. Flash returns ``None``.
+
+    Flex / SDPA builders receive ``skip_ulysses``. Magi packed ranges come
+    from ``cu_seqlens`` and are not scaled.
+    """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
+    extra["skip_ulysses"] = skip_ulysses
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support packed_causal_mask")
     if backend in _FLASH:
@@ -252,6 +269,7 @@ def packed_causal_mask(
     if backend == "magi_attention":
         extra.pop("dtype", None)
         extra.pop("mask_function", None)
+        extra.pop("skip_ulysses", None)
         return MagiAttentionMask.from_cu_seqlens(
             cu_seqlens,
             extra.pop("cu_seq_lens_k", extra.pop("cu_seqlens_k", cu_seqlens)),

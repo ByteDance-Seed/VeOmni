@@ -50,15 +50,8 @@ def attention_kernel() -> VeomniKernel:
 
 
 def resolve_moe_impl() -> str:
-    """Map ``moe_implementation`` onto a ``moe_experts`` registry impl.
-
-    Config may use ``fused_triton`` / ``fused_quack`` / ``fused_npu``.
-    Registry rows are ``triton`` / ``quack`` / ``npu``.
-    """
-    impl = resolve_kernel_impl("moe_implementation")
-    if impl.startswith("fused_"):
-        return impl.removeprefix("fused_")
-    return impl
+    """Return the active ``moe_experts`` impl from kernels config."""
+    return resolve_kernel_impl("moe_implementation")
 
 
 def empty_bias(weight: Tensor) -> Tensor:

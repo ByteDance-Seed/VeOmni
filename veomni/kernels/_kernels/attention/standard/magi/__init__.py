@@ -134,7 +134,7 @@ def magi_attention_forward(
     if parallel_state.cp_size != 1:
         raise ValueError(f"MagiAttention FFA currently supports cp_size == 1, got cp_size={parallel_state.cp_size}.")
 
-    ulysses_enabled = should_apply_ulysses() and not skip_ulysses
+    ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)

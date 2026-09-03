@@ -27,11 +27,11 @@ selection knob.
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
+| MoE experts | `moe_implementation` | `eager`, `triton`, `quack` (SM90+), `npu`, `mlu` | `"triton"` (GPU) | `build_foundation_model` |
 
 **Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
 equal to the dataclass defaults automatically resolve to `npu` for RMSNorm,
-rotary embedding, vision rotary embedding, and cross-entropy; to `fused_npu`
+rotary embedding, vision rotary embedding, and cross-entropy; to `npu`
 for MoE; and to `eager` for SwiGLU and load-balancing loss. Explicit
 non-default overrides are retained and rejected when unsupported. Qwen3.5's
 three GatedDeltaNet fields are
@@ -363,17 +363,18 @@ selected backend automatically — no per-model patching needed.
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: fused_triton   # Triton group-gemm (GPU, SM70+)
-    # moe_implementation: fused_quack  # Quack CUTLASS/CuTe (GPU, SM90+)
-    # moe_implementation: fused_npu    # NPU group-gemm (Ascend)
-    # moe_implementation: eager        # Reference PyTorch loop (very slow, debug only)
+    moe_implementation: triton   # Triton group-gemm (GPU SM70+ or MLU)
+    # moe_implementation: quack   # Quack CUTLASS/CuTe (GPU, SM90+)
+    # moe_implementation: npu     # NPU group-gemm (Ascend)
+    # moe_implementation: mlu     # Apex grouped-GEMM (MLU)
+    # moe_implementation: eager   # Reference PyTorch loop (very slow, debug only)
 ```
 
 **Field:** `OpsImplementationConfig.moe_implementation`
-**Default:** `"fused_triton"` (GPU). On NPU, a value still equal to this
+**Default:** `"triton"` (GPU). On NPU, a value still equal to this
 dataclass default—including an explicit YAML value—is normalized to
-`"fused_npu"`. Set `"fused_npu"` explicitly for clarity; incompatible
-non-default overrides such as `"fused_quack"` raise at config validation time.
+`"npu"`. Set `"npu"` explicitly for clarity; incompatible
+non-default overrides such as `"quack"` raise at config validation time.
 
 The mode and kernel backend are expressed as a single field. After the
 default-value compatibility normalization above, remaining hardware mismatches
@@ -382,19 +383,20 @@ raise during config validation or kernel binding.
 | Value | Kernel | Hardware | EP support |
 |-------|--------|----------|:----------:|
 | `eager` | PyTorch expert loop | Any | No |
-| `fused_triton` | Triton group-gemm | GPU, SM70+ (V100+) | Yes |
-| `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
-| `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
+| `triton` | Triton group-gemm | GPU SM70+ or MLU | Yes |
+| `quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
+| `npu` | NPU group-gemm | Ascend NPU | Yes |
+| `mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` indexer and attention implementations. Its MoE path
 uses the independent `moe_implementation` selection and therefore defaults to
-`fused_triton` on GPU.
+`triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
 directly to `fused_moe_forward(...)` and forwards `swiglu_limit` so backends
 that implement the clamp preserve V4's clamped SwiGLU pre-activation semantics.
-Clamp-aware fused V4 support is GPU-only today (`fused_triton` / `fused_quack`);
-selecting `fused_npu` for a V4 model raises because the NPU fused MoE kernel
+Clamp-aware fused V4 support is GPU-only today (`triton` / `quack`);
+selecting `npu` for a V4 model raises because the NPU fused MoE kernel
 does not yet implement `swiglu_limit`.
 
 ### Key files
