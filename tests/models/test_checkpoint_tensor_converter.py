@@ -983,6 +983,61 @@ class TestQwen3VLMoeConverterConvert:
             )
 
 
+class TestQwen3VLMoeConverterShapeDispatch:
+    """Both trailing dims are matched, and the square-shape case is handled.
+
+    `gate_up_proj` is square in dims 1-2 when `hidden == 2 * intermediate`, and
+    `down_proj` when `intermediate == hidden`. The two layouts are then the same
+    shape, so the converter assumes HF -- which is correct for the HF
+    checkpoints it exists to load -- and warns that a VeOmni-saved checkpoint
+    reloaded through the same path would be transposed twice.
+    """
+
+    def test_wrong_dim2_is_rejected_even_when_dim1_matches_hf(self):
+        # hidden=8 -> HF trailing dims (8, 12). dim-1 matches, dim-2 does not:
+        # this is corrupt input, and transposing it would propagate the corruption.
+        converter = Qwen3VLMoeCheckpointTensorConverter(num_experts=2, hidden_size=8, intermediate_size=6)
+        with pytest.raises(RuntimeError, match="unrecognized layout"):
+            converter.convert("l.mlp.experts.gate_up_proj", torch.randn(2, 8, 7))
+
+    def test_gate_up_square_config_still_converts_hf(self):
+        # hidden == 2 * intermediate -> both layouts are (12, 12).
+        converter = Qwen3VLMoeCheckpointTensorConverter(num_experts=2, hidden_size=12, intermediate_size=6)
+        hf = torch.arange(2 * 12 * 12, dtype=torch.float32).reshape(2, 12, 12)
+        result = converter.convert("l.mlp.experts.gate_up_proj", hf)
+        # By value, not shape: the shapes are equal here, so only the values
+        # distinguish a real transpose from a passthrough.
+        assert torch.equal(result.tensor, hf.transpose(1, 2))
+
+    def test_down_proj_square_config_still_converts_hf(self):
+        # intermediate == hidden -> both layouts are (8, 8).
+        converter = Qwen3VLMoeCheckpointTensorConverter(num_experts=2, hidden_size=8, intermediate_size=8)
+        hf = torch.arange(2 * 8 * 8, dtype=torch.float32).reshape(2, 8, 8)
+        result = converter.convert("l.mlp.experts.down_proj", hf)
+        assert torch.equal(result.tensor, hf.transpose(1, 2))
+
+    def test_square_config_warns_about_the_round_trip(self, monkeypatch):
+        from veomni.models.transformers.qwen3_vl_moe import checkpoint_tensor_converter as mod
+
+        seen = []
+        monkeypatch.setattr(mod.logger, "warning_once", lambda msg, *a, **k: seen.append(msg))
+        converter = Qwen3VLMoeCheckpointTensorConverter(num_experts=2, hidden_size=12, intermediate_size=6)
+        converter.convert("l.mlp.experts.gate_up_proj", torch.randn(2, 12, 12))
+        assert seen and "cannot be told apart" in seen[0]
+
+    def test_non_square_config_does_not_warn(self, monkeypatch):
+        from veomni.models.transformers.qwen3_vl_moe import checkpoint_tensor_converter as mod
+
+        seen = []
+        monkeypatch.setattr(mod.logger, "warning_once", lambda msg, *a, **k: seen.append(msg))
+        converter = Qwen3VLMoeCheckpointTensorConverter(num_experts=2, hidden_size=12, intermediate_size=5)
+        hf = torch.arange(2 * 12 * 10, dtype=torch.float32).reshape(2, 12, 10)
+        assert torch.equal(converter.convert("l.mlp.experts.gate_up_proj", hf).tensor, hf.transpose(1, 2))
+        v5 = torch.randn(2, 10, 12)
+        assert torch.equal(converter.convert("l.mlp.experts.gate_up_proj", v5).tensor, v5)
+        assert seen == []
+
+
 class TestQwen3VLMoeConverterFinalize:
     def test_finalize_is_noop(self):
         converter = Qwen3VLMoeCheckpointTensorConverter(

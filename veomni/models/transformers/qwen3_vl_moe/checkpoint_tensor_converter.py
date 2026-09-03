@@ -40,11 +40,14 @@ from typing import List, Optional
 
 import torch
 
+from ....utils import logging
 from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
 
 
 # Matches fused-expert keys like: ...mlp.experts.{gate_up_proj|down_proj}
 _EXPERT_PATTERN = re.compile(r"^(.+\.mlp\.experts\.(?P<proj>gate_up_proj|down_proj))$")
+
+logger = logging.get_logger(__name__)
 
 
 class Qwen3VLMoeCheckpointTensorConverter:
@@ -57,9 +60,18 @@ class Qwen3VLMoeCheckpointTensorConverter:
     - ``gate_up_proj``: HF has dim-1 == ``hidden_size``, v5 has dim-1 == ``2 * intermediate_size``.
     - ``down_proj``:    HF has dim-1 == ``intermediate_size``, v5 has dim-1 == ``hidden_size``.
 
-    Hidden size, intermediate size and (for Qwen3-VL-MoE) their doubled variants
-    are all distinct integers for any realistic model, so the dispatch is
-    unambiguous.
+    Both trailing dims are matched, so a tensor with the right dim-1 and a
+    wrong dim-2 is rejected rather than transposed.
+
+    The two expectations coincide when ``hidden_size == 2 * intermediate_size``
+    (``gate_up_proj``) or ``intermediate_size == hidden_size`` (``down_proj``),
+    which makes the tensor square in dims 1-2 and the layouts
+    indistinguishable. No model using this converter has such a config today
+    (Qwen3-VL-MoE is 2048/768), but the ratio is not far-fetched. In that case
+    ``convert()`` still assumes HF and transposes -- correct for an HF
+    checkpoint, which is what this converter exists to load -- and warns that a
+    VeOmni-saved checkpoint reloaded through the same path would be transposed
+    twice. Convert such a checkpoint offline instead.
     """
 
     def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int):
@@ -84,18 +96,39 @@ class Qwen3VLMoeCheckpointTensorConverter:
             )
 
         if proj == "gate_up_proj":
-            hf_mid, v5_mid = self.hidden_size, 2 * self.intermediate_size
+            hf_shape = (self.hidden_size, 2 * self.intermediate_size)
+            v5_shape = (2 * self.intermediate_size, self.hidden_size)
         else:  # down_proj
-            hf_mid, v5_mid = self.intermediate_size, self.hidden_size
+            hf_shape = (self.intermediate_size, self.hidden_size)
+            v5_shape = (self.hidden_size, self.intermediate_size)
 
-        if tensor.shape[1] == hf_mid:
+        # Match on both trailing dims, not just dim-1: a tensor whose dim-1
+        # happens to equal the HF expectation but whose dim-2 is wrong is
+        # corrupt input, and transposing it silently would propagate that.
+        actual = tuple(tensor.shape[1:])
+        if actual == hf_shape:
+            if hf_shape == v5_shape:
+                # Square in dims 1-2, so the two layouts are indistinguishable
+                # by shape. transpose(1, 2) is still correct for an HF
+                # checkpoint, which is the common case, so keep converting --
+                # but a VeOmni-saved checkpoint reloaded here would be
+                # transposed a second time and silently wrong.
+                logger.warning_once(
+                    f"Qwen3VLMoe checkpoint converter: hidden_size={self.hidden_size} and "
+                    f"intermediate_size={self.intermediate_size} make the HF and VeOmni expert "
+                    f"layouts identical in shape ({hf_shape}), so {proj} tensors cannot be told "
+                    f"apart. Assuming the HF layout, which is correct when loading an HF "
+                    f"checkpoint. Reloading a VeOmni-saved checkpoint through this path would "
+                    f"transpose it a second time — convert such a checkpoint offline instead."
+                )
             converted = tensor.transpose(1, 2).contiguous()
-        elif tensor.shape[1] == v5_mid:
+        elif actual == v5_shape:
             converted = tensor
         else:
             raise RuntimeError(
                 f"Qwen3VLMoe checkpoint converter: unrecognized layout for {name} "
-                f"(shape={tuple(tensor.shape)}; expected dim-1 == {hf_mid} (HF) or {v5_mid} (v5))"
+                f"(shape={tuple(tensor.shape)}; expected trailing dims {hf_shape} (HF) "
+                f"or {v5_shape} (v5))"
             )
         return ConvertedCheckpointTensor(name, converted)
 
