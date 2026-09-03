@@ -68,6 +68,7 @@ examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
+examples/minimax_h3.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md

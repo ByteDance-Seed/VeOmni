@@ -12,9 +12,8 @@ remapping. Only the query axis is sharded.
 It is selected with `train.accelerator.cp_size > 1` and `ulysses_size == 1`; the
 two are mutually exclusive in milestone 1.
 
-Why CP rather than Ulysses for this model, with the kernel and trace
-measurements that decided it, is in the design record:
-[`docs/superpowers/specs/2026-08-05-deepseek-v4-context-parallel-design.md`](../superpowers/specs/2026-08-05-deepseek-v4-context-parallel-design.md).
+The constraints and tradeoffs below explain why this model uses CP instead of
+Ulysses.
 
 This document records what the code cannot tell you on its own: the constraints
 it enforces and why they exist, the decisions that took more than one attempt,
@@ -79,8 +78,8 @@ predecessor lands two or more ranks away and no halo carries it.
 
 The practical risk is a short sequence with a wide rate. Production carries its
 rates in the checkpoint's HF config, which is not vendored here, and a 512-wide
-rate caps `cp_size` at `S/512` — no constraint at all at `S=131072`, a ceiling of
-8 ranks at `S=4096`. There is no launch-time check, so an operator who exceeds it
+rate caps `cp_size` at `S/512` — at most 256 ranks at `S=131072` and at most 8
+ranks at `S=4096`. There is no launch-time check, so an operator who exceeds it
 learns so on step 1 of the job rather than at submission.
 
 That is a deliberate decision rather than an omission, and worth knowing before
