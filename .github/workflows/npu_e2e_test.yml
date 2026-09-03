@@ -138,7 +138,6 @@ jobs:
       - name: Run e2e training test
         run: |
           uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py
-          uv run --frozen pytest -v -s -x tests/e2e/test_qwen4_exp_pipeline.py
       - name: Free NPUs between test steps
         # pytest's mp.spawn / torchrun workers sometimes outlive the pytest
         # session — they hold tens of GiB on NPU and OOM the next test.

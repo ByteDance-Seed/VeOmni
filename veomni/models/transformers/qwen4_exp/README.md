@@ -2,7 +2,7 @@
 
 This directory is an internal-validation integration for the experimental
 `qwen4_exp` model from Transformers commit
-`42ca97014c85d71a88ad60d55f08cb9fb4d26e2c`.
+`93d1bcfbd2af5798e2f66bf7955e31a537902b64`.
 
 Supported in this first stage:
 
