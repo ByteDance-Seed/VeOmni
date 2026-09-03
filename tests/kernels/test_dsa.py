@@ -390,6 +390,10 @@ def test_dsa_attention_tilelang_matches_eager():
     for actual_grad, expected_grad in zip((q_t.grad, kv_t.grad, sink_t.grad), (q_e.grad, kv_e.grad, sink_e.grad)):
         assert actual_grad is not None and expected_grad is not None
         assert _cosine(actual_grad, expected_grad) > 0.95
+    # dAttnSink is accumulated by an atomic under a replicated T.Parallel loop, so a
+    # lost replication guard would scale it by the warp count -- which cosine, being
+    # scale-invariant, cannot see.
+    torch.testing.assert_close(sink_t.grad, sink_e.grad, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="DeepSeek V4 TileLang requires SM90+ NVIDIA CUDA")

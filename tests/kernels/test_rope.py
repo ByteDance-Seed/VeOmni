@@ -256,26 +256,81 @@ def test_deepseek_v4_eager_matches_hf():
     assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+# Mirrors the real DeepSeek-V4 RoPE call sites. ``transposed`` marks the ones
+# that reach the op as a ``[B, S, H, D].transpose(1, 2)`` view (Q, MQA KV, the
+# attention output) rather than a contiguous tensor (compressor entries).
+_DSV4_ROPE_CALL_SITES = [
+    pytest.param(1, 8, 37, 512, 64, True, id="query"),
+    pytest.param(2, 1, 64, 512, 64, True, id="mqa_kv"),
+    pytest.param(1, 1, 13, 512, 64, False, id="compressed_entries"),
+    pytest.param(2, 4, 33, 128, 64, True, id="indexer_query"),
+    pytest.param(1, 2, 16, 64, 64, False, id="rope_spans_full_head"),
+    pytest.param(2, 3, 33, 48, 24, True, id="rope_dim_not_power_of_two"),
+]
+
+
+def _dsv4_rope_inputs(
+    batch: int,
+    heads: int,
+    seqlen: int,
+    head_dim: int,
+    rope_dim: int,
+    transposed: bool,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor, Tensor]:
+    if transposed:
+        x = torch.randn(batch, seqlen, heads, head_dim, device="cuda", dtype=dtype).transpose(1, 2)
+    else:
+        x = torch.randn(batch, heads, seqlen, head_dim, device="cuda", dtype=dtype)
+    angle = torch.randn(batch, seqlen, rope_dim // 2, device="cuda", dtype=dtype)
+    return x, angle.cos(), angle.sin()
+
+
+# The eager backward rounds each of its two branches to the activation dtype
+# before summing them, so individual elements can cancel to exactly zero where
+# the fused kernel's single rounding leaves a residue. That makes a relative
+# comparison meaningless per element; bound the absolute error at ~2 ULP of the
+# operand scale instead.
+_DSV4_ROPE_GRAD_TOLERANCE = {
+    torch.bfloat16: {"rtol": 1.6e-2, "atol": 1e-2},
+    torch.float32: {"rtol": 1.3e-6, "atol": 1e-6},
+}
+
+
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
-def test_deepseek_v4_triton_matches_eager():
+@pytest.mark.parametrize("batch, heads, seqlen, head_dim, rope_dim, transposed", _DSV4_ROPE_CALL_SITES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_deepseek_v4_triton_matches_eager(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype):
     pytest.importorskip("triton")
     eager = resolve_kernel("rope", "deepseek_v4", "eager").wrapper
     other = resolve_kernel("rope", "deepseek_v4", "triton").wrapper
-    torch.manual_seed(0)
-    x = torch.randn(2, 4, 16, 128, device="cuda", dtype=torch.bfloat16)
-    angle = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
-    cos, sin = angle.cos(), angle.sin()
+    torch.manual_seed(7)
+    x, cos, sin = _dsv4_rope_inputs(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype)
+    grad = torch.randn(batch, heads, seqlen, head_dim, device="cuda", dtype=dtype)
 
-    x_e = x.detach().requires_grad_(True)
-    x_o = x.detach().requires_grad_(True)
+    x_e = x.detach().clone().requires_grad_(True)
+    x_o = x.detach().clone().requires_grad_(True)
     out_e = eager(x_e, cos, sin, unsqueeze_dim=1)
     out_o = other(x_o, cos, sin, unsqueeze_dim=1)
-    assert torch.allclose(out_e, out_o, atol=ROPE_FUSED_ATOL, rtol=ROPE_FUSED_RTOL)
+    assert out_o.shape == out_e.shape
+    assert out_o.is_contiguous()
+    torch.testing.assert_close(out_o, out_e)
 
-    go = torch.randn_like(out_e)
-    out_e.backward(go)
-    out_o.backward(go)
-    assert torch.allclose(x_e.grad, x_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
+    out_e.backward(grad)
+    out_o.backward(grad)
+    torch.testing.assert_close(x_o.grad, x_e.grad, **_DSV4_ROPE_GRAD_TOLERANCE[dtype])
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
+def test_deepseek_v4_triton_inverse_rotation_round_trips():
+    pytest.importorskip("triton")
+    rope = resolve_kernel("rope", "deepseek_v4", "triton").wrapper
+    torch.manual_seed(7)
+    x, cos, sin = _dsv4_rope_inputs(1, 4, 32, 512, 64, True, torch.float32)
+
+    round_tripped = rope(rope(x, cos, sin, unsqueeze_dim=1), cos, -sin, unsqueeze_dim=1)
+
+    torch.testing.assert_close(round_tripped, x.contiguous(), rtol=1e-5, atol=1e-5)
 
 
 def test_wan_eager_matches_reference():

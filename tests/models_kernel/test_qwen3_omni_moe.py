@@ -20,6 +20,7 @@ Direct-import the generated Thinker class. Do not register or use
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import torch
@@ -29,8 +30,14 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeConfig as HFQwen3OmniMoeConfig,
+)
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinker,
+)
+from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
+    Qwen3OmniMoeProcessor as HFQwen3OmniMoeProcessor,
 )
 
 from tests.models_kernel.compare import (
@@ -252,3 +259,83 @@ def test_qwen3_omni_moe_eager_matches_hf_aux_loss():
     assert hf_out.aux_loss is not None
     torch.testing.assert_close(ours_out.aux_loss, hf_out.aux_loss, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(ours_out.loss, hf_out.loss, atol=1e-6, rtol=1e-6)
+
+
+class _StubTokenizer:
+    init_kwargs: dict = {}
+    image_token = "<|image|>"
+    audio_token = "<|audio|>"
+    video_token = "<|video|>"
+    vision_bos_token = "<|vision_bos|>"
+    vision_eos_token = "<|vision_eos|>"
+    audio_bos_token = "<|audio_bos|>"
+    audio_eos_token = "<|audio_eos|>"
+
+    def __call__(self, text, **kwargs):
+        return {"input_ids": [[1, 2, 3]]}
+
+
+def _stub_qwen3_omni_moe_processor():
+    from veomni.models_kernel.transformers.qwen3_omni_moe.processing_qwen3_omni_moe import (
+        Qwen3OmniMoeProcessor,
+    )
+
+    processor = object.__new__(Qwen3OmniMoeProcessor)
+    processor.tokenizer = _StubTokenizer()
+    processor.image_processor = SimpleNamespace(merge_size=2)
+    processor.video_processor = SimpleNamespace(merge_size=2, temporal_patch_size=2)
+    processor.feature_extractor = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("empty VeOmni lists must not reach the feature extractor")
+    )
+    processor.image_token = processor.tokenizer.image_token
+    processor.audio_token = processor.tokenizer.audio_token
+    processor.video_token = processor.tokenizer.video_token
+    processor.vision_bos_token = processor.tokenizer.vision_bos_token
+    processor.vision_eos_token = processor.tokenizer.vision_eos_token
+    processor.audio_bos_token = processor.tokenizer.audio_bos_token
+    processor.audio_eos_token = processor.tokenizer.audio_eos_token
+    return processor
+
+
+def test_qwen3_omni_moe_config_forces_untied_embeddings():
+    from veomni.models_kernel.transformers.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeConfig,
+    )
+
+    assert not hasattr(HFQwen3OmniMoeConfig(), "tie_word_embeddings")
+    assert getattr(HFQwen3OmniMoeConfig(), "tie_word_embeddings", True) is True
+    assert Qwen3OmniMoeConfig().tie_word_embeddings is False
+    assert Qwen3OmniMoeConfig(tie_word_embeddings=True).tie_word_embeddings is False
+
+
+def test_qwen3_omni_moe_processor_accepts_veomni_empty_lists():
+    from veomni.models_kernel.transformers.qwen3_omni_moe.processing_qwen3_omni_moe import (
+        Qwen3OmniMoeProcessor,
+    )
+
+    assert "audios" in inspect.signature(Qwen3OmniMoeProcessor.__call__).parameters
+    assert "audios" not in inspect.signature(HFQwen3OmniMoeProcessor.__call__).parameters
+
+    processor = _stub_qwen3_omni_moe_processor()
+    batch = processor(text="hello", images=[], videos=[], audios=[])
+    assert batch["input_ids"] == [[1, 2, 3]]
+
+
+def test_qwen3_omni_moe_processor_interleaves_video_and_audio():
+    processor = _stub_qwen3_omni_moe_processor()
+    text = [f"{processor.vision_bos_token}{processor.video_token}{processor.vision_eos_token}"]
+    grid = torch.tensor([2, 4, 4])
+    processed = processor.replace_multimodal_special_tokens(
+        text,
+        iter([4]),
+        iter([]),
+        iter([grid]),
+        video_second_per_grid=iter([1.0]),
+        position_id_per_seconds=1,
+        seconds_per_chunk=2,
+    )
+    sample = processed[0]
+    assert processor.video_token in sample
+    assert processor.audio_token in sample
+    assert sample.count(processor.video_token) == int(grid.prod()) // (processor.video_processor.merge_size**2)
+    assert sample.count(processor.audio_token) == 4
