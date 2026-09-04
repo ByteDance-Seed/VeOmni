@@ -535,7 +535,7 @@ class TestDeepseekV4ConverterConvert:
             ),
             (
                 "layers.2.attn.indexer.weights_proj.weight",
-                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
+                "model.layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight",
             ),
             ("layers.2.ffn.gate.bias", "model.layers.2.mlp.gate.e_score_correction_bias"),
             ("layers.2.ffn.gate.tid2eid", "model.layers.2.mlp.gate.tid2eid"),

@@ -171,13 +171,14 @@ def test_deepseek_v4_attention_matches_official_q_norm_and_rope_dtype_modes(monk
     q_raw = attention.q_b_proj(q_residual).view(
         hidden_states.shape[0], hidden_states.shape[1], config.num_attention_heads, config.head_dim
     )
-    expected = q_raw * torch.rsqrt(q_raw.square().mean(-1, keepdim=True) + config.rms_norm_eps)
+    norm_factor = torch.rsqrt(q_raw.float().square().mean(-1, keepdim=True) + config.rms_norm_eps).to(q_raw.dtype)
+    expected = q_raw * norm_factor
     expected = dsv4.apply_rotary_pos_emb(expected.transpose(1, 2), cos, sin)
-    old_fp32_norm = attention.q_b_norm(q_raw.transpose(1, 2))
-    old_fp32_norm = dsv4.apply_rotary_pos_emb(old_fp32_norm, cos, sin)
+    legacy_bf16_norm = q_raw * torch.rsqrt(q_raw.square().mean(-1, keepdim=True) + config.rms_norm_eps)
+    legacy_bf16_norm = dsv4.apply_rotary_pos_emb(legacy_bf16_norm.transpose(1, 2), cos, sin)
 
     torch.testing.assert_close(captured["query"], expected, rtol=0, atol=0)
-    assert not torch.equal(captured["query"], old_fp32_norm)
+    assert not torch.equal(captured["query"], legacy_bf16_norm)
 
     rope_dim = cos.shape[-1] * 2
     expected_rope = torch.view_as_real(

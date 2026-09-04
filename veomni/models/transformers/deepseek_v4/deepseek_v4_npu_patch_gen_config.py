@@ -87,6 +87,7 @@ from transformers.cache_utils import Cache
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4CSACache,
     DeepseekV4HCACache,
+    DeepseekV4IndexerScorer,
     apply_rotary_pos_emb,
 )
 
@@ -126,6 +127,7 @@ config = PatchConfig(
     description="DeepseekV4 NPU sibling — reuses every GPU structural/numerics patch, plus NPU-only FSDP2 hardening",
 )
 
+config.add_import("typing", names=["Optional"])
 config.add_import("veomni.ops", names=["fused_moe_forward"])
 # ``sparse_mqa_target_fwd`` is the indexer loss's teacher kernel. The objective
 # needs both the TileLang indexer and the TileLang attention (see
@@ -381,15 +383,13 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
     self.num_heads = config.index_n_heads
     self.head_dim = config.index_head_dim
     self.index_topk = config.index_topk
-    self.softmax_scale = self.head_dim**-0.5
-    self.weights_scaling = self.num_heads**-0.5
     self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
     self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
     self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
     self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-    self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+    self.scorer = DeepseekV4IndexerScorer(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
 
 

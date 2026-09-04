@@ -39,7 +39,7 @@ uv sync --extra gpu --dev
 source .venv/bin/activate
 ```
 
-This installs `transformers==5.9.0` via the `transformers-stable` dependency
+This installs `transformers==5.16.0` via the `transformers-stable` dependency
 group. `gpu` / `npu` / `npu_aarch64` are the only extras — each a complete
 superset, mutually exclusive. New code must target transformers v5 and FSDP2.
 See `.agents/knowledge/uv.md` and `.agents/knowledge/constraints.md`.
