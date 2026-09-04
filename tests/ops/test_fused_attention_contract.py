@@ -39,6 +39,7 @@ _FLASH_IMPLEMENTATIONS = (
     "veomni_flash_attention_2_with_sp",
     "veomni_flash_attention_3_with_sp",
     "veomni_flash_attention_4_with_sp",
+    "veomni_flash_attention_aiter_with_sp",
 )
 _FLEX_IMPLEMENTATION = "veomni_flex_attention_with_sp"
 _MAGI_IMPLEMENTATION = "veomni_magi_attention_with_sp"
