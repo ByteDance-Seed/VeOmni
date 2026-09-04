@@ -317,8 +317,9 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | train_size | `int` | `10_000_000` | Number of tokens for training (used to compute steps under dynamic batch). |
 | train_sample | `int` | `10_000` | Number of samples for training (used to compute steps under non-dynamic batch). |
 | data_type | `Literal["plaintext", "conversation", "diffusion", "classification", "dpo"]` | `"conversation"` | Type of the training data. |
-| datasets_type | `str` | `"mapping"` | `IterableDataset` or `MappingDataset` (or custom). |
-| multisource_datasets_type | `str` | `"interleave"` | Dataset type for multisource training. |
+| datasets_type | `str` | `"mapping"` | Single-source builder for a non-YAML `train_path`. Built-in values: `"mapping"`, `"iterable"`. |
+| dataset_repeat | `bool` | `false` | Iterable-only. Replay the stream after one pass so training can continue past `max_steps` when the dump is small. Each pass drops the last incomplete DP round. Mapping ignores this. |
+| multisource_datasets_type | `str` | `"interleave"` | Dataset builder when `train_path` is a YAML. Built-in value: `"interleave"`. |
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
 | text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |

@@ -122,7 +122,7 @@ model:
 data:
   train_path: dataset/minimax-h3-demo/minimax_h3/MiniMax-H3-FL2VA/metadata.csv
   data_transform: minimax_h3_online         # Stage 1 encodes raw video online
-  datasets_type: minimax_h3_online
+  datasets_type: mapping
   dataloader:
     num_workers: 0                          # Stage 1 is encode-heavy; use 0 workers to avoid memory contention
     drop_last: false
@@ -138,7 +138,7 @@ data:
 
 **Important**:
 
-- `train_path` must point to the **metadata.csv file**, not a directory, otherwise you get `png files are not supported`
+- `train_path` must point to the **metadata.csv file** (or a directory that contains it). Directories are scanned for `parquet` / `json` / `csv` / `arrow` files only, so leftover images or `veomni_cli.yaml` are ignored.
 - When changing data, `fps/min_frames/max_frames/height/width` must match the actual video parameters; the frame count must satisfy `(N-5) % 17 == 0`
 - `offline_embedding_save_dir` must match Stage 2's `data.train_path`
 
@@ -156,10 +156,9 @@ model:
 data:
   train_path: output/minimax_h3_fl2va_embedding    # output dir of Stage 1
   data_transform: dit_offline
-  datasets_type: minimax_h3_offline
+  datasets_type: iterable
   shuffle: false
-  mm_configs:
-    repeat: 100                             # dataset repeat count (must be > 1 for small datasets)
+  dataset_repeat: true
 
 train:
   training_task: offline_training

@@ -192,7 +192,7 @@ class GetCnt:
                 self._block_tensor_nums[block_idx] = 1
             self._block_idx = block_idx
 
-        offload_tensor_key = "{}_{}".format(self._block_idx, self._block_tensor_nums[self._block_idx] - 1)
+        offload_tensor_key = f"{self._block_idx}_{self._block_tensor_nums[self._block_idx] - 1}"
         return offload_tensor_key, previous_block_idx
 
     def reset(self):
@@ -207,7 +207,7 @@ class GetCnt:
 
         block_tensor_nums = self._block_tensor_nums[prefetch_block_idx]
         prefetch_idxs = list(range(0, block_tensor_nums))
-        return ["{}_{}".format(prefetch_block_idx, prefetch_idx) for prefetch_idx in prefetch_idxs]
+        return [f"{prefetch_block_idx}_{prefetch_idx}" for prefetch_idx in prefetch_idxs]
 
     def get_layer_tensor_nums(self, block_idx):
         return self._block_tensor_nums[block_idx]
@@ -442,7 +442,7 @@ class async_save_on_cpu(saved_tensors_hooks):
             d2h_stream = manager.swap_stream
 
             if previous_block_idx is not None:
-                manager.wait_d2h_finished("{}_".format(previous_block_idx))
+                manager.wait_d2h_finished(f"{previous_block_idx}_")
 
             if block_idx == depth - 1:
                 return tensor
@@ -505,7 +505,7 @@ def _get_no_split_offload_modules(model):
     matched_submodules = [
         [name, module, layer_idx, 0]
         for layer_idx, (name, module) in enumerate(
-            (item for item in model.named_modules() if type(item[1]).__name__ in target_classes)
+            item for item in model.named_modules() if type(item[1]).__name__ in target_classes
         )
     ]
     if not matched_submodules:

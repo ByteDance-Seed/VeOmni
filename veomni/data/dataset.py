@@ -24,7 +24,6 @@ import numpy as np
 import torch
 from datasets import IterableDataset as HFIterableDataset
 from datasets import interleave_datasets, load_dataset
-from datasets.distributed import split_dataset_by_node
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
@@ -113,13 +112,63 @@ class IterativeDataset(IterableDataset):
                 yield sample
 
     def load_state_dict(self, state_dict):
-        self._data.load_state_dict(state_dict["dataset"])
+        inner = state_dict.get("dataset")
+        if inner is not None and hasattr(self._data, "load_state_dict"):
+            self._data.load_state_dict(inner)
 
     def state_dict(self):
-        return {"dataset": self._data.state_dict()}
+        if hasattr(self._data, "state_dict"):
+            return {"dataset": self._data.state_dict()}
+        return {"dataset": None}
 
     def set_epoch(self, epoch: int):
-        self._data.set_epoch(epoch)
+        if hasattr(self._data, "set_epoch"):
+            self._data.set_epoch(epoch)
+
+
+class ShardedIterableDataset(IterableDataset):
+    """Row-level DP shard. Each pass drops an incomplete last round; ``repeat`` replays."""
+
+    def __init__(self, dataset, dp_rank: int = 0, dp_size: int = 1, repeat: bool = False, seed: int = 42):
+        self._dataset = dataset
+        self._dp_rank = dp_rank
+        self._dp_size = dp_size
+        self._repeat = repeat
+        self._seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        num_workers = 1 if worker_info is None else worker_info.num_workers
+        index = 0
+        pending: List[Any] = []
+        pass_i = 0
+        while True:
+            n_before = index
+            if hasattr(self._dataset, "set_epoch"):
+                self._dataset.set_epoch(self._seed + self._epoch + pass_i)
+            for sample in self._dataset:
+                if index % self._dp_size == self._dp_rank and (index // self._dp_size) % num_workers == worker_id:
+                    pending.append(sample)
+                index += 1
+                if index % self._dp_size == 0:
+                    yield from pending
+                    pending = []
+            produced = index - n_before
+            if produced == 0 or not self._repeat:
+                return
+            # Drop an incomplete last DP round so it cannot leak into the next pass.
+            pending = []
+            remainder = index % self._dp_size
+            if remainder:
+                index += self._dp_size - remainder
+            if produced < self._dp_size:
+                return
+            pass_i += 1
 
 
 class InterleavedIterableDataset(IterativeDataset):
@@ -1419,6 +1468,34 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self.dataset.set_epoch(epoch)
 
 
+# HuggingFace `load_dataset` loader names. `jsonl` is loaded as `json`.
+_DATA_FILE_EXTENSIONS = ("parquet", "jsonl", "json", "csv", "arrow")
+_HF_LOADER_BY_EXT = {
+    "parquet": "parquet",
+    "jsonl": "json",
+    "json": "json",
+    "csv": "csv",
+    "arrow": "arrow",
+}
+
+
+def _local_data_extension(path: str) -> str:
+    return os.path.splitext(path)[-1][1:].lower()
+
+
+def _collect_local_data_files(root: str) -> list[str]:
+    collected = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+        for filename in sorted(filenames):
+            if filename.startswith("."):
+                continue
+            if _local_data_extension(filename) not in _DATA_FILE_EXTENSIONS:
+                continue
+            collected.append(os.path.join(dirpath, filename))
+    return collected
+
+
 def get_data_files(train_path):
     data_files = []
     data_paths = train_path.split(",")
@@ -1427,23 +1504,42 @@ def get_data_files(train_path):
             if not isdir(data_path):
                 raise FileNotFoundError(f"Dataset {data_path} not exists.")
 
-            for filename in listdir(data_path):
+            for filename in sorted(listdir(data_path)):
+                if _local_data_extension(filename) not in _DATA_FILE_EXTENSIONS:
+                    continue
                 from ..utils.helper import get_cache_dir
 
                 data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
 
         elif os.path.isdir(data_path):
-            data_files.extend([os.path.join(data_path, fn) for fn in sorted(os.listdir(data_path))])
+            data_files.extend(_collect_local_data_files(data_path))
         elif os.path.isfile(data_path):
             data_files.append(data_path)
         else:
             raise FileNotFoundError(f"Dataset {data_path} not exists.")
-    file_extenstion = os.path.splitext(data_files[0])[-1][1:]
-    if file_extenstion not in ["parquet", "jsonl", "json", "csv", "arrow"]:
-        raise ValueError(f"{file_extenstion} files are not supported.")
 
-    file_extenstion = "json" if file_extenstion == "jsonl" else file_extenstion
-    return data_files, file_extenstion
+    if not data_files:
+        raise FileNotFoundError(
+            f"No supported data files ({', '.join(_DATA_FILE_EXTENSIONS)}) found under {train_path}."
+        )
+
+    loader_names = {_HF_LOADER_BY_EXT.get(_local_data_extension(path)) for path in data_files}
+    if None in loader_names:
+        bad = [path for path in data_files if _local_data_extension(path) not in _DATA_FILE_EXTENSIONS]
+        raise ValueError(f"{_local_data_extension(bad[0])} files are not supported.")
+    if len(loader_names) != 1:
+        raise ValueError(f"Mixed data file types under {train_path}: {sorted(loader_names)}")
+
+    return data_files, loader_names.pop()
+
+
+def _shard_iterable(dataset, dataset_repeat: bool, seed: int, split_by_node: bool):
+    dp_rank, dp_size = 0, 1
+    if split_by_node:
+        parallel_state = get_parallel_state()
+        dp_rank = parallel_state.dp_rank
+        dp_size = parallel_state.dp_size
+    return ShardedIterableDataset(dataset, dp_rank=dp_rank, dp_size=dp_size, repeat=dataset_repeat, seed=seed)
 
 
 @DATASET_REGISTRY.register("mapping")
@@ -1485,6 +1581,7 @@ def build_iterable_dataset(
     source_name: Optional[str] = None,
     split_by_node: bool = True,
     shuffle: bool = True,
+    dataset_repeat: bool = False,
     **kwargs,
 ) -> "IterableDataset":
     """
@@ -1495,6 +1592,9 @@ def build_iterable_dataset(
         namespace (Literal["train", "test"]): dataset namespace
         seed (int): random seed
         source_name (Optional[str]): source name
+        split_by_node (bool): shard the stream across DP ranks
+        shuffle (bool): shuffle examples with a streaming buffer
+        dataset_repeat (bool): replay the stream when one pass is exhausted
     Returns:
         IterableDataset: iterative dataset
     """
@@ -1504,9 +1604,8 @@ def build_iterable_dataset(
     if shuffle:
         dataset = dataset.shuffle(seed=seed, buffer_size=10_000)
 
-    if split_by_node:
-        parallel_state = get_parallel_state()
-        dataset = split_dataset_by_node(dataset, parallel_state.dp_rank, parallel_state.dp_size)
+    if dataset_repeat or split_by_node:
+        dataset = _shard_iterable(dataset, bool(dataset_repeat), seed, split_by_node)
 
     if transform:
         transform = partial(transform, source_name=source_name)
@@ -1558,15 +1657,17 @@ def build_interleave_dataset(
             return dataset.map(trans_example)
 
         for idx, source in enumerate(sources):
-            dataset = build_iterable_dataset(source, namespace=namespace, seed=seed, split_by_node=False)
+            dataset = build_iterable_dataset(
+                source, namespace=namespace, seed=seed, split_by_node=False, dataset_repeat=False
+            )
             ds = dataset._data
             ds = add_ds_idx_to_iterable(ds, idx, source_names[idx])
             datasets.append(ds)
 
         interleave_dataset = interleave_datasets(datasets=datasets, probabilities=weights, seed=seed)
-        # split dataset by node
-        parallel_state = get_parallel_state()
-        interleave_dataset = split_dataset_by_node(interleave_dataset, parallel_state.dp_rank, parallel_state.dp_size)
+        interleave_dataset = _shard_iterable(
+            interleave_dataset, bool(kwargs.get("dataset_repeat", False)), seed, split_by_node=True
+        )
 
         interleave_dataset = InterleavedIterableDataset(
             interleave_dataset,
@@ -1720,6 +1821,7 @@ def build_weighted_multisource_dataset(
             transform=transform,
             split_by_node=split_by_node,
             shuffle=shuffle,
+            dataset_repeat=bool(kwargs.get("dataset_repeat", False)),
         )
         for source in sources
     ]

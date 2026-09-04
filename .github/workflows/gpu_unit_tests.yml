@@ -179,7 +179,7 @@ jobs:
           uv run --frozen pytest -s -x tests/distributed/test_torch_compile.py
       - name: Run data tests
         run: |
-          uv run --frozen pytest -s -x tests/data
+          uv run --frozen pytest -s -x tests/data/test_iterable_dataset.py tests/data
       - name: Run ops tests
         run: |
           uv run --frozen pytest -s -x tests/ops
