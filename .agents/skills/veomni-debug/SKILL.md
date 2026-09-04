@@ -99,7 +99,10 @@ Phase 5: Knowledge capture           -> pending
 
 - [ ] **New hard constraint?** → add to `.agents/knowledge/constraints.md`
 - [ ] **Architecture insight?** → add to `.agents/knowledge/architecture.md`
-- [ ] **New test needed?** → add to `tests/` for regression prevention
+- [ ] **Regression guard needed?** → prefer adding a case to an existing
+      CI-enumerated test; see `.agents/knowledge/testing.md`. A new file outside
+      `tests/ops/` / `tests/data/` must be wired into the unit-test workflows or
+      it never runs.
 - [ ] **Docs outdated?** → update `docs/` if the fix changes API behavior, config semantics, or usage patterns
 
 If none apply, explicitly note "no new knowledge to capture."

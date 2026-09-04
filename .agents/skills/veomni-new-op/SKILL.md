@@ -162,10 +162,16 @@ ships a `device_patch.py`.
 
 ## Phase 3: Test
 
-1. **Add unit tests** to `tests/ops/`:
+1. **Add unit tests** to `tests/ops/`. The GPU job runs this directory
+   wholesale, so a new file needs no `gpu_unit_tests.yml` change. The NPU job
+   does *not* — it enumerates ops files by name, so if the kernel must run on
+   Ascend, add a line to `npu_unit_tests.yml` (see
+   `.agents/knowledge/testing.md`):
    - Test correctness: compare output against a reference implementation (eager PyTorch)
    - Test numerical precision: verify tolerance for bf16/fp16
    - Test edge cases: empty inputs, single-element tensors, extreme shapes
+   If the kernel only binds on SM90+, guard it so the SM89 GPU runners skip
+   rather than fail.
 
 2. **Add benchmark** (optional but recommended for performance-critical ops):
    - Use `veomni/ops/kernels/moe/_kernels/utils/benchmark_utils.py` as reference
