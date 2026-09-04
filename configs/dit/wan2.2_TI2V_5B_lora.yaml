@@ -1,11 +1,7 @@
 model:
-  model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers/transformer
-  condition_model_path: Wan-AI/Wan2.1-I2V-1.3B-diffusers
+  model_path: Wan-AI/Wan2.2-TI2V-5B-Diffusers/transformer
+  condition_model_path: Wan-AI/Wan2.2-TI2V-5B-Diffusers
   ops_implementation:
-    # Wan's RoPE has a non-standard signature (rope_apply takes a single
-    # tensor plus freqs/head_dim kwargs) so the framework's default
-    # liger_kernel RoPE cannot drop in. Pin to eager explicitly until a
-    # Wan-specific liger wrapper exists.
     rotary_pos_emb_implementation: eager
   lora_config:
     rank: 128
@@ -23,10 +19,10 @@ data:
   source_name: Tom-and-Jerry-VideoGeneration-Dataset
   mm_configs:
     fps: 24
-    max_frames: 81
+    max_frames: 49
     frame_factor: 4
     frame_factor_remainder: 1
-    scale_factor: 16
+    scale_factor: 32
 
 train:
   global_batch_size: 8
@@ -41,7 +37,7 @@ train:
     fsdp_config:
       fsdp_mode: fsdp2
   checkpoint:
-    output_dir: Wan2.1-I2V-1.3B_lora
+    output_dir: Wan2.2-TI2V-5B_lora
     save_hf_weights: true
     hf_save_epochs: 5
   optimizer:
@@ -55,4 +51,4 @@ train:
   wandb:
     enable: true
     project: veomni_dit
-    name: Wan2.1-I2V-1.3B_lora
+    name: Wan2.2-TI2V-5B_lora
