@@ -2,11 +2,9 @@
 # Example inference invocation for Wan2.1-T2V (text-to-video) using
 # scripts/inference/infer_omni.py.
 #
-# Wan inference currently requires a newer transformers than the project
-# pin (``transformers==5.2.0`` from the ``transformers-stable`` group in
-# pyproject.toml). We therefore launch via ``uv run --with`` which installs
-# the override into a per-invocation cache under ~/.cache/uv/ and prepends
-# that cache to PYTHONPATH — the project's ``.venv`` is never modified
+# VeOmni pins ``transformers==5.16.0`` in the ``transformers-stable`` group.
+# This script mirrors that pin through ``uv run --with`` so standalone runs
+# use the supported version without modifying the project's ``.venv``
 # (``--no-sync`` skips the auto-sync that would otherwise touch it).
 # Setting TRANSFORMERS_VERSION lets you swap the override without editing
 # the script.
@@ -35,12 +33,11 @@ MODEL_PATH="${MODEL_PATH:-Wan-AI/Wan2.1-T2V-1.3B-Diffusers}"
 OUTPUT_DIR="${OUTPUT_DIR:-./inference_outputs/wan_t2v}"
 LORA_PATH="${LORA_PATH:-}"
 LORA_WEIGHT="${LORA_WEIGHT:-1.0}"
-# Pin a newer transformers just for this run; leave the project .venv at the
-# transformers-stable group's pin (5.2.0). Pass an explicit empty string
+# Pin the supported transformers version just for this run. Pass an explicit empty string
 # (``TRANSFORMERS_VERSION='' bash scripts/inference/infer_wan.sh``) to skip
 # the overlay and use whatever is already in .venv. Bare ``-`` (not ``:-``)
 # distinguishes "unset" from "set to empty".
-TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION-5.9.0}"
+TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION-5.16.0}"
 
 PROMPTS=(
     "Tom, the mischievous gray cat, is sprawled out on a vibrant red pillow, his body relaxed and his eyes half-closed."

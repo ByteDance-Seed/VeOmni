@@ -144,6 +144,15 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
+6. Qwen4-Exp PLE is a model-specific exception: its embedding tables remain
+   persistent DTensors on the full `(ple_fsdp, ple)` mesh with placements
+   `[Shard(1), Shard(0)]`. FSDP2 ignores those parameters, and PLE routes sparse
+   lookup requests/results over the flattened 2D mesh. This does not enable
+   general tensor parallelism; `tp_size` remains 1.
+7. Qwen4-Exp can enable PLE and EP together. Its PLE tables and MoE expert
+   tensors are disjoint `ParallelPlan` entries and use independent
+   `(ple_fsdp, ple)` and `(ep_fsdp, ep)` mesh views; shared parameter ownership
+   across enabled ExtraParallel dimensions is invalid.
 
 ## Config Structure
 

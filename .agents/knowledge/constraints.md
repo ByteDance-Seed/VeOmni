@@ -18,17 +18,17 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
 
-4. **Transformers version: pinned to v5.9.0**
-   - VeOmni installs `transformers==5.9.0` via the `transformers-stable`
+4. **Transformers version: pinned to v5.16.0**
+   - VeOmni installs `transformers==5.16.0` via the `transformers-stable`
      default dependency group in `pyproject.toml`.
    - The legacy v4 path was removed; all modeling under
      `veomni/models/transformers/<m>/` is patchgen-generated.
    - `is_transformers_version_greater_or_equal_to()` from
      `veomni/utils/import_utils.py` is retained only for forward-looking
      gates (for HF APIs newer than the current pin) — do **not** add new
-     version gates for versions `<= 5.9.0` (the legacy `>= 5.0.0` …
+     version gates for versions `<= 5.16.0` (the legacy `>= 5.0.0` …
      `>= 5.8.x` interval is dead code).
-   - Patchgen regeneration must be done with `transformers==5.9.0` installed.
+   - Patchgen regeneration must be done with `transformers==5.16.0` installed.
 
 ## Distributed Training
 
@@ -98,6 +98,12 @@ Core entry points:
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
    - Device mesh: `init_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
+
+8a. **Persistent 2D ExtraParallel parameters have a distinct precision and norm-reduction boundary**
+   - Qwen4-Exp PLE weights remain FP32 DTensors with placements `[Shard(1), Shard(0)]` and are ignored by FSDP2. Cast the sparse lookup result to the activation dtype before the result all-to-all; do not cast or gather the persistent parameter.
+   - Their local gradient shards are unique across both mesh axes. Gradient clipping must reduce their norm statistic exactly once over `extra_parallel_flat_group(para)`, not through the ordinary sequential `para_fsdp` and `para` groups.
+   - Record persistent parameter identities after FSDP wrapping so the ExtraParallel clipper can keep this bucket separate from ordinary sharded and Para-replicated parameters.
+   - Persistent PLE may coexist with ordinary EP because their parameters use independent meshes. Every parameter must match at most one enabled ExtraParallel plan; overlapping patterns are rejected before sharding.
 
 ## Data Pipeline
 

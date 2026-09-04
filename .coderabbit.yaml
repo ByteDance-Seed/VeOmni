@@ -45,7 +45,7 @@ reviews:
         - Do not request edits under veomni/models/transformers/*/generated/. Change patch_spec.py or modeling_*_patch.py instead.
         - Model registration must happen at import time.
         - config model_type must match the registry key.
-        - New modeling must target transformers 5.9.0 and FSDP2.
+        - New modeling must target transformers 5.16.0 and FSDP2.
         - NPU-only imports must be guarded with is_torch_npu_available() or IS_NPU_AVAILABLE.
     - path: "veomni/checkpoint/**"
       instructions: |

@@ -131,12 +131,14 @@ def _imported_veomni_signatures(tree: ast.Module) -> dict[str, inspect.Signature
     return found
 
 
-def _attribute_owner_classes(tree: ast.Module, classes: set[str]) -> dict[str, set[str]]:
-    """Map ``self.<attr>`` to the classes it is constructed from.
+def _attribute_owner_classes(tree: ast.Module, classes: set[str]) -> dict[str, dict[str, set[str]]]:
+    """Map each class's ``self.<attr>`` to the classes it constructs.
 
     Covers a direct ``self.x = SomeClass(...)`` and the dispatch-table form
     ``self.x = TABLE[key](...)``, which is how DeepSeek-V4 picks a compressor
-    per layer type. Anything else stays unmapped and is simply not checked.
+    per layer type. Attribute names are scoped to their enclosing class: two
+    unrelated classes may both use ``self.norm`` for different module types.
+    Anything else stays unmapped and is simply not checked.
     """
     tables: dict[str, set[str]] = {}
     for node in tree.body:
@@ -147,23 +149,32 @@ def _attribute_owner_classes(tree: ast.Module, classes: set[str]) -> dict[str, s
                     if isinstance(target, ast.Name):
                         tables[target.id] = names
 
-    owners: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if not (
-                isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self"
-            ):
+    owners: dict[str, dict[str, set[str]]] = {}
+    for class_node in (node for node in tree.body if isinstance(node, ast.ClassDef)):
+        class_owners: dict[str, set[str]] = {}
+        for node in ast.walk(class_node):
+            if not isinstance(node, ast.Assign):
                 continue
-            for call in ast.walk(node.value):
-                if not isinstance(call, ast.Call):
+            for target in node.targets:
+                if not (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
                     continue
-                func = call.func
-                if isinstance(func, ast.Name) and func.id in classes:
-                    owners.setdefault(target.attr, set()).add(func.id)
-                elif isinstance(func, ast.Subscript) and isinstance(func.value, ast.Name) and func.value.id in tables:
-                    owners.setdefault(target.attr, set()).update(tables[func.value.id])
+                for call in ast.walk(node.value):
+                    if not isinstance(call, ast.Call):
+                        continue
+                    func = call.func
+                    if isinstance(func, ast.Name) and func.id in classes:
+                        class_owners.setdefault(target.attr, set()).add(func.id)
+                    elif (
+                        isinstance(func, ast.Subscript)
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id in tables
+                    ):
+                        class_owners.setdefault(target.attr, set()).update(tables[func.value.id])
+        owners[class_node.name] = class_owners
     return owners
 
 
@@ -183,11 +194,17 @@ def _violations(path: Path) -> list[str]:
     functions.update(_imported_veomni_signatures(tree))
 
     methods: dict[str, dict[str, inspect.Signature]] = {}
+    call_classes: dict[int, str] = {}
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             methods[node.name] = {
                 m.name: _signature_from_ast(m, drop_self=True) for m in node.body if isinstance(m, ast.FunctionDef)
             }
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for child in ast.walk(member):
+                        if isinstance(child, ast.Call):
+                            call_classes[id(child)] = node.name
     owners = _attribute_owner_classes(tree, set(methods))
 
     problems = []
@@ -208,7 +225,8 @@ def _violations(path: Path) -> list[str]:
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
             and func.value.id == "self"
-            and func.attr in owners
+            and (class_name := call_classes.get(id(call))) is not None
+            and func.attr in owners[class_name]
         ):
             # One attribute can hold any of several classes, and sibling classes
             # may legitimately disagree: DeepSeek-V4's hash and top-k routers
@@ -216,7 +234,9 @@ def _violations(path: Path) -> list[str]:
             # installed. So the bar is that the call fits *some* class it could
             # reach, not every one.
             candidates = [
-                (cls, methods[cls]["forward"]) for cls in sorted(owners[func.attr]) if "forward" in methods[cls]
+                (cls, methods[cls]["forward"])
+                for cls in sorted(owners[class_name][func.attr])
+                if "forward" in methods[cls]
             ]
             reasons = {cls: _rejection(signature, len(call.args), keywords) for cls, signature in candidates}
             if candidates and all(reasons.values()):
@@ -228,6 +248,57 @@ def _violations(path: Path) -> list[str]:
 def test_generated_modules_exist():
     """A silent zero-module glob would make every check below vacuously pass."""
     assert len(GENERATED_MODULES) > 20, GENERATED_MODULES
+
+
+def test_attribute_owner_inference_is_scoped_per_class(tmp_path: Path):
+    source = """
+class GatedNorm:
+    def forward(self, hidden_states, gate):
+        pass
+
+class PlainNorm:
+    def forward(self, hidden_states):
+        pass
+
+class UsesGatedNorm:
+    def __init__(self):
+        self.norm = GatedNorm()
+
+    def forward(self, hidden_states, gate):
+        return self.norm(hidden_states, gate)
+
+class UsesPlainNorm:
+    def __init__(self):
+        self.norm = PlainNorm()
+
+    def forward(self, hidden_states):
+        return self.norm(hidden_states)
+"""
+    path = tmp_path / "generated.py"
+    path.write_text(source)
+
+    assert _violations(path) == []
+
+
+def test_attribute_owner_inference_still_reports_same_class_mismatch(tmp_path: Path):
+    source = """
+class GatedNorm:
+    def forward(self, hidden_states, gate):
+        pass
+
+class Broken:
+    def __init__(self):
+        self.norm = GatedNorm()
+
+    def forward(self, hidden_states):
+        return self.norm(hidden_states)
+"""
+    path = tmp_path / "generated.py"
+    path.write_text(source)
+
+    assert _violations(path) == [
+        "generated.py:11 calls self.norm(...) — GatedNorm.forward: missing a required argument: 'gate'"
+    ]
 
 
 @pytest.mark.parametrize("path", GENERATED_MODULES, ids=lambda p: p.stem)

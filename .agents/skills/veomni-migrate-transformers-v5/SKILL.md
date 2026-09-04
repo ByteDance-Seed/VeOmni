@@ -7,7 +7,7 @@ description: "Use this skill when adding or refreshing a patchgen-generated mode
 
 Purpose: add or refresh a model's patchgen-generated modeling under
 `veomni/models/transformers/<model>/generated/`. VeOmni pins
-`transformers==5.9.0` and ships patchgen-generated modeling for every
+`transformers==5.16.0` and ships patchgen-generated modeling for every
 supported model; legacy v4 monkey-patches have been retired.
 
 **References (read first, load on demand):**
@@ -59,14 +59,14 @@ Examples grouped by complexity / capability — pick the closest one and adapt:
 
 ### 0.1 Verify transformers venv
 
-Patchgen runs against `transformers==5.9.0`. Before touching code:
+Patchgen runs against `transformers==5.16.0`. Before touching code:
 
 ```bash
 source .venv/bin/activate
 python -c "import transformers; print(transformers.__version__)"
 ```
 
-If not `5.9.0`, re-sync the default env:
+If not `5.16.0`, re-sync the default env:
 
 ```bash
 uv sync --frozen --extra gpu --group dev
@@ -80,17 +80,17 @@ patchgen config is the single biggest accelerator for catching subtle
 signature/contract drift while iterating.
 
 ```bash
-mkdir -p .agents_workspace/hf_reference/<m>/v5_8_1
+mkdir -p .agents_workspace/hf_reference/<m>/v5_16_0
 
-curl -sL -o .agents_workspace/hf_reference/<m>/v5_8_1/modeling_<m>.py \
-  "https://github.com/huggingface/transformers/raw/v5.9.0/src/transformers/models/<m>/modeling_<m>.py"
+curl -sL -o .agents_workspace/hf_reference/<m>/v5_16_0/modeling_<m>.py \
+  "https://github.com/huggingface/transformers/raw/v5.16.0/src/transformers/models/<m>/modeling_<m>.py"
 ```
 
 For VLMs also grab `processing_<m>.py` / `image_processing_<m>.py` /
 `configuration_<m>.py` if you expect processor-side or config-shape work.
 
 If you are **refreshing** an existing patchgen-generated file across a
-transformers minor bump (e.g. the current pin `5.9.0 → 5.9.0`), pull both
+transformers minor bump (e.g. `5.9.0 → 5.16.0`), pull both
 versions side-by-side and diff to spot contract drift — substitute the
 `<old_ver>` / `<new_ver>` tags with the actual versions you are migrating
 between:

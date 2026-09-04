@@ -429,12 +429,20 @@ class _FakeParallelState:
     def extra_parallel_group(self, name: str) -> object | None:
         return None
 
+    def extra_parallel_flat_group(self, name: str) -> object | None:
+        return None
 
-def _make_model(param_groups: dict[str, list[nn.Parameter]], replicated_ids: set) -> nn.Module:
+
+def _make_model(
+    param_groups: dict[str, list[nn.Parameter]],
+    replicated_ids: set,
+    persistent_ids: set | None = None,
+) -> nn.Module:
     """Wrap a ``param_groups`` dict in the duck-typed object the clipper expects."""
     m = nn.Module()
     m._extra_parallel_param_groups = param_groups
     m._ep_replicated_lora_param_ids = replicated_ids
+    m._persistent_extra_parallel_param_ids = persistent_ids or set()
     return m
 
 
@@ -477,7 +485,10 @@ def test_inf_norm_with_replicated_bucket_does_not_crash(extra_names):
 
     model = _make_model(param_groups, replicated_ids)
     expected = torch.stack(grads_seen).max().to(torch.float32)
-    with mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps):
+    with (
+        mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(cgn_mod, "get_device_type", return_value="cpu"),
+    ):
         total = extra_parallel_fsdp2_clip_grad_norm(
             model, max_norm=1e9, norm_type=math.inf, error_if_nonfinite=False, foreach=False
         )
@@ -504,12 +515,108 @@ def test_inf_norm_single_axis_no_replicated_still_works():
     )
     model = _make_model({"non_extra_parallel": [p_non], "ep": [p_ep]}, replicated_ids=set())
 
-    with mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps):
+    with (
+        mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(cgn_mod, "get_device_type", return_value="cpu"),
+    ):
         total = extra_parallel_fsdp2_clip_grad_norm(
             model, max_norm=1e9, norm_type=math.inf, error_if_nonfinite=False, foreach=False
         )
 
     assert total.item() == pytest.approx(6.0, abs=1e-6)
+
+
+def test_persistent_extra_parallel_norm_reduces_once_over_flat_mesh():
+    """A persistent 2D shard owns unique values and needs one flat-mesh reduction."""
+    p_non = _param_with_grad(torch.tensor([12.0]))
+    p_persistent = _param_with_grad(torch.tensor([3.0, 4.0]))
+    fake_ps = _FakeParallelState(
+        extra_parallel_names=["ple"],
+        extra_parallel_fsdp_device_mesh={"ple": None},
+    )
+    fake_ps.extra_parallel_enabled = lambda _name: True
+    fake_ps.extra_parallel_group = lambda name: f"{name}_group"
+    fake_ps.extra_parallel_flat_group = lambda name: f"{name}_flat_group"
+    model = _make_model(
+        {"non_extra_parallel": [p_non], "ple": [p_persistent]},
+        replicated_ids=set(),
+        persistent_ids={id(p_persistent)},
+    )
+    reduce_calls = []
+
+    def record_reduce(params, norm_type, reduce_groups):
+        reduce_calls.append((list(params), list(reduce_groups)))
+        return cgn_mod._local_pth_sum(params, float(norm_type))
+
+    with (
+        mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(cgn_mod, "get_device_type", return_value="cpu"),
+        mock.patch.object(cgn_mod, "_fsdp2_reduce_group", side_effect=record_reduce),
+    ):
+        total = extra_parallel_fsdp2_clip_grad_norm(
+            model, max_norm=1e9, norm_type=2.0, error_if_nonfinite=False, foreach=False
+        )
+
+    assert total.item() == pytest.approx(13.0, abs=1e-6)
+    persistent_calls = [call for call in reduce_calls if len(call[0]) == 1 and call[0][0] is p_persistent]
+    assert len(persistent_calls) == 1
+    assert persistent_calls[0][1] == [("ple_flat", "ple_flat_group")]
+
+
+def test_persistent_ple_and_ep_norm_use_independent_reduction_groups():
+    """PLE uses one flat reduction while ordinary EP uses EP-FSDP then EP."""
+
+    class _FakeMesh:
+        def __init__(self, group):
+            self.group = group
+
+        def get_group(self):
+            return self.group
+
+    p_non = _param_with_grad(torch.tensor([12.0]))
+    p_ple = _param_with_grad(torch.tensor([3.0, 4.0]))
+    p_ep = _param_with_grad(torch.tensor([5.0, 12.0]))
+    fake_ps = _FakeParallelState(
+        extra_parallel_names=["ple", "ep"],
+        extra_parallel_fsdp_device_mesh={
+            "ple": {"ple_fsdp": _FakeMesh("ple_fsdp_group")},
+            "ep": {"ep_fsdp": _FakeMesh("ep_fsdp_group")},
+        },
+    )
+    fake_ps.extra_parallel_enabled = lambda _name: True
+    fake_ps.extra_parallel_group = lambda name: f"{name}_group"
+    fake_ps.extra_parallel_flat_group = lambda name: f"{name}_flat_group"
+    model = _make_model(
+        {
+            "non_extra_parallel": [p_non],
+            "ple": [p_ple],
+            "ep": [p_ep],
+        },
+        replicated_ids=set(),
+        persistent_ids={id(p_ple)},
+    )
+    reduce_calls = []
+
+    def record_reduce(params, norm_type, reduce_groups):
+        reduce_calls.append((list(params), list(reduce_groups)))
+        return cgn_mod._local_pth_sum(params, float(norm_type))
+
+    with (
+        mock.patch.object(cgn_mod, "get_parallel_state", return_value=fake_ps),
+        mock.patch.object(cgn_mod, "get_device_type", return_value="cpu"),
+        mock.patch.object(cgn_mod, "_fsdp2_reduce_group", side_effect=record_reduce),
+    ):
+        total = extra_parallel_fsdp2_clip_grad_norm(
+            model, max_norm=1e9, norm_type=2.0, error_if_nonfinite=False, foreach=False
+        )
+
+    assert total.item() == pytest.approx(math.sqrt(338.0), abs=1e-6)
+    ple_calls = [call for call in reduce_calls if len(call[0]) == 1 and call[0][0] is p_ple]
+    ep_calls = [call for call in reduce_calls if len(call[0]) == 1 and call[0][0] is p_ep]
+    assert len(ple_calls) == 1
+    assert ple_calls[0][1] == [("ple_flat", "ple_flat_group")]
+    assert len(ep_calls) == 1
+    assert ep_calls[0][1] == [("ep_fsdp", "ep_fsdp_group"), ("ep", "ep_group")]
 
 
 if __name__ == "__main__":

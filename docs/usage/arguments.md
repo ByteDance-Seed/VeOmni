@@ -362,7 +362,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
 | init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory loader for large ExtraParallel-sharded tensors such as MoE experts or PLE embedding tables: each rank reads only its dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
 | sync_each_train_step | `bool` | `True` | Synchronize the accelerator before each training step's forward/backward work. Disable to allow async dataloader and H2D work to overlap with the next step. |

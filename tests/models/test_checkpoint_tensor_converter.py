@@ -27,6 +27,8 @@ import torch
 
 from veomni.models.checkpoint_tensor_loading import (
     ConvertedCheckpointTensor,
+    checkpoint_converter_record_skip_without_loading,
+    checkpoint_converter_should_skip_without_loading,
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
@@ -119,6 +121,23 @@ class TestMaybeConvertCheckpointTensor:
         result = maybe_convert_checkpoint_tensor("handle_me.weight", t, converter)
         assert result is not None
         assert result.name == "HANDLE_ME.WEIGHT"
+
+    def test_optional_skip_without_loading_capability(self):
+        class _SkippingConverter(_DummyConverter):
+            skipped = 0
+
+            def should_skip_without_loading(self, name: str) -> bool:
+                return name == "handle_me.skip"
+
+            def record_skip_without_loading(self, name: str) -> None:
+                assert name == "handle_me.skip"
+                self.skipped += 1
+
+        converter = _SkippingConverter()
+        assert checkpoint_converter_should_skip_without_loading(converter, "handle_me.skip")
+        assert not checkpoint_converter_should_skip_without_loading(converter, "other_key")
+        checkpoint_converter_record_skip_without_loading(converter, "handle_me.skip")
+        assert converter.skipped == 1
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +535,7 @@ class TestDeepseekV4ConverterConvert:
             ),
             (
                 "layers.2.attn.indexer.weights_proj.weight",
-                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
+                "model.layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight",
             ),
             ("layers.2.ffn.gate.bias", "model.layers.2.mlp.gate.e_score_correction_bias"),
             ("layers.2.ffn.gate.tid2eid", "model.layers.2.mlp.gate.tid2eid"),

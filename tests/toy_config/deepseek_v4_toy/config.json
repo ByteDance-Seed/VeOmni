@@ -48,5 +48,5 @@
   "mlp_bias": false,
   "attention_dropout": 0.0,
   "torch_dtype": "bfloat16",
-  "transformers_version": "5.9.0"
+  "transformers_version": "5.16.0"
 }

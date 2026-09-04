@@ -166,6 +166,7 @@ config = PatchConfig(
     description="DeepseekV4 with VeOmni fused-MoE + OpSlot-guarded fused-CE patches",
 )
 
+config.add_import("typing", names=["Optional"])
 config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import(
     "veomni.ops.kernels.deepseek_v4",
@@ -1168,7 +1169,9 @@ def deepseek_v4_indexer_forward_patched(
     cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
     q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
     q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
-    weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
+    weights = self.scorer.weights_proj(hidden_states).float() * (
+        self.scorer.weights_scaling * self.scorer.softmax_scale
+    )
     compressed_len = compressed_kv.shape[1]
     top_k = min(self.index_topk, compressed_len)
 
@@ -1282,8 +1285,8 @@ def deepseek_v4_indexer_forward_patched(
     # that no test can exercise is worse than none: it reads as the protection while
     # the one doing the work sits elsewhere.
     scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
-    scores = F.relu(scores) * self.softmax_scale
-    eager_weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+    scores = F.relu(scores) * self.scorer.softmax_scale
+    eager_weights = self.scorer.weights_proj(hidden_states).float() * self.scorer.weights_scaling
     index_scores = (scores * eager_weights.unsqueeze(-1)).sum(dim=2)
     if compressed_len > 0:
         entry_indices = torch.arange(compressed_len, device=index_scores.device)

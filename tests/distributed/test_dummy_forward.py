@@ -29,7 +29,7 @@ _VOCAB_SIZE = 1024
 # ---------------------------------------------------------------------------
 
 
-def _vlm_batch(*, rank, device, dtype, patch_size):
+def _vlm_batch(*, rank, device, dtype, patch_size, vocab_size=_VOCAB_SIZE, with_position_ids=False):
     """Build VLM batch: rank 0 gets images + video, other ranks get text-only."""
     h, w = 4, 4
     image_t, video_t = 2, 10
@@ -48,10 +48,10 @@ def _vlm_batch(*, rank, device, dtype, patch_size):
         video_mask = mask.clone()
         video_mask[0, -video_seqlen:] = True
 
-        return {
-            "input_ids": torch.randint(0, _VOCAB_SIZE, (1, seq_len), device=device),
+        batch = {
+            "input_ids": torch.randint(0, vocab_size, (1, seq_len), device=device),
             "attention_mask": torch.ones(1, seq_len, dtype=torch.long, device=device),
-            "labels": torch.randint(0, _VOCAB_SIZE, (1, seq_len), device=device),
+            "labels": torch.randint(0, vocab_size, (1, seq_len), device=device),
             "pixel_values": torch.rand(image_t * h * w, pixel_dim, dtype=dtype, device=device),
             "pixel_values_videos": torch.rand(video_t * h * w, pixel_dim, dtype=dtype, device=device),
             "image_mask": image_mask,
@@ -59,14 +59,20 @@ def _vlm_batch(*, rank, device, dtype, patch_size):
             "image_grid_thw": torch.tensor([[1, h, w]] * image_t, dtype=torch.long, device=device),
             "video_grid_thw": torch.tensor([[video_t, h, w]], dtype=torch.long, device=device),
         }
+        if with_position_ids:
+            batch["position_ids"] = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, 1, -1)
+        return batch
     else:
-        return {
-            "input_ids": torch.randint(0, _VOCAB_SIZE, (1, _TEXT_SEQ_LEN), device=device),
+        batch = {
+            "input_ids": torch.randint(0, vocab_size, (1, _TEXT_SEQ_LEN), device=device),
             "attention_mask": torch.ones(1, _TEXT_SEQ_LEN, dtype=torch.long, device=device),
-            "labels": torch.randint(0, _VOCAB_SIZE, (1, _TEXT_SEQ_LEN), device=device),
+            "labels": torch.randint(0, vocab_size, (1, _TEXT_SEQ_LEN), device=device),
             "image_mask": torch.zeros(1, _TEXT_SEQ_LEN, dtype=torch.bool, device=device),
             "video_mask": torch.zeros(1, _TEXT_SEQ_LEN, dtype=torch.bool, device=device),
         }
+        if with_position_ids:
+            batch["position_ids"] = torch.arange(_TEXT_SEQ_LEN, device=device).view(1, 1, -1).expand(3, 1, -1)
+        return batch
 
 
 def _omni_batch(*, rank, device, dtype, patch_size, is_qwen3_omni=False):
@@ -132,7 +138,7 @@ def _omni_batch(*, rank, device, dtype, patch_size, is_qwen3_omni=False):
 # ---------------------------------------------------------------------------
 
 
-def _asymmetric_forward_worker(model_type, config_path, batch_fn):
+def _asymmetric_forward_worker(model_type, config_path, batch_fn, weights_path=None):
     """Rank 0 gets multimodal data, other ranks get text-only. Verifies no NCCL hang."""
     from veomni import _apply_patches
     from veomni.distributed.parallel_state import init_parallel_state
@@ -148,14 +154,24 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
     os.environ["NCCL_TIMEOUT"] = "120"
 
     world_size = dist.get_world_size()
-    init_parallel_state(dp_size=world_size, dp_shard_size=world_size, dp_mode="fsdp2")
+    if model_type == "qwen4_exp":
+        init_parallel_state(
+            dp_size=world_size,
+            dp_shard_size=world_size,
+            dp_mode="fsdp2",
+            extra_parallel_names=("ple", "ep"),
+            extra_parallel_sizes=(world_size, 1),
+            extra_parallel_placement_innermost=(False, False),
+        )
+    else:
+        init_parallel_state(dp_size=world_size, dp_shard_size=world_size, dp_mode="fsdp2")
 
     rank = dist.get_rank()
     device = torch.device(f"{get_device_type()}:{rank}")
 
     model = build_foundation_model(
         config_path=config_path,
-        weights_path=None,
+        weights_path=weights_path,
         torch_dtype="float32",
         init_device="meta",
         ops_implementation=make_eager_ops_config(),
@@ -164,11 +180,13 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn):
 
     model = build_parallelize_model(
         model,
-        weights_path=None,
+        weights_path=weights_path,
         init_device="meta",
         mixed_precision=MixedPrecisionConfig(enable=True),
         enable_gradient_checkpointing=False,
         basic_modules=[],
+        broadcast_model_weights_from_rank0=False,
+        ep_sharded_stream_load=weights_path is not None,
     )
 
     batch = batch_fn(rank=rank, device=device, dtype=torch.bfloat16)
@@ -217,16 +235,28 @@ _vlm_cases = [
         partial(_vlm_batch, patch_size=16),
         id="qwen3_vl_moe",
     ),
+    pytest.param(
+        "qwen4_exp",
+        "./tests/toy_config/qwen4_exp_toy/config.json",
+        partial(_vlm_batch, patch_size=4, vocab_size=120, with_position_ids=True),
+        id="qwen4_exp",
+    ),
 ]
 
 
 @pytest.mark.parametrize("model_type, config_path, batch_fn", _vlm_cases)
-def test_asymmetric_forward_vlm(model_type: str, config_path: str, batch_fn):
+def test_asymmetric_forward_vlm(model_type: str, config_path: str, batch_fn, tmp_path):
     """Verify no NCCL hang when some ranks lack image/video data under FSDP2."""
     from ..tools.launch_utils import torchrun
+    from ..tools.training_utils import materialize_weights
+
+    weights_path = None
+    if model_type == "qwen4_exp":
+        weights_path = str(tmp_path / "qwen4_exp_model")
+        materialize_weights(config_path, weights_path, save_original_format=False)
 
     torchrun(
-        partial(_asymmetric_forward_worker, model_type, config_path, batch_fn),
+        partial(_asymmetric_forward_worker, model_type, config_path, batch_fn, weights_path),
         world_size=2,
     )
 
