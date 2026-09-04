@@ -31,8 +31,12 @@ import torch
 from veomni.patchgen.patch_spec import PatchConfig
 
 from .deepseek_v3_gpu_patch_gen_config import (
+    DeepseekV3MultiTokenPredictor,
     PatchedDeepseekV3NaiveMoe,
+    _shift_mtp_inputs,
+    deepseek_v3_configure_mtp_training,
     deepseek_v3_forcausallm_forward_patched,
+    deepseek_v3_forcausallm_init_mtp,
     deepseek_v3_get_parallel_plan_patched,
     deepseek_v3_moe_forward_patched,
     deepseek_v3_topk_router_forward_patched,
@@ -47,6 +51,8 @@ config = PatchConfig(
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
+config.add_import("veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor"])
+config.add_import("veomni.distributed.sequence_parallel.comm", names=["get_unified_sequence_parallel_group"])
 
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
 # ``forward`` (reused from the GPU config) can return per-token log-probs in
@@ -109,6 +115,15 @@ config.replace_class(
     description="Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path",
 )
 
+config.add_helper_after("DeepseekV3DecoderLayer", DeepseekV3MultiTokenPredictor)
+config.add_helper(_shift_mtp_inputs)
+
+config.override_method(
+    "DeepseekV3ForCausalLM.__init__",
+    replacement=deepseek_v3_forcausallm_init_mtp,
+    description="Construct checkpoint-compatible DeepSeek-V3 MTP modules when enabled",
+)
+
 config.override_method(
     "DeepseekV3TopkRouter.forward",
     replacement=deepseek_v3_topk_router_forward_patched,
@@ -125,6 +140,12 @@ config.override_method(
     "DeepseekV3ForCausalLM.forward",
     replacement=deepseek_v3_forcausallm_forward_patched,
     description="OpSlot guard for fused cross entropy in DeepseekV3ForCausalLM.forward",
+)
+
+config.override_method(
+    "DeepseekV3ForCausalLM.configure_mtp_training",
+    replacement=deepseek_v3_configure_mtp_training,
+    description="Configure runtime-only DeepSeek-V3 MTP training state",
 )
 
 config.override_method(
