@@ -1499,7 +1499,7 @@ class DataArguments:
     )
     eval_path: Optional[str] = field(
         default=None,
-        metadata={"help": "path of the evaluation data. If None, use a subset of train_path."},
+        metadata={"help": "Path of the evaluation data. If None, training-time validation is disabled."},
     )
     train_size: int = field(
         default=10_000_000,

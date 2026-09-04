@@ -313,7 +313,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | train_path | `str` | **Required** | Path of the training dataset. Use comma to separate multiple datasets. |
-| eval_path | `Optional[str]` | `None` | Path of the evaluation dataset. |
+| eval_path | `Optional[str]` | `None` | Path of the evaluation dataset for Text SFT training-time validation. `None` disables validation. See [Training-time validation](trainer.md#training-time-validation) for the current support boundary. |
 | train_size | `int` | `10_000_000` | Number of tokens for training (used to compute steps under dynamic batch). |
 | train_sample | `int` | `10_000` | Number of samples for training (used to compute steps under non-dynamic batch). |
 | data_type | `Literal["plaintext", "conversation", "diffusion", "classification", "dpo"]` | `"conversation"` | Type of the training data. |
