@@ -127,7 +127,7 @@ class IterativeDataset(IterableDataset):
 
 
 class ShardedIterableDataset(IterableDataset):
-    """Row-level DP shard. One pass drops an incomplete last round; ``repeat`` replays."""
+    """Row-level DP shard. Each pass drops an incomplete last round; ``repeat`` replays."""
 
     def __init__(self, dataset, dp_rank: int = 0, dp_size: int = 1, repeat: bool = False, seed: int = 42):
         self._dataset = dataset
@@ -158,7 +158,15 @@ class ShardedIterableDataset(IterableDataset):
                 if index % self._dp_size == 0:
                     yield from pending
                     pending = []
-            if index == n_before or not self._repeat:
+            produced = index - n_before
+            if produced == 0 or not self._repeat:
+                return
+            # Drop an incomplete last DP round so it cannot leak into the next pass.
+            pending = []
+            remainder = index % self._dp_size
+            if remainder:
+                index += self._dp_size - remainder
+            if produced < self._dp_size:
                 return
             pass_i += 1
 

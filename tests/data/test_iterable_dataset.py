@@ -72,6 +72,24 @@ def test_repeat_replays_the_stream():
     assert list(islice(stream, 5)) == [0, 1, 0, 1, 0]
 
 
+def test_repeat_drops_incomplete_round_before_replay():
+    source = [0, 1, 2]
+    ranks = [
+        list(islice(ShardedIterableDataset(_ListStream(source), dp_rank=rank, dp_size=2, repeat=True), 4))
+        for rank in range(2)
+    ]
+    assert ranks[0] == [0, 0, 0, 0]
+    assert ranks[1] == [1, 1, 1, 1]
+
+
+def test_repeat_exits_when_source_shorter_than_dp():
+    ranks = [
+        list(islice(ShardedIterableDataset(_ListStream([0]), dp_rank=rank, dp_size=2, repeat=True), 4))
+        for rank in range(2)
+    ]
+    assert ranks == [[], []]
+
+
 def test_repeat_advances_inner_epoch():
     inner = _ListStream(["a"])
     stream = ShardedIterableDataset(inner, repeat=True, seed=10)
