@@ -13,7 +13,7 @@ import torch.nn as nn
 from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
-from veomni.arguments import TrainingArguments, parse_args
+from veomni.arguments import ModelRuntimeArguments, TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import init_parallel_state
@@ -42,6 +42,7 @@ def _torch_npu_version() -> str:
 
 @dataclass
 class Argument:
+    model: "ModelRuntimeArguments" = field(default_factory=ModelRuntimeArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
@@ -127,32 +128,32 @@ def main():
 
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     init_parallel_state(
-        dp_size=args.train.accelerator.dp_size,
-        dp_replicate_size=args.train.accelerator.dp_replicate_size,
-        dp_shard_size=args.train.accelerator.dp_shard_size,
-        tp_size=args.train.accelerator.tp_size,
-        pp_size=args.train.accelerator.pp_size,
-        cp_size=args.train.accelerator.cp_size,
-        ulysses_size=args.train.accelerator.ulysses_size,
-        extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.train.accelerator.extra_parallel_names,
-        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+        dp_size=args.model.accelerator.dp_size,
+        dp_replicate_size=args.model.accelerator.dp_replicate_size,
+        dp_shard_size=args.model.accelerator.dp_shard_size,
+        tp_size=args.model.accelerator.tp_size,
+        pp_size=args.model.accelerator.pp_size,
+        cp_size=args.model.accelerator.cp_size,
+        ulysses_size=args.model.accelerator.ulysses_size,
+        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
+        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
+        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
     )
 
     model = ToyMoeAndEmbedModel()
     model = build_parallelize_model(
         model,
-        init_device=args.train.init_device,
+        init_device=args.model.accelerator.init_device,
         weights_path=None,
-        mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
-        enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
-        enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
+        mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,
+        enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable,
+        enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
         basic_modules=[],
-        enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
-        enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-        broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
-        max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+        enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
+        enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
+        broadcast_model_weights_from_rank0=args.model.accelerator.broadcast_model_weights_from_rank0,
+        max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
     )
 
     from veomni.distributed.parallel_state import get_parallel_state
@@ -173,12 +174,12 @@ def main():
     # build optimizer to register ep param groups when ep is enabled
     _ = build_optimizer(
         model,
-        lr=args.train.optimizer.lr,
-        weight_decay=args.train.optimizer.weight_decay,
+        lr=args.model.optimizer.lr,
+        weight_decay=args.model.optimizer.weight_decay,
         fused=True,
-        optimizer_type=args.train.optimizer.type,
-        no_decay_modules=args.train.optimizer.no_decay_modules,
-        no_decay_params=args.train.optimizer.no_decay_params,
+        optimizer_type=args.model.optimizer.type,
+        no_decay_modules=args.model.optimizer.no_decay_modules,
+        no_decay_params=args.model.optimizer.no_decay_params,
     )
     logger.info_rank0(
         "group sizes - fsdp: %s, ep: %s, ep_fsdp: %s, emb: %s, emb_fsdp: %s",
@@ -190,7 +191,7 @@ def main():
     )
     device_type = get_device_type()
     tensor_device = torch.device(f"{device_type}:{get_device_id()}")
-    max_grad_norm = args.train.optimizer.max_grad_norm
+    max_grad_norm = args.model.optimizer.max_grad_norm
 
     def check_model_param_grad_one_by_one(expected_grad, ep_expected_grad, emb_expected_grad, msg):
         # check them one-by-one
@@ -295,13 +296,13 @@ def _run_clip_grad_norm_fsdp2_test(
         "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
-        f"--train.accelerator.ep_size={ep_size}",
-        "--train.accelerator.ep_outside=False",
-        f"--train.accelerator.extra_parallel_sizes={emb_size}",
-        "--train.accelerator.extra_parallel_placement_innermost=False",
-        "--train.accelerator.extra_parallel_names=emb",
-        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
-        "--train.init_device=meta",
+        f"--model.accelerator.ep_size={ep_size}",
+        "--model.accelerator.ep_outside=False",
+        f"--model.accelerator.extra_parallel_sizes={emb_size}",
+        "--model.accelerator.extra_parallel_placement_innermost=False",
+        "--model.accelerator.extra_parallel_names=emb",
+        "--model.accelerator.fsdp_config.fsdp_mode=fsdp2",
+        "--model.accelerator.init_device=meta",
         "--train.checkpoint.output_dir='debug'",
     ]
     # HSDP: split the dp dim into (dp_replicate, dp_shard). dp_shard is inferred
@@ -309,9 +310,9 @@ def _run_clip_grad_norm_fsdp2_test(
     # total grad norm is identical to the pure-FSDP case: the clip reduces over
     # the shard group only, so replicating over dp_replicate must NOT inflate it.
     if dp_replicate_size is not None:
-        command.append(f"--train.accelerator.dp_replicate_size={dp_replicate_size}")
+        command.append(f"--model.accelerator.dp_replicate_size={dp_replicate_size}")
     if cpu_offload:
-        command.append("--train.accelerator.fsdp_config.offload=True")
+        command.append("--model.accelerator.fsdp_config.offload=True")
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
 

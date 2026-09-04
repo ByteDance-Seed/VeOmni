@@ -23,7 +23,7 @@
 import fnmatch
 from collections import OrderedDict, deque
 from threading import Lock
-from typing import List
+from typing import List, Optional
 from weakref import WeakValueDictionary
 
 import torch
@@ -42,6 +42,8 @@ from ..utils.device import (
 
 
 logger = logging.get_logger(__name__)
+
+_DEFAULT_HOST_CACHE_LIMIT_BYTES = 4 * 1024**3
 
 
 def _module_name_match(pattern: str, name: str) -> bool:
@@ -82,7 +84,7 @@ def base_check_fn(tensor) -> bool:
 class PinnedBufferPool:
     """Reuse host buffers with a bounded, layout-level LRU cache."""
 
-    def __init__(self, max_cached_bytes: int = 4 * 1024**3):
+    def __init__(self, max_cached_bytes: int = _DEFAULT_HOST_CACHE_LIMIT_BYTES):
         if max_cached_bytes < 0:
             raise ValueError(f"max_cached_bytes must be non-negative, got {max_cached_bytes}.")
 
@@ -192,7 +194,7 @@ class GetCnt:
                 self._block_tensor_nums[block_idx] = 1
             self._block_idx = block_idx
 
-        offload_tensor_key = "{}_{}".format(self._block_idx, self._block_tensor_nums[self._block_idx] - 1)
+        offload_tensor_key = f"{self._block_idx}_{self._block_tensor_nums[self._block_idx] - 1}"
         return offload_tensor_key, previous_block_idx
 
     def reset(self):
@@ -207,7 +209,7 @@ class GetCnt:
 
         block_tensor_nums = self._block_tensor_nums[prefetch_block_idx]
         prefetch_idxs = list(range(0, block_tensor_nums))
-        return ["{}_{}".format(prefetch_block_idx, prefetch_idx) for prefetch_idx in prefetch_idxs]
+        return [f"{prefetch_block_idx}_{prefetch_idx}" for prefetch_idx in prefetch_idxs]
 
     def get_layer_tensor_nums(self, block_idx):
         return self._block_tensor_nums[block_idx]
@@ -301,14 +303,38 @@ class SwapTensor:
 
 
 class OffloadManager:
-    def __init__(self, host_cache_limit_bytes: int = 4 * 1024**3):
+    """Bookkeeping for one offload schedule, drawing host memory from a shared pool.
+
+    One manager serves exactly one matched set. Keys stay unique across sets --
+    ``GetCnt`` increments rather than resets on a repeated ``block_idx`` -- but
+    ``block_idx`` still means "position within this schedule", and everything
+    that reasons about ordering keys off it: ``wait_d2h_finished`` waits on the
+    previous block by key prefix, ``get_prefetch_keys`` returns the next-lowest
+    block, and ``block_idx == depth - 1`` skips the final block. Two sets both
+    numbering from 0 would prefetch and wait on each other's tensors, and the
+    ``layer_idx == 0`` reset in ``_patch_instance_call`` would fire again at the
+    second set's first layer, mid-step.
+
+    The host pool is the opposite: its buffers are keyed by layout alone and are
+    fungible across schedules, and the limit it enforces is a property of the
+    process rather than of any one schedule. It is therefore injected rather
+    than owned, so a composed model can apply offload per module without
+    multiplying the configured limit by the module count.
+    """
+
+    def __init__(self, host_buffer_pool: PinnedBufferPool):
+        if not isinstance(host_buffer_pool, PinnedBufferPool):
+            # Wiring mistakes otherwise surface as an AttributeError raised from
+            # inside the pack hook, several steps away from the bad call.
+            raise TypeError(f"host_buffer_pool must be a PinnedBufferPool, got {type(host_buffer_pool).__name__}.")
+
         # Autograd owns packed SwapTensor objects until backward. Weak references
         # let abandoned graphs release stale entries after a failed step.
         self.items = WeakValueDictionary()
         self.getcnt = GetCnt()
         self.swap_stream = create_stream()
 
-        self.host_buffer_pool = PinnedBufferPool(max_cached_bytes=host_cache_limit_bytes)
+        self.host_buffer_pool = host_buffer_pool
 
     def get_cnt(self, block_idx):
         return self.getcnt.get_cnt(block_idx)
@@ -401,8 +427,11 @@ def reset_async_activation_offload(model):
     The saved-tensor graph normally releases ``SwapTensor`` objects after
     backward.  A failed loss/backward step can leave the graph alive, though,
     so the next training step must explicitly discard its keys and counters.
-    The host pool remains attached to the model and can still reuse buffers
-    once the old graph is collected.
+    Only per-schedule bookkeeping is discarded; the host pool outlives the reset
+    and can still reuse buffers once the old graph is collected.
+
+    Managers are found by walking ``model``, so a caller that offloaded several
+    roots must reset each of them.
     """
     managers = {}
     for module in model.modules():
@@ -442,7 +471,7 @@ class async_save_on_cpu(saved_tensors_hooks):
             d2h_stream = manager.swap_stream
 
             if previous_block_idx is not None:
-                manager.wait_d2h_finished("{}_".format(previous_block_idx))
+                manager.wait_d2h_finished(f"{previous_block_idx}_")
 
             if block_idx == depth - 1:
                 return tensor
@@ -505,7 +534,7 @@ def _get_no_split_offload_modules(model):
     matched_submodules = [
         [name, module, layer_idx, 0]
         for layer_idx, (name, module) in enumerate(
-            (item for item in model.named_modules() if type(item[1]).__name__ in target_classes)
+            item for item in model.named_modules() if type(item[1]).__name__ in target_classes
         )
     ]
     if not matched_submodules:
@@ -520,7 +549,7 @@ def _get_no_split_offload_modules(model):
     return matched_submodules
 
 
-def async_offload_modules(modules, prefetch=True, hidden_states_idx=0, host_cache_limit_bytes: int = 4 * 1024**3):
+def async_offload_modules(modules, *, host_buffer_pool: PinnedBufferPool, prefetch=True, hidden_states_idx=0):
     """Apply async activation offload via selected-instance ``__call__`` patching.
 
     For each module, per-instance attributes (``_veomni_offload_layer_idx``,
@@ -556,8 +585,12 @@ def async_offload_modules(modules, prefetch=True, hidden_states_idx=0, host_cach
     on the second unpack.  The VeOmni fix increments existing counts instead
     of resetting, so the second pass produces ``"0_1"``, ``"1_1"``, … rather
     than repeating ``"0_0"``, ``"1_0"``, ….
+
+    ``host_buffer_pool`` is keyword-only and supplied by the caller so that
+    several matched sets can draw on one host-memory budget; see
+    ``OffloadManager``.
     """
-    manager = OffloadManager(host_cache_limit_bytes=host_cache_limit_bytes)
+    manager = OffloadManager(host_buffer_pool)
     for name, module, layer_idx, depth in modules:
         logger.info_rank0(
             f"Applying activation offload to module: {name}, offload idx: {layer_idx}, offload_layers_num: {depth}"
@@ -638,7 +671,8 @@ def _patch_instance_call(module):
 def apply_async_activation_offload(
     model,
     activation_offload_modules: List[str],
-    host_cache_limit_bytes: int = 4 * 1024**3,
+    host_cache_limit_bytes: Optional[int] = None,
+    host_buffer_pool: Optional[PinnedBufferPool] = None,
 ):
     """Apply async activation offload to matched submodules.
 
@@ -651,7 +685,32 @@ def apply_async_activation_offload(
         GC handles intermediate activations via recomputation.
       - Without GC: async offload intercepts hidden_states directly,
         intermediate activations stay on GPU.
+
+    Several patterns in one call share a manager and a pool already, so
+    ``host_cache_limit_bytes`` is all a single model needs. ``host_buffer_pool``
+    is for the caller that applies offload more than once -- a composed model
+    configured per module, or a second model such as a DPO reference -- where
+    building a pool per call would multiply the configured limit by the call
+    count. The two are mutually exclusive.
+
+    Sharing a pool is not free: its LRU is global and keyed by layout, so
+    schedules with unlike activation shapes can evict each other and fall back
+    to fresh pinned allocations. Scale the limit with the number of schedules
+    rather than reusing the single-model value.
+
+    ``reset_async_activation_offload`` walks one root, so a caller that offloads
+    several roots owes it a call per root.
     """
+    if host_buffer_pool is not None and host_cache_limit_bytes is not None:
+        raise ValueError(
+            "Pass either host_cache_limit_bytes or host_buffer_pool, not both: "
+            "a supplied pool already carries its own limit."
+        )
+    if host_buffer_pool is None:
+        if host_cache_limit_bytes is None:
+            host_cache_limit_bytes = _DEFAULT_HOST_CACHE_LIMIT_BYTES
+        host_buffer_pool = PinnedBufferPool(max_cached_bytes=host_cache_limit_bytes)
+
     if activation_offload_modules:
         matched_modules = get_offload_modules(model, activation_offload_modules)
         if not matched_modules:
@@ -660,4 +719,4 @@ def apply_async_activation_offload(
             )
     else:
         matched_modules = _get_no_split_offload_modules(model)
-    async_offload_modules(matched_modules, host_cache_limit_bytes=host_cache_limit_bytes)
+    async_offload_modules(matched_modules, host_buffer_pool=host_buffer_pool)

@@ -263,7 +263,7 @@ def build_torchrun_cmd(
         # less GPU memory required on the L20 (44 GiB) runners.
         "--train.global_batch_size=8",
         "--train.micro_batch_size=1",
-        f"--train.init_device={init_device}",
+        f"--model.accelerator.init_device={init_device}",
         "--train.bsz_warmup_ratio=0",
         "--train.num_train_epochs=1",
         "--train.checkpoint.save_epochs=0",
@@ -280,9 +280,9 @@ def build_torchrun_cmd(
     if parallel_config is not None:
         cmd.extend(
             [
-                f"--train.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
-                f"--train.accelerator.ulysses_size={parallel_config.sp_size}",
-                f"--train.accelerator.ep_size={parallel_config.ep_size}",
+                f"--model.accelerator.fsdp_config.fsdp_mode={parallel_config.fsdp_mode}",
+                f"--model.accelerator.ulysses_size={parallel_config.sp_size}",
+                f"--model.accelerator.ep_size={parallel_config.ep_size}",
             ]
         )
 

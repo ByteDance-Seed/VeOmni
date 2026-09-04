@@ -17,7 +17,7 @@ import os
 import sys
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import ClassVar, Dict, List, Literal, Optional, Tuple
 
 from ..utils import logging
 from ..utils.env import get_env
@@ -46,24 +46,39 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 # ================================ Training Arguments ======================================
 #
 # Hierarchy:
-#   train.*
+#   model.*
+#   ├── ops_implementation.* → OpsImplementationConfig
 #   ├── optimizer.*          → OptimizerConfig
+#   └── accelerator.*        → AcceleratorConfig
+#       ├── fsdp_config.*    → FSDPConfig
+#       |   └── mixed_precision.* → MixedPrecisionConfig
+#       ├── offload_config.* → OffloadConfig
+#       ├── gradient_checkpointing.*  → GradientCheckpointingConfig
+#       └── torch_compile.*  → TorchCompileConfig
+#   train.*
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
 #   ├── channel_loss.*       → ChannelLossConfig
-#   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
-#   ├── torch_compile.*      → TorchCompileConfig
-#   ├── accelerator.*        → AcceleratorConfig
-#   │   ├── fsdp_config.*    → FSDPConfig
-#   │   |   └── mixed_precision.* → MixedPrecisionConfig
-#   │   └── offload_config.* → OffloadConfig
 #   └── checkpoint.*         → CheckpointConfig
+#
+# `accelerator` and `optimizer` sit under `model`, not `train`, because both are
+# per-model decisions: an omni model gives each module its own block, so
+# `model.modules.<name>.accelerator.*` has the same shape as `model.accelerator.*`
+# and the two merge through one code path. What is left under `train.*` is the
+# job-level schedule — batch sizes, steps, logging, checkpointing — which stays
+# singular no matter how many modules the model has.
+#
+# `model.*` is split so an omni module can reuse it without inheriting a
+# single-model loader's baggage:
+#   BaseModelArguments      model fields alone (model_path, config_path, lora_config, ops, …)
+#   └── ModelRuntimeArguments   + accelerator + optimizer — one training unit
+#       └── ModelArguments      + tokenizer/safetensor-index paths
 #
 
 
 @dataclass
 class OptimizerConfig:
-    """train.optimizer.* — Optimizer and learning-rate schedule.
+    """model.optimizer.* — Optimizer and learning-rate schedule.
 
     ``type="muon"`` builds a Muon + AdamW multi-optimizer: 2D hidden weights
     and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases and
@@ -114,6 +129,18 @@ class OptimizerConfig:
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
     )
+    grad_clip_scope: Literal["per_module", "global"] = field(
+        default="per_module",
+        metadata={
+            "help": (
+                "Which parameters max_grad_norm is computed over. 'per_module' clips each "
+                "module against its own norm; 'global' clips every module against one norm "
+                "taken across all of them. A single-model job has one module, so the two "
+                "agree; 'global' only becomes meaningful once an omni model owns several, "
+                "and is not implemented yet."
+            )
+        },
+    )
     betas: Tuple[float, float] = field(
         default=(0.9, 0.95),
         metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
@@ -124,8 +151,8 @@ class OptimizerConfig:
         metadata={
             "help": (
                 "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
-                "If unset: inherits train.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
-                "(default); uses 25x train.optimizer.lr when muon_adjust_lr_fn=original "
+                "If unset: inherits model.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
+                "(default); uses 25x model.optimizer.lr when muon_adjust_lr_fn=original "
                 "(Moonlight-style starting point)."
             )
         },
@@ -220,6 +247,13 @@ class OptimizerConfig:
             )
         },
     )
+
+    def __post_init__(self):
+        if self.grad_clip_scope == "global":
+            raise NotImplementedError(
+                "model.optimizer.grad_clip_scope='global' needs a clip that spans several "
+                "modules, which arrives with the omni module runtime. Use 'per_module'."
+            )
 
 
 @dataclass
@@ -375,7 +409,7 @@ class ChannelLossConfig:
 
 @dataclass
 class GradientCheckpointingConfig:
-    """train.gradient_checkpointing.* — Activation recomputation settings."""
+    """model.accelerator.gradient_checkpointing.* — Activation recomputation settings."""
 
     enable: bool = field(
         default=True,
@@ -403,8 +437,40 @@ class GradientCheckpointingConfig:
 
 
 @dataclass
+class TorchCompileConfig:
+    """model.accelerator.torch_compile.* — Per-block torch.compile options."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
+    )
+    backend: Optional[str] = field(
+        default="inductor",
+        metadata={"help": "Backend passed to torch.compile."},
+    )
+    mode: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Mode passed to torch.compile. Leave as None to use the inductor default. "
+                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
+                "model.accelerator.fsdp_config.reshard_after_forward=False."
+            )
+        },
+    )
+    fullgraph: bool = field(
+        default=True,
+        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
+    )
+    dynamic: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    )
+
+
+@dataclass
 class MixedPrecisionConfig:
-    """train.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
+    """model.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
 
     enable: bool = field(
         default=True,
@@ -439,11 +505,17 @@ class MixedPrecisionConfig:
 
 @dataclass
 class FSDPConfig:
-    """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
+    """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp2"] = field(
+    fsdp_mode: Literal["ddp", "fsdp2", "eager"] = field(
         default="fsdp2",
-        metadata={"help": "Data parallel mode."},
+        metadata={
+            "help": (
+                "Data parallel mode. 'eager' is reserved for a future single-process "
+                "from_pretrained(device_map=...) inference path that skips every wrapper, "
+                "and currently raises."
+            )
+        },
     )
     reshard_after_forward: bool = field(
         default=True,
@@ -461,6 +533,16 @@ class FSDPConfig:
         default=False,
         metadata={"help": "Enable CPU offload for FSDP2."},
     )
+    offload_pin_memory: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Pin the CPU offload buffers, matching torch's CPUOffloadPolicy default. "
+                "Set False to keep offloaded shards pageable, so a large-MoE job is not "
+                "charged non-reclaimable Shmem."
+            )
+        },
+    )
     max_load_broadcast_size: float = field(
         default=20.0,
         metadata={
@@ -470,16 +552,24 @@ class FSDPConfig:
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
     def __post_init__(self):
-        if self.fsdp_mode not in ("ddp", "fsdp2"):
+        if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
-                "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."
+                "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
+                "'ddp', or 'eager'."
+            )
+        if self.fsdp_mode == "eager":
+            # Reserved rather than live: the parallelize path has no unwrapped branch,
+            # so accepting this silently would hand the model to DDP instead.
+            raise NotImplementedError(
+                "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
+                "single-process inference path and is not wired up yet."
             )
 
 
 @dataclass
 class OffloadConfig:
-    """train.accelerator.offload_config.* — Activation offload settings."""
+    """model.accelerator.offload_config.* — Activation offload settings."""
 
     enable_activation: bool = field(
         default=False,
@@ -516,7 +606,8 @@ class OffloadConfig:
         default=4.0,
         metadata={
             "help": (
-                "Maximum GB of free host buffers retained by async activation offload between steps. "
+                "Maximum GB of free host buffers retained by async activation offload between steps, "
+                "counted once for the process rather than per offloaded module. "
                 "In-flight offloads may temporarily use more host memory. Set to 0 to disable reuse."
             )
         },
@@ -544,7 +635,7 @@ class OffloadConfig:
 
 @dataclass
 class AcceleratorConfig:
-    """train.accelerator.* — Parallelism and distributed-training topology."""
+    """model.accelerator.* — Parallelism and distributed-training topology."""
 
     dp_replicate_size: int = field(
         default=-1,
@@ -594,15 +685,114 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
+    init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
+        default="meta",
+        metadata={
+            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU."
+        },
+    )
+    broadcast_model_weights_from_rank0: bool = field(
+        default=True,
+        metadata={
+            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
+        },
+    )
+    ep_sharded_stream_load: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+        },
+    )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     offload_config: OffloadConfig = field(default_factory=OffloadConfig)
+    gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
+    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
     def __post_init__(self):
         # although expert parallel and extra parallel are both provided in the arguments,
-        # the implementation is configuring extra parallelism to include expert parallelism
-        self.extra_parallel_sizes.append(self.ep_size)
-        self.extra_parallel_names.append("ep")
-        self.extra_parallel_placement_innermost.append(self.ep_outside)
+        # the implementation is configuring extra parallelism to include expert parallelism.
+        # Guarded so re-instantiating from a saved config (asdict round-trip) does not
+        # append a second "ep" dimension.
+        if "ep" not in self.extra_parallel_names:
+            self.extra_parallel_sizes.append(self.ep_size)
+            self.extra_parallel_names.append("ep")
+            self.extra_parallel_placement_innermost.append(self.ep_outside)
+
+        # world_size and dp_size are plain attributes rather than fields: an omni model
+        # builds one of these per module, and a field would let asdict() round-trip a
+        # value derived under a different WORLD_SIZE back in as if the user had set it.
+        self.world_size = int(os.getenv("WORLD_SIZE", 1))
+        self._resolve_topology()
+        self._validate_init_device()
+
+    def _resolve_topology(self):
+        # Ahead of the topology arithmetic below, which cannot defend itself: a
+        # cp_size of 0 makes the modulo raise ZeroDivisionError instead of naming
+        # the constraint, and a negative one derives a negative dp_size that then
+        # passes ParallelState's product check, because the two negatives cancel.
+        # Unlike dp_replicate_size / dp_shard_size, where non-positive means
+        # "derive it", cp_size is always an explicit divisor of the world size.
+        if self.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+
+        non_dp_size = self.pp_size * self.ulysses_size * self.cp_size * self.tp_size
+        if self.world_size % non_dp_size != 0:
+            raise ValueError(
+                f"World size should be a multiple of pp_size: {self.pp_size}, "
+                f"ulysses_size: {self.ulysses_size}, cp_size: {self.cp_size}, "
+                f"tp_size: {self.tp_size}."
+            )
+        assert self.tp_size == 1, "Tensor parallel size not supported yet."
+        assert self.pp_size == 1, "Pipeline parallel size not supported yet."
+        if self.cp_size > 1 and self.ulysses_size > 1:
+            raise NotImplementedError(
+                "Context parallelism cannot be combined with Ulysses yet; "
+                f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
+                "Set ulysses_size=1 to use context parallelism."
+            )
+
+        self.dp_size = self.world_size // non_dp_size
+
+        # dp_replicate_size / dp_shard_size stay fields so HSDP is configurable, and
+        # are resolved in place: -1 means "derive me".
+        if self.dp_replicate_size > 0 and self.dp_shard_size > 0:
+            assert self.dp_size == self.dp_replicate_size * self.dp_shard_size, (
+                f"dp_size should be equal to dp_replicate_size: {self.dp_replicate_size} "
+                f"* dp_shard_size: {self.dp_shard_size}."
+            )
+        elif self.dp_replicate_size > 0:
+            if self.dp_size % self.dp_replicate_size != 0:
+                raise ValueError("dp_size should be a multiple of dp_replicate_size.")
+            self.dp_shard_size = self.dp_size // self.dp_replicate_size
+        elif self.dp_shard_size > 0:
+            if self.dp_size % self.dp_shard_size != 0:
+                raise ValueError("dp_size should be a multiple of dp_shard_size.")
+            self.dp_replicate_size = self.dp_size // self.dp_shard_size
+        else:
+            self.dp_replicate_size = 1
+            self.dp_shard_size = self.dp_size
+
+    def _validate_init_device(self):
+        if self.fsdp_config.fsdp_mode == "fsdp2":
+            assert self.init_device == "meta", "Please use model.accelerator.init_device: meta for FSDP2 training"
+        else:
+            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
+            # CPU-resident module, and only rank0 would hold weights anyway. Fail
+            # here so every rank stops at parse time, rather than let rank0 die in
+            # DDP's constructor while the others block in its first collective.
+            assert self.init_device != "cpu", (
+                "model.accelerator.init_device: cpu is not supported with fsdp_mode: ddp. "
+                "Use meta or an accelerator device."
+            )
+
+        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
+        # instead of silently ignoring the flag.
+        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
+            "model.accelerator.ep_sharded_stream_load requires "
+            "model.accelerator.broadcast_model_weights_from_rank0=False "
+            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+        )
 
 
 @dataclass
@@ -665,38 +855,6 @@ class CheckpointConfig:
 
 
 @dataclass
-class TorchCompileConfig:
-    """train.torch_compile.* — Per-block torch.compile options."""
-
-    enable: bool = field(
-        default=False,
-        metadata={"help": "Enable per-block torch.compile for supported FSDP2 text and VLM training."},
-    )
-    backend: Optional[str] = field(
-        default="inductor",
-        metadata={"help": "Backend passed to torch.compile."},
-    )
-    mode: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Mode passed to torch.compile. Leave as None to use the inductor default. "
-                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
-                "train.accelerator.fsdp_config.reshard_after_forward=False."
-            )
-        },
-    )
-    fullgraph: bool = field(
-        default=True,
-        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
-    )
-    dynamic: bool = field(
-        default=False,
-        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
-    )
-
-
-@dataclass
 class TrainingArguments:
     """train.* — Top-level training configuration."""
 
@@ -755,24 +913,6 @@ class TrainingArguments:
             )
         },
     )
-    init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
-        default="meta",
-        metadata={
-            "help": "Device to initialize model weights. 1. `cuda`: Init parameters on GPU. 2. `meta`: Init parameters on meta (required for FSDP2). 3. `npu`: Init parameters on Ascend NPU. 4. `mlu`: Init parameters on Cambricon MLU."
-        },
-    )
-    broadcast_model_weights_from_rank0: bool = field(
-        default=True,
-        metadata={
-            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
-        },
-    )
-    ep_sharded_stream_load: bool = field(
-        default=False,
-        metadata={
-            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
-        },
-    )
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
@@ -826,13 +966,9 @@ class TrainingArguments:
     )
 
     # sub-argument groups
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
-    gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
-    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
-    accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
@@ -846,62 +982,14 @@ class TrainingArguments:
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
 
-        self._validate_accelerator()
-        self._derive_batch_config()
+        self._warn_multi_node()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
 
     # -- validation & derivation helpers (called by __post_init__) -----------------------
 
-    def _validate_accelerator(self):
-        acc = self.accelerator
-
-        # Ahead of the topology arithmetic below, which cannot defend itself: a
-        # cp_size of 0 makes the modulo raise ZeroDivisionError instead of naming
-        # the constraint, and a negative one derives a negative dp_size that then
-        # passes ParallelState's product check, because the two negatives cancel.
-        # Unlike dp_replicate_size / dp_shard_size, where non-positive means
-        # "derive it", cp_size is always an explicit divisor of the world size.
-        if acc.cp_size < 1:
-            raise ValueError(f"cp_size must be a positive integer; got {acc.cp_size}.")
-
-        if self.world_size % (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size) != 0:
-            raise ValueError(
-                f"World size should be a multiple of pp_size: {acc.pp_size}, "
-                f"ulysses_size: {acc.ulysses_size}, cp_size: {acc.cp_size}, "
-                f"tp_size: {acc.tp_size}."
-            )
-        assert acc.tp_size == 1, "Tensor parallel size not supported yet."
-        assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
-        if acc.cp_size > 1 and acc.ulysses_size > 1:
-            raise NotImplementedError(
-                "Context parallelism cannot be combined with Ulysses yet; "
-                f"got cp_size={acc.cp_size} with ulysses_size={acc.ulysses_size}. "
-                "Set ulysses_size=1 to use context parallelism."
-            )
-
-        acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
-
-        # resolve dp_replicate_size / dp_shard_size
-        if acc.dp_replicate_size > 0 and acc.dp_shard_size > 0:
-            assert acc.dp_size == acc.dp_replicate_size * acc.dp_shard_size, (
-                f"dp_size should be equal to dp_replicate_size: {acc.dp_replicate_size} "
-                f"* dp_shard_size: {acc.dp_shard_size}."
-            )
-        elif acc.dp_replicate_size > 0:
-            if acc.dp_size % acc.dp_replicate_size != 0:
-                raise ValueError("dp_size should be a multiple of dp_replicate_size.")
-            acc.dp_shard_size = acc.dp_size // acc.dp_replicate_size
-        elif acc.dp_shard_size > 0:
-            if acc.dp_size % acc.dp_shard_size != 0:
-                raise ValueError("dp_size should be a multiple of dp_shard_size.")
-            acc.dp_replicate_size = acc.dp_size // acc.dp_shard_size
-        else:
-            acc.dp_replicate_size = 1
-            acc.dp_shard_size = acc.dp_size
-
-        # multi-node warning
-        num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
+    def _warn_multi_node(self):
+        num_nodes = self.world_size // int(os.getenv("LOCAL_WORLD_SIZE", 1))
         if num_nodes > 1:
             logger.warning_rank0(
                 f"Detected {num_nodes} nodes. "
@@ -909,28 +997,13 @@ class TrainingArguments:
                 "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
             )
 
-        # init method constraints
-        if acc.fsdp_config.fsdp_mode == "fsdp2":
-            assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
-        else:
-            # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
-            # CPU-resident module, and only rank0 would hold weights anyway. Fail
-            # here so every rank stops at parse time, rather than let rank0 die in
-            # DDP's constructor while the others block in its first collective.
-            assert self.init_device != "cpu", (
-                "init_device: cpu is not supported with fsdp_mode: ddp. Use meta or an accelerator device."
-            )
+    def _derive_batch_config(self, accelerator: AcceleratorConfig):
+        """Derive batch/accumulation sizes from the model's accelerator topology.
 
-        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
-        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
-        # instead of silently ignoring the flag.
-        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
-            "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
-            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
-        )
-
-    def _derive_batch_config(self):
-        acc = self.accelerator
+        Takes the accelerator as an argument rather than reading it off ``self``:
+        it lives on ``model`` now, so only the root config can pair the two.
+        """
+        acc = accelerator
 
         # gradient accumulation steps
         if self.global_batch_size is None:
@@ -1369,30 +1442,27 @@ class OpsImplementationConfig:
 
 
 @dataclass
-class ModelArguments:
-    """model.* — Model architecture, paths, and multimodal encoder/decoder setup."""
+class BaseModelArguments:
+    """Model fields shared by every trainable unit, whole model or single module.
 
-    config_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
-    )
+    Deliberately excludes the tokenizer and index paths: an omni module is
+    addressed by its subfolder inside a composed checkpoint and never carries
+    its own tokenizer, so those belong on :class:`ModelArguments` alone.
+    ``config_path`` is here because every unit has to say where its architecture
+    is defined, even when that is just its own subfolder.
+    """
+
     model_path: Optional[str] = field(
         default=None,
         metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
     )
+    config_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
+    )
     model_config: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config to overwrite foundation model config."},
-    )
-    tokenizer_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
-    )
-    safetensor_idx_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
-        },
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
@@ -1404,38 +1474,104 @@ class ModelArguments:
     )
     ops_implementation: OpsImplementationConfig = field(default_factory=OpsImplementationConfig)
 
+    _fqn_to_index_mapping_cache: ClassVar[Dict[str, Optional[Dict[str, int]]]] = {}
+
+    def __post_init__(self):
+        # Localize here rather than in each owner: every subclass needs a
+        # ``model_path`` that exists on disk before any loader touches it, and a
+        # composed model resolves its module subfolders against this root.
+        self.model_path = _resolve_hdfs_path(self.model_path)
+        self.config_path = _resolve_hdfs_path(self.config_path)
+        if self.config_path is None:
+            self.config_path = self.model_path
+
+    def _safetensor_idx_path(self) -> Optional[str]:
+        """Where to read the HF ``weight_map`` from. Overridden to allow an explicit path."""
+        if self.model_path is None:
+            return None
+        return os.path.join(self.model_path, "model.safetensors.index.json")
+
+    @property
+    def fqn_to_index_mapping(self) -> Optional[Dict[str, int]]:
+        """Raw HF ``weight_map`` from the safetensor index (MoE key renames happen at runtime).
+
+        Resolved lazily and cached per index path: a composed model builds one of
+        these per module and re-instantiates them on every merge, and sibling
+        modules routinely share a checkpoint, so parsing eagerly would re-read the
+        same index file several times per job.
+        """
+        idx_path = self._safetensor_idx_path()
+        if idx_path is None:
+            self._warn_unsharded()
+            return None
+
+        cache = BaseModelArguments._fqn_to_index_mapping_cache
+        if idx_path not in cache:
+            if os.path.exists(idx_path):
+                from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
+
+                cache[idx_path] = parse_fqn_to_index_mapping_from_json(idx_path)
+            else:
+                cache[idx_path] = None
+
+        mapping = cache[idx_path]
+        if mapping is None:
+            self._warn_unsharded()
+        return mapping
+
+    @staticmethod
+    def _warn_unsharded() -> None:
+        logger.warning_once("fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded.")
+
+
+@dataclass
+class ModelRuntimeArguments(BaseModelArguments):
+    """Everything one training unit needs: model fields + its own accelerator and optimizer.
+
+    This is the shape a per-module runtime consumes. An omni model builds one of
+    these per module and merges it over the model-level defaults, which is why
+    the pair is declared here rather than on :class:`ModelArguments`.
+    """
+
+    accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+
+@dataclass
+class ModelArguments(ModelRuntimeArguments):
+    """model.* — One composed model, plus the paths its loaders resolve from."""
+
+    tokenizer_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
+    )
+    safetensor_idx_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Local path/HDFS path to model.safetensors.index.json. "
+            "Defaults to `model_path`/model.safetensors.index.json."
+        },
+    )
+
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
             raise ValueError("`config_path` must be specified when `model_path` is None.")
 
         # Download HDFS-hosted paths to a local cache before resolving defaults so
         # that all downstream loaders (config/tokenizer/safetensors) see local paths.
-        self.model_path = _resolve_hdfs_path(self.model_path)
-        self.config_path = _resolve_hdfs_path(self.config_path)
+        # ``super()`` settles ``config_path``, which the tokenizer then falls back to.
+        super().__post_init__()
         self.tokenizer_path = _resolve_hdfs_path(self.tokenizer_path)
-
-        if self.config_path is None:
-            self.config_path = self.model_path
+        # Resolved once here rather than in ``_safetensor_idx_path()``, which the
+        # ``fqn_to_index_mapping`` property calls on every access.
+        self.safetensor_idx_path = _resolve_hdfs_path(self.safetensor_idx_path)
 
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
 
-        # Auto-resolve safetensor_idx_path from model_path if not specified
-        if self.safetensor_idx_path is None and self.model_path is not None:
-            default_idx_path = os.path.join(self.model_path, "model.safetensors.index.json")
-            if os.path.exists(default_idx_path):
-                self.safetensor_idx_path = default_idx_path
-
-        # Parse raw HF weight_map from safetensor index json (MoE key renames happen at runtime).
-        self.fqn_to_index_mapping = None
-        if self.safetensor_idx_path is not None:
-            from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
-
-            self.fqn_to_index_mapping = parse_fqn_to_index_mapping_from_json(self.safetensor_idx_path)
-        if self.fqn_to_index_mapping is None:
-            logger.warning_rank0(
-                "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
-            )
+    def _safetensor_idx_path(self) -> Optional[str]:
+        """Honour an explicit index path, else fall back to the one under ``model_path``."""
+        return self.safetensor_idx_path or super()._safetensor_idx_path()
 
 
 # ================================ Data Arguments ======================================
@@ -1585,6 +1721,8 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
+        self.train._derive_batch_config(self.model.accelerator)
+
         if self.train.pad_to_length:
             if not self.train.dyn_bsz:
                 logger.warning_rank0(
@@ -1596,20 +1734,21 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
-        if self.train.torch_compile.enable:
+        if self.model.accelerator.torch_compile.enable:
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
-                    "train.torch_compile.enable is not supported by this data pipeline. "
+                    "model.accelerator.torch_compile.enable is not supported by this data pipeline. "
                     "The pipeline must implement pad_to_length for static packed shapes."
                 )
             if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
                 raise ValueError(
-                    "train.torch_compile.enable currently supports packed language-model data types only; "
+                    "model.accelerator.torch_compile.enable currently supports packed language-model data types only; "
                     f"got data.data_type={self.data.data_type!r}."
                 )
             if not self.train.dyn_bsz or not self.train.pad_to_length:
                 raise ValueError(
-                    "train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True. "
+                    "model.accelerator.torch_compile.enable requires train.dyn_bsz=True and "
+                    "train.pad_to_length=True. "
                     "Variable packed lengths trigger recompilation and prevent stable CUDA Graph replay when enabled; "
                     "see https://github.com/ByteDance-Seed/VeOmni/issues/401."
                 )

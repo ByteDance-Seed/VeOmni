@@ -15,7 +15,7 @@ r"""Trainer-driven EP=2 tests for fused MoE-LoRA on Qwen3-MoE.
 
 Two complementary tests, both driving the merged ``MoeLoraTrainer``
 subprocess (the same one ``test_moe_lora_trainer.py`` uses for
-save/load/resume) end-to-end with ``--train.accelerator.ep_size=2``:
+save/load/resume) end-to-end with ``--model.accelerator.ep_size=2``:
 
 1. ``test_ep2_trainer_integration[mode]`` -- asserts that the EP=2 path
    engages the right plumbing (plan-bridges fire, slicing log emits the
@@ -418,7 +418,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         yaml_path,
         ep1_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=1"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=1"],
         nproc=nproc,
     )
     ep1_adapter = _load_adapter(_writer_adapter_path(ep1_dir, save_step=4))
@@ -428,7 +428,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     ep2_stdout = _torchrun_capture(
         yaml_path,
         ep2_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
 
@@ -500,7 +500,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
 # Test 2: EP=2 save + (cross-EP adapter resume parity) + (EP=2 DCP
 # round-trip parity). All four subprocesses driven by the same
 # trainer entry point used in test_moe_lora_trainer.py; only the
-# yamls + ``--train.accelerator.ep_size`` differ.
+# yamls + ``--model.accelerator.ep_size`` differ.
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -578,7 +578,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
        ``_ALIGN_MAX_STEPS`` steps from a freshly-zeroed optimizer.
 
     3. **Adapter resumer (EP=2)**. Same as (2) but with
-       ``--train.accelerator.ep_size=2``. The adapter-load path
+       ``--model.accelerator.ep_size=2``. The adapter-load path
        EP-slices the LoRA on read (Independent) or leaves it
        replicated (Shared). Runs ``_ALIGN_MAX_STEPS`` steps from a
        freshly-zeroed optimizer.
@@ -665,7 +665,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         seeder_yaml,
         seeder_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
     seeder_adapter = _writer_adapter_path(seeder_dir, save_step=_ALIGN_MAX_STEPS)
@@ -700,7 +700,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         adapter_yaml,
         ep1_adapter_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=1"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=1"],
         nproc=nproc,
     )
 
@@ -709,7 +709,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         adapter_yaml,
         ep2_adapter_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
 
@@ -718,7 +718,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     _torchrun_capture(
         dcp_yaml,
         ep2_dcp_dir,
-        extra_overrides=base_overrides + ["--train.accelerator.ep_size=2"],
+        extra_overrides=base_overrides + ["--model.accelerator.ep_size=2"],
         nproc=nproc,
     )
 

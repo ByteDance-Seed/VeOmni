@@ -659,7 +659,7 @@ def load_model_weights_ep_sharded(
                     f"'{bare_name}' (e.g. per-expert -> fused MoE experts). Per-rank slice "
                     f"streaming cannot reconstruct the whole tensor set from a single shard, so "
                     f"this model/checkpoint combination is unsupported. Either save the checkpoint "
-                    f"in the model's fused expert layout, or disable train.ep_sharded_stream_load "
+                    f"in the model's fused expert layout, or disable model.accelerator.ep_sharded_stream_load "
                     f"to use the whole-tensor loader (broadcast or every-rank-read)."
                 )
 

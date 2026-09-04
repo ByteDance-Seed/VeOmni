@@ -237,7 +237,7 @@ deepseek_v4_tilelang_dyn_bsz_test_cases = [
     ),
     pytest.param(
         "dummy_deepseek_v4_dense_packed_text_dataset",
-        ["--train.gradient_checkpointing.enable=False"],
+        ["--model.accelerator.gradient_checkpointing.enable=False"],
         id="packed-4x512-no-gc",
     ),
 ]
@@ -636,9 +636,9 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert cmd_kwargs["extra_args"] == [
-            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
-            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
 
