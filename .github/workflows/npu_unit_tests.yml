@@ -204,7 +204,7 @@ jobs:
         # Numerical gate for NPU fused MoE-LoRA (shared + independent; forward +
         # hidden/A/B grads; EP=1 vs non-EP). Lives with the kernel family.
         run: |
-          uv run --frozen pytest -v -s -x tests/kernels/test_moe_experts_lora.py
+          uv run --frozen pytest -v -s -x tests/kernels/moe_experts_lora/test_moe_experts_lora.py
       - name: Run MoE-LoRA ep_sharded_stream_load (PEFT, EP=2)
         # Exercises the PEFT ep_sharded adapter streaming *and* the NPU
         # fused MoE-LoRA EP kernel (fused_npu): the test auto-selects

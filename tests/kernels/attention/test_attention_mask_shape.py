@@ -27,7 +27,7 @@ from transformers.masking_utils import (
     sliding_window_overlay,
 )
 
-from tests.kernels.attention_cases import flex_visible
+from tests.kernels.attention.attention_cases import flex_visible
 from veomni.kernels._kernels.attention.mask import flex as flex_mask
 from veomni.kernels._kernels.attention.mask import magi as magi_mask
 from veomni.kernels._kernels.attention.mask import sdpa as sdpa_mask

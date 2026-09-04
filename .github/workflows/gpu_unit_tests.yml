@@ -215,7 +215,7 @@ jobs:
           uv run --frozen pytest -s -x tests/lora/test_veomni_lora_moe_native.py
           uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py
-          uv run --frozen pytest -s -x tests/kernels/test_moe_experts_lora.py
+          uv run --frozen pytest -s -x tests/kernels/moe_experts_lora/test_moe_experts_lora.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py

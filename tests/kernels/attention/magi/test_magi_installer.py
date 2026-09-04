@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 INSTALLER = REPO_ROOT / "scripts" / "kernel" / "install_magi_sm90.sh"
 
 

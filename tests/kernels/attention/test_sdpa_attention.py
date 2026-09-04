@@ -22,7 +22,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.kernels.attention_cases import clone_qkv, dense_mask, math_sdpa_reference
+from tests.kernels.attention.attention_cases import clone_qkv, dense_mask, math_sdpa_reference
 from tests.kernels.tol import ATTN_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL, EAGER_ATOL, EAGER_RTOL
 from veomni.kernels._kernels.attention.standard import sdpa as sdpa_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
@@ -136,7 +136,7 @@ def test_sdpa_attention_skip_ulysses_skips_exchange(monkeypatch):
     assert "skip_ulysses" not in captured["kwargs"]
 
 
-@pytest.mark.parametrize("mask_case", ("causal", "full", "bagel_mixed"))
+@pytest.mark.parametrize("mask_case", ("causal", "full", "2d_mask"))
 def test_sdpa_attention_matches_math_reference(mask_case):
     sequence_length = 32
     query_heads, kv_heads, head_dim = 4, 2, 16
@@ -181,7 +181,7 @@ def test_sdpa_attention_matches_math_reference(mask_case):
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA SDPA numerical comparison")
-@pytest.mark.parametrize("mask_case", ("causal", "bagel_mixed"))
+@pytest.mark.parametrize("mask_case", ("causal", "2d_mask"))
 def test_sdpa_attention_matches_math_reference_on_cuda(mask_case):
     device = torch.device(get_device_type())
     dtype = torch.bfloat16

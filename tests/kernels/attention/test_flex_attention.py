@@ -24,7 +24,7 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 
-from tests.kernels.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
+from tests.kernels.attention.attention_cases import clone_qkv, dense_mask, flex_mask, math_sdpa_reference
 from tests.kernels.tol import ATTN_ATOL, ATTN_BF16_GRAD_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_RTOL
 from veomni.kernels._kernels.attention.standard import flex as flex_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
@@ -271,7 +271,7 @@ def test_flex_attention_skip_ulysses_skips_exchange(monkeypatch):
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FlexAttention numerical comparison requires CUDA")
-@pytest.mark.parametrize("mask_case", ("causal", "bagel_mixed"))
+@pytest.mark.parametrize("mask_case", ("causal", "2d_mask"))
 def test_flex_attention_matches_math_sdpa(mask_case):
     device = torch.device(get_device_type())
     dtype = torch.bfloat16

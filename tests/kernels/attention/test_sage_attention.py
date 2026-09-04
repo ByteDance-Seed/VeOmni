@@ -23,7 +23,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.kernels.attention_cases import dense_mask, math_sdpa_reference
+from tests.kernels.attention.attention_cases import dense_mask, math_sdpa_reference
 from tests.kernels.tol import ATTN_ATOL, ATTN_RTOL
 from veomni.kernels._kernels.attention.standard import sage as sage_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type

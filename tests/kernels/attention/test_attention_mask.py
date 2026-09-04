@@ -25,11 +25,11 @@ from transformers import PreTrainedConfig
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from tests.kernels.attention_cases import (
-    bagel_dense_mask,
-    bagel_flex_mask,
-    bagel_magi_mask,
+from tests.kernels.attention.attention_cases import (
+    dense_2d_mask,
+    flex_2d_mask,
     flex_visible,
+    magi_2d_mask,
     materialize_magi_mask,
 )
 from veomni.kernels._kernels.attention.install import _VEOMNI_HF_PATCHES
@@ -261,11 +261,11 @@ def test_magi_mask_rejects_invalid_metadata(overrides, match):
         MagiAttentionMask(**values)
 
 
-def test_bagel_mixed_masks_match_dense_visibility():
+def test_2d_masks_match_dense_visibility():
     sequence_length = 16
     device = torch.device("cpu")
-    dense = bagel_dense_mask(sequence_length, device)
-    magi = bagel_magi_mask(sequence_length, device)
-    flex = bagel_flex_mask(sequence_length, device)
+    dense = dense_2d_mask(sequence_length, device)
+    magi = magi_2d_mask(sequence_length, device)
+    flex = flex_2d_mask(sequence_length, device)
     torch.testing.assert_close(materialize_magi_mask(magi, sequence_length), dense)
     torch.testing.assert_close(flex_visible(flex, sequence_length, sequence_length), dense[0, 0])

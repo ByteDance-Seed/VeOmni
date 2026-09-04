@@ -24,21 +24,21 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from veomni.kernels.mask import MagiAttentionMask
 
 
-_BAGEL_MODES = ("causal", "noise", "full", "causal")
+_2D_MASK_MODES = ("causal", "noise", "full", "causal")
 
 
-def bagel_span_splits(sequence_length: int) -> list[int]:
+def _2d_mask_span_splits(sequence_length: int) -> list[int]:
     if sequence_length % 4 != 0:
-        raise ValueError("bagel mixed visibility requires a sequence length divisible by 4")
+        raise ValueError("2d mask requires a sequence length divisible by 4")
     quarter = sequence_length // 4
     return [quarter, quarter, quarter, sequence_length - 3 * quarter]
 
 
-def bagel_dense_mask(sequence_length: int, device: torch.device | str) -> torch.Tensor:
+def dense_2d_mask(sequence_length: int, device: torch.device | str) -> torch.Tensor:
     visible = torch.zeros((sequence_length, sequence_length), device=device, dtype=torch.bool)
     clean_spans: list[tuple[int, int]] = []
     span_start = 0
-    for length, mode in zip(bagel_span_splits(sequence_length), _BAGEL_MODES, strict=True):
+    for length, mode in zip(_2d_mask_span_splits(sequence_length), _2D_MASK_MODES, strict=True):
         span_end = span_start + length
         for clean_start, clean_end in clean_spans:
             visible[span_start:span_end, clean_start:clean_end] = True
@@ -52,13 +52,13 @@ def bagel_dense_mask(sequence_length: int, device: torch.device | str) -> torch.
     return visible.unsqueeze(0).unsqueeze(0).contiguous()
 
 
-def bagel_magi_mask(sequence_length: int, device: torch.device | str) -> MagiAttentionMask:
+def magi_2d_mask(sequence_length: int, device: torch.device | str) -> MagiAttentionMask:
     q_ranges: list[list[int]] = []
     k_ranges: list[list[int]] = []
     attn_types: list[int] = []
     clean_spans: list[tuple[int, int]] = []
     span_start = 0
-    for length, mode in zip(bagel_span_splits(sequence_length), _BAGEL_MODES, strict=True):
+    for length, mode in zip(_2d_mask_span_splits(sequence_length), _2D_MASK_MODES, strict=True):
         span_end = span_start + length
         for clean_start, clean_end in clean_spans:
             q_ranges.append([span_start, span_end])
@@ -77,7 +77,7 @@ def bagel_magi_mask(sequence_length: int, device: torch.device | str) -> MagiAtt
     )
 
 
-def bagel_flex_mask(sequence_length: int, device: torch.device | str) -> BlockMask:
+def flex_2d_mask(sequence_length: int, device: torch.device | str) -> BlockMask:
     quarter = sequence_length // 4
 
     def mask_mod(batch_idx, head_idx, query_idx, key_idx):
@@ -111,8 +111,8 @@ def dense_mask(mask_case: str, sequence_length: int, device: torch.device | str)
         return torch.ones((1, 1, sequence_length, sequence_length), device=device, dtype=torch.bool).tril_()
     if mask_case == "full":
         return torch.ones((1, 1, sequence_length, sequence_length), device=device, dtype=torch.bool)
-    if mask_case == "bagel_mixed":
-        return bagel_dense_mask(sequence_length, device)
+    if mask_case == "2d_mask":
+        return dense_2d_mask(sequence_length, device)
     raise ValueError(f"unsupported mask case: {mask_case}")
 
 
@@ -128,8 +128,8 @@ def magi_mask(mask_case: str, sequence_length: int, device: torch.device | str) 
             torch.tensor([[0, sequence_length]], device=device),
             torch.tensor([[0, sequence_length]], device=device),
         )
-    if mask_case == "bagel_mixed":
-        return bagel_magi_mask(sequence_length, device)
+    if mask_case == "2d_mask":
+        return magi_2d_mask(sequence_length, device)
     raise ValueError(f"unsupported mask case: {mask_case}")
 
 
@@ -144,8 +144,8 @@ def flex_mask(mask_case: str, sequence_length: int, device: torch.device | str) 
             device=device,
             BLOCK_SIZE=128,
         )
-    if mask_case == "bagel_mixed":
-        return bagel_flex_mask(sequence_length, device)
+    if mask_case == "2d_mask":
+        return flex_2d_mask(sequence_length, device)
     raise ValueError(f"unsupported flex mask case: {mask_case}")
 
 

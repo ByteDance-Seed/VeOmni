@@ -201,7 +201,7 @@ def _build_magi_mask(mask_case: str, sequence_length: int, device: torch.device)
         attn_type_map = torch.tensor([1], device=device, dtype=torch.int32) if mask_case == "causal" else None
         return MagiAttentionMask.from_ranges(ranges, ranges.clone(), attn_type_map)
 
-    if mask_case != "bagel_mixed":
+    if mask_case != "2d_mask":
         raise ValueError(f"Unsupported mask case: {mask_case}")
 
     modes = ("causal", "noise", "full", "causal")
@@ -468,7 +468,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         original_should_apply = magi_backend.should_apply_ulysses
         try:
             dtype = torch.bfloat16
-            for mask_idx, mask_case in enumerate(("causal", "full", "bagel_mixed")):
+            for mask_idx, mask_case in enumerate(("causal", "full", "2d_mask")):
                 group, world_size, device, local_slice, baseline, local, output_gradient = self._build_qkv(
                     sequence_length=128,
                     head_dim=64,

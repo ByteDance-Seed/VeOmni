@@ -23,7 +23,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.kernels.attention_cases import clone_qkv, dense_mask, magi_mask, math_sdpa_reference
+from tests.kernels.attention.attention_cases import clone_qkv, dense_mask, magi_mask, math_sdpa_reference
 from tests.kernels.tol import ATTN_ATOL, ATTN_BF16_GRAD_ATOL, ATTN_GRAD_ATOL, ATTN_GRAD_RTOL, ATTN_LSE_RTOL, ATTN_RTOL
 from veomni.kernels._kernels.attention.standard import magi as magi_backend
 from veomni.kernels._kernels.attention.standard.magi import _kernel as magi_kernel
@@ -258,7 +258,7 @@ def test_magi_attention_rejects_global_ranges_when_ulysses_is_off(monkeypatch):
 
 @pytest.mark.skipif(not _MAGI_FFA_AVAILABLE, reason=_MAGI_FFA_REASON)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("mask_case", ("causal", "full", "bagel_mixed"))
+@pytest.mark.parametrize("mask_case", ("causal", "full", "2d_mask"))
 def test_magi_attention_matches_math_sdpa(monkeypatch, mask_case, dtype):
     device = torch.device(get_device_type())
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
