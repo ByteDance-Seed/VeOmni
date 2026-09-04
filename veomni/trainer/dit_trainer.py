@@ -34,10 +34,8 @@ from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
-from ..models import build_foundation_model
-from ..models.auto import build_config
-from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
-from ..ops import apply_ops_config
+from ..kernels.config import set_kernels_config
+from ..models_kernel import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, build_foundation_model
 from ..utils import helper
 from ..utils.device import (
     get_device_type,
@@ -275,11 +273,11 @@ class DiTTrainer:
     def _build_model(self):
         logger.info_rank0("Build model")
         args: VeOmniDiTArguments = self.base.args
-        # Apply ops config eagerly so the condition model (built below via
+        # Install the kernels config so the condition model (built below via
         # ``model_class._from_config``, not ``build_foundation_model``) sees a
-        # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
-        # below will re-apply the same config — that call is idempotent.
-        apply_ops_config(args.model.ops_implementation)
+        # populated singleton. ``build_foundation_model`` below will re-apply
+        # the same config — that call is idempotent.
+        set_kernels_config(args.model.ops_implementation)
         model_config = args.model.model_config
         dit_config = build_config(args.model.config_path, **model_config)
         self.base.model_config = dit_config
@@ -294,7 +292,7 @@ class DiTTrainer:
                 weights_path=args.model.model_path,
                 torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 init_device=args.train.init_device,
-                ops_implementation=args.model.ops_implementation,
+                kernels_implementation=args.model.ops_implementation,
                 config_kwargs=model_config,
             )
             self.base.model_config = getattr(self.base.model, "config", None)

@@ -62,7 +62,7 @@ from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
-from ..models import build_foundation_model, build_tokenizer
+from ..models_kernel import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
@@ -405,7 +405,7 @@ class BaseTrainer(Stateful, ABC):
             weights_path=self.args.model.model_path,
             torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=self.args.train.init_device,
-            ops_implementation=self.args.model.ops_implementation,
+            kernels_implementation=self.args.model.ops_implementation,
             config_kwargs=self.args.model.model_config,
         )
         self.model_config = self.model.config

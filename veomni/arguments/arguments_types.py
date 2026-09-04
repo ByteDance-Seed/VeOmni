@@ -1417,7 +1417,7 @@ class ModelArguments:
         # Parse raw HF weight_map from safetensor index json (MoE key renames happen at runtime).
         self.fqn_to_index_mapping = None
         if self.safetensor_idx_path is not None:
-            from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
+            from ..models_kernel.checkpoint import parse_fqn_to_index_mapping_from_json
 
             self.fqn_to_index_mapping = parse_fqn_to_index_mapping_from_json(self.safetensor_idx_path)
         if self.fqn_to_index_mapping is None:

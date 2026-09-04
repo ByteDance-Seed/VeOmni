@@ -14,12 +14,10 @@
 
 """DeepSeek-V4 modeling that calls local VeomniKernel handles."""
 
-# TODO: hook this module into the models_kernel registry fill. DeepseekV4Config
-# must replace the upstream class on MODEL_CONFIG_REGISTRY so from_dict keeps
-# dsa_indexer_loss / dsa_indexer_loss_coef. Importing this package is enough
-# once that fill site exists; do not re-export the class from models_kernel.
+from functools import partial
 
-from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .configuration_deepseek_v4 import DeepseekV4Config
 
@@ -27,6 +25,41 @@ from .configuration_deepseek_v4 import DeepseekV4Config
 @MODEL_CONFIG_REGISTRY.register("deepseek_v4")
 def register_deepseek_v4_config():
     return DeepseekV4Config
+
+
+@MODELING_REGISTRY.register("deepseek_v4")
+def register_deepseek_v4_modeling(architecture: str):
+    from .checkpoint_tensor_converter import (
+        convert_deepseek_v4_fqn_to_index_mapping,
+        create_deepseek_v4_checkpoint_tensor_converter,
+    )
+
+    if IS_NPU_AVAILABLE:
+        from .generated import patched_modeling_deepseek_v4_npu as gen
+    else:
+        from .generated import patched_modeling_deepseek_v4_gpu as gen
+
+    DeepseekV4ForCausalLM = gen.DeepseekV4ForCausalLM
+    DeepseekV4Model = gen.DeepseekV4Model
+
+    DeepseekV4ForCausalLM._create_checkpoint_tensor_converter = staticmethod(
+        create_deepseek_v4_checkpoint_tensor_converter
+    )
+    DeepseekV4ForCausalLM._convert_fqn_to_index_mapping = staticmethod(
+        partial(convert_deepseek_v4_fqn_to_index_mapping, target_model_prefix="model.")
+    )
+
+    DeepseekV4Model._create_checkpoint_tensor_converter = staticmethod(create_deepseek_v4_checkpoint_tensor_converter)
+    DeepseekV4Model._convert_fqn_to_index_mapping = staticmethod(
+        partial(convert_deepseek_v4_fqn_to_index_mapping, target_model_prefix="")
+    )
+
+    if "ForCausalLM" in architecture:
+        return DeepseekV4ForCausalLM
+    elif "Model" in architecture:
+        return DeepseekV4Model
+    else:
+        return DeepseekV4ForCausalLM
 
 
 __all__ = ["DeepseekV4Config"]

@@ -25,7 +25,7 @@ from ..data import (
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import use_parallel_state
 from ..distributed.torch_compile import mark_compile_step_begin
-from ..models import build_tokenizer
+from ..models_kernel import build_tokenizer
 from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token, reduce_global_loss_token

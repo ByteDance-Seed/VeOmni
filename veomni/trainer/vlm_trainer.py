@@ -28,7 +28,7 @@ from ..distributed.torch_compile import (
     validate_compile_model,
     validate_compile_runtime,
 )
-from ..models import build_foundation_model, build_processor
+from ..models_kernel import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
 from ..utils.device import get_device_type, synchronize
@@ -161,7 +161,7 @@ class VLMTrainer:
             init_device=args.train.init_device,
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
-            ops_implementation=args.model.ops_implementation,
+            kernels_implementation=args.model.ops_implementation,
             config_kwargs=args.model.model_config,
         )
         self.base.model_config = self.base.model.config

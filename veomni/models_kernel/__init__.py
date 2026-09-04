@@ -19,7 +19,9 @@ live on this package: ``build_foundation_model``, ``get_model_class``, and
 the checkpoint weight I/O functions.
 """
 
+from . import transformers
 from .auto import (
+    build_config,
     build_foundation_model,
     build_processor,
     build_tokenizer,
@@ -46,6 +48,7 @@ __all__ = [
     "MODEL_CONFIG_REGISTRY",
     "MODEL_PROCESSOR_REGISTRY",
     "MODELING_REGISTRY",
+    "build_config",
     "build_foundation_model",
     "build_processor",
     "build_tokenizer",
@@ -58,4 +61,5 @@ __all__ = [
     "rank0_load_and_broadcast_weights",
     "save_model_assets",
     "save_model_weights",
+    "transformers",
 ]
