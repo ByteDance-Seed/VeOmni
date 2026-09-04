@@ -271,12 +271,23 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate
     shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size))
 
 
-def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
-    exec_command = get_checkpoint_test_command(model_name, ep_size, save_hf_weights=True)
+def _run_trainer_save_hf_safetensor(
+    model_name: str,
+    ep_size: int,
+    dp_replicate_size: Optional[int] = None,
+    full_determinism: bool = False,
+):
+    exec_command = get_checkpoint_test_command(
+        model_name,
+        ep_size,
+        save_hf_weights=True,
+        dp_replicate_size=dp_replicate_size,
+        full_determinism=full_determinism,
+    )
     exec_result = subprocess.run(exec_command, shell=True, check=True)
     assert exec_result.returncode == 0
 
-    shutil.rmtree(get_output_dir(model_name, ep_size))
+    shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size))
 
 
 # MoE save/load coverage.
@@ -325,3 +336,14 @@ def test_trainer_saveload_hsdp(ep_size: int):
 def test_trainer_save_hf_safetensor(ep_size: int):
     # only test save hf safetensor on qwen3_moe to save resources
     _run_trainer_save_hf_safetensor("qwen3_moe", ep_size)
+
+
+# HSDP + HF safetensors: exercises the distributed HuggingFaceStorageWriter
+# under dp_replicate > 1 — the exact config that hit the intermittent 1-ULP
+# bf16 mismatch on NPU (see save_safetensor_utils.py / #919). Full determinism
+# keeps replica fp32->bf16 casts bit-exact so the zero-tolerance DCP-vs-HF
+# check is valid; this is the one checkpoint test that needs the flag.
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_trainer_save_hf_safetensor_hsdp(ep_size: int):
+    # only test save hf safetensor on qwen3_moe to save resources
+    _run_trainer_save_hf_safetensor("qwen3_moe", ep_size, dp_replicate_size=2, full_determinism=True)
