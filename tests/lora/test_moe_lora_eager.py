@@ -276,13 +276,35 @@ def test_independent_eager_gate_up_accumulates_with_addmm(monkeypatch):
     assert all(call[3] == wrapper._lora_scale_value for call in calls)
 
 
-def test_gate_up_addmm_matches_nonzero_reference_and_gradients():
+@pytest.mark.parametrize(
+    ("device", "dtype", "rtol", "atol"),
+    [
+        pytest.param("cpu", torch.float64, 1e-12, 1e-12, id="cpu-fp64"),
+        pytest.param(
+            "cuda",
+            torch.float16,
+            2e-3,
+            2e-3,
+            id="cuda-fp16",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
+        ),
+        pytest.param(
+            "cuda",
+            torch.bfloat16,
+            2e-2,
+            2e-2,
+            id="cuda-bf16",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
+        ),
+    ],
+)
+def test_gate_up_addmm_matches_nonzero_reference_and_gradients(device, dtype, rtol, atol):
     """The accumulated form must preserve nonzero LoRA values and gradients."""
     torch.manual_seed(0)
     shapes = ((3, 7), (10, 7), (2, 7), (5, 2), (2, 7), (5, 2))
-    reference_inputs = [torch.randn(shape, dtype=torch.float64, requires_grad=True) for shape in shapes]
+    reference_inputs = [torch.randn(shape, dtype=dtype, device=device, requires_grad=True) for shape in shapes]
     candidate_inputs = [value.detach().clone().requires_grad_() for value in reference_inputs]
-    scale = 1.75
+    scale = 1 / 3
 
     x, weight, a_gate, b_gate, a_up, b_up = reference_inputs
     gate_delta = torch.nn.functional.linear(torch.nn.functional.linear(x, a_gate), b_gate) * scale
@@ -295,11 +317,12 @@ def test_gate_up_addmm_matches_nonzero_reference_and_gradients():
     up = torch.addmm(up, torch.nn.functional.linear(x, a_up), b_up.T, alpha=scale)
     candidate = torch.cat((gate, up), dim=-1)
 
-    reference_grads = torch.autograd.grad(reference.square().sum(), reference_inputs)
-    candidate_grads = torch.autograd.grad(candidate.square().sum(), candidate_inputs)
-    torch.testing.assert_close(candidate, reference, rtol=1e-12, atol=1e-12)
+    output_grad = torch.randn_like(reference)
+    reference_grads = torch.autograd.grad(reference, reference_inputs, output_grad)
+    candidate_grads = torch.autograd.grad(candidate, candidate_inputs, output_grad)
+    torch.testing.assert_close(candidate, reference, rtol=rtol, atol=atol)
     for candidate_grad, reference_grad in zip(candidate_grads, reference_grads, strict=True):
-        torch.testing.assert_close(candidate_grad, reference_grad, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(candidate_grad, reference_grad, rtol=rtol, atol=atol)
 
 
 def test_independent_scale_cache_tracks_loaded_state():
@@ -317,10 +340,12 @@ def test_independent_scale_cache_tracks_loaded_state():
     )
     wrapper = model.get_submodule(sample_fqn)
     state_dict = wrapper.state_dict()
-    state_dict["lora_scaling"] = torch.tensor(1.75)
+    loaded_scaling = torch.tensor(1 / 3, dtype=torch.float64)
+    state_dict["lora_scaling"] = loaded_scaling
     wrapper.load_state_dict(state_dict)
 
-    assert wrapper._lora_scale_value == 1.75
+    assert wrapper._lora_scale_value == wrapper.lora_scaling.item()
+    assert wrapper._lora_scale_value != loaded_scaling.item()
 
 
 def test_independent_scale_cache_load_is_meta_safe():

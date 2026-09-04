@@ -956,7 +956,7 @@ class LoraIndependentExperts(nn.Module):
             error_msgs,
         )
         if loaded_scaling is not None and loaded_scaling.numel() == 1 and not loaded_scaling.is_meta:
-            self._lora_scale_value = loaded_scaling.item()
+            self._lora_scale_value = loaded_scaling.to(dtype=self.lora_scaling.dtype).item()
 
     # ── PEFT-compatible accessors (same surface as LoraSharedExperts) ──────
 
