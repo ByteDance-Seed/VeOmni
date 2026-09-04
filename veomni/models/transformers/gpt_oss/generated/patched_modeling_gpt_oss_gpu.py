@@ -122,7 +122,7 @@ class GptOssExperts(nn.Module):
             raise RuntimeError(
                 "GPT-OSS MoE experts have no implementation bound. "
                 "Set moe_implementation='eager' to use the HuggingFace reference path, "
-                "or set moe_implementation to a supported fused backend such as 'fused_triton' or 'fused_quack'."
+                "or set moe_implementation to a supported fused backend such as 'triton' or 'quack'."
             )
 
         with torch.no_grad():

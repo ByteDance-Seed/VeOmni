@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 
 from ...checkpoint import CheckpointerBase, build_checkpointer
-from ...models import save_model_assets
+from ...models_kernel import save_model_assets
 from ...utils import helper
 from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from .base import Callback, TrainerState

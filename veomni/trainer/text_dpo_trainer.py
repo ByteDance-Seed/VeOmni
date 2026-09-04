@@ -30,7 +30,7 @@ from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
-from ..models import build_foundation_model, build_tokenizer
+from ..models_kernel import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
@@ -195,7 +195,7 @@ class TextDPOTrainer:
             weights_path=args.model.model_path,
             torch_dtype=args.dpo_config.refer_model_precision,
             init_device=args.train.init_device,
-            ops_implementation=args.model.ops_implementation,
+            kernels_implementation=args.model.ops_implementation,
             # The same overrides the policy model is built with. Without this the
             # reference reads only ``config.json`` and the two architectures can
             # diverge on anything set under ``model_config`` -- which is where a

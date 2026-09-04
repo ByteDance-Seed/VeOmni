@@ -27,9 +27,8 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 _REGISTRY_MODULE = "veomni.ops.kernel_registry"
-_NPU_GROUP_GEMM_MODULE = "veomni.ops.kernels.moe.npu_group_gemm"
-_NPU_GROUP_GEMM_KERNEL_MODULE = "veomni.ops.kernels.moe._kernels.kernel.npu_group_gemm"
-_NPU_CLAMPED_SWIGLU_MODULE = "veomni.ops.kernels.moe._kernels.kernel.npu_clamped_swiglu"
+_NPU_GROUP_GEMM_MODULE = "veomni.kernels._kernels.moe_experts.standard.npu"
+_NPU_CLAMPED_SWIGLU_MODULE = "veomni.kernels._kernels.moe_experts.shared.npu_clamped_swiglu"
 
 
 class _RecordingSlot:
@@ -46,39 +45,10 @@ class _RecordingSlot:
 
 @pytest.fixture
 def npu_group_gemm_module(monkeypatch):
-    module_names = (_NPU_GROUP_GEMM_MODULE, _NPU_GROUP_GEMM_KERNEL_MODULE)
-    previous_modules = {name: sys.modules.pop(name, None) for name in module_names}
-    parent_module = sys.modules["veomni.ops.kernels.moe"]
-    missing_parent_attribute = object()
-    previous_parent_attribute = getattr(parent_module, "npu_group_gemm", missing_parent_attribute)
     fake_torch_npu = ModuleType("torch_npu")
-    fake_moe_package = ModuleType("veomni.distributed.moe")
-    fake_moe_package.__path__ = []
-    fake_comm = ModuleType("veomni.distributed.moe.comm")
-    fake_comm.all_to_all = object()
-    fake_moe_utils = ModuleType("veomni.distributed.moe.moe_utils")
-    fake_moe_utils.sort_chunks_by_idxs = object()
-    fake_group_gemm = ModuleType(_NPU_GROUP_GEMM_KERNEL_MODULE)
-    fake_group_gemm.npu_group_gemm = object()
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
-    monkeypatch.setitem(sys.modules, "veomni.distributed.moe", fake_moe_package)
-    monkeypatch.setitem(sys.modules, "veomni.distributed.moe.comm", fake_comm)
-    monkeypatch.setitem(sys.modules, "veomni.distributed.moe.moe_utils", fake_moe_utils)
-    sys.modules[_NPU_GROUP_GEMM_KERNEL_MODULE] = fake_group_gemm
-
-    try:
-        module = importlib.import_module(_NPU_GROUP_GEMM_MODULE)
-        yield module, fake_torch_npu
-    finally:
-        for name in module_names:
-            sys.modules.pop(name, None)
-            if previous_modules[name] is not None:
-                sys.modules[name] = previous_modules[name]
-        if previous_parent_attribute is missing_parent_attribute:
-            if hasattr(parent_module, "npu_group_gemm"):
-                delattr(parent_module, "npu_group_gemm")
-        else:
-            parent_module.npu_group_gemm = previous_parent_attribute
+    module = importlib.import_module(_NPU_GROUP_GEMM_MODULE)
+    yield module, fake_torch_npu
 
 
 def test_deepseek_v4_npu_swiglu_dispatches_by_limit(monkeypatch, npu_group_gemm_module):

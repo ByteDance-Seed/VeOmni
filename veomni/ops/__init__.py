@@ -21,20 +21,18 @@ from ..utils.env import get_env
 
 # Eagerly import kernel packages so that every op registers itself with the
 # registry.  Order does not matter; each ``register_op`` call is idempotent.
-from . import kernels, liger  # noqa: F401  triggers all register_op() calls
+from . import kernels  # noqa: F401  triggers all register_op() calls
 from .config.registry import apply_global_ops
 from .config.singleton import set_ops_config
 from .dispatch import OpSlot
-from .kernels import attention, cross_entropy, load_balancing_loss, moe  # noqa: F401
+from .kernels import cross_entropy, load_balancing_loss  # noqa: F401
 from .kernels.load_balancing_loss import load_balancing_loss_func
-from .kernels.moe import fused_moe_forward
 
 
 if TYPE_CHECKING:
     from ..arguments.arguments_types import OpsImplementationConfig
 
 __all__ = [
-    "fused_moe_forward",
     "OpSlot",
     "load_balancing_loss_func",
 ]
@@ -44,32 +42,15 @@ logger = logging.get_logger(__name__)
 
 def build_ALL_OPS():
     return [
-        ("_fused_moe_forward", moe._fused_moe_forward),
-        ("_flash_attention_forward", attention.flash._flash_attention_forward),
-        ("_flex_attention_forward", attention.flex._flex_attention_forward),
-        ("_magi_attention_forward", attention.magi._magi_attention_forward),
         ("_load_balancing_loss", load_balancing_loss._load_balancing_loss),
     ]
 
 
 def apply_ops_patch():
-    """Import-time ops patch — attention only.
+    """Leftover import-time hook. Attention now installs via ``apply_kernel_patch``."""
+    from ..kernels import apply_kernel_patch
 
-    Registers VeOmni's SP-aware attention variants into the shared
-    ``ALL_ATTENTION_FUNCTIONS`` registry. Loss dispatch (``LOSS_MAPPING``) is
-    deferred to ``apply_ops_config`` so there is a single binding point that
-    consumes ``OpsImplementationConfig``; ``build_foundation_model`` invokes
-    it automatically when callers pass ``ops_implementation=...`` (and
-    installs defaults otherwise).
-    """
-    modeling_backend = get_env("MODELING_BACKEND")
-    if modeling_backend == "hf":
-        logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
-    else:
-        from .kernels.attention import apply_veomni_attention_patch
-
-        apply_veomni_attention_patch()
-        logger.info_rank0("✅ VeOmni attention patches applied.")
+    apply_kernel_patch()
 
 
 def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
@@ -84,10 +65,7 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
     3. Populates the ops-config singleton so per-model ``device_patch.py`` and
        ``OpSlot.bind`` can read the user's selections.
 
-    MoE dispatch is applied in ``build_foundation_model`` (via
-    ``moe_implementation`` ∈ {``eager``, ``fused_triton``, ``fused_quack``,
-    ``fused_npu``}); per-model kernels are applied by each model's
-    ``device_patch.py``.
+    Per-model kernels are applied by each model's ``device_patch.py``.
     """
     set_ops_config(ops_config)
 

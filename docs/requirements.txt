@@ -1,8 +1,8 @@
-# Sphinx build
-sphinx==9.1.0
 
 # Markdown support
 myst-parser==5.1.0
+# Sphinx build
+sphinx==9.1.0
 
 # Default book theme
 sphinx-book-theme==1.4.0

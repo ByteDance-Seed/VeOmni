@@ -15,7 +15,7 @@ model:
     # supported by VeOmni's FlashAttention 4 integration.
     attn_implementation: flash_attention_4
     # GPT-OSS uses interleaved gate/up projections; use its Quack backend.
-    moe_implementation: fused_quack
+    moe_implementation: quack
   # EP=4 fits the BF16 base, gradients, and activations on 4x192 GB, but full
   # AdamW states do not. Train attention adapters while keeping the base local.
   lora_config:

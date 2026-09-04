@@ -1,0 +1,425 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Patch configuration for Qwen3_5Moe NPU VeomniKernel replacements.
+
+Regen command:
+patchgen veomni.models_kernel.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_5_moe/generated --diff
+"""
+
+import torch
+from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.processing_utils import Unpack
+
+from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    qwen3_5_gated_deltanet_get_local_conv1d_weight,
+    qwen3_5_gated_deltanet_init_patched,
+    qwen3_5_model_get_image_features,
+    qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_update_linear_attn_mask,
+    qwen3_5_vision_model_dummy_forward,
+    qwen3_5_vision_model_fast_pos_embed_interpolate,
+    qwen3_5_vision_model_rot_pos_emb,
+)
+from veomni.models_kernel.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_vision,
+    qwen3_5_gated_deltanet_forward_patched,
+    qwen3_5_rmsnorm_forward_patched,
+    qwen3_5_text_model_forward_patched,
+    qwen3_5_vision_model_forward,
+)
+from veomni.models_kernel.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
+    PatchedQwen3_5MoeExperts,
+    Qwen3_5MoeCausalLMOutputWithLogProbs,
+    _Qwen3_5MoeFakeForPosID,
+    collate_multimodal_metadata,
+    get_position_id,
+    mm_token_type_ids_from_input_ids,
+    qwen3_5_moe_attention_forward_patched,
+    qwen3_5_moe_forcausallm_forward_patched,
+    qwen3_5_moe_forcausallm_init_patched,
+    qwen3_5_moe_forconditional_generation_forward_patched,
+    qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
+    qwen3_5_moe_forconditional_generation_get_position_id_func,
+    qwen3_5_moe_forconditional_generation_init_patched,
+    qwen3_5_moe_get_parallel_plan_patched,
+    qwen3_5_moe_model_forward_patched,
+    qwen3_5_moe_model_init_patched,
+    qwen3_5_moe_rmsnorm_init_patched,
+    qwen3_5_moe_sparse_moe_block_forward_patched,
+)
+from veomni.patchgen.patch_spec import PatchConfig
+
+
+config = PatchConfig(
+    source_module="transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+    target_file="patched_modeling_qwen3_5_moe_npu.py",
+    description="Qwen3_5Moe with mojo_opset NPU replacements, fused MoE, and VeOmni SP/fused loss patches",
+)
+
+config.add_import("copy", names=["copy"])
+config.add_import("functools", names=["partial"])
+config.add_import("types", names=["SimpleNamespace"])
+config.add_import("torch.distributed", alias="dist", is_from_import=False)
+config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import("veomni.utils.device", names=["get_device_id"])
+config.add_import(
+    "veomni.distributed.sequence_parallel.ulysses",
+    names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
+)
+# gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
+# (re-exported by the package __init__), not in .ulysses.
+config.add_import(
+    "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
+)
+config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward``
+# (re-used from the GPU config) can return per-token log-probs in the unified
+# MoE output dataclass.
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+)
+config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
+config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import(
+    "veomni.models_kernel.utils.kernel_utils",
+    names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
+)
+config.add_import(
+    "veomni.models_kernel.utils.loss_utils",
+    names=["ForCausalLMLoss"],
+)
+config.drop_import_names(
+    "FusedRMSNormGated",
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
+    "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+)
+config.add_post_import_block(
+    """
+    # NPU has no fla/flash_qla backend registered today; selecting a
+    # non-eager linear-attention impl raises at VeomniKernel construct
+    # time. These None placeholders preserve the upstream HF top-level
+    # `is_fast_path_available = all((causal_conv1d_fn, ...))`.
+    FusedRMSNormGated = None
+    causal_conv1d_fn = None
+    causal_conv1d_update = None
+    chunk_gated_delta_rule = None
+    fused_recurrent_gated_delta_rule = None
+    """
+)
+
+# Dummy definitions for names that exist in the generated file's scope but not here.
+# The patchgen only extracts the function body; these are resolved at codegen time.
+gather_seq_scatter_heads = None
+gather_heads_scatter_seq = None
+gather_outputs = None
+slice_input_tensor = None
+# Mirror the qwen3_5 NPU sentinel: this NPU config reuses
+# qwen3_5_vision_model_forward (Patch.5) but does NOT register the
+# Qwen3_5MoeVisionAttention.forward consumer. False suppresses the host sync
+# and kwarg leak — see qwen3_5_gpu_patch_gen_config.py Patch.5 for rationale.
+config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
+
+
+# Register the multimodal helpers used by the reused get_position_id_func /
+# get_metadata_collate_func / Model.forward bodies. Defined in
+# qwen3_5_moe_gpu_patch_gen_config.py (imported above) and referenced by name
+# in the reused function bodies, so the NPU generated file must emit them.
+# qwen3_5_moe_npu picks helpers à la carte (not wholesale via
+# `config.helpers.extend(gpu_config.helpers)`), so each helper has to be
+# registered explicitly here. `mm_token_type_ids_from_input_ids` in
+# particular is called from `get_position_id` and the Model.forward
+# multimodal-RoPE path — both required since transformers v5.
+config.add_helper(mm_token_type_ids_from_input_ids)
+config.add_helper(get_position_id)
+config.add_helper(collate_multimodal_metadata)
+config.add_helper(_Qwen3_5MoeFakeForPosID)
+
+
+config.override_method(
+    "Qwen3_5MoeRMSNorm.__init__",
+    replacement=qwen3_5_moe_rmsnorm_init_patched,
+    description="Construct a local rms_norm qwen3_5 VeomniKernel",
+)
+config.override_method(
+    "Qwen3_5MoeRMSNorm.forward",
+    replacement=qwen3_5_rmsnorm_forward_patched,
+    description="Always call the local rms_norm qwen3_5 VeomniKernel",
+)
+
+config.replace_function(
+    "apply_rotary_pos_emb",
+    replacement=apply_rotary_pos_emb,
+    description="Always call rope partial VeomniKernel",
+)
+
+config.replace_function(
+    "apply_rotary_pos_emb_vision",
+    replacement=apply_rotary_pos_emb_vision,
+    description="Always call rope_vision full VeomniKernel",
+)
+
+# ── Propagate _moe_implementation from top-level config to text_config ────────
+
+
+config.override_method(
+    "Qwen3_5MoeModel.__init__",
+    replacement=qwen3_5_moe_model_init_patched,
+    description="Propagate _moe_implementation from top-level config to text_config",
+)
+
+
+# ── SparseMoeBlock forward (avoid in-place op on autograd Function output) ────
+
+
+config.override_method(
+    "Qwen3_5MoeSparseMoeBlock.forward",
+    replacement=qwen3_5_moe_sparse_moe_block_forward_patched,
+    description="Avoid in-place += on custom autograd Function output",
+)
+
+
+# ── ViT patches ───────────────────────────────────────────────────────────────
+
+config.override_method(
+    "Qwen3_5MoeModel.get_image_features",
+    replacement=qwen3_5_model_get_image_features,
+    description="Remove unnecessary split operation to maintain contiguous memory layout.",
+)
+
+config.override_method(
+    "Qwen3_5MoeModel.get_placeholder_mask",
+    replacement=qwen3_5_model_get_placeholder_mask,
+    description="Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_model_rot_pos_emb,
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.fast_pos_embed_interpolate",
+    replacement=qwen3_5_vision_model_fast_pos_embed_interpolate,
+    description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.forward",
+    replacement=qwen3_5_vision_model_forward,
+    description="Optimized vision forward with Sequence Parallel (SP) support and padded cu_seqlens. Keep cu_seqlens on CPU to avoid per-layer NPU→CPU sync.",
+)
+
+config.override_method(
+    "Qwen3_5MoeVisionModel.dummy_forward",
+    replacement=qwen3_5_vision_model_dummy_forward,
+    description="Add dummy_forward to prevent FSDP reduce-scatter hang on uneven multimodal batches.",
+)
+
+
+config.override_method(
+    "Qwen3_5MoeModel.forward",
+    replacement=qwen3_5_moe_model_forward_patched,
+    description=(
+        "Optimized multimodal forward supporting Ulysses SP (multimodal scattering), "
+        "FSDP-safe dummy vision processing, position_ids shape alignment, and "
+        "CPU-GPU sync avoidance via pre-computed metadata."
+    ),
+)
+
+
+config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast", Qwen3_5MoeCausalLMOutputWithLogProbs)
+
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_position_id_func",
+    replacement=qwen3_5_moe_forconditional_generation_get_position_id_func,
+    description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
+)
+
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+
+
+# ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
+
+
+config.replace_class(
+    "Qwen3_5MoeExperts",
+    replacement=PatchedQwen3_5MoeExperts,
+    description="Always call moe_experts VeomniKernel on v5 gate_up_proj weights",
+)
+
+
+# ── GatedDeltaNet patches (shared with qwen3_5 via name_map) ─────────────────
+
+_NAME_MAP = {"Qwen3_5": "Qwen3_5Moe"}
+
+config.override_method(
+    "Qwen3_5MoeGatedDeltaNet.__init__",
+    replacement=qwen3_5_gated_deltanet_init_patched,
+    name_map=_NAME_MAP,
+    description="Use device-agnostic get_device_id() for FusedRMSNormGated init",
+)
+
+config.override_method(
+    "Qwen3_5MoeGatedDeltaNet._get_local_conv1d_weight",
+    replacement=qwen3_5_gated_deltanet_get_local_conv1d_weight,
+    name_map=_NAME_MAP,
+    description="Shard depthwise conv1d weights for local heads under Ulysses SP",
+)
+
+config.override_method(
+    "Qwen3_5MoeGatedDeltaNet.forward",
+    replacement=qwen3_5_gated_deltanet_forward_patched,
+    name_map=_NAME_MAP,
+    description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
+)
+
+config.override_method(
+    "Qwen3_5MoeTextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
+)
+
+
+# ── DecoderLayer forward (NPU: plumb precomputed varlen metadata to GDN) ───────
+
+
+@config.override_method(
+    "Qwen3_5MoeDecoderLayer.forward",
+    description="Extract and pass cu_seq_lens_q + precomputed varlen metadata for AscendC GDN kernels in Qwen3_5MoeDecoderLayer.forward",
+)
+def qwen3_5_moe_decoder_layer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    cache_position: torch.LongTensor | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> torch.FloatTensor:
+    residual = hidden_states
+
+    hidden_states = self.input_layernorm(hidden_states)
+
+    # Modification: read varlen metadata from kwargs and enforce it for linear-attention varlen kernels.
+    cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
+    assert cu_seq_lens_q is not None, (
+        "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
+        "and to remove the full Flash Attention CPU-GPU sync."
+    )
+    linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
+    linear_attn_cu_seqlens_list = kwargs.pop("cu_seqlens_list_q", None)
+    linear_attn_chunk_indices = kwargs.pop("chunk_indices_q", None)
+    linear_attn_chunk_indices_list = kwargs.pop("chunk_indices_list_q", None)
+
+    # Token Mixer
+    if self.layer_type == "linear_attention":
+        # Modification: pass linear-attention cu_seqlens + precomputed metadata through to GatedDeltaNet.forward.
+        hidden_states = self.linear_attn(
+            hidden_states=hidden_states,
+            cache_params=past_key_values,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            cu_seq_lens_q=linear_attn_cu_seq_lens_q,
+            cu_seqlens_list=linear_attn_cu_seqlens_list,
+            chunk_indices=linear_attn_chunk_indices,
+            chunk_indices_list=linear_attn_chunk_indices_list,
+        )
+    elif self.layer_type == "full_attention":
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+    hidden_states = residual + hidden_states
+
+    # Fully Connected
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    # For the MoE layers, we need to unpack
+    if isinstance(hidden_states, tuple):
+        hidden_states, _ = hidden_states
+    hidden_states = residual + hidden_states
+    return hidden_states
+
+
+# ── TextModel forward (NPU: reuse dense + MoE output type) ─────────────────────
+
+
+config.override_method(
+    "Qwen3_5MoeTextModel.forward",
+    replacement=qwen3_5_text_model_forward_patched,
+    name_map={"Qwen3_5": "Qwen3_5Moe"},
+    description="Precompute varlen metadata (cu_seqlens_list, chunk_indices, chunk_indices_list) once for all AscendC GDN layers to avoid per-layer tolist overhead",
+)
+
+
+config.override_method(
+    "Qwen3_5MoeForCausalLM.__init__",
+    replacement=qwen3_5_moe_forcausallm_init_patched,
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+)
+config.override_method(
+    "Qwen3_5MoeForCausalLM.forward",
+    replacement=qwen3_5_moe_forcausallm_forward_patched,
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+)
+
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.__init__",
+    replacement=qwen3_5_moe_forconditional_generation_init_patched,
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+)
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.forward",
+    replacement=qwen3_5_moe_forconditional_generation_forward_patched,
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+)
+
+
+# ── Expert parallel plan ─────────────────────────────────────────────────────
+
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_parallel_plan",
+    replacement=qwen3_5_moe_get_parallel_plan_patched,
+    description="Register Qwen3_5Moe expert parallel plan for v5 generated modeling",
+)
+
+config.override_method(
+    "Qwen3_5MoeAttention.forward",
+    replacement=qwen3_5_moe_attention_forward_patched,
+    description="Dispatch attention through the interned VeomniKernel",
+)

@@ -6,7 +6,7 @@ from PIL import Image
 
 from veomni.arguments import InferArguments, parse_args
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.models import build_foundation_model, build_processor
+from veomni.models_kernel import build_foundation_model, build_processor
 from veomni.utils import helper
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_flash_attn_2_available
@@ -43,7 +43,7 @@ def main() -> None:
     helper.set_seed(args.infer.seed)
     helper.enable_third_party_logging()
     model = (
-        build_foundation_model(args.infer.model_path, args.infer.model_path, ops_implementation=_INFERENCE_OPS)
+        build_foundation_model(args.infer.model_path, args.infer.model_path, kernels_implementation=_INFERENCE_OPS)
         .eval()
         .to(get_device_type())
     )

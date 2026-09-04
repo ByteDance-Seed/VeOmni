@@ -30,11 +30,8 @@ from veomni.distributed.sequence_parallel import (
     get_ulysses_sequence_parallel_world_size,
     slice_input_tensor_scale_grad,
 )
-from veomni.distributed.sequence_parallel.async_ulysses_dit import (
-    async_ulysses_output_projection,
-    async_ulysses_qkv_projection,
-)
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
+from veomni.kernels import VeomniKernel
 
 from ....utils import logging
 from .config_wan import WanConfig
@@ -330,7 +327,7 @@ class SelfAttention(nn.Module):
             k = self.norm_k(self.k(x))
             v = self.v(x)
         else:
-            q, k, v = async_ulysses_qkv_projection(
+            q, k, v = VeomniKernel("async_ulysses_qkv", "dit")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,
@@ -353,7 +350,7 @@ class SelfAttention(nn.Module):
         if not self.sp_async:
             x = self.o(x)
         else:
-            x = async_ulysses_output_projection(
+            x = VeomniKernel("async_ulysses_o", "dit")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,

@@ -54,9 +54,6 @@ veomni/
 │   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
 │   │   ├── load_balancing_loss/  eager + triton variants
 │   │   ├── mhc/        TileKernels DeepSeek V4 pre/post/head adapters
-│   │   ├── rms_norm/   Liger/NPU/batch-invariant Triton RMSNorm
-│   │   ├── rotary/     Liger/NPU + DeepSeek V3 deterministic + Wan Triton
-│   │   ├── swiglu_mlp/ Liger SwiGLU MLP
 │   │   └── moe/        Fused MoE kernels + group_gemm sub-kernels
 │   ├── platform/       Platform-specific runtime patches
 │   │   └── npu/        HCCL pre-mul sum patch

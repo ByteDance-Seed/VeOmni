@@ -465,10 +465,10 @@ def test_models_patch_fwd_bwd(
     # ``TrainerTest(hf_model_modes[0])`` with
     # ``ValueError: DeepseekV4ForCausalLM does not support Flash Attention 2``.
     # Keep attention eager, but exercise the clamp-aware fused MoE path on each
-    # backend: DeepSeek-V4 forwards ``swiglu_limit`` into fused_triton/fused_npu.
+    # backend: DeepSeek-V4 forwards ``swiglu_limit`` into triton/npu.
     if case_id == "deepseek_v4":
         hf_model_modes = [ModelMode("hf", "eager")]
-        moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
+        moe_impl = "npu" if get_device_type() == "npu" else "triton"
         veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
 
     # Qwen3.5 compatibility:

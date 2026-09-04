@@ -100,10 +100,7 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor,
     sp_pad_and_slice,
 )
-from veomni.distributed.sequence_parallel.async_ulysses import (
-    async_ulysses_output_projection,
-    async_ulysses_qkv_projection,
-)
+from veomni.kernels import VeomniKernel
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
@@ -196,7 +193,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
     unpadded_seq_len = hidden_states.size(1)
 
-    q, k, v = async_ulysses_qkv_projection(
+    q, k, v = VeomniKernel("async_ulysses_qkv", "standard")(
         hidden_states=hidden_states,
         seq_dimension=1,
         head_dimension=2,
@@ -246,7 +243,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
         **kwargs,
     )
 
-    attn_output = async_ulysses_output_projection(
+    attn_output = VeomniKernel("async_ulysses_o", "standard")(
         hidden_states=attn_output,
         seq_dimension=1,
         head_dimension=2,

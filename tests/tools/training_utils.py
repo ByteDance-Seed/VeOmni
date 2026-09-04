@@ -25,7 +25,7 @@ from .launch_utils import find_free_port
 # specific fields to ``eager`` where the model has no NPU kernel.
 _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "attn_implementation": "flash_attention_2",
-    "moe_implementation": "fused_npu",
+    "moe_implementation": "npu",
     "cross_entropy_loss_implementation": "chunk_loss",
     "rms_norm_implementation": "npu",
     "rotary_pos_emb_implementation": "npu",
@@ -45,7 +45,7 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "deepseek_v4": {
         # DeepSeek-V4 attention, RMSNorm, and partial RoPE remain eager-only on NPU.
         # The generic NPU rotary backend is incompatible with V4's partial layout.
-        # Routed experts keep fused_npu; its clamp-aware activation uses Ascend
+        # Routed experts keep npu; its clamp-aware activation uses Ascend
         # Triton when available and preserves the eager training fallback otherwise.
         "attn_implementation": "eager",
         "rms_norm_implementation": "eager",
@@ -116,11 +116,11 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # configs/text/deepseek_v4.yaml so the fused partial-interleaved Triton
     # kernel is exercised under FSDP2, Ulysses SP and the TileLang paths rather
     # than only by the standalone kernel tests. MoE uses the GPU-default
-    # fused_triton backend, while weighted/unweighted RMSNorm and the
+    # triton backend, while weighted/unweighted RMSNorm and the
     # shared-expert MLP use their default Liger OpSlots.
     "deepseek_v4": {
         "attn_implementation": "eager",
-        "moe_implementation": "fused_triton",
+        "moe_implementation": "triton",
         "rotary_pos_emb_implementation": "triton",
     },
 }

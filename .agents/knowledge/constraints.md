@@ -189,7 +189,7 @@ Core files:
 
 22. **NPU (Ascend) code paths require guards**
     - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
-    - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/` — they must not be imported on GPU-only environments.
+    - NPU kernels live in `veomni/kernels/_kernels/` (RMSNorm is `rms_norm/<variant>/npu.py`, RoPE is `rope/<variant>/npu.py`) plus leftover `veomni/ops/platform/npu/` — they must not be imported on GPU-only environments.
 
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.

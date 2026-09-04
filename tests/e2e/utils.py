@@ -89,7 +89,7 @@ _WAN_BFLOAT16_TRAINING_ARGS = [
 ]
 _GPT_OSS_FA4_QUACK_TRAINING_ARGS = [
     "--model.ops_implementation.attn_implementation=flash_attention_4",
-    "--model.ops_implementation.moe_implementation=fused_quack",
+    "--model.ops_implementation.moe_implementation=quack",
 ]
 
 

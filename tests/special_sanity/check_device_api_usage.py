@@ -34,7 +34,6 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/utils/import_utils.py",
     "veomni/utils/device.py",
-    "veomni/ops/kernels/moe/_kernels/utils/benchmark_utils.py",
     "veomni/utils/helper.py",
     "veomni/distributed/torch_parallelize.py",
     "veomni/models/auto.py",
@@ -42,11 +41,11 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models/module_utils.py",
     "veomni/models/transformers/flux/encode_flux.py",
     "veomni/arguments/arguments_types.py",
-    "veomni/ops/kernels/moe/_kernels/utils/device.py",
     # Magi FA4 is an intrinsically CUDA-only backend. It uses CUDA device
     # contexts and cuda.bindings.runtime for the per-device stack limit, which
     # has no device-agnostic equivalent.
     "veomni/ops/kernels/attention/magi/_fa4_cuda.py",
+    "veomni/kernels/_kernels/attention/standard/magi/",
     # The consolidated Magi contract suite directly mocks the CUDA-only FA4
     # backend and its runtime bindings.
     "tests/ops/test_magi_attention_contract.py",

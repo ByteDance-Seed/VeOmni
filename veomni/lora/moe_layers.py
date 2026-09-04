@@ -114,8 +114,10 @@ still finds and EP-shards the base experts after wrapping, and so the
 EP-aware rank-0 broadcast / per-rank load paths slice the disk-side
 ``[E, ...]`` tensors down to ``[E_local, ...]`` correctly.
 
-A fused-Triton path is bound for both modes in
-``veomni/lora/ops/moe_group_gemm.py`` (non-EP and EP).
+Both wrappers always call ``VeomniKernel("moe_experts_lora", variant, impl)``.
+``variant`` is the wrapper class (``shared`` / ``independent``). ``impl``
+comes from kernels ``moe_implementation`` (``triton`` / ``npu``; everything
+else remaps to ``eager``).
 
 PEFT-format save/load compatibility (PEFT-aligned FQN layout)
 -------------------------------------------------------------
@@ -144,9 +146,9 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 
+from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 
 
@@ -155,6 +157,24 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+_FUSED_MOE_LORA_IMPLS = frozenset({"triton", "npu"})
+
+
+def _resolve_moe_lora_impl() -> str:
+    """Map kernels ``moe_implementation`` onto a registered LoRA impl."""
+    from veomni.kernels.config import get_kernels_config
+
+    cfg = get_kernels_config()
+    impl = "eager" if cfg is None else getattr(cfg, "moe_implementation", "eager")
+    return impl if impl in _FUSED_MOE_LORA_IMPLS else "eager"
+
+
+def _moe_lora_kernel(variant: str):
+    """Intern the ``moe_experts_lora`` handle for ``variant`` and the active impl."""
+    from veomni.kernels import VeomniKernel
+
+    return VeomniKernel("moe_experts_lora", variant, _resolve_moe_lora_impl())
 
 
 # Module FQNs of PEFT-wrapped models gain a ``base_model.model.`` prefix.
@@ -464,10 +484,11 @@ class LoraSharedExperts(nn.Module):
         scaling = lora_alpha / (math.sqrt(r) if use_rslora else r)
         self.register_buffer("lora_scaling", torch.tensor(scaling, dtype=torch.float32))
         # Python-float copy of the scaling factor — used by the fused MoE-LoRA
-        # forward kernel (``veomni.lora.ops.moe_group_gemm``) which takes
-        # the scale as a plain float to avoid a host/device sync inside the
-        # autograd.Function. Kept in lock-step with ``lora_scaling``.
+        # kernel which takes the scale as a plain float to avoid a host/device
+        # sync inside the autograd.Function. Kept in lock-step with
+        # ``lora_scaling``.
         self._lora_scale_value: float = float(scaling)
+        self.veomni_moe_lora = _moe_lora_kernel("shared")
 
         # Freeze base, then unfreeze lora_*. ``_is_lora_param_name``
         # detects the canonical ``lora_A`` / ``lora_B`` segments in the
@@ -580,8 +601,6 @@ class LoraSharedExperts(nn.Module):
         if getattr(self, "_ep_grad_hooks_done", False):
             return
 
-        from ..distributed.parallel_state import get_parallel_state
-
         if not (dist.is_available() and dist.is_initialized()):
             self._ep_grad_hooks_done = True
             return
@@ -649,118 +668,31 @@ class LoraSharedExperts(nn.Module):
         # Must run after FSDP wrapping has converted params to DTensors, hence
         # the lazy install at first forward rather than in ``__init__``.
         self._ensure_ep_grad_sync_hooks()
-        # Fused-kernel path: available when the user opted into a non-eager
-        # ``moe_implementation`` whose patch function bound a LoRA-aware
-        # kernel ('fused_triton' on GPU, 'fused_npu' on NPU; Quack leaves
-        # ``_fused_lora_moe_forward = None`` so we transparently fall back to
-        # eager). The bound kernel handles the EP branch internally (Triton via
-        # ``preprocess`` / ``token_pre_all2all`` / ``EPMergedFc1SharedLoRAGroupGemm``
-        # / ``tokens_post_all2all``; NPU via its all-to-all dispatch/combine) —
-        # no EP gating needed here.
-        from ..distributed.parallel_state import get_parallel_state
-        from . import ops as _lora_ops
 
-        if _lora_ops._fused_lora_moe_forward is not None:
-            return self._fused_forward(_lora_ops._fused_lora_moe_forward, hidden_states, top_k_index, top_k_weights)
-        # Eager fallback. Note: the eager forward indexes ``base.gate_up_proj``
-        # / ``base.down_proj`` by global ``top_k_index``, which only works when
-        # the experts module owns the *full* expert set. Under EP the experts
-        # module is local-sliced and ``top_k_index`` carries global ids, so
-        # eager would index out of range. Surface that as a clear error rather
-        # than letting the indexing fail downstream.
-        if get_parallel_state().ep_enabled:
+        if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraSharedExperts: eager forward does not support expert parallelism (EP). "
-                "Set ops_implementation.moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
+                "Set moe_implementation='triton' (GPU) or 'npu' (NPU) "
                 "to use the EP-aware fused LoRA path, or disable EP."
             )
-        return self._eager_forward(hidden_states, top_k_index, top_k_weights)
 
-    def _fused_forward(
-        self,
-        fused_kernel,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dispatch into the bound fused MoE-LoRA kernel.
-
-        ``fused_kernel`` is the kernel pointer captured by ``forward`` so we
-        don't re-read the module attribute twice (cheap optimisation, also
-        keeps this method side-effect free for testing). Passes both halves
-        of the seed-style gate_up LoRA pair as separate ``(A, B, scale)``
-        triples — the kernel keeps them split end-to-end to avoid the
-        rank-collapse a merged ``[2I, H]`` LoRA would impose.
-        """
-        return fused_kernel(
+        return self.veomni_moe_lora(
+            hidden_states,
+            top_k_weights.to(hidden_states.dtype),
+            top_k_index,
+            self.gate_up_proj.base_layer.weight,
+            self.down_proj.base_layer.weight,
+            self.get_lora_A_weight("gate_proj"),
+            self.get_lora_B_weight("gate_proj"),
+            self.get_lora_A_weight("up_proj"),
+            self.get_lora_B_weight("up_proj"),
+            self.get_lora_A_weight("down_proj"),
+            self.get_lora_B_weight("down_proj"),
             num_experts=self.num_experts,
-            routing_weights=top_k_weights.to(hidden_states.dtype),
-            selected_experts=top_k_index,
-            hidden_states=hidden_states,
-            fc1_1_2_weight=self.gate_up_proj.base_layer.weight,
-            fc2_weight=self.down_proj.base_layer.weight,
-            lora_a_gate=self.get_lora_A_weight("gate_proj"),
-            lora_b_gate=self.get_lora_B_weight("gate_proj"),
-            lora_a_up=self.get_lora_A_weight("up_proj"),
-            lora_b_up=self.get_lora_B_weight("up_proj"),
-            lora_a_down=self.get_lora_A_weight("down_proj"),
-            lora_b_down=self.get_lora_B_weight("down_proj"),
             lora_scale_gate=self._lora_scale_value,
             lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
         )
-
-    def _eager_forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        scale = self.lora_scaling.to(hidden_states.dtype)
-        a_gate = self.get_lora_A_weight("gate_proj")
-        b_gate = self.get_lora_B_weight("gate_proj")
-        a_up = self.get_lora_A_weight("up_proj")
-        b_up = self.get_lora_B_weight("up_proj")
-        a_dn = self.get_lora_A_weight("down_proj")
-        b_dn = self.get_lora_B_weight("down_proj")
-
-        # Pull base weight tensors once (expensive only via FSDP unshard);
-        # downstream loop just indexes per-expert slices on the local tensor.
-        gate_up_w = self.gate_up_proj.base_layer.weight
-        down_w = self.down_proj.base_layer.weight
-
-        # Two independent shared LoRA deltas — gate and up each get their
-        # own rank-r adapter. Both depend only on x ⇒ compute once and slice
-        # per expert below. Cat into a single ``[N, 2I]`` block so the
-        # per-expert add lines up with the merged ``gate_up_proj`` output
-        # before chunk + SiLU (LoRA must enter pre-activation).
-        gate_delta = F.linear(F.linear(hidden_states, a_gate), b_gate) * scale  # [N, I]
-        up_delta = F.linear(F.linear(hidden_states, a_up), b_up) * scale  # [N, I]
-        lora_x_gate_up = torch.cat([gate_delta, up_delta], dim=-1)  # [N, 2I]
-
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-
-            gate_up = F.linear(current_state, gate_up_w[expert_idx]) + lora_x_gate_up[token_idx]
-            gate, up = gate_up.chunk(2, dim=-1)
-            mid = self.act_fn(gate) * up
-
-            # down LoRA depends on the per-expert intermediate, so compute inside the loop.
-            lora_x_down = F.linear(F.linear(mid, a_dn), b_dn) * scale
-            current_hidden_states = F.linear(mid, down_w[expert_idx]) + lora_x_down
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
 
     def extra_repr(self) -> str:
         return f"r={self.r}, alpha={self.lora_alpha}, num_experts={self.num_experts}"
@@ -840,9 +772,8 @@ class LoraIndependentExperts(nn.Module):
         mid_t           = SiLU(gate_aug_e(x_t)) * up_aug_e(x_t)
         out_t           = W_dn_e @ mid_t + B_dn_e @ (A_dn_e @ mid_t) * scale
 
-    The wrapper's ``forward`` dispatches into a fused MoE-LoRA triton
-    kernel (non-EP and EP) when bound, falling back to the eager loop
-    above otherwise.
+    The wrapper's ``forward`` always calls
+    ``VeomniKernel("moe_experts_lora", "independent", impl)``.
     """
 
     def __init__(
@@ -916,10 +847,11 @@ class LoraIndependentExperts(nn.Module):
 
         scaling = lora_alpha / (math.sqrt(r) if use_rslora else r)
         self.register_buffer("lora_scaling", torch.tensor(scaling, dtype=torch.float32))
-        # Python-float copy used by the (Round 2) fused MoE-LoRA kernel which
-        # takes the scale as a plain float to avoid a host/device sync inside
-        # the autograd.Function. Kept in lock-step with ``lora_scaling``.
+        # Python-float copy used by the fused MoE-LoRA kernel which takes
+        # the scale as a plain float to avoid a host/device sync inside the
+        # autograd.Function. Kept in lock-step with ``lora_scaling``.
         self._lora_scale_value: float = float(scaling)
+        self.veomni_moe_lora = _moe_lora_kernel("independent")
 
         # Freeze base, then unfreeze lora_*. ``_is_lora_param_name`` looks
         # at canonical ``lora_A`` / ``lora_B`` segments so it works under
@@ -1011,106 +943,30 @@ class LoraIndependentExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        # Mirrors LoraSharedExperts.forward: prefer the fused branch whenever
-        # the active ``moe_implementation`` bound a Mode 1 LoRA-aware kernel
-        # ('fused_triton' on GPU, 'fused_npu' on NPU; Quack leaves the pointer
-        # as ``None`` so we transparently fall back). The bound kernel handles
-        # the EP branch internally (Triton via ``preprocess`` /
-        # ``token_pre_all2all`` / ``EPMergedFc1IndependentLoRAGroupGemm`` /
-        # ``tokens_post_all2all``; NPU via its all-to-all dispatch/combine).
-        from ..distributed.parallel_state import get_parallel_state
-        from . import ops as _lora_ops
-
-        if _lora_ops._fused_independent_lora_moe_forward is not None:
-            return self._fused_forward(
-                _lora_ops._fused_independent_lora_moe_forward, hidden_states, top_k_index, top_k_weights
-            )
-        if get_parallel_state().ep_enabled:
+        if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
-                "Set ops_implementation.moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
+                "Set moe_implementation='triton' (GPU) or 'npu' (NPU) "
                 "to use the EP-aware fused LoRA path, or disable EP."
             )
-        return self._eager_forward(hidden_states, top_k_index, top_k_weights)
 
-    def _fused_forward(
-        self,
-        fused_kernel,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dispatch into the bound fused independent-LoRA MoE kernel.
-
-        ``fused_kernel`` is the kernel pointer captured by ``forward`` so we
-        don't re-read the module attribute twice (cheap optimisation, also
-        keeps this method side-effect free for testing). Passes both halves
-        of the seed-style gate_up LoRA pair as separate ``(A, B, scale)``
-        triples — the kernel keeps them split end-to-end.
-        """
-        return fused_kernel(
+        return self.veomni_moe_lora(
+            hidden_states,
+            top_k_weights.to(hidden_states.dtype),
+            top_k_index,
+            self.gate_up_proj.base_layer.weight,
+            self.down_proj.base_layer.weight,
+            self.get_lora_A_weight("gate_proj"),
+            self.get_lora_B_weight("gate_proj"),
+            self.get_lora_A_weight("up_proj"),
+            self.get_lora_B_weight("up_proj"),
+            self.get_lora_A_weight("down_proj"),
+            self.get_lora_B_weight("down_proj"),
             num_experts=self.num_experts,
-            routing_weights=top_k_weights.to(hidden_states.dtype),
-            selected_experts=top_k_index,
-            hidden_states=hidden_states,
-            fc1_1_2_weight=self.gate_up_proj.base_layer.weight,
-            fc2_weight=self.down_proj.base_layer.weight,
-            lora_a_gate=self.get_lora_A_weight("gate_proj"),
-            lora_b_gate=self.get_lora_B_weight("gate_proj"),
-            lora_a_up=self.get_lora_A_weight("up_proj"),
-            lora_b_up=self.get_lora_B_weight("up_proj"),
-            lora_a_down=self.get_lora_A_weight("down_proj"),
-            lora_b_down=self.get_lora_B_weight("down_proj"),
             lora_scale_gate=self._lora_scale_value,
             lora_scale_up=self._lora_scale_value,
             lora_scale_down=self._lora_scale_value,
         )
-
-    def _eager_forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        scale = self.lora_scaling.to(hidden_states.dtype)
-        a_gate = self.get_lora_A_weight("gate_proj")  # [E, r, H]
-        b_gate = self.get_lora_B_weight("gate_proj")  # [E, I, r]
-        a_up = self.get_lora_A_weight("up_proj")  # [E, r, H]
-        b_up = self.get_lora_B_weight("up_proj")  # [E, I, r]
-        a_dn = self.get_lora_A_weight("down_proj")  # [E, r, I]
-        b_dn = self.get_lora_B_weight("down_proj")  # [E, H, r]
-
-        gate_up_w = self.gate_up_proj.base_layer.weight
-        down_w = self.down_proj.base_layer.weight
-
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-
-            # Per-expert LoRA on gate and up halves — independent rank-r
-            # adapters, both computed inside the per-expert loop. Cat the
-            # per-half deltas into [n_e, 2I] so the add lines up with the
-            # merged ``gate_up_proj`` output before chunk + SiLU.
-            gate_delta = F.linear(F.linear(current_state, a_gate[expert_idx]), b_gate[expert_idx]) * scale  # [n_e, I]
-            up_delta = F.linear(F.linear(current_state, a_up[expert_idx]), b_up[expert_idx]) * scale  # [n_e, I]
-            gate_up = F.linear(current_state, gate_up_w[expert_idx]) + torch.cat([gate_delta, up_delta], dim=-1)
-            gate, up = gate_up.chunk(2, dim=-1)
-            mid = self.act_fn(gate) * up
-
-            lora_x_down = F.linear(F.linear(mid, a_dn[expert_idx]), b_dn[expert_idx]) * scale
-            current_hidden_states = F.linear(mid, down_w[expert_idx]) + lora_x_down
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
 
     def extra_repr(self) -> str:
         return f"r={self.r}, alpha={self.lora_alpha}, num_experts={self.num_experts}, mode=independent"

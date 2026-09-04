@@ -1,0 +1,1184 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Patch configuration for Qwen2.5-VL transformers>=5.9.0 code generation.
+
+Regen command:
+patchgen veomni.models_kernel.transformers.qwen2_5vl.qwen2_5_vl_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen2_5vl/generated --diff
+
+CausalLM uses ``ForCausalLMLoss``. Vision and sequence-parallel patches stay.
+"""
+
+import copy
+from functools import partial
+from types import SimpleNamespace
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
+from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.modeling_utils import (
+    is_flash_attention_requested,
+)
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLModel,
+    Qwen2_5_VLModelOutputWithPast,
+    apply_multimodal_rotary_pos_emb,
+    apply_rotary_pos_emb_vision,
+)
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs
+
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import (
+    gather_outputs,
+    pad_tensor,
+    slice_input_tensor,
+    sp_pad_and_slice,
+    unpad_tensor,
+)
+from veomni.kernels import VeomniKernel
+from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
+from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.model_outputs import Qwen2_5_VLCausalLMOutputWithLogProbs
+
+
+config = PatchConfig(
+    source_module="transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
+    target_file="patched_modeling_qwen2_5_vl_gpu.py",
+    description="Qwen2.5-VL with VeOmni v5 compatibility (SP + window attention + fused-loss)",
+)
+
+config.add_import("copy", is_from_import=False)
+config.add_import("torch.distributed", alias="dist", is_from_import=False)
+config.add_import("functools", names=["partial"])
+config.add_import("types", names=["SimpleNamespace"])
+# transformers 5.9 dropped ``import torch.nn.functional as F`` from the upstream
+# qwen2_5_vl modeling file; the patched ViT forward still calls ``F.pad`` to
+# build cu_seqlens and pad window indices, so re-add the alias here.
+config.add_import("torch.nn.functional", alias="F", is_from_import=False)
+config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
+config.add_import(
+    "veomni.distributed.sequence_parallel",
+    names=["gather_outputs", "slice_input_tensor", "pad_tensor", "sp_pad_and_slice", "unpad_tensor"],
+)
+config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Surface ``Qwen2_5_VLCausalLMOutputWithLogProbs`` so the patched multimodal
+# ``forward`` can return per-token log-probs / entropy as constructor fields
+# while preserving ``rope_deltas``. Mutating ``output.log_probs`` /
+# ``output.entropy`` after constructing ``Qwen2_5_VLCausalLMOutputWithPast``
+# would bypass ModelOutput pytree flattening, breaking FSDP2's pre-backward
+# unshard hook on ``lm_head`` and triggering ``setStorage … storage of
+# size 0`` in ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen2_5_VLCausalLMOutputWithLogProbs"],
+)
+config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import(
+    "veomni.models_kernel.utils.kernel_utils",
+    names=["attention_kernel", "resolve_kernel_impl"],
+)
+config.add_import(
+    "veomni.models_kernel.utils.loss_utils",
+    names=["ForCausalLMLoss"],
+)
+config.drop_import_names("Qwen2_5_VLCausalLMOutputWithPast")
+
+
+# ================================================================
+# Patch: Qwen2_5_VLVisionAttention.forward
+# 1. accept precomputed max_seqlen from outer forward to avoid
+#    per-layer `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VLVisionAttention.forward",
+    description="Use precomputed max_seqlen passed from outer forward to avoid per-layer CPU-GPU sync",
+)
+def qwen2_5_vl_vision_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    # --- Patch.1 ---
+    max_seqlen: int,
+    # --- Patch.1 ---
+    rotary_pos_emb: torch.Tensor | None = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    seq_length = hidden_states.shape[0]
+    query_states, key_states, value_states = (
+        self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+    )
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
+    query_states = query_states.transpose(0, 1).unsqueeze(0)
+    key_states = key_states.transpose(0, 1).unsqueeze(0)
+    value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+    attention_interface = attention_kernel()
+
+    if is_flash_attention_requested(self.config):
+        # --- Patch.1 ---
+        # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        # --- Patch.1 ---
+        attn_output, _ = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
+            **kwargs,
+        )
+    else:
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
+        attn_outputs = [
+            attention_interface(
+                self,
+                q,
+                k,
+                v,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )[0]
+            for q, k, v in zip(*splits)
+        ]
+        attn_output = torch.cat(attn_outputs, dim=1)
+
+    attn_output = attn_output.reshape(seq_length, -1).contiguous()
+    attn_output = self.proj(attn_output)
+    return attn_output
+
+
+# ================================================================
+# Patch: Qwen2_5_VLVisionBlock.forward
+# 1. thread the precomputed max_seqlen down into the attention call
+#    (paired with the Qwen2_5_VLVisionAttention.forward patch above)
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VLVisionBlock.forward",
+    description="Propagate precomputed max_seqlen to attention to avoid per-layer CPU-GPU sync",
+)
+def qwen2_5_vl_vision_block_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    # --- Patch.1 ---
+    max_seqlen: int,
+    # --- Patch.1 ---
+    rotary_pos_emb: torch.Tensor | None = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    r"""
+    cu_seqlens (`torch.Tensor`):
+        Cumulative sequence lengths for variable-length vision attention.
+    max_seqlen (`int`):
+        Maximum per-image or per-video sequence length in the packed vision batch.
+    rotary_pos_emb (`torch.Tensor`, *optional*):
+        Precomputed rotary position embeddings for vision attention.
+    """
+    hidden_states = hidden_states + self.attn(
+        self.norm1(hidden_states),
+        cu_seqlens=cu_seqlens,
+        # --- Patch.1 ---
+        max_seqlen=max_seqlen,
+        # --- Patch.1 ---
+        rotary_pos_emb=rotary_pos_emb,
+        position_embeddings=position_embeddings,
+        **kwargs,
+    )
+    hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+    return hidden_states
+
+
+# ================================================================
+# Patch: Qwen2_5_VisionTransformerPretrainedModel.forward
+# 1. SP all_gather to get full-seq hidden_states for window attention
+#    (gather_outputs / slice_input_tensor around the
+#    window-index permutation + merger fill-back)
+# 2. SP-pad cu_seqlens / cu_window_seqlens / position embeddings so the
+#    padded tokens participate in a valid attention window
+# 3. precompute max_seqlen / win_max_seqlen here (once) to avoid
+#    per-layer CPU-GPU sync inside Qwen2_5_VLVisionAttention.forward
+# 4. return BaseModelOutputWithPooling (v5 contract: last_hidden_state =
+#    pre-merger tokens, pooler_output = post-merger tokens)
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VisionTransformerPretrainedModel.forward",
+    description="VeOmni SP + window-attention all-to-all + precomputed max_seqlen",
+)
+def qwen2_5_vit_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    grid_thw: torch.Tensor,
+    **kwargs,
+) -> BaseModelOutputWithPooling:
+    # Precomputed ViT metadata — a per-modality sub-dict Model.forward selects
+    # from `multimodal_metadata` and passes as the single `vit_metadata` kwarg.
+    # qwen2.5-VL's window-attention ViT consumes the full set: cu_seqlens,
+    # cu_window_seqlens, window_index (the get_window_index permutation),
+    # max_seqlen, win_max_seqlen — all derived host-side by the collator hook.
+    # All .get() below fall back to None for callers bypassing MainCollator,
+    # in which case the in-forward derivation runs unchanged.
+    # See .agents/knowledge/multimodal_metadata.md.
+    vit_metadata = kwargs.pop("vit_metadata", None) or {}
+    precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
+    precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
+    precomputed_cu_window_seqlens = vit_metadata.get("cu_window_seqlens")
+    precomputed_window_index = vit_metadata.get("window_index")
+    precomputed_max_seqlen = vit_metadata.get("max_seqlen")
+    precomputed_win_max_seqlen = vit_metadata.get("win_max_seqlen")
+    use_precompute = precomputed_cu_seqlens is not None
+
+    hidden_states = self.patch_embed(hidden_states)
+
+    # `grid_thw_list` — host-side list reused for rotary position-id
+    # construction, total_seq_len, and the cu_seqlens fallback below.
+    # Materialise once here so the rotary path shares the same tolist sync.
+    grid_thw_list = precomputed_grid_thw_list
+    if grid_thw_list is None:
+        grid_thw_list = grid_thw.tolist()
+
+    # Build ``position_ids`` host-driven, mirroring upstream's
+    # ``get_vision_position_ids``. Replaces ``self.rot_pos_emb(grid_thw)`` which
+    # in transformers 5.9 is a deprecated shim that (a) emits a per-forward
+    # ``FutureWarning`` and (b) re-runs ``grid_thw.tolist()`` internally.
+    ms = self.spatial_merge_size
+    device = hidden_states.device
+    position_ids_list = []
+    for t, h, w in grid_thw_list:
+        hpos_ids = torch.arange(h, device=device).reshape(h, 1).expand(h, w)
+        hpos_ids = hpos_ids.reshape(h // ms, ms, w // ms, ms).transpose(1, 2).flatten()
+        wpos_ids = torch.arange(w, device=device).reshape(1, w).expand(h, w)
+        wpos_ids = wpos_ids.reshape(h // ms, ms, w // ms, ms).transpose(1, 2).flatten()
+        position_ids_list.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+    rotary_pos_emb = self.rotary_pos_emb(torch.cat(position_ids_list, dim=0))
+
+    if use_precompute:
+        # Collator-precomputed: window_index / cu_seqlens / cu_window_seqlens
+        # are CPU tensors (the latter two already carry any SP-pad tail and
+        # are unique_consecutive'd). Move to device non-blocking — an H2D
+        # copy, not a host-device sync. FA2 needs int32; tracing needs grid's.
+        window_index = precomputed_window_index.to(hidden_states.device, non_blocking=True)
+        cu_seqlens = precomputed_cu_seqlens.to(
+            hidden_states.device,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            non_blocking=True,
+        )
+        cu_window_seqlens = precomputed_cu_window_seqlens.to(
+            hidden_states.device,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            non_blocking=True,
+        )
+    else:
+        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            device=hidden_states.device,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+            dim=0,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+    # `total_seq_len` (pre-SP-pad patch count) — derived host-side from
+    # the `grid_thw_list` materialised above so the SP padding math stays a
+    # Python int and doesn't read `cu_seqlens[-1]` (a 0-D GPU scalar → sync).
+    total_seq_len = sum(t * h * w for t, h, w in grid_thw_list)
+
+    # --- Patch.1 ---
+    sp_padding_size = 0
+    if get_parallel_state().sp_enabled:
+        hidden_states = gather_outputs(hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
+        sp_padding_size = hidden_states.size(0) - total_seq_len
+        if sp_padding_size > 0:
+            hidden_states = unpad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
+    # --- Patch.1 ---
+
+    seq_len, _ = hidden_states.size()
+    hidden_states = hidden_states.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+    hidden_states = hidden_states[window_index, :, :]
+    hidden_states = hidden_states.reshape(seq_len, -1)
+    rotary_pos_emb = rotary_pos_emb.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+    rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+    rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+
+    if get_parallel_state().sp_enabled:
+        if sp_padding_size > 0:
+            # --- Patch.1 ---
+            hidden_states = pad_tensor(hidden_states, dim=0, padding_size=sp_padding_size)
+            # --- Patch.1 ---
+            # --- Patch.2 ---
+            emb = pad_tensor(emb, dim=0, padding_size=sp_padding_size)
+            # Precomputed cu_seqlens / cu_window_seqlens already carry the
+            # SP-pad tail entry; only the fallback path extends them here.
+            if not use_precompute:
+                new_cumsum = cu_seqlens[-1] + sp_padding_size
+                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+                cu_window_seqlens = torch.cat([cu_window_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+            # --- Patch.2 ---
+        # --- Patch.1 ---
+        hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
+        # --- Patch.1 ---
+        # --- Patch.2 ---
+        emb = sp_pad_and_slice(emb, dim=0)
+        # --- Patch.2 ---
+
+    position_embeddings = (emb.cos(), emb.sin())
+
+    # --- Patch.3 ---
+    # Prefer the collator-precomputed max seqlens; fallback to the GPU-side
+    # reduction (`.max().detach().cpu().item()` — one sync each per forward).
+    if use_precompute:
+        win_max_seqlen = precomputed_win_max_seqlen
+        max_seqlen = precomputed_max_seqlen
+    else:
+        win_max_seqlen = (cu_window_seqlens[1:] - cu_window_seqlens[:-1]).max().detach().cpu().item()
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().detach().cpu().item()
+    # --- Patch.3 ---
+
+    for layer_num, blk in enumerate(self.blocks):
+        if layer_num in self.fullatt_block_indexes:
+            cu_seqlens_now = cu_seqlens
+            max_seqlens_now = max_seqlen
+        else:
+            cu_seqlens_now = cu_window_seqlens
+            max_seqlens_now = win_max_seqlen
+
+        hidden_states = blk(
+            hidden_states,
+            cu_seqlens=cu_seqlens_now,
+            # --- Patch.3 ---
+            max_seqlen=max_seqlens_now,
+            # --- Patch.3 ---
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+    merged_hidden_states = self.merger(hidden_states)
+    reverse_indices = torch.argsort(window_index)
+
+    # --- Patch.1 ---
+    if get_parallel_state().sp_enabled:
+        merged_sp_padding = sp_padding_size // self.spatial_merge_unit
+        merged_hidden_states = gather_outputs(merged_hidden_states, gather_dim=0, group=get_parallel_state().sp_group)
+        if merged_sp_padding > 0:
+            merged_hidden_states = unpad_tensor(merged_hidden_states, dim=0, padding_size=merged_sp_padding)
+        merged_hidden_states = merged_hidden_states[reverse_indices, :]
+        if merged_sp_padding > 0:
+            merged_hidden_states = pad_tensor(merged_hidden_states, dim=0, padding_size=merged_sp_padding)
+        merged_hidden_states = slice_input_tensor(merged_hidden_states, dim=0, group=get_parallel_state().sp_group)
+    else:
+        merged_hidden_states = merged_hidden_states[reverse_indices, :]
+    # --- Patch.1 ---
+
+    # --- Patch.4 ---
+    return BaseModelOutputWithPooling(
+        last_hidden_state=hidden_states,
+        pooler_output=merged_hidden_states,
+    )
+    # --- Patch.4 ---
+
+
+# ================================================================
+# Patch: Qwen2_5_VisionTransformerPretrainedModel.dummy_forward (new)
+# 1. add dummy_forward so ranks without pixel_values can still run the
+#    visual encoder under FSDP — otherwise reduce-scatter hangs when
+#    some ranks get None pixel_values while others have real images.
+# 2. SP-aware shape: grid_thw width is scaled by sp_size so the cached
+#    dummy batch stays a clean multiple after sequence slicing.
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VisionTransformerPretrainedModel.dummy_forward",
+    description="Provide dummy vision forward for FSDP path with SP-aware shape",
+)
+def qwen2_5_vit_dummy_forward_patched(self):
+    # Build the `vit_metadata` sub-dict host-side from the Python-int dummy
+    # grid: dummy_forward runs inside Model.forward (FSDP path for ranks with
+    # no real images), so the collator can't precompute it — but the dummy
+    # grid is plain ints here, so the host-side derivation runs sync-free.
+    # The dummy grid is SP-divisible, so there is no sp-pad tail.
+    def _dummy_vit_metadata(t, h, w):
+        return _qwen2_5_vit_metadata(  # noqa: F821 defined via add_helper
+            [[t, h, w]],
+            0,
+            self.window_size,
+            self.spatial_merge_size,
+            self.patch_size,
+        )
+
+    # --- Patch.1 ---
+    if get_parallel_state().sp_enabled:
+        if getattr(self, "_sp_dummy_data", None) is None:
+            # --- Patch.2 ---
+            sp_size = get_parallel_state().sp_size
+            pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
+            grid_thw = torch.tensor([[1, 2 * sp_size, 2]], dtype=torch.int32, device=self.device)
+            # --- Patch.2 ---
+            self._sp_dummy_data = {
+                "hidden_states": pixel_values,
+                "grid_thw": grid_thw,
+                "vit_metadata": _dummy_vit_metadata(1, 2 * sp_size, 2),
+            }
+        outputs = self(**self._sp_dummy_data)
+    else:
+        if getattr(self, "_dummy_data", None) is None:
+            pixel_values = torch.randn((4, 3 * 2 * 14 * 14), dtype=self.dtype, device=self.device)
+            grid_thw = torch.tensor([[1, 2, 2]], dtype=torch.int32, device=self.device)
+            self._dummy_data = {
+                "hidden_states": pixel_values,
+                "grid_thw": grid_thw,
+                "vit_metadata": _dummy_vit_metadata(1, 2, 2),
+            }
+        outputs = self(**self._dummy_data)
+    return outputs
+    # --- Patch.1 ---
+
+
+# ================================================================
+# Patch: Qwen2_5_VLModel.get_placeholder_mask
+# 1. return raw (image_mask, video_mask) bool tensors without the
+#    HF v5 `inputs_embeds` / `*_features` shape-validation branch —
+#    VeOmni needs the masks on the *full* all-gathered input_ids,
+#    which have a different seq-len than the SP-sliced inputs_embeds.
+# Signature keeps the v5 kwargs so any HF-internal caller still works.
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VLModel.get_placeholder_mask",
+    description="Return raw image/video placeholder bool masks for VeOmni SP-aware masked_scatter",
+)
+def qwen2_5_vl_model_get_placeholder_mask_patched(
+    self,
+    input_ids: torch.LongTensor,
+    inputs_embeds: torch.FloatTensor | None = None,
+    image_features: torch.FloatTensor | None = None,
+    video_features: torch.FloatTensor | None = None,
+):
+    # --- Patch.1 ---
+    special_image_mask = input_ids == self.config.image_token_id
+    special_video_mask = input_ids == self.config.video_token_id
+    # --- Patch.1 ---
+    return special_image_mask, special_video_mask
+
+
+# ================================================================
+# Patch: Qwen2_5_VLModel.{get_image_features,get_video_features}
+# Skip the upstream HF ``torch.split(pooler_output, split_sizes)``: the
+# visual tower returns an SP-scattered ``pooler_output`` (each rank holds
+# ``total_tokens / sp_size`` rows), so the split — whose sizes are
+# computed from the *full* grid — fails with
+# ``split_with_sizes expects split_sizes to sum exactly to N``. Returning
+# the raw ``BaseModelOutputWithPooling`` lets the outer forward gather
+# pooler_output along dim 0 before slicing, matching the pattern already
+# used in qwen2_vl (which has the same override).
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VLModel.get_image_features",
+    description="Skip upstream split — outer forward gathers SP-scattered pooler_output before use",
+)
+def qwen2_5_vl_model_get_image_features_patched(
+    self,
+    pixel_values: torch.FloatTensor,
+    image_grid_thw: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | BaseModelOutputWithPooling:
+    r"""
+    pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+        The tensors corresponding to the input images.
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    """
+    pixel_values = pixel_values.type(self.visual.dtype)
+    vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
+    return vision_outputs
+
+
+@config.override_method(
+    "Qwen2_5_VLModel.get_video_features",
+    description="Skip upstream split — outer forward gathers SP-scattered pooler_output before use",
+)
+def qwen2_5_vl_model_get_video_features_patched(
+    self,
+    pixel_values_videos: torch.FloatTensor,
+    video_grid_thw: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | BaseModelOutputWithPooling:
+    r"""
+    pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+        The tensors corresponding to the input videos.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    """
+    pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+    vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, return_dict=True, **kwargs)
+    return vision_outputs
+
+
+# ================================================================
+# Patch: Qwen2_5_VLModel.forward
+# 1. Ulysses SP gather/slice around the visual-embed masked_scatter
+#    (gather_outputs on inputs_embeds + image/video embeds,
+#    slice_input_tensor after fill-back)
+# 2. precomputed image/video masks: use kwargs["image_mask"/"video_mask"]
+#    when provided by the VeOmni data pipeline; otherwise all-gather
+#    input_ids across SP group and recompute masks on the full sequence
+# 3. pop ViT-incompatible flash-attn kwargs (cu_seq_lens_q/k,
+#    max_length_q/k) before calling ViT/visual; restore onto the
+#    language-model kwargs afterwards
+# 4. FSDP dummy_forward branch when pixel_values / pixel_values_videos
+#    are None on this rank — keeps visual params on the FSDP all-reduce
+#    graph via fake_embeds * 0
+# 5. honor precomputed 3D position_ids: (bs, 3, L) -> (3, bs, L)
+# 6. get_{image,video}_features now skip the upstream split (see
+#    overrides above); pooler_output is a single SP-scattered tensor
+#    ready for the SP gather + masked_scatter below.
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VLModel.forward",
+    description="VeOmni SP + precomputed position-id + dummy-forward multimodal patches",
+)
+def qwen2_5_vl_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    output_attentions: bool | None = None,
+    output_hidden_states: bool | None = None,
+    return_dict: bool | None = None,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.FloatTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
+    rope_deltas: torch.LongTensor | None = None,
+    cache_position: torch.LongTensor | None = None,
+    second_per_grid_ts: torch.Tensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | Qwen2_5_VLModelOutputWithPast:
+    r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+        The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+    """
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    if inputs_embeds is None:
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+    # --- Patch.2 ---
+    # Precomputed image/video masks when provided by VeOmni data pipeline,
+    # otherwise all-gather input_ids across SP group to compute them.
+    image_mask = kwargs.pop("image_mask", None)
+    video_mask = kwargs.pop("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+    if video_mask is None and image_mask is None:
+        input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
+        dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
+        image_mask, video_mask = self.get_placeholder_mask(torch.cat(input_ids_list, dim=1))
+    # --- Patch.2 ---
+
+    # --- Patch.3 ---
+    # Pop ViT-incompatible flash-attn kwargs (they belong to the language model only)
+    flash_attn_kwargs = {}
+    for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+        if key in kwargs:
+            flash_attn_kwargs[key] = kwargs.pop(key)
+    # --- Patch.3 ---
+
+    # --- Patch.7 ---
+    # Bundle the per-modality ViT metadata from `multimodal_metadata`
+    # (collator-precomputed; see .agents/knowledge/multimodal_metadata.md)
+    # into one `vit_metadata` sub-dict per `get_*_features` call. The patched
+    # window-attention ViT.forward reads grid_thw_list / cu_seqlens /
+    # cu_window_seqlens / window_index / max_seqlen / win_max_seqlen from it,
+    # with runtime fallback when absent.
+    multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
+    image_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+            "cu_window_seqlens": multimodal_metadata.get("vit_image_cu_window_seqlens"),
+            "window_index": multimodal_metadata.get("vit_image_window_index"),
+            "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+            "win_max_seqlen": multimodal_metadata.get("vit_image_win_max_seqlen"),
+        }
+    }
+    video_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+            "cu_window_seqlens": multimodal_metadata.get("vit_video_cu_window_seqlens"),
+            "window_index": multimodal_metadata.get("vit_video_window_index"),
+            "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+            "win_max_seqlen": multimodal_metadata.get("vit_video_win_max_seqlen"),
+        }
+    }
+    # --- Patch.7 ---
+
+    # --- Patch.1 ---
+    if get_parallel_state().sp_enabled:
+        inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
+    # --- Patch.1 ---
+
+    if pixel_values is not None:
+        # --- Patch.6 ---
+        # VeOmni overrides get_image_features to skip the upstream split,
+        # so pooler_output is a single SP-scattered tensor.
+        image_embeds = self.get_image_features(
+            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
+        ).pooler_output
+        # --- Patch.6 ---
+        # --- Patch.1 ---
+        if get_parallel_state().sp_enabled:
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+        # --- Patch.1 ---
+        # `masked_scatter` consumes exactly `image_mask.sum()` leading rows of
+        # `image_embeds`; image-placeholder positions are in vision-token order
+        # and the collator pads the vision sequence only at the end, so padded
+        # rows are trailing and unused. No `[:n]` slice — drops a host sync.
+        image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.4 ---
+        fake_embeds = self.visual.dummy_forward().pooler_output.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+        # --- Patch.4 ---
+
+    if pixel_values_videos is not None:
+        # --- Patch.6 ---
+        # VeOmni overrides get_video_features to skip the upstream split,
+        # so pooler_output is a single SP-scattered tensor.
+        video_embeds = self.get_video_features(
+            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
+        ).pooler_output
+        # --- Patch.6 ---
+        # --- Patch.1 ---
+        if get_parallel_state().sp_enabled:
+            video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+        # --- Patch.1 ---
+        # As with the image branch: masked_scatter uses exactly
+        # `video_mask.sum()` leading rows — no `[:n]` slice, no host sync.
+        video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+    elif get_parallel_state().fsdp_enabled:
+        # --- Patch.4 ---
+        fake_embeds = self.visual.dummy_forward().pooler_output.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+        # --- Patch.4 ---
+
+    # --- Patch.1 ---
+    if get_parallel_state().sp_enabled:
+        inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
+    # --- Patch.1 ---
+
+    if position_ids is None:
+        # v5 `compute_3d_position_ids` gates M-RoPE on `mm_token_type_ids`
+        # via its `can_compute_mrope` check; without it the multimodal
+        # branch silently falls through and the call returns `None`,
+        # leaving `position_ids=None` for the language model. Derive
+        # `mm_token_type_ids` from `input_ids` here so the M-RoPE branch
+        # actually runs whenever multimodal grids are present.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                input_ids, self.config
+            )
+        position_ids = self.compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+    else:
+        # --- Patch.5 ---
+        if position_ids.dim() == 3 and position_ids.shape[1] == 3:
+            position_ids = position_ids.transpose(0, 1).contiguous()  # bs, 3, l -> 3, bs, l
+        # --- Patch.5 ---
+
+    # --- Patch.3 ---
+    kwargs.update(flash_attn_kwargs)
+    # --- Patch.3 ---
+
+    outputs = self.language_model(
+        input_ids=None,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=True,
+        cache_position=cache_position,
+        **kwargs,
+    )
+
+    output = Qwen2_5_VLModelOutputWithPast(
+        last_hidden_state=outputs.last_hidden_state,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        rope_deltas=self.rope_deltas,
+    )
+    return output if return_dict else output.to_tuple()
+
+
+@config.add_helper
+def mm_token_type_ids_from_input_ids(input_ids, config):
+    # transformers v5 VLMs require `mm_token_type_ids` to compute multimodal
+    # RoPE (M-RoPE): text=0, image=1, video=2 per token. HF's processor emits
+    # it; VeOmni's data pipeline carries modality only via the multimodal
+    # token ids inside `input_ids`, so derive the type ids from those here.
+    # `config` selects the token-id namespace and must match `input_ids`: the
+    # live model config on the `forward` path, the IMAGE/VIDEO_INPUT_INDEX fake
+    # config in the `get_position_id` precompute path. Do not unify the two
+    # call sites onto one config.
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[input_ids == config.image_token_id] = 1
+    mm_token_type_ids[input_ids == config.video_token_id] = 2
+    return mm_token_type_ids
+
+
+@config.add_helper
+def get_position_id(main_func, self, **kwargs):
+    # Module-level function so `partial(...)` is picklable for multiprocessing.
+    # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
+    # `input_ids` when the data pipeline did not pass it explicitly.
+    if kwargs.get("mm_token_type_ids") is None and kwargs.get("input_ids") is not None:
+        kwargs["mm_token_type_ids"] = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+            kwargs["input_ids"], self.config
+        )
+    position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, bs, l)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
+# ================================================================
+# Patch: Qwen2_5_VLForConditionalGeneration.get_position_id_func (new)
+# 1. wrap Qwen2_5_VLModel.get_rope_index so VeOmni's data pipeline can
+#    precompute multimodal position_ids in process_sample (on CPU worker
+#    processes) — get_position_id is defined as a module-level function
+#    so `partial(...)` is picklable for multiprocessing
+# 2. overwrite token ids with VeOmni constants (IMAGE_INPUT_INDEX /
+#    VIDEO_INPUT_INDEX) so input_ids produced by our data pipeline match
+# ================================================================
+# ================================================================
+# Helper: _Qwen2_5_VLFakeForPosID  (emitted into the generated file via
+# add_helper). Picklable fake `self` used by `get_position_id_func`.
+# ================================================================
+@config.add_helper
+class _Qwen2_5_VLFakeForPosID(SimpleNamespace):
+    """Picklable fake `self` used by `get_position_id_func` — must be a
+    module-level class so `get_vision_position_ids` survives the pickle
+    round-trip that happens when this object reaches a dataloader worker
+    via `multiprocessing.spawn`. Assigning a bound method to a plain
+    `SimpleNamespace` instance deadlocks on unpickle (`AttributeError:
+    'types.SimpleNamespace' object has no attribute 'get_vision_position_ids'`)
+    because pickle reduces a bound method to `getattr(self.__self__, name)`
+    and `name` is the very attribute being restored from `__dict__`. As a
+    class attribute, the method is resolved via class lookup and never has
+    to be pickled."""
+
+    def get_vision_position_ids(self, *args, **kwargs):
+        return Qwen2_5_VLModel.get_vision_position_ids(self, *args, **kwargs)
+
+
+@config.override_method(
+    "Qwen2_5_VLForConditionalGeneration.get_position_id_func",
+    description="Use VeOmni precomputed position-id function and unified multimodal token ids",
+)
+def qwen2_5_vl_get_position_id_func_patched(self):
+    # --- Patch.1 ---
+    fake_config = copy.copy(self.config)
+    # --- Patch.2 ---
+    fake_config.image_token_id = IMAGE_INPUT_INDEX
+    fake_config.video_token_id = VIDEO_INPUT_INDEX
+    # --- Patch.2 ---
+    # Use a module-level fake-self class (see `_Qwen2_5_VLFakeForPosID`
+    # above) instead of `SimpleNamespace + bound-method on instance`. The
+    # bound-method form survives single-process callers but deadlocks on
+    # `multiprocessing.spawn`'s pickle round-trip used by the streaming
+    # dataloader workers — see the class's docstring for the full rationale.
+    fake_model = _Qwen2_5_VLFakeForPosID(config=fake_config)  # noqa: F821
+    return partial(get_position_id, Qwen2_5_VLModel.get_rope_index, fake_model)  # noqa: F821
+    # --- Patch.1 ---
+
+
+# ================================================================
+# Patch: Qwen2_5_VLForConditionalGeneration.__init__ + forward
+# Bind ForCausalLMLoss to a local VeomniKernel. Always call
+# self.loss_function when labels are present.
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VLForConditionalGeneration.__init__",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+)
+def qwen2_5_vl_for_conditional_generation_init_patched(self, config):
+    super().__init__(config)
+    self.model = Qwen2_5_VLModel(config)
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen2_5_VLForConditionalGeneration.forward",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+)
+def qwen2_5_vl_for_conditional_generation_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    labels: torch.LongTensor | None = None,
+    use_cache: bool | None = None,
+    output_attentions: bool | None = None,
+    output_hidden_states: bool | None = None,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.FloatTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
+    rope_deltas: torch.LongTensor | None = None,
+    cache_position: torch.LongTensor | None = None,
+    second_per_grid_ts: torch.Tensor | None = None,
+    logits_to_keep: int | torch.Tensor = 0,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | Qwen2_5_VLCausalLMOutputWithLogProbs:
+    r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
+        The rope index difference between sequence length and multimodal rope.
+    second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
+        The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
+    """
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+
+    outputs: Qwen2_5_VLModelOutputWithPast = self.model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        pixel_values_videos=pixel_values_videos,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        second_per_grid_ts=second_per_grid_ts,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=True,
+        cache_position=cache_position,
+        **kwargs,
+    )
+
+    hidden_states = outputs.last_hidden_state
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    hidden_states = hidden_states[:, slice_indices, :]
+
+    # --- Patch.1 ---
+    loss = None
+    logits = None
+    fused_linear_aux = None
+    if labels is not None:
+        loss, logits, fused_linear_aux = self.loss_function(
+            logits=logits,
+            labels=labels,
+            vocab_size=self.config.text_config.vocab_size,
+            hidden_states=hidden_states,
+            weights=self.lm_head.weight,
+            **kwargs,
+        )
+    else:
+        logits = self.lm_head(hidden_states)
+    # --- Patch.1 ---
+
+    return Qwen2_5_VLCausalLMOutputWithLogProbs(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        rope_deltas=outputs.rope_deltas,
+        fused_linear_aux=fused_linear_aux,
+    )
+
+
+@config.add_helper
+def _qwen2_5_vit_metadata(grid_list, sp_padding_size, window_size, spatial_merge_size, patch_size):
+    """Host-side port of the qwen2.5-VL window-attention ViT metadata.
+
+    Returns the per-modality `vit_metadata` sub-dict (grid_thw_list,
+    cu_seqlens, cu_window_seqlens, window_index, max_seqlen, win_max_seqlen)
+    for a list of ``(t, h, w)`` grids. Shared by ``collate_multimodal_metadata``
+    (collator path) and ``dummy_forward`` (FSDP path). Pure CPU — the
+    window-index loop is a line-for-line port of
+    ``Qwen2_5_VisionTransformerPretrainedModel.get_window_index`` (which
+    otherwise runs in the forward and syncs on ``grid_thw.tolist()`` /
+    ``cu_seqlens_tmp.tolist()``). Every value it produces is consumed by the
+    ViT forward without a host-device sync.
+    """
+    spatial_merge_unit = spatial_merge_size * spatial_merge_size
+    vit_merger_window_size = window_size // spatial_merge_size // patch_size
+
+    # Plain varlen cu_seqlens — temporal unroll: each (t, h, w) expands to
+    # ``t`` cu steps of ``h * w``.
+    cu = [0]
+    max_hw = 0
+    for t, h, w in grid_list:
+        hw = h * w
+        max_hw = max(max_hw, hw)
+        for _ in range(t):
+            cu.append(cu[-1] + hw)
+
+    # Window-attention metadata — host-side port of get_window_index.
+    window_index_parts = []
+    cu_window = [0]
+    window_index_id = 0
+    for t, h, w in grid_list:
+        llm_grid_h = h // spatial_merge_size
+        llm_grid_w = w // spatial_merge_size
+        index = torch.arange(t * llm_grid_h * llm_grid_w).reshape(t, llm_grid_h, llm_grid_w)
+        pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
+        pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+        num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
+        num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+        index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
+        index_padded = index_padded.reshape(
+            t, num_windows_h, vit_merger_window_size, num_windows_w, vit_merger_window_size
+        )
+        index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
+            t, num_windows_h * num_windows_w, vit_merger_window_size, vit_merger_window_size
+        )
+        seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+        index_padded = index_padded.reshape(-1)
+        index_new = index_padded[index_padded != -100]
+        window_index_parts.append(index_new + window_index_id)
+        cu_seqlens_tmp = seqlens.cumsum(0) * spatial_merge_unit + cu_window[-1]
+        cu_window.extend(cu_seqlens_tmp.tolist())
+        window_index_id += t * llm_grid_h * llm_grid_w
+    window_index = torch.cat(window_index_parts, dim=0)
+
+    # unique_consecutive drops zero-length window segments (HF parity); the
+    # forward applies it to the device tensor — do it host-side here instead.
+    cu_window = torch.unique_consecutive(torch.tensor(cu_window, dtype=torch.int32, device="cpu")).tolist()
+    win_max = 0
+    for i in range(1, len(cu_window)):
+        win_max = max(win_max, cu_window[i] - cu_window[i - 1])
+
+    # SP-pad tail: the collator zero-pads pixel_values to SP-divisible; those
+    # patches become one synthetic sequence so both the full-attention and
+    # window-attention varlen paths treat them independently. ``pad > 0``
+    # always extends strictly, so no unique_consecutive duplicate is created.
+    # Discarded after the per-rank slice.
+    if sp_padding_size > 0:
+        cu.append(cu[-1] + sp_padding_size)
+        max_hw = max(max_hw, sp_padding_size)
+        cu_window.append(cu_window[-1] + sp_padding_size)
+        win_max = max(win_max, sp_padding_size)
+
+    # device='cpu': this runs in CPU dataloader workers — pin to CPU so a
+    # global torch.set_default_device('cuda') can't misallocate it.
+    return {
+        "grid_thw_list": grid_list,
+        "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
+        "max_seqlen": max_hw,
+        "cu_window_seqlens": torch.tensor(cu_window, dtype=torch.int32, device="cpu"),
+        "win_max_seqlen": win_max,
+        "window_index": window_index,
+    }
+
+
+@config.add_helper
+def collate_multimodal_metadata(batch, sp_pad, window_size, spatial_merge_size, patch_size):
+    """Derive ``multimodal_metadata`` for the Qwen2.5-VL window-attention ViT.
+
+    Module-level so ``get_metadata_collate_func`` can hand it (``partial``-
+    closed over the vision-config dims) to VeOmni's collator as a picklable
+    callable. Runs purely on CPU inside the collator after SP padding — every
+    value it produces is consumed by the ViT forward without a host-device
+    sync.
+
+    ``batch`` is the packed (+ SP-padded) batch dict; ``sp_pad`` maps
+    ``pixel_values`` / ``pixel_values_videos`` to the number of patch rows the
+    SP collator appended. Mutates ``batch`` in place, writing
+    ``batch["multimodal_metadata"]``.
+    """
+    md = {}
+    for modality, grid_key, pad_key in (
+        ("image", "image_grid_thw", "pixel_values"),
+        ("video", "video_grid_thw", "pixel_values_videos"),
+    ):
+        grid = batch.get(grid_key)
+        if grid is None:
+            continue
+        grid_list = grid.tolist() if torch.is_tensor(grid) else grid
+        if not grid_list:
+            continue
+        sub = _qwen2_5_vit_metadata(  # noqa: F821 defined via add_helper
+            grid_list,
+            sp_pad.get(pad_key, 0),
+            window_size,
+            spatial_merge_size,
+            patch_size,
+        )
+        md[f"{modality}_grid_thw_list"] = sub["grid_thw_list"]
+        md[f"vit_{modality}_cu_seqlens"] = sub["cu_seqlens"]
+        md[f"vit_{modality}_max_seqlen"] = sub["max_seqlen"]
+        md[f"vit_{modality}_cu_window_seqlens"] = sub["cu_window_seqlens"]
+        md[f"vit_{modality}_win_max_seqlen"] = sub["win_max_seqlen"]
+        md[f"vit_{modality}_window_index"] = sub["window_index"]
+
+    if md:
+        batch["multimodal_metadata"] = md
+
+
+# ================================================================
+# Patch: Qwen2_5_VLForConditionalGeneration.get_metadata_collate_func (new)
+# Expose the window-attention ViT metadata derivation (cu_seqlens /
+# cu_window_seqlens / window_index / max_seqlen / win_max_seqlen) to VeOmni's
+# collator as a picklable callable, mirroring get_position_id_func. The
+# collator invokes it after SP padding; deriving the metadata CPU-side off the
+# GPU critical path eliminates the host-device syncs the ViT.forward would
+# otherwise pay (grid_thw.tolist(), cu_window tolist(), two .max().cpu()).
+# `partial` binds the vision-config dims, so the returned callable takes only
+# (batch, sp_pad). See .agents/knowledge/multimodal_metadata.md.
+# ================================================================
+@config.override_method(
+    "Qwen2_5_VLForConditionalGeneration.get_metadata_collate_func",
+    description="Expose CPU-side window-attention ViT multimodal-metadata derivation to the VeOmni collator",
+)
+def qwen2_5_vl_get_metadata_collate_func_patched(self):
+    vc = self.config.vision_config
+    # collate_multimodal_metadata is a module-level helper (via add_helper);
+    # partial over plain-int config dims keeps the callable picklable for the
+    # multiprocessing DataLoader workers.
+    return partial(
+        collate_multimodal_metadata,  # noqa: F821 defined via add_helper
+        window_size=vc.window_size,
+        spatial_merge_size=vc.spatial_merge_size,
+        patch_size=vc.patch_size,
+    )
+
+
+@config.override_method(
+    "Qwen2_5_VLAttention.forward",
+    description="Dispatch attention through the interned VeomniKernel",
+)
+def qwen2_5_vl_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    del output_attentions, use_cache
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_multimodal_rotary_pos_emb(
+        query_states, key_states, cos, sin, self.config.rope_parameters["mrope_section"]
+    )
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_output, attn_weights = attention_kernel()(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        position_ids=position_ids,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights

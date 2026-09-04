@@ -212,7 +212,7 @@ deepseek_v4_text_smoke_test_cases = [
         # gather around compressors). Exercise SP=1 vs SP=2 alignment.
         2,
         # The GPU fused-MoE path now preserves DeepSeek-V4's ``swiglu_limit``
-        # clamp, so keep the smoke test on the default fused_triton MoE path.
+        # clamp, so keep the smoke test on the default triton MoE path.
         # EP remains disabled here because the surrounding V4 e2e coverage is
         # an SP alignment smoke test, not an EP alignment test.
         1,
@@ -661,7 +661,7 @@ def test_gpt_oss_parallel_uses_fa4_and_quack():
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
-        assert "--model.ops_implementation.moe_implementation=fused_quack" in cmd
+        assert "--model.ops_implementation.moe_implementation=quack" in cmd
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)

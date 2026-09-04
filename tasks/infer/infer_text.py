@@ -7,7 +7,7 @@ from transformers import AutoTokenizer, TextStreamer
 
 from veomni.arguments import InferArguments, parse_args
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.models import build_foundation_model
+from veomni.models_kernel import build_foundation_model
 from veomni.utils import helper
 from veomni.utils.import_utils import is_flash_attn_2_available
 
@@ -45,7 +45,7 @@ def main() -> None:
     model = build_foundation_model(
         config_path=args.infer.model_path,
         weights_path=args.infer.model_path,
-        ops_implementation=_INFERENCE_OPS,
+        kernels_implementation=_INFERENCE_OPS,
         # A training objective baked into a checkpoint's ``config.json`` would
         # otherwise follow it here: DeepSeek-V4 serialises ``dsa_indexer_loss``,
         # which demands the TileLang DSA stack that ``_INFERENCE_OPS`` has just

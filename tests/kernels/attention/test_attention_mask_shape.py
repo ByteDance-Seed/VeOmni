@@ -1,0 +1,233 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing limitations
+# under the License.
+
+"""Shape mask APIs: ``causal_mask`` / ``sliding_window_mask`` / ``packed_causal_mask``."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from transformers.masking_utils import (
+    ALL_MASK_ATTENTION_FUNCTIONS,
+    and_masks,
+    causal_mask_function,
+    sliding_window_overlay,
+)
+
+from tests.kernels.attention.attention_cases import flex_visible
+from veomni.kernels._kernels.attention.mask import flex as flex_mask
+from veomni.kernels._kernels.attention.mask import magi as magi_mask
+from veomni.kernels._kernels.attention.mask import sdpa as sdpa_mask
+from veomni.kernels.mask import (
+    MagiAttentionMask,
+    causal_mask,
+    flex_attention_mask_builder,
+    magi_attention_mask_builder,
+    packed_causal_mask,
+    sdpa_attention_mask_builder,
+    sliding_window_mask,
+)
+
+
+def test_flash_shapes_are_none():
+    assert causal_mask(8, 8, impl="veomni_flash_attention_2", device="cpu") is None
+    assert causal_mask(8, 8, impl="veomni_sage_attention", device="cpu") is None
+    assert sliding_window_mask(8, 8, impl="flash_attention_2", device="cpu", sliding_window=4) is None
+    assert (
+        packed_causal_mask(8, 8, impl="veomni_flash_attention_3", device="cpu", cu_seqlens=torch.tensor([0, 8]))
+        is None
+    )
+
+
+def test_sage_mask_builder_is_flash_like_for_causal_only():
+    assert causal_mask(8, 8, impl="veomni_sage_attention", device="cpu") is None
+    with pytest.raises(ValueError, match="does not support sliding_window_mask"):
+        sliding_window_mask(8, 8, impl="veomni_sage_attention", device="cpu", sliding_window=4)
+    with pytest.raises(ValueError, match="does not support packed_causal_mask"):
+        packed_causal_mask(8, 8, impl="veomni_sage_attention", device="cpu", cu_seqlens=torch.tensor([0, 8]))
+
+
+@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
+def test_sdpa_causal_aligns_with_hf_builder(impl):
+    built = sdpa_attention_mask_builder(1, 4, 4, device="cpu", allow_is_causal_skip=False)
+    shaped = causal_mask(4, 4, impl=impl, device="cpu")
+    torch.testing.assert_close(shaped, built)
+    torch.testing.assert_close(shaped[0, 0], torch.tril(torch.ones(4, 4, dtype=torch.bool)))
+
+
+def test_eager_causal_is_additive_like_hf():
+    built = ALL_MASK_ATTENTION_FUNCTIONS["eager"](batch_size=1, q_length=4, kv_length=4, device="cpu")
+    shaped = causal_mask(4, 4, impl="eager", device="cpu")
+    torch.testing.assert_close(shaped, built)
+    assert shaped.dtype == torch.float32
+    keep = torch.tril(torch.ones(4, 4, dtype=torch.bool))
+    torch.testing.assert_close(shaped[0, 0][keep], torch.zeros(keep.sum(), dtype=torch.float32))
+    blocked = shaped[0, 0][~keep]
+    torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
+
+
+@pytest.mark.parametrize("impl", ("sdpa", "veomni_sdpa"))
+def test_sdpa_cached_causal_aligns_with_hf_builder(impl):
+    built = sdpa_attention_mask_builder(1, 2, 4, q_offset=2, device="cpu")
+    shaped = causal_mask(2, 4, impl=impl, device="cpu")
+    assert built is not None
+    torch.testing.assert_close(shaped, built)
+    torch.testing.assert_close(shaped[0, 0], torch.ones(2, 4, dtype=torch.bool).tril(diagonal=2))
+
+
+def test_sdpa_sliding_aligns_with_hf_builder():
+    built = sdpa_attention_mask_builder(1, 4, 4, device="cpu", sliding_window=2, allow_is_causal_skip=False)
+    shaped = sliding_window_mask(4, 4, impl="sdpa", device="cpu", sliding_window=2)
+    torch.testing.assert_close(shaped, built)
+    expected = torch.tensor(
+        [
+            [True, False, False, False],
+            [True, True, False, False],
+            [False, True, True, False],
+            [False, False, True, True],
+        ]
+    )
+    torch.testing.assert_close(shaped[0, 0], expected)
+
+
+def test_eager_sliding_is_additive_like_hf():
+    built = ALL_MASK_ATTENTION_FUNCTIONS["eager"](
+        batch_size=1,
+        q_length=4,
+        kv_length=4,
+        device="cpu",
+        mask_function=and_masks(causal_mask_function, sliding_window_overlay(2)),
+    )
+    shaped = sliding_window_mask(4, 4, impl="eager", device="cpu", sliding_window=2)
+    torch.testing.assert_close(shaped, built)
+    assert shaped.dtype == torch.float32
+
+
+def test_eager_packed_with_long_padding_mask_is_additive():
+    cu_seqlens = torch.tensor([0, 2, 4])
+    attention_mask = torch.ones(1, 4, dtype=torch.long)
+    shaped = packed_causal_mask(
+        4,
+        4,
+        impl="eager",
+        device="cpu",
+        cu_seqlens=cu_seqlens,
+        attention_mask=attention_mask,
+        dtype=torch.float32,
+    )
+    assert shaped.dtype == torch.float32
+    keep = torch.zeros(4, 4, dtype=torch.bool)
+    keep[:2, :2] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    keep[2:, 2:] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    torch.testing.assert_close(shaped[0, 0][keep], torch.zeros(keep.sum(), dtype=torch.float32))
+    blocked = shaped[0, 0][~keep]
+    torch.testing.assert_close(blocked, torch.full_like(blocked, torch.finfo(torch.float32).min))
+
+
+def test_sdpa_packed_aligns_with_hf_builder():
+    cu_seqlens = torch.tensor([0, 2, 4])
+    built = sdpa_attention_mask_builder(
+        1,
+        4,
+        4,
+        device="cpu",
+        cu_seqlens=cu_seqlens,
+        allow_is_causal_skip=False,
+    )
+    shaped = packed_causal_mask(4, 4, impl="sdpa", device="cpu", cu_seqlens=cu_seqlens)
+    torch.testing.assert_close(shaped, built)
+    expected = torch.zeros(4, 4, dtype=torch.bool)
+    expected[:2, :2] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    expected[2:, 2:] = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    torch.testing.assert_close(shaped[0, 0], expected)
+
+
+def test_sdpa_packed_cached_aligns_with_hf_builder():
+    built = sdpa_attention_mask_builder(
+        1,
+        2,
+        4,
+        q_offset=2,
+        device="cpu",
+        cu_seqlens=torch.tensor([0, 2]),
+        cu_seqlens_k=torch.tensor([0, 4]),
+    )
+    shaped = packed_causal_mask(
+        2,
+        4,
+        impl="sdpa",
+        device="cpu",
+        cu_seqlens=torch.tensor([0, 2]),
+        cu_seq_lens_k=torch.tensor([0, 4]),
+    )
+    assert built is not None
+    torch.testing.assert_close(shaped, built)
+
+
+@pytest.mark.parametrize("impl", ("flex_attention", "veomni_flex_attention"))
+def test_flex_causal_aligns_with_hf_builder(impl):
+    built = flex_attention_mask_builder(1, 4, 4, device="cpu")
+    shaped = causal_mask(4, 4, impl=impl, device="cpu")
+    torch.testing.assert_close(flex_visible(shaped, 4, 4), flex_visible(built, 4, 4))
+
+
+@pytest.mark.parametrize("impl", ("magi_attention", "veomni_magi_attention"))
+def test_magi_causal_aligns_with_hf_builder(impl):
+    built = magi_attention_mask_builder(1, 4, 4, device="cpu")
+    shaped = causal_mask(4, 4, impl=impl, device="cpu")
+    torch.testing.assert_close(shaped.q_ranges, built.q_ranges)
+    torch.testing.assert_close(shaped.k_ranges, built.k_ranges)
+    torch.testing.assert_close(shaped.attn_type_map, built.attn_type_map)
+
+
+def test_magi_packed_aligns_with_from_cu_seqlens():
+    cu_seqlens = torch.tensor([0, 2, 4])
+    built = MagiAttentionMask.from_cu_seqlens(cu_seqlens)
+    shaped = packed_causal_mask(4, 4, impl="magi_attention", device="cpu", cu_seqlens=cu_seqlens)
+    torch.testing.assert_close(shaped.q_ranges, built.q_ranges)
+    torch.testing.assert_close(shaped.k_ranges, built.k_ranges)
+    torch.testing.assert_close(shaped.attn_type_map, built.attn_type_map)
+
+
+def test_magi_sliding_window_is_unsupported():
+    with pytest.raises(ValueError, match="sliding windows in ranges"):
+        sliding_window_mask(4, 4, impl="magi_attention", device="cpu", sliding_window=2)
+
+
+@pytest.mark.parametrize(
+    ("impl", "module"),
+    (
+        ("flex_attention", flex_mask),
+        ("sdpa", sdpa_mask),
+        ("magi_attention", magi_mask),
+    ),
+)
+def test_causal_mask_forwards_skip_ulysses(monkeypatch, impl, module):
+    state = SimpleNamespace(ulysses_size=2, async_enabled=False)
+    monkeypatch.setattr(module, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
+    monkeypatch.setattr(module, "get_parallel_state", lambda: state)
+    if impl == "magi_attention":
+        expanded = causal_mask(4, 4, impl=impl, device="cpu")
+        skipped = causal_mask(4, 4, impl=impl, device="cpu", skip_ulysses=True)
+        assert expanded.q_ranges.tolist() == [[0, 8]]
+        assert skipped.q_ranges.tolist() == [[0, 4]]
+        return
+    expanded = causal_mask(4, 4, impl=impl, device="cpu", attention_mask=torch.ones(1, 8, dtype=torch.bool))
+    skipped = causal_mask(
+        4, 4, impl=impl, device="cpu", skip_ulysses=True, attention_mask=torch.ones(1, 4, dtype=torch.bool)
+    )
+    assert tuple(expanded.shape[-2:]) == (8, 8)
+    assert tuple(skipped.shape[-2:]) == (4, 4)

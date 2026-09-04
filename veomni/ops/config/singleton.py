@@ -9,39 +9,31 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# See the License for the specific language governing limitations
+# under the License.
 
-"""Global ops implementation config singleton.
+"""Ops-facing aliases for the kernel-impl config singleton.
 
-This module stores the resolved ``OpsImplementationConfig`` so that model
-``device_patch.py`` files and the registry dispatch engine can query per-op
-kernel selections without relying on environment variables.
-
-Typical lifecycle:
-1. ``OpsImplementationConfig.__post_init__`` validates requested backends.
-2. ``set_ops_config(config)`` is called (from trainer or test harness).
-3. Consumers call ``get_ops_config()`` to read the resolved config.
+Storage lives in ``veomni.kernels.config``. These names stay for
+``apply_ops_config`` and unconsumed OpSlot models.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from ...kernels.config import get_kernels_config, set_kernels_config
 
 
 if TYPE_CHECKING:
     from ...arguments.arguments_types import OpsImplementationConfig
 
 
-_ops_config: OpsImplementationConfig | None = None
+def set_ops_config(config: OpsImplementationConfig | None) -> None:
+    """Write the shared kernel-impl config."""
+    set_kernels_config(config)
 
 
-def set_ops_config(config: OpsImplementationConfig) -> None:
-    """Set the global ops implementation config singleton."""
-    global _ops_config
-    _ops_config = config
-
-
-def get_ops_config() -> OpsImplementationConfig | None:
-    """Return the global ops implementation config, or ``None`` if not yet set."""
-    return _ops_config
+def get_ops_config() -> Any:
+    """Read the shared kernel-impl config."""
+    return get_kernels_config()

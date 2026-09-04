@@ -39,8 +39,8 @@ def _deepseek_v4_experts_reference(
 @pytest.mark.parametrize(
     ("device_type", "expected_moe"),
     [
-        (MOE_TRITON_DEVICE_TYPES[0], "fused_triton"),
-        ("npu", "fused_npu"),
+        (MOE_TRITON_DEVICE_TYPES[0], "triton"),
+        ("npu", "npu"),
     ],
 )
 def test_deepseek_v4_test_overrides_follow_active_device(monkeypatch, device_type, expected_moe):

@@ -5,10 +5,7 @@ import torch.utils.checkpoint
 from einops import rearrange
 
 from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.distributed.sequence_parallel.async_ulysses import (
-    async_ulysses_output_projection,
-    async_ulysses_qkv_projection,
-)
+from veomni.kernels import VeomniKernel
 
 from .normalization import get_layernorm
 
@@ -71,25 +68,25 @@ class Attention(nn.Module):
             v = rearrange(v, "B N (h d) -> B N h d", d=self.head_dim).contiguous()
             q, k = self.q_norm(q), self.k_norm(k)
         else:
-            q, k, v = async_ulysses_qkv_projection(
-                hidden_states=x,
+            q, k, v = VeomniKernel("async_ulysses_qkv", "standard")(
+                x,
+                self.q_proj.weight,
+                self.q_proj.bias,
+                self.k_proj.weight,
+                self.k_proj.bias,
+                self.v_proj.weight,
+                self.v_proj.bias,
+                self.q_norm.weight,
+                self.q_norm.bias,
+                self.k_norm.weight,
+                self.k_norm.bias,
                 seq_dimension=1,
                 head_dimension=2,
-                q_weight=self.q_proj.weight,
-                q_bias=self.q_proj.bias,
-                k_weight=self.k_proj.weight,
-                k_bias=self.k_proj.bias,
-                v_weight=self.v_proj.weight,
-                v_bias=self.v_proj.bias,
-                norm_type="layernorm",
-                norm_q_weight=self.q_norm.weight,
-                norm_q_bias=self.q_norm.bias,
-                norm_k_weight=self.k_norm.weight,
-                norm_k_bias=self.k_norm.bias,
-                normalized_shape=self.head_dim,
-                eps=self.q_norm.eps,
                 unpadded_dim_size=unpadded_seq_len,
                 head_dim=self.head_dim,
+                norm_type="layernorm",
+                normalized_shape=self.head_dim,
+                eps=self.q_norm.eps,
             )
 
         if self.rope:
@@ -110,12 +107,12 @@ class Attention(nn.Module):
             x = gather_heads_scatter_seq(x, head_dim=2, seq_dim=1)
             x = self.proj_o(x)
         else:
-            x = async_ulysses_output_projection(
-                hidden_states=x,
+            x = VeomniKernel("async_ulysses_o", "standard")(
+                x,
+                self.proj_o.weight,
+                self.proj_o.bias,
                 seq_dimension=1,
                 head_dimension=2,
-                proj_weight=self.proj_o.weight,
-                proj_bias=self.proj_o.bias,
                 unpadded_dim_size=unpadded_seq_len,
             )
         x = self.proj_drop(x)

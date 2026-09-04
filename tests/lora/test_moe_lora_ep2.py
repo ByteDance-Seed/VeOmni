@@ -21,7 +21,7 @@ save/load/resume) end-to-end with ``--train.accelerator.ep_size=2``:
    engages the right plumbing (plan-bridges fire, slicing log emits the
    right FQNs at the right ratio, DCP consolidates EP shards before HF
    save). These are the integration claims that the kernel-level test
-   (``test_moe_lora_fused.py``) cannot make about the trainer.
+   (``tests/kernels/moe_experts_lora/test_moe_experts_lora.py``) cannot make about the trainer.
 
 2. ``test_moe_lora_ep_save_load_parallel_align[mode]`` -- asserts that
    the **EP=2 save formats** are loadable across configs and that
@@ -116,7 +116,7 @@ __all__ = [
 # (LoraSharedExperts / LoraIndependentExperts raise under ep_enabled if
 # the eager path is selected -- only the fused triton kernel implements
 # the EP dispatch via ``dispatch_to_ep_class``).
-_FUSED_OPS_OVERRIDE = "--model.ops_implementation.moe_implementation=fused_triton"
+_FUSED_OPS_OVERRIDE = "--model.ops_implementation.moe_implementation=triton"
 
 # Two different log lines fire during EP plan application; we grep for
 # both so the assertion catches every Shard(0) target regardless of

@@ -371,20 +371,19 @@ Each MoE-LoRA wrapper dispatches based on `model.ops_implementation.moe_implemen
 
 | `moe_implementation` | non-EP | EP | Notes |
 |---|---|---|---|
-| `fused_triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
-| `fused_npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
+| `triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
+| `npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
 | `eager` | eager loop (reference) | not supported (raises) | Portable reference path. |
 
-The fused GPU path lives in `veomni/lora/ops/moe_group_gemm.py` and reuses the same
-`group_gemm_same_nk` / `group_gemm_same_mn` primitives (from `veomni/ops/kernels/moe/_kernels/`)
-as the non-LoRA MoE forward, so it inherits the same EP `all-to-all` dispatch pipeline. The
-LoRA fused pointers are bound by `veomni.ops.kernels.moe.apply_veomni_fused_moe_patch` via
-`veomni.lora.ops.bind_lora_moe_kernels`.
+The fused GPU path lives in `veomni/kernels/_kernels/moe_experts_lora/` and reuses the same
+`group_gemm_same_nk` / `group_gemm_same_mn` primitives as the non-LoRA MoE forward, so it
+inherits the same EP `all-to-all` dispatch pipeline. Each wrapper constructs
+`VeomniKernel("moe_experts_lora", variant, impl)` from kernels `moe_implementation`.
 
 ### 5.4 Expert Parallelism (EP)
 
-Both `fused_triton` and `fused_npu` support the EP path; `fused_npu` uses the
-Ascend GroupGEMM implementation in `veomni/lora/ops/npu_moe_group_gemm.py`.
+Both `triton` and `npu` support the EP path; `npu` uses the
+Ascend GroupGEMM implementation in `veomni/kernels/_kernels/moe_experts_lora/{shared,independent}/npu.py`.
 
 When `train.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
 `ParallelPlan` (`Shard(0)` on `gate_up_proj` / `down_proj`). MoE-LoRA tracks this layout:
@@ -400,7 +399,7 @@ When `train.accelerator.ep_size > 1`, base experts are sharded along the expert 
   EP all-reduce for these replicated params so the global grad-norm matches EP=1.
 
 Both modes work with FSDP2 + EP. EP requires a fused forward path:
-`fused_triton` on GPU or `fused_npu` on Ascend NPU; `eager` raises.
+`triton` on GPU or `npu` on Ascend NPU; `eager` raises.
 
 ### 5.5 Save / load artefacts
 
@@ -559,7 +558,7 @@ model:
   model_path: Qwen3-30B-A3B-merge
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: eager           # EP (ep_size > 1) REQUIRES fused_triton
+    moe_implementation: eager           # EP (ep_size > 1) REQUIRES triton
   lora_config:
     rank: 16
     alpha: 32
@@ -571,7 +570,7 @@ train:
   init_device: meta
   accelerator:
     ulysses_size: 1
-    ep_size: 1                          # set >1 to enable EP; also set moe_implementation: fused_triton
+    ep_size: 1                          # set >1 to enable EP; also set moe_implementation: triton
     fsdp_config:
       fsdp_mode: fsdp2
 ```
@@ -674,7 +673,7 @@ Suite layout:
 | `test_veomni_lora_native.py` | CPU, single-process: `VeOmniLoraConfig` round-trips, dense injection structure / no-op-at-init, `get_lora_state_dict` PEFT key format, save→`from_pretrained`→load parity, `merge_and_unload`, rank/alpha patterns, exclude_modules, rslora scaling, and **bidirectional PEFT interop** (gated on `peft`). |
 | `test_veomni_lora_moe_native.py` | CPU, single-process: native MoE injection (independent/shared), MoE metadata embedded in `adapter_config.json` (no sidecar), state-dict key format/rank, save→reload param round-trip, and MoE-mode inference when the `veomni_lora` block is absent. |
 | `test_moe_lora_eager.py` | Wrapper layout + autograd parity for both Mode 1 (independent) and Mode 2 (shared); covers all v5 MoE configs (qwen3_moe / qwen3_5_moe / qwen3_vl_moe / qwen3_omni_moe / deepseek_v3). |
-| `test_moe_lora_fused.py` | Triton fused MoE-LoRA kernel parity vs eager (forward + backward) and EP autograd-class parity vs non-EP under controlled inputs. |
+| `tests/kernels/moe_experts_lora/test_moe_experts_lora.py` | `moe_experts_lora` registry rows plus Triton/NPU fused-vs-eager and single-rank EP math. |
 | `test_moe_lora_trainer.py` | Production save/load/resume round-trip: writer (DCP shard + HF adapter) → DCP-resume subprocess → adapter-resume subprocess; bit-exact LoRA reload assertion. The yaml enables both `lora_modules` (linear LoRA on `q_proj`/`v_proj`) and `target_parameters` (MoE-LoRA wrappers), so both LoRA flavors round-trip end-to-end. |
 | `test_moe_lora_ep2.py` | Trainer-driven EP=2 coverage: (a) integration assertions that the EP plumbing engages (plan-bridge fires, EP slicing happens at the right ratio, DCP consolidates EP shards before HF save); (b) `test_moe_lora_ep_save_load_parallel_align` -- one EP=2 seeder writes both an HF adapter (full `[E, r, H]`) and DCP shards, then three resumer subprocesses validate cross-EP adapter parity (EP=1 vs EP=2 adapter-load trajectories match) and EP=2 DCP round-trip parity (DCP-resumer trajectory matches the seeder's tail). |
 

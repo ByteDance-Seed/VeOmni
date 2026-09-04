@@ -1,0 +1,311 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""RMSNorm eager vs HF, and fused impls vs eager."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+import torch.nn as nn
+from torch import Tensor
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4UnweightedRMSNorm
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+
+from tests.kernels.tol import (
+    EAGER_ATOL,
+    EAGER_GRAD_ATOL,
+    EAGER_GRAD_RTOL,
+    EAGER_RTOL,
+    RMS_FUSED_ATOL,
+    RMS_FUSED_GRAD_ATOL,
+    RMS_FUSED_GRAD_RTOL,
+    RMS_FUSED_QWEN35_ATOL,
+    RMS_FUSED_QWEN35_RTOL,
+    RMS_FUSED_RTOL,
+    RMS_NPU_ATOL,
+    RMS_NPU_BF16_DIM256_ATOL,
+    RMS_NPU_BF16_DIM512_ATOL,
+    RMS_NPU_BF16_DIM1024_ATOL,
+    RMS_NPU_BF16_DIM2048_ATOL,
+    RMS_NPU_FP16_DIM256_ATOL,
+    RMS_NPU_FP16_DIM1024_ATOL,
+    RMS_NPU_FP16_DIM2048_ATOL,
+    RMS_NPU_FP32_ATOL,
+    RMS_NPU_FP32_RTOL,
+    RMS_NPU_RTOL,
+    RMS_TRITON_ATOL,
+    RMS_TRITON_GRAD_ATOL,
+    RMS_TRITON_GRAD_RTOL,
+    RMS_TRITON_RTOL,
+    RMS_UNWEIGHTED_ATOL,
+    RMS_UNWEIGHTED_RTOL,
+)
+from veomni.kernels import resolve_kernel
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+
+def _hf_rms_norm(variant: str, hidden: int, eps: float) -> nn.Module:
+    if variant == "standard":
+        return Qwen3RMSNorm(hidden, eps=eps)
+    if variant == "qwen3_5":
+        return Qwen3_5RMSNorm(hidden, eps=eps)
+    raise KeyError(variant)
+
+
+def _clone_inputs(x: Tensor, weight: Tensor) -> tuple[Tensor, Tensor]:
+    return x.detach().requires_grad_(True), weight.detach().requires_grad_(True)
+
+
+def _fused_weight(variant: str, hidden: int, device: str, dtype: torch.dtype) -> Tensor:
+    if variant == "qwen3_5":
+        weight = torch.zeros(hidden, device=device, dtype=dtype)
+        return weight + 0.01 * torch.randn_like(weight)
+    return torch.randn(hidden, device=device, dtype=dtype)
+
+
+@pytest.mark.parametrize("variant", ["standard", "qwen3_5"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_eager_matches_hf(variant: str, dtype: torch.dtype):
+    torch.manual_seed(0)
+    hidden = 64
+    eps = 1e-6
+    x = torch.randn(2, 16, hidden, dtype=dtype, requires_grad=True)
+    weight = torch.randn(hidden, dtype=dtype, requires_grad=True)
+
+    module = _hf_rms_norm(variant, hidden, eps).to(dtype=dtype)
+    with torch.no_grad():
+        module.weight.copy_(weight)
+
+    x_h = x.detach().requires_grad_(True)
+    out_h = module(x_h)
+
+    x_e, w_e = _clone_inputs(x, weight)
+    out_e = resolve_kernel("rms_norm", variant, "eager").wrapper(x_e, w_e, eps=eps)
+    assert torch.allclose(out_e.float(), out_h.float(), atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = torch.randn_like(out_e)
+    out_h.backward(go)
+    out_e.backward(go)
+    assert torch.allclose(x_e.grad.float(), x_h.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(w_e.grad.float(), module.weight.grad.float(), atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_unweighted_eager_matches_hf():
+    torch.manual_seed(0)
+    hidden = 64
+    eps = 1e-6
+    x = torch.randn(2, 16, hidden, dtype=torch.float32, requires_grad=True)
+
+    module = DeepseekV4UnweightedRMSNorm(eps=eps)
+    x_h = x.detach().requires_grad_(True)
+    out_h = module(x_h)
+
+    x_e = x.detach().requires_grad_(True)
+    out_e = resolve_kernel("rms_norm", "unweighted", "eager").wrapper(x_e, eps=eps)
+    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = torch.randn_like(out_e)
+    out_h.backward(go)
+    out_e.backward(go)
+    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def _fused_matches_eager(
+    variant: str,
+    impl: str,
+    device: str,
+    dtype: torch.dtype,
+    *,
+    atol: float,
+    rtol: float,
+    grad_atol: float | None = None,
+    grad_rtol: float | None = None,
+    cast_fp32: bool = False,
+) -> None:
+    eager = resolve_kernel("rms_norm", variant, "eager").wrapper
+    other = resolve_kernel("rms_norm", variant, impl).wrapper
+    torch.manual_seed(0)
+    hidden = 128
+    base_x = torch.randn(2, 16, hidden, device=device, dtype=dtype)
+    base_w = _fused_weight(variant, hidden, device, dtype)
+    eps = 1e-6
+    if grad_atol is None:
+        grad_atol = atol
+    if grad_rtol is None:
+        grad_rtol = rtol
+
+    x_e, w_e = _clone_inputs(base_x, base_w)
+    x_o, w_o = _clone_inputs(base_x, base_w)
+    out_e = eager(x_e, w_e, eps=eps)
+    out_o = other(x_o, w_o, eps=eps)
+    left, right = (out_e.float(), out_o.float()) if cast_fp32 else (out_e, out_o)
+    assert torch.allclose(left, right, atol=atol, rtol=rtol)
+
+    go = torch.randn_like(out_e)
+    out_e.backward(go)
+    out_o.backward(go)
+    assert torch.allclose(x_e.grad, x_o.grad, atol=grad_atol, rtol=grad_rtol)
+    assert torch.allclose(w_e.grad, w_o.grad, atol=grad_atol, rtol=grad_rtol)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs CUDA")
+@pytest.mark.parametrize("variant", ["standard", "qwen3_5"])
+def test_liger_matches_eager(variant: str):
+    pytest.importorskip("liger_kernel")
+    _fused_matches_eager(
+        variant,
+        "liger_kernel",
+        "cuda",
+        torch.bfloat16,
+        atol=RMS_FUSED_QWEN35_ATOL if variant == "qwen3_5" else RMS_FUSED_ATOL,
+        rtol=RMS_FUSED_QWEN35_RTOL if variant == "qwen3_5" else RMS_FUSED_RTOL,
+        grad_atol=RMS_FUSED_GRAD_ATOL,
+        grad_rtol=RMS_FUSED_GRAD_RTOL,
+        cast_fp32=variant == "qwen3_5",
+    )
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs CUDA")
+def test_unweighted_liger_matches_eager():
+    pytest.importorskip("liger_kernel")
+    eager = resolve_kernel("rms_norm", "unweighted", "eager").wrapper
+    other = resolve_kernel("rms_norm", "unweighted", "liger_kernel").wrapper
+    torch.manual_seed(0)
+    base_x = torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16)
+    eps = 1e-6
+
+    x_e = base_x.detach().requires_grad_(True)
+    x_o = base_x.detach().requires_grad_(True)
+    out_e = eager(x_e, eps=eps)
+    out_o = other(x_o, eps=eps)
+    assert torch.allclose(out_e, out_o, atol=RMS_UNWEIGHTED_ATOL, rtol=RMS_UNWEIGHTED_RTOL)
+
+    go = torch.randn_like(out_e)
+    out_e.backward(go)
+    out_o.backward(go)
+    assert torch.allclose(x_e.grad, x_o.grad, atol=RMS_FUSED_GRAD_ATOL, rtol=RMS_FUSED_GRAD_RTOL)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton RMSNorm needs CUDA")
+def test_triton_matches_eager():
+    pytest.importorskip("triton")
+    _fused_matches_eager(
+        "standard",
+        "triton",
+        "cuda",
+        torch.bfloat16,
+        atol=RMS_TRITON_ATOL,
+        rtol=RMS_TRITON_RTOL,
+        grad_atol=RMS_TRITON_GRAD_ATOL,
+        grad_rtol=RMS_TRITON_GRAD_RTOL,
+    )
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
+@pytest.mark.parametrize("variant", ["standard", "qwen3_5"])
+def test_npu_matches_eager(variant: str):
+    _fused_matches_eager(
+        variant,
+        "npu",
+        "npu",
+        torch.bfloat16,
+        atol=RMS_NPU_ATOL,
+        rtol=RMS_NPU_RTOL,
+        cast_fp32=variant == "qwen3_5",
+    )
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
+def test_npu_standard_matches_eager_fp32():
+    _fused_matches_eager(
+        "standard",
+        "npu",
+        "npu",
+        torch.float32,
+        atol=RMS_NPU_FP32_ATOL,
+        rtol=RMS_NPU_FP32_RTOL,
+    )
+
+
+def _npu_forward_only(variant: str, x: Tensor, weight: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    eager = resolve_kernel("rms_norm", variant, "eager").wrapper
+    other = resolve_kernel("rms_norm", variant, "npu").wrapper
+    return eager(x, weight, eps=eps), other(x, weight, eps=eps)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
+@pytest.mark.parametrize(
+    "hidden,dtype,atol",
+    [
+        (256, torch.bfloat16, RMS_NPU_BF16_DIM256_ATOL),
+        (1024, torch.bfloat16, RMS_NPU_BF16_DIM1024_ATOL),
+        (2048, torch.bfloat16, RMS_NPU_BF16_DIM2048_ATOL),
+        (256, torch.float16, RMS_NPU_FP16_DIM256_ATOL),
+        (1024, torch.float16, RMS_NPU_FP16_DIM1024_ATOL),
+        (2048, torch.float16, RMS_NPU_FP16_DIM2048_ATOL),
+    ],
+)
+def test_npu_standard_production_shape(hidden: int, dtype: torch.dtype, atol: float):
+    torch.manual_seed(0)
+    x = torch.randn(2, 64, hidden, device="npu", dtype=dtype)
+    w = torch.randn(hidden, device="npu", dtype=dtype)
+    out_e, out_o = _npu_forward_only("standard", x, w, 1e-6)
+    assert torch.allclose(out_e, out_o, atol=atol, rtol=atol)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
+@pytest.mark.parametrize(
+    "hidden,atol",
+    [
+        (512, RMS_NPU_BF16_DIM512_ATOL),
+        (1024, RMS_NPU_BF16_DIM1024_ATOL),
+    ],
+)
+def test_npu_qwen3_5_production_shape(hidden: int, atol: float):
+    torch.manual_seed(1)
+    x = torch.randn(2, 32, hidden, device="npu", dtype=torch.bfloat16)
+    w = torch.zeros(hidden, device="npu", dtype=torch.bfloat16)
+    w = w + 0.01 * torch.randn_like(w)
+    out_e, out_o = _npu_forward_only("qwen3_5", x, w, 1e-6)
+    assert torch.allclose(out_e.float(), out_o.float(), atol=atol, rtol=atol)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
+def test_npu_standard_zero_input_keeps_zero():
+    x = torch.zeros(1, 4, 64, device="npu", dtype=torch.float32)
+    w = torch.randn(64, device="npu", dtype=torch.float32)
+    out_e, out_o = _npu_forward_only("standard", x, w, 1e-6)
+    assert torch.allclose(out_e, out_o, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    assert out_o.abs().max().item() < 1e-5
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
+def test_npu_standard_uniform_weight_matches_eager():
+    torch.manual_seed(42)
+    x = torch.randn(2, 8, 128, device="npu", dtype=torch.float32)
+    w = torch.ones(128, device="npu", dtype=torch.float32)
+    out_e, out_o = _npu_forward_only("standard", x, w, 1e-6)
+    assert torch.allclose(out_e, out_o, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU RMSNorm needs NPU")
+@pytest.mark.parametrize("eps", [1e-3, 1e-5, 1e-8])
+def test_npu_standard_eps_matches_eager(eps: float):
+    torch.manual_seed(2)
+    x = torch.randn(1, 4, 64, device="npu", dtype=torch.float32)
+    w = torch.randn(64, device="npu", dtype=torch.float32)
+    out_e, out_o = _npu_forward_only("standard", x, w, eps)
+    assert torch.allclose(out_e, out_o, atol=1e-5, rtol=1e-5)

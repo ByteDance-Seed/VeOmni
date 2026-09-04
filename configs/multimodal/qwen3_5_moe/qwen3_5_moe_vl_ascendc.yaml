@@ -1,12 +1,12 @@
 model:
   model_path: Qwen/Qwen3.5-35B-A3B
   ops_implementation:
-    attn_implementation: veomni_flash_attention_2_with_sp
+    attn_implementation: veomni_flash_attention_2
     rms_norm_implementation: npu
     rotary_pos_emb_implementation: npu
     cross_entropy_loss_implementation: chunk_loss
     swiglu_mlp_implementation: eager
-    moe_implementation: fused_npu
+    moe_implementation: npu
     rms_norm_gated_implementation: npu
     causal_conv1d_implementation: npu
     chunk_gated_delta_rule_implementation: npu_ascendc

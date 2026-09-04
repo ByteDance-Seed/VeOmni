@@ -13,12 +13,6 @@
 # limitations under the License.
 
 
-from .async_ulysses import (
-    async_ulysses_output_projection,
-    async_ulysses_qkv_projection,
-    divide_qkv_linear_bias,
-    divide_qkv_linear_weight,
-)
 from .comm import (
     get_context_parallel_group,
     get_context_parallel_rank,
@@ -79,8 +73,4 @@ __all__ = [
     "pad_tensor",
     "unpad_tensor",
     "reduce_sequence_parallel_loss",
-    "async_ulysses_qkv_projection",
-    "async_ulysses_output_projection",
-    "divide_qkv_linear_weight",
-    "divide_qkv_linear_bias",
 ]

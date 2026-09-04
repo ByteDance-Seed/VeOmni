@@ -79,13 +79,12 @@ __all__ = [
 
 
 # EP requires a fused MoE-LoRA kernel: the wrappers only implement the EP
-# dispatch on the fused path. The backend is device-specific — ``fused_triton``
-# on GPU, ``fused_npu`` on NPU (selecting the wrong one raises a hard error in
-# ``apply_veomni_fused_moe_patch``), so pick it from the active accelerator.
+# dispatch on the fused path. The backend is device-specific — ``triton``
+# on GPU, ``npu`` on NPU — so pick it from the active accelerator.
 def _fused_ops_override() -> str:
     from veomni.utils.import_utils import is_torch_npu_available
 
-    backend = "fused_npu" if is_torch_npu_available() else "fused_triton"
+    backend = "npu" if is_torch_npu_available() else "triton"
     return f"--model.ops_implementation.moe_implementation={backend}"
 
 
