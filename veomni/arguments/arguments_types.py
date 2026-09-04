@@ -1519,6 +1519,10 @@ class DataArguments:
         default="mapping",
         metadata={"help": "Type of the datasets."},
     )
+    dataset_repeat: bool = field(
+        default=False,
+        metadata={"help": "Iterable-only. Replay the stream after one pass. Mapping ignores this."},
+    )
     multisource_datasets_type: str = field(
         default="interleave",
         metadata={"help": "Type of the datasets for multisource training."},

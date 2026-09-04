@@ -205,7 +205,8 @@ NPU validation runs at two times:
 | train_size | `int` | `10_000_000` | Number of tokens for training (used to compute steps under dynamic batch). |
 | train_sample | `int` | `10_000` | Number of samples for training (used to compute steps under non-dynamic batch). |
 | data_type | `Literal["plaintext", "conversation", "diffusion", "classification", "dpo"]` | `"conversation"` | Type of the training data. |
-| datasets_type | `str` | `"mapping"` | `IterableDataset` or `MappingDataset` (or custom). |
+| datasets_type | `str` | `"mapping"` | Dataset builder. Built-in values: `"mapping"`, `"iterable"`, `"interleave"`, `"energon"`. |
+| dataset_repeat | `bool` | `false` | Iterable-only. Replay the stream after one pass so training can continue past `max_steps` when the dump is small. One pass drops the last incomplete DP round. Mapping ignores this. |
 | multisource_datasets_type | `str` | `"interleave"` | Dataset type for multisource training. |
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
