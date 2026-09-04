@@ -104,6 +104,7 @@ def test_opslot_unknown_backend_raises(op_name):
 def test_gdn_registry_has_fla_and_npu(op_name):
     available = KERNEL_REGISTRY.list_available(op_name, "standard")
     assert "fla" in available
+    assert "fla_npu" in available
     assert "npu" in available
 
 

@@ -42,8 +42,10 @@ from transformers.modeling_outputs import (
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeCausalLMOutputWithPast,
+    Qwen3_5MoeDecoderLayer,
     Qwen3_5MoeModel,
     Qwen3_5MoeModelOutputWithPast,
+    Qwen3_5MoeRMSNorm,
     Qwen3_5MoeTextModel,
     Qwen3_5MoeVisionModel,
     load_balancing_loss_func,
@@ -53,11 +55,15 @@ from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    _mtp_loss_weight,
+    compute_mtp_loss,
+    make_mtp_labels,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_forward_patched,
     qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
@@ -66,7 +72,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
+from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -95,7 +101,7 @@ config.add_import(
 config.add_import(
     "veomni.distributed.sequence_parallel", names=["gather_outputs", "slice_input_tensor", "sp_pad_and_slice"]
 )
-config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward`` can return
 # per-token log-probs in the unified MoE output dataclass.
 config.add_import(
@@ -103,6 +109,9 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
+config.add_helper(_mtp_loss_weight)
+config.add_helper(compute_mtp_loss)
+config.add_helper(make_mtp_labels)
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -250,7 +259,7 @@ def qwen3_5_moe_sparse_moe_block_forward_patched(
     # being modified inplace" RuntimeError from PyTorch autograd.
     expert_output = expert_output + shared_expert_output
     expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
-    return expert_output
+    return expert_output, router_logits
 
 
 # ── ViT patches ───────────────────────────────────────────────────────────────
@@ -299,6 +308,14 @@ config.override_method(
         "the per-block GPU->CPU sync that flash_attn_varlen_func incurs when "
         "`max_length_q/k` are 0-D GPU tensors (FA's C++ binding `.item()`s them)."
     ),
+)
+
+
+config.override_method(
+    "Qwen3_5MoeTextModel.forward",
+    replacement=qwen3_5_text_model_forward_patched,
+    name_map={"Qwen3_5": "Qwen3_5Moe"},
+    description="Expose MTP context when requested by the outer MTP objective",
 )
 
 
@@ -536,10 +553,11 @@ def qwen3_5_moe_model_forward_patched(
         **kwargs,
     )
 
-    return Qwen3_5MoeModelOutputWithPast(
-        **outputs,
-        rope_deltas=self.rope_deltas,
-    )
+    output_kwargs = dict(outputs)
+    output_kwargs["rope_deltas"] = self.rope_deltas
+    if getattr(outputs, "mtp_context", None) is not None:
+        return Qwen3_5MoeMTPContextOutput(**output_kwargs)  # noqa: F821
+    return Qwen3_5MoeModelOutputWithPast(**output_kwargs)
 
 
 # Surface ``Qwen3_5MoeCausalLMOutputWithLogProbs`` so the patched multimodal
@@ -561,6 +579,139 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
         ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
         ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
+
+    loss_dict: dict[str, torch.Tensor] | None = None
+
+
+@config.add_helper_after("Qwen3_5MoeModelOutputWithPast")
+@dataclass
+class Qwen3_5MoeMTPContextOutput(Qwen3_5MoeModelOutputWithPast):
+    mtp_context: dict | None = None
+
+
+@config.add_helper_after("Qwen3_5MoeDecoderLayer")
+class Qwen3_5MoeMTP(nn.Module):
+    """Qwen3.5 MoE multi-token predictor with one layer per prediction depth."""
+
+    def __init__(self, config):
+        """Build the shared fusion modules and depth-specific decoder layers."""
+        super().__init__()
+        assert not getattr(config, "mtp_use_dedicated_embeddings", False)
+        num_layers = int(config.mtp_num_hidden_layers)
+        assert "full_attention" in config.layer_types
+        layer_idx = config.layer_types.index("full_attention")
+        self.pre_fc_norm_embedding = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList([Qwen3_5MoeDecoderLayer(config, layer_idx) for _ in range(num_layers)])
+        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self, hidden_states, inputs_embeds, position_embeddings, attention_mask=None, position_ids=None, **kwargs
+    ):
+        """Return recurrent hidden states and optional router logits for every MTP depth."""
+        assert kwargs.get("past_key_values") is None and not kwargs.get("use_cache", False)
+        output_router_logits = kwargs.pop("output_router_logits", False)
+        depth_hidden_states = []
+        depth_router_logits = [] if output_router_logits else None
+        for depth, layer in enumerate(self.layers):
+            shift = depth + 1
+            shifted_embeds = F.pad(inputs_embeds, (0, 0, 0, shift))[:, shift:, :]
+            hidden_states = self.fc(
+                torch.cat([self.pre_fc_norm_embedding(shifted_embeds), self.pre_fc_norm_hidden(hidden_states)], dim=-1)
+            )
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                return_router_logits=output_router_logits,
+                **kwargs,
+            )
+            if output_router_logits:
+                hidden_states, router_logits = hidden_states
+                if router_logits is None:
+                    raise ValueError(f"MTP depth {depth} returned no router logits.")
+                depth_router_logits.append(router_logits)
+            hidden_states = self.norm(hidden_states)
+            depth_hidden_states.append(hidden_states)
+        return tuple(depth_hidden_states), tuple(depth_router_logits) if depth_router_logits is not None else None
+
+
+@config.add_helper
+def compute_mtp_router_aux_loss(
+    router_loss_fn,
+    foundation_router_logits,
+    mtp_router_logits,
+    attention_mask,
+    mtp_labels,
+    num_experts,
+    top_k,
+):
+    """Compute one load-balancing loss over trunk and MTP routers with layer-specific masks."""
+    if not isinstance(foundation_router_logits, tuple) or not isinstance(mtp_router_logits, tuple):
+        raise ValueError("Foundation and MTP router logits must both be tuples when router output is enabled.")
+    if mtp_labels.ndim != 3:
+        raise ValueError(
+            f"MTP labels must have shape [batch, depth, sequence]; got mtp_labels.shape={tuple(mtp_labels.shape)}."
+        )
+
+    batch_size, num_depths, sequence_length = mtp_labels.shape
+    if len(mtp_router_logits) != num_depths:
+        raise ValueError(
+            "MTP router-logit depth must match the label depth; "
+            f"got {len(mtp_router_logits)} router row(s) and {num_depths} label row(s)."
+        )
+
+    combined_router_logits = foundation_router_logits + mtp_router_logits
+    expected_tokens = batch_size * sequence_length
+    for layer_idx, router_logits in enumerate(combined_router_logits):
+        if router_logits.ndim != 2 or router_logits.shape != (expected_tokens, num_experts):
+            raise ValueError(
+                "Each router-logit tensor must have shape [batch * sequence, num_experts]; "
+                f"layer {layer_idx} has shape={tuple(router_logits.shape)}, "
+                f"expected=({expected_tokens}, {num_experts})."
+            )
+
+    if attention_mask is None:
+        foundation_mask = torch.ones(
+            (batch_size, sequence_length),
+            dtype=torch.bool,
+            device=mtp_labels.device,
+        )
+    else:
+        if attention_mask.ndim != 2 or attention_mask.shape != (batch_size, sequence_length):
+            raise ValueError(
+                "Router attention_mask must have shape [batch, sequence]; "
+                f"got attention_mask.shape={tuple(attention_mask.shape)}, "
+                f"expected=({batch_size}, {sequence_length})."
+            )
+        foundation_mask = attention_mask
+
+    foundation_masks = foundation_mask.unsqueeze(0).expand(len(foundation_router_logits), -1, -1)
+    mtp_masks = (
+        (mtp_labels != IGNORE_INDEX)
+        .to(  # noqa: F821
+            device=foundation_mask.device,
+            dtype=foundation_mask.dtype,
+        )
+        .transpose(0, 1)
+    )
+    layer_attention_mask = torch.cat((foundation_masks, mtp_masks), dim=0)
+    # Present all router rows as one logical layer so both the upstream eager
+    # implementation (2D masks only) and VeOmni kernels apply the same global
+    # load-balancing formula with depth-specific masks.
+    flattened_router_logits = (torch.cat(combined_router_logits, dim=0),)
+    flattened_attention_mask = layer_attention_mask.flatten(0, 1)
+    aux_loss = router_loss_fn(
+        flattened_router_logits,
+        num_experts,
+        top_k,
+        flattened_attention_mask,
+    )
+    return aux_loss, combined_router_logits
 
 
 @config.add_helper
@@ -803,6 +954,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     cache_position: torch.LongTensor | None = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> torch.FloatTensor:
+    return_router_logits = kwargs.pop("return_router_logits", False)
     residual = hidden_states
 
     hidden_states = self.input_layernorm(hidden_states)
@@ -844,9 +996,12 @@ def qwen3_5_moe_decoder_layer_forward_patched(
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = self.mlp(hidden_states)
     # For the MoE layers, we need to unpack
+    router_logits = None
     if isinstance(hidden_states, tuple):
-        hidden_states, _ = hidden_states
+        hidden_states, router_logits = hidden_states
     hidden_states = residual + hidden_states
+    if return_router_logits:
+        return hidden_states, router_logits
     return hidden_states
 
 
@@ -987,6 +1142,48 @@ def qwen3_5_moe_forcausallm_forward_patched(
 
 
 @config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.__init__",
+    description="Build the MTP head when enabled",
+)
+def qwen3_5_moe_forconditional_generation_init_patched(self, config):
+    """Initialize Qwen3.5-MoE conditional generation and its optional MTP head."""
+    super().__init__(config)
+    self.model = Qwen3_5MoeModel(config)
+    self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+    self.mtp = None
+    weight = _mtp_loss_weight(config.text_config)  # noqa: F821
+    if weight is not None:
+        assert not get_parallel_state().sp_enabled, "Qwen3.5 MoE MTP does not support sequence parallel."
+        self.mtp = Qwen3_5MoeMTP(config.text_config)  # noqa: F821
+        logger.info_rank0(
+            f"Qwen3.5 MoE MTP enabled: {config.text_config.mtp_num_hidden_layers} layer(s), loss weight {weight}."
+        )
+    self.post_init()
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos",
+    description="Declare the MTP label collate rule",
+)
+def qwen3_5_moe_forconditional_generation_get_extra_collate_infos(self):
+    """Declare the packing rule for MoE MTP labels when enabled."""
+    if self.mtp is None:
+        return {}
+    return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
+
+
+@config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_sample_collate_func",
+    description="Expose the per-sample MTP label shift",
+)
+def qwen3_5_moe_forconditional_generation_get_sample_collate_func(self):
+    """Return the per-sample hook that creates all configured MTP depth labels."""
+    if self.mtp is None:
+        return None
+    return partial(make_mtp_labels, num_depths=len(self.mtp.layers))  # noqa: F821
+
+
+@config.override_method(
     "Qwen3_5MoeForConditionalGeneration.forward",
     description="Support fused cross entropy path in Qwen3_5MoeForConditionalGeneration.forward",
 )
@@ -1002,10 +1199,22 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     pixel_values_videos: torch.FloatTensor | None = None,
     image_grid_thw: torch.LongTensor | None = None,
     video_grid_thw: torch.LongTensor | None = None,
+    output_router_logits: bool | None = None,
     cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
+    mtp_labels: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> Qwen3_5MoeCausalLMOutputWithLogProbs:
+    """Run MoE conditional generation and combine foundation, MTP, and router losses."""
+    output_router_logits = (
+        output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
+    )
+    requires_mtp_context = self.mtp is not None and labels is not None
+    if requires_mtp_context and mtp_labels is None:
+        raise ValueError("Qwen3.5 MoE MTP loss requires `mtp_labels` when `labels` are provided.")
+
+    model_kwargs = dict(kwargs)
+    model_kwargs["return_mtp_context"] = requires_mtp_context
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -1016,8 +1225,9 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         attention_mask=attention_mask,
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
+        output_router_logits=output_router_logits,
         cache_position=cache_position,
-        **kwargs,
+        **model_kwargs,
     )
 
     hidden_states = outputs[0]
@@ -1059,34 +1269,73 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
     else:
         logits = self.lm_head(hidden_states)
 
+    loss_dict = None
+    mtp_router_logits = None
+    if requires_mtp_context:
+        mtp_context = getattr(outputs, "mtp_context", None)
+        if mtp_context is None:
+            raise RuntimeError("Qwen3.5 MoE MTP context was requested but the language model did not return it.")
+        mtp_hidden_states, mtp_router_logits = self.mtp(
+            hidden_states=outputs[0],
+            inputs_embeds=mtp_context["inputs_embeds"],
+            position_embeddings=mtp_context["position_embeddings"],
+            attention_mask=mtp_context["attention_mask"],
+            position_ids=mtp_context["position_ids"],
+            cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+            cu_seq_lens_k=kwargs.get("cu_seq_lens_k"),
+            max_length_q=kwargs.get("max_length_q"),
+            max_length_k=kwargs.get("max_length_k"),
+            output_router_logits=output_router_logits,
+        )
+        mtp_loss_fn = veomni_causal_lm_loss if veomni_causal_lm_loss.use_non_eager_impl else self.loss_function
+        mtp_loss = compute_mtp_loss(  # noqa: F821
+            mtp_loss_fn,
+            mtp_hidden_states,
+            mtp_labels,
+            weights=self.lm_head.weight,
+            vocab_size=self.config.text_config.vocab_size,
+            **kwargs,
+        )
+        weight = _mtp_loss_weight(self.config.text_config)  # noqa: F821
+        loss_dict = {"foundation_loss": loss, "mtp_loss": weight * mtp_loss}
+
+    router_logits = outputs.router_logits
     aux_loss = None
-    if kwargs.get("output_router_logits", False):
-        # Modification: OpSlot guard for load-balancing loss.
-        if veomni_load_balancing_loss.use_non_eager_impl:
-            aux_loss = veomni_load_balancing_loss(
+    if output_router_logits:
+        router_loss_fn = (
+            veomni_load_balancing_loss if veomni_load_balancing_loss.use_non_eager_impl else load_balancing_loss_func
+        )
+        if mtp_router_logits is not None:
+            aux_loss, router_logits = compute_mtp_router_aux_loss(  # noqa: F821
+                router_loss_fn,
                 outputs.router_logits,
+                mtp_router_logits,
+                attention_mask,
+                mtp_labels,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
-                attention_mask,
             )
         else:
-            aux_loss = load_balancing_loss_func(
+            aux_loss = router_loss_fn(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
                 attention_mask,
             )
-        if labels is not None:
-            loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+        if labels is not None and isinstance(aux_loss, torch.Tensor):
+            loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
+            if loss_dict is not None:
+                loss_dict["foundation_loss"] = loss
 
     return Qwen3_5MoeCausalLMOutputWithLogProbs(
         loss=loss,
+        loss_dict=loss_dict,
         aux_loss=aux_loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
-        router_logits=outputs.router_logits,
+        router_logits=router_logits,
         rope_deltas=outputs.rope_deltas,
         fused_linear_aux=fused_linear_aux,
     )

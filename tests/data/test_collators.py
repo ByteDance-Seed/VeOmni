@@ -200,4 +200,66 @@ def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, fe
     assert m._LINEAR_ATTN_TAIL_PADDING_LENGTH not in out
 
 
+def _mtp_labels_hook(feature):
+    labels = feature["labels"]
+    feature["mtp_labels"] = torch.stack(
+        [torch.nn.functional.pad(labels, (0, shift), value=IGNORE_INDEX)[..., shift:].contiguous() for shift in (2, 3)]
+    )
+
+
+def test_sample_collate_func_runs_before_packing(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+
+    features = [
+        {
+            "input_ids": torch.tensor([11, 12, 13, 14], dtype=torch.long),
+            "attention_mask": torch.tensor([1, 1, 1, 1], dtype=torch.long),
+            "labels": torch.tensor([11, 12, 13, 14], dtype=torch.long),
+        },
+        {
+            "input_ids": torch.tensor([21, 22, 23], dtype=torch.long),
+            "attention_mask": torch.tensor([1, 1, 1], dtype=torch.long),
+            "labels": torch.tensor([21, 22, 23], dtype=torch.long),
+        },
+    ]
+
+    collator = m.MainCollator(
+        data_collate_info={"mtp_labels": (-1, True, IGNORE_INDEX, 1)},
+        sample_collate_func=_mtp_labels_hook,
+    )
+    out = collator([{k: v.clone() for k, v in f.items()} for f in features])
+
+    expected = torch.tensor(
+        [
+            [
+                [13, 14, IGNORE_INDEX, IGNORE_INDEX, 23, IGNORE_INDEX, IGNORE_INDEX],
+                [14, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+            ]
+        ],
+        dtype=torch.long,
+    )
+    assert torch.equal(out["mtp_labels"], expected)
+    assert out["mtp_labels"].shape == (out["labels"].shape[0], 2, out["labels"].shape[-1])
+
+    assert 21 not in out["mtp_labels"].tolist()[0][0][:4]
+
+
+def test_no_sample_collate_func_leaves_batch_unchanged(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+
+    features = [
+        {
+            "input_ids": torch.tensor([11, 12], dtype=torch.long),
+            "attention_mask": torch.tensor([1, 1], dtype=torch.long),
+            "labels": torch.tensor([11, 12], dtype=torch.long),
+        }
+    ]
+    out = m.MainCollator()([{k: v.clone() for k, v in f.items()} for f in features])
+    assert "mtp_labels" not in out
+
+
 # TODO: add omni data ci test
