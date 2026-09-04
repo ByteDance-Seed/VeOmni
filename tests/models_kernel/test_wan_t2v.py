@@ -14,8 +14,7 @@
 
 """Wan T2V models_kernel consume tests.
 
-Direct-import the staged wrapper. Do not register or use
-``build_foundation_model``. Compare a tiny transformer against official
+Direct-import the staged wrapper. Compare a tiny transformer against official
 ``diffusers.WanTransformer3DModel``.
 """
 

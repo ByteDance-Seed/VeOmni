@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Empty-init, load, and save helpers for models_kernel checkpoints.
+
+Public entry points cover meta-device construction, safetensors / bin load,
+ExtraParallel slice streaming, rank-0 broadcast, and sharded save.
+"""
 
 import itertools
 import json
@@ -1526,6 +1531,7 @@ def save_model_weights(
 
 
 def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Sequence["ModelAssets"]):
+    """Save tokenizer / config / processor assets next to the weight shards."""
     if output_dir.startswith("hdfs://"):
         hdfs_dir = output_dir
         hdfs_upper_dir = output_dir.rstrip("/")

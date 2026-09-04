@@ -14,8 +14,7 @@
 
 """Wan models_kernel consume tests.
 
-Direct-import the staged class. Do not register or use
-``build_foundation_model``. Compare a toy DiT against
+Direct-import the staged class. Compare a toy DiT against
 ``tests/models_kernel/refs/wan.py``.
 """
 

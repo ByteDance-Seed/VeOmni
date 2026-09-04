@@ -14,8 +14,7 @@
 
 """Qwen3-Omni-MoE models_kernel consume tests.
 
-Direct-import the generated Thinker class. Do not register or use
-``build_foundation_model``. Compare a toy Thinker against HuggingFace.
+Direct-import the generated Thinker class. Compare a toy Thinker against HuggingFace.
 """
 
 from __future__ import annotations

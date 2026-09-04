@@ -77,14 +77,17 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
 
 
 def build_tokenizer(tokenizer_path: str) -> PreTrainedTokenizer:
+    """Build a right-padded tokenizer from ``tokenizer_path``."""
     return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right", trust_remote_code=True)
 
 
 def build_processor(processor_path: str, **kwargs) -> ProcessorMixin:
+    """Build a right-padded processor from ``processor_path``."""
     return get_model_processor(processor_path, padding_side="right", trust_remote_code=True, **kwargs)
 
 
 def build_config(config_path: str, **config_kwargs) -> PretrainedConfig:
+    """Build a model config from ``config_path``."""
     trust_remote_code = config_kwargs.pop("trust_remote_code", True)
     return get_model_config(config_path, trust_remote_code=trust_remote_code, **config_kwargs)
 

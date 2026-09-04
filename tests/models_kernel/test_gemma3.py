@@ -14,8 +14,7 @@
 
 """Gemma 3 text models_kernel consume tests.
 
-Direct-import the generated CausalLM. Do not register or use
-``build_foundation_model``. Compare a toy model against HuggingFace.
+Direct-import the generated CausalLM. Compare a toy model against HuggingFace.
 """
 
 from __future__ import annotations

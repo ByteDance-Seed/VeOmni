@@ -14,8 +14,7 @@
 
 """Qwen3.5-MoE models_kernel consume tests.
 
-Direct-import the generated classes. Do not register or use
-``build_foundation_model``. Compare a toy model against HuggingFace on
+Direct-import the generated classes. Compare a toy model against HuggingFace on
 full-attention text, linear-attention (GDN) text, and image+text.
 """
 

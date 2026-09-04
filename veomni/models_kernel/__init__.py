@@ -14,8 +14,9 @@
 
 """Transformer modeling that calls local ``VeomniKernel`` handles.
 
-Import classes from ``transformers.<model>.generated``. Packages are not
-registered until each ``transformers/<model>/__init__.py`` is filled in.
+Import classes from ``transformers.<model>.generated``. Construct helpers
+live on this package: ``build_foundation_model``, ``get_model_class``, and
+the checkpoint weight I/O functions.
 """
 
 from .auto import build_foundation_model, build_processor, build_tokenizer

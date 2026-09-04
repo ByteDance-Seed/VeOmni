@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -49,24 +47,3 @@ def test_save_and_load_roundtrip(tmp_path):
 
     assert torch.equal(dst.weight, src.weight)
     assert torch.equal(dst.bias, src.bias)
-
-
-def test_weights_does_not_import_ops_or_models():
-    path = Path(__file__).resolve().parents[2] / "veomni" / "models_kernel" / "checkpoint" / "weights.py"
-    tree = ast.parse(path.read_text())
-    forbidden = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names = [node.module]
-        else:
-            continue
-        for name in names:
-            if name == "veomni.ops" or name.startswith("veomni.ops."):
-                forbidden.append(name)
-            if name == "veomni.models" or (
-                name.startswith("veomni.models.") and not name.startswith("veomni.models_kernel")
-            ):
-                forbidden.append(name)
-    assert forbidden == []

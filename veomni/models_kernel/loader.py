@@ -30,21 +30,27 @@ logger = logging.get_logger(__name__)
 
 
 class BaseModelLoader(ABC):
+    """Construct a model class, then optionally load weights."""
+
     @abstractmethod
     def __init__(self):
         pass
 
     @abstractmethod
     def load_model(self, model_config, **kwargs):
+        """Return an initialized model, optionally filled from ``weights_path``."""
         raise NotImplementedError
 
 
 class HuggingfaceLoader(BaseModelLoader):
+    """Build an upstream HuggingFace class via ``from_config``."""
+
     def __init__(self, model_cls: PreTrainedModel):
         super().__init__()
         self.model_cls = model_cls
 
     def load_model(self, init_kwargs: dict, **kwargs):
+        """Construct ``model_cls`` and optionally load checkpoint weights."""
         init_kwargs.pop("trust_remote_code", True)
 
         init_device = kwargs.pop("init_device", "cuda")
@@ -77,11 +83,14 @@ class HuggingfaceLoader(BaseModelLoader):
 
 
 class CustomizedModelingLoader(BaseModelLoader):
+    """Build a registered models_kernel class via ``_from_config``."""
+
     def __init__(self, model_cls: PreTrainedModel):
         super().__init__()
         self.model_cls = model_cls
 
     def load_model(self, init_kwargs: dict, **kwargs):
+        """Construct ``model_cls`` and optionally load checkpoint weights."""
         init_kwargs.pop("trust_remote_code", True)
 
         init_device = kwargs.pop("init_device", "cuda")
@@ -132,6 +141,7 @@ class CustomizedModelingLoader(BaseModelLoader):
 
 
 def get_loader(model_config):
+    """Return the HuggingFace or customized loader for ``model_config``."""
     model_cls = get_model_class(model_config)
     if get_env("MODELING_BACKEND") == "hf":
         return HuggingfaceLoader(model_cls=model_cls)

@@ -12,6 +12,10 @@
 # See the License for the specific language governing limitations
 # under the License.
 
+"""Kernel construct helpers and causal / sequence-classification loss wrappers."""
+
+from .chunk_logprobs import chunk_logprobs_function
+from .chunk_topk_distill import chunk_topk_distill_function
 from .kernel_utils import linear_bias, resolve_kernel_impl, resolve_moe_impl
 from .loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 
@@ -19,6 +23,8 @@ from .loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 __all__ = [
     "ForCausalLMLoss",
     "ForSequenceClassificationLoss",
+    "chunk_logprobs_function",
+    "chunk_topk_distill_function",
     "linear_bias",
     "resolve_kernel_impl",
     "resolve_moe_impl",

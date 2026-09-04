@@ -14,8 +14,7 @@
 
 """SeedOss models_kernel consume tests.
 
-Direct-import the generated class. Do not register or use
-``build_foundation_model``. Compare a toy CausalLM against HuggingFace.
+Direct-import the generated class. Compare a toy CausalLM against HuggingFace.
 """
 
 from __future__ import annotations

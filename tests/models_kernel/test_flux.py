@@ -14,8 +14,7 @@
 
 """Flux models_kernel consume tests.
 
-Direct-import the staged classes. Do not register or use
-``build_foundation_model``. Compare RMSNorm and a tiny joint-attention
+Direct-import the staged classes. Compare RMSNorm and a tiny joint-attention
 block against ``tests/models_kernel/refs/flux.py``. Full ``FluxModel``
 stays hardcoded at 3072-d / 19+38 blocks.
 """

@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""MiniMax H3 transformer staged under models_kernel. Not on ``MODELING_REGISTRY``."""
+"""MiniMax H3 DiT transformer."""

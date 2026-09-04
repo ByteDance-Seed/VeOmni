@@ -14,8 +14,7 @@
 
 """MiniMax H3 models_kernel consume tests.
 
-Direct-import staged classes. Do not register or use
-``build_foundation_model``. Compare ``VeomniRMSNorm`` against official
+Direct-import staged classes. Compare ``VeomniRMSNorm`` against official
 ``torch.nn.RMSNorm``.
 """
 
@@ -64,6 +63,15 @@ def test_minimax_h3_instances_keep_distinct_impls():
 
     set_kernels_config(other_cfg)
     assert eager.veomni_rms_norm.impl == "eager"
+
+
+def test_minimax_h3_pipeline_constructs_without_weights():
+    from veomni.models_kernel.diffusers.minimax_h3.inference import MiniMaxH3Pipeline
+
+    pipe = MiniMaxH3Pipeline(device="cpu")
+    assert pipe.dit is None
+    assert len(pipe.units) == 8
+    assert pipe.model_fn is not None
 
 
 def test_minimax_h3_rms_norm_matches_official():

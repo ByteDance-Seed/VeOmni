@@ -14,8 +14,7 @@
 
 """Qwen2-VL models_kernel consume tests.
 
-Direct-import the generated class. Do not register or use
-``build_foundation_model``. Compare a toy model against HuggingFace on
+Direct-import the generated class. Compare a toy model against HuggingFace on
 both the text-only and image+text paths.
 """
 

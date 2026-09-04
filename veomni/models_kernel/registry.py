@@ -15,7 +15,6 @@
 """Construct registries for models_kernel classes.
 
 This is a separate ``Registry`` instance from any other modeling registry.
-Packages register here from ``transformers/<model>/__init__.py``.
 """
 
 from transformers import (
@@ -56,6 +55,7 @@ def raise_unsupported_veomni_modeling(model_name: str) -> None:
 
 
 def get_model_config(config_path: str, **kwargs):
+    """Load a config, replacing it with a registered class when one exists."""
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         logger.info_rank0("[CONFIG] Force loading model config from Huggingface.")
@@ -80,6 +80,7 @@ def get_model_config(config_path: str, **kwargs):
 
 
 def get_model_processor(processor_path: str, **kwargs):
+    """Load a processor, replacing it with a registered class when one exists."""
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend == "hf":
         logger.info_rank0("[PROCESSOR] Force loading model processor from Huggingface.")
@@ -112,6 +113,8 @@ def get_model_processor(processor_path: str, **kwargs):
 
 
 def get_model_class(model_config: PretrainedConfig):
+    """Return the registered modeling class, or the HuggingFace Auto class."""
+
     def get_model_arch_from_config(model_config):
         arch_name = model_config.architectures
         if isinstance(arch_name, list):

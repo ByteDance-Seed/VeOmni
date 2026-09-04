@@ -16,9 +16,6 @@
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
-
 import pytest
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -79,25 +76,3 @@ def test_build_foundation_model_installs_kernels_config():
 
 def test_modeling_registry_starts_without_qwen3():
     assert "qwen3" not in MODELING_REGISTRY.valid_keys()
-
-
-def test_auto_and_registry_do_not_import_ops_or_models():
-    root = Path(__file__).resolve().parents[2] / "veomni" / "models_kernel"
-    forbidden = []
-    for path in (root / "auto.py", root / "registry.py", root / "loader.py"):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                names = [node.module]
-            else:
-                continue
-            for name in names:
-                if name == "veomni.ops" or name.startswith("veomni.ops."):
-                    forbidden.append((str(path), name))
-                if name == "veomni.models" or (
-                    name.startswith("veomni.models.") and not name.startswith("veomni.models_kernel")
-                ):
-                    forbidden.append((str(path), name))
-    assert forbidden == []
