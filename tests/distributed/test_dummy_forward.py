@@ -159,9 +159,9 @@ def _asymmetric_forward_worker(model_type, config_path, batch_fn, weights_path=N
             dp_size=world_size,
             dp_shard_size=world_size,
             dp_mode="fsdp2",
-            extra_parallel_names=("ple",),
-            extra_parallel_sizes=(world_size,),
-            extra_parallel_placement_innermost=(False,),
+            extra_parallel_names=("ple", "ep"),
+            extra_parallel_sizes=(world_size, 1),
+            extra_parallel_placement_innermost=(False, False),
         )
     else:
         init_parallel_state(dp_size=world_size, dp_shard_size=world_size, dp_mode="fsdp2")
