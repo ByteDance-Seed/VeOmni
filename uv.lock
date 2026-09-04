@@ -3991,7 +3991,7 @@ wheels = [
 [[package]]
 name = "transformers"
 version = "5.16.0"
-source = { git = "https://github.com/huggingface/transformers.git?rev=93d1bcfbd2af5798e2f66bf7955e31a537902b64#93d1bcfbd2af5798e2f66bf7955e31a537902b64" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy" },
@@ -4002,6 +4002,10 @@ dependencies = [
     { name = "tokenizers" },
     { name = "tqdm" },
     { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6c/3b/51cf33e0c59f46d8e9cfdcee8fb6169a542728f822e0fa3c9f23967cb2ce/transformers-5.16.0.tar.gz", hash = "sha256:ef551c6d12e8c5c82b976720d8c1e6ed597fbed2c0f46c63be73a73ae80b9102", size = 9596373, upload-time = "2026-08-26T12:32:14.935Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a9/6b/b606c1a5d6a8aa6436bea8bfbbc0fce146859430db684debb5f740c216d3/transformers-5.16.0-py3-none-any.whl", hash = "sha256:2b4adda8d99bb4c1b208da5ed967e2625ad449087827a750cb3b23ce4000b139", size = 12014254, upload-time = "2026-08-26T12:32:10.987Z" },
 ]
 
 [[package]]
@@ -4378,7 +4382,7 @@ test = [
     { name = "pytest" },
     { name = "rich" },
 ]
-transformers-stable = [{ name = "transformers", git = "https://github.com/huggingface/transformers.git?rev=93d1bcfbd2af5798e2f66bf7955e31a537902b64" }]
+transformers-stable = [{ name = "transformers", specifier = "==5.16.0" }]
 
 [[package]]
 name = "virtualenv"

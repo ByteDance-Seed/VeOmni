@@ -903,16 +903,6 @@ class TrainingArguments:
         extra_parallel_sizes = dict(zip(acc.extra_parallel_names, acc.extra_parallel_sizes))
         ple_size = extra_parallel_sizes.get("ple", 1)
         if ple_size > 1:
-            if acc.fsdp_config.fsdp_mode != "fsdp2":
-                raise NotImplementedError("PLE two-dimensional parallelism requires fsdp_mode='fsdp2'.")
-            if acc.dp_replicate_size != 1:
-                raise NotImplementedError("PLE two-dimensional parallelism does not support HSDP replicas yet.")
-            if acc.ulysses_size != 1 or acc.cp_size != 1:
-                raise NotImplementedError(
-                    "PLE two-dimensional parallelism does not support Ulysses or context parallelism yet."
-                )
-            if acc.fsdp_config.offload:
-                raise NotImplementedError("PLE two-dimensional parallelism does not support FSDP CPU offload yet.")
             if acc.dp_shard_size % ple_size != 0:
                 raise ValueError(f"PLE size ({ple_size}) must divide the FSDP shard size ({acc.dp_shard_size}).")
             if not self.ep_sharded_stream_load:
