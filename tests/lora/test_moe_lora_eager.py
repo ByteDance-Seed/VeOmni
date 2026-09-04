@@ -65,6 +65,7 @@ Run:
 from __future__ import annotations
 
 import warnings
+from unittest import mock
 
 import pytest
 import torch
@@ -74,6 +75,7 @@ from veomni.lora.moe_layers import (
     _LORA_SPEC_KEYS,
     LoraIndependentExperts,
     LoraSharedExperts,
+    _group_routing_assignments,
     apply_independent_moe_lora,
     apply_shared_moe_lora,
 )
@@ -129,6 +131,32 @@ _MODE_CASES = [
     pytest.param("shared", id="shared"),
     pytest.param("independent", id="independent"),
 ]
+
+
+@pytest.mark.parametrize(
+    ("top_k_index", "num_experts"),
+    [
+        (torch.tensor([[3], [1], [3], [0]]), 5),
+        (torch.tensor([[2, 1], [2, 2], [0, 1], [2, 0]]), 4),
+        (torch.randint(0, 64, (257, 8), generator=torch.Generator().manual_seed(0)), 64),
+    ],
+)
+def test_group_routing_assignments_matches_one_hot_reference(top_k_index, num_experts):
+    expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts).permute(2, 1, 0)
+    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+    expected = []
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        expected.append((int(expert_idx), top_k_pos, token_idx))
+
+    actual = list(_group_routing_assignments(top_k_index))
+
+    assert len(actual) == len(expected)
+    for actual_group, expected_group in zip(actual, expected, strict=True):
+        assert actual_group[0] == expected_group[0]
+        assert torch.equal(actual_group[1], expected_group[1])
+        assert torch.equal(actual_group[2], expected_group[2])
 
 
 def _select_yaml_then_build(toy_dir: str):
@@ -294,6 +322,31 @@ def test_backward_isolates_to_lora_params(toy_dir: str, mode: str):
         f"{toy_dir}/{mode}: expected at least 3 lora_B params with grad "
         f"(gate + up + down halves), got {n_lora_with_grad}"
     )
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_eager_forward_does_not_materialize_one_hot_routing(mode: str):
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
+    _apply(
+        mode,
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper = model.get_submodule(sample_fqn)
+    parameter = next(wrapper.parameters())
+    hidden_states = torch.randn(8, experts.hidden_dim, dtype=parameter.dtype, device=parameter.device)
+    top_k_index = torch.randint(0, experts.num_experts, (8, 2), device=parameter.device)
+    top_k_weights = torch.softmax(torch.randn(8, 2, dtype=torch.float32, device=parameter.device), dim=-1).to(
+        parameter.dtype
+    )
+
+    with mock.patch.object(torch.nn.functional, "one_hot", side_effect=AssertionError("one-hot routing used")):
+        wrapper(hidden_states, top_k_index, top_k_weights)
 
 
 # ---------------------------------------------------------------------------
