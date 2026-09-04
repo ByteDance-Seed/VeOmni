@@ -195,6 +195,26 @@ def _chunk_list(
     return chunk_indices_list.get(str(chunk_size))
 
 
+def _ensure_fla_npu_registered() -> None:
+    """Import ``fla_npu`` for its ``torch.ops.npu.*`` GDN op registration.
+
+    Deferred off module top so ``precompute_varlen_metadata`` and the other
+    fla_npu-free helpers can load on NPU images that only install ``fla_npu``
+    for this backend. Idempotent: Python caches the module in ``sys.modules``.
+    """
+    try:
+        import fla_npu  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name != "fla_npu":
+            raise
+        raise RuntimeError(
+            "chunk_gated_delta_rule 'npu_ascendc' backend requires the 'fla_npu' package, "
+            "which is not installed. Install fla_npu manually on NPU "
+            "(https://github.com/flashserve/flash-linear-attention-npu), or set "
+            "chunk_gated_delta_rule_implementation to 'npu' (vendored Triton) or 'eager'."
+        ) from error
+
+
 def _chunk_fwd(
     q: Tensor,
     k: Tensor,
@@ -210,7 +230,7 @@ def _chunk_fwd(
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
-    import fla_npu  # noqa: F401
+    _ensure_fla_npu_registered()
 
     from ...vendor.triton.cumsum import chunk_local_cumsum
     from ...vendor.triton.utils import is_arch35
@@ -306,7 +326,7 @@ def _chunk_bwd(
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    import fla_npu  # noqa: F401
+    _ensure_fla_npu_registered()
 
     from ...vendor.triton.cumsum import chunk_local_cumsum
 

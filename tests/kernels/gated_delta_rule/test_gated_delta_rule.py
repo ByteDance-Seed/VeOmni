@@ -373,3 +373,23 @@ def test_ensure_varlen_metadata_reuses_precomputed_tables() -> None:
             assert got_tensor[key] is tensor
     for key, values in chunk_indices_list.items():
         assert got_list_dict[key] == values
+
+
+def test_npu_ascendc_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+    import sys
+
+    from veomni.kernels._kernels.gated_delta_rule.chunk_gated_delta_rule.standard import npu_ascendc as m
+
+    real_import = builtins.__import__
+
+    def _import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fla_npu" or name.startswith("fla_npu."):
+            raise ModuleNotFoundError("No module named 'fla_npu'", name="fla_npu")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    sys.modules.pop("fla_npu", None)
+
+    with pytest.raises(RuntimeError, match="npu_ascendc"):
+        m._ensure_fla_npu_registered()

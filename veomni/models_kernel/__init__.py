@@ -19,7 +19,13 @@ live on this package: ``build_foundation_model``, ``get_model_class``, and
 the checkpoint weight I/O functions.
 """
 
-from .auto import build_foundation_model, build_processor, build_tokenizer
+from .auto import (
+    build_foundation_model,
+    build_processor,
+    build_tokenizer,
+    check_context_parallel_supported,
+    check_model_build_prerequisites,
+)
 from .checkpoint.weights import (
     init_empty_weights,
     load_model_weights,
@@ -43,6 +49,8 @@ __all__ = [
     "build_foundation_model",
     "build_processor",
     "build_tokenizer",
+    "check_context_parallel_supported",
+    "check_model_build_prerequisites",
     "get_model_class",
     "init_empty_weights",
     "load_model_weights",

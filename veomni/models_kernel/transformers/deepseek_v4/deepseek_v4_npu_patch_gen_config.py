@@ -34,6 +34,7 @@ from veomni.kernels import VeomniKernel
 from veomni.models_kernel.transformers.deepseek_v4.packed_utils import (
     compress_packed_windows,
     packed_compressed_block_bias,
+    shard_packed_compression_metadata,
 )
 from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
 from veomni.patchgen.patch_spec import PatchConfig
@@ -68,6 +69,15 @@ from .deepseek_v4_gpu_patch_gen_config import (
 from .deepseek_v4_gpu_patch_gen_config import (
     config as gpu_config,
 )
+
+
+# Names resolved at codegen time from generated imports.
+get_parallel_state = None
+all_gather_compressed_rows = None
+empty_compressed_rows = None
+exchange_compressor_halos = None
+local_window_token_indices = None
+plan_compressor_shard = None
 
 
 config = PatchConfig(
@@ -314,6 +324,12 @@ def deepseek_v4_hca_compressor_forward_patched(
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
     build_block_bias: bool = True,
+    # Accepted and ignored. ``DeepseekV4Attention.forward`` holds one compressor whose
+    # class is chosen by layer type and calls it through a single call site, so the two
+    # compressors have to take the same arguments; only the CSA one owns a Lightning
+    # Indexer and so only it has anything to do with this. Defaulted, so an HCA
+    # compressor called directly is unaffected.
+    build_indexer_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
@@ -322,8 +338,35 @@ def deepseek_v4_hca_compressor_forward_patched(
     kv = self.kv_proj(hidden_states)
     gate = self.gate_proj(hidden_states)
 
+    parallel_state = get_parallel_state()
+    cp_enabled = parallel_state.cp_enabled and cache_layer is None
+    if cp_enabled:
+        cp_group = parallel_state.cp_group
+        cp_rank = parallel_state.cp_rank
+        local_seq_len = hidden_states.shape[1]
+        rate = self.compress_rate
+        shard = plan_compressor_shard(
+            role="DeepSeek V4 HCA compressor",
+            rate=rate,
+            local_seq_len=local_seq_len,
+            cp_rank=cp_rank,
+            cp_size=parallel_state.cp_size,
+            packed_compression_metadata=packed_compression_metadata,
+            device=kv.device,
+        )
+        kv, gate = exchange_compressor_halos(kv, gate, rate, cp_group)
+
     if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
         rate_metadata = packed_compression_metadata[self.compress_rate]
+        if cp_enabled:
+            rate_metadata = shard_packed_compression_metadata(
+                rate_metadata,
+                window_begin=shard.begin,
+                window_end=shard.end,
+                local_seq_len=local_seq_len,
+                cp_rank=cp_rank,
+                halo=rate,
+            )
         compressed = compress_packed_windows(
             kv,
             gate,
@@ -341,11 +384,19 @@ def deepseek_v4_hca_compressor_forward_patched(
         if compressed.shape[1] == 0:
             anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
             compressed = compressed + anchor.to(compressed.dtype)
+        if cp_enabled:
+            compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
         block_bias = packed_compressed_block_bias(rate_metadata) if build_block_bias else None
         result = (compressed.unsqueeze(1), block_bias)
         return (*result, None) if return_topk_indices else result
 
-    if cache_layer is None:
+    if cp_enabled:
+        window_indices, first_window_position = local_window_token_indices(
+            shard, rate=rate, local_seq_len=local_seq_len, cp_rank=cp_rank, device=kv.device
+        )
+        flat_indices = window_indices.reshape(-1)
+        chunk_kv, chunk_gate = kv[:, flat_indices], gate[:, flat_indices]
+    elif cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
         chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
     else:
@@ -365,10 +416,16 @@ def deepseek_v4_hca_compressor_forward_patched(
         cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
         compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
     else:
-        compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+        compressed = (
+            empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
+            if cp_enabled
+            else chunk_kv.new_zeros((batch, 0, self.head_dim))
+        )
 
     if cache_layer is not None:
         compressed = cache_layer.update_compressor_states("compressor", compressed)
+    if cp_enabled:
+        compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
     compressed_kv = compressed.unsqueeze(1)
 
     compressed_len = compressed_kv.shape[2]
@@ -406,16 +463,54 @@ def deepseek_v4_csa_compressor_forward_patched(
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
     build_block_bias: bool = True,
+    # Accepted, refused, and never forwarded on this backend. The shared attention
+    # forward passes ``_builds_indexer_kl``'s answer down here, so the parameter
+    # exists because the call site is shared. The two indexer call sites below stay
+    # on their bare-tensor return.
+    build_indexer_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
+    if build_indexer_loss:
+        raise NotImplementedError(
+            "dsa_indexer_loss is not implemented on NPU: the objective's student "
+            "distribution is the TileLang Lightning Indexer's per-slot scores, and that "
+            "kernel is CUDA-only. Set dsa_indexer_loss: false under model.model_config."
+        )
     batch, seq_len, _ = hidden_states.shape
     cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
     kv = self.kv_proj(hidden_states)
     gate = self.gate_proj(hidden_states)
 
+    parallel_state = get_parallel_state()
+    cp_enabled = parallel_state.cp_enabled and cache_layer is None
+    if cp_enabled:
+        cp_group = parallel_state.cp_group
+        cp_rank = parallel_state.cp_rank
+        local_seq_len = hidden_states.shape[1]
+        rate = self.compress_rate
+        shard = plan_compressor_shard(
+            role="DeepSeek V4 CSA compressor",
+            rate=rate,
+            local_seq_len=local_seq_len,
+            cp_rank=cp_rank,
+            cp_size=parallel_state.cp_size,
+            packed_compression_metadata=packed_compression_metadata,
+            device=kv.device,
+        )
+        kv, gate = exchange_compressor_halos(kv, gate, rate, cp_group)
+
     if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
         rate_metadata = packed_compression_metadata[self.compress_rate]
+        if cp_enabled:
+            rate_metadata = shard_packed_compression_metadata(
+                rate_metadata,
+                window_begin=shard.begin,
+                window_end=shard.end,
+                local_seq_len=local_seq_len,
+                cp_rank=cp_rank,
+                halo=rate,
+            )
         compressed = compress_packed_windows(
             kv,
             gate,
@@ -437,6 +532,8 @@ def deepseek_v4_csa_compressor_forward_patched(
         if compressed.shape[1] == 0:
             anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
             compressed = compressed + anchor.to(compressed.dtype)
+        if cp_enabled:
+            compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
         compressed_kv = compressed.unsqueeze(1)
         top_k_indices = self.indexer(
             hidden_states,
@@ -459,7 +556,20 @@ def deepseek_v4_csa_compressor_forward_patched(
         result = (compressed_kv, block_bias)
         return (*result, top_k_indices) if return_topk_indices else result
 
-    if cache_layer is None:
+    prior_kv = prior_gate = None
+    if cp_enabled:
+        window_indices, first_window_position = local_window_token_indices(
+            shard, rate=rate, local_seq_len=local_seq_len, cp_rank=cp_rank, device=kv.device
+        )
+        flat_indices = window_indices.reshape(-1)
+        chunk_kv, chunk_gate = kv[:, flat_indices], gate[:, flat_indices]
+        if first_window_position >= rate:
+            previous_indices = window_indices[0] - rate
+            prior_kv = kv[:, previous_indices, : self.head_dim]
+            prior_gate = gate[:, previous_indices, : self.head_dim] + self.position_bias[:, : self.head_dim].to(
+                gate.dtype
+            )
+    elif cache_layer is None:
         usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
         chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
     else:
@@ -479,9 +589,9 @@ def deepseek_v4_csa_compressor_forward_patched(
             new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, : self.head_dim]
         if cache_layer is not None:
             prior_kv, prior_gate = cache_layer.update_overlap_state("compressor", chunk_kv, chunk_gate, self.head_dim)
-            if prior_kv is not None:
-                new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
-                new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+        if prior_kv is not None:
+            new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+            new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
         compressed = self.kv_norm((new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2))
         positions = torch.arange(n_windows, device=compressed.device)
         positions = positions * self.compress_rate + first_window_position
@@ -489,10 +599,16 @@ def deepseek_v4_csa_compressor_forward_patched(
         cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
         compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
     else:
-        compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+        compressed = (
+            empty_compressed_rows(chunk_kv, chunk_gate, self.head_dim)
+            if cp_enabled
+            else chunk_kv.new_zeros((batch, 0, self.head_dim))
+        )
 
     if cache_layer is not None:
         compressed = cache_layer.update_compressor_states("compressor", compressed)
+    if cp_enabled:
+        compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
     compressed_kv = compressed.unsqueeze(1)
     top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
     if build_block_bias:
