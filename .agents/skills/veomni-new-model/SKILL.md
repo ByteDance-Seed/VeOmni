@@ -1,7 +1,13 @@
 ---
 name: veomni-new-model
-description: "Use this skill when adding support for a new model to VeOmni. Covers the full lifecycle: analyzing the HuggingFace model, creating model patches, defining parallel plans, writing configs, integrating with the trainer, and testing. Trigger: 'add model', 'support new model', 'integrate a model', 'new model support'."
+description: "Use this skill when adding support for a new model to VeOmni. Owns the lifecycle around the modeling itself: analyzing the HuggingFace model, choosing the category, the training config, trainer and data-pipeline integration, tests and docs. The modeling patch itself is delegated to /veomni-patchgen-model. Trigger: 'add model', 'support new model', 'integrate a model', 'new model support'."
 ---
+
+> The hard part of a new transformers-family model — the patchgen config,
+> parallel plan, MoE weight conversion, `__init__.py` registration, codegen —
+> lives in `/veomni-patchgen-model`. This skill is the wrapper around it: it
+> decides *what* you are adding, then hands off, then does the config, trainer
+> and data work that patchgen does not cover.
 
 ## Before You Start: Create a Plan
 
@@ -9,11 +15,10 @@ Track the phases with whatever todo/plan tool the running agent provides:
 
 ```
 Phase 1: Analyze HF model             -> in_progress
-Phase 2: Create model patch            -> pending
-Phase 3: Define parallel plan          -> pending
-Phase 4: Write training config         -> pending
-Phase 5: Integrate with trainer        -> pending
-Phase 6: Test                          -> pending
+Phase 2: Modeling (/veomni-patchgen-model)  -> pending
+Phase 3: Write training config         -> pending
+Phase 4: Integrate with trainer        -> pending
+Phase 5: Test and document             -> pending
 ```
 
 ## Phase 1: Analyze HuggingFace Model
@@ -28,41 +33,34 @@ Phase 6: Test                          -> pending
 
 3. **Check existing similar models**: Find the closest existing model in `veomni/models/transformers/` and use it as a reference. E.g., if adding a new Qwen variant, reference `qwen3/` or `qwen3_vl/`.
 
-4. **Identify required patches**: VeOmni uses a patchgen system (`veomni/patchgen/`) to auto-generate model patches from HuggingFace models. Check if a patch spec already exists or if one needs to be created.
+4. **Identify required patches**: VeOmni uses a patchgen system (`veomni/patchgen/`) to generate model patches from the HuggingFace modeling. Check whether a sibling model already has a config you can extend via `name_map` — that is usually the difference between a 60-line config and a 1000-line one.
 
-## Phase 2: Create Model Patch
+## Phase 2: Modeling — hand off to `/veomni-patchgen-model`
 
-1. **Create the model directory**: `veomni/models/transformers/<model_name>/`
+1. **Create the model directory**: `veomni/models/transformers/<model_name>/`.
 
-2. **Required files**:
-   - `__init__.py` — model registration (`MODELING_REGISTRY` / `MODEL_CONFIG_REGISTRY` / `MODEL_PROCESSOR_REGISTRY`)
-   - `<model_name>_gpu_patch_gen_config.py` — declarative patchgen config (replace_class / override_method / replace_function / modify_init / add_post_import_block / drop_import_names) defining all VeOmni patches against the upstream HF modeling
-   - `<model_name>_npu_patch_gen_config.py` — NPU patchgen config (often just imports the GPU config and applies NPU-specific overrides via `name_map`)
-   - `parallel_plan.py` — FSDP / TP / EP sharding plan
-   - `generated/patched_modeling_<model_name>_{gpu,npu}.py` — patchgen output (do NOT edit manually)
+2. **Switch to `/veomni-patchgen-model`.** It owns the whole modeling surface —
+   the `<model_name>_{gpu,npu}_patch_gen_config.py` files, the MoE
+   `parallel_plan.py` and `checkpoint_tensor_converter.py`, `__init__.py`
+   registration, `make patchgen`, and the model-level test cases — with the
+   working examples and the pitfalls that cost the most time. Do not re-derive
+   it from this file.
 
-3. **Patch patterns** — follow existing models:
-   - Sequence parallel: declare an `OpSlot` for attention/loss and override `forward` via patchgen
-   - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and add a `veomni_moe_experts_forward` `OpSlot`
-   - Cross-entropy: add a `veomni_causal_lm_loss` `OpSlot` and return `CausalLMOutputWithLogProbs`
-   - Register the model class in the model package `__init__.py` (no entry in `veomni/models/auto.py` is needed for transformers models — registration happens via the per-model `MODELING_REGISTRY` decorators)
+   Note that `parallel_plan.py` is **not** an FSDP wrapping policy: FSDP2 wraps
+   generically in `build_parallelize_model()`, and `ParallelPlan`
+   (`veomni/distributed/parallel_plan.py`) only describes ExtraParallel
+   EP/embedding sharding. Every `parallel_plan.py` in the repo belongs to a MoE
+   model; a dense model does not need one.
 
-4. **Run patchgen**: `make patchgen` regenerates every `generated/patched_modeling_*.py` from the matching `*_patch_gen_config.py`.
+3. **Exception — non-transformers architectures.** Diffusion models under
+   `veomni/models/diffusers/<model_name>/`, and the `flux` / `movqgan` / `wan`
+   directories, have no `generated/` output and no patchgen config: they patch
+   through `device_patch.py` or direct modeling. Copy the closest existing one
+   and skip to Phase 3.
 
-## Phase 3: Define Parallel Plan
+Come back here once the model loads and its registry / patch tests pass.
 
-1. Create `parallel_plan.py` in the model directory.
-
-2. Define FSDP/FSDP2 sharding strategy:
-   - Which layers to wrap (typically transformer blocks)
-   - Activation checkpointing granularity
-   - Parameter dtype policies
-
-3. If the model is MoE, define expert parallelism plan in addition to FSDP.
-
-4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`).
-
-## Phase 4: Write Training Config
+## Phase 3: Write Training Config
 
 1. **Model config**: Create `configs/model_configs/<model_family>/<ModelName>.json` matching HuggingFace format.
 
@@ -75,7 +73,7 @@ Phase 6: Test                          -> pending
 
 4. **Verify against existing configs** — match the structure of similar model configs.
 
-## Phase 5: Integrate with Trainer
+## Phase 4: Integrate with Trainer
 
 1. Verify the model works with the appropriate trainer:
    - Text -> `TextTrainer` (`veomni/trainer/text_trainer.py`)
@@ -98,7 +96,7 @@ Phase 6: Test                          -> pending
    Model.forward → ViT.forward (with a runtime fallback), and the model added to
    `_MM_METADATA_WIRED_CASES` in the sync gate test.
 
-## Phase 6: Test
+## Phase 5: Test and Document
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
 
@@ -124,6 +122,5 @@ Phase 6: Test                          -> pending
 ## Common Pitfalls
 
 - **Model registry**: Registration must happen at import time in `__init__.py`. If the model's `AutoConfig` type is not registered, `build_foundation_model()` will fail.
-- **Generated files**: Never edit files in `generated/` directories — they are overwritten by patchgen. Edit the matching `<model>_{gpu,npu}_patch_gen_config.py` and re-run `make patchgen` instead.
 - **Tokenizer compatibility**: Some models require specific tokenizer versions or custom chat templates — verify in `veomni/data/chat_template.py`.
-- **Transformers version**: All modeling targets `transformers==5.9.0` (pinned by the `transformers-stable` default dependency group). Models register through the patchgen-generated path under `generated/`; do not introduce legacy `modeling_<m>.py` files or `apply_veomni_<m>_patch()` helpers.
+- **Skipping the handoff**: the modeling pitfalls — never editing `generated/`, MoE expert layout, `name_map` reuse, Omni subtree exclusion — are in `/veomni-patchgen-model`, not here. This file deliberately does not restate them, so a summary read of Phase 2 is not enough to write a config.

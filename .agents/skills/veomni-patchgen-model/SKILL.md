@@ -1,22 +1,22 @@
 ---
-name: veomni-migrate-transformers-v5
-description: "Use this skill when adding or refreshing a patchgen-generated modeling file for a VeOmni model under its generated directory — GPU-only or GPU+NPU, dense or MoE, text-only / VLM / Omni-thinker+talker. Covers: creating GPU and NPU patchgen configs, using patchgen decorators (replace_class/override_method/replace_function/modify_init/add_post_import_block/drop_import_names), reusing sibling-model patches via name_map, handling MoE weight-loading (CheckpointTensorConverter + fused gate_up_proj layout), multimodal/VLM forward with Ulysses SP, excluding speech/vocoder subtrees in Omni models (talker/token2wav/DiT/BigVGAN), wiring __init__.py for the patchgen-generated classes, running codegen, and adding test cases. Trigger: 'port a model to patchgen', 'add patchgen for a model', 'transformers v5 migration', 'add NPU patchgen'. Do NOT edit files under generated/ manually — always regenerate via patchgen."
+name: veomni-patchgen-model
+description: "Author or refresh a VeOmni model's patchgen-generated modeling under generated/ — GPU and/or NPU config, dense or MoE, text / VLM / Omni. Covers the patchgen decorators, sharing patches across sibling models via name_map, MoE fused-expert weight loading, Ulysses SP in multimodal forwards, __init__.py registration, running codegen, and the test cases. This is the modeling step of adding a new model, not only of refreshing an existing one. Trigger: 'add patchgen for a model', 'write a patch_gen_config', 'regenerate the generated modeling', 'add NPU patchgen', 'port a model to patchgen', 'transformers v5 migration'. Never hand-edit anything under generated/."
 ---
 
-# VeOmni Transformers v5 Patchgen Protocol
+# VeOmni Patchgen Modeling Protocol
 
 Purpose: add or refresh a model's patchgen-generated modeling under
 `veomni/models/transformers/<model>/generated/`. VeOmni pins
 `transformers==5.9.0` and ships patchgen-generated modeling for every
-supported model; legacy v4 monkey-patches have been retired.
+supported transformers-family model. The non-transformers architectures
+(`flux`, `movqgan`, `wan`) have no `generated/` directory and are out of scope.
 
 **References (read first, load on demand):**
 
-- `docs/transformers_v5/index.md` — overview of what v5 migration covers
 - `docs/design/patchgen.md` — patchgen DSL, CLI, CI drift check
 - `docs/transformers_v5/transformers_v5_moe_weight_loading.md` — MoE fused-expert layout + runtime converter
 - `docs/transformers_v5/veomni_flash_attention_kernel_adapter.md` — FA custom-name adapter
-- `docs/transformers_v5/testing_new_model.md` — v5 test case SOP
+- `docs/transformers_v5/testing_new_model.md` — test case SOP for a new model
 
 **Working examples (copy the structure, do not edit `generated/`):**
 
@@ -170,18 +170,19 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
 
 ## Phase 1: Scope & Audit
 
-**Input**: model name `<M>` (e.g. `qwen3_5`, `glm4_moe`).
+**Input**: model name `<M>` (e.g. `qwen3_5`, `glm_moe_dsa`).
 
 **Operations:**
 
-1. Confirm model exists at `veomni/models/transformers/<M>/`. If not, the task is
-   "add new model" — use `/veomni-new-model` instead.
+1. Locate `veomni/models/transformers/<M>/`. If the directory does not exist yet
+   you are being called as the modeling step of `/veomni-new-model`: create it,
+   and read that skill's Phase 1 first so the category (text / VLM / Omni,
+   dense / MoE, GPU-only or GPU+NPU) is already decided when you get here.
 2. If a patchgen-generated file already exists under
    `veomni/models/transformers/<M>/generated/` you are **refreshing** an
    existing config (e.g. picking up upstream changes, adding NPU sibling,
-   fixing a bug). Otherwise you are adding patchgen support to a model whose
-   `__init__.py` previously imported HF classes directly. Either way, the rest
-   of this protocol applies identically.
+   fixing a bug). Otherwise you are writing the first config for this model.
+   Either way, the rest of this protocol applies identically.
 3. Decide backend coverage:
    - GPU only → one `<m>_gpu_patch_gen_config.py` + one
      `generated/patched_modeling_<m>_gpu.py`.
@@ -625,7 +626,9 @@ def register_<m>_modeling(architecture: str):
 
 ## Phase 5: Run Patchgen + Verify Diff
 
-1. Regenerate:
+1. Regenerate. `make patchgen` (`patchgen --all --diff`) rebuilds every model's
+   generated file, which is the safe default because it cannot leave a GPU/NPU
+   sibling behind. Target a single module only when you want a fast loop:
    ```bash
    patchgen \
        veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
@@ -667,8 +670,13 @@ and regenerate. This is a hard rule called out in `AGENTS.md`.
 ## Phase 6: Add Test Cases
 
 Follow `docs/transformers_v5/testing_new_model.md`. Every file below is already
-enumerated in the unit-test workflows, so appending a case needs no workflow
-change — that is exactly why this phase extends tables instead of adding files.
+enumerated in a CI workflow — the unit-test ones, or `gpu_e2e_test.yml` /
+`npu_e2e_test.yml` for the e2e tables — so appending a case needs no workflow
+change. That is exactly why this phase extends tables instead of adding files.
+`tests/models/test_model_registry.py` and
+`tests/models/test_models_logits_equal_v5.py` are part of the minimum too:
+the first proves the registry returns the generated class, the second that it
+is numerically equal to upstream.
 If you think you need a new test file, read `.agents/knowledge/testing.md` first.
 Minimum coverage:
 
@@ -1031,10 +1039,15 @@ Extra e2e gotchas:
 
 ## Scope Guard
 
-This skill adds or refreshes patchgen-generated modeling for an **existing**
-model directory under `veomni/models/transformers/`. For:
+This skill owns everything that produces `generated/patched_modeling_<m>_*.py`
+for a model under `veomni/models/transformers/` — for a brand-new model
+directory as much as for an existing one. For:
 
-- New model (does not yet exist under `veomni/models/transformers/`): use
+- The rest of onboarding a new model — deciding the model category, the
+  training config, trainer and data-pipeline integration, docs: use
+  `/veomni-new-model`, which hands the modeling step back here.
+- A diffusion or other non-transformers architecture (`veomni/models/diffusers/`,
+  or `flux` / `movqgan` / `wan`): patchgen does not apply — use
   `/veomni-new-model`.
 - New op / kernel: use `/veomni-new-op`.
 - uv / dependency bumps (e.g. upgrading the `transformers-stable` pin): use

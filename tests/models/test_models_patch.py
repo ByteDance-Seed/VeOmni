@@ -328,8 +328,8 @@ class TrainerTest(BaseTrainer):
 _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
-# Models without a patchgen path are not covered here. Migrate them via
-# ``/veomni-migrate-transformers-v5`` to bring them back into this list.
+# Models without a patchgen path are not covered here. Add one via
+# ``/veomni-patchgen-model`` to bring them back into this list.
 TEST_CASES = [
     pytest.param(
         "./tests/toy_config/llama31_toy/config.json",
