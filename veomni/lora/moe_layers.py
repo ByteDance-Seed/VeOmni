@@ -164,6 +164,20 @@ logger = logging.get_logger(__name__)
 _PEFT_PREFIX = "base_model.model."
 
 
+def _group_routing_assignments(top_k_index: torch.Tensor):
+    """Yield expert routing groups in the eager path's top-k-major order."""
+    num_tokens = top_k_index.shape[0]
+    flat_experts = top_k_index.T.reshape(-1)
+    sorted_experts, flat_positions = torch.sort(flat_experts, stable=True)
+    expert_ids, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
+
+    offset = 0
+    for expert_idx, count in zip(expert_ids.tolist(), counts.tolist(), strict=True):
+        group_positions = flat_positions[offset : offset + count]
+        yield expert_idx, group_positions // num_tokens, group_positions % num_tokens
+        offset += count
+
+
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Convert a PEFT-style glob (``*``) to a fully-anchored regex."""
     parts = [re.escape(piece) for piece in pattern.split("*")]
@@ -739,15 +753,7 @@ class LoraSharedExperts(nn.Module):
         lora_x_gate_up = torch.cat([gate_delta, up_delta], dim=-1)  # [N, 2I]
 
         final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        for expert_idx, top_k_pos, token_idx in _group_routing_assignments(top_k_index):
             current_state = hidden_states[token_idx]
 
             gate_up = F.linear(current_state, gate_up_w[expert_idx]) + lora_x_gate_up[token_idx]
@@ -1084,15 +1090,7 @@ class LoraIndependentExperts(nn.Module):
         down_w = self.down_proj.base_layer.weight
 
         final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        for expert_idx, top_k_pos, token_idx in _group_routing_assignments(top_k_index):
             current_state = hidden_states[token_idx]
 
             # Per-expert LoRA on gate and up halves — independent rank-r
