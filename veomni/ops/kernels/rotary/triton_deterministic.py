@@ -15,11 +15,62 @@
 """Deterministic batched matmul Triton kernel used by DeepSeek V3's deterministic RoPE path.
 
 Originally adapted from https://github.com/thinking-machines-lab/batch_invariant_ops.
+
+H100 optimization: the RoPE frequency computation ``inv_freq @ position_ids`` is
+a rank-1 product with ``K == 1`` (``(B, D/2, 1) x (B, 1, S)``), i.e. a batched
+**outer product**, not a real contraction. Routing it through ``tl.dot`` with
+``BLOCK_K=16`` pads K from 1 to 16 and wastes ~15/16 of the tensor-core MMA. For
+the ``K == 1`` case we use a dedicated broadcast (outer-product) kernel:
+``C[b, m, n] = A[b, m, 0] * B[b, 0, n]``. Because there is no summation, the
+result is **bitwise identical** to the GEMM path (a single fp32 multiply) and
+remains fully deterministic (no cuBLAS, no split-K). General ``K > 1`` inputs
+fall back to the original deterministic ``_bmm_kernel``.
 """
 
 import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _outer_kernel(
+    a_ptr,  # [B, M] (K==1 squeezed)
+    b_ptr,  # [B, N]
+    c_ptr,  # [B, M, N]
+    B,
+    M,
+    N,
+    stride_ab,
+    stride_am,
+    stride_bb,
+    stride_bn,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    LARGE: tl.constexpr,
+):
+    """Batched outer product: C[b, m, n] = A[b, m] * B[b, n]."""
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    if pid_b >= B:
+        return
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    if LARGE:
+        offs_m = offs_m.to(tl.int64)
+        offs_n = offs_n.to(tl.int64)
+
+    a = tl.load(a_ptr + pid_b * stride_ab + offs_m * stride_am, mask=mask_m, other=0.0)
+    b = tl.load(b_ptr + pid_b * stride_bb + offs_n * stride_bn, mask=mask_n, other=0.0)
+    c = a[:, None] * b[None, :]
+
+    c_ptrs = c_ptr + pid_b * stride_cb + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, c.to(c_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
 
 
 @triton.jit
@@ -106,6 +157,34 @@ def triton_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     a = a.contiguous()
     b = b.contiguous()
     c = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
+
+    if K == 1:
+        # Rank-1 outer product (the RoPE case). No contraction => a plain
+        # broadcast multiply, bitwise-identical to the GEMM and deterministic.
+        BLOCK_M = triton.next_power_of_2(M)
+        BLOCK_N = min(triton.next_power_of_2(N), 1024)
+        grid = (B, triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        large = (a.numel() > 2**31) or (b.numel() > 2**31) or (c.numel() > 2**31)
+        _outer_kernel[grid](
+            a,
+            b,
+            c,
+            B,
+            M,
+            N,
+            a.stride(0),
+            a.stride(1),  # stride over M (K==1 dim squeezed out)
+            b.stride(0),
+            b.stride(2),  # stride over N
+            c.stride(0),
+            c.stride(1),
+            c.stride(2),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            LARGE=large,
+        )
+        return c
+
     BLOCK_M = 16 if M <= 16 else (32 if M <= 32 else (64 if M <= 64 else 128))
     BLOCK_N = 16 if N <= 16 else (32 if N <= 32 else (64 if N <= 64 else 128))
     BLOCK_K = 16 if K <= 16 else (32 if K <= 32 else 64)
