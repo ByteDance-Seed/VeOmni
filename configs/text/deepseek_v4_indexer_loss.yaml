@@ -1,0 +1,147 @@
+# DeepSeek-V4-Flash SFT with the Lightning Indexer KL objective (DeepSeek-V3.2 eq. 4).
+#
+# Sibling of configs/text/deepseek_v4.yaml. One line turns the feature on
+# (model.model_config.dsa_indexer_loss); max_seq_len and dyn_bsz are the two non-obvious
+# values and each has a section below; the rest scales the job down to a smoke run on the
+# 4-layer checkpoint.
+#
+# WHY max_seq_len IS 8192 AND NOT THE 2048 THE SIBLING CONFIG SHIPS
+# ----------------------------------------------------------------
+# The indexer objective only exercises top-k *selection* when a query row has more visible
+# compressed slots than index_topk (512 here). At max_seq_len 2048 the rate-4 CSA layer compresses
+# to exactly 2048/4 = 512 slots, which is exactly index_topk, so the top-k selects every visible
+# slot: that is the degenerate boundary, not a safety margin. 8192 gives 2048 compressed slots
+# against a 512-slot budget. If you change index_topk or the compress rate, re-derive this from
+# `max_seq_len / compress_rate >> index_topk` rather than keeping 8192.
+#
+# READ THIS BEFORE CONCLUDING THAT 8192 IS SUFFICIENT. The visible-slot count is per *sample*,
+# not per packed row: build_packed_compression_metadata restarts range_starts/range_ends at every
+# cu_seq_lens boundary, so a query row only ever sees its own conversation's compressed slots.
+# tulu-3-sft-mixture conversations are short -- measured with this checkpoint's tokenizer over
+# 4000 samples, the median is 296 tokens, p99 is 1293, and 0.2% exceed the 2048 tokens a row needs
+# before its 512-slot budget can bind. So on *this dataset* the top-k is non-binding whatever
+# max_seq_len says, and the objective reduces to a dense KL over each row's visible slots. What
+# 8192 buys here is a full 8192-token packed micro-batch (see dyn_bsz below), not an escape from
+# the boundary. A dataset with genuinely long documents is what escapes it.
+
+# WHY dyn_bsz IS true HERE AND false IN THE SIBLING CONFIG
+# -------------------------------------------------------
+# With dyn_bsz false each micro-batch is one unpadded conversation, so the sequence length changes
+# every micro-batch and TileLang JITs a fresh kernel for every unseen shape: 227 compilations in
+# the first 5 steps on a cold kernel cache, 5 steps in 5m21s. That cost is one-off per shape -- the
+# same 5 steps re-run against the warmed cache compile nothing -- but unpadded conversations have
+# an unbounded shape space, so it never finishes amortising, and it makes step times incomparable
+# between runs. Packed at a fixed 8192 the whole 50-step run compiles 4 kernels, and carries 14x
+# the tokens per step at 2.72s against 4.0s. Packing also makes max_seq_len mean something:
+# nothing on this dataset comes within 6000 tokens of it one conversation at a time.
+
+model:
+  # The 4-layer checkpoint, whose compress_ratios of [0, 0, 4, 128] give exactly one CSA
+  # layer to train an indexer on. Named as the sibling config names its own checkpoint;
+  # point it at wherever yours lives.
+  model_path: DeepSeek-V4-Flash-Base-4L
+  # The feature. Off by default. These are fields of DeepSeek-V4's own config, beside the
+  # output_router_logits / router_aux_loss_coef pair the model's other auxiliary objective is
+  # configured through -- an objective is a property of the model, not a kernel selection --
+  # so they go under model_config and not under ops_implementation below.
+  model_config:
+    dsa_indexer_loss: true
+    # dsa_indexer_loss_coef: 1.0  # default; weight on the KL when it is folded into the loss
+  ops_implementation:
+    attn_implementation: eager
+    moe_implementation: fused_triton
+    cross_entropy_loss_implementation: liger_kernel
+    # The indexer loss refuses anything but TileLang on both of these: the eager indexer
+    # discards the per-slot scores the student needs, and the eager attention has no LSE to
+    # build the teacher from. They are already the sibling config's values; they are repeated
+    # here because the flag above depends on them, and the disagreement is refused at launch.
+    dsa_attention_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+    mhc_implementation: tilelang
+    rms_norm_implementation: liger_kernel
+    swiglu_mlp_implementation: liger_kernel
+    rotary_pos_emb_implementation: triton
+
+data:
+  # tulu-3-sft-mixture/data, not tulu-3-sft-mixture/. get_data_files lists a directory
+  # non-recursively and takes the extension of its first sorted entry; if the parent holds a
+  # .cache entry it raises " files are not supported" before it ever sees a parquet.
+  train_path: tulu-3-sft-mixture/data
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 8192
+  train_size: 100000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  # Packed, padding-free batching at a fixed 8192 tokens per micro-batch. See the header.
+  dyn_bsz: true
+  pad_to_length: true
+  accelerator:
+    # ulysses_size must stay 1: the indexer loss refuses Ulysses, because each rank would hold a
+    # head shard of the index scores and the teacher is built from the full head set. cp_size is
+    # refused too, and is left at its default of 1 here; DeepSeek-V4's forward has no
+    # context-parallel path, so a shard would be scored as though it were a whole sequence.
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    # Non-reentrant (the default). VeOmni's reentrant CheckpointFunction is broken against
+    # transformers v5 for every model, indexer loss or not -- it reads run_function.__self__
+    # while transformers hands it a functools.partial.
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    # Muon + AdamW, as the sibling config ships. The indexer's parameters carry gradients for
+    # the first time under this objective, so they join Muon's 2D group by dimensionality --
+    # which is the paper-faithful routing (V4 §2.4 puts everything but embeddings, the head,
+    # mHC biases and norms on Muon), and needs no configuration.
+    #
+    # muon_head_split_modules is deliberately unset. Head-split Muon reaches the indexer,
+    # whose up-projection is named q_b_proj like the main attention's, and this objective is
+    # what gives that matrix a gradient for the split to act on. Which of the two is meant has
+    # to be spelled out -- a bare [q_b_proj] is rejected, and the qualified forms are
+    # self_attn.q_b_proj and indexer.q_b_proj -- so the sibling config's commented-out
+    # self_attn.q_b_proj stays the paper-faithful choice here too.
+    type: muon
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.01
+    muon_ns_steps: 5
+    muon_ns_implementation: gram_quack
+    muon_adjust_lr_fn: match_rms_adamw
+    muon_expert_zero_comm: true
+  init_device: meta
+  enable_full_determinism: false
+  # Smoke run. Raise for a real job.
+  max_steps: 50
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: deepseek_v4_4l_indexer_loss_smoke
+    manager: dcp
+    # One checkpoint, at the last step. Without it the smoke run leaves nothing to
+    # read the indexer back out of, and the diagnostic's open question -- whether the
+    # KL plateau is the right tracking residual for a *trained* teacher -- cannot be
+    # asked at all. Equal to max_steps, so a run that stops there writes exactly once.
+    # save_epochs defaults to 1, so it has to be turned off explicitly, not just left out.
+    save_steps: 50
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: true
+    project: VeOmni
+    name: deepseek_v4_4l_indexer_loss_smoke

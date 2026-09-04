@@ -17,3 +17,6 @@ jobs:
 
       - name: Verify tasks/*.py paths in docs
         run: python3 scripts/ci/check_doc_task_paths.py
+
+      - name: Verify repo paths and skill refs in agent docs
+        run: python3 scripts/ci/check_agent_doc_paths.py

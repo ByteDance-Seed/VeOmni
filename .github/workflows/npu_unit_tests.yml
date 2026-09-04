@@ -161,6 +161,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -v -s -x tests/models/test_vlm_trainer.py
+          uv run --frozen pytest -v -s -x tests/trainer/test_aux_metrics.py
           uv run --frozen pytest -v -s -x tests/lora/test_vlm_lora.py
           uv run --frozen pytest -v -s -x tests/models/test_checkpoint_tensor_converter.py
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
@@ -181,6 +182,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run distributed tests (dummy_forward)
         run: |
+          uv run --frozen pytest -v -s -x tests/distributed/test_async_offload_unit.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
       - name: Run data tests
         run: |

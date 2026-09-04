@@ -59,20 +59,24 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    | `veomni/trainer/` | `trainer` |
    | `veomni/data/` | `data` |
    | `veomni/distributed/` | `dist` |
-   | `veomni/parallel/` | `parallel` |
    | `veomni/ops/` | `ops` |
    | `veomni/checkpoint/` | `ckpt` |
    | `veomni/optim/` | `optim` |
-   | `veomni/logging/` | `logging` |
    | `veomni/lora/` | `lora` |
    | `configs/` | `config` |
    | `docs/` | `docs` |
    | `tests/`, `.github/workflows/` | `ci` |
    | `docker/` | `docker` |
    | `tasks/` | `task` |
-   | `veomni/omni/` | `omni` |
    | `.agents/` | `agent` |
    | other / mixed | `misc` |
+
+   `parallel`, `logging`, `omni`, `perf` and `release` have no directory of
+   their own: use `parallel` when a `veomni/distributed/` change is about a
+   parallelism strategy rather than the plumbing, `perf` alongside another
+   module when the PR makes a measurable speed or memory claim, and `omni`,
+   `logging`, `release` for omni-model, log/telemetry-surface and
+   release-plumbing work respectively.
 
    Allowed modules: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `docker`, `trainer`, `agent`, `lora`
 
