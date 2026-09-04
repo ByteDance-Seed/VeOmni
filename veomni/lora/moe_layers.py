@@ -935,6 +935,29 @@ class LoraIndependentExperts(nn.Module):
         if not any(p.is_meta for n, p in self.named_parameters() if _is_lora_param_name(n)):
             self.reset_lora_parameters()
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        loaded_scaling = state_dict.get(prefix + "lora_scaling")
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if loaded_scaling is not None and loaded_scaling.numel() == 1 and not loaded_scaling.is_meta:
+            self._lora_scale_value = loaded_scaling.item()
+
     # ── PEFT-compatible accessors (same surface as LoraSharedExperts) ──────
 
     def _get_lora_container(self, role: str, param_name: str, adapter_name: str | None = None) -> _LoraParam3D:
@@ -1095,14 +1118,11 @@ class LoraIndependentExperts(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
 
-            # Per-expert LoRA on gate and up halves — independent rank-r
-            # adapters, both computed inside the per-expert loop. Cat the
-            # per-half deltas into [n_e, 2I] so the add lines up with the
-            # merged ``gate_up_proj`` output before chunk + SiLU.
-            gate_delta = F.linear(F.linear(current_state, a_gate[expert_idx]), b_gate[expert_idx]) * scale  # [n_e, I]
-            up_delta = F.linear(F.linear(current_state, a_up[expert_idx]), b_up[expert_idx]) * scale  # [n_e, I]
-            gate_up = F.linear(current_state, gate_up_w[expert_idx]) + torch.cat([gate_delta, up_delta], dim=-1)
-            gate, up = gate_up.chunk(2, dim=-1)
+            gate, up = F.linear(current_state, gate_up_w[expert_idx]).chunk(2, dim=-1)
+            gate_hidden = F.linear(current_state, a_gate[expert_idx])
+            up_hidden = F.linear(current_state, a_up[expert_idx])
+            gate = torch.addmm(gate, gate_hidden, b_gate[expert_idx].T, alpha=self._lora_scale_value)
+            up = torch.addmm(up, up_hidden, b_up[expert_idx].T, alpha=self._lora_scale_value)
             mid = self.act_fn(gate) * up
 
             lora_x_down = F.linear(F.linear(mid, a_dn[expert_idx]), b_dn[expert_idx]) * scale
