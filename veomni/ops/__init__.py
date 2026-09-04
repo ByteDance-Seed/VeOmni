@@ -25,7 +25,7 @@ from . import kernels  # noqa: F401  triggers all register_op() calls
 from .config.registry import apply_global_ops
 from .config.singleton import set_ops_config
 from .dispatch import OpSlot
-from .kernels import attention, cross_entropy, load_balancing_loss  # noqa: F401
+from .kernels import cross_entropy, load_balancing_loss  # noqa: F401
 from .kernels.load_balancing_loss import load_balancing_loss_func
 
 
@@ -42,31 +42,15 @@ logger = logging.get_logger(__name__)
 
 def build_ALL_OPS():
     return [
-        ("_flash_attention_forward", attention.flash._flash_attention_forward),
-        ("_flex_attention_forward", attention.flex._flex_attention_forward),
-        ("_magi_attention_forward", attention.magi._magi_attention_forward),
         ("_load_balancing_loss", load_balancing_loss._load_balancing_loss),
     ]
 
 
 def apply_ops_patch():
-    """Import-time ops patch — attention only.
+    """Leftover import-time hook. Attention now installs via ``apply_kernel_patch``."""
+    from ..kernels import apply_kernel_patch
 
-    Registers VeOmni's SP-aware attention variants into the shared
-    ``ALL_ATTENTION_FUNCTIONS`` registry. Loss dispatch (``LOSS_MAPPING``) is
-    deferred to ``apply_ops_config`` so there is a single binding point that
-    consumes ``OpsImplementationConfig``; ``build_foundation_model`` invokes
-    it automatically when callers pass ``ops_implementation=...`` (and
-    installs defaults otherwise).
-    """
-    modeling_backend = get_env("MODELING_BACKEND")
-    if modeling_backend == "hf":
-        logger.info_rank0("⚠️ Skip applying ops patch. Using huggingface transformers backend.")
-    else:
-        from .kernels.attention import apply_veomni_attention_patch
-
-        apply_veomni_attention_patch()
-        logger.info_rank0("✅ VeOmni attention patches applied.")
+    apply_kernel_patch()
 
 
 def apply_ops_config(ops_config: OpsImplementationConfig) -> None:

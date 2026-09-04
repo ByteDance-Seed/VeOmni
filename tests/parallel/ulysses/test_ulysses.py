@@ -20,6 +20,7 @@ if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backen
 import pytest
 import torch.distributed as dist
 from torch.testing._internal.common_utils import run_tests
+from transformers.masking_utils import create_causal_mask
 
 from veomni.distributed.sequence_parallel.comm import (
     get_ulysses_sequence_parallel_group,
@@ -27,11 +28,11 @@ from veomni.distributed.sequence_parallel.comm import (
 )
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
-from veomni.models.transformers.masking_utils import create_causal_mask
-from veomni.ops.kernels.attention import flash as flash_backend
-from veomni.ops.kernels.attention import flex as flex_backend
-from veomni.ops.kernels.attention import magi as magi_backend
-from veomni.ops.kernels.attention.magi import _fa4_cuda as magi_fa4_backend
+from veomni.kernels._kernels.attention.standard import flash as flash_backend
+from veomni.kernels._kernels.attention.standard import flex as flex_backend
+from veomni.kernels._kernels.attention.standard import magi as magi_backend
+from veomni.kernels._kernels.attention.standard.magi import _kernel as magi_kernel
+from veomni.kernels.mask import MagiAttentionMask
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention
@@ -174,7 +175,7 @@ class AsyncAttentionSequenceParallelTest(SequenceParallelTest):
 class _FakeFlashAttentionModule(nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(_attn_implementation="veomni_flash_attention_2_with_sp")
+        self.config = SimpleNamespace(_attn_implementation="veomni_flash_attention_2")
         self.is_causal = False
         self.proj = nn.Linear(1, 1, bias=False)
 
@@ -188,7 +189,7 @@ class _FakeFlexAttentionModule(nn.Module):
 class _FakeMagiAttentionModule(nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(_attn_implementation="veomni_magi_attention_with_sp")
+        self.config = SimpleNamespace(_attn_implementation="veomni_magi_attention")
 
 
 _MAGI_PACKAGE_AVAILABLE = importlib.util.find_spec("magi_attention") is not None
@@ -198,7 +199,7 @@ def _build_magi_mask(mask_case: str, sequence_length: int, device: torch.device)
     if mask_case in {"causal", "full"}:
         ranges = torch.tensor([[0, sequence_length]], device=device, dtype=torch.int32)
         attn_type_map = torch.tensor([1], device=device, dtype=torch.int32) if mask_case == "causal" else None
-        return magi_backend.MagiAttentionMask(ranges, ranges.clone(), attn_type_map)
+        return MagiAttentionMask.from_ranges(ranges, ranges.clone(), attn_type_map)
 
     if mask_case != "bagel_mixed":
         raise ValueError(f"Unsupported mask case: {mask_case}")
@@ -226,10 +227,10 @@ def _build_magi_mask(mask_case: str, sequence_length: int, device: torch.device)
             clean_spans.append((span_start, span_end))
         span_start = span_end
 
-    return magi_backend.MagiAttentionMask(
-        q_ranges=torch.tensor(q_ranges, device=device, dtype=torch.int32),
-        k_ranges=torch.tensor(k_ranges, device=device, dtype=torch.int32),
-        attn_type_map=torch.tensor(attn_types, device=device, dtype=torch.int32),
+    return MagiAttentionMask.from_ranges(
+        torch.tensor(q_ranges, device=device, dtype=torch.int32),
+        torch.tensor(k_ranges, device=device, dtype=torch.int32),
+        torch.tensor(attn_types, device=device, dtype=torch.int32),
     )
 
 
@@ -286,15 +287,18 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         module = _FakeFlashAttentionModule().to(device)
         original_backend = flash_backend._flash_attention_forward
         original_get_parallel_state = flash_backend.get_parallel_state
+        original_should_apply = flash_backend.should_apply_ulysses
         try:
             flash_backend._flash_attention_forward = _sdpa_flash_oracle
-            flash_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_enabled=False)
+            flash_backend.should_apply_ulysses = lambda *, skip_ulysses=False: False
+            flash_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_size=1, async_enabled=False)
             baseline_output, _ = flash_backend.flash_attention_forward(module, *baseline, attention_mask=None)
 
+            flash_backend.should_apply_ulysses = lambda *, skip_ulysses=False: not skip_ulysses
             flash_backend.get_parallel_state = lambda: SimpleNamespace(
-                ulysses_enabled=True,
                 ulysses_group=group,
                 ulysses_size=world_size,
+                async_enabled=False,
             )
             local_output, _ = flash_backend.flash_attention_forward(module, *local, attention_mask=None)
 
@@ -305,6 +309,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         finally:
             flash_backend._flash_attention_forward = original_backend
             flash_backend.get_parallel_state = original_get_parallel_state
+            flash_backend.should_apply_ulysses = original_should_apply
 
     @pytest.mark.skipif(
         not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
@@ -337,8 +342,10 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         )
         module = _FakeFlexAttentionModule().to(device)
         original_get_parallel_state = flex_backend.get_parallel_state
+        original_should_apply = flex_backend.should_apply_ulysses
         try:
-            flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_enabled=False)
+            flex_backend.should_apply_ulysses = lambda *, skip_ulysses=False: False
+            flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_size=1, async_enabled=False)
             baseline_output, baseline_lse = flex_backend.flex_attention_forward(
                 module,
                 *baseline,
@@ -347,10 +354,11 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 s_aux=head_auxiliary,
             )
 
+            flex_backend.should_apply_ulysses = lambda *, skip_ulysses=False: not skip_ulysses
             flex_backend.get_parallel_state = lambda: SimpleNamespace(
-                ulysses_enabled=True,
                 ulysses_group=group,
                 ulysses_size=world_size,
+                async_enabled=False,
             )
             local_output, local_lse = flex_backend.flex_attention_forward(
                 module,
@@ -367,6 +375,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             self._assert_qkv_gradients(local, baseline)
         finally:
             flex_backend.get_parallel_state = original_get_parallel_state
+            flex_backend.should_apply_ulysses = original_should_apply
 
     @pytest.mark.skipif(
         not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2,
@@ -381,13 +390,15 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             seed=9192,
         )
         config = PreTrainedConfig()
-        config._attn_implementation = "veomni_flex_attention_with_sp"
+        config._attn_implementation = "veomni_flex_attention"
         attention_mask = torch.ones(1, sequence_length, device=device, dtype=torch.long)
         cu_seq_lens_q = torch.tensor([0, 3, 8, 12, 16], device=device, dtype=torch.int32)
         module = _FakeFlexAttentionModule().to(device)
         original_get_parallel_state = flex_backend.get_parallel_state
+        original_should_apply = flex_backend.should_apply_ulysses
         try:
-            flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_enabled=False)
+            flex_backend.should_apply_ulysses = lambda *, skip_ulysses=False: False
+            flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_size=1, async_enabled=False)
             baseline_block_mask = create_causal_mask(
                 config=config,
                 inputs_embeds=torch.empty(1, sequence_length, 1, device=device),
@@ -402,10 +413,11 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 kernel_options={"BACKEND": "TRITON"},
             )
 
+            flex_backend.should_apply_ulysses = lambda *, skip_ulysses=False: not skip_ulysses
             flex_backend.get_parallel_state = lambda: SimpleNamespace(
-                ulysses_enabled=True,
                 ulysses_group=group,
                 ulysses_size=world_size,
+                async_enabled=False,
             )
             local_block_mask = create_causal_mask(
                 config=config,
@@ -434,6 +446,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
             self._assert_qkv_gradients(local, baseline)
         finally:
             flex_backend.get_parallel_state = original_get_parallel_state
+            flex_backend.should_apply_ulysses = original_should_apply
 
     @pytest.mark.skipif(
         not IS_CUDA_AVAILABLE or not _MAGI_PACKAGE_AVAILABLE or get_torch_device().device_count() < 2,
@@ -443,15 +456,16 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
         group = self._get_process_group()
         rank = dist.get_rank(group)
         device = torch.device(get_device_type(), rank)
-        kernel_mode = magi_fa4_backend._get_magi_kernel_mode(device)
-        if kernel_mode == magi_fa4_backend._MAGI_KERNEL_UNSUPPORTED:
+        kernel_mode = magi_kernel.get_kernel_mode(device)
+        if kernel_mode == magi_kernel.KERNEL_UNSUPPORTED:
             self.skipTest("MagiAttention does not support this GPU architecture")
         try:
-            magi_fa4_backend._prepare_default_magi_kernel(device)
+            magi_kernel.prepare_kernel(device)
         except (ImportError, RuntimeError) as error:
             self.skipTest(str(error))
 
         original_get_parallel_state = magi_backend.get_parallel_state
+        original_should_apply = magi_backend.should_apply_ulysses
         try:
             dtype = torch.bfloat16
             for mask_idx, mask_case in enumerate(("causal", "full", "bagel_mixed")):
@@ -465,9 +479,11 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 attention_mask = _build_magi_mask(mask_case, 128, device)
                 module = _FakeMagiAttentionModule().to(device)
 
+                magi_backend.should_apply_ulysses = lambda *, skip_ulysses=False: False
                 magi_backend.get_parallel_state = lambda: SimpleNamespace(
                     cp_size=1,
-                    ulysses_enabled=False,
+                    ulysses_size=1,
+                    async_enabled=False,
                 )
                 baseline_output, baseline_lse = magi_backend.magi_attention_forward(
                     module,
@@ -475,11 +491,12 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                     attention_mask,
                 )
 
+                magi_backend.should_apply_ulysses = lambda *, skip_ulysses=False: not skip_ulysses
                 magi_backend.get_parallel_state = lambda group=group, world_size=world_size: SimpleNamespace(
                     cp_size=1,
-                    ulysses_enabled=True,
                     ulysses_group=group,
                     ulysses_size=world_size,
+                    async_enabled=False,
                 )
                 local_output, local_lse = magi_backend.magi_attention_forward(
                     module,
@@ -509,6 +526,7 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
                 self._assert_qkv_gradients(local, baseline)
         finally:
             magi_backend.get_parallel_state = original_get_parallel_state
+            magi_backend.should_apply_ulysses = original_should_apply
 
 
 if __name__ == "__main__":

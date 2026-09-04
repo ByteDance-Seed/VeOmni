@@ -1097,6 +1097,7 @@ class OpsImplementationConfig:
             "flash_attention_4",
             "flex_attention",
             "magi_attention",
+            "sage_attention",
             "native-sparse",
             "veomni_flash_attention_2",
             "veomni_flash_attention_3",
@@ -1109,8 +1110,8 @@ class OpsImplementationConfig:
     ] = field(
         default="flash_attention_2",
         metadata={
-            "help": "Attention implementation. Stock names (flash_attention_2, flex_attention, "
-            "magi_attention, ...) rewrite to the matching veomni_* adapter when "
+            "help": "Attention implementation. Short names (flash_attention_2, flex_attention, "
+            "magi_attention, sage_attention, sdpa) rewrite to the matching veomni_* adapter when "
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
@@ -1120,8 +1121,7 @@ class OpsImplementationConfig:
             "help": "MoE experts forward. 'triton' (default, GPU SM70+ or MLU) | "
             "'quack' (GPU SM90+) | 'npu' (NPU) | 'mlu' (MLU Apex grouped-GEMM) | 'eager'. "
             "On NPU, a default-valued 'triton' selection maps to 'npu'; "
-            "incompatible non-default overrides raise. Legacy 'fused' auto-resolves to "
-            "quack/npu/mlu-or-triton with a deprecation warning."
+            "incompatible non-default overrides raise."
         },
     )
     cross_entropy_loss_implementation: str = field(
@@ -1226,36 +1226,13 @@ class OpsImplementationConfig:
                 "flash_attention_4": "veomni_flash_attention_4",
                 "flex_attention": "veomni_flex_attention",
                 "magi_attention": "veomni_magi_attention",
-                "veomni_flash_attention_2_with_sp": "veomni_flash_attention_2",
-                "veomni_flash_attention_3_with_sp": "veomni_flash_attention_3",
-                "veomni_flash_attention_4_with_sp": "veomni_flash_attention_4",
-                "veomni_flex_attention_with_sp": "veomni_flex_attention",
-                "veomni_magi_attention_with_sp": "veomni_magi_attention",
+                "sage_attention": "veomni_sage_attention",
+                "sdpa": "veomni_sdpa",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
                 logger.info_rank0(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
                 self.attn_implementation = new_impl
-
-        # Legacy alias: ``moe_implementation='fused'`` resolves to a
-        # hardware-appropriate kernel — Quack on GPU, NPU group-gemm on
-        # Ascend, Apex or Triton on Cambricon MLU. Kept for back-compat with
-        # pre-#678 YAMLs; warn so users migrate to the explicit name.
-        if self.moe_implementation == "fused":
-            from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available, is_torch_npu_available
-
-            if is_torch_npu_available():
-                resolved = "npu"
-            elif is_torch_mlu_available():
-                resolved = "mlu" if is_apex_mlu_available() else "triton"
-            else:
-                resolved = "quack"
-
-            logger.warning_rank0(
-                f"moe_implementation='fused' is a deprecated alias; resolving to '{resolved}' on this host. "
-                f"Set moe_implementation='{resolved}' explicitly to silence this warning."
-            )
-            self.moe_implementation = resolved
 
         self._apply_npu_default_fallback()
         self._apply_mlu_default_fallback()

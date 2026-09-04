@@ -78,6 +78,55 @@ _MAGI_FFA_REASON = (
 )
 
 
+def test_magi_attention_preserves_ffa_layout_and_scale(monkeypatch):
+    captured = {}
+
+    def fake_backend(query, key, value, q_ranges, k_ranges, attn_type_map, **kwargs):
+        captured.update(
+            query=query,
+            key=key,
+            value=value,
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_type_map=attn_type_map,
+            kwargs=kwargs,
+        )
+        output = query + 1
+        return output, SimpleNamespace(lse=torch.ones(query.shape[:2]))
+
+    monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
+    monkeypatch.setattr(magi_backend, "_magi_attention_forward", fake_backend)
+    query = torch.randn(1, 4, 8, 16)
+    key = torch.randn(1, 2, 8, 16)
+    value = torch.randn(1, 2, 8, 16)
+    attn_type_map = torch.tensor([1], dtype=torch.int32)
+    attention_mask = MagiAttentionMask.from_ranges(
+        torch.tensor([[0, 8]]),
+        torch.tensor([[0, 8]]),
+        attn_type_map,
+    )
+
+    output, lse = magi_backend.magi_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling=0.25,
+        softcap=30.0,
+    )
+
+    assert captured["query"].shape == (8, 4, 16)
+    assert captured["key"].shape == (8, 2, 16)
+    assert captured["value"].shape == (8, 2, 16)
+    assert captured["q_ranges"] is attention_mask.q_ranges
+    assert captured["k_ranges"] is attention_mask.k_ranges
+    assert captured["attn_type_map"] is attn_type_map
+    assert captured["kwargs"] == {"softmax_scale": 0.25, "softcap": 30.0}
+    torch.testing.assert_close(output, query.transpose(1, 2) + 1)
+    assert lse.shape == (1, 4, 8)
+
+
 def test_magi_attention_rejects_unsupported_features(monkeypatch):
     monkeypatch.setattr(magi_backend, "get_parallel_state", lambda: _cp1_state())
     query = torch.randn(1, 4, 8, 16)

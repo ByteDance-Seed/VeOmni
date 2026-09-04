@@ -167,3 +167,82 @@ def test_flash_attention_skip_ulysses_skips_exchange_and_is_not_forwarded(monkey
         contract_marker=object(),
     )
     assert "skip_ulysses" not in captured["kwargs"]
+
+
+def test_flash_attention_forwards_fa4_sinks_and_sliding_window(monkeypatch):
+    captured = {}
+
+    def fake_flash(query, key, value, attention_mask, **kwargs):
+        captured.update(kwargs)
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
+    module = _FakeAttentionModule("veomni_flash_attention_4")
+    query = torch.randn(1, 2, 3, 4)
+    sinks = torch.randn(2)
+
+    output, attention_weights = flash_backend.flash_attention_forward(
+        module,
+        query,
+        query[:, :1],
+        query[:, :1],
+        attention_mask=None,
+        scaling=0.5,
+        sliding_window=8,
+        s_aux=sinks,
+    )
+
+    assert output.shape == (1, 3, 2, 4)
+    assert attention_weights is None
+    assert captured["attn_implementation"] == "veomni_flash_attention_4"
+    assert captured["sliding_window"] == 8
+    assert captured["s_aux"] is sinks
+    assert captured["softmax_scale"] == 0.5
+    assert captured["layer_idx"] == 7
+
+
+def test_gpt_oss_attention_passes_learnable_sinks_through_hf_dict():
+    from transformers import GptOssConfig
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.models.gpt_oss.modeling_gpt_oss import GptOssAttention
+
+    captured = {}
+    backend_name = "veomni_test_gpt_oss_attention"
+
+    def fake_attention_backend(module, query, key, value, attention_mask, **kwargs):
+        captured["module"] = module
+        captured["s_aux"] = kwargs["s_aux"]
+        captured["sliding_window"] = kwargs["sliding_window"]
+        return torch.zeros_like(query.transpose(1, 2)), None
+
+    ALL_ATTENTION_FUNCTIONS.register(backend_name, fake_attention_backend)
+    try:
+        config = GptOssConfig(
+            hidden_size=16,
+            head_dim=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=1,
+            layer_types=["sliding_attention"],
+            sliding_window=8,
+        )
+        config._attn_implementation = backend_name
+        attention = GptOssAttention(config, layer_idx=0)
+        hidden_states = torch.randn(1, 3, 16)
+        cos = torch.ones(1, 3, 2)
+        sin = torch.zeros(1, 3, 2)
+
+        output, attention_weights = attention(
+            hidden_states,
+            position_embeddings=(cos, sin),
+            attention_mask=None,
+        )
+    finally:
+        type(ALL_ATTENTION_FUNCTIONS)._global_mapping.pop(backend_name, None)
+
+    assert output.shape == hidden_states.shape
+    assert attention_weights is None
+    assert captured["module"] is attention
+    assert captured["s_aux"] is attention.sinks
+    assert captured["sliding_window"] == 8
