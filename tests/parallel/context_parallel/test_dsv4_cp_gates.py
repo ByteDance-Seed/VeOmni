@@ -30,7 +30,12 @@ is stubbed.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 from veomni.distributed import parallel_state as parallel_state_module
+from veomni.models import auto as auto_module
 from veomni.models.auto import build_config, check_context_parallel_supported
 
 
@@ -41,3 +46,16 @@ def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
     monkeypatch.setattr(parallel_state_module.dist, "get_world_size", lambda: 2)
 
     check_context_parallel_supported(build_config("tests/toy_config/qwen3_toy"))
+
+
+def test_gate_rejects_context_parallel_on_npu(monkeypatch):
+    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(
+        auto_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True),
+    )
+    monkeypatch.setattr(auto_module, "is_torch_npu_available", lambda: True)
+
+    with pytest.raises(NotImplementedError, match="GPU-only"):
+        check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))

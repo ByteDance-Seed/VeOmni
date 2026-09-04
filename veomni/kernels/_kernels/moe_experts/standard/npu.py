@@ -73,18 +73,7 @@ def npu_group_gemm(x, weight, group_list):
     return output
 
 
-def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
-    """gpt-oss-style clamped SwiGLU (DeepSeek-V4).
-
-    ``torch_npu.npu_swiglu`` is a fused kernel with no clamp support, so this
-    manual (unfused) path is only taken when ``swiglu_limit`` is set -- today
-    that is exclusively DeepSeek-V4's ``PatchedDeepseekV4Experts`` (see
-    ``deepseek_v4_gpu_patch_gen_config.py``). Chunk convention and clamp
-    bounds mirror that class's eager ``_apply_gate`` exactly: first half of
-    the last dim is ``gate`` (clamped to ``max=limit``), second half is ``up``
-    (clamped to ``[-limit, limit]``), activation is SiLU (DeepSeek-V4's
-    ``config.hidden_act``).
-    """
+def _eager_clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
     gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(max=limit)
     up = up.clamp(min=-limit, max=limit)
@@ -106,6 +95,24 @@ def _fc1_weight(
     if fc1_1_weight is None or fc1_2_weight is None:
         raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
     return torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
+
+
+def _is_triton_ascend_available() -> bool:
+    try:
+        from triton._C import libtriton
+    except ImportError:
+        return False
+    return hasattr(libtriton, "ascend")
+
+
+def _clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """Use Ascend Triton when available and preserve the eager training fallback."""
+    if _is_triton_ascend_available():
+        from ..shared.npu_clamped_swiglu import npu_triton_clamped_swiglu
+
+        return npu_triton_clamped_swiglu(x, limit)
+
+    return _eager_clamped_swiglu(x, limit)
 
 
 def _swiglu(x: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:

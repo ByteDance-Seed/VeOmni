@@ -464,13 +464,11 @@ def test_models_patch_fwd_bwd(
     # compressor concatenation. The default FA-based mode grid would fail at
     # ``TrainerTest(hf_model_modes[0])`` with
     # ``ValueError: DeepseekV4ForCausalLM does not support Flash Attention 2``.
-    # Keep attention eager, but exercise VeOmni's default GPU MoE path: the
-    # DeepSeek-V4 experts patch forwards ``swiglu_limit`` into the fused kernel.
-    # NPU fused MoE still raises for that clamp, so NPU keeps the eager MoE
-    # baseline until ``fused_npu`` implements ``swiglu_limit``.
+    # Keep attention eager, but exercise the clamp-aware fused MoE path on each
+    # backend: DeepSeek-V4 forwards ``swiglu_limit`` into triton/npu.
     if case_id == "deepseek_v4":
         hf_model_modes = [ModelMode("hf", "eager")]
-        moe_impl = "eager" if IS_NPU_AVAILABLE else "triton"
+        moe_impl = "npu" if get_device_type() == "npu" else "triton"
         veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
 
     # Qwen3.5 compatibility:

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import importlib
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +27,8 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 _REGISTRY_MODULE = "veomni.ops.kernel_registry"
+_NPU_GROUP_GEMM_MODULE = "veomni.kernels._kernels.moe_experts.standard.npu"
+_NPU_CLAMPED_SWIGLU_MODULE = "veomni.kernels._kernels.moe_experts.shared.npu_clamped_swiglu"
 
 
 class _RecordingSlot:
@@ -38,6 +41,80 @@ class _RecordingSlot:
     def __call__(self, *args):
         self.args = args
         return self.output
+
+
+@pytest.fixture
+def npu_group_gemm_module(monkeypatch):
+    fake_torch_npu = ModuleType("torch_npu")
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    module = importlib.import_module(_NPU_GROUP_GEMM_MODULE)
+    yield module, fake_torch_npu
+
+
+def test_deepseek_v4_npu_swiglu_dispatches_by_limit(monkeypatch, npu_group_gemm_module):
+    module, fake_torch_npu = npu_group_gemm_module
+    x = torch.empty((2, 16), dtype=torch.bfloat16)
+    clamped_output = object()
+    unclamped_output = object()
+    calls = []
+
+    def fake_clamped_swiglu(actual_x, limit):
+        calls.append(("clamped", actual_x is x, limit))
+        return clamped_output
+
+    def fake_npu_swiglu(actual_x, *, dim):
+        calls.append(("unclamped", actual_x is x, dim))
+        return unclamped_output
+
+    monkeypatch.setattr(module, "_clamped_swiglu", fake_clamped_swiglu)
+    fake_torch_npu.npu_swiglu = fake_npu_swiglu
+
+    assert module._swiglu(x, 7.0) is clamped_output
+    assert module._swiglu(x, None) is unclamped_output
+    assert calls == [("clamped", True, 7.0), ("unclamped", True, -1)]
+
+
+def test_deepseek_v4_npu_clamped_swiglu_missing_triton_uses_eager(monkeypatch, npu_group_gemm_module):
+    module, _ = npu_group_gemm_module
+    monkeypatch.setattr(module, "_is_triton_ascend_available", lambda: False)
+    source = torch.tensor([[8.0, -7.0, 9.0, -9.0]], requires_grad=True)
+    expected_input = source.detach().clone().requires_grad_()
+
+    actual = module._clamped_swiglu(source, 7.0)
+    expected_gate, expected_up = expected_input.chunk(2, dim=-1)
+    expected = torch.nn.functional.silu(expected_gate.clamp(max=7.0)) * expected_up.clamp(min=-7.0, max=7.0)
+    grad_output = torch.tensor([[0.25, -0.5]])
+    actual.backward(grad_output)
+    expected.backward(grad_output)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(source.grad, expected_input.grad, rtol=0, atol=0)
+
+
+def test_deepseek_v4_npu_clamped_swiglu_requires_ascend_backend(monkeypatch, npu_group_gemm_module):
+    module, _ = npu_group_gemm_module
+    fake_triton = ModuleType("triton")
+    fake_triton.__path__ = []
+    fake_triton_c = ModuleType("triton._C")
+    fake_triton_c.libtriton = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "triton", fake_triton)
+    monkeypatch.setitem(sys.modules, "triton._C", fake_triton_c)
+
+    assert not module._is_triton_ascend_available()
+    fake_triton_c.libtriton.ascend = object()
+    assert module._is_triton_ascend_available()
+
+
+def test_deepseek_v4_npu_clamped_swiglu_dispatches_to_ascend_triton(monkeypatch, npu_group_gemm_module):
+    module, _ = npu_group_gemm_module
+    x = torch.empty((1, 2))
+    output = object()
+    fake_kernel = ModuleType(_NPU_CLAMPED_SWIGLU_MODULE)
+    fake_kernel.npu_triton_clamped_swiglu = lambda actual_x, limit: output if actual_x is x and limit == 7.0 else None
+    monkeypatch.setitem(sys.modules, _NPU_CLAMPED_SWIGLU_MODULE, fake_kernel)
+    monkeypatch.setattr(module, "_is_triton_ascend_available", lambda: True)
+
+    assert module._clamped_swiglu(x, 7.0) is output
 
 
 def test_deepseek_v4_declares_liger_opslots():

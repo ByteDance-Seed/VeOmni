@@ -84,6 +84,7 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "embedding",
     "lm_head",
     "output_layer",
+    "conv1d",
 )
 
 # Attribute names carrying a head count and a per-head row stride. MLA modules
