@@ -18,10 +18,13 @@
 import datetime
 import gc
 import logging as builtin_logging
+import multiprocessing
 import os
 import random
+import shlex
 import subprocess
 import sys
+import time
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
@@ -64,8 +67,137 @@ if IS_NPU_AVAILABLE:
 
 # internal use
 VALID_CONFIG_TYPE = None
+# Platform integrations assign this module global after import. An explicit
+# user override is read separately from the environment in ``handler_fn``.
 VEOMNI_UPLOAD_CMD = None
 FlopsCounter = None
+
+
+def validate_npu_profile_config(trace_dir: str, npu_analysis_mode: str) -> None:
+    """Validate rank-shared NPU options before rank-local profiler creation."""
+    if IS_NPU_AVAILABLE and npu_analysis_mode == "async" and trace_dir.startswith("hdfs://"):
+        raise ValueError(
+            "NPU async analysis requires a pod-local trace_dir. Background analysis is still writing its output, "
+            "so an hdfs:// destination cannot be copied safely from on_trace_ready."
+        )
+
+
+def _should_upload_npu_profile_to_merlin(enabled: bool) -> bool:
+    """Auto-enable Merlin upload in a JobRun; the sidecar selects the uploader."""
+    if not enabled:
+        return False
+    has_merlin_context = bool(
+        os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID") or os.getenv("ARNOLD_TRIAL_ID")
+    )
+    return has_merlin_context
+
+
+def spawn_npu_offline_sidecar(
+    raw_dir: str,
+    *,
+    copy_to: Optional[str] = None,
+    analyse: bool = True,
+    upload_cmd: Optional[str] = None,
+    merlin_upload: bool = False,
+    platform_associated_upload: bool = False,
+    job_associated_upload: bool = False,
+) -> Optional[subprocess.Popen]:
+    """Fire-and-forget offline Ascend postprocess so training is not blocked.
+
+    The sidecar runs in a new session so it can outlive a soft train shutdown.
+    Logs go to ``<raw_dir>/veomni_npu_offline_postprocess.log``.
+    """
+    cmd = [sys.executable, "-m", "veomni.utils.npu_offline_postprocess", "--raw-dir", raw_dir]
+    if copy_to:
+        cmd.extend(["--copy-to", copy_to])
+    if analyse:
+        cmd.append("--analyse")
+    if upload_cmd:
+        cmd.extend(["--upload-cmd", upload_cmd])
+    if merlin_upload:
+        cmd.append("--merlin-upload")
+
+    if not (copy_to or analyse or upload_cmd or merlin_upload):
+        logger.warning("spawn_npu_offline_sidecar called with nothing to do; skipping")
+        return None
+
+    log_path = os.path.join(
+        raw_dir if os.path.isdir(raw_dir) else os.path.dirname(raw_dir) or ".",
+        "veomni_npu_offline_postprocess.log",
+    )
+    log_fh = None
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        log_fh = open(log_path, "a", encoding="utf-8")
+        sidecar_env = None
+        if platform_associated_upload:
+            trial_id = os.getenv("ARNOLD_TRIAL_ID")
+            job_id = os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID")
+            if trial_id:
+                sidecar_env = os.environ.copy()
+                sidecar_env["ARNOLD_TRIAL_ID"] = trial_id
+                sidecar_env.pop("RH2_JOB_RUN_ID", None)
+                sidecar_env.pop("MERLIN_JOB_ID", None)
+                sidecar_env.pop("ARNOLD_RUN_ID", None)
+            elif job_id:
+                sidecar_env = os.environ.copy()
+                sidecar_env["MERLIN_JOB_ID"] = job_id
+                sidecar_env.pop("ARNOLD_TRIAL_ID", None)
+                sidecar_env.pop("ARNOLD_RUN_ID", None)
+        elif job_associated_upload:
+            # Compatibility for direct callers of the former keyword: retain
+            # its JobRun-first environment semantics.
+            job_id = os.getenv("RH2_JOB_RUN_ID") or os.getenv("MERLIN_JOB_ID")
+            if job_id:
+                sidecar_env = os.environ.copy()
+                sidecar_env["MERLIN_JOB_ID"] = job_id
+                sidecar_env.pop("ARNOLD_TRIAL_ID", None)
+                sidecar_env.pop("ARNOLD_RUN_ID", None)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=sidecar_env,
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to spawn NPU offline postprocess sidecar: {exc}")
+        return None
+    finally:
+        if log_fh is not None:
+            log_fh.close()
+
+    logger.info(f"Spawned NPU offline postprocess sidecar pid={proc.pid} log={log_path} cmd={shlex.join(cmd)}")
+    return proc
+
+
+def wait_npu_profile_sidecars(profiler, timeout_seconds: float = 300.0) -> None:
+    """Wait briefly for detached NPU postprocess work after training is done."""
+    sidecars = tuple(getattr(profiler, "_veomni_npu_sidecars", ()))
+    if not sidecars:
+        return
+    logger.info(f"Waiting for {len(sidecars)} NPU profile sidecar(s), total timeout={timeout_seconds:.1f}s.")
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    for proc in sidecars:
+        started = time.perf_counter()
+        try:
+            return_code = proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"NPU profile sidecar pid={proc.pid} is still running when the "
+                f"{timeout_seconds:.1f}s total wait budget expired; "
+                "the raw local capture is preserved, but durable copy/upload may still be incomplete."
+            )
+            continue
+        duration = time.perf_counter() - started
+        if return_code == 0:
+            logger.info(f"NPU_PROFILE_SIDECAR_WAIT pid={proc.pid} status=completed duration_seconds={duration:.6f}")
+        else:
+            logger.warning(
+                f"NPU profile sidecar pid={proc.pid} exited with return code {return_code}; "
+                "inspect veomni_npu_offline_postprocess.log and preserve the raw capture."
+            )
 
 
 def convert_hdfs_fuse_path(*args, **kwargs):
@@ -672,7 +804,11 @@ def make_list(item):
 
 
 class ProfilerWithMem:
-    """Thin wrapper that toggles CUDA-allocator tracing around profiler.step()"""
+    """Thin wrapper that toggles CUDA-allocator tracing around profiler.step().
+
+    This is intentionally CUDA-only; Ascend memory events are owned by
+    ``torch_npu.profiler`` and remain in its trace output.
+    """
 
     def __init__(self, inner):
         self._p = inner
@@ -707,6 +843,9 @@ def create_profiler(
     with_stack: bool,
     with_modules: bool,
     global_rank: int,
+    npu_analysis_mode: str = "offline",
+    npu_postprocess: bool = True,
+    npu_upload: bool = True,
 ):
     """
     Creates a profiler to record the CPU and CUDA / MLU activities. Default export to trace.json.
@@ -721,62 +860,192 @@ def create_profiler(
         record_shapes (bool): Whether to record the shapes of the tensors.
         profile_memory (bool): Whether to profile the memory usage.
         with_stack (bool): Whether to include the stack trace.
+        npu_analysis_mode (str): Ascend analysis mode: ``offline`` or ``async``.
+        npu_postprocess (bool): Whether to analyse/copy an offline NPU capture in a sidecar.
+        npu_upload (bool): Whether the offline sidecar may upload a parsed trace asset.
     """
 
+    if npu_analysis_mode not in {"offline", "async"}:
+        raise ValueError(f"Invalid npu_analysis_mode={npu_analysis_mode!r}; expected one of: offline, async.")
+
+    validate_npu_profile_config(trace_dir, npu_analysis_mode)
+    is_hdfs_trace = trace_dir.startswith("hdfs://")
+
+    effective_npu_analysis_mode = npu_analysis_mode
+    npu_sidecars: list[subprocess.Popen] = []
+
     def handler_fn(p):
-        time = int(datetime.datetime.now().timestamp())
+        timestamp = int(datetime.datetime.now().timestamp())
 
         trace_file_extention = "pt.trace.json.gz"
         gpu_memory_file_extension = "pkl"
 
-        if trace_dir.startswith("hdfs://"):
-            hdfs_io.makedirs(trace_dir, exist_ok=True)
+        if is_hdfs_trace:
+            if not IS_NPU_AVAILABLE:
+                hdfs_io.makedirs(trace_dir, exist_ok=True)
             os.makedirs(CACHE_DIR, exist_ok=True)
-            trace_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
-            gpu_memory_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
+            trace_file = os.path.join(CACHE_DIR, f"veomni_rank{global_rank}_{timestamp}.{trace_file_extention}")
+            gpu_memory_file = os.path.join(
+                CACHE_DIR, f"veomni_rank{global_rank}_{timestamp}.{gpu_memory_file_extension}"
+            )
         else:
             os.makedirs(trace_dir, exist_ok=True)
-            trace_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{trace_file_extention}")
-            gpu_memory_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{time}.{gpu_memory_file_extension}")
+            trace_file = os.path.join(trace_dir, f"veomni_rank{global_rank}_{timestamp}.{trace_file_extention}")
+            gpu_memory_file = os.path.join(
+                trace_dir, f"veomni_rank{global_rank}_{timestamp}.{gpu_memory_file_extension}"
+            )
 
         if IS_NPU_AVAILABLE:
             nonlocal npu_trace_handler
-            npu_trace_handler(p)
             trace_file = p.prof_if.prof_path
+            handler_started = time.perf_counter()
+            handler_status = "ok"
+            try:
+                npu_trace_handler(p)
+            except Exception as exc:
+                if effective_npu_analysis_mode != "async":
+                    raise
+                # Raw finalization has already selected prof_path. A failure to
+                # submit optional background analysis must not take down the
+                # distributed training job or strand peers at the barrier.
+                handler_status = "analysis_submit_failed"
+                logger.warning(
+                    "NPU async analysis submission failed; training will continue and the finalized raw capture "
+                    f"remains at {trace_file}. Error: {exc}"
+                )
+            handler_seconds = time.perf_counter() - handler_started
+            logger.info(
+                "NPU_PROFILE_HANDLER "
+                f"mode={effective_npu_analysis_mode} status={handler_status} rank={global_rank} "
+                f"duration_seconds={handler_seconds:.6f} raw_dir={trace_file}"
+            )
         elif IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE:
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
+        if IS_NPU_AVAILABLE:
+            merlin_upload = _should_upload_npu_profile_to_merlin(npu_upload)
+            user_upload_cmd = os.getenv("VEOMNI_UPLOAD_CMD") if npu_upload else None
+            platform_upload_cmd = VEOMNI_UPLOAD_CMD if npu_upload else None
+            if user_upload_cmd:
+                selected_upload_cmd = user_upload_cmd
+                selected_merlin_upload = False
+                selected_platform_associated_upload = False
+            elif platform_upload_cmd:
+                # Platform integrations may provide a file-based uploader that
+                # handles traces too large for an SDK JSON/base64 request. Give
+                # it a trial-first environment because the JobRun Profiling
+                # tab queries assets through the selected Arnold trial.
+                selected_upload_cmd = platform_upload_cmd
+                selected_merlin_upload = False
+                selected_platform_associated_upload = merlin_upload
+            elif merlin_upload:
+                selected_upload_cmd = None
+                selected_merlin_upload = True
+                selected_platform_associated_upload = False
+            else:
+                selected_upload_cmd = None
+                selected_merlin_upload = False
+                selected_platform_associated_upload = False
+
+            if effective_npu_analysis_mode == "async":
+                if npu_postprocess or selected_upload_cmd or selected_merlin_upload:
+                    logger.warning(
+                        "Offline NPU postprocessing/upload is skipped for async analysis because the background parser may "
+                        f"still be writing {trace_file}. Upload the completed trace after training exits."
+                    )
+                return
+
+            if not npu_postprocess:
+                if selected_upload_cmd or selected_merlin_upload:
+                    logger.warning(
+                        "NPU offline upload was requested while npu_postprocess=false; preserving the raw capture "
+                        f"without parsing or uploading: {trace_file}"
+                    )
+                else:
+                    logger.warning(f"NPU offline postprocessing disabled; raw capture remains at {trace_file}.")
+                return
+
+            needs_copy = is_hdfs_trace
+            needs_analysis = True
+            needs_sidecar = needs_copy or needs_analysis
+            if needs_sidecar:
+                sidecar_kwargs = {
+                    "copy_to": trace_dir if needs_copy else None,
+                    "analyse": needs_analysis,
+                    "upload_cmd": selected_upload_cmd,
+                    "merlin_upload": selected_merlin_upload,
+                }
+                if selected_platform_associated_upload:
+                    sidecar_kwargs["platform_associated_upload"] = True
+                proc = spawn_npu_offline_sidecar(str(trace_file), **sidecar_kwargs)
+                if proc is None:
+                    logger.warning(
+                        "NPU offline postprocess sidecar did not start; no synchronous fallback will run inside the "
+                        f"training barrier. The raw capture remains at {trace_file}."
+                    )
+                else:
+                    npu_sidecars.append(proc)
+            return
+
         get_torch_device().memory._dump_snapshot(gpu_memory_file)
         logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
-        if trace_dir.startswith("hdfs://"):
+        if is_hdfs_trace:
             copy(trace_file, trace_dir)
             logger.info(f"Profiling result uploaded to {trace_dir}.")
 
         if VEOMNI_UPLOAD_CMD:
             try:
                 logger.info_rank0(f"upload trace file {trace_file}")
-                if IS_NPU_AVAILABLE:
-                    import gzip
-                    import shutil
-
-                    npu_trace_file = f"{trace_file}/ASCEND_PROFILER_OUTPUT/trace_view.json"
-                    with open(npu_trace_file, "rb") as f_in, gzip.open(f"{npu_trace_file}.gz", "wb") as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                    command2 = f"{VEOMNI_UPLOAD_CMD} {npu_trace_file}.gz"
+                command2 = shlex.split(VEOMNI_UPLOAD_CMD)
+                if not command2:
+                    raise ValueError("VEOMNI_UPLOAD_CMD is empty")
+                if any("{trace}" in arg for arg in command2):
+                    command2 = [arg.replace("{trace}", trace_file) for arg in command2]
                 else:
-                    command2 = f"{VEOMNI_UPLOAD_CMD} {trace_file}"
-                subprocess.run(command2, shell=True, check=True, executable="/bin/bash")
+                    command2.append(trace_file)
+                subprocess.run(command2, check=True)
             except Exception as e:
                 logger.warning(f"failed to upload trace file {trace_file}, error: {e}")
 
     if IS_NPU_AVAILABLE:
+        if profile_memory:
+            logger.warning_rank0(
+                "NPU profile_memory is recorded by torch_npu in the profiler trace; "
+                "VeOmni does not emit a CUDA-style .pkl allocator snapshot on Ascend."
+            )
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
-        npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
-            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
-        )
+        npu_trace_dir = CACHE_DIR if is_hdfs_trace else trace_dir
+        if npu_analysis_mode == "async" and multiprocessing.current_process().daemon:
+            effective_npu_analysis_mode = "offline"
+            logger.warning(
+                "NPU async analysis is unavailable in a daemon process; falling back to offline raw capture."
+            )
+
+        if effective_npu_analysis_mode == "async":
+            try:
+                npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+                    npu_trace_dir,
+                    analyse_flag=True,
+                    async_mode=True,
+                )
+            except TypeError as exc:
+                effective_npu_analysis_mode = "offline"
+                logger.warning(
+                    "This torch_npu version does not support async tensorboard trace analysis; falling back to "
+                    f"offline raw capture. Error: {exc}"
+                )
+                npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+                    npu_trace_dir,
+                    analyse_flag=False,
+                )
+        else:
+            npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+                npu_trace_dir,
+                analyse_flag=False,
+            )
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
@@ -812,10 +1081,15 @@ def create_profiler(
         with_stack=with_stack,
         experimental_config=experimental_config,
     )
-    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and profile_memory:
-        return ProfilerWithMem(base_profiler)
-    else:
+    if IS_NPU_AVAILABLE:
+        # Do not wrap the NPU profiler with ProfilerWithMem: its memory events
+        # are emitted by torch_npu and there is no CUDA allocator snapshot API.
+        base_profiler._veomni_npu_analysis_mode = effective_npu_analysis_mode
+        base_profiler._veomni_npu_sidecars = npu_sidecars
         return base_profiler
+    if IS_CUDA_AVAILABLE and profile_memory:
+        return ProfilerWithMem(base_profiler)
+    return base_profiler
 
 
 if os.getenv("DISABLE_WARNINGS", "0").lower() in ["true", "1"]:
