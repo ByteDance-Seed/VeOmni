@@ -1,13 +1,19 @@
-# Cursor Cloud (CPU-only) Environment
+# CPU-only Environment
 
-Notes for agents running on the Cursor Cloud VM. Not relevant to GPU CI or local
-GPU/NPU dev boxes.
+What you can and cannot verify on a machine with no GPU or NPU — a hosted agent
+VM, a laptop, or any CPU box. Not relevant to GPU CI or local GPU/NPU dev boxes.
 
-The Cursor Cloud VM is **CPU-only (no GPU/NPU), x86_64, Python 3.12**. The
-startup update script already runs `uv sync --extra gpu --dev`, so `.venv` is
-ready — activate it with `source .venv/bin/activate` before any command. `uv`
-is installed under `~/.local/bin` (on `PATH` via `~/.bashrc`); the `gpu` extra's
-CUDA torch wheels install fine here and `torch.cuda.is_available()` is `False`.
+The `gpu` extra's CUDA torch wheels install fine on a CPU-only x86_64 host;
+`torch.cuda.is_available()` is simply `False`. So the normal setup works:
+
+```bash
+uv sync --extra gpu --dev
+source .venv/bin/activate
+```
+
+Some hosted environments pre-run that sync in a startup script, in which case
+`.venv` already exists and you only need to activate it. If `uv` is not on
+`PATH`, check `~/.local/bin`.
 
 ## What works CPU-only (use these to validate changes without hardware)
 
