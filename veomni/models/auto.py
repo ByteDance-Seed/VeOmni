@@ -50,6 +50,30 @@ logger = logging.get_logger(__name__)
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
 
 
+def check_model_build_prerequisites(config: PretrainedConfig) -> None:
+    """Let a model config refuse a run it cannot serve, before any weight is read.
+
+    A hook rather than a body: any config class may define
+    ``validate_build_prerequisites`` and this calls it. Nothing here knows which
+    models do, which is the point -- the alternative is a list of model names in the
+    generic builder, and a list is a thing the next model has to be remembered into.
+
+    What a config cannot see on its own is the rest of the run, so the convention is
+    that the hook reads whatever singletons it needs (the installed
+    ``OpsImplementationConfig``, the parallel state) and takes no arguments. Kept as a
+    plain ``getattr`` for the same reason: a config that has nothing to refuse should
+    not have to say so.
+
+    ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
+    today. It refuses a Lightning Indexer KL objective configured without the TileLang
+    indexer and attention it is defined in terms of -- a disagreement between a model
+    field and two kernel selections, which no single dataclass can see.
+    """
+    validate = getattr(config, "validate_build_prerequisites", None)
+    if callable(validate):
+        validate()
+
+
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
     """Raise unless this model type implements context parallelism.
 
@@ -242,6 +266,7 @@ def build_foundation_model(
         config = build_config(config_path, **config_kwargs)
 
     check_context_parallel_supported(config)
+    check_model_build_prerequisites(config)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
