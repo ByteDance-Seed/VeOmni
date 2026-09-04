@@ -34,7 +34,8 @@ Those require the self-hosted GPU CI runners.
 - To build a model on this box, force all-eager ops and `init_device="cpu"`
   (flash-attn/triton are unavailable). `tasks/infer/*.py` show the eager
   `OpsImplementationConfig` pattern (`is_flash_attn_2_available()` → `eager`).
-- `make build` is stale (its `setup.py` target doesn't exist); build the wheel
-  with `./build.sh` (which runs `python3 -m build`) instead.
+- `make build` runs `python3 -m build`, the same command `publish.yml` uses.
+  It needs the `build` package (`pip install build`); `./build.sh` installs it
+  first and then runs the same thing.
 - Re-running `uv sync` is cheap and idempotent (~1s when unchanged); prefer it
   over `pip install`.
