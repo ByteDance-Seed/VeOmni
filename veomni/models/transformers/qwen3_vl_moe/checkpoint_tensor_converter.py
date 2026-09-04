@@ -57,9 +57,14 @@ class Qwen3VLMoeCheckpointTensorConverter:
     - ``gate_up_proj``: HF has dim-1 == ``hidden_size``, v5 has dim-1 == ``2 * intermediate_size``.
     - ``down_proj``:    HF has dim-1 == ``intermediate_size``, v5 has dim-1 == ``hidden_size``.
 
-    Hidden size, intermediate size and (for Qwen3-VL-MoE) their doubled variants
-    are all distinct integers for any realistic model, so the dispatch is
-    unambiguous.
+    This only works while the two expectations differ. They coincide when
+    ``hidden_size == 2 * intermediate_size`` (``gate_up_proj``) or
+    ``intermediate_size == hidden_size`` (``down_proj``) -- neither is
+    far-fetched for a MoE config, and ``tests/toy_config/glm_moe_dsa_toy``
+    is already a 2:1 model. In that case the layout genuinely cannot be
+    recovered from the shape, so ``convert()`` raises instead of guessing;
+    guessing would transpose a v5-saved checkpoint and corrupt the weights
+    silently.
     """
 
     def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int):
@@ -87,6 +92,16 @@ class Qwen3VLMoeCheckpointTensorConverter:
             hf_mid, v5_mid = self.hidden_size, 2 * self.intermediate_size
         else:  # down_proj
             hf_mid, v5_mid = self.intermediate_size, self.hidden_size
+
+        if hf_mid == v5_mid:
+            raise RuntimeError(
+                f"Qwen3VLMoe checkpoint converter: cannot distinguish HF from VeOmni layout for {name}. "
+                f"Both expect dim-1 == {hf_mid} for this config "
+                f"(hidden_size={self.hidden_size}, intermediate_size={self.intermediate_size}), so the "
+                f"shape carries no information about which layout the checkpoint uses. Convert the "
+                f"checkpoint offline, or add an explicit layout marker, rather than letting the "
+                f"converter guess and risk transposing an already-converted tensor."
+            )
 
         if tensor.shape[1] == hf_mid:
             converted = tensor.transpose(1, 2).contiguous()
