@@ -1,13 +1,38 @@
 ---
 name: veomni-review
-description: "Use this skill before committing ANY code change — this is a mandatory gate in the commit flow. Also trigger proactively when: you've made changes across multiple files and want to check consistency, you're unsure if a fix is safe, a change touches shared infrastructure (BaseTrainer, distributed, model loading, data pipeline), or a change is larger than a few lines. The review launches a subagent that checks implementation quality, multi-file consistency, and known constraint violations, then rates the change as safe/needs-attention/risky."
+description: "Pre-commit code review gate. Required before committing any change to Python under veomni/, tasks/ or tests/, and any change to CI workflows, pyproject.toml, uv.lock, docker/ or configs/. Also trigger proactively when a change spans multiple files, touches shared infrastructure (BaseTrainer, distributed, model loading, data pipeline, ops dispatch), or you are unsure a fix is safe. The review launches a subagent that checks implementation quality, multi-file consistency, and known constraint violations, then rates the change as safe/needs-attention/risky."
 ---
+
+## When this gate applies
+
+| Change | Review |
+|--------|--------|
+| Python under `veomni/`, `tasks/`, `tests/` | Required |
+| `.github/workflows/`, `pyproject.toml`, `uv.lock`, `docker/`, `configs/` | Required |
+| Docs, comments, or `.agents/` knowledge and skills only | Skip — self-check instead: verify every repo path, config key and version you assert actually exists |
+| A revert, or re-applying a diff a reviewer already approved | Skip |
+
+Skipping means skipping the subagent, not skipping verification. Say which
+branch you took, so the reader knows a review happened or why it didn't.
 
 ## Steps
 
-1. Run `git diff` (staged + unstaged) to capture the full diff.
+1. Capture the full diff, including files git does not track yet:
+   ```bash
+   git add -N .    # intent-to-add: makes new files visible to diff, stages no content
+   git diff HEAD
+   ```
+   Both halves matter. Plain `git diff` omits anything already staged — which
+   is exactly what is about to be committed. `git diff HEAD` on its own still
+   omits untracked files, so a brand-new module or test would be reviewed as
+   if it did not exist, and "add a new file" is one of the most common changes
+   there is. `git add -N` respects `.gitignore`, so build artifacts stay out.
 2. Read `.agents/knowledge/constraints.md` for known constraints.
-3. **Launch a review subagent** (see below). The subagent receives only the diff + constraints — NOT your reasoning — to avoid confirmation bias.
+3. **Launch a review subagent** with your agent's subagent/task mechanism (see
+   the prompt below). The subagent receives only the diff + constraints — NOT
+   your reasoning — to avoid confirmation bias. If the change is already
+   committed on a feature branch, point it at `git diff main...HEAD` instead of
+   pasting the diff.
 4. Act on the verdict.
 
 | Verdict | Action |
@@ -20,7 +45,9 @@ description: "Use this skill before committing ANY code change — this is a man
 
 ## Subagent Launch
 
-Use the Task tool with this prompt:
+Launch a subagent with this prompt. Use whatever the running agent calls it —
+`Task`, `spawn_agent`, or an equivalent — and give it read-only access to the
+repo so it can verify claims against the actual files.
 
 ```
 You are a code reviewer for VeOmni, a distributed multi-modality training framework. Your job is to find problems in the following diff. You are NOT validating the author's intent — you are looking for bugs, risks, and constraint violations.
@@ -45,7 +72,8 @@ For each changed file, check:
 - If a Trainer method changed, do all subclasses need matching changes?
 - If model loading changed, are configs and parallel plans updated?
 - If data collator changed, do all modalities still work?
-- If distributed code changed, are both FSDP and FSDP2 paths handled?
+- If distributed code changed, are the FSDP2, sequence-parallel and ExtraParallel/EP paths all handled? (FSDP1 no longer exists — a diff that adds an FSDP1 branch is itself a finding.)
+- If a trainer lifecycle hook changed, do the composed trainers that override `forward_backward_step()` (`TextDPOTrainer`, `DiTTrainer`) still get it?
 
 ### Constraint Violations
 - Does this violate any entry in the known-constraints list?
@@ -55,6 +83,7 @@ For each changed file, check:
 - PR title format: `[{modules}] {type}: {description}`?
 - All comments and docstrings in English?
 - No auto-generated files (`veomni/models/transformers/*/generated/`) edited directly?
+- Tests: does the diff extend an existing CI-enumerated test, or add a new file that the workflow owning that path actually lists? Check the owning workflow rather than assuming — `tests/data/` runs wholesale in both unit workflows, `tests/ops/` only in the GPU one (NPU enumerates ops files by name, so an Ascend-relevant ops file still needs a line), the e2e paths belong to `{gpu,npu}_e2e_test.yml`, and everything else must be listed file by file or it never runs. See `.agents/knowledge/testing.md`.
 - Ruff-compliant (`make quality` passes)?
 
 ## Output
