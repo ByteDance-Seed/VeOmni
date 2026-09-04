@@ -118,6 +118,7 @@ def test_dsa_package_does_not_import_tilelang_eagerly():
     """Registering DSA must not import TileLang or FlashMLA."""
     importlib.import_module("veomni.kernels._kernels.dsa")
     assert "veomni.kernels._kernels.dsa.vendor.tilelang_sparse_mla" not in sys.modules
+    assert "veomni.kernels._kernels.dsa.vendor.tilelang_sparse_mla_target" not in sys.modules
     assert "veomni.kernels._kernels.dsa.vendor.tilelang_indexer" not in sys.modules
     assert "veomni.kernels._kernels.dsa.vendor.flashmla_cudnn" not in sys.modules
 
