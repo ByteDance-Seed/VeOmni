@@ -268,9 +268,20 @@ class OptimizerState(Stateful):
     cannot be scoped to optimizer-only). ``_ModelStrictLoadPlanner`` therefore
     validates model-key completeness from checkpoint metadata before loading a
     non-LoRA full-model DCP.
+
+    Args:
+        model: the model whose parameters the optimizer owns.
+        optimizer: the optimizer to save or load.
+        parallel_state: optional parallel state; otherwise ``get_parallel_state()`` is used.
+        load: when ``True`` (the normal resume path), ``state_dict()`` returns a
+            dense state dict so DCP knows where to place restored optimizer
+            entries.  When ``False`` (the save path), the returned dict is
+            sparse and skips sub-optimizers that have never been stepped,
+            avoiding synthetic zero state for unused parameters (e.g. unused
+            MoE experts) in the checkpoint.
     """
 
-    def __init__(self, model, optimizer, parallel_state=None):
+    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False):
         self.model = model
         self.optimizer = optimizer
         self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
@@ -278,6 +289,7 @@ class OptimizerState(Stateful):
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
         )
+        self._load = load
 
     def state_dict(self):
         if self.should_extra_parallel_aware:
@@ -293,6 +305,11 @@ class OptimizerState(Stateful):
             )
             return optim_sd_with_extra_parallel_dim
 
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            if self._load:
+                return self.optimizer.state_dict()
+            return self.optimizer._sparse_state_dict()
+
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
@@ -306,6 +323,11 @@ class OptimizerState(Stateful):
             self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
             # MultiOptimizer sub-optimizers can also lose param-group hyperparams
             # (betas/...) for empty groups after load; restore recurses into them.
+            restore_optimizer_param_group_defaults(self.optimizer)
+            return
+
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            self.optimizer.load_state_dict(optim_state_from_dcp_load)
             restore_optimizer_param_group_defaults(self.optimizer)
             return
 
@@ -490,7 +512,10 @@ class DistributedCheckpointer(CheckpointerBase):
         }
         if "optimizer" in state:
             save_state["optimizer"] = OptimizerState(
-                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+                model=state["model"],
+                optimizer=state["optimizer"],
+                parallel_state=parallel_state,
+                load=False,
             )
 
         if storage_writer is None:
@@ -544,7 +569,10 @@ class DistributedCheckpointer(CheckpointerBase):
         }
         if "optimizer" in state:
             load_state["optimizer"] = OptimizerState(
-                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+                model=state["model"],
+                optimizer=state["optimizer"],
+                parallel_state=parallel_state,
+                load=True,
             )  # type: ignore[index]
 
         if storage_reader is None:
