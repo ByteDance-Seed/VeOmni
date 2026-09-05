@@ -74,10 +74,4 @@ Use `rg` to find definitions and call sites. Prefer implementation, tests, curre
 5. Inspect `git diff --check` and the final diff.
 6. Report: scanned scope; confirmed fixes with evidence; intentional false positives; checks run and results; unverified findings and coverage limits.
 
-When changing this skill's scanner, run its portable regression suite:
-
-```bash
-python -m unittest discover -s .agents/skills/veomni-fix-docs/tests -v
-```
-
 Do not claim that the documentation is error-free. State the scanned scope and checks performed.
