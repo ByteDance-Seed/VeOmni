@@ -33,9 +33,14 @@ Use this checklist after the deterministic scanner. Consult only the sections re
 - Balance fenced code blocks and preserve their language tags.
 - Resolve relative links from the containing file, not from the repository root, unless the path begins with `/`.
 - Verify image paths and case sensitivity for Linux readers.
+- Include HTML `img` and `a` elements when checking embedded assets and links.
+- For heading links, compare the destination with the intended renderer's actual permalink. Formatting, linked heading text, Emoji, and duplicate titles can change generated IDs. Do not infer an anchor from the raw heading alone.
+- On Sphinx/MyST pages, check the generated HTML for affected anchors and MyST labels/directives; the standalone scanner does not validate these renderer-specific constructs.
 - Distinguish intentional Markdown hard breaks (two trailing spaces) from accidental whitespace.
 - Leave code spans, URLs, generated output, and quoted error messages verbatim unless they are themselves the documented defect.
 
 ## Evidence threshold
 
 Apply a correction when at least one authoritative repository source proves it, or when the language defect has only one reasonable correction. Otherwise, record the candidate with the evidence needed to decide it.
+
+For each uncertain technical claim, record the document location, the source checked, and what remains unverified. A missing tool or insufficient evidence is a reason to retain that claim for review, not to guess a replacement.
