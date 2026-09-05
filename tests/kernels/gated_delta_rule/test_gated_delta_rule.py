@@ -35,9 +35,11 @@ from tests.kernels.tol import (
     GDN_FUSED_GRAD_ATOL,
     GDN_FUSED_GRAD_RTOL,
     GDN_FUSED_RTOL,
+    GDN_NPU_ATOL,
+    GDN_NPU_RTOL,
 )
 from veomni.kernels import KERNEL_REGISTRY, resolve_kernel
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 
 
 def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
@@ -52,6 +54,24 @@ def test_fla_is_registered_for_cuda_and_mlu(kernel):
     assert (kernel, "standard", "fla", "cuda") in KERNEL_REGISTRY._entries
     assert (kernel, "standard", "fla", "mlu") in KERNEL_REGISTRY._entries
     assert KERNEL_REGISTRY.list_registered(kernel, "standard").count("fla") == 1
+
+
+@pytest.mark.parametrize(
+    "kernel,impls",
+    (
+        ("rms_norm_gated", ["eager", "fla", "npu"]),
+        ("causal_conv1d", ["eager", "fla", "npu"]),
+        ("chunk_gated_delta_rule", ["eager", "fla", "flash_qla", "npu", "npu_ascendc"]),
+    ),
+)
+def test_gated_delta_rule_registration_matrix(kernel, impls):
+    assert KERNEL_REGISTRY.list_registered(kernel, "standard") == impls
+
+
+def test_npu_ascendc_is_scoped_to_chunk_gated_delta_rule():
+    assert "npu_ascendc" in KERNEL_REGISTRY.list_registered("chunk_gated_delta_rule", "standard")
+    assert "npu_ascendc" not in KERNEL_REGISTRY.list_registered("rms_norm_gated", "standard")
+    assert "npu_ascendc" not in KERNEL_REGISTRY.list_registered("causal_conv1d", "standard")
 
 
 def test_rms_norm_gated_eager_matches_hf():
@@ -104,6 +124,49 @@ def test_rms_norm_gated_fla_matches_eager():
     assert torch.allclose(x_e.grad, x_o.grad, atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL)
     assert torch.allclose(g_e.grad, g_o.grad, atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL)
     assert torch.allclose(w_e.grad, w_o.grad, atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="rms_norm_gated npu needs torch_npu")
+@pytest.mark.parametrize("shape", [(2, 16, 128), (1, 8, 64)])
+def test_rms_norm_gated_npu_matches_eager(shape):
+    eager = resolve_kernel("rms_norm_gated", "standard", "eager").wrapper
+    other = resolve_kernel("rms_norm_gated", "standard", "npu").wrapper
+    torch.manual_seed(0)
+    x = torch.randn(*shape, device="npu", dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    weight = torch.randn(shape[-1], device="npu", dtype=torch.bfloat16)
+
+    out_e = eager(x, gate, weight, eps=1e-6)
+    out_o = other(x, gate, weight, eps=1e-6)
+    assert out_o.shape == x.shape
+    assert out_o.dtype == x.dtype
+    assert torch.allclose(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="rms_norm_gated npu needs torch_npu")
+def test_rms_norm_gated_npu_zero_gate_is_zero():
+    other = resolve_kernel("rms_norm_gated", "standard", "npu").wrapper
+    x = torch.randn(1, 4, 32, device="npu", dtype=torch.bfloat16)
+    gate = torch.zeros_like(x)
+    weight = torch.randn(32, device="npu", dtype=torch.bfloat16)
+
+    output = other(x, gate, weight, eps=1e-6)
+    assert torch.count_nonzero(output) == 0
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="rms_norm_gated npu needs torch_npu")
+@pytest.mark.parametrize("eps", [1e-5, 1e-6, 1e-7])
+def test_rms_norm_gated_npu_uses_eps(eps):
+    eager = resolve_kernel("rms_norm_gated", "standard", "eager").wrapper
+    other = resolve_kernel("rms_norm_gated", "standard", "npu").wrapper
+    torch.manual_seed(1)
+    x = torch.randn(1, 4, 32, device="npu", dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    weight = torch.randn(32, device="npu", dtype=torch.bfloat16)
+
+    out_e = eager(x, gate, weight, eps=eps)
+    out_o = other(x, gate, weight, eps=eps)
+    assert torch.allclose(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
 
 
 def _hf_qwen3_5_prefill_causal_conv1d(x: Tensor, weight: Tensor, bias: Tensor, *, kernel_size: int) -> Tensor:

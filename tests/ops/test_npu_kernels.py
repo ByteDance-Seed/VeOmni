@@ -12,40 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Numerical alignment tests for NPU-optimised kernels.
-
-For each NPU kernel registered in KERNEL_REGISTRY, bind an OpSlot to the ``npu``
-implementation and compare its output against the canonical eager implementation
-on random inputs. This guards against:
-  - The wrong variant being bound into a slot (e.g. standard bound into qwen3_5).
-  - Silent regressions in the torch_npu kernel wrappers.
-
-Tests are skipped on non-NPU hosts so the same test suite runs in any CI runner.
-"""
+"""NPU clamped-SwiGLU and HCCL premul-sum tests."""
 
 import pytest
 import torch
 
-import veomni.ops  # noqa: F401 — trigger KERNEL_REGISTRY registrations
-from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
 
 pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU kernels require torch_npu")
 
 DEVICE = get_device_type()
-
-
-def _eager_rms_norm_gated(hidden_states, weight, eps, gate):
-    """Eager reference: RMSNorm + concatenate gate + SiLU gating."""
-    dtype = hidden_states.dtype
-    x_f = hidden_states.to(torch.float32)
-    variance = x_f.pow(2).mean(-1, keepdim=True)
-    x_f = x_f * torch.rsqrt(variance + eps)
-    normed = (weight * x_f.to(dtype)).to(dtype)
-    fused_input = torch.cat([gate, normed], dim=-1)
-    half = fused_input.shape[-1] // 2
-    return torch.nn.functional.silu(fused_input[..., :half]) * fused_input[..., half:]
 
 
 def _eager_clamped_swiglu(x, limit):
@@ -130,33 +107,6 @@ class TestNPUClampedSwiGLU:
 
         with pytest.raises(ValueError, match="even last dimension"):
             npu_triton_clamped_swiglu(x, 7.0)
-
-
-# ---------------------------------------------------------------------------
-# RMSNorm gated tests (Qwen3.5 GatedDeltaNet fused RMSNorm + SiLU gate)
-# ---------------------------------------------------------------------------
-
-
-class TestNPURmsNormGated:
-    """Tests for the ``rms_norm_gated`` NPU kernel (NPUFusedRMSNormGated)."""
-
-    @pytest.mark.parametrize("batch,seq,hidden,ffn_dim", [(2, 16, 128, 256), (1, 8, 64, 128)])
-    def test_matches_eager_bf16(self, batch, seq, hidden, ffn_dim):
-        slot = OpSlot("rms_norm_gated", "standard")
-        slot.bind("npu")
-        # The bound kernel is the NPUFusedRMSNormGated class; instantiate it.
-        # (OpSlot exposes bound_kernel(); resolve() is on the KERNEL_REGISTRY.)
-        fused_cls = slot.bound_kernel()
-        fused_module = fused_cls(hidden_size=hidden, eps=1e-6).to(device=DEVICE, dtype=torch.bfloat16)
-
-        hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
-        gate = torch.randn(batch, seq, ffn_dim, device=DEVICE, dtype=torch.bfloat16)
-
-        out_fused = fused_module(hidden_states, gate=gate)
-        out_eager = _eager_rms_norm_gated(hidden_states, fused_module.weight, fused_module.variance_epsilon, gate)
-        # Compound op: RMSNorm + concat + SiLU gate — multiple bf16 roundings.
-        # 1e-2 atol+rtol covers 1-2 bf16 ULPs at typical normalized values.
-        assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -262,25 +212,3 @@ class TestHcclPremulSum:
             dist.all_reduce = orig_all_reduce
             dist.reduce_scatter = orig_reduce_scatter
             dist.reduce_scatter_tensor = orig_reduce_scatter_tensor
-
-
-# ---------------------------------------------------------------------------
-# Kernel registry NPU registrations sanity checks
-# ---------------------------------------------------------------------------
-
-
-class TestNPUKernelRegistry:
-    """Verify NPU kernels are correctly registered in KERNEL_REGISTRY."""
-
-    @pytest.mark.parametrize(
-        "op_name,variant",
-        [
-            ("rms_norm_gated", "standard"),
-        ],
-    )
-    def test_npu_kernel_registered(self, op_name, variant):
-        from veomni.ops.kernel_registry import KERNEL_REGISTRY
-
-        assert "npu" in KERNEL_REGISTRY.list_available(op_name, variant), (
-            f"Expected 'npu' kernel registered for ({op_name!r}, {variant!r})"
-        )

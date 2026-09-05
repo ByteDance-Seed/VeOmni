@@ -22,7 +22,6 @@ them.
 
 from . import (  # noqa: F401
     cross_entropy,
-    gated_delta_rule,
     load_balancing_loss,
     mhc,
 )

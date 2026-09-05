@@ -31,7 +31,8 @@ def wrapper(
 ) -> Tensor:
     """NPU ``npu_rms_norm`` plus ``npu_swiglu`` on ``cat(gate, normed)``.
 
-    Same math as ``NPUFusedRMSNormGated``. Lazy-imports ``torch_npu``.
+    Implements functional RMSNorm followed by a SiLU gate. Lazy-imports
+    ``torch_npu``.
     """
     from ...optional import optional_tensor
 
