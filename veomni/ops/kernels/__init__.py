@@ -23,5 +23,4 @@ them.
 from . import (  # noqa: F401
     cross_entropy,
     load_balancing_loss,
-    mhc,
 )
