@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
-from veomni.utils.import_utils import is_torch_npu_available
+from veomni.utils.device import get_device_type
 
 from .launch_utils import find_free_port
 
@@ -43,10 +43,11 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rotary_pos_emb_implementation": "eager",
     },
     "deepseek_v4": {
-        # DeepSeek-V4 attention is eager-only and its clamped SwiGLU requires
-        # swiglu_limit support that the NPU fused-MoE kernel does not yet have.
+        # DeepSeek-V4 attention, RMSNorm, and partial RoPE remain eager-only on NPU.
+        # The generic NPU rotary backend is incompatible with V4's partial layout.
+        # Routed experts keep fused_npu; its clamp-aware activation uses Ascend
+        # Triton when available and preserves the eager training fallback otherwise.
         "attn_implementation": "eager",
-        "moe_implementation": "eager",
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
@@ -111,13 +112,16 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
-    # DeepSeek-V4 attention and partial interleaved RoPE are eager-only. MoE
-    # uses the GPU-default fused_triton backend, while weighted/unweighted
-    # RMSNorm and the shared-expert MLP use their default Liger OpSlots.
+    # DeepSeek-V4 attention is eager-only. RoPE matches the shipped
+    # configs/text/deepseek_v4.yaml so the fused partial-interleaved Triton
+    # kernel is exercised under FSDP2, Ulysses SP and the TileLang paths rather
+    # than only by the standalone kernel tests. MoE uses the GPU-default
+    # fused_triton backend, while weighted/unweighted RMSNorm and the
+    # shared-expert MLP use their default Liger OpSlots.
     "deepseek_v4": {
         "attn_implementation": "eager",
         "moe_implementation": "fused_triton",
-        "rotary_pos_emb_implementation": "eager",
+        "rotary_pos_emb_implementation": "triton",
     },
 }
 
@@ -138,7 +142,7 @@ def resolve_ops_overrides(model_name: Optional[str]) -> List[str]:
     returns the NPU-supported backend per op, with per-model eager fallbacks for
     ops without an NPU kernel for that model.
     """
-    if not is_torch_npu_available():
+    if get_device_type() != "npu":
         overrides = _GPU_PER_MODEL_OVERRIDES.get(model_name, {}) if model_name else {}
         return [f"--model.ops_implementation.{k}={v}" for k, v in overrides.items()]
     return [f"--model.ops_implementation.{k}={v}" for k, v in _npu_overrides(model_name).items()]

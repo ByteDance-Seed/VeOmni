@@ -233,28 +233,22 @@ The config sets `ulysses_size: 4`, so the world size must be a multiple of 4. To
 sequence parallelism, override `--train.accelerator.ulysses_size 1`; the attention kernels adapt
 on their own.
 
-## ChunkMBS
+### Qwen3.5 MoE 35B VL Muon training
 
-Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,
-then runs each `Qwen3_5DecoderLayer` chunk sequentially while keeping the outer FSDP2 layer invocation intact. The
-same token ranges are used by both full-attention and GatedDeltaNet layers, so every ChunkMBS cut must be present in
-both cumulative-length tensors; their internal boundaries may differ.
+The Ascend VL recipe uses UP1 and EP4, `fused_npu` MoE, the AscendC GatedDeltaNet
+backend, and the pure-PyTorch `gram` Muon backend:
 
-The example config exposes the feature but keeps it disabled by default:
-
-```yaml
-train:
-  chunk_mbs_config:
-    enable: true
-    chunk_mbs: 2
+```shell
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl_muon_ascendc.yaml \
+    --model.model_path ${HOME}/Qwen3.5-35B-A3B \
+    --data.train_path ${HOME}/tulu-first2000.parquet \
+    --train.max_steps 20
 ```
 
-`chunk_mbs` is the number of packed samples per layer chunk, not a token count or `train.micro_batch_size`.
-ChunkMBS may be combined with non-reentrant gradient checkpointing. It currently does not support Qwen3.5-MoE,
-Ulysses SP, TP/PP, `torch.compile`, `pad_to_length`, DPO, or RL training. See
-[ChunkMBSConfig](../usage/arguments.md#chunkmbsconfig) for the complete support boundary.
-The model-level automated tests cover decoder routing, metadata slicing, outputs, and gradients on CPU. Real
-FlashAttention, FLA, and NPU fused-kernel execution requires separate accelerator validation.
+`muon_expert_zero_comm: true` selects whole-expert `Shard(0)` when the
+EP-local expert count is divisible by the EP-FSDP size; otherwise VeOmni logs
+a warning and falls back to the communication path.
 
 ## Ulysses Sequence Parallelism
 

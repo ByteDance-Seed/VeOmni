@@ -686,6 +686,8 @@ diffusers `transformer/config.json` with the VeOmni additions:
 }
 ```
 
+Copy the remaining fields from the Diffusers transformer config into the same JSON object.
+
 ---
 
 ## Required Functions — Summary

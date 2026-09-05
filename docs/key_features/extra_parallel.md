@@ -25,7 +25,7 @@ The overall design of extra parallelism is similar to EP+FSDP2, except that it a
 
 In VeOmni, experts module is defined as tensors of [E, H, I] (Expert number, hidden dim, intermediate size) for down projection weights, and [E, I, H] for gate projection and up projection. Embedding is defined as tensors of [V, H] (Vocab size, hidden dim).
 
-> please see [modeling_qwen3_moe_foundation.py](../../veomni/models/seed_omni/foundation/qwen3_moe_foundation/modeling_qwen3_moe_foundation.py) for detailed implementation of experts and embedding layer.
+> please see [patched_modeling_qwen3_moe_gpu.py](../../veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py) for detailed implementation of experts and embedding layer.
 
 Extra parallelism is applied on dim-0 (expert number, vocab size), while FSDP2 is applied on dim-1 instead of default dim-0 for more flexible parallelism setup. Otherwise, if we also choose dim-0 for FSDP2, Expert Parallel or Embed Parallel x FSDP2 size needs to be exact expert number or vocab size.
 

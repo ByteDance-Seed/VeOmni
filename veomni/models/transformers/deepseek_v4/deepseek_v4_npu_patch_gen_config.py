@@ -98,6 +98,9 @@ from veomni.patchgen.patch_spec import PatchConfig
 
 from .deepseek_v4_gpu_patch_gen_config import (
     PatchedDeepseekV4Experts,
+    _builds_indexer_kl,
+    _indexer_loss_enabled,
+    _split_indexer_output,
     deepseek_v4_attention_forward_patched,
     deepseek_v4_decoder_layer_forward_patched,
     deepseek_v4_eager_attention_forward_patched,
@@ -113,6 +116,7 @@ from .deepseek_v4_gpu_patch_gen_config import (
     deepseek_v4_rotary_embedding_forward_patched,
     deepseek_v4_topk_router_forward_patched,
     deepseek_v4_unweighted_rmsnorm_forward_patched,
+    indexer_kl_terms,
 )
 
 
@@ -123,9 +127,15 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
+# ``sparse_mqa_target_fwd`` is the indexer loss's teacher kernel. The objective
+# needs both the TileLang indexer and the TileLang attention (see
+# ``_indexer_loss_enabled``), and the TileLang sparse attention declines any
+# non-CUDA tensor, so the branches reusing it are dead on NPU and refuse on the
+# first attention call. The import exists only so patchgen can emit a module that
+# type-checks.
 config.add_import(
     "veomni.ops.kernels.deepseek_v4",
-    names=["sparse_attn_tilelang", "v4_lighting_indexer"],
+    names=["sparse_attn_tilelang", "sparse_mqa_target_fwd", "v4_lighting_indexer"],
 )
 config.add_import(
     "veomni.distributed.parallel_state",
@@ -133,18 +143,42 @@ config.add_import(
 )
 config.add_import(
     "veomni.distributed.sequence_parallel",
-    names=["gather_heads_scatter_seq", "gather_outputs", "gather_seq_scatter_heads"],
+    names=[
+        "gather_heads_scatter_seq",
+        "gather_outputs",
+        "gather_seq_scatter_heads",
+        "reduce_sequence_parallel_loss",
+    ],
+)
+# The GPU attention/indexer forwards reused below include context-parallel
+# branches. CP is rejected at model build on NPU (see
+# ``check_context_parallel_supported``), so those branches are dead here; the
+# imports exist only so patchgen can emit a module that type-checks.
+config.add_import(
+    "veomni.distributed.context_parallel",
+    names=[
+        "all_gather_compressed_rows",
+        "all_gather_kv",
+        "empty_compressed_rows",
+        "exchange_compressor_halos",
+        "local_window_token_indices",
+        "plan_compressor_shard",
+    ],
 )
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
     names=[
+        "CompressedCandidates",
         "build_packed_compression_metadata",
+        "build_packed_sparse_attention_indices",
         "build_sparse_attention_indices",
         "compress_packed_windows",
         "isolate_packed_causal_mask_",
         "mask_sparse_attention_indices",
         "packed_compressed_block_bias",
         "packed_compressed_causal_ranges",
+        "scatter_topk_block_bias",
+        "shard_packed_compression_metadata",
     ],
 )
 
@@ -153,7 +187,12 @@ config.add_import(
 # constructor fields (FSDP2 unshard-hook safe — see GPU config comment).
 config.add_import(
     "veomni.utils.model_outputs",
-    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+    names=[
+        "FusedLinearAuxOutput",
+        "FusedLinearAuxOutputMixin",
+        "MoeCausalLMOutputWithLogProbs",
+        "MoeModelOutputWithIndexerKL",
+    ],
 )
 config.drop_import_names("MoeCausalLMOutputWithPast")
 
@@ -180,6 +219,16 @@ config.add_post_import_block(
     veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
     """
 )
+
+# The reused indexer/attention/model/ForCausalLM forwards read the indexer-loss
+# gate, so the generated NPU module needs the same helpers the GPU one defines.
+# Registered by reference rather than restated, so the two backends cannot drift
+# apart on a predicate whose whole purpose is to be read identically from the
+# three call sites that decide the forward's arity.
+config.add_helper(_indexer_loss_enabled)
+config.add_helper(_builds_indexer_kl)
+config.add_helper(_split_indexer_output)
+config.add_helper(indexer_kl_terms)
 
 # ================================================================
 # Structural + numerics patches reused verbatim from the GPU config. Keeping
@@ -388,6 +437,14 @@ def deepseek_v4_hca_compressor_forward_patched(
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
+    build_block_bias: bool = True,
+    # Accepted and ignored, matching the GPU config's HCA compressor: the shared
+    # ``DeepseekV4Attention.forward`` holds one compressor whose class is chosen by
+    # layer type and calls it through a single call site, so both compressors have to
+    # take the same arguments. Only the CSA one owns a Lightning Indexer. Dead on NPU
+    # either way -- ``_indexer_loss_enabled`` refuses anything but the TileLang
+    # indexer, which is CUDA-only -- but the signature has to line up with the call.
+    build_indexer_loss: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, None]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
@@ -410,11 +467,12 @@ def deepseek_v4_hca_compressor_forward_patched(
             position_ids,
             rate_metadata,
             overlap=False,
+            apply_rope=apply_rotary_pos_emb,
         )
         if compressed.shape[1] == 0:
             anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
             compressed = compressed + anchor.to(compressed.dtype)
-        block_bias = packed_compressed_block_bias(rate_metadata)
+        block_bias = packed_compressed_block_bias(rate_metadata) if build_block_bias else None
         result = (compressed.unsqueeze(1), block_bias)
         return (*result, None) if return_topk_indices else result
 
@@ -450,13 +508,16 @@ def deepseek_v4_hca_compressor_forward_patched(
         result = (compressed_kv, None)
         return (*result, None) if return_topk_indices else result
 
-    entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
-    causal_threshold = (position_ids + 1) // self.compress_rate
-    block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
-    block_bias = block_bias.masked_fill(
-        entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
-        float("-inf"),
-    )
+    if build_block_bias:
+        entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
+        causal_threshold = (position_ids + 1) // self.compress_rate
+        block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
+        block_bias = block_bias.masked_fill(
+            entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
+            float("-inf"),
+        )
+    else:
+        block_bias = None
     result = (compressed_kv, block_bias)
     return (*result, None) if return_topk_indices else result
 
@@ -475,9 +536,30 @@ def deepseek_v4_csa_compressor_forward_patched(
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     return_topk_indices: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    build_block_bias: bool = True,
+    # Accepted, refused, and never forwarded on this backend. The shared attention
+    # forward passes ``_builds_indexer_kl``'s answer down here, so the parameter
+    # exists because the call site is shared -- ``tests/models/
+    # test_generated_call_site_signatures.py`` is what enforces that. The two indexer
+    # call sites below stay on their bare-tensor return and this file needs no
+    # ``_split_indexer_output``.
+    build_indexer_loss: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     if (packed_sequence_slices is None) != (packed_compression_metadata is None):
         raise ValueError("Packed sequence slices and compression metadata must be provided together")
+    if build_indexer_loss:
+        # Reachable: ``dsa_indexer_implementation`` is a plain ``Literal`` with no
+        # hardware gate, so ``tilelang`` parses on NPU and ``_indexer_loss_enabled``
+        # then admits the objective. Everything after this point would quietly
+        # disagree with it -- the indexer is called without the flag and returns bare
+        # top-k indices, and the attention forward eventually fails its own wiring
+        # check with a message about an internal invariant rather than about the two
+        # lines of YAML that caused it. Say the true thing here instead.
+        raise NotImplementedError(
+            "dsa_indexer_loss is not implemented on NPU: the objective's student "
+            "distribution is the TileLang Lightning Indexer's per-slot scores, and that "
+            "kernel is CUDA-only. Set dsa_indexer_loss: false under model.model_config."
+        )
     batch, seq_len, _ = hidden_states.shape
     cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
     kv = self.kv_proj(hidden_states)
@@ -497,6 +579,7 @@ def deepseek_v4_csa_compressor_forward_patched(
             position_ids,
             rate_metadata,
             overlap=True,
+            apply_rope=apply_rotary_pos_emb,
         )
         # The indexer submodule is intentionally NOT anchored here: its outputs
         # are non-differentiable top-k indices, so its params already receive no
@@ -515,12 +598,16 @@ def deepseek_v4_csa_compressor_forward_patched(
             packed_sequence_slices=packed_sequence_slices,
             packed_compression_metadata=packed_compression_metadata,
         )
-        compressed_len = compressed_kv.shape[2]
-        valid = top_k_indices >= 0
-        safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
-        block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
-        block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-        result = (compressed_kv, block_bias[..., :compressed_len])
+        if build_block_bias:
+            compressed_len = compressed_kv.shape[2]
+            valid = top_k_indices >= 0
+            safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
+            block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
+            block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
+            block_bias = block_bias[..., :compressed_len]
+        else:
+            block_bias = None
+        result = (compressed_kv, block_bias)
         return (*result, top_k_indices) if return_topk_indices else result
 
     if cache_layer is None:
@@ -559,10 +646,14 @@ def deepseek_v4_csa_compressor_forward_patched(
         compressed = cache_layer.update_compressor_states("compressor", compressed)
     compressed_kv = compressed.unsqueeze(1)
     top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
-    compressed_len = compressed_kv.shape[2]
-    valid = top_k_indices >= 0
-    safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
-    block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
-    block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-    result = (compressed_kv, block_bias[..., :compressed_len])
+    if build_block_bias:
+        compressed_len = compressed_kv.shape[2]
+        valid = top_k_indices >= 0
+        safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
+        block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
+        block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
+        block_bias = block_bias[..., :compressed_len]
+    else:
+        block_bias = None
+    result = (compressed_kv, block_bias)
     return (*result, top_k_indices) if return_topk_indices else result

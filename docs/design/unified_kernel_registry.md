@@ -291,7 +291,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 |-------|------------------|-------|
 | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | VeOmni rewrites FA2/3/4 to SP-aware variants under `MODELING_BACKEND=veomni` |
 | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
-| `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
+| `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | |
 | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
 | `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field. On NPU, a value still equal to the GPU default `fused_triton` is normalized to `fused_npu`; incompatible non-default overrides raise. |
 | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | |
@@ -788,7 +788,7 @@ model.forward()                                    # (5) runtime
 | `VEOMNI_USE_LIGER_KERNEL=1` env var | Per-op `*_implementation: liger_kernel` fields | Removed; configure fields explicitly |
 | `gpu_patch.py` monkey-patching | patchgen + registry/`OpSlot` dispatch | Removed from current model paths |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `apply_ops_config()` | Replaced by the unified config install point |
-| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 separately exposes TileLang DSA indexer/attention config slots and three registry-backed TileKernels mHC slots. Its MoE keeps a direct `fused_moe_forward(...)` call under the experts guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is currently provided by the GPU backends and defaults to `fused_triton` on GPU, while `fused_npu` raises until the NPU kernel implements `swiglu_limit`. |
+| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 separately exposes TileLang DSA indexer/attention config slots and three registry-backed TileKernels mHC slots. Its MoE keeps a direct `fused_moe_forward(...)` call under the experts guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is provided by `fused_triton`, `fused_quack`, and Ascend `fused_npu` (via a forward/backward Triton activation kernel with the original eager activation as the missing-package fallback). |
 | `moe_implementation: fused` | `moe_implementation: fused_triton`, `fused_quack`, or `fused_npu` | The legacy `"fused"` alias remains deprecated: it resolves to `fused_quack` on GPU and `fused_npu` on NPU with a warning. The default-valued `fused_triton` selection is also normalized to `fused_npu` on NPU for compatibility; explicit backend names are recommended. |
 
 ---

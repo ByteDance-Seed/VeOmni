@@ -2,7 +2,7 @@ import os
 import sys
 
 
-sys.path.insert(0, os.path.abspath("../.."))
+sys.path.insert(0, os.path.abspath(".."))
 
 # -- Project information -----------------------------------------------------
 version_file = "../veomni/_version.py"
@@ -21,7 +21,6 @@ release = __version__
 
 
 # -- General configuration ---------------------------------------------------
-templates_path = ["_templates"]
 
 source_suffix = {
     ".rst": "restructuredtext",
@@ -43,11 +42,9 @@ extensions = [
     "sphinx.ext.viewcode",
 ]
 
-# Keep automatically generated section labels unique across documents and
-# avoid registering repeated low-level headings such as "Config".
 autosectionlabel_prefix_document = True
 autosectionlabel_maxdepth = 2
-myst_heading_anchors = 6
+myst_heading_anchors = 4
 
 html_theme = "sphinx_book_theme"
 

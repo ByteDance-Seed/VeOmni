@@ -67,13 +67,13 @@ If a turn carries audio that is **not** paired with any video (a voice query,
 a sound effect, narration over a silent clip, …), use the existing
 `sample["audios"]` field and an `<audio>` marker:
 
-```json
+```json5
 {
-  "videos": [{"frames": ["<frame-0>", "<frame-1>"], "audio": "<wav-bytes>"}],
+  "videos": [{"frames": ["<frame-bytes>"], "audio": "<wav-bytes>"}],
   "audios": ["<voice_query.wav>"],
   "conversations": [
     {"from": "human", "value": "<video>\nDescribe this. Also listen: <audio>"},
-    {"from": "gpt",   "value": "..."}
+    {"from": "gpt", "value": "Description and transcript."}
   ]
 }
 ```

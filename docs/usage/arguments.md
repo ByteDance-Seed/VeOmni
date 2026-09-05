@@ -76,7 +76,6 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `ChannelLossConfig` — `train.channel_loss.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
     * `TorchCompileConfig` — `train.torch_compile.*`
-    * `ChunkMBSConfig` — `train.chunk_mbs_config.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
           * `MixedPrecisionConfig` — `train.accelerator.fsdp_config.mixed_precision`
@@ -133,12 +132,6 @@ Root config — assembles `model`, `data`, and `train`.
 | model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
-| foundation | `Dict[str, str]` | `{}` | Foundation model extra config. |
-| encoders | `Dict` | `{}` | Multimodal encoder configs keyed by modality (`image`, `video`, `audio`). |
-| decoders | `Dict` | `{}` | Multimodal decoder configs keyed by modality (`image`). |
-| input_encoder | `Literal["encoder", "decoder"]` | `"encoder"` | Whether to use the encoder or decoder to encode input images. |
-| output_encoder | `Literal["encoder", "decoder"]` | `"decoder"` | Whether to use the encoder or decoder to encode output images. |
-| encode_target | `bool` | `False` | Whether to encode training targets with decoder (diffusion only). |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
@@ -191,7 +184,7 @@ NPU validation runs at two times:
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend, so a value still equal to the default auto-resolves to `eager` on NPU. |
-| rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
+| rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. DeepSeek-V4 and Wan reject the `liger_kernel` default because their rotary layout is partial / non-standard, and DeepSeek-V4 also rejects `npu`; both raise at model registration, so their configs must pin `triton` or `eager`. |
 | rotary_pos_emb_vision_implementation | `str` | `"eager"` | Vision rotary positional embedding. Known values: `eager`, `npu`. |
 | load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` uses the fused CUDA kernel; `eager` is the pure-PyTorch reference. On NPU, config normalization maps every value equal to the default `triton` (including an explicit YAML value) to `eager`. |
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
@@ -200,6 +193,118 @@ NPU validation runs at two times:
 | dsa_indexer_implementation | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
 | mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
+
+#### The Lightning Indexer KL objective (`dsa_indexer_loss`)
+
+Set under **`model.model_config`**, not under `model.ops_implementation`. The
+distinction matters because the YAML parser drops keys that are not fields of the
+dataclass they land in, without complaining: a config that puts either name under
+`ops_implementation` parses cleanly, trains the language-model objective alone and
+reports no indexer metric.
+
+```yaml
+model:
+  model_path: DeepSeek-V4-Flash-Base
+  model_config:
+    dsa_indexer_loss: true
+    dsa_indexer_loss_coef: 1.0
+  ops_implementation:
+    dsa_indexer_implementation: tilelang
+    dsa_attention_implementation: tilelang
+```
+
+The two are fields of DeepSeek-V4's own config, beside the
+`output_router_logits` / `router_aux_loss_coef` pair that configures the model's
+other auxiliary objective — a training objective is a property of the model,
+while `ops_implementation` selects kernel backends. They are therefore
+DeepSeek-V4-only by construction: no other model's config declares them.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| dsa_indexer_loss | `bool` | `False` | Train the DeepSeek sparse attention Lightning Indexer with the DeepSeek-V3.2 eq. (4) sparse KL objective. Requires `dsa_indexer_implementation: tilelang` and `dsa_attention_implementation: tilelang`, both refused at model build before any weight is read, and `ulysses_size: 1` with `cp_size: 1`, refused on the first forward. GPU-only; NPU refuses it. No unsupported combination is silently downgraded. |
+| dsa_indexer_loss_coef | `float` | `1.0` | Weight on the indexer KL when it is folded into the total loss. `0.0` switches the objective off entirely: no teacher is recomputed, no gradient reaches the indexer and no metric is reported, so it costs exactly what `dsa_indexer_loss: false` costs. Negative and non-finite values are refused. It is not a learning-rate knob for the indexer — see below before tuning it. |
+
+Both fields are serialised into the checkpoint's `config.json`, so a checkpoint
+produced by a flag-on run reports `dsa_indexer_loss: true` when it is reloaded. To
+serve such a checkpoint on an eager DSA stack, switch the objective off with
+`dsa_indexer_loss: false` or `dsa_indexer_loss_coef: 0.0` under `model_config`;
+otherwise the prerequisite check refuses the build.
+
+The objective minimises `KL(target ‖ softmax(index_score))` over the compressed
+candidates the sparse attention selected, where `target` is a teacher
+distribution recomputed in the forward from that attention's own LSE. It is
+summed over CSA layers, normalised per query token, scaled by
+`dsa_indexer_loss_coef` and added to the total loss. Gradients from the KL reach the Lightning Indexer only — no language-model
+parameter is on its backward path, which
+`test_the_indexer_objective_moves_only_the_indexer` pins. That is a narrower claim
+than "a flag-on run tracks a flag-off baseline step for step", which it does not;
+see `dsa_indexer_loss_coef` below.
+
+**The top-k has to actually bind, or this is not the paper's objective.** Eq. (4)
+is a KL over the *selected* candidates, which is only a selection when a query row
+has more causally visible compressed slots than `index_topk`. When it has fewer,
+every visible slot is selected and the objective degenerates to the dense eq. (3).
+Two things decide this and both are easy to get wrong:
+
+- `max_seq_len / compress_rate` must comfortably exceed `index_topk`. At
+  `max_seq_len: 2048` with a rate-4 CSA layer and `index_topk: 512` the two are
+  exactly equal — the degenerate boundary, not a margin.
+- The visible-slot count is per **sample**, not per packed row: compression
+  windows and causal ranges restart at every `cu_seq_lens` boundary, so a query
+  row only ever sees its own sample's slots. On a short-conversation SFT mixture
+  the top-k never binds however large `max_seq_len` is. Long documents are what
+  escape this, not a longer packed row.
+
+`configs/text/deepseek_v4_indexer_loss.yaml` derives both numbers for a concrete
+dataset and is the place to start from.
+
+Four metrics are reported, all per micro-batch means:
+
+| Metric | Meaning |
+| --- | --- |
+| `training/indexer_kl` | The objective itself, as a **per-layer** mean so runs with different CSA layer counts are comparable. The loss keeps the layer sum; only the metric is divided. |
+| `training/indexer_kl_uniform` | `log(n_candidates) − H(target)`, the KL a student would pay knowing the candidate set and nothing about which slot matters. The scale `indexer_kl` has to be read against — it is not interpretable alone. |
+| `training/indexer_kl_captured` | `1 − indexer_kl / indexer_kl_uniform`, formed per micro-batch and then averaged like any other auxiliary metric, so it is close to but not exactly that expression applied to the two values logged beside it. 1.0 reproduces the teacher, 0.0 is that zero-information student. A pretrained indexer sits at ~0.96 on the 4-layer reference checkpoint and ~0.99 on the 43-layer base one, from step 1 and flat: it arrives near-optimal, and the residual does not shrink because the teacher moves with the LM. This is the metric to watch — `indexer_kl`'s absolute scale also tracks how full the packing buffer is, so it ramps over the first few steps while this one does not. |
+| `training/lm_loss_before_indexer_kl` | The language-model loss from before the KL was folded in, so a flag-on run has a curve comparable to a flag-off baseline. `training/foundation_loss` includes the KL. |
+
+#### What `dsa_indexer_loss_coef` controls, and what it does not
+
+It scales the KL where the loss is assembled, so it moves two things: the value of
+`training/foundation_loss`, and the indexer's share of the global gradient norm —
+hence how often `train.optimizer.max_grad_norm` clips. The four metrics above are
+coefficient-free, so tuning it does not change how they read.
+
+It is **not** a learning-rate knob for the indexer. Muon orthogonalises its update
+and Adam divides by `sqrt(v)`, so both are invariant to a constant rescale of a
+parameter's gradient: quartering the coefficient does not quarter how fast the
+indexer moves. Only extreme values break that invariance, by pushing gradients under
+Adam's `eps` or degrading the Newton-Schulz conditioning. Read it as "how much the
+indexer objective may perturb the LM update", not "how hard the indexer trains".
+
+That perturbation is measurable. A 43-layer DeepSeek-V4-Flash SFT run at
+`dsa_indexer_loss_coef: 1.0` and `max_grad_norm: 1.0`, against three flag-off
+baselines on bitwise-identical batches, over its first 375 steps:
+
+| | flag off (3 runs) | flag on |
+| --- | --- | --- |
+| `grad_norm`, steps 60–100 | 0.245, over 1.0 on 0% of steps | 1.211, on 63% |
+| `grad_norm`, steps 150–375 | 0.192 | 0.33 |
+| MFU, steps 100–375 | 0.0373 / 0.0389 / 0.0394 | 0.0380 |
+| LM loss, paired per step | within ±0.02% of each other | +0.5% to +1.9% |
+
+The throughput cost sits inside the baselines' own ±2.9% spread, so the objective is
+free on step time. The LM-loss offset is not noise: the three baselines agree to
+0.02% on identical batches. Two channels produce it — the clip coefficient now
+depends on the indexer's gradient, and a moving indexer selects different candidates
+wherever the top-k binds — and neither is a gradient leak, which the test named above
+rules out. Lowering the coefficient is the in-semantics lever against the first
+channel only; the indexer's motion, and so the second channel, is coefficient-
+invariant for the reason above.
+
+Megatron-LM shares both channels and mitigates neither: `rg -in "indexer|dsa"` over
+its `core/optimizer/__init__.py` and `core/optimizer/clip_grads.py` is empty — no
+indexer param group, no clip exemption, no indexer learning rate. A per-indexer clip
+group or learning rate is therefore a recipe choice beyond the reference, not a fix.
 
 ### DataArguments
 
@@ -255,7 +360,7 @@ NPU validation runs at two times:
 | pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
 | bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |
 | bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
-| init_device | `Literal["cpu", "cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2. |
+| init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
 | ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
@@ -274,13 +379,12 @@ NPU validation runs at two times:
 | channel_loss | `ChannelLossConfig` | — | Detached per-channel causal-LM loss logging. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
 | torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
-| chunk_mbs_config | `ChunkMBSConfig` | — | Packed-sequence layer micro-batching settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
 | checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
 
 ### TorchCompileConfig
 
-`train.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `train.torch_compile.dynamic=False`, `train.accelerator.ulysses_size=1`, `train.accelerator.cp_size=1`, and `train.accelerator.enable_async=False`. Qwen3-VL-MoE, ChunkMBS, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
+`train.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `train.torch_compile.dynamic=False`, `train.accelerator.ulysses_size=1`, `train.accelerator.cp_size=1`, and `train.accelerator.enable_async=False`. Qwen3-VL-MoE, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
 
 The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `train.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 
@@ -318,7 +422,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_eps | `float` | `1e-7` | Numerical-stability epsilon used in spectral-norm normalization. |
 | muon_adjust_lr_fn | `Literal["original", "match_rms_adamw"]` | `"match_rms_adamw"` | Per-matrix learning-rate adjustment strategy. |
 | muon_head_group_size | `int` | `0` | Attention heads per Newton–Schulz block ("Muon Split"). `0` orthogonalizes each projection as one matrix, `1` is per-head, `g>1` groups `g` heads. Any value `>= 1` requires `muon_head_split_modules`. |
-| muon_head_split_modules | `List[str]` | `[]` | Leaf module names to head-split, e.g. `[q_b_proj]`. No default — required when `muon_head_group_size >= 1`. |
+| muon_head_split_modules | `List[str]` | `[]` | Projections to head-split, each a leaf module name or a dotted path suffix, e.g. `[self_attn.q_b_proj]`. An entry that would split two *nested* projections is rejected with the qualified names to use instead. No default — required when `muon_head_group_size >= 1`. |
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
@@ -361,10 +465,8 @@ not change the returned training loss or gradients. Fused-loss backends may
 recompute the LM-head projection on sampled steps, so the default interval is
 10 steps; set `interval=1` for per-step metrics. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
-a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
-because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
-is unsupported because it packs source alignment metadata after the common step
-lifecycle. In DPO training, only the policy-model forward is observed; the
+a causal-LM objective. `BaseRLTrainer` is unsupported because it packs source
+alignment metadata after the common step lifecycle. In DPO training, only the policy-model forward is observed; the
 reference-model forward is excluded, and the chosen/rejected segments both use
 their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
@@ -394,28 +496,6 @@ distinct from the first emission.
 | debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
 | enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
 | early_stop | `bool` | `True` | Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. PyTorch ignores this option when `enable_reentrant=True`. |
-
-### ChunkMBSConfig
-
-`train.chunk_mbs_config.*` — Packed-sequence layer micro-batching settings.
-
-`chunk_mbs` is the number of packed samples per layer chunk. With dynamic batching, the runtime sample
-count is inferred from `cu_seq_lens_q`, so it is independent of `train.micro_batch_size`. Chunks are cut
-only on packed sample boundaries. The current implementation supports trainer-based SFT with packed-sequence
-FlashAttention kwargs using `torch.int32` cumulative lengths, identical query/key metadata, exactly one
-`*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
-`GradientCheckpointingLayer`, and decoder states with shape `[1, sequence, hidden]`. Gradient checkpointing may be
-enabled or disabled; when enabled, it must use the non-reentrant implementation. CPU model-level numerical coverage
-currently includes Qwen3-VL and dense Qwen3.5; accelerator-specific kernels require separate hardware validation. Sequence parallelism,
-tensor parallelism, pipeline parallelism, ExtraParallel/MoE, DiT trainers, RL trainers, DPO, the custom Omni training loop,
-`pad_to_length`, and `torch.compile` are not supported. Chunk boundaries must also align with linear-attention
-cumulative sequence boundaries when that metadata is present. Models with ambiguous decoder classes or stacks fail
-validation instead of applying ChunkMBS to multiple stacks.
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| enable | `bool` | `False` | Enable ChunkMBS for packed-sequence decoder layers listed in `model._no_split_modules`. |
-| chunk_mbs | `int` | `1` | Number of packed samples per layer chunk. |
 
 ### AcceleratorConfig
 
@@ -471,8 +551,20 @@ validation instead of applying ChunkMBS to multiple stacks.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable_activation | `bool` | `False` | Enable activation offload to CPU. |
+| enable_activation | `bool` | `False` | Enable synchronous activation offload to CPU. |
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
+| enable_async_activation | `bool` | `False` | Enable async activation offload via stream-based D2H/H2D. Mutually exclusive with `enable_activation`. When `activation_offload_modules` is empty, targets are discovered from `model._no_split_modules`; missing or unmatched model metadata fails closed. |
+| activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
+| activation_offload_host_cache_limit_gb | `float` | `4.0` | Maximum GB of free host buffers retained between steps. In-flight offloads may temporarily exceed this value. Set to `0` to disable reuse. |
+
+Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
+through unchanged. Only private, dense, contiguous activations are swapped so
+shared-storage views are never resized. Host buffers are pooled per model,
+keyed by shape, stride, and dtype, and evicted by least-recently-used layout to
+enforce `activation_offload_host_cache_limit_gb`. The manager is reset at every training-step
+boundary, including before a step after a failed forward/backward, so stale
+autograd keys cannot affect the next step. The path wraps selected module instances
+and is not intended to be captured by `torch.compile`.
 
 ### CheckpointConfig
 
