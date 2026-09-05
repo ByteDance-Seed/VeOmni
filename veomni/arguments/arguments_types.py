@@ -491,55 +491,19 @@ class OffloadConfig:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
-    enable_async_activation: bool = field(
+    enable_async_activation_offload: bool = field(
         default=False,
         metadata={
             "help": (
-                "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
-                "More efficient than synchronous offload. Mutually exclusive with "
-                "`enable_activation`. Uses `model._no_split_modules` when "
-                "`activation_offload_modules` is empty."
+                "Enable async activation offload to CPU via stream‑based D2H/H2D transfers. "
+                "More efficient than synchronous offload. When enabled, takes precedence over "
+                "`enable_activation`. Must be used together with gradient checkpointing "
+                "(recomputation). Offload targets are auto‑derived from "
+                "`model._no_split_modules` — the same class names used for FSDP sharding "
+                "boundaries."
             )
         },
     )
-    activation_offload_modules: List[str] = field(
-        default_factory=list,
-        metadata={
-            "help": (
-                "Module name patterns for async activation offload. Supports glob patterns "
-                "(e.g. `model.layers.*`) and the special `{*}` wildcard for sequential "
-                "module groups (e.g. `model.layers.{*}` expands to all decoder layers)."
-            )
-        },
-    )
-    activation_offload_host_cache_limit_gb: float = field(
-        default=4.0,
-        metadata={
-            "help": (
-                "Maximum GB of free host buffers retained by async activation offload between steps. "
-                "In-flight offloads may temporarily use more host memory. Set to 0 to disable reuse."
-            )
-        },
-    )
-
-    def __post_init__(self):
-        if self.enable_activation and self.enable_async_activation:
-            raise ValueError(
-                "enable_activation and enable_async_activation are mutually exclusive; "
-                "select exactly one activation offload mode."
-            )
-        if not math.isfinite(self.activation_offload_host_cache_limit_gb) or (
-            self.activation_offload_host_cache_limit_gb < 0
-        ):
-            raise ValueError(
-                "activation_offload_host_cache_limit_gb must be a finite non-negative value, "
-                f"got {self.activation_offload_host_cache_limit_gb}."
-            )
-        if self.activation_offload_host_cache_limit_gb > _MAX_HOST_CACHE_LIMIT_GB:
-            raise ValueError(
-                "activation_offload_host_cache_limit_gb is too large to convert to bytes: "
-                f"got {self.activation_offload_host_cache_limit_gb}, maximum {_MAX_HOST_CACHE_LIMIT_GB}."
-            )
 
 
 @dataclass
@@ -846,12 +810,22 @@ class TrainingArguments:
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
 
+        self._validate_offload()
         self._validate_accelerator()
         self._derive_batch_config()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
 
     # -- validation & derivation helpers (called by __post_init__) -----------------------
+
+    def _validate_offload(self):
+        if self.accelerator.offload_config.enable_async_activation_offload and not self.gradient_checkpointing.enable:
+            raise ValueError(
+                "enable_async_activation_offload requires gradient_checkpointing.enable=True. "
+                "Async activation offload relies on recomputation to release intermediate "
+                "activations from GPU memory. Please enable gradient checkpointing or disable "
+                "async activation offload."
+            )
 
     def _validate_accelerator(self):
         acc = self.accelerator
