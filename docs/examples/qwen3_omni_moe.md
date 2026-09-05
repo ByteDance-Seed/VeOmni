@@ -3,9 +3,9 @@
 ## Download multisource dataset
 
 ### sharegpt4v_cap_100k + COCO2017
-Download the [COCO2017](https://images.cocodataset.org/zips/train2017.zip) dataset and download the data annotation JSON file [sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/tree/main).
+Download the [COCO2017](https://images.cocodataset.org/zips/train2017.zip) dataset and the [sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/tree/main) annotation file.
 
-Modify the `sharegpt4v_instruct_gpt4-vision_cap100k.json` and genrate `sharegpt4v_instruct_gpt4-vision_cap100k_coco.json`.
+Modify `sharegpt4v_instruct_gpt4-vision_cap100k.json` to generate `sharegpt4v_instruct_gpt4-vision_cap100k_coco.json`.
 
 ```python
 import json

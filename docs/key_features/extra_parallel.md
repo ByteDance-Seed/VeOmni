@@ -7,15 +7,15 @@
 
 ## Motivation
 
-As EP+FSDP2 is well supported in VeOmni, similar parallelism is also needed for other modules, like embedding layer. To support this kind of parallelism with similar communication ops, we extend EP+FSDP2 to extra parallelism+FSDP2:
+VeOmni supports EP+FSDP2, but other modules, such as embedding layers, also need similar parallelism. To reuse the same communication operations, VeOmni generalizes EP+FSDP2 into ExtraParallel+FSDP2:
 
-* Support any length of list of parallelism sizes for different parallism patterns in FSDP2 training.
+* Support a list of parallelism sizes of any length for different parallelism patterns in FSDP2 training.
 * Support checkpoint save and (resharding) load for different parallelism patterns.
 * Support prefetching to overlap communication and computation as described in [ep_fsdp2.md](./ep_fsdp2.md).
 
 ## Design Overview
 
-The overall design of extra parallelism is similar to EP+FSDP2, except that it is applied on different parallel modules. Before reading this document, please read [ep_fsdp2.md](./ep_fsdp2.md). The key requirement:
+The overall design of extra parallelism is similar to EP+FSDP2, except that it applies to different parallel modules. Before reading this document, read [ep_fsdp2.md](./ep_fsdp2.md). The key requirement is:
 
 * The sharded modules need to be sorted in reverse order from submodules to parent modules to avoid sharding twice, as `fully_shard` is applied from bottom to top.
 
