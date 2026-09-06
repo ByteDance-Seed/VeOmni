@@ -43,6 +43,7 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor,
 )
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     apply_rotary_pos_emb_patched,
     apply_rotary_pos_emb_vision_patched,
@@ -65,7 +66,6 @@ from veomni.models_kernel.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config im
     config as qwen3_vl_config,
 )
 from veomni.models_kernel.utils.kernel_utils import empty_bias, resolve_kernel_impl, resolve_moe_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
@@ -109,8 +109,8 @@ config.add_import(
     names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
 )
 config.add_import(
-    "veomni.models_kernel.utils.loss_utils",
-    names=["ForCausalLMLoss"],
+    "veomni.models_kernel.loss_utils",
+    names=["ForCausalLMLoss", "load_balancing_loss"],
 )
 config.drop_import_names("Qwen3VLMoeCausalLMOutputWithPast")
 
@@ -598,13 +598,14 @@ def qwen3_vl_moe_for_conditional_generation_init_patched(self, config):
         "standard",
         resolve_kernel_impl("load_balancing_loss_implementation"),
     )
+    self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
     self.post_init()
 
 
 # ================================================================
 # Patch: Qwen3VLMoeForConditionalGeneration.forward
 # 1. always call self.loss_function (ForCausalLMLoss + VeomniKernel)
-# 2. aux_loss via local load_balancing_loss kernel after cat to [N, E]
+# 2. aux_loss via the model-facing load_balancing_loss helper
 # ================================================================
 @config.override_method(
     "Qwen3VLMoeForConditionalGeneration.forward",
@@ -664,13 +665,12 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     # --- Patch.2 ---
     aux_loss = None
     if kwargs.get("output_router_logits", False):
-        router_logits = outputs.router_logits
-        if router_logits is None or not isinstance(router_logits, tuple):
-            aux_loss = 0
-        else:
-            gate = torch.cat([layer.reshape(-1, layer.shape[-1]) for layer in router_logits], dim=0)
-            mask = attention_mask if isinstance(attention_mask, torch.Tensor) else gate.new_empty(0)
-            aux_loss = self.veomni_lb(gate, mask, top_k=self.config.text_config.num_experts_per_tok)
+        aux_loss = self.load_balancing_loss(
+            outputs.router_logits,
+            self.config.text_config.num_experts,
+            self.config.text_config.num_experts_per_tok,
+            attention_mask,
+        )
         if labels is not None and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
     # --- Patch.2 ---

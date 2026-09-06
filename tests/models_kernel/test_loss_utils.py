@@ -23,10 +23,10 @@ import torch.nn.functional as F
 from torch import Tensor
 from transformers.loss.loss_utils import fixed_cross_entropy
 
+import veomni.models_kernel.loss_utils.cross_entropy_loss as loss_utils
 from tests.kernels.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils import loss_utils
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
 
 
 IGNORE_INDEX = -100

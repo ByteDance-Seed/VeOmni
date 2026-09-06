@@ -100,8 +100,8 @@ config.add_import(
     names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
 )
 config.add_import(
-    "veomni.models_kernel.utils.loss_utils",
-    names=["ForCausalLMLoss"],
+    "veomni.models_kernel.loss_utils",
+    names=["ForCausalLMLoss", "load_balancing_loss"],
 )
 config.drop_import_names(
     "FusedRMSNormGated",

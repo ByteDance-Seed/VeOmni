@@ -60,8 +60,8 @@ from transformers.utils.output_capturing import capture_outputs
 
 from veomni.kernels import VeomniKernel
 from veomni.kernels.mask import causal_mask, packed_causal_mask, sliding_window_mask
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 

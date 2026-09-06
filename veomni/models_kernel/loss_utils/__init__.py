@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Legacy model-facing operation helpers."""
+"""Model-facing loss policy around local ``VeomniKernel`` handles."""
 
-from . import cross_entropy  # noqa: F401
+from .chunk_logprobs import chunk_logprobs_function
+from .chunk_topk_distill import chunk_topk_distill_function
+from .cross_entropy_loss import ForCausalLMLoss, ForSequenceClassificationLoss
+from .load_balancing_loss import load_balancing_loss
+
+
+__all__ = [
+    "ForCausalLMLoss",
+    "ForSequenceClassificationLoss",
+    "chunk_logprobs_function",
+    "chunk_topk_distill_function",
+    "load_balancing_loss",
+]

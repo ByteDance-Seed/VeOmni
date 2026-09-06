@@ -31,7 +31,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import veomni.models_kernel.utils.chunk_logprobs as cl
+import veomni.models_kernel.loss_utils.chunk_logprobs as cl
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 

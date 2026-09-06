@@ -117,9 +117,9 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice, unpad_tensor
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, empty_bias, resolve_kernel_impl, resolve_moe_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 
@@ -2306,6 +2306,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             "standard",
             resolve_kernel_impl("load_balancing_loss_implementation"),
         )
+        self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
         self.post_init()
 
     def get_input_embeddings(self):
@@ -2760,13 +2761,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         aux_loss = None
         if output_router_logits:
-            router_logits = outputs.router_logits
-            if router_logits is None or not isinstance(router_logits, tuple):
-                aux_loss = 0
-            else:
-                gate = torch.cat([layer.reshape(-1, layer.shape[-1]) for layer in router_logits], dim=0)
-                mask = attention_mask if isinstance(attention_mask, torch.Tensor) else gate.new_empty(0)
-                aux_loss = self.veomni_lb(gate, mask, top_k=self.num_experts_per_tok)
+            aux_loss = self.load_balancing_loss(
+                outputs.router_logits,
+                self.num_experts,
+                self.num_experts_per_tok,
+                attention_mask,
+            )
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 

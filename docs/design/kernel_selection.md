@@ -26,7 +26,7 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
-| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
+| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | Model `__init__` via an instance-local `VeomniKernel` |
 | MoE experts | `moe_implementation` | `eager`, `triton`, `quack` (SM90+), `npu`, `mlu` | `"triton"` (GPU) | `build_foundation_model` |
 
 **Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
@@ -59,13 +59,13 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
 
 BaseTrainer._build_model()                    # (3) model build time
   └─ build_foundation_model(..., ops_implementation=ops)
-       ├─ apply_ops_config(ops)               # install LOSS_MAPPING + GLOBAL patches
-       │    ├─ install_loss_mapping(ce_impl)  # partial(ForCausalLMLoss, cross_entropy_fn=<impl>)
-       │    └─ apply_global_ops(config)       # load_balancing_loss, etc.
+       ├─ apply_ops_config(ops)               # install legacy LOSS_MAPPING integration
+       │    └─ install_loss_mapping(ce_impl)  # partial(ForCausalLMLoss, cross_entropy_fn=<impl>)
        ├─ apply_veomni_fused_moe_patch(...)   # bind MoE kernel
        ├─ device_patch.py reads ops config     # RMSNorm/RoPE/SwiGLU
        ├─ OpSlot.bind(impl_name)              # per-model OpSlot dispatch
        └─ model init + weight loading
+            └─ MoE model binds load_balancing_loss helper to a local VeomniKernel
 
 model.forward()                               # (4) runtime
   ├─ attention: ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
@@ -334,25 +334,27 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `triton` | Fused Triton kernel (`_load_balancing_loss` is rebound by `apply_ops_config` via the registry's `global_slot`) | `triton` on CUDA |
-| `eager` | Pure-PyTorch reference (`load_balancing_loss_pytorch`) | — |
+| `triton` | Fused tensor-native `[N, E]` kernel | `triton` on CUDA |
+| `eager` | Pure-PyTorch tensor-native `[N, E]` reference | — |
 
 Normal NPU config construction maps every value equal to the dataclass default
 `triton`—including an explicit YAML value—to `eager` before registry binding.
 The optimized `triton` implementation is CUDA-only; select `eager` in current
 NPU configs.
 
-This is a `GLOBAL`-scope op: the function pointer
-`veomni.ops.kernels.load_balancing_loss._load_balancing_loss` is rebound
-once per process from `apply_ops_config()`, and every call site that
-imports `from veomni.ops import load_balancing_loss_func` picks up the
-selected backend automatically — no per-model patching needed.
+This loss intentionally has no `veomni.ops` facade and no process-global
+dispatch. Each MoE model creates
+`VeomniKernel("load_balancing_loss", "standard", impl)` in `__init__`, then
+binds the model-facing helper with `partial(load_balancing_loss,
+kernel=self.veomni_lb)`. The helper preserves the HF-shaped API and converts
+the tuple of per-layer router logits into the raw kernel's `[N, E]` input.
 
 ### Key files
 
-- Selection: `veomni/ops/kernels/load_balancing_loss/__init__.py` — `register_op(...)` entry
-- Triton impl: `veomni/ops/kernels/load_balancing_loss/triton.py`
-- Eager impl: `veomni/ops/kernels/load_balancing_loss/eager.py`
+- Model helper: `veomni/models_kernel/loss_utils/load_balancing_loss.py`
+- Triton impl: `veomni/kernels/_kernels/loss/load_balancing_loss/standard/triton.py`
+- Eager impl: `veomni/kernels/_kernels/loss/load_balancing_loss/standard/eager.py`
+- Registration: `veomni/kernels/_kernels/loss/__init__.py`
 
 ---
 
@@ -523,9 +525,11 @@ Both Qwen3MoE and Qwen3.5MoE in Transformers v5 include a standalone
 loss. This function is called directly in `Qwen3MoeForCausalLM.forward()` —
 there is no kernel selection, no registry, and no hub kernel for it.
 
-VeOmni adds a configurable Triton implementation through
-`load_balancing_loss_implementation`; Transformers itself still has no
-corresponding selection surface for this function.
+VeOmni adds a configurable Triton implementation through an instance-local
+`VeomniKernel`. `models_kernel/loss_utils/load_balancing_loss.py` preserves the
+HF input policy while the registered eager/Triton kernels operate only on a
+concatenated `[N, E]` tensor. Transformers itself still has no corresponding
+selection surface for this function.
 
 #### 3. Qwen3.5 MoE Variant-Specific Ops
 
@@ -606,7 +610,7 @@ currently exist in the `kernels-community` hub.
 | Attention | `ALL_ATTENTION_FUNCTIONS` (shared registry) | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | `apply_veomni_fused_moe_patch` (Triton/Quack) | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses custom Triton kernels; HF uses PyTorch native `grouped_mm` |
 | Cross-entropy | `apply_ops_config` + `LOSS_MAPPING`/OpSlot | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
-| MoE aux loss | Configurable eager/Triton registry | Eager `load_balancing_loss_func` | VeOmni only | HF has no fused selection surface |
+| MoE aux loss | Instance-local eager/Triton `VeomniKernel` + model helper | Eager `load_balancing_loss_func` | VeOmni only | HF has no fused selection surface |
 | RMSNormGated | Variant-aware OpSlot (`fla`/`npu`/`eager`) | Hard-coded `fla.modules.FusedRMSNormGated` if `fla` is installed, else eager | Different dispatch | VeOmni adds explicit hardware selection |
 
 ---

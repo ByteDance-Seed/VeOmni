@@ -68,8 +68,8 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, linear_bias, resolve_kernel_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 

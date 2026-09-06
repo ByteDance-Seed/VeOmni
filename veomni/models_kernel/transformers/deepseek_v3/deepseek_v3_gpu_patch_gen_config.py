@@ -35,13 +35,13 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
 from veomni.models_kernel.utils.kernel_utils import (
     empty_bias,
     linear_bias,
     resolve_kernel_impl,
     resolve_moe_impl,
 )
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
@@ -60,7 +60,7 @@ config.add_import(
     names=["empty_bias", "linear_bias", "resolve_kernel_impl", "resolve_moe_impl"],
 )
 config.add_import(
-    "veomni.models_kernel.utils.loss_utils",
+    "veomni.models_kernel.loss_utils",
     names=["ForCausalLMLoss"],
 )
 config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])

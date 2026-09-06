@@ -40,8 +40,8 @@ from transformers.utils import TransformersKwargs, auto_docstring
 from transformers.utils.output_capturing import OutputRecorder
 
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl, resolve_moe_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -63,8 +63,8 @@ config.add_import(
     names=["attention_kernel", "resolve_kernel_impl", "resolve_moe_impl"],
 )
 config.add_import(
-    "veomni.models_kernel.utils.loss_utils",
-    names=["ForCausalLMLoss"],
+    "veomni.models_kernel.loss_utils",
+    names=["ForCausalLMLoss", "load_balancing_loss"],
 )
 apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling file
 
@@ -199,6 +199,7 @@ def gpt_oss_forcausallm_init_patched(self, config):
         "standard",
         resolve_kernel_impl("load_balancing_loss_implementation"),
     )
+    self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
     self.post_init()
 
 
@@ -255,13 +256,12 @@ def gpt_oss_forcausallm_forward_patched(
 
     aux_loss = None
     if output_router_logits:
-        router_logits = outputs.router_logits
-        if router_logits is None or not isinstance(router_logits, tuple):
-            aux_loss = 0
-        else:
-            gate = torch.cat([layer.reshape(-1, layer.shape[-1]) for layer in router_logits], dim=0)
-            mask = attention_mask if isinstance(attention_mask, torch.Tensor) else gate.new_empty(0)
-            aux_loss = self.veomni_lb(gate, mask, top_k=self.num_experts_per_tok)
+        aux_loss = self.load_balancing_loss(
+            outputs.router_logits,
+            self.num_experts,
+            self.num_experts_per_tok,
+            attention_mask,
+        )
         if labels is not None and isinstance(aux_loss, torch.Tensor):
             loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
 

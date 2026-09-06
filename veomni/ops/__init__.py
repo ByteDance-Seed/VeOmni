@@ -18,32 +18,16 @@ from typing import TYPE_CHECKING
 
 from ..utils import logging
 from ..utils.env import get_env
-
-# Eagerly import kernel packages so that every op registers itself with the
-# registry.  Order does not matter; each ``register_op`` call is idempotent.
-from . import kernels  # noqa: F401  triggers all register_op() calls
-from .config.registry import apply_global_ops
 from .config.singleton import set_ops_config
 from .dispatch import OpSlot
-from .kernels import cross_entropy, load_balancing_loss  # noqa: F401
-from .kernels.load_balancing_loss import load_balancing_loss_func
 
 
 if TYPE_CHECKING:
     from ..arguments.arguments_types import OpsImplementationConfig
 
-__all__ = [
-    "OpSlot",
-    "load_balancing_loss_func",
-]
+__all__ = ["OpSlot"]
 
 logger = logging.get_logger(__name__)
-
-
-def build_ALL_OPS():
-    return [
-        ("_load_balancing_loss", load_balancing_loss._load_balancing_loss),
-    ]
 
 
 def apply_ops_patch():
@@ -60,9 +44,7 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
 
     1. Binds the cross-entropy kernel into ``LOSS_MAPPING`` via
        ``install_loss_mapping`` (pre-bound ``partial`` — no runtime resolution).
-    2. Walks GLOBAL ops (e.g. load-balancing loss) and binds each selected
-       backend to its ``global_slot``.
-    3. Populates the ops-config singleton so per-model ``device_patch.py`` and
+    2. Populates the ops-config singleton so per-model ``device_patch.py`` and
        ``OpSlot.bind`` can read the user's selections.
 
     Per-model kernels are applied by each model's ``device_patch.py``.
@@ -76,20 +58,13 @@ def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
     from .kernels.cross_entropy import install_loss_mapping
 
     ce_label = install_loss_mapping(ops_config.cross_entropy_loss_implementation)
-
-    applied = apply_global_ops(ops_config)
-    applied.insert(0, ce_label)
-    logger.info_rank0(f"✅ VeOmni ops config applied: {', '.join(applied)}.")
+    logger.info_rank0(f"✅ VeOmni ops config applied: {ce_label}.")
     logger.info_rank0(format_kernel_functions())
 
 
 def format_kernel_functions() -> str:
     lines = []
     lines.append("\n=========== OPS ============")
-
-    for alias, func in build_ALL_OPS():
-        impl = func.__name__ if func is not None else "None"
-        lines.append(f"{alias} = {impl}")
 
     # Cross-entropy is bound via LOSS_MAPPING (partial-wrapped), not a module
     # global — surface it here so the log still shows the active CE kernel.

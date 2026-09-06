@@ -1346,9 +1346,8 @@ class OpsImplementationConfig:
                         f"for ops with no MLU kernel for the current model."
                     )
 
-        # The Triton load-balancing-loss kernel imports ``triton`` at module
-        # top — surface a missing package here with an actionable message
-        # instead of a noisy ImportError at apply_global_ops time.
+        # Surface a missing Triton package before a model tries to construct
+        # its instance-local load-balancing-loss ``VeomniKernel`` handle.
         if self.load_balancing_loss_implementation == "triton" and not is_package_available("triton"):
             raise ValueError(
                 "load_balancing_loss_implementation='triton' requires the 'triton' package "

@@ -111,9 +111,9 @@ from transformers.vision_utils import get_vision_position_ids, get_vision_window
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, unpad_tensor
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 

@@ -95,8 +95,8 @@ from veomni.distributed.sequence_parallel import (
 
 # Additional imports for patches
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log_probs path

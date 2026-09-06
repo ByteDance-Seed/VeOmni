@@ -39,9 +39,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import veomni.models_kernel.utils.chunk_logprobs as cl
-import veomni.models_kernel.utils.chunk_topk_distill as ctkd
-from veomni.models_kernel.utils import chunk_logprobs_function
+import veomni.models_kernel.loss_utils.chunk_logprobs as cl
+import veomni.models_kernel.loss_utils.chunk_topk_distill as ctkd
+from veomni.models_kernel.loss_utils import chunk_logprobs_function
 from veomni.utils.constants import IGNORE_INDEX
 
 

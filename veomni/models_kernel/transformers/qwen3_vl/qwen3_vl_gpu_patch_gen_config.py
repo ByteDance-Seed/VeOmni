@@ -51,8 +51,8 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
@@ -102,7 +102,7 @@ from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log
 )
 from veomni.kernels import VeomniKernel
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
 """)
 
 config.add_import("veomni.kernels", names=["VeomniKernel"])
@@ -111,7 +111,7 @@ config.add_import(
     names=["attention_kernel", "resolve_kernel_impl"],
 )
 config.add_import(
-    "veomni.models_kernel.utils.loss_utils",
+    "veomni.models_kernel.loss_utils",
     names=["ForCausalLMLoss"],
 )
 

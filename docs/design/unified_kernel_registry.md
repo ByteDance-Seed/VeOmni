@@ -363,7 +363,6 @@ model:                       @dataclass
                                │    └─ module-level OpSlot instances created:
                                │         veomni_apply_rotary_pos_emb = OpSlot(...)
                                │         veomni_moe_experts_forward  = OpSlot(...)
-                               │         veomni_load_balancing_loss   = OpSlot(...)
                                │    (all start with _kernel = None)
                                │
                                ├─ _bind_veomni_ops(module, ops_config):
@@ -654,54 +653,33 @@ only touch the guard lines, not the function bodies.
 
 ### 8. Loss and MoE LB Coverage
 
-Both loss ops use the same `OpSlot` + if-else guard pattern.
-
-#### Cross-Entropy Loss
-
-```python
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-veomni_seq_cls_loss   = OpSlot("cross_entropy_loss", "seq_cls")
-
-# In ForCausalLM.forward / ForConditionalGeneration.forward:
-    if labels is not None:
-        # +++ veomni: kernel dispatch +++
-        if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits = veomni_causal_lm_loss(logits, labels, self.config)
-        else:
-            loss = self.loss_function(logits, labels, self.vocab_size, ...)
-
-# In ForSequenceClassification.forward the seq_cls OpSlot is used instead.
-```
-
-#### MoE Load-Balancing Loss
+Losses in `models_kernel` use instance-local `VeomniKernel` handles. Modeling
+policy remains outside the raw kernel registry:
 
 ```python
-veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", ce_impl)
+self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
 
-# Original HF function — UNCHANGED
-def load_balancing_loss_func(gate_logits, num_experts, top_k, attention_mask=None):
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-    ...
-
-# Call site in ForCausalLM/ForConditionalGeneration.forward:
-    # +++ veomni: kernel dispatch +++
-    if veomni_load_balancing_loss.use_non_eager_impl:
-        aux_loss = veomni_load_balancing_loss(outputs.router_logits, ...)
-    else:
-        aux_loss = load_balancing_loss_func(outputs.router_logits, ...)
+self.veomni_lb = VeomniKernel("load_balancing_loss", "standard", lb_impl)
+self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
 ```
+
+`models_kernel/loss_utils/load_balancing_loss.py` owns the HF-shaped input
+policy (`None`, tuple concatenation, and optional attention mask). The
+registered eager and Triton kernels receive only a concatenated `[N, E]`
+tensor plus a mask sentinel. There is no `veomni.ops` facade, global slot, or
+per-forward implementation branch for load-balancing loss.
 
 ### 9. Full Example: Qwen3.5 MoE
 
 #### Current generated dispatch coverage
 
-| OpSlot | Purpose |
+| Binding | Purpose |
 |--------|---------|
 | `OpSlot("rms_norm", "qwen3_5")` | Qwen3.5 MoE RMSNorm |
 | `OpSlot("moe_experts", "standard")` | Fused or eager MoE expert forward |
-| `OpSlot("cross_entropy_loss", "causal")` | Causal language-model loss |
-| `OpSlot("load_balancing_loss", "standard")` | MoE auxiliary load-balancing loss |
+| `self.veomni_ce = VeomniKernel(...)` | Causal language-model loss |
+| `self.veomni_lb = VeomniKernel(...)` | MoE auxiliary load-balancing loss |
 | `OpSlot("rms_norm_gated", "standard")` | GatedDeltaNet gated RMSNorm |
 | `OpSlot("causal_conv1d", "standard")` | GatedDeltaNet causal convolution |
 | `OpSlot("chunk_gated_delta_rule", "standard")` | GatedDeltaNet recurrent update |
@@ -752,8 +730,6 @@ build_foundation_model(config, ops_implementation=ops) # (4) model build time
   │    └─ module-level OpSlot instances created:    #     (at import time)
   │         veomni_rms_norm               = OpSlot("rms_norm", "qwen3_5")
   │         veomni_moe_experts_forward   = OpSlot("moe_experts", "standard")
-  │         veomni_load_balancing_loss   = OpSlot("load_balancing_loss", "standard")
-  │         veomni_causal_lm_loss        = OpSlot("cross_entropy_loss", "causal")
   │         veomni_rms_norm_gated        = OpSlot("rms_norm_gated", "standard")
   │         veomni_causal_conv1d         = OpSlot("causal_conv1d", "standard")
   │         veomni_chunk_gated_delta_rule= OpSlot("chunk_gated_delta_rule", "standard")
@@ -766,6 +742,10 @@ build_foundation_model(config, ops_implementation=ops) # (4) model build time
   │        slot.bind(impl)                                    # KERNEL_REGISTRY.resolve()
   │
   └─ model init + weight loading
+       ├─ self.veomni_ce = VeomniKernel("cross_entropy_loss", ...)
+       ├─ self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+       ├─ self.veomni_lb = VeomniKernel("load_balancing_loss", ...)
+       └─ self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
 
 model.forward()                                    # (5) runtime
   ├─ RMSNorm / gated RMSNorm / causal Conv1D / gated delta rule
@@ -775,8 +755,8 @@ model.forward()                                    # (5) runtime
   │   └─ if veomni_moe_experts_forward.use_non_eager_impl:
   │        return veomni_moe_experts_forward(...)    #     → fused kernel
   │      else: <original HF expert loop>             #     → eager fallback
-  ├─ if veomni_causal_lm_loss.use_non_eager_impl: ...        #     guard in forward
-  └─ if veomni_load_balancing_loss.use_non_eager_impl: ...   #     guard in forward
+  ├─ self.loss_function(...)                   # instance-local CE kernel
+  └─ self.load_balancing_loss(...)             # helper -> instance-local LB kernel
 ```
 
 ---

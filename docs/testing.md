@@ -26,12 +26,17 @@ tests/
 ├── ops/                            # Fused kernel correctness & performance
 │   ├── test_fused_moe_split_vs_merged.py   # Split vs merged MoE fc1
 │   ├── test_quack_fused_moe.py             # Quack GEMM MoE (SM90+)
-│   ├── test_fused_load_balancing_loss.py    # Triton load-balancing loss kernel
 │   ├── test_deepseek_v4_kernels.py           # DeepSeek-V4 TileLang guards and numerical parity
-│   ├── test_mhc_tile_kernels.py              # DeepSeek-V4 TileKernels mHC dispatch and parity
 │   ├── test_flash_attn_varlen_padding.py   # Flash-attn variable-length padding
 │   ├── test_seqcls_loss.py                 # Sequence classification loss
 │   └── test_comp.py                        # Position embedding computation
+│
+├── kernels/loss/
+│   └── test_load_balancing_loss.py          # eager/HF + Triton forward/backward/memory matrix
+├── kernels/mhc/
+│   └── test_mhc.py                           # mHC eager/TileKernels registry and parity coverage
+├── models_kernel/
+│   └── test_model_load_balancing_loss.py    # HF-shaped model helper and gradient fan-out
 │
 ├── data/                           # Data loading & preprocessing
 │   ├── test_datasets.py            # Dataset loading, filtering, schema validation
@@ -167,7 +172,7 @@ TileLang DSA indexer/attention numerical checks are covered by
 `tests/ops/test_deepseek_v4_kernels.py`. The guard and utility cases run on
 CPU; optimized numerical tests require TileLang on an SM90+ NVIDIA GPU.
 Registry binding plus mHC pre/post/head forward and backward parity are covered
-by `tests/ops/test_mhc_tile_kernels.py`, which requires TileKernels on an SM90+
+by `tests/kernels/mhc/test_mhc.py`, which requires TileKernels on an SM90+
 NVIDIA GPU for kernel execution.
 
 ---
@@ -273,13 +278,16 @@ NVIDIA GPU for kernel execution.
 |---|---|---|
 | `test_fused_moe_split_vs_merged.py` | Split vs merged fc1 in fused MoE | 1 GPU |
 | `test_quack_fused_moe.py` | Quack GEMM MoE backend | SM90+ |
-| `test_kernel_registry_numerical.py` | Numerical alignment per (op, variant, impl) | CUDA; the FlashQLA `chunk_gated_delta_rule` case skips unless running on SM90 (Hopper) — SM10x WIP upstream. |
-| `test_fused_load_balancing_loss.py` | Triton load-balancing loss | CUDA |
 | `test_deepseek_v4_kernels.py` | CPU import/hardware guards plus TileLang DSA numerical parity | CPU for guards; TileLang + NVIDIA SM90+ for optimized kernels |
-| `test_mhc_tile_kernels.py` | TileKernels mHC registry dispatch and forward/backward parity | TileKernels + NVIDIA SM90+ |
 | `test_flash_attn_varlen_padding.py` | Flash-attn variable-length padding | CUDA |
 | `test_seqcls_loss.py` | Sequence classification loss | CUDA (optional) |
 | `test_comp.py` | Position embedding computation | CUDA |
+
+Load-balancing loss is covered at two layers: `tests/kernels/loss/test_load_balancing_loss.py`
+checks the raw `[N, E]` eager and Triton kernels against HF/eager across the
+configuration matrix, forward/backward, masks, determinism, and peak memory;
+`tests/models_kernel/test_model_load_balancing_loss.py` checks tuple
+concatenation, optional-input policy, and gradient fan-out in the model helper.
 
 ---
 

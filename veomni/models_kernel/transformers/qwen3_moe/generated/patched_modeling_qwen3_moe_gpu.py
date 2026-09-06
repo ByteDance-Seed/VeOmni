@@ -70,6 +70,7 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.utils.kernel_utils import (
     attention_kernel,
     empty_bias,
@@ -77,7 +78,6 @@ from veomni.models_kernel.utils.kernel_utils import (
     resolve_kernel_impl,
     resolve_moe_impl,
 )
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 
 # Additional imports for patches
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
@@ -734,6 +734,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             "standard",
             resolve_kernel_impl("load_balancing_loss_implementation"),
         )
+        self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
         self.post_init()
 
     @can_return_tuple
@@ -798,13 +799,12 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
 
         aux_loss = None
         if output_router_logits:
-            router_logits = outputs.router_logits
-            if router_logits is None or not isinstance(router_logits, tuple):
-                aux_loss = 0
-            else:
-                gate = torch.cat([layer.reshape(-1, layer.shape[-1]) for layer in router_logits], dim=0)
-                mask = attention_mask if isinstance(attention_mask, torch.Tensor) else gate.new_empty(0)
-                aux_loss = self.veomni_lb(gate, mask, top_k=self.num_experts_per_tok)
+            aux_loss = self.load_balancing_loss(
+                outputs.router_logits,
+                self.num_experts,
+                self.num_experts_per_tok,
+                attention_mask,
+            )
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
 

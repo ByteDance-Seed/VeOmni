@@ -78,9 +78,9 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -122,7 +122,7 @@ config.add_import(
     names=["attention_kernel", "resolve_kernel_impl"],
 )
 config.add_import(
-    "veomni.models_kernel.utils.loss_utils",
+    "veomni.models_kernel.loss_utils",
     names=["ForCausalLMLoss"],
 )
 # Surface ``Qwen2_5OmniThinkerCausalLMOutputWithLogProbs`` so the patched

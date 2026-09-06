@@ -24,6 +24,11 @@ veomni/
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
 │   ├── transformers/   Per-model patches (one subpackage per model family)
 │   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
+├── models_kernel/      Kernel-registry model implementations and patchgen configs
+│   ├── transformers/   Model classes/configs with instance-local VeomniKernel handles
+│   └── loss_utils/     Model-facing CE, load-balancing, and chunked-loss policy
+├── kernels/            Tensor-native unified kernel registry and implementations
+│   └── _kernels/       Per-op/variant eager and optimized forward/backward pairs
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW
@@ -44,17 +49,14 @@ veomni/
 │   │                   experts go through one all-to-all-gather over the
 │   │                   ep_fsdp mesh.
 │   └── lr_scheduler.py LR scheduler construction
-├── ops/                Optimized kernels and dispatch
-│   ├── config/         Unified ops registry + singleton resolved config
+├── ops/                Legacy model-integration dispatch pending migration/removal
+│   ├── config/         Legacy ops registry + singleton resolved config
 │   │   ├── registry.py OpSpec/BackendSpec/OpScope + register_op/apply_*
 │   │   └── singleton.py  get_ops_config()/set_ops_config() for patch files
-│   ├── kernels/        Kernel implementations (one subdir per op)
+│   ├── kernels/        Remaining legacy model-integration implementations
 │   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
-│   │   ├── attention/  Flash attention v2/3/4 + SP-aware variants
-│   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
-│   │   ├── load_balancing_loss/  eager + triton variants
-│   │   ├── mhc/        TileKernels DeepSeek V4 pre/post/head adapters
-│   │   └── moe/        Fused MoE kernels + group_gemm sub-kernels
+│   │   ├── deepseek_sparse_attention/
+│   │   └── cross_entropy/  LOSS_MAPPING integration
 │   ├── platform/       Platform-specific runtime patches
 │   │   └── npu/        HCCL pre-mul sum patch
 │   └── batch_invariant_ops/  Mode switch for deterministic ops

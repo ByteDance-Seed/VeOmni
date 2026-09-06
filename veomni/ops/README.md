@@ -1,26 +1,22 @@
-# `veomni.ops` — Kernel Registry and Dispatch
+# `veomni.ops` — Legacy Model-Integration Dispatch
 
-This package houses every optimized kernel VeOmni selects at runtime
-(attention, cross-entropy loss, RMSNorm, RoPE, SwiGLU MLP, fused MoE, …) and
-the dispatch machinery that picks the right implementation based on
-`OpsImplementationConfig`.
+This package retains the model-integration hooks that have not yet migrated to
+`veomni.kernels`. Tensor-native kernel implementations and their registry live
+under `veomni/kernels`; model-facing loss policy lives under
+`veomni/models_kernel/loss_utils`.
 
 ## Directory layout
 
 ```
 veomni/ops/
 ├── config/                 Dispatch infrastructure (no kernels here)
-│   ├── registry.py         OpSpec / BackendSpec / OpScope + register_op,
-│   │                       apply_global_ops, apply_per_model_patches
+│   ├── registry.py         Legacy OpSpec / BackendSpec / OpScope dispatch
 │   └── singleton.py        get_ops_config / set_ops_config — bridges the
 │                           resolved config from BaseTrainer to device_patch.py
-├── kernels/                Kernel implementations, one subpackage per op
-│   ├── attention/          Flash v2/3/4, FlexAttention, and Magi FFA + SP-aware wrappers
-│   ├── cross_entropy/      eager / liger / npu-chunk loss (+ ForCausalLMLoss)
-│   ├── deepseek_v4/        TileLang sparse attention/indexer + precision helpers
-│   ├── load_balancing_loss/  eager + triton fused kernel
-│   ├── mhc/                TileKernels mHC pre/post/head adapters
-│   └── moe/                Fused MoE + _kernels/ (group_gemm, quack_gemm)
+├── kernels/                Remaining legacy model-integration implementations
+│   ├── cross_entropy/      LOSS_MAPPING integration
+│   ├── deepseek_sparse_attention/
+│   └── deepseek_v4/        Legacy model-specific helpers
 ├── platform/               Platform-specific runtime patches
 │   └── npu/                HCCL pre-mul sum patch
 └── batch_invariant_ops/    Opt-in deterministic-mode toggle
@@ -28,15 +24,14 @@ veomni/ops/
 
 ## Dispatch model
 
-All kernel selection is driven by `OpsImplementationConfig` fields
-(`model.ops_implementation.*` in YAML). There are **four** dispatch scopes
-depending on when and where the kernel is bound:
+Legacy selection is driven by `OpsImplementationConfig` fields
+(`model.ops_implementation.*` in YAML). The remaining dispatch scopes differ
+by when and where the integration is bound:
 
 | Scope | Who binds | When | What gets replaced |
 |-------|-----------|------|--------------------|
 | **import-time** | `apply_ops_patch()` | `import veomni` | Registers VeOmni attention kernels in HF's `ALL_ATTENTION_FUNCTIONS`. Gated by `MODELING_BACKEND`. |
 | **LOSS_MAPPING** | `install_loss_mapping()` via `apply_ops_config()` | Before model build, in `BaseTrainer` | `LOSS_MAPPING["ForCausalLM"/"ForConditionalGeneration"/"ForSequenceClassification"]` bound to `partial(<wrapper>, cross_entropy_fn=<impl>)`. |
-| **GLOBAL** | `apply_global_ops()` via `apply_ops_config()` | Before model build, in `BaseTrainer` | Module-level function pointer shared by all models (e.g. `veomni.ops.kernels.load_balancing_loss._load_balancing_loss`). |
 | **PER_MODEL** | `apply_per_model_patches()` in each model's `device_patch.py` | During `build_foundation_model()` | `setattr(hf_module, "<ClassOrFuncName>", …)` on the HF modeling module (different class name per model). |
 | **build-time** | `apply_veomni_fused_moe_patch()` | During `build_foundation_model()` | `veomni.ops.kernels.moe._fused_moe_forward`; NPU auto-overrides to the NPU group-gemm kernel. |
 
@@ -46,11 +41,9 @@ depending on when and where the kernel is bound:
 |---|---|:-:|---|---|
 | Attention | `attn_implementation` | import-time | `flash_attention_2` | `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, `native-sparse` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | LOSS_MAPPING | `eager` | `eager`, `liger_kernel`, `npu` (chunked loss) |
-| Load-balancing loss | `load_balancing_loss_implementation` | GLOBAL | `eager` | `eager`, `triton` |
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
-| mHC | `mhc_implementation` | build-time `OpSlot` | `eager` | `tilelang` (DeepSeek V4, SM90+; provided by `tile-kernels`) |
 | Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `triton` (group-gemm, SM70+ GPU or MLU), `quack` (CUTLASS/CuTe, SM90+), `npu` (Ascend), `mlu` (Apex grouped-GEMM). Mismatches raise instead of falling back. |
 
 \* The `triton` backend is registered per-model via `extra_backends`: DeepSeek
@@ -116,7 +109,6 @@ model:
     attn_implementation: flash_attention_2
     moe_implementation: fused
     cross_entropy_loss_implementation: liger_kernel
-    load_balancing_loss_implementation: triton
     rms_norm_implementation: liger_kernel
     rotary_pos_emb_implementation: liger_kernel
     swiglu_mlp_implementation: eager   # keep HF MLP even when Liger is on
@@ -132,8 +124,9 @@ facade, native BlockMask contract, and Ulysses behavior.
 Apache-2.0 `radixark/miles` implementation: TileLang sparse-attention and
 Lightning Indexer forward/backward kernels, block-wise FP8 activation
 quantization, and a BF16-input/FP32-accumulation linear autograd function.
-`kernels/mhc/` adapts TileKernels' training-capable DeepSeek V4 mHC pre,
-post, and head kernels behind registry `OpSlot`s.
+`veomni/kernels/_kernels/mhc/` adapts TileKernels' training-capable DeepSeek
+V4 mHC pre, post, and head kernels behind instance-local `VeomniKernel`
+handles.
 The package does not import TileLang eagerly, so CPU and NPU installations can
 still import VeOmni. Callers that use a TileLang entry point must have the GPU
 extra installed. The GPU extra pins `tilelang==0.1.9` and
@@ -238,13 +231,15 @@ Example: add `layer_norm` as a per-model op.
    )
    ```
 
-### GLOBAL instead of PER_MODEL
+### Load-balancing loss ownership
 
-For ops that are a single function pointer shared across all models (like
-`load_balancing_loss`), set `scope=OpScope.GLOBAL` and provide a
-`global_slot="<module>:<attr>"`. `apply_global_ops()` writes the selected
-backend to that slot; callers `from ... import <attr>` and call it. See
-`kernels/load_balancing_loss/__init__.py` for the full pattern.
+Load-balancing loss no longer has an `ops` facade or process-global function
+pointer. Its eager and Triton implementations are registered as tensor-native
+`[N, E]` kernels under `veomni/kernels/_kernels/loss/load_balancing_loss`.
+Each MoE model constructs an instance-local `VeomniKernel` and binds it to the
+HF-shaped helper in `veomni/models_kernel/loss_utils/load_balancing_loss.py`.
+That helper handles `None`, per-layer tuple concatenation, and the optional
+attention mask; the raw kernel only performs loss math.
 
 Cross-entropy is handled separately via `LOSS_MAPPING` scope (see
 `install_loss_mapping` in `kernels/cross_entropy/__init__.py`) — it needs

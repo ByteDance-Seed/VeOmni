@@ -107,6 +107,7 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.kernels import VeomniKernel
 from veomni.kernels._kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
+from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.transformers.deepseek_v4.indexer_loss import (
     _builds_indexer_kl,
     _indexer_loss_enabled,
@@ -127,7 +128,6 @@ from veomni.models_kernel.transformers.deepseek_v4.packed_utils import (
     shard_packed_compression_metadata,
 )
 from veomni.models_kernel.utils.kernel_utils import empty_bias, linear_bias, resolve_kernel_impl, resolve_moe_impl
-from veomni.models_kernel.utils.loss_utils import ForCausalLMLoss
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -503,11 +503,6 @@ class DeepseekV4HCACompressor(nn.Module):
     # Patch: packed compressed-attention windows
     # 1. Keep every HCA/CSA compression window within one packed sequence.
     # 2. Reset compressed RoPE positions and causal ranges at each boundary.
-    # 3. Under context parallelism compress only the windows this rank owns --
-    #    a window belongs to the rank holding its first token -- and all-gather
-    #    the compressed rows into global order. Halos of one compression rate on
-    #    each side carry an owned window past the shard edge and the overlap half
-    #    of the first owned window back across it.
     # ================================================================
     def forward(
         self,
@@ -705,13 +700,9 @@ class DeepseekV4Indexer(nn.Module):
 
     # ================================================================
     # Patch: DeepseekV4Indexer.forward
-    # 1. Always call the local dsa_indexer deepseek_v4 VeomniKernel.
-    # 2. Context parallelism: compress this shard's own windows and all-gather the
-    #    compressed rows, so the keys stay global while the queries stay local, and
-    #    drop the Ulysses query partitioning, which has nothing left to do.
-    # 3. Under ``dsa_indexer_loss``, hand the per-slot index scores back next to the
-    #    selection so the auxiliary KL has a student to train, and detach the inputs so
-    #    that KL cannot reach the main model.
+    # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
+    #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
+    #    position layouts retain the upstream eager implementation.
     # ================================================================
     def __init__(self, config: "DeepseekV4Config") -> None:
         nn.Module.__init__(self)
@@ -1216,8 +1207,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 # Patch: eager_attention_forward
 # Always call the local dsa_attention deepseek_v4 VeomniKernel. Convert a
 # dense additive mask into compact top-k indices when the caller did not
-# already provide them. Return the indexer loss's teacher distribution as a
-# third value when the caller sets ``indexer_target_width``.
+# already provide them.
 # ================================================================
 def eager_attention_forward(
     module: nn.Module,
@@ -1341,11 +1331,6 @@ class DeepseekV4Attention(nn.Module):
     # 2. Ulysses SP: all-to-all Q heads, sequence all-gather for MQA KV and
     #    compressor inputs (windows/indexers need the full sequence), then
     #    scatter attention outputs back to the local sequence shard.
-    # 3. Context parallelism: shard the queries instead of the heads and
-    #    replicate the MQA KV, so both Ulysses all-to-alls disappear and the
-    #    sparse indices keep addressing global KV rows.
-    # 4. Under ``dsa_indexer_loss`` on a CSA layer, return the indexer KL and its
-    #    zero-information reference as third and fourth values.
     # ================================================================
     def __init__(self, config: "DeepseekV4Config", layer_idx: int):
         nn.Module.__init__(self)
@@ -1708,8 +1693,8 @@ class DeepseekV4HyperHead(nn.Module):
 
 class DeepseekV4MLP(nn.Module):
     # ================================================================
-    # Patch: DeepseekV4MLP — shared experts. HuggingFace's MLP has no clamp;
-    # the kernel is still called so a later swiglu impl swap stays local.
+    # Patch: DeepseekV4MLP — shared experts. Pass ``swiglu_limit`` so the
+    # kernel applies the same gate/up clamp as routed experts.
     # ================================================================
     def __init__(self, config):
         nn.Module.__init__(self)
@@ -2076,15 +2061,11 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     # Patch: DeepseekV4Model.forward
     # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
     # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
-    # 3. Under either sequence-parallel mode -- Ulysses or context parallelism --
-    #    the collator keeps full ``attention_mask`` / ``cu_seq_lens_*`` while
-    #    slicing ``input_ids`` / local ``position_ids``. Build the sliding-window
-    #    mask and packed compression metadata on the full sequence length so
-    #    attention matches non-SP semantics after the all-gather inside
-    #    ``DeepseekV4Attention``.
-    # 4. Refuse ``position_ids=None`` under either sequence-parallel mode instead
-    #    of defaulting to ``arange`` over the shard, which the layers below would
-    #    read as global positions.
+    # 3. Under Ulysses SP the collator keeps full ``attention_mask`` /
+    #    ``cu_seq_lens_*`` while slicing ``input_ids`` / local ``position_ids``.
+    #    Build the sliding-window mask and packed compression metadata on the full
+    #    sequence length so attention matches non-SP semantics after the all-gather
+    #    inside ``DeepseekV4Attention``.
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -2418,6 +2399,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             "standard",
             resolve_kernel_impl("load_balancing_loss_implementation"),
         )
+        self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
         self.post_init()
 
     @can_return_tuple
@@ -2471,13 +2453,12 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
 
         aux_loss = None
         if output_router_logits:
-            router_logits = outputs.router_logits
-            if router_logits is None or not isinstance(router_logits, tuple):
-                aux_loss = 0
-            else:
-                gate = torch.cat([layer.reshape(-1, layer.shape[-1]) for layer in router_logits], dim=0)
-                mask = attention_mask if isinstance(attention_mask, torch.Tensor) else gate.new_empty(0)
-                aux_loss = self.veomni_lb(gate, mask, top_k=self.num_experts_per_tok)
+            aux_loss = self.load_balancing_loss(
+                outputs.router_logits,
+                self.num_experts,
+                self.num_experts_per_tok,
+                attention_mask,
+            )
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
 

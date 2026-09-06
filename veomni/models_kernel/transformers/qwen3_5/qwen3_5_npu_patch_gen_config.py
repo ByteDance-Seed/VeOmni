@@ -102,7 +102,7 @@ config.add_import(
     names=["attention_kernel", "resolve_kernel_impl"],
 )
 config.add_import(
-    "veomni.models_kernel.utils.loss_utils",
+    "veomni.models_kernel.loss_utils",
     names=["ForCausalLMLoss"],
 )
 config.drop_import_names(
