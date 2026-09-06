@@ -62,8 +62,8 @@ from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
+from ..kernels.batch_invariant import set_batch_invariant_mode
 from ..models_kernel import build_foundation_model, build_tokenizer
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
 from ..utils.checkpoint_utils import should_skip_hf_weight_load

@@ -49,8 +49,9 @@ without modifying `OpsImplementationConfig`.
 
 ```
 import veomni                                 # (1) import time
-  └─ apply_ops_patch()
-       └─ apply_veomni_attention_patch()      # register Flash/Flex facade names with SP
+  └─ import veomni.kernels
+       └─ apply_kernel_patch()
+            └─ apply_veomni_attention_patch() # register Flash/Flex facade names with SP
 
 OpsImplementationConfig.__post_init__()       # (2) config parse time
   ├─ validate requested backends are available
@@ -127,7 +128,7 @@ not rebased for head-specific masks. See
 ### Key files
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
-- Registration: `veomni/ops/kernels/attention/__init__.py` — `apply_veomni_attention_patch()`
+- Installation: `veomni/kernels/install.py` — `apply_kernel_patch()` / `apply_veomni_attention_patch()`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ### DeepSeek V4 DSA and mHC

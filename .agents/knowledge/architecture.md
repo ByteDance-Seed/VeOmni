@@ -28,7 +28,9 @@ veomni/
 │   ├── transformers/   Model classes/configs with instance-local VeomniKernel handles
 │   └── loss_utils/     Model-facing CE, load-balancing, and chunked-loss policy
 ├── kernels/            Tensor-native unified kernel registry and implementations
-│   └── _kernels/       Per-op/variant eager and optimized forward/backward pairs
+│   ├── install.py      Idempotent process-wide integrations for registered kernels
+│   ├── batch_invariant/  Scoped deterministic ATen patch + Triton implementations
+│   └── _kernels/       Registered per-op/variant eager and optimized forward/backward pairs
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW
@@ -56,9 +58,8 @@ veomni/
 │   ├── kernels/        Remaining legacy model-integration implementations
 │   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
 │   │   └── deepseek_sparse_attention/
-│   ├── platform/       Platform-specific runtime patches
-│   │   └── npu/        HCCL pre-mul sum patch
-│   └── batch_invariant_ops/  Mode switch for deterministic ops
+│   └── platform/       Platform-specific runtime patches
+│       └── npu/        HCCL pre-mul sum patch
 ├── patchgen/           Auto-generate model patches from HuggingFace models
 ├── schedulers/         LR scheduler implementations (flow matching)
 ├── trainer/            Training loop implementations

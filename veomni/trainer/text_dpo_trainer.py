@@ -30,8 +30,8 @@ from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
+from ..kernels.batch_invariant import set_batch_invariant_mode
 from ..models_kernel import build_foundation_model, build_tokenizer
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize

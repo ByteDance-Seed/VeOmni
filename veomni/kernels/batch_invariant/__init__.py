@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .kernels import apply_kernel_patch
-from .ops import apply_ops_config
-from .utils.env import format_envs
-from .utils.logging import get_logger
+"""Opt-in batch-invariant ATen implementations."""
+
+from .patch import (
+    disable_batch_invariant_mode,
+    enable_batch_invariant_mode,
+    is_batch_invariant_mode_enabled,
+    set_batch_invariant_mode,
+)
 
 
-logger = get_logger(__name__)
-
-
-def _log_environment():
-    logger.info_rank0(format_envs())
-
-
-_log_environment()
-
-from ._version import __version__
+__all__ = [
+    "set_batch_invariant_mode",
+    "is_batch_invariant_mode_enabled",
+    "disable_batch_invariant_mode",
+    "enable_batch_invariant_mode",
+]

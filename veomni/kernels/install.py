@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Register ``veomni_*`` attention names and matching mask builders on HF dicts."""
+"""Install process-wide integrations required by VeOmni kernels."""
 
 from __future__ import annotations
 
@@ -23,17 +23,18 @@ from typing import Any
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ....utils import logging
-from ....utils.import_utils import is_transformers_version_greater_or_equal_to
-from .mask.flash import flash_attention_mask_builder
-from .mask.flex import flex_attention_mask_builder
-from .mask.magi import magi_attention_mask_builder
-from .mask.sdpa import sdpa_attention_mask_builder
-from .standard.flash import flash_attention_forward
-from .standard.flex import flex_attention_forward
-from .standard.magi import magi_attention_forward
-from .standard.sage import sage_attention_forward
-from .standard.sdpa import sdpa_attention_forward
+from ..utils import logging
+from ..utils.env import get_env
+from ..utils.import_utils import is_transformers_version_greater_or_equal_to
+from ._kernels.attention.mask.flash import flash_attention_mask_builder
+from ._kernels.attention.mask.flex import flex_attention_mask_builder
+from ._kernels.attention.mask.magi import magi_attention_mask_builder
+from ._kernels.attention.mask.sdpa import sdpa_attention_mask_builder
+from ._kernels.attention.standard.flash import flash_attention_forward
+from ._kernels.attention.standard.flex import flex_attention_forward
+from ._kernels.attention.standard.magi import magi_attention_forward
+from ._kernels.attention.standard.sage import sage_attention_forward
+from ._kernels.attention.standard.sdpa import sdpa_attention_forward
 
 
 logger = logging.get_logger(__name__)
@@ -150,3 +151,18 @@ def apply_veomni_attention_patch() -> None:
         ALL_MASK_ATTENTION_FUNCTIONS.register(name, mask_builder)
     for name, forward, _ in _VEOMNI_HF_PATCHES:
         ALL_ATTENTION_FUNCTIONS.register(name, forward)
+
+
+def apply_kernel_patch() -> None:
+    """Install the process-wide integrations used by registered kernels.
+
+    No-op when ``MODELING_BACKEND=hf``. Safe to call more than once.
+    """
+    if get_env("MODELING_BACKEND") == "hf":
+        logger.info_rank0("Skip applying kernel patch. Using huggingface transformers backend.")
+        return
+
+    apply_veomni_attention_patch()
+
+
+__all__ = ["apply_kernel_patch", "apply_veomni_attention_patch"]

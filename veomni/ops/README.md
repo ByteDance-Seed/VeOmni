@@ -3,7 +3,8 @@
 This package retains the model-integration hooks that have not yet migrated to
 `veomni.kernels`. Tensor-native kernel implementations and their registry live
 under `veomni/kernels`; model-facing loss policy lives under
-`veomni/models_kernel/loss_utils`.
+`veomni/models_kernel/loss_utils`. The opt-in batch-invariant ATen patch lives
+under `veomni/kernels/batch_invariant`; it is not a registered kernel family.
 
 ## Directory layout
 
@@ -16,9 +17,8 @@ veomni/ops/
 ├── kernels/                Remaining legacy model-integration implementations
 │   ├── deepseek_sparse_attention/
 │   └── deepseek_v4/        Legacy model-specific helpers
-├── platform/               Platform-specific runtime patches
-│   └── npu/                HCCL pre-mul sum patch
-└── batch_invariant_ops/    Opt-in deterministic-mode toggle
+└── platform/               Platform-specific runtime patches
+    └── npu/                HCCL pre-mul sum patch
 ```
 
 ## Dispatch model
@@ -29,7 +29,7 @@ by when and where the integration is bound:
 
 | Scope | Who binds | When | What gets replaced |
 |-------|-----------|------|--------------------|
-| **import-time** | `apply_ops_patch()` | `import veomni` | Registers VeOmni attention kernels in HF's `ALL_ATTENTION_FUNCTIONS`. Gated by `MODELING_BACKEND`. |
+| **import-time** | `apply_kernel_patch()` | `import veomni.kernels` | Registers VeOmni attention kernels in HF's `ALL_ATTENTION_FUNCTIONS`. Gated by `MODELING_BACKEND`. |
 | **PER_MODEL** | `apply_per_model_patches()` in each model's `device_patch.py` | During `build_foundation_model()` | `setattr(hf_module, "<ClassOrFuncName>", …)` on the HF modeling module (different class name per model). |
 | **build-time** | `apply_veomni_fused_moe_patch()` | During `build_foundation_model()` | `veomni.ops.kernels.moe._fused_moe_forward`; NPU auto-overrides to the NPU group-gemm kernel. |
 

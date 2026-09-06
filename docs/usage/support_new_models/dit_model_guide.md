@@ -764,5 +764,5 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 | NCCL deadlock on SP with gradient checkpointing | SP gather not inside the checkpoint boundary | Ensure `gather_outputs` is called outside the block loop, not inside `_gradient_checkpointing_func` |
 | Wrong shape after AllToAll in attention | Q/K/V not transposed before `flash_attention_forward` | `flash_attention_forward` expects `(B, heads, seq, head_dim)`; transpose before calling |
 | Double SP gather (output is wrong) | `flash_attention_forward` called without `skip_ulysses=True` while AllToAll already done manually | Pass `skip_ulysses=True` to all `attention_interface(...)` calls in the SP processor |
-| `KeyError` in `ALL_ATTENTION_FUNCTIONS` | `apply_veomni_attention_patch()` not called before model load | `ops` patch is applied via `apply_ops_patch()` at startup; ensure it runs before the register function |
+| `KeyError` in `ALL_ATTENTION_FUNCTIONS` | `apply_veomni_attention_patch()` not called before model load | Kernel integrations are installed by `apply_kernel_patch()` when `veomni.kernels` is imported; ensure that happens before model loading |
 | `process_condition` key names mismatch | Returned dict keys don't match `forward()` parameter names | Check that every key in `process_condition` output corresponds to a `forward()` parameter |

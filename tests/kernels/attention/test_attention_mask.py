@@ -32,10 +32,10 @@ from tests.kernels.attention.attention_cases import (
     magi_2d_mask,
     materialize_magi_mask,
 )
-from veomni.kernels._kernels.attention.install import _VEOMNI_HF_PATCHES
 from veomni.kernels._kernels.attention.mask import flex as flex_mask
 from veomni.kernels._kernels.attention.mask import magi as magi_mask
 from veomni.kernels._kernels.attention.mask import sdpa as sdpa_mask
+from veomni.kernels.install import _VEOMNI_HF_PATCHES
 from veomni.kernels.mask import (
     MagiAttentionMask,
     flash_attention_mask_builder,

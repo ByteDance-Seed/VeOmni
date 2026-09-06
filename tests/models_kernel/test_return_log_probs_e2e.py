@@ -208,7 +208,7 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     bi_active = _have_python_dev_headers()
     bi_ctx = None
     if bi_active:
-        from veomni.ops.batch_invariant_ops import set_batch_invariant_mode
+        from veomni.kernels.batch_invariant import set_batch_invariant_mode
 
         bi_ctx = set_batch_invariant_mode(True)
         bi_ctx.__enter__()

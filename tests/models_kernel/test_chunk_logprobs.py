@@ -77,7 +77,7 @@ def _bitwise_setup(monkeypatch):
 
     bi_ctx = None
     if _have_python_dev_headers():
-        from veomni.ops.batch_invariant_ops import set_batch_invariant_mode
+        from veomni.kernels.batch_invariant import set_batch_invariant_mode
 
         bi_ctx = set_batch_invariant_mode(True)
         bi_ctx.__enter__()

@@ -27,13 +27,13 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from veomni.kernels import VeomniKernel, resolve_kernel
 from veomni.kernels._kernels.attention import lookup
 from veomni.kernels._kernels.attention import ulysses as ulysses_backend
-from veomni.kernels._kernels.attention.install import apply_veomni_attention_patch
 from veomni.kernels._kernels.attention.standard.flash import flash_attention_forward
 from veomni.kernels._kernels.attention.standard.flex import flex_attention_forward
 from veomni.kernels._kernels.attention.standard.magi import magi_attention_forward
 from veomni.kernels._kernels.attention.standard.sage import sage_attention_forward
 from veomni.kernels._kernels.attention.standard.sdpa import sdpa_attention_forward
 from veomni.kernels._kernels.attention.ulysses import should_apply_ulysses
+from veomni.kernels.install import apply_veomni_attention_patch
 
 
 _VEOMNI_FORWARDS = {
@@ -80,6 +80,18 @@ def test_apply_kernel_patch_registers_kernels_names():
     apply_kernel_patch()
     for name, forward in _VEOMNI_FORWARDS.items():
         assert ALL_ATTENTION_FUNCTIONS[name] is forward
+
+
+def test_apply_kernel_patch_skips_hf_backend(monkeypatch):
+    from veomni.kernels import install
+
+    calls = []
+    monkeypatch.setattr(install, "get_env", lambda _name: "hf")
+    monkeypatch.setattr(install, "apply_veomni_attention_patch", lambda: calls.append(True))
+
+    install.apply_kernel_patch()
+
+    assert calls == []
 
 
 def eager_attention_forward(module, query, key, value, attention_mask, **kwargs):

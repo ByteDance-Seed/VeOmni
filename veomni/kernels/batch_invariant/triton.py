@@ -1,5 +1,6 @@
-"""
-Copy and modified from https://github.com/thinking-machines-lab/batch_invariant_ops
+"""Batch-invariant Triton implementations installed by :mod:`.patch`.
+
+Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops.
 """
 
 from collections import namedtuple
