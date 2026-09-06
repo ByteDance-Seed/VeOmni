@@ -16,6 +16,7 @@ veomni/
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── async_offload.py    Async activation offload (SwapTensor, OffloadManager, async_save_on_cpu)
+│   ├── hccl_premul_sum.py  Idempotent HCCL PREMUL_SUM collective compatibility patch
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
@@ -55,11 +56,9 @@ veomni/
 │   ├── config/         Legacy ops registry + singleton resolved config
 │   │   ├── registry.py OpSpec/BackendSpec/OpScope + register_op/apply_*
 │   │   └── singleton.py  get_ops_config()/set_ops_config() for patch files
-│   ├── kernels/        Remaining legacy model-integration implementations
-│   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
-│   │   └── deepseek_sparse_attention/
-│   └── platform/       Platform-specific runtime patches
-│       └── npu/        HCCL pre-mul sum patch
+│   └── kernels/        Remaining legacy model-integration implementations
+│       ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
+│       └── deepseek_sparse_attention/
 ├── patchgen/           Auto-generate model patches from HuggingFace models
 ├── schedulers/         LR scheduler implementations (flow matching)
 ├── trainer/            Training loop implementations
