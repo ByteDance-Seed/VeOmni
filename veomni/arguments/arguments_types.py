@@ -1293,8 +1293,7 @@ class OpsImplementationConfig:
         Only checks things cheaper to catch here than at bind time. Package
         availability (liger / torch_npu) and per-model backend compatibility
         are validated by the resolution sites (``apply_per_model_patches`` /
-        ``apply_global_ops`` / ``install_loss_mapping`` /
-        ``KERNEL_REGISTRY.resolve``) — not duplicated here.
+        ``VeomniKernel`` / legacy ``OpSlot.bind``) — not duplicated here.
         """
         from ..ops import config as _ops_config_pkg  # noqa: F401  triggers op registrations
         from ..ops.config.registry import list_ops

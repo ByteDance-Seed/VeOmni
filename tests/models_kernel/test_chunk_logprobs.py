@@ -17,7 +17,7 @@
 Pin **bitwise** parity vs a reference ``F.linear -> log_softmax ->
 gather`` implementation under deterministic algorithms + batch-invariant
 mode on CUDA. Same contract that
-``tests/models/test_return_log_probs_e2e.py::
+``tests/models_kernel/test_return_log_probs_e2e.py::
 test_return_log_probs_bitwise_matches_logits_reference`` enforces
 end-to-end. The kernel returns per-token actual log-probabilities
 (non-positive) **and** softmax entropy (non-negative); IGNORE_INDEX

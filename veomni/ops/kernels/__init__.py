@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Legacy model-facing operation helpers."""
+"""Legacy model-specific operation helpers.
 
-from . import cross_entropy  # noqa: F401
+Tensor-native kernels and model-facing loss policy live under
+``veomni.kernels`` and ``veomni.models_kernel.loss_utils`` respectively.
+"""

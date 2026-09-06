@@ -66,7 +66,7 @@ if they implement the same variant.
 | `swiglu_mlp` | `standard` | SwiGLU MLP (gate/up/down) |
 | `attention` | `standard` | Multi-head / GQA attention (existing `ALL_ATTENTION_FUNCTIONS` — unchanged) |
 | `moe_experts` | `standard` | Expert GEMM dispatch (merged gate+up projection, HF v5 convention; DeepSeek-V4 additionally forwards `swiglu_limit` to clamp-aware backends) |
-| `cross_entropy_loss` | `causal`, `seq_cls` | Causal-LM CE (shifts labels) vs. sequence-classification CE (no shift) |
+| `cross_entropy_loss` | `standard` | Token-level CE; task-specific shifting and reduction stay in the model helper |
 | `load_balancing_loss` | `standard` | Switch Transformer auxiliary loss |
 
 ### 2. Kernel Registry
@@ -208,28 +208,17 @@ KERNEL_REGISTRY.register(KernelSpec(
     hardware=HardwareRequirement("cuda", min_compute_capability=90),
 ))
 
-# -- cross_entropy_loss (split by task to avoid mixing causal-LM label
-#    shifting with sequence-classification token-level labels) --
-KERNEL_REGISTRY.register(KernelSpec(
-    name="liger_kernel",
-    op_name="cross_entropy_loss", variant="causal",
-    factory=_liger_fused_ce_causal_factory,   # partial(ForCausalLMLoss, cross_entropy_fn=liger)
-    hardware=HardwareRequirement("cuda"),
-))
-KERNEL_REGISTRY.register(KernelSpec(
-    name="liger_kernel",
-    op_name="cross_entropy_loss", variant="seq_cls",
-    factory=_liger_fused_ce_seq_cls_factory,  # partial(ForSequenceClassificationLoss, cross_entropy_fn=liger)
-    hardware=HardwareRequirement("cuda"),
-))
-# NPU chunk-loss backs the causal variant only; chunk_loss hard-codes the
-# `labels[..., 1:]` shift so ForSequenceClassification stays on eager.
-KERNEL_REGISTRY.register(KernelSpec(
-    name="npu",
-    op_name="cross_entropy_loss", variant="causal",
-    factory=_npu_chunk_loss_causal_factory,   # chunk_loss_function (handles SP reduction internally)
-    hardware=HardwareRequirement("npu"),
-))
+# -- cross_entropy_loss: every row has the same token-level contract. --
+register_kernel("cross_entropy_loss", "standard", "eager", ce_eager.forward, ce_eager.backward)
+register_kernel("cross_entropy_loss", "standard", "chunk_loss", ce_chunk.forward, ce_chunk.backward)
+register_kernel(
+    "cross_entropy_loss",
+    "standard",
+    "liger_kernel",
+    ce_liger.forward,
+    ce_liger.backward,
+    requirement=CudaKernelRequirement(),
+)
 ```
 
 **Internal registration** (in an internal package, never in OSS):
@@ -670,6 +659,12 @@ registered eager and Triton kernels receive only a concatenated `[N, E]`
 tensor plus a mask sentinel. There is no `veomni.ops` facade, global slot, or
 per-forward implementation branch for load-balancing loss.
 
+`models_kernel/loss_utils/cross_entropy_loss.py` similarly owns causal label
+selection, sequence-classification policy, SP reduction, and log-probs /
+distillation routing. The raw eager, chunked, and Liger rows receive only token
+inputs and share the `standard` variant. Cross-entropy has no `veomni.ops`
+facade and does not mutate Transformers' process-global `LOSS_MAPPING`.
+
 ### 9. Full Example: Qwen3.5 MoE
 
 #### Current generated dispatch coverage
@@ -767,7 +762,7 @@ model.forward()                                    # (5) runtime
 |---|---|---|
 | `VEOMNI_USE_LIGER_KERNEL=1` env var | Per-op `*_implementation: liger_kernel` fields | Removed; configure fields explicitly |
 | `gpu_patch.py` monkey-patching | patchgen + registry/`OpSlot` dispatch | Removed from current model paths |
-| `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `apply_ops_config()` | Replaced by the unified config install point |
+| Global `LOSS_MAPPING` loss patch | Instance-local `VeomniKernel` + `models_kernel.loss_utils` helper | Removed from the current model stack |
 | `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 separately exposes TileLang DSA indexer/attention config slots and three registry-backed TileKernels mHC slots. Its MoE keeps a direct `fused_moe_forward(...)` call under the experts guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is provided by `fused_triton`, `fused_quack`, and Ascend `fused_npu` (via a forward/backward Triton activation kernel with the original eager activation as the missing-package fallback). |
 | `moe_implementation: fused` | `moe_implementation: fused_triton`, `fused_quack`, or `fused_npu` | The legacy `"fused"` alias remains deprecated: it resolves to `fused_quack` on GPU and `fused_npu` on NPU with a warning. The default-valued `fused_triton` selection is also normalized to `fused_npu` on NPU for compatibility; explicit backend names are recommended. |
 

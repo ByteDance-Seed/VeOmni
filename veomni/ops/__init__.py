@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..utils import logging
-from ..utils.env import get_env
 from .config.singleton import set_ops_config
 from .dispatch import OpSlot
 
@@ -38,51 +37,12 @@ def apply_ops_patch():
 
 
 def apply_ops_config(ops_config: OpsImplementationConfig) -> None:
-    """Apply kernel patches based on resolved ``OpsImplementationConfig``.
+    """Populate the legacy ops-config singleton for old model integrations.
 
-    Single install point for config-driven dispatch:
-
-    1. Binds the cross-entropy kernel into ``LOSS_MAPPING`` via
-       ``install_loss_mapping`` (pre-bound ``partial`` — no runtime resolution).
-    2. Populates the ops-config singleton so per-model ``device_patch.py`` and
-       ``OpSlot.bind`` can read the user's selections.
-
-    Per-model kernels are applied by each model's ``device_patch.py``.
+    Tensor-native kernels, including cross-entropy, are selected by
+    ``models_kernel`` through instance-local ``VeomniKernel`` handles. This
+    function intentionally does not mutate Transformers' process-global
+    ``LOSS_MAPPING``.
     """
     set_ops_config(ops_config)
-
-    modeling_backend = get_env("MODELING_BACKEND")
-    if modeling_backend == "hf":
-        return
-
-    from .kernels.cross_entropy import install_loss_mapping
-
-    ce_label = install_loss_mapping(ops_config.cross_entropy_loss_implementation)
-    logger.info_rank0(f"✅ VeOmni ops config applied: {ce_label}.")
-    logger.info_rank0(format_kernel_functions())
-
-
-def format_kernel_functions() -> str:
-    lines = []
-    lines.append("\n=========== OPS ============")
-
-    # Cross-entropy is bound via LOSS_MAPPING (partial-wrapped), not a module
-    # global — surface it here so the log still shows the active CE kernel.
-    lines.append(f"cross_entropy = {_current_cross_entropy_name()}")
-
-    lines.append("==============================")
-    return "\n".join(lines)
-
-
-def _current_cross_entropy_name() -> str:
-    from functools import partial
-
-    from transformers.loss.loss_utils import LOSS_MAPPING
-
-    entry = LOSS_MAPPING.get("ForCausalLM")
-    if entry is None:
-        return "unset"
-    if isinstance(entry, partial):
-        ce_fn = entry.keywords.get("cross_entropy_fn")
-        return getattr(ce_fn, "__name__", repr(ce_fn)) if ce_fn is not None else "unset"
-    return getattr(entry, "__name__", repr(entry))
+    logger.info_rank0("✅ VeOmni legacy ops config applied.")

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .kernels import apply_kernel_patch
-from .ops import apply_ops_config, format_kernel_functions
+from .ops import apply_ops_config
 from .utils.env import format_envs
 from .utils.logging import get_logger
 

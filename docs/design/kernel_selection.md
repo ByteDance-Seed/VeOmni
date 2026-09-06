@@ -18,7 +18,7 @@ selection knob.
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniKernel` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
@@ -54,47 +54,37 @@ import veomni                                 # (1) import time
 
 OpsImplementationConfig.__post_init__()       # (2) config parse time
   ├─ validate requested backends are available
-  ├─ rewrite attn_implementation for SP
-  └─ set_ops_config(self)                     # populate singleton
+  └─ rewrite attn_implementation for SP
 
 BaseTrainer._build_model()                    # (3) model build time
-  └─ build_foundation_model(..., ops_implementation=ops)
-       ├─ apply_ops_config(ops)               # install legacy LOSS_MAPPING integration
-       │    └─ install_loss_mapping(ce_impl)  # partial(ForCausalLMLoss, cross_entropy_fn=<impl>)
+  └─ models_kernel.build_foundation_model(..., kernels_implementation=ops)
+       ├─ set_kernels_config(ops)
        ├─ apply_veomni_fused_moe_patch(...)   # bind MoE kernel
        ├─ device_patch.py reads ops config     # RMSNorm/RoPE/SwiGLU
        ├─ OpSlot.bind(impl_name)              # per-model OpSlot dispatch
        └─ model init + weight loading
+            ├─ self.veomni_ce = VeomniKernel("cross_entropy_loss", ...)
+            ├─ self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
             └─ MoE model binds load_balancing_loss helper to a local VeomniKernel
 
 model.forward()                               # (4) runtime
   ├─ attention: ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
-  ├─ loss: self.loss_function(...) -> LOSS_MAPPING[...] (pre-bound partial)
-  │         OR veomni_causal_lm_loss(...) via OpSlot.use_non_eager_impl guard
+  ├─ loss: self.loss_function(...) -> model helper -> instance-local VeomniKernel
   ├─ RMSNorm/RoPE/SwiGLU: Liger or HF default (set at registration)
   ├─ mHC: TileKernels pre/post/head or original Transformers implementation
   └─ MoE: fused_moe_forward(...) or eager loop
 ```
 
-**Single install point.** `apply_ops_config` is the only place that binds
-`LOSS_MAPPING` — there is no separate `apply_veomni_loss_patch` call. The
-inner CE kernel (eager / liger / npu) is pre-bound onto the wrapper via
-`functools.partial`, so runtime dispatch is just a function call and there
-is no per-forward "which impl?" lookup.
+**No global loss mutation.** The current `models_kernel` stack does not replace
+Transformers' `LOSS_MAPPING`. Each model resolves its configured CE row once,
+stores an instance-local `VeomniKernel`, and binds that handle to the model
+helper with `functools.partial`; there is no per-forward implementation lookup.
 
-**Ownership.** `build_foundation_model` owns the call to `apply_ops_config`:
-when callers pass `ops_implementation=ops` (trainers do this), it runs
-`apply_ops_config(ops)` before constructing the model and reads
-`attn_implementation` from `ops`. Callers that pass neither
-`ops_implementation` nor a prior `apply_ops_config` raise `ValueError` —
-there is no silent all-eager fallback. Standalone scripts (`tasks/infer/*`)
-construct an explicit `OpsImplementationConfig` (typically all-eager so
-inference doesn't depend on Liger / Triton). The DiT trainer is the one
-exception that calls `apply_ops_config` manually — it has to populate the
-singleton before building the condition model, which uses
-`model_class._from_config(...)` rather than `build_foundation_model`. The
-subsequent `build_foundation_model` call hits the
-"singleton-already-installed" branch and leaves the prior config alone.
+**Ownership.** `models_kernel.build_foundation_model` installs the supplied
+`kernels_implementation` through `set_kernels_config` before constructing the
+model. Callers that provide neither an explicit config nor a previously
+installed kernel config receive `ValueError`; there is no silent all-eager
+fallback.
 
 ---
 
@@ -179,15 +169,18 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | `fused_liger_kernel_cross_entropy` | `liger-kernel` package |
-| `npu` | `chunk_loss_function` (chunked loss for `ForCausalLM` and `ForConditionalGeneration`; SP reduction handled internally) | `torch_npu` |
-| `eager` | `eager_cross_entropy` (PyTorch `F.cross_entropy`) | — |
+| `liger_kernel` | Fused linear + CE raw forward/backward | `liger-kernel` package + CUDA |
+| `chunk_loss` | Chunked `F.linear` + CE with one global denominator | — |
+| `npu` | Config alias resolved to `chunk_loss` by model construction | Ascend NPU config |
+| `eager` | PyTorch `F.linear`/`F.cross_entropy` | — |
 
-The `npu` chunk-loss binds only to `ForCausalLM` and
-`ForConditionalGeneration`; `ForSequenceClassification` stays on
-`eager_cross_entropy` because chunk_loss hard-codes the causal
-`labels[..., 1:]` shift (incompatible with token-level classification
-labels).
+All registered rows implement the same token-level `standard` contract:
+`(hidden_or_logits, labels, weight, *, ignore_index, num_items_in_batch)`.
+An empty weight marks a logits input and is supported by eager; the fused rows
+require a projection weight. Causal shifting, sequence-classification label
+policy, and SP reduction are outside the kernel in
+`models_kernel/loss_utils/cross_entropy_loss.py`, so chunked CE is no longer
+causal-only.
 
 Selecting `liger_kernel` requires that the model's forward pass pass
 `hidden_states=` and `weights=self.lm_head.weight` through
@@ -202,10 +195,10 @@ model cannot be patched.
 
 ### Key files
 
-- Dispatch: `veomni/ops/kernels/cross_entropy/__init__.py` — `install_loss_mapping(impl)`
-- Eager impl: `veomni/ops/kernels/cross_entropy/eager.py`
-- Liger impl: `veomni/ops/kernels/cross_entropy/liger.py`
-- NPU chunk loss: `veomni/ops/kernels/cross_entropy/chunk_loss.py` — `chunk_loss_function`
+- Registration: `veomni/kernels/_kernels/loss/__init__.py`
+- Implementations: `veomni/kernels/_kernels/loss/cross_entropy_loss/standard/`
+- Model policy: `veomni/models_kernel/loss_utils/cross_entropy_loss.py`
+- Log-probs/distillation side paths: `veomni/models_kernel/loss_utils/`
 
 ---
 
@@ -504,19 +497,12 @@ up `LOSS_MAPPING[self.loss_type]` — this returns a standard PyTorch
 `F.cross_entropy`-based loss. There is no decorator, no hub kernel, and no
 env-var-based kernel swap for the loss function.
 
-VeOmni replaces this at model-build time via `apply_ops_config(...)` →
-`install_loss_mapping(impl)`, which binds `LOSS_MAPPING["ForCausalLM"]` to
-`partial(ForCausalLMLoss, cross_entropy_fn=<impl>)` — where `<impl>` is
-`fused_liger_kernel_cross_entropy` (GPU `liger_kernel`), `chunk_loss_function`
-(NPU), or `eager_cross_entropy` (portable default). The fused Liger
-cross-entropy computes the loss without materializing the full logits
-tensor, which significantly reduces memory for large-vocabulary models.
-
-**Implication:** When using VeOmni's trainer or `build_foundation_model`
-with `ops_implementation=...`, the fused loss is transparent. A standalone
-Transformers training loop that doesn't go through `build_foundation_model`
-would need to call `apply_ops_config(OpsImplementationConfig(...))`
-itself before model construction (or directly monkey-patch `LOSS_MAPPING`).
+VeOmni's `models_kernel` stack leaves that global mapping untouched. Generated
+model classes construct a local `VeomniKernel` and bind it to
+`models_kernel.loss_utils.ForCausalLMLoss` (or the sequence-classification
+helper). The fused Liger and chunked implementations compute loss without
+materializing the full logits tensor, while wrapper-only input policy remains
+outside the raw registry.
 
 #### 2. MoE Load-Balancing Auxiliary Loss
 
@@ -609,7 +595,7 @@ currently exist in the `kernels-community` hub.
 | SwiGLU MLP | Per-model registry | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
 | Attention | `ALL_ATTENTION_FUNCTIONS` (shared registry) | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | `apply_veomni_fused_moe_patch` (Triton/Quack) | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses custom Triton kernels; HF uses PyTorch native `grouped_mm` |
-| Cross-entropy | `apply_ops_config` + `LOSS_MAPPING`/OpSlot | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
+| Cross-entropy | Instance-local `VeomniKernel` + model helper | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
 | MoE aux loss | Instance-local eager/Triton `VeomniKernel` + model helper | Eager `load_balancing_loss_func` | VeOmni only | HF has no fused selection surface |
 | RMSNormGated | Variant-aware OpSlot (`fla`/`npu`/`eager`) | Hard-coded `fla.modules.FusedRMSNormGated` if `fla` is installed, else eager | Different dispatch | VeOmni adds explicit hardware selection |
 

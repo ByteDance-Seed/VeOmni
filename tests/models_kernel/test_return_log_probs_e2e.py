@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end test for ``return_log_probs=True`` on a real (toy-config) model.
+"""End-to-end test for ``return_log_probs=True`` on generated models-kernel classes.
 
 Builds a tiny Qwen3 from ``tests/toy_config/qwen3_toy/`` via
 ``build_foundation_model`` and asserts:
@@ -98,7 +98,7 @@ def _reference_log_probs_and_entropy_from_logits(
     output stays bitwise equal. Entropy is computed via the same
     ``_per_token_entropy_from_logits`` helper for the same reason.
     """
-    from veomni.ops.kernels.cross_entropy.chunk_logprobs import (
+    from veomni.models_kernel.loss_utils.chunk_logprobs import (
         _per_token_entropy_from_logits,
         _per_token_log_probs_from_logits,
     )
@@ -118,27 +118,39 @@ def _reference_log_probs_and_entropy_from_logits(
 
 
 def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
-    """Build a tiny model from a toy config (text or VLM).
+    """Build a tiny generated models-kernel class (text or VLM).
 
-    Forces eager attention (toy config dtype is fp32; flash_attn requires
-    fp16/bf16) and pins the cross-entropy backend.
+    Qwen3 and Qwen3-VL generated classes exist but are intentionally not in the
+    public ``models_kernel`` auto registry yet, so consume tests construct them
+    directly, just like the focused model tests in ``tests/models_kernel``.
     """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models.auto import build_foundation_model
+    from transformers import AutoConfig
 
-    ops_implementation = OpsImplementationConfig(
-        attn_implementation="eager",
-        cross_entropy_loss_implementation=ce_impl,
-    )
+    from tests.models_kernel.compare import eager_kernels_config, pin_eager_attn_implementation
+    from veomni.kernels.config import get_kernels_config, set_kernels_config
 
-    return build_foundation_model(
-        config_path=toy_path,
-        weights_path=None,
-        torch_dtype="float32",
-        attn_implementation="eager",
-        init_device=get_device_type() if IS_CUDA_AVAILABLE else "cpu",
-        ops_implementation=ops_implementation,
-    )
+    config = AutoConfig.from_pretrained(toy_path)
+    if config.model_type == "qwen3":
+        from veomni.models_kernel.transformers.qwen3.generated.patched_modeling_qwen3_gpu import (
+            Qwen3ForCausalLM as ModelClass,
+        )
+    elif config.model_type == "qwen3_vl":
+        from veomni.models_kernel.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+            Qwen3VLForConditionalGeneration as ModelClass,
+        )
+    else:
+        raise ValueError(f"Unsupported toy model type: {config.model_type}")
+
+    kernels = eager_kernels_config()
+    kernels.cross_entropy_loss_implementation = ce_impl
+    previous = get_kernels_config()
+    set_kernels_config(kernels)
+    try:
+        model = ModelClass(config)
+    finally:
+        set_kernels_config(previous)
+    pin_eager_attn_implementation(model)
+    return model.to(device=get_device_type(), dtype=torch.float32)
 
 
 def _skip_unless_cuda(toy_path: str):
@@ -445,7 +457,7 @@ def test_return_log_probs_with_topk_distill_populates_three_fields(toy_path, fam
     _skip_unless_cuda(toy_path)
     _apply_determinism()
 
-    from veomni.ops.kernels.cross_entropy.chunk_topk_distill import chunk_topk_distill_function
+    from veomni.models_kernel.loss_utils import chunk_topk_distill_function
 
     torch.manual_seed(0)
     model = _build_model(toy_path, ce_impl="chunk_loss").train()

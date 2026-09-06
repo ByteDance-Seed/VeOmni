@@ -124,6 +124,32 @@ def test_chunk_loss_matches_eager():
     assert torch.allclose(weight_e.grad, weight_o.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+def test_chunk_loss_computes_shared_valid_token_denominator_once(monkeypatch):
+    """Chunking must not turn one global mean into a sum of chunk means."""
+    original_sum = torch.Tensor.sum
+    denominator_sum_calls = 0
+
+    def counting_sum(self, *args, **kwargs):
+        nonlocal denominator_sum_calls
+        if self.dtype == torch.bool and self.shape == (2 * 11,):
+            denominator_sum_calls += 1
+        return original_sum(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "sum", counting_sum)
+
+    torch.manual_seed(4)
+    hidden = torch.randn(2, 11, 6, requires_grad=True)
+    weight = torch.randn(9, 6, requires_grad=True)
+    labels = torch.randint(0, 9, (2, 11))
+    labels[:, :2] = -100
+    loss = resolve_kernel("cross_entropy_loss", "standard", "chunk_loss").wrapper(hidden, labels, weight, chunk_size=4)
+    loss.backward()
+
+    assert denominator_sum_calls == 1
+    assert hidden.grad is not None
+    assert weight.grad is not None
+
+
 def test_chunk_loss_requires_weight():
     with pytest.raises(RuntimeError, match="nonempty ``weight``"):
         resolve_kernel("cross_entropy_loss", "standard", "chunk_loss").wrapper(

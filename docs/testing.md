@@ -28,14 +28,16 @@ tests/
 │   ├── test_quack_fused_moe.py             # Quack GEMM MoE (SM90+)
 │   ├── test_deepseek_v4_kernels.py           # DeepSeek-V4 TileLang guards and numerical parity
 │   ├── test_flash_attn_varlen_padding.py   # Flash-attn variable-length padding
-│   ├── test_seqcls_loss.py                 # Sequence classification loss
 │   └── test_comp.py                        # Position embedding computation
 │
 ├── kernels/loss/
+│   ├── test_cross_entropy_loss.py           # eager/HF + chunk/Liger forward/backward parity
 │   └── test_load_balancing_loss.py          # eager/HF + Triton forward/backward/memory matrix
 ├── kernels/mhc/
 │   └── test_mhc.py                           # mHC eager/TileKernels registry and parity coverage
 ├── models_kernel/
+│   ├── test_loss_utils.py                   # causal/seq-cls policy, SP reduction, side-path routing
+│   ├── test_return_log_probs_e2e.py          # generated Qwen3/VL log-probs and distill wiring
 │   └── test_model_load_balancing_loss.py    # HF-shaped model helper and gradient fan-out
 │
 ├── data/                           # Data loading & preprocessing
@@ -280,8 +282,14 @@ NVIDIA GPU for kernel execution.
 | `test_quack_fused_moe.py` | Quack GEMM MoE backend | SM90+ |
 | `test_deepseek_v4_kernels.py` | CPU import/hardware guards plus TileLang DSA numerical parity | CPU for guards; TileLang + NVIDIA SM90+ for optimized kernels |
 | `test_flash_attn_varlen_padding.py` | Flash-attn variable-length padding | CUDA |
-| `test_seqcls_loss.py` | Sequence classification loss | CUDA (optional) |
 | `test_comp.py` | Position embedding computation | CUDA |
+
+Cross-entropy is covered at two layers: `tests/kernels/loss/test_cross_entropy_loss.py`
+checks token-level eager parity with HF plus chunked/Liger forward and backward;
+`tests/models_kernel/test_loss_utils.py` checks causal target selection,
+sequence-classification policy, SP reduction, logits ownership, and log-probs
+side-path dispatch. Chunked log-probs and top-k distillation have focused tests
+in `tests/models_kernel/`.
 
 Load-balancing loss is covered at two layers: `tests/kernels/loss/test_load_balancing_loss.py`
 checks the raw `[N, E]` eager and Triton kernels against HF/eager across the

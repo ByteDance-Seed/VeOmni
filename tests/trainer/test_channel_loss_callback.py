@@ -251,18 +251,14 @@ def test_channel_loss_opslot_wrapper_handles_positional_loss_args():
             module.veomni_causal_lm_loss = old_slot
 
 
-@pytest.mark.parametrize("signature_kind", ["liger_partial", "chunk_dispatch"])
-def test_channel_loss_extracts_fused_inputs_from_variadic_loss_signatures(signature_kind):
-    from veomni.ops.kernels.cross_entropy import ForCausalLMLoss, _chunk_loss_dispatch
+def test_channel_loss_extracts_fused_inputs_from_models_kernel_loss_partial():
+    from veomni.models_kernel.loss_utils import ForCausalLMLoss
 
-    if signature_kind == "liger_partial":
+    def fake_ce(hidden_states, labels, weights, **kwargs):
+        del labels, kwargs
+        return hidden_states.sum() * 0 + weights.sum() * 0
 
-        def fake_fused_cross_entropy(*args, **kwargs):
-            return torch.tensor(0.0), None
-
-        loss_fn = partial(ForCausalLMLoss, cross_entropy_fn=fake_fused_cross_entropy)
-    else:
-        loss_fn = _chunk_loss_dispatch
+    loss_fn = partial(ForCausalLMLoss, kernel=fake_ce)
 
     computer = ChannelLossComputer()
     computer._source_ids = [0]

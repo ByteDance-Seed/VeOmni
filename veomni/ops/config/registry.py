@@ -21,10 +21,10 @@ Each op (cross-entropy loss, RMSNorm, RoPE, ...) registers an ``OpSpec`` with:
 - a mapping of backend name (``"eager"`` / ``"liger_kernel"`` / ``"npu"`` /
   ``"triton"``) to ``BackendSpec``.
 
-GLOBAL ops are resolved by ``apply_global_ops()``: the selected backend's
-``entry`` is lazily imported and assigned to ``global_slot``; an optional
-``side_effect`` is then invoked (e.g. installing ``LOSS_MAPPING["ForCausalLM"]
-= chunk_loss_function`` for the NPU chunked-loss backend).
+GLOBAL ops, when present, are resolved by ``apply_global_ops()``: the selected
+backend's ``entry`` is lazily imported and assigned to ``global_slot``; an
+optional ``side_effect`` is then invoked. Cross-entropy no longer uses this
+legacy path; it is instance-local under ``models_kernel``.
 
 PER-MODEL ops are resolved inside each model's ``device_patch.py`` via
 ``apply_per_model_patches(hf_module, model_name, targets={op: attr})``. The
@@ -71,8 +71,7 @@ class BackendSpec:
         requires: Package names that must be available, checked before
             resolution. Supported values: ``"liger_kernel"``, ``"torch_npu"``.
         side_effect: GLOBAL ops only. ``"module:callable"`` invoked after
-            ``entry`` is bound to ``global_slot`` (e.g. installing additional
-            ``LOSS_MAPPING`` entries).
+            ``entry`` is bound to ``global_slot``.
         replace_forward: PER_MODEL ops only. If ``True``, replace
             ``hf_module.<target>.forward`` rather than ``hf_module.<target>``.
         entry_is_factory: PER_MODEL ops only. If ``True``, ``entry`` is a

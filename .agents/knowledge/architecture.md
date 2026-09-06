@@ -55,8 +55,7 @@ veomni/
 │   │   └── singleton.py  get_ops_config()/set_ops_config() for patch files
 │   ├── kernels/        Remaining legacy model-integration implementations
 │   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
-│   │   ├── deepseek_sparse_attention/
-│   │   └── cross_entropy/  LOSS_MAPPING integration
+│   │   └── deepseek_sparse_attention/
 │   ├── platform/       Platform-specific runtime patches
 │   │   └── npu/        HCCL pre-mul sum patch
 │   └── batch_invariant_ops/  Mode switch for deterministic ops

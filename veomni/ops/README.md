@@ -14,7 +14,6 @@ veomni/ops/
 │   └── singleton.py        get_ops_config / set_ops_config — bridges the
 │                           resolved config from BaseTrainer to device_patch.py
 ├── kernels/                Remaining legacy model-integration implementations
-│   ├── cross_entropy/      LOSS_MAPPING integration
 │   ├── deepseek_sparse_attention/
 │   └── deepseek_v4/        Legacy model-specific helpers
 ├── platform/               Platform-specific runtime patches
@@ -31,7 +30,6 @@ by when and where the integration is bound:
 | Scope | Who binds | When | What gets replaced |
 |-------|-----------|------|--------------------|
 | **import-time** | `apply_ops_patch()` | `import veomni` | Registers VeOmni attention kernels in HF's `ALL_ATTENTION_FUNCTIONS`. Gated by `MODELING_BACKEND`. |
-| **LOSS_MAPPING** | `install_loss_mapping()` via `apply_ops_config()` | Before model build, in `BaseTrainer` | `LOSS_MAPPING["ForCausalLM"/"ForConditionalGeneration"/"ForSequenceClassification"]` bound to `partial(<wrapper>, cross_entropy_fn=<impl>)`. |
 | **PER_MODEL** | `apply_per_model_patches()` in each model's `device_patch.py` | During `build_foundation_model()` | `setattr(hf_module, "<ClassOrFuncName>", …)` on the HF modeling module (different class name per model). |
 | **build-time** | `apply_veomni_fused_moe_patch()` | During `build_foundation_model()` | `veomni.ops.kernels.moe._fused_moe_forward`; NPU auto-overrides to the NPU group-gemm kernel. |
 
@@ -40,7 +38,6 @@ by when and where the integration is bound:
 | Kernel | Config key | Scope | Default | Available backends |
 |---|---|:-:|---|---|
 | Attention | `attn_implementation` | import-time | `flash_attention_2` | `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, `native-sparse` |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | LOSS_MAPPING | `eager` | `eager`, `liger_kernel`, `npu` (chunked loss) |
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
@@ -108,7 +105,6 @@ model:
   ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: fused
-    cross_entropy_loss_implementation: liger_kernel
     rms_norm_implementation: liger_kernel
     rotary_pos_emb_implementation: liger_kernel
     swiglu_mlp_implementation: eager   # keep HF MLP even when Liger is on
@@ -241,11 +237,12 @@ HF-shaped helper in `veomni/models_kernel/loss_utils/load_balancing_loss.py`.
 That helper handles `None`, per-layer tuple concatenation, and the optional
 attention mask; the raw kernel only performs loss math.
 
-Cross-entropy is handled separately via `LOSS_MAPPING` scope (see
-`install_loss_mapping` in `kernels/cross_entropy/__init__.py`) — it needs
-three distinct wrapper shapes (`ForCausalLM`, `ForConditionalGeneration`,
-`ForSequenceClassification`) rather than a single function pointer, so the
-GLOBAL slot pattern does not fit.
+Cross-entropy follows the same ownership split: token-level eager, chunked,
+and Liger implementations are registered under
+`veomni/kernels/_kernels/loss/cross_entropy_loss`; causal shifting, sequence
+classification policy, SP reduction, log-probs, and distillation routing live
+in `veomni/models_kernel/loss_utils`. Models bind a local `VeomniKernel`; this
+package no longer owns a facade or mutates Transformers' `LOSS_MAPPING`.
 
 ---
 
