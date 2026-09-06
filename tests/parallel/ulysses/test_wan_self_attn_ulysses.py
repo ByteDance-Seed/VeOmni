@@ -14,20 +14,22 @@ ranks -- exactly matches a single-process "full sequence, no SP" reference compu
 the same synced weights.
 """
 
-import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as c10d
 
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
 
+# A module-level `sys.exit(0)` here would raise SystemExit during collection and abort
+# the whole pytest session (other test files included) on environments without the
+# distributed backend, rather than just skipping this file -- use pytest's own skip
+# mechanism instead.
 if not c10d.is_available() or not c10d.is_backend_available(get_dist_comm_backend()):
-    print("c10d NCCL not available, skipping tests", file=sys.stderr)
-    sys.exit(0)
+    pytest.skip("c10d NCCL not available, skipping tests", allow_module_level=True)
 
-import pytest
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state, init_parallel_state
