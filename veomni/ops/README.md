@@ -14,8 +14,8 @@ veomni/ops/
 │   ├── registry.py         Legacy OpSpec / BackendSpec / OpScope dispatch
 │   └── singleton.py        get_ops_config / set_ops_config — bridges the
 │                           resolved config from BaseTrainer to device_patch.py
-└── kernels/                Remaining legacy model-integration implementations
-    └── deepseek_v4/        Legacy model-specific helpers
+├── dispatch.py             Legacy model-integration dispatch helpers
+└── kernel_registry.py      Legacy backend metadata
 ```
 
 ## Dispatch model
