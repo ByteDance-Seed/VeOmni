@@ -46,7 +46,8 @@ def _check_gather_backward(rank, init_method, backend, layout, sum_grad, scale_g
         else:
             upstream = torch.tensor(float(rank + 1), device=device).expand(4, 3)
         original = upstream.clone()
-        expected = original.clone()
+        # NCCL requires a contiguous reference buffer; upstream keeps its layout.
+        expected = original.clone(memory_format=torch.contiguous_format)
         if sum_grad:
             dist.all_reduce(expected, group=dist.group.WORLD)
         if scale_grad:
