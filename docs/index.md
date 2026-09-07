@@ -96,6 +96,7 @@ key_features/lora.md
 design/kernel_selection.md
 design/fused_moe_kernels.md
 design/local_parallel_state.md
+design/ddp_under_sequence_parallel.md
 design/patchgen.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md
