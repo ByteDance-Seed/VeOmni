@@ -150,13 +150,21 @@ def test_group_routing_assignments_matches_one_hot_reference(top_k_index, num_ex
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         expected.append((int(expert_idx), top_k_pos, token_idx))
 
-    actual = list(_group_routing_assignments(top_k_index))
+    actual = list(_group_routing_assignments(top_k_index, num_experts))
 
     assert len(actual) == len(expected)
     for actual_group, expected_group in zip(actual, expected, strict=True):
         assert actual_group[0] == expected_group[0]
         assert torch.equal(actual_group[1], expected_group[1])
         assert torch.equal(actual_group[2], expected_group[2])
+
+
+def test_group_routing_assignments_skips_padding_expert():
+    top_k_index = torch.tensor([[0, 3], [3, 1]])
+
+    actual = list(_group_routing_assignments(top_k_index, num_experts=3))
+
+    assert [expert_idx for expert_idx, _, _ in actual] == [0, 1]
 
 
 def _select_yaml_then_build(toy_dir: str):
@@ -347,6 +355,30 @@ def test_eager_forward_does_not_materialize_one_hot_routing(mode: str):
 
     with mock.patch.object(torch.nn.functional, "one_hot", side_effect=AssertionError("one-hot routing used")):
         wrapper(hidden_states, top_k_index, top_k_weights)
+
+
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_eager_forward_skips_padding_expert(mode: str):
+    model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
+    patterns = lora_cfg["target_parameters"]
+    sample_fqn, experts = find_first_matching_module(model, experts_module_globs(patterns))
+    _apply(
+        mode,
+        model,
+        target_parameter_patterns=patterns,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        freeze_base_model=True,
+    )
+    wrapper = model.get_submodule(sample_fqn)
+    parameter = next(wrapper.parameters())
+    hidden_states = torch.randn(2, experts.hidden_dim, dtype=parameter.dtype, device=parameter.device)
+    top_k_index = torch.tensor([[0, experts.num_experts], [1, 0]], device=parameter.device)
+    top_k_weights = torch.softmax(torch.randn(2, 2, dtype=torch.float32, device=parameter.device), dim=-1).to(
+        parameter.dtype
+    )
+
+    wrapper(hidden_states, top_k_index, top_k_weights)
 
 
 # ---------------------------------------------------------------------------

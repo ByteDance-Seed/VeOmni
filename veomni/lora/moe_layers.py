@@ -164,7 +164,7 @@ logger = logging.get_logger(__name__)
 _PEFT_PREFIX = "base_model.model."
 
 
-def _group_routing_assignments(top_k_index: torch.Tensor):
+def _group_routing_assignments(top_k_index: torch.Tensor, num_experts: int):
     """Yield expert routing groups in the eager path's top-k-major order."""
     num_tokens = top_k_index.shape[0]
     flat_experts = top_k_index.T.reshape(-1)
@@ -174,8 +174,10 @@ def _group_routing_assignments(top_k_index: torch.Tensor):
     offset = 0
     for expert_idx, count in zip(expert_ids.tolist(), counts.tolist(), strict=True):
         group_positions = flat_positions[offset : offset + count]
-        yield expert_idx, group_positions // num_tokens, group_positions % num_tokens
         offset += count
+        if expert_idx == num_experts:
+            continue
+        yield expert_idx, group_positions // num_tokens, group_positions % num_tokens
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
@@ -753,7 +755,7 @@ class LoraSharedExperts(nn.Module):
         lora_x_gate_up = torch.cat([gate_delta, up_delta], dim=-1)  # [N, 2I]
 
         final_hidden_states = torch.zeros_like(hidden_states)
-        for expert_idx, top_k_pos, token_idx in _group_routing_assignments(top_k_index):
+        for expert_idx, top_k_pos, token_idx in _group_routing_assignments(top_k_index, self.num_experts):
             current_state = hidden_states[token_idx]
 
             gate_up = F.linear(current_state, gate_up_w[expert_idx]) + lora_x_gate_up[token_idx]
@@ -1090,7 +1092,7 @@ class LoraIndependentExperts(nn.Module):
         down_w = self.down_proj.base_layer.weight
 
         final_hidden_states = torch.zeros_like(hidden_states)
-        for expert_idx, top_k_pos, token_idx in _group_routing_assignments(top_k_index):
+        for expert_idx, top_k_pos, token_idx in _group_routing_assignments(top_k_index, self.num_experts):
             current_state = hidden_states[token_idx]
 
             # Per-expert LoRA on gate and up halves — independent rank-r
