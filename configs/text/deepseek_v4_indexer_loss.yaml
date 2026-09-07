@@ -61,44 +61,6 @@ model:
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel
     rotary_pos_emb_implementation: triton
-
-data:
-  # tulu-3-sft-mixture/data, not tulu-3-sft-mixture/. get_data_files lists a directory
-  # non-recursively and takes the extension of its first sorted entry; if the parent holds a
-  # .cache entry it raises " files are not supported" before it ever sees a parquet.
-  train_path: tulu-3-sft-mixture/data
-  data_type: conversation
-  chat_template: chatml
-  max_seq_len: 8192
-  train_size: 100000000
-  text_keys: messages
-  dyn_bsz_buffer_size: 200
-
-train:
-  # Packed, padding-free batching at a fixed 8192 tokens per micro-batch. See the header.
-  dyn_bsz: true
-  pad_to_length: true
-  accelerator:
-    # ulysses_size must stay 1: the indexer loss refuses Ulysses, because each rank would hold a
-    # head shard of the index scores and the teacher is built from the full head set. cp_size is
-    # refused too, and is left at its default of 1 here; DeepSeek-V4's forward has no
-    # context-parallel path, so a shard would be scored as though it were a whole sequence.
-    ulysses_size: 1
-    ep_size: 1
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: true
-    offload:
-      enable_activation: false
-  gradient_checkpointing:
-    # Non-reentrant (the default). VeOmni's reentrant CheckpointFunction is broken against
-    # transformers v5 for every model, indexer loss or not -- it reads run_function.__self__
-    # while transformers hands it a functools.partial.
-    enable: true
-  global_batch_size: 8
-  micro_batch_size: 1
-  bsz_warmup_ratio: 0.007
   optimizer:
     # Muon + AdamW, as the sibling config ships. The indexer's parameters carry gradients for
     # the first time under this objective, so they join Muon's 2D group by dimensionality --
@@ -125,7 +87,45 @@ train:
     muon_ns_implementation: gram_quack
     muon_adjust_lr_fn: match_rms_adamw
     muon_expert_zero_comm: true
-  init_device: meta
+  accelerator:
+    gradient_checkpointing:
+      # Non-reentrant (the default). VeOmni's reentrant CheckpointFunction is broken against
+      # transformers v5 for every model, indexer loss or not -- it reads run_function.__self__
+      # while transformers hands it a functools.partial.
+      enable: true
+    init_device: meta
+    # ulysses_size must stay 1: the indexer loss refuses Ulysses, because each rank would hold a
+    # head shard of the index scores and the teacher is built from the full head set. cp_size is
+    # refused too, and is left at its default of 1 here; DeepSeek-V4's forward has no
+    # context-parallel path, so a shard would be scored as though it were a whole sequence.
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+
+data:
+  # tulu-3-sft-mixture/data, not tulu-3-sft-mixture/. get_data_files lists a directory
+  # non-recursively and takes the extension of its first sorted entry; if the parent holds a
+  # .cache entry it raises " files are not supported" before it ever sees a parquet.
+  train_path: tulu-3-sft-mixture/data
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 8192
+  train_size: 100000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  # Packed, padding-free batching at a fixed 8192 tokens per micro-batch. See the header.
+  dyn_bsz: true
+  pad_to_length: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
   enable_full_determinism: false
   # Smoke run. Raise for a real job.
   max_steps: 50

@@ -292,7 +292,7 @@ Four metrics are reported, all per micro-batch means:
 
 It scales the KL where the loss is assembled, so it moves two things: the value of
 `training/foundation_loss`, and the indexer's share of the global gradient norm —
-hence how often `train.optimizer.max_grad_norm` clips. The four metrics above are
+hence how often `model.optimizer.max_grad_norm` clips. The four metrics above are
 coefficient-free, so tuning it does not change how they read.
 
 It is **not** a learning-rate knob for the indexer. Muon orthogonalises its update
