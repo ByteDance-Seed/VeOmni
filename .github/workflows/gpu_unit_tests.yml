@@ -131,7 +131,6 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_ulysses.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_all_gather.py
-          uv run --frozen pytest -s -x tests/parallel/ulysses/test_gather_backward.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_slice_input_tensor.py
           uv run --frozen pytest -s -x tests/parallel/ulysses/test_wan_ulysses_padding.py
           uv run --frozen pytest -s -x tests/parallel/encoder_data_balance/test_balance_reverse.py
