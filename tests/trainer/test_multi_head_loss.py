@@ -103,32 +103,78 @@ def test_model_output_subclass_field_order_is_still_loss_first():
     assert issubclass(_OutputWithLossDict, ModelOutput)
 
 
-def test_text_trainer_builds_model_sample_collator(monkeypatch):
+def test_text_trainer_routes_model_sample_hook_to_data_transform(monkeypatch):
     import veomni.data.data_collator as data_collator
-    from veomni.trainer.text_trainer import TextTrainer
+    import veomni.trainer.text_trainer as text_trainer
 
     def sample_hook(feature):
         return feature
+
+    captured = {}
+
+    def fake_build_data_transform(transform_name, **kwargs):
+        captured["transform_name"] = transform_name
+        captured.update(kwargs)
+        return object()
 
     model = SimpleNamespace(
         get_extra_collate_infos=lambda: {"mtp_labels": (-1, True, -100, 1)},
         get_sample_collate_func=lambda: sample_hook,
     )
-    trainer = TextTrainer.__new__(TextTrainer)
+    trainer = text_trainer.TextTrainer.__new__(text_trainer.TextTrainer)
     trainer.base = SimpleNamespace(
         model=model,
+        tokenizer=object(),
+        chat_template=object(),
         args=SimpleNamespace(
-            data=SimpleNamespace(data_type="conversation"),
+            data=SimpleNamespace(data_type="conversation", max_seq_len=128, text_keys="messages"),
             train=SimpleNamespace(pad_to_length=False),
         ),
     )
+    monkeypatch.setattr(text_trainer, "build_data_transform", fake_build_data_transform)
     monkeypatch.setattr(
         data_collator,
         "get_parallel_state",
         lambda: SimpleNamespace(sp_enabled=False, sp_size=1),
     )
 
+    trainer._build_data_transform()
     trainer._build_collate_fn()
 
-    assert trainer.base.collate_fn.sample_collate_func is sample_hook
+    assert captured["transform_name"] == "conversation"
+    assert captured["sample_collate_func"] is sample_hook
+    assert not hasattr(trainer.base.collate_fn, "sample_collate_func")
     assert "mtp_labels" in trainer.base.collate_fn.collate_infos
+
+
+def test_vlm_trainer_routes_model_sample_hook_to_qwen_transform(monkeypatch):
+    import veomni.trainer.vlm_trainer as vlm_trainer
+
+    def sample_hook(feature):
+        return feature
+
+    captured = {}
+
+    def fake_build_data_transform(transform_name, **kwargs):
+        captured["transform_name"] = transform_name
+        captured.update(kwargs)
+        return object()
+
+    model = SimpleNamespace(
+        get_position_id_func=lambda: object(),
+        get_sample_collate_func=lambda: sample_hook,
+    )
+    trainer = vlm_trainer.VLMTrainer.__new__(vlm_trainer.VLMTrainer)
+    trainer.base = SimpleNamespace(
+        model=model,
+        model_config=SimpleNamespace(model_type="qwen3_5"),
+        processor=object(),
+        chat_template=object(),
+        args=SimpleNamespace(data=SimpleNamespace(mm_configs={})),
+    )
+    monkeypatch.setattr(vlm_trainer, "build_data_transform", fake_build_data_transform)
+
+    trainer._build_data_transform()
+
+    assert captured["transform_name"] == "qwen3_5"
+    assert captured["sample_collate_func"] is sample_hook

@@ -28,11 +28,11 @@ upstream `transformers` 5.9.0 has no MTP module — only
 tensors were loaded and discarded, so continued training silently degraded the
 MTP head relative to the trunk.
 
-Currently supported through `tasks/train_text.py`: **Qwen3.5 dense**
-(`Qwen3_5ForConditionalGeneration`) and **Qwen3.5 MoE**
-(`Qwen3_5MoeForConditionalGeneration`) on GPU and Ascend NPU. DPO, RL, and VLM
-trainers do not support MTP. The NPU path uses FLA's Ascend dispatch for the
-GatedDeltaNet kernels.
+Currently supported through `tasks/train_text.py` and `tasks/train_vlm.py`:
+**Qwen3.5 dense** (`Qwen3_5ForConditionalGeneration`) and **Qwen3.5 MoE**
+(`Qwen3_5MoeForConditionalGeneration`) on GPU and Ascend NPU. DPO and RL trainers
+do not support MTP. The NPU path uses FLA's Ascend dispatch for the GatedDeltaNet
+kernels.
 
 ## 🚀 Quick Start
 
@@ -127,18 +127,18 @@ the MTP cross-entropy contribution.
 
 `ForCausalLMLoss` shifts labels by one internally when SP is disabled
 (`veomni/ops/kernels/cross_entropy/__init__.py`), so position `i` of the main head
-predicts `labels[i+1]`. MTP depth `d` instead needs `labels[i+d+2]`. The collator
-therefore builds `mtp_labels` with shape `[batch, depth, sequence]`, and the model
-supplies it as an explicit `shift_labels=` argument that bypasses the internal
-shift.
+predicts `labels[i+1]`. MTP depth `d` instead needs `labels[i+d+2]`. The data
+transform therefore builds `mtp_labels` with shape `[batch, depth, sequence]`, and
+the model supplies it as an explicit `shift_labels=` argument that bypasses the
+internal shift.
 
-The row is built by a **per-sample** collator hook
-(`Qwen3_5ForConditionalGeneration.get_sample_collate_func` →
-`SampleFieldsCollator`), which runs after `PrecomputePositionIDsCollator` and
-*before* `PackingCollator`. That ordering is the whole point: shifting by two inside
-an already-packed row would pull the next sample's first tokens into the tail of the
-current one. Doing every depth shift per sample makes that impossible by
-construction, so no `cu_seq_lens` boundary arithmetic is needed.
+The row is built by a **per-sample** model hook
+(`Qwen3_5ForConditionalGeneration.get_sample_collate_func`) invoked by the text
+conversation/plaintext transforms and `_process_sample_qwen_vl_base`, before the
+sample reaches `MainCollator`. That ordering is the whole point: shifting by two
+inside an already-packed row would pull the next sample's first tokens into the
+tail of the current one. Doing every depth shift per sample makes that impossible
+by construction, so no `cu_seq_lens` boundary arithmetic is needed.
 
 `mtp_labels` is registered via `get_extra_collate_infos()` as
 `(-1, True, IGNORE_INDEX, 1)`. The depth dimension is retained while samples are
@@ -150,9 +150,9 @@ The model flattens batch and depth for one fused loss call, so `mtp_tokens` is t
 exact denominator across all valid depth targets, including under gradient
 accumulation.
 
-`TextTrainer._build_collate_fn` resolves `get_extra_collate_infos` and
-`get_sample_collate_func` for text training. Other trainer-specific collators are
-unchanged.
+`TextTrainer` and `VLMTrainer` pass `get_sample_collate_func` to their data
+transforms. Their collators only resolve `get_extra_collate_infos` and pack the
+resulting field.
 
 ### Why `loss_dict` and not `loss`
 
@@ -225,8 +225,7 @@ MTP per step (median, +3.9%). Peak memory increased from 43.95GB to 44.89GB (+2.
   train the head on 1-shifted labels behind nothing louder than a `warning_once`.
 - **Training only.** Speculative decoding runs in the inference engine; the forward
   asserts `past_key_values is None`.
-- **Text SFT only.** Use `tasks/train_text.py`; DPO, RL, and VLM trainers are not
-  wired to construct MTP labels.
+- **SFT only.** Text and Qwen3.5 VLM trainers construct MTP labels; DPO and RL do not.
 - **Multimodal shift semantics differ slightly from vLLM.** vLLM rotates `input_ids`
   then embeds; training shifts the already-scattered `inputs_embeds`. Equivalent for
   text, and only different at multimodal placeholder boundaries.
@@ -240,8 +239,8 @@ MTP per step (median, +3.9%). Peak memory increased from 43.95GB to 44.89GB (+2.
 
 ## 🛠️ Supporting MTP for a new model
 
-The trainer-side plumbing (`SampleFieldsCollator`, the `TextTrainer` hook lookup,
-`loss_dict` in `postforward`, `count_loss_token`'s `{prefix}_tokens`) is
+The trainer-side plumbing (the text/VLM data-transform hook lookup,
+`loss_dict` in `postforward`, and `count_loss_token`'s `{prefix}_tokens`) is
 model-agnostic. Per model you need, in its patch config:
 
 1. An MTP `nn.Module` whose submodule names match the checkpoint's `mtp.*` FQNs,

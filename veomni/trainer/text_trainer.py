@@ -83,23 +83,23 @@ class TextTrainer:
 
     def _build_data_transform(self):
         args: VeOmniArguments = self.base.args
+        get_sample_func = getattr(self.base.model, "get_sample_collate_func", None)
         self.base.data_transform = build_data_transform(
             args.data.data_type,
             tokenizer=self.base.tokenizer,
             chat_template=self.base.chat_template,
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
+            sample_collate_func=get_sample_func() if get_sample_func is not None else None,
         )
 
     def _build_collate_fn(self):
         model = self.base.model
         get_extra_infos = getattr(model, "get_extra_collate_infos", None)
-        get_sample_func = getattr(model, "get_sample_collate_func", None)
         self.base.collate_fn = MainCollator(
             pad_to_length=self.base.args.train.pad_to_length,
             seq_classification=self.base.args.data.data_type == "classification",
             data_collate_info=get_extra_infos() if get_extra_infos is not None else {},
-            sample_collate_func=get_sample_func() if get_sample_func is not None else None,
         )
 
     def on_train_begin(self):

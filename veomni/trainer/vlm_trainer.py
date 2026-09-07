@@ -249,12 +249,14 @@ class VLMTrainer:
     def _build_data_transform(self):
         args: VeOmniVLMArguments = self.base.args
         model_type = self.base.model_config.model_type
+        get_sample_func = getattr(self.base.model, "get_sample_collate_func", None)
 
         self.base.data_transform = build_data_transform(
             model_type,
             processor=self.base.processor,
             chat_template=self.base.chat_template,
             position_id_func=self.base.model.get_position_id_func(),
+            sample_collate_func=get_sample_func() if get_sample_func is not None else None,
             **args.data.mm_configs,
         )
 
