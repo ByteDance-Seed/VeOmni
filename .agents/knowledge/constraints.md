@@ -74,20 +74,20 @@ Core entry points:
    - Reduce with `SUM` then divide, **never** `ReduceOp.AVG` — the NPU backend does not support it (as in `veomni/utils/dist_utils.py::all_reduce`).
    - Reduce over `dp_sp`, not `sp` alone, so the result does not depend on whether DDP already reduced.
    - Select gradients by `requires_grad`, not `grad is not None`, and zero-fill a missing one: it is one collective per gradient, so a parameter unused on some ranks only would desynchronize and hang.
-   - Convert a DTensor grad norm with `full_tensor()` before `.item()` — `.item()` on a sharded DTensor reads this rank's piece, not the global norm.
+   - Convert a DTensor grad norm with `full_tensor()` before `.item()` — `.item()` on a sharded **or partial** DTensor reads this rank's piece, not the global norm, and a grad norm arrives `Partial`.
    - Pass `broadcast_buffers=False` **unconditionally**, never conditioned on `sp_size`. FSDP2/HSDP performs no buffer sync at all, and buffer semantics must not change with the `fsdp_mode` a config happened to pick.
    - `broadcast_buffers=True` is not the fix for replicated mutable state either — it overwrites every rank with rank0's copy instead of aggregating. Use `SyncBatchNorm`, and under SP give it a `process_group` spanning dp+sp, since `dp_group` excludes the SP peers. The repo has no `nn.BatchNorm*` today, so this is a rule for new code.
    - Rationale, including what is unreachable today and when to revisit: `docs/design/ddp_under_sequence_parallel.md`.
 
 7b. **DDP must materialize and load meta-init weights itself, before the wrap**
    - `parallelize_model_ddp()` must call `_materialize_and_load_weights()`, as `parallelize_model_fsdp2()` does; a new dp mode owes the same call. `train.init_device` defaults to `"meta"` and DDP materializes nothing, so omitting it dies in DDP's constructor on `Tensor.item() cannot be called on meta tensors`.
-   - Gate that pass on `param.is_meta`, not on `init_device` — the flag is an intent the model builder may ignore, and re-materializing a model that already holds weights discards them.
-   - `init_device == "cpu"` is refused for `ddp` by an assert in `_validate_accelerator()`, i.e. at parse time so every rank fails together before a model is built.
+   - Gate **the DDP pass** on `param.is_meta`, not on `init_device` — the flag is an intent the model builder may ignore, and re-materializing a model that already holds weights discards them. `parallelize_model_fsdp2()` deliberately keeps its call unconditional, because `arguments_types.py` asserts `init_device == "meta"` for fsdp2 so a real model cannot reach it. Do not "harmonize" the two.
+   - `init_device == "cpu"` is refused for `ddp` by an assert in `_validate_accelerator()` — at parse time so every rank fails together before a model is built, **not** in `parallelize_model_ddp()`.
    - A config value that must be rejected needs an explicit assert in `__post_init__`. No `Literal` in the arguments layer enforces anything at runtime: the parser turns it into argparse `choices`, which covers the CLI only, while a YAML value goes straight to the dataclass via `_instantiate_recursive()` (`veomni/arguments/parser.py`).
    - Do not sweep up the other two users of `"cpu"`: `build_foundation_model(init_device="cpu")` is a live public API, and `materialize_device="cpu"` is how fsdp2 CPU offload reaches `load_model_weights()`.
    - Honour `should_skip_hf_weight_load` (a DCP resume overwrites every parameter, so reading the HF snapshot doubles peak memory and it may not exist) and `broadcast_model_weights_from_rank0`.
    - After the load pass, re-check `param.is_meta` and raise naming the offending parameters.
-   - Refuse ExtraParallel on the DDP path keyed on the model's plan (`_has_extra_parallel_plan()`), not on `ParallelState.any_extra_parallel_enabled` — the mesh alone does not identify a model that owns experts. The same predicate gates `ep_sharded_stream_load` in `_materialize_and_load_weights()`.
+   - Refuse ExtraParallel on the DDP path keyed on the model's plan (`_has_extra_parallel_plan()`), not on `ParallelState.any_extra_parallel_enabled` — the mesh alone does not identify a model that owns experts. The same predicate gates `ep_sharded_stream_load` in `_materialize_and_load_weights()`, and the two arms differ: a plan-less model skips the fast path with a log line, while a model that *does* have a plan lets the loader's `NotImplementedError` propagate, because that one means the checkpoint layout is unsupported. `tests/utils/test_moe_ep_sharded_load_matrix.py` pins the distinction — do not make the skip swallow both.
    - Rationale for each of the above: `docs/design/ddp_under_sequence_parallel.md`.
 
 ### Expert Parallel (MoE)
