@@ -3,7 +3,7 @@
 check_dirs := tasks tests veomni docs scripts
 
 build:
-	python3 -m build
+	uv run --with build python -m build
 
 commit:
 	pre-commit install
