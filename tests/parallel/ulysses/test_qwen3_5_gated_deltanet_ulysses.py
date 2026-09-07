@@ -35,32 +35,32 @@ except Exception:
 
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-_PATCHED_MODULE = "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu"
+_PATCHED_MODULE = "veomni.models_kernel.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu"
+
+
+def _install_fla_kernel_config() -> None:
+    from veomni.kernels.config import set_kernels_config
+
+    set_kernels_config(
+        SimpleNamespace(
+            rms_norm_gated_implementation="fla",
+            causal_conv1d_implementation="fla",
+            chunk_gated_delta_rule_implementation="fla",
+        )
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _bind_qwen3_5_op_slots():
-    """Bind the patched module's OpSlots to FLA before any test runs.
+def _configured_qwen3_5_kernels():
+    """Install the FLA selections used by directly constructed test layers."""
+    from veomni.kernels.config import get_kernels_config, set_kernels_config
 
-    ``build_foundation_model`` is what normally calls ``_bind_veomni_ops`` to
-    resolve each ``OpSlot`` to a concrete kernel. These tests skip that path —
-    they construct ``Qwen3_5GatedDeltaNet`` directly to isolate the SP layer —
-    so without this fixture every slot stays unbound, ``bound_kernel()``
-    returns ``None`` in ``__init__``, and the varlen guard in ``forward``
-    raises ``RuntimeError``.
-
-    These tests already require FLA (see the ``causal_conv1d_fn is None`` skip
-    inside each test), so binding to the FLA defaults matches existing intent.
-    """
-    if causal_conv1d_fn is None:
-        # No FLA installed → individual tests will skip; nothing to bind.
-        return
-    import importlib
-
-    from veomni.arguments.arguments_types import OpsImplementationConfig
-    from veomni.models.auto import _bind_veomni_ops
-
-    _bind_veomni_ops(importlib.import_module(_PATCHED_MODULE), OpsImplementationConfig())
+    previous = get_kernels_config()
+    _install_fla_kernel_config()
+    try:
+        yield
+    finally:
+        set_kernels_config(previous)
 
 
 def _set_deterministic(seed=42):
@@ -159,7 +159,9 @@ def test_lasp_depthwise_conv1d_slicing_matches_full(
     if causal_conv1d_fn is None or not get_torch_device().is_available():
         pytest.skip("FLA causal_conv1d or accelerator not available")
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+    from veomni.models_kernel.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5GatedDeltaNet,
+    )
 
     _set_deterministic(42)
     key_dim = num_k_heads * head_k_dim
@@ -213,22 +215,15 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str, bsz
         world_size=world_size,
     )
 
-    import importlib
-
-    from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.distributed.parallel_state import init_parallel_state
-    from veomni.models.auto import _bind_veomni_ops
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+    from veomni.models_kernel.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5GatedDeltaNet,
+    )
 
     init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
-
-    # The module-level ``_bind_qwen3_5_op_slots`` fixture only binds OpSlots
-    # in the parent test process; ``mp.spawn(start_method="spawn")`` here
-    # creates fresh interpreters that re-import the patched module with
-    # OpSlots unbound. Re-bind in each child so ``self.causal_conv1d_fn`` /
-    # ``self.chunk_gated_delta_rule`` are non-``None`` when
-    # ``Qwen3_5GatedDeltaNet.__init__`` reads them.
-    _bind_veomni_ops(importlib.import_module(_PATCHED_MODULE), OpsImplementationConfig())
+    # Spawned workers do not inherit the process-global config installed by the
+    # parent fixture, so install the same FLA selections in each child.
+    _install_fla_kernel_config()
 
     _set_deterministic(42)
     config = _TinyQwen3_5Config()
@@ -345,22 +340,13 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
         world_size=world_size,
     )
 
-    import importlib
-
-    from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.distributed.parallel_state import init_parallel_state
-    from veomni.models.auto import _bind_veomni_ops
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+    from veomni.models_kernel.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5GatedDeltaNet,
+    )
 
     init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type)
-
-    # The module-level ``_bind_qwen3_5_op_slots`` fixture only binds OpSlots
-    # in the parent test process; ``mp.spawn(start_method="spawn")`` here
-    # creates fresh interpreters that re-import the patched module with
-    # OpSlots unbound. Re-bind in each child so ``self.causal_conv1d_fn`` /
-    # ``self.chunk_gated_delta_rule`` are non-``None`` when
-    # ``Qwen3_5GatedDeltaNet.__init__`` reads them.
-    _bind_veomni_ops(importlib.import_module(_PATCHED_MODULE), OpsImplementationConfig())
+    _install_fla_kernel_config()
 
     _set_deterministic(42)
     config = _TinyQwen3_5Config()
@@ -423,7 +409,9 @@ def test_qwen3_5_gated_deltanet_forward_deterministic_no_sp(bsz, seq_len):
     if causal_conv1d_fn is None or not get_torch_device().is_available():
         pytest.skip("FLA causal_conv1d or accelerator not available")
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+    from veomni.models_kernel.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5GatedDeltaNet,
+    )
 
     device_type = get_device_type()
 

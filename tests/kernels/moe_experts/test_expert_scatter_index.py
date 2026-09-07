@@ -2,19 +2,27 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Numerical parity tests for ``compute_expert_scatter_index``.
 
 The helper replaces the ``argsort(stable=True).argsort()`` pair that the
-Triton MoE (``group_gemm.py``) and Quack MoE (``quack_gemm.py``) kernels
-used to build the scatter-index tensor. The second ``argsort`` was
-inverting a permutation of ``[0..N)`` — an O(N) operation that used to be
-implemented as an O(N log N) sort. This test verifies bit-exact parity
-with the old expression and the inverse-permutation invariant.
+Triton and Quack MoE kernels used to build the scatter-index tensor. The
+second ``argsort`` was inverting a permutation of ``[0..N)`` -- an O(N)
+operation that used to be implemented as an O(N log N) sort. These tests
+verify bit-exact parity with the old expression and the inverse-permutation
+invariant.
 
-All checks run on CPU: the helper is device-agnostic (composes
-``argsort`` + ``arange`` + scatter) and the semantic parity is what
-matters for downstream kernels.
+All checks run on CPU: the helper is device-agnostic (composes ``argsort`` +
+``arange`` + scatter) and the semantic parity is what matters downstream.
 """
 
 import pytest
@@ -64,8 +72,7 @@ def test_scatter_index_is_a_permutation_of_range():
 
 
 def test_sorted_order_is_stable_and_experts_are_contiguous():
-    """The MoE kernels rely on ``stable=True`` so tokens for the same expert
-    stay in original (token, top-k slot) order in the expert-sorted buffer."""
+    """Equal-expert entries must retain their original token/top-k order."""
     expert_index = torch.tensor(
         [[0, 1], [1, 0], [0, 2], [2, 1]],
         dtype=torch.int64,
@@ -74,14 +81,12 @@ def test_sorted_order_is_stable_and_experts_are_contiguous():
 
     flat = expert_index.flatten()
     experts_in_sorted_order = flat[sorted_order]
-    # experts_in_sorted_order should be non-decreasing (contiguous per-expert runs)
     assert torch.all(experts_in_sorted_order[1:] >= experts_in_sorted_order[:-1])
 
-    # Within the same expert, original flat positions must be increasing (stability).
-    for e in torch.unique(flat):
-        positions = sorted_order[experts_in_sorted_order == e]
+    for expert in torch.unique(flat):
+        positions = sorted_order[experts_in_sorted_order == expert]
         assert torch.all(positions[1:] > positions[:-1]), (
-            f"stability violated for expert {e.item()}: {positions.tolist()}"
+            f"stability violated for expert {expert.item()}: {positions.tolist()}"
         )
 
 
@@ -89,24 +94,17 @@ def test_scatter_index_dtype_and_device_preserved():
     expert_index = torch.tensor([[0, 3, 2], [1, 0, 2]], dtype=torch.int64)
     sorted_order, scatter_index = compute_expert_scatter_index(expert_index)
 
-    assert sorted_order.dtype == torch.int64  # argsort returns int64
-    assert scatter_index.dtype == torch.int32  # documented int32 for Triton kernels
+    assert sorted_order.dtype == torch.int64
+    assert scatter_index.dtype == torch.int32
     assert scatter_index.device == expert_index.device
 
 
 def test_scatter_index_inverts_sorted_order():
-    """scatter_index and sorted_order must be inverse permutations."""
     torch.manual_seed(42)
     expert_index = torch.randint(0, 8, (33, 3), dtype=torch.int64)
 
     sorted_order, scatter_index = compute_expert_scatter_index(expert_index)
-    N = sorted_order.numel()
+    count = sorted_order.numel()
     flat_scatter = scatter_index.flatten().to(torch.int64)
 
-    # sorted_order[scatter_index[i]] == i  for all i in [0, N).
-    inv_check = sorted_order[flat_scatter]
-    assert torch.equal(inv_check, torch.arange(N, dtype=torch.int64))
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    assert torch.equal(sorted_order[flat_scatter], torch.arange(count, dtype=torch.int64))

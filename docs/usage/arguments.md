@@ -169,12 +169,12 @@ NPU validation runs at two times:
   `swiglu_mlp`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
   `load_balancing_loss`). Errors fire
   immediately with a model-agnostic allow-list.
-- **OpSlot-bind time** (`KERNEL_REGISTRY.resolve` via the kernel's
-  `HardwareRequirement`) for Qwen3.5-only ops (`rms_norm_gated`,
+- **Model-build time** (instance-local `VeomniKernel` resolution via the
+  registry row's hardware requirement) for Qwen3.5-only ops (`rms_norm_gated`,
   `causal_conv1d`, `chunk_gated_delta_rule`). Validating these at config
   parse would force every NPU user to override them even when training
-  non-Qwen3.5 models, so the check fires only when Qwen3.5's patched
-  modeling is actually loaded. Qwen3.5 on NPU should select the `"npu"`
+  non-Qwen3.5 models, so the check fires only when Qwen3.5 constructs its
+  local handles. Qwen3.5 on NPU should select the `"npu"`
   backend for these three operations.
 
 | Field | Type | Default | Description |

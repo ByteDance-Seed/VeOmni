@@ -341,7 +341,6 @@ target-version = "py311"
 line-length = 119
 indent-width = 4
 extend-exclude = [
-    "veomni/ops/kernels/gated_delta_rule/_ascend",
     "veomni/kernels/_kernels/gated_delta_rule/vendor",
 ]
 
@@ -351,14 +350,13 @@ select = ["B", "C", "E", "F", "I", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
-# Patch gen configs reference names from add_post_import_block (e.g. OpSlot
-# instances, rotate_half) that ruff can't resolve because they only exist as
+# Patch gen configs reference names from add_post_import_block (for example,
+# rotate_half) that ruff can't resolve because they only exist as
 # string literals until patchgen materializes them into the generated file.
 "veomni/models/transformers/**/generated/*.py" = ["E402", "B007"]
 "veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
 "veomni/models_kernel/**/generated/*.py" = ["E402", "B007"]
 "veomni/models_kernel/**/*_patch_gen_config.py" = ["F821"]
-"veomni/ops/kernels/gated_delta_rule/_ascend/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
 "veomni/kernels/_kernels/gated_delta_rule/vendor/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
 
 [tool.ruff.lint.isort]

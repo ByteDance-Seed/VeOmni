@@ -372,8 +372,8 @@ pytest tests/e2e/test_e2e_parallel.py -k <model_name>
 pytest → test_models_patch_fwd_bwd(config, is_moe, ...)
   → prepare_model_modes(is_moe) → [(HF, eager), (HF, fa2), (VeOmni, fa2_sp), ...]
   → for each mode:
-      apply_ops_config(mode-specific OpsImplementationConfig)
-      BaseTrainer._build_model() → build_foundation_model(config, ops_implementation=...)
+      set_kernels_config(mode-specific OpsImplementationConfig)
+      BaseTrainer._build_model() → models_kernel.build_foundation_model(config, kernels_implementation=...)
       TrainerTest.forward_backward_step(dummy_batch)
       → record loss, grad_norm
   → compare_multi_items(all_results, rtol, atol)

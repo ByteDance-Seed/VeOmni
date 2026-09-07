@@ -1,7 +1,6 @@
 import importlib.util
 import math
 import os
-import sys
 from contextlib import nullcontext
 from functools import partial
 from importlib.machinery import ModuleSpec
@@ -29,10 +28,10 @@ try:
     import veomni.trainer.callbacks.base as callback_base_module
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
     from veomni.arguments.arguments_types import ChannelLossConfig
-    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+    from veomni.models_kernel.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
         Qwen2_5OmniForConditionalGeneration,
     )
-    from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
+    from veomni.models_kernel.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
         Qwen3OmniMoeForConditionalGeneration,
     )
     from veomni.trainer.base import BaseTrainer
@@ -78,15 +77,6 @@ def _sp_state(monkeypatch, *, sp_size, sp_rank=0):
     if group is not None:
         monkeypatch.setattr(channel_loss_module.dist, "get_rank", lambda _group=None: sp_rank)
     return SimpleNamespace(sp_enabled=sp_size > 1, sp_group=group, sp_size=sp_size)
-
-
-class _DummyOpSlot:
-    def __init__(self, kernel):
-        self._kernel = kernel
-        self.use_non_eager_impl = True
-
-    def __call__(self, *args, **kwargs):
-        return self._kernel(*args, **kwargs)
 
 
 class _TinyLossModel(torch.nn.Module):
@@ -216,41 +206,6 @@ def test_channel_loss_wrapper_forwards_original_call_unchanged():
         computer.uninstall()
 
 
-def test_channel_loss_opslot_wrapper_handles_positional_loss_args():
-    def original_kernel(logits, labels, vocab_size, num_items_in_batch=None, ignore_index=IGNORE_INDEX, **kwargs):
-        return "main-loss", logits, None
-
-    module = sys.modules[__name__]
-    old_slot = getattr(module, "veomni_causal_lm_loss", None)
-    module.veomni_causal_lm_loss = _DummyOpSlot(original_kernel)
-
-    class DummyModel(torch.nn.Module):
-        pass
-
-    computer = ChannelLossComputer()
-    computer._source_ids = [0]
-    computer._position_ids = torch.tensor([[0, 1, 2]])
-    logits = torch.randn(1, 3, 8)
-    labels = torch.tensor([[1, 2, 3]])
-
-    try:
-        computer.install(DummyModel())
-        assert computer._wrapped_opslots
-        with computer.capture():
-            result = module.veomni_causal_lm_loss(logits, labels, 8)
-        assert result[0] == "main-loss"
-        assert result[1] is logits
-        assert result[2] is None
-        assert computer._result
-        assert computer._result[0]["source_id"] == 0
-    finally:
-        computer.uninstall()
-        if old_slot is None:
-            delattr(module, "veomni_causal_lm_loss")
-        else:
-            module.veomni_causal_lm_loss = old_slot
-
-
 def test_channel_loss_extracts_fused_inputs_from_models_kernel_loss_partial():
     from veomni.models_kernel.loss_utils import ForCausalLMLoss
 
@@ -258,8 +213,12 @@ def test_channel_loss_extracts_fused_inputs_from_models_kernel_loss_partial():
         del labels, kwargs
         return hidden_states.sum() * 0 + weights.sum() * 0
 
-    loss_fn = partial(ForCausalLMLoss, kernel=fake_ce)
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.loss_function = partial(ForCausalLMLoss, kernel=fake_ce)
 
+    model = DummyModel()
     computer = ChannelLossComputer()
     computer._source_ids = [0]
     computer._position_ids = torch.tensor([[0, 1, 2]])
@@ -267,22 +226,22 @@ def test_channel_loss_extracts_fused_inputs_from_models_kernel_loss_partial():
     hidden_states = torch.randn(1, 3, 4)
     weights = torch.randn(8, 4)
 
-    with computer.capture():
-        computer._observe_opslot_call(
-            loss_fn,
-            (),
-            {
-                "logits": None,
-                "labels": labels,
-                "vocab_size": 8,
-                "hidden_states": hidden_states,
-                "weights": weights,
-            },
-        )
+    try:
+        computer.install(model)
+        with computer.capture():
+            model.loss_function(
+                logits=None,
+                labels=labels,
+                vocab_size=8,
+                hidden_states=hidden_states,
+                weights=weights,
+            )
 
-    assert computer._result
-    assert computer._result[0]["source_id"] == 0
-    assert computer._result[0]["token_count"].item() == 2
+        assert computer._result
+        assert computer._result[0]["source_id"] == 0
+        assert computer._result[0]["token_count"].item() == 2
+    finally:
+        computer.uninstall()
 
 
 def test_channel_loss_unwraps_native_lora_model_for_eager_loss():
@@ -352,59 +311,6 @@ def test_channel_loss_unwraps_omni_thinker_loss(model_cls):
         assert computer._result[0]["source_id"] == 0
     finally:
         computer.uninstall()
-
-
-def test_channel_loss_opslot_dispatch_is_scoped_and_reference_counted():
-    def original_kernel(logits, labels, vocab_size, **kwargs):
-        return "main-loss", logits, None
-
-    module = sys.modules[__name__]
-    old_slot = getattr(module, "veomni_causal_lm_loss", None)
-    slot = _DummyOpSlot(original_kernel)
-    module.veomni_causal_lm_loss = slot
-
-    class DummyModel(torch.nn.Module):
-        pass
-
-    first = ChannelLossComputer()
-    second = ChannelLossComputer()
-    for index, computer in enumerate((first, second)):
-        computer._source_ids = [index]
-        computer._position_ids = torch.tensor([[0, 1, 2]])
-
-    logits = torch.randn(1, 3, 8)
-    labels = torch.tensor([[1, 2, 3]])
-
-    try:
-        first.install(DummyModel())
-        dispatcher = slot._kernel
-        second.install(DummyModel())
-        assert slot._kernel is dispatcher
-
-        slot(logits, labels, 8)
-        assert first._result is None
-        assert second._result is None
-
-        with first.capture():
-            slot(logits, labels, 8)
-        assert first._result and first._result[0]["source_id"] == 0
-        assert second._result is None
-
-        with second.capture():
-            slot(logits, labels, 8)
-        assert second._result and second._result[0]["source_id"] == 1
-
-        first.uninstall()
-        assert slot._kernel is dispatcher
-        second.uninstall()
-        assert slot._kernel is original_kernel
-    finally:
-        first.uninstall()
-        second.uninstall()
-        if old_slot is None:
-            delattr(module, "veomni_causal_lm_loss")
-        else:
-            module.veomni_causal_lm_loss = old_slot
 
 
 def test_channel_loss_sp_reduce_preserves_batch_order_for_multiple_sources(monkeypatch):

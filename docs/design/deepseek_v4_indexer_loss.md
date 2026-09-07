@@ -179,10 +179,11 @@ Three things followed from moving them:
   model-agnostic dataclass can be set on any model, so it had to be refused for
   every model that does not implement it; a field on `DeepseekV4Config` cannot be
   set on GLM MoE DSA at all.
-- `OpsConfigSlot` went back to holding only implementation strings. The slots are
-  module-level globals on the generated modeling module, so two models built from
-  it — a DPO policy and its reference — shared one value, and the second `bind`
-  decided for both. `self.config` is per-instance.
+- The old module-global kernel config slots only held implementation strings.
+  Two models built from one generated modeling module — a DPO policy and its
+  reference — therefore shared one value, and the second bind decided for both.
+  `self.config` is per-instance; the current kernel registry also uses
+  instance-local handles.
 - Declaring the fields is load-bearing, not tidiness. `model.model_config`
   overrides reach the config as `from_dict` kwargs, which are applied only for
   keys the constructed config already answers `hasattr` for and dropped silently

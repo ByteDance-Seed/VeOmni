@@ -5,7 +5,9 @@
 **Historical proposal** | 2026-03-16
 
 > This document records the original registry design and contains illustrative
-> pseudocode. It is not the source of truth for runnable configuration. See
+> pseudocode, including the now-removed `veomni.ops` package. It is not the
+> source of truth for runnable configuration. The active registry lives under
+> `veomni.kernels`, with model adapters under `veomni.models_kernel`. See
 > [Kernel Selection in VeOmni](kernel_selection.md) for the current config
 > fields, defaults, backends, lifecycle, and implementation paths.
 

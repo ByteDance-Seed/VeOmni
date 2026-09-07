@@ -85,7 +85,7 @@ Current approaches have significant drawbacks:
 
 ```python
 # BAD: Runtime monkey patching - hard to debug, order-dependent
-apply_ops_patch()
+legacy_apply_runtime_patches()
 apply_logprobs_patch()
 apply_xpu_patch()
 

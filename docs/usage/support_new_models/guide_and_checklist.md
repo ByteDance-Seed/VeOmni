@@ -201,7 +201,7 @@ For implementation details of each patch, refer to the example docs.
 
 - [ ] `parallel_plan.py` with correct expert weight paths
 - [ ] `get_parallel_plan` wired on the pretrained model base class
-- [ ] Stacked-weight `YourModelExperts` module + `fused_moe_forward`
+- [ ] Stacked-weight `YourModelExperts` module + a local `moe_experts` `VeomniKernel`
 - [ ] `_moe_implementation` propagated from top-level config to text sub-config
 - [ ] `_init_weights` patched for stacked expert params
 
@@ -253,7 +253,7 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.distributed.sequence_parallel.ulysses import _Gather  # all-gather with autograd
 
-from veomni.ops import fused_moe_forward
+from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
 
 from veomni.utils.constants import (

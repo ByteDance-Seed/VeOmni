@@ -8,12 +8,10 @@ This note documents VeOmni MoE weight-loading expectations under
 Transformers v5 introduced expert-dispatch integration points (`use_experts_implementation` and `ALL_EXPERTS_FUNCTIONS`).
 
 For VeOmni's qwen3_moe path, we use a simpler approach:
-- patch experts behavior in patchgen-generated modeling;
-- call `veomni.ops.fused_moe_forward(...)` explicitly in the patched forward;
-- gate the call on a module-level `OpSlot("moe_experts", "standard")` whose
-  `use_non_eager_impl` flag is bound from
-  `OpsImplementationConfig.moe_implementation` by `_bind_veomni_ops` at
-  model-build time.
+- patch experts behavior in `models_kernel` patchgen-generated modeling;
+- construct an instance-local `VeomniKernel("moe_experts", "standard", impl)`;
+- always call that handle from the patched expert forward. The eager reference
+  is itself a registry row, so no separate module-global gate is needed.
 
 ## Survey: Qwen MoE Weight Formats
 
@@ -96,12 +94,12 @@ VeOmni's patchgen-generated modeling uses the native v5 fused expert layout:
 - `gate_up_proj` `[E, 2*I, H]`
 - `down_proj` `[E, H, I]`
 
-See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the patchgen config.
+See `veomni/models_kernel/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the patchgen config.
 
 ### Loading (HF safetensors -> VeOmni modeling)
 
 A runtime `CheckpointTensorConverter`
-(`veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`) is
+(`veomni/models_kernel/transformers/qwen3_moe/checkpoint_tensor_converter.py`) is
 registered on every patchgen-generated model class. It converts per-expert HF
 keys at load time:
 
@@ -154,15 +152,18 @@ The script auto-detects the input format (fused `gate_up_proj` or legacy separat
 - HuggingFace `from_pretrained()`
 - Inference engines (vLLM, SGLang)
 
-## VeOmni Fused MoE Op Interface
+## VeOmni MoE Kernel Interface
 
-VeOmni fused MoE entrypoint:
-- `veomni.ops.kernels.moe.fused_moe_forward(...)`
+VeOmni models construct the entrypoint with:
+
+```python
+moe = VeomniKernel("moe_experts", "standard", implementation)
+```
 
 Current signature supports both split and fused gate/up weights:
 
 ```python
-fused_moe_forward(
+moe(
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,

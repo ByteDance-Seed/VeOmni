@@ -304,13 +304,21 @@ if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[1]
 
 ## P11. VeOmni Loss Utility
 
-Replace the model's built-in CE loss with `ForCausalLMLoss` to get Liger/fused kernel selection and correct SP loss reduction:
+Replace the model's built-in CE loss with the models-kernel helper and an
+instance-local registry handle to get fused selection and correct SP loss reduction:
 
 ```python
-from ....ops.kernels.cross_entropy import ForCausalLMLoss
+from functools import partial
+
+from veomni.kernels import VeomniKernel
+from veomni.models_kernel.loss_utils import ForCausalLMLoss
+
+# In the model constructor:
+self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", implementation)
+self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
 
 if labels is not None:
-    loss, logits = ForCausalLMLoss(
+    loss, logits, aux = self.loss_function(
         labels=labels,
         vocab_size=self.config.vocab_size,
         hidden_states=hidden_states,

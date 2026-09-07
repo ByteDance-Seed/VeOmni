@@ -4,7 +4,7 @@ import torch
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
-def _skip_if_no_flash_attn():
+def _skip_if_no_flash_attn() -> None:
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA is required for flash-attn.")
     try:
@@ -28,7 +28,6 @@ def test_varlen_flash_attn_padded_input_matches_unpadded():
 
     total_tokens = int(cu_seqlens[-1].item())
     padded_tokens = total_tokens + 4
-
     nheads = 4
     head_dim = 8
 
@@ -37,16 +36,13 @@ def test_varlen_flash_attn_padded_input_matches_unpadded():
     v = torch.randn_like(q)
 
     q_padded = torch.cat(
-        [q, torch.zeros(padded_tokens - total_tokens, nheads, head_dim, device=device, dtype=dtype)],
-        dim=0,
+        [q, torch.zeros(padded_tokens - total_tokens, nheads, head_dim, device=device, dtype=dtype)], dim=0
     )
     k_padded = torch.cat(
-        [k, torch.zeros(padded_tokens - total_tokens, nheads, head_dim, device=device, dtype=dtype)],
-        dim=0,
+        [k, torch.zeros(padded_tokens - total_tokens, nheads, head_dim, device=device, dtype=dtype)], dim=0
     )
     v_padded = torch.cat(
-        [v, torch.zeros(padded_tokens - total_tokens, nheads, head_dim, device=device, dtype=dtype)],
-        dim=0,
+        [v, torch.zeros(padded_tokens - total_tokens, nheads, head_dim, device=device, dtype=dtype)], dim=0
     )
 
     out_unpadded = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, dropout_p=0.0)

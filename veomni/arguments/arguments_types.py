@@ -1007,9 +1007,9 @@ class TrainingArguments:
 # always allowed implicitly. A value not in ``_NPU_ALLOWED[field]`` raises on
 # NPU; a value in ``_NPU_REQUIRED[field]`` raises off NPU.
 #
-# Hardcoded (not inferred from ``BackendSpec.requires``) because backend names
-# alone do not capture per-model and per-hardware compatibility. The NPU
-# default-normalization step runs before this allow-list validation.
+# Hardcoded rather than inferred from registry requirements because backend
+# names alone do not capture per-model compatibility. The NPU default
+# normalization step runs before this allow-list validation.
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
@@ -1066,16 +1066,15 @@ class OpsImplementationConfig:
 
     NPU validation runs at two times:
 
-    - **Config-parse time** (``__post_init__``) for ops registered in the
-      legacy per-model registry: ``rms_norm``, ``rotary_pos_emb``,
+    - **Config-parse time** (``__post_init__``) for the model-agnostic fields:
+      ``rms_norm``, ``rotary_pos_emb``,
       ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
       ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
       model-agnostic allow-list.
-    - **Model-build time** (``OpSlot.bind`` via ``KERNEL_REGISTRY.resolve``)
-      for Qwen3.5-only ops: ``rms_norm_gated``, ``causal_conv1d``,
-      ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
-      patched modeling module, so config-parse-time validation would force
-      every NPU user to override them even when training non-Qwen3.5 models.
+    - **Model-build time** (instance-local ``VeomniKernel`` resolution) for
+      model-specific ops such as ``rms_norm_gated``, ``causal_conv1d``, and
+      ``chunk_gated_delta_rule``. Keeping this compatibility check at the
+      consuming model avoids forcing unrelated models to configure them.
       All three ship both a GPU (``fla``) and an NPU (``npu``) backend; the
       kernel's ``HardwareRequirement`` raises only when the requested value has
       no backend for the current hardware. The varlen (``dyn_bsz=True``) caveat
@@ -1184,7 +1183,7 @@ class OpsImplementationConfig:
             "because no torch fallback handles cu_seqlens. "
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
             "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
-            "matching backend raises at OpSlot bind time."
+            "matching backend raises when the model resolves its kernel."
         },
     )
     chunk_gated_delta_rule_implementation: str = field(
@@ -1199,7 +1198,7 @@ class OpsImplementationConfig:
             "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
             "'npu_ascendc' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
             "delegates heavy GDN compute to torch.ops.npu.*). "
-            "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
+            "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
     dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
@@ -1290,27 +1289,16 @@ class OpsImplementationConfig:
     def _validate_implementations(self):
         """Fail fast on hardware/op mismatch at config-parse time.
 
-        Only checks things cheaper to catch here than at bind time. Package
-        availability (liger / torch_npu) and per-model backend compatibility
-        are validated by the resolution sites (``apply_per_model_patches`` /
-        ``VeomniKernel`` / legacy ``OpSlot.bind``) — not duplicated here.
+        Only checks things cheaper to catch here than at model-build time.
+        Package availability (liger / torch_npu) and model-specific backend
+        compatibility are validated by instance-local ``VeomniKernel``
+        resolution — not duplicated here.
         """
-        from ..ops import config as _ops_config_pkg  # noqa: F401  triggers op registrations
-        from ..ops.config.registry import list_ops
         from ..utils.import_utils import (
             is_apex_mlu_available,
             is_package_available,
             is_torch_mlu_available,
             is_torch_npu_available,
-        )
-
-        # Coverage check: every registered op must appear in ``_NPU_ALLOWED``,
-        # otherwise a future op addition silently bypasses NPU validation.
-        registered_fields = {op.config_field for op in list_ops()}
-        missing = registered_fields - _NPU_ALLOWED.keys()
-        assert not missing, (
-            f"NPU allow-list missing entries for registered ops: {sorted(missing)}. "
-            f"Add them to _NPU_ALLOWED in arguments_types.py."
         )
 
         on_npu = is_torch_npu_available()
