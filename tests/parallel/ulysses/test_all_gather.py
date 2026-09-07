@@ -131,54 +131,55 @@ class AllToAllCommTest(SequenceParallelTest):
         torch.testing.assert_close(grad_ref, grad_sp, rtol=1e-8, atol=1e-8)
 
 
-def _check_gather_backward(rank, init_method, backend, layout, sum_grad, scale_grad):
+def _check_gather_backward(rank, init_method, backend):
     device = "cpu"
     if backend == "nccl":
         get_torch_device().set_device(rank)
         device = get_device_type()
     dist.init_process_group(backend, init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=45))
     try:
-        local = torch.full((2, 3), float(rank), device=device, requires_grad=True)
-        gathered = _Gather.apply(dist.group.WORLD, local, 0, scale_grad, sum_grad)
-        values = torch.arange(1, 13, dtype=torch.float32, device=device).reshape(4, 3) + rank * 10
-        if layout == "contiguous":
-            upstream = values.clone()
-        elif layout == "transposed":
-            upstream = values.T.contiguous().T
-        elif layout == "narrowed":
-            backing = torch.zeros((4, 5), device=device)
-            backing[:, 1:4] = values
-            upstream = backing[:, 1:4]
-        else:
-            upstream = torch.tensor(float(rank + 1), device=device).expand(4, 3)
-        original = upstream.clone()
-        # NCCL requires a contiguous reference buffer; upstream keeps its layout.
-        expected = original.clone(memory_format=torch.contiguous_format)
-        if sum_grad:
-            dist.all_reduce(expected, group=dist.group.WORLD)
-        if scale_grad:
-            expected = expected * 2
+        for layout, sum_grad, scale_grad in product(
+            ("contiguous", "transposed", "narrowed", "expanded"), (False, True), (False, True)
+        ):
+            case = f"{backend=}, {rank=}, {layout=}, {sum_grad=}, {scale_grad=}"
+            local = torch.full((2, 3), float(rank), device=device, requires_grad=True)
+            gathered = _Gather.apply(dist.group.WORLD, local, 0, scale_grad, sum_grad)
+            values = torch.arange(1, 13, dtype=torch.float32, device=device).reshape(4, 3) + rank * 10
+            if layout == "contiguous":
+                upstream = values.clone()
+            elif layout == "transposed":
+                upstream = values.T.contiguous().T
+            elif layout == "narrowed":
+                backing = torch.zeros((4, 5), device=device)
+                backing[:, 1:4] = values
+                upstream = backing[:, 1:4]
+            else:
+                upstream = torch.tensor(float(rank + 1), device=device).expand(4, 3)
+            original = upstream.clone()
+            # NCCL requires a contiguous reference buffer; upstream keeps its layout.
+            expected = original.clone(memory_format=torch.contiguous_format)
+            if sum_grad:
+                dist.all_reduce(expected, group=dist.group.WORLD)
+            if scale_grad:
+                expected = expected * 2
 
-        # AddBackward shares its incoming gradient with both branches. A gather
-        # that reduces it in place also changes the unrelated bias gradient.
-        bias = torch.zeros_like(gathered, requires_grad=True)
-        local_grad, bias_grad = torch.autograd.grad(gathered + bias, (local, bias), grad_outputs=upstream)
+            # AddBackward shares its incoming gradient with both branches. A gather
+            # that reduces it in place also changes the unrelated bias gradient.
+            bias = torch.zeros_like(gathered, requires_grad=True)
+            local_grad, bias_grad = torch.autograd.grad(gathered + bias, (local, bias), grad_outputs=upstream)
 
-        torch.testing.assert_close(local_grad, expected[rank * 2 : (rank + 1) * 2], rtol=0, atol=0)
-        torch.testing.assert_close(bias_grad, original, rtol=0, atol=0)
-        torch.testing.assert_close(upstream, original, rtol=0, atol=0)
+            torch.testing.assert_close(local_grad, expected[rank * 2 : (rank + 1) * 2], rtol=0, atol=0, msg=case)
+            torch.testing.assert_close(bias_grad, original, rtol=0, atol=0, msg=case)
+            torch.testing.assert_close(upstream, original, rtol=0, atol=0, msg=case)
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("backend", _GATHER_BACKWARD_BACKENDS)
-@pytest.mark.parametrize("layout", ["contiguous", "transposed", "narrowed", "expanded"])
-@pytest.mark.parametrize("sum_grad", [False, True])
-@pytest.mark.parametrize("scale_grad", [False, True])
-def test_gather_backward_preserves_shared_gradients(tmp_path, backend, layout, sum_grad, scale_grad):
+def test_gather_backward_preserves_shared_gradients(tmp_path, backend):
     mp.spawn(
         _check_gather_backward,
-        args=((tmp_path / "rendezvous").as_uri(), backend, layout, sum_grad, scale_grad),
+        args=((tmp_path / "rendezvous").as_uri(), backend),
         nprocs=2,
     )
 
