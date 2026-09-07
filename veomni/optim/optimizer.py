@@ -334,6 +334,34 @@ class MultiOptimizer(Optimizer, Stateful):
 
         return merged
 
+    def _sparse_state_dict(
+        self,
+    ) -> Dict[str, Any]:
+        """Return a flattened optimizer state dict without materializing state.
+
+        Unlike ``state_dict()``, this skips sub-optimizers whose ``.state`` is
+        still empty.  PyTorch's ``get_optimizer_state_dict`` would otherwise
+        call ``_init_optim_state`` and synthesize default state for every
+        parameter owned by that sub-optimizer (e.g. an unused MoE expert on
+        this rank), bloating the checkpoint.
+        """
+        merged: Dict[str, Any] = {}
+        for name in self.key_names:
+            opt = self.optimizers_dict.get(name)
+            if not opt.state:
+                continue
+            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            overlap = set(merged.keys()) & set(sd.keys())
+            if overlap:
+                raise KeyError(
+                    f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
+                )
+            else:
+                logger.info_rank0("No clashes when merging MultiOptimizer state dicts")
+            merged.update(sd)
+
+        return merged
+
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
         # pick out only the entries for parameters that belong to that optimizer.

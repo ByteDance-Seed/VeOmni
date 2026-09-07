@@ -54,3 +54,11 @@ The `knowledge/` directory contains domain-specific context loaded by agents on 
 - **constraints.md** — hard constraints checked before any code change
 - **multimodal_metadata.md** — canonical multimodal metadata keys and ownership
 - **uv.md** — dependency management architecture
+
+## Keeping these docs honest
+
+`make check-agent-docs` (run in CI by the **Check doc task paths** workflow)
+verifies that every repo path and skill name referenced from `AGENTS.md`,
+`.agents/**/*.md` and `.cursor/rules/*` actually exists. Use `<angle brackets>`
+for placeholders so they are skipped. It cannot check prose claims about
+behaviour — when you edit a skill, re-read the file it describes.
