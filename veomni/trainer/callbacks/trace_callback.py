@@ -183,6 +183,30 @@ class ProfileTraceCallback(Callback):
                 self.profiler.stop()
 
 
+# Names ``on_step_end`` below publishes into the ``training/`` namespace itself,
+# rather than taking from ``loss_dict``. A model's ``aux_metrics`` key that matches
+# one of these collides in that namespace even though it does not collide with any
+# loss, so ``BaseTrainer.postforward`` rejects them; keeping the set here means it
+# is updated next to the code that decides the names.
+#
+# Both collision directions are silent, which is why they are worth a guard:
+# ``total_loss`` is assigned *before* the metrics are merged, so an auxiliary
+# metric replaces it and ``training/total_loss`` then reports the metric. So do
+# ``avg_effective_len`` and ``avg_sample_seq_len``, which ``EnvironMeter.step``
+# emits already prefixed and which the merge at the end of ``on_step_end`` lets
+# ``training/`` values win over. ``grad_norm`` and ``lr`` are assigned *after* the
+# merge, so they win instead and the auxiliary metric is dropped without a trace.
+RESERVED_TRAINING_METRIC_NAMES = frozenset(
+    {
+        "total_loss",
+        "grad_norm",
+        "lr",
+        "avg_effective_len",
+        "avg_sample_seq_len",
+    }
+)
+
+
 class EnvironMeterCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
@@ -207,7 +231,13 @@ class EnvironMeterCallback(Callback):
         self.start_time = time.time()
 
     def on_step_end(
-        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
+        self,
+        state: TrainerState,
+        loss: float,
+        loss_dict: Dict[str, float],
+        grad_norm: float,
+        aux_metrics: Dict[str, float] = None,
+        **kwargs,
     ) -> None:
         delta_time = time.time() - self.start_time
         step_env_metrics = self.trainer.environ_meter.step(
@@ -221,6 +251,12 @@ class EnvironMeterCallback(Callback):
             "total_loss": loss,
         }
         step_train_metrics.update(loss_dict)
+        # Auxiliary metrics arrive in their own dict -- they are diagnostics, not
+        # part of the objective -- but are published beside the losses, and merged
+        # before the reduction below so they are averaged over the FSDP group too.
+        # ``BaseTrainer.postforward`` has already rejected any name that would
+        # collide here.
+        step_train_metrics.update(aux_metrics or {})
         step_train_metrics["grad_norm"] = grad_norm
 
         # gather training_step_info from all ranks

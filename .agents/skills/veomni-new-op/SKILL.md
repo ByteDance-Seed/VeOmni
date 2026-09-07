@@ -104,7 +104,9 @@ unpatched (or non-Transformers) Python code.
 
 5. **For legacy global ops** (only when needed): add the public function to `veomni/ops/__init__.py` and rebind it from `apply_ops_config(ops_config)`.
 
-6. **NPU support**:
+6. **Async Ulysses split wrappers** (only for `rms_norm` and `rotary_pos_emb`): compound Functions cannot call `OpSlot`. They use no-autograd `(output, saved)` / `backward` pairs in `veomni/distributed/sequence_parallel/op_wrappers.py`. A new backend or variant must either add a matching wrapper there, or be left off `_SUPPORTED_IMPLEMENTATIONS` / `_SUPPORTED_VARIANTS` so `get_op_wrapper` rejects it. `KERNEL_REGISTRY` coverage is not enough.
+
+7. **NPU support**:
    - Always guard NPU imports with `is_torch_npu_available()`.
    - Put NPU implementations in a separate file (e.g., `npu_kernel.py`).
    - Register the NPU variant under the same slot with a distinct variant name.
@@ -142,6 +144,7 @@ unpatched (or non-Transformers) Python code.
 - **Forgetting to add the matching `OpSlot` to the patchgen config**: registering a kernel alone has no effect — generated modeling code must declare an `OpSlot` for it to be picked up.
 - **Unconditional NPU imports**: importing NPU modules without an `is_torch_npu_available()` guard crashes on GPU-only environments.
 - **Binding at wrong time**: registry entries are resolved when `build_foundation_model` runs `_bind_veomni_ops()`. Kernels that depend on per-model config must be picked at that point — not at module-import time.
+- **New `rms_norm` / `rotary_pos_emb` backend without an async wrapper**: `OpSlot` will bind, but async Ulysses goes through `op_wrappers.py`, not the registry callable. Add a split wrapper or confirm `get_op_wrapper` rejects the new name; do not derive the supported set from `KERNEL_REGISTRY`.
 - **Sequence parallel interaction**: ops that touch attention or loss must handle sequence parallel correctly — use `get_parallel_state().sp_enabled` to check and dispatch.
 - **Mixed precision**: fused kernels often require specific dtypes (bf16/fp16). Add assertions at the public API level to catch dtype mismatches early.
 - **Not exporting public APIs**: if the op provides a public function (legacy global ops), export it from `veomni/ops/__init__.py`'s `__all__`.

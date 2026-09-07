@@ -832,9 +832,9 @@ def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch)
     trainer.micro_batch_token_len = 1
     trainer.micro_batches_token_len = 1
     trainer.LOG_SAMPLE = False
-    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
+    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()}, {})
 
-    loss, loss_dict = BaseTrainer.forward_backward_step(trainer, {"x": torch.tensor(2.0)})
+    loss, loss_dict, _ = BaseTrainer.forward_backward_step(trainer, {"x": torch.tensor(2.0)})
 
     assert loss.item() == 2.0
     assert loss_dict["loss"].item() == 2.0
@@ -860,7 +860,7 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     trainer.micro_batch_token_len = 1
     trainer.micro_batches_token_len = 1
     trainer.LOG_SAMPLE = False
-    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
+    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()}, {})
     trainer.channel_loss_callback = ChannelLossCallback(trainer)
     preforward_seen = {}
 
@@ -877,7 +877,7 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypa
     }
 
     trainer.channel_loss_callback.on_step_begin(trainer.state, micro_batches=[micro_batch])
-    loss, loss_dict = BaseTrainer.forward_backward_step(trainer, micro_batch)
+    loss, loss_dict, _ = BaseTrainer.forward_backward_step(trainer, micro_batch)
 
     assert preforward_seen["has_source_metadata"]
     assert loss.item() == 2.0

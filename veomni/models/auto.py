@@ -50,6 +50,30 @@ logger = logging.get_logger(__name__)
 CONTEXT_PARALLEL_MODEL_TYPES = frozenset({"deepseek_v4"})
 
 
+def check_model_build_prerequisites(config: PretrainedConfig) -> None:
+    """Let a model config refuse a run it cannot serve, before any weight is read.
+
+    A hook rather than a body: any config class may define
+    ``validate_build_prerequisites`` and this calls it. Nothing here knows which
+    models do, which is the point -- the alternative is a list of model names in the
+    generic builder, and a list is a thing the next model has to be remembered into.
+
+    What a config cannot see on its own is the rest of the run, so the convention is
+    that the hook reads whatever singletons it needs (the installed
+    ``OpsImplementationConfig``, the parallel state) and takes no arguments. Kept as a
+    plain ``getattr`` for the same reason: a config that has nothing to refuse should
+    not have to say so.
+
+    ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
+    today. It refuses a Lightning Indexer KL objective configured without the TileLang
+    indexer and attention it is defined in terms of -- a disagreement between a model
+    field and two kernel selections, which no single dataclass can see.
+    """
+    validate = getattr(config, "validate_build_prerequisites", None)
+    if callable(validate):
+        validate()
+
+
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
     """Raise unless this model type implements context parallelism.
 
@@ -66,6 +90,9 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
 
     if not get_parallel_state().cp_enabled:
         return
+
+    if is_torch_npu_available():
+        raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
 
     model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
@@ -184,7 +211,7 @@ def build_foundation_model(
             "native-sparse",
         ]
     ] = None,
-    init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     encoder_data_balance: Optional[bool] = False,
     encoder_data_balance_sorting_algo: Optional[str] = "post_mbs_balancing_greedy_without_pad",
@@ -239,6 +266,7 @@ def build_foundation_model(
         config = build_config(config_path, **config_kwargs)
 
     check_context_parallel_supported(config)
+    check_model_build_prerequisites(config)
 
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":

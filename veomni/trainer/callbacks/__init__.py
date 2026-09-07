@@ -24,6 +24,7 @@ from .checkpoint_callback import ModelDcpCallback, ModelHfCallback
 from .evaluate_callback import EvaluateCallback
 from .global_state_callback import GlobalStateCallback, RootAssetsCallback
 from .trace_callback import (
+    RESERVED_TRAINING_METRIC_NAMES,
     EnvironMeterCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
@@ -47,4 +48,5 @@ __all__ = [
     "EnvironMeterCallback",
     "MoERouterMonitorCallback",
     "TqdmCallback",
+    "RESERVED_TRAINING_METRIC_NAMES",
 ]

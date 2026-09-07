@@ -1,3 +1,5 @@
+# Ascend Docker Overview
+
 ## Quick Reference
 
 - VeOmni is maintained by [ByteDance Seed](https://github.com/ByteDance-Seed/VeOmni).
@@ -15,7 +17,7 @@ The VeOmni Ascend images build on Huawei's [CANN (Compute Architecture for Neura
 
 ---
 
-## Supported Images and Tag Naming Rules
+## Tag Naming Rules and Supported Images
 
 ### Tag Naming Rules
 
@@ -28,11 +30,11 @@ All image tags follow this pattern:
 | Field | Example Values | Description |
 |---|---|---|
 | `veomni-version` | `v0.1.11` | VeOmni release tag |
-| `cann` | `9.0.0` | CANN version |
+| `cann` | `9.1.0` | CANN version |
 | `torch_npu` | `2.10.0.post2` | torch-npu version |
 | `chip-series` | `910b`, `a3` | Target Ascend chip series |
 | `os` | `ubuntu22.04` | Base operating system |
-| `python` | `py3.11` | Python version |
+| `python` | `py3.12` | Python version |
 | `veomni` | `-veomni` | Marks the image as built by VeOmni |
 
 > Note: Tags are mutable — rebuilding on the same release tag overwrites the image of the same name.
@@ -41,8 +43,10 @@ All image tags follow this pattern:
 
 | Chip Series | Architecture | Tag Example | Dockerfile |
 |---|---|---|---|
-| 910B (A2) | amd64 + arm64 | `v0.1.11-cann9.0.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.11-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_910b.arm) |
-| A3 | arm64 | `v0.1.11-cann9.0.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.11-veomni` | [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.0.0_torch_npu2.10.0.post2_a3) |
+| 910B (A2) | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
+| A3 | arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) |
+
+For the complete list of published image tags, see [Ascend Docker Supported Tags](supported_tags.md).
 
 Notes:
 
@@ -64,10 +68,10 @@ Pull the image from quay.io and run it:
 
 ```bash
 # 910B (A2), multi-arch
-docker pull quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.11-veomni
+docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni
 
 # A3
-docker pull quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.11-veomni
+docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni
 ```
 
 To run the container, mount the Ascend device files and the host driver directories:
@@ -84,7 +88,7 @@ docker run --runtime=runc -it \
   -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \
   -v /usr/local/Ascend/driver/tools:/usr/local/Ascend/driver/tools:ro \
   -v /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro \
-  quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.11-veomni \
+  quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni \
   /bin/bash
 ```
 
@@ -109,7 +113,7 @@ Starting from a CANN base image, build locally with the in-repo Dockerfiles. For
 Use the VeOmni image as the base image and add your own software:
 
 ```dockerfile
-FROM quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.11-veomni
+FROM quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni
 
 RUN apt update -y && \
     apt install gcc ...

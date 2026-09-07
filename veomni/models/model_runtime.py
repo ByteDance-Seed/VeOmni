@@ -306,6 +306,22 @@ class VeOmniModelRuntime:
         """
         args = self.args
 
+        # Apply async activation offload BEFORE FSDP2 sharding.
+        # Uses per-instance __call__ patching so that async_save_on_cpu is
+        # OUTER to the checkpoint boundary pushed by GradientCheckpointingLayer,
+        # matching MindSpeed-MM's GC+async offload behavior: hidden_states
+        # inputs are offloaded to CPU (via _NoopSaveInputs), while intermediate
+        # activations are handled by GC recomputation (via _checkpoint_hook).
+        offload_config = args.accelerator.offload_config
+        if offload_config.enable_async_activation:
+            from ..distributed.async_offload import apply_async_activation_offload
+
+            apply_async_activation_offload(
+                self.model,
+                offload_config.activation_offload_modules,
+                host_cache_limit_bytes=int(offload_config.activation_offload_host_cache_limit_gb * 1024**3),
+            )
+
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
         if callable(customized_parallelize_model_function):
