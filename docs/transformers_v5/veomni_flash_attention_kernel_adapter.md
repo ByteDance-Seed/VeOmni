@@ -7,6 +7,7 @@ VeOmni uses custom attention implementation names:
 - `veomni_flash_attention_2_with_sp`
 - `veomni_flash_attention_3_with_sp`
 - `veomni_flash_attention_4_with_sp`
+- `veomni_flash_attention_aiter_with_sp`
 
 These names are registered into `ALL_ATTENTION_FUNCTIONS` and routed to VeOmni's SP-aware attention wrapper.
 
@@ -42,11 +43,13 @@ For VeOmni names, the adapter returns a local kernel-like object exposing:
 - `flash_attn_func`
 - `flash_attn_varlen_func`
 
-mapped to local FA2/FA3/FA4 backends:
+mapped to local FA2/FA3/FA4/aiter backends:
 
 - `veomni_flash_attention_2_with_sp` -> `flash_attn.flash_attn_func` / `flash_attn.flash_attn_varlen_func`
 - `veomni_flash_attention_3_with_sp` -> `flash_attn_interface.flash_attn_func` / `flash_attn_interface.flash_attn_varlen_func`
 - `veomni_flash_attention_4_with_sp` -> `flash_attn.cute.flash_attn_func` / `flash_attn.cute.flash_attn_varlen_func`
+- `veomni_flash_attention_aiter_with_sp` -> `aiter.flash_attn_func` / `aiter.flash_attn_varlen_func`, wrapped by
+  `veomni/ops/kernels/attention/aiter.py` to absorb aiter's calling-convention differences
 
 For simplicity, paged VeOmni aliases (for example `paged|veomni_flash_attention_2_with_sp`) are not handled by this adapter.
 
@@ -77,8 +80,11 @@ After `import veomni`:
 - FA2 and FA3 have dedicated branches in `_lazy_imports` and are resolved
   directly without reaching the hub-kernel path. The adapter is therefore a
   no-op for those two in practice, but is kept for safety.
-- FA4 (`veomni_flash_attention_4_with_sp`) has no such branch in
-  `_lazy_imports` and always falls through to the hub-kernel path. The
-  adapter is the **critical** component that makes FA4 usable.
+- FA4 (`veomni_flash_attention_4_with_sp`) and aiter
+  (`veomni_flash_attention_aiter_with_sp`) have no such branch in
+  `_lazy_imports` and always fall through to the hub-kernel path. The
+  adapter is the **critical** component that makes those two usable.
 - FA4 requires the `flash-attn-cute` package (`flash_attn.cute`), shipped
   in the `gpu` extra; `uv sync --extra gpu` source-builds it.
+- aiter requires AMD ROCm and the `aiter` package, which is not in any extra —
+  it ships in the ROCm image. See `docs/hardware_support/rocm/README.md`.

@@ -44,6 +44,7 @@ _VEOMNI_FLASH_ATTN_IMPL_MAPPING = {
     "veomni_flash_attention_2_with_sp": "flash_attention_2",
     "veomni_flash_attention_3_with_sp": "flash_attention_3",
     "veomni_flash_attention_4_with_sp": "flash_attention_4",
+    "veomni_flash_attention_aiter_with_sp": "aiter",
 }
 
 
@@ -82,6 +83,17 @@ def _load_veomni_local_flash_kernel(implementation: str) -> SimpleNamespace:
                 "VeOmni attention implementation `veomni_flash_attention_4_with_sp` requires "
                 "`flash_attn.cute` (FA4) to be importable."
             ) from e
+    elif implementation == "veomni_flash_attention_aiter_with_sp":
+        try:
+            import aiter  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "VeOmni attention implementation `veomni_flash_attention_aiter_with_sp` requires "
+                "`aiter` (AMD AI Tensor Engine for ROCm) to be importable."
+            ) from e
+        from .aiter import build_aiter_flash_kernels
+
+        return build_aiter_flash_kernels()
     else:
         raise ValueError(f"Unknown VeOmni flash attention implementation: {implementation}")
 
@@ -103,11 +115,12 @@ def patch_transformers_hub_kernel_loader_for_veomni():
     which tries to fetch them from the Hugging Face hub.  VeOmni custom names
     (e.g. ``veomni_flash_attention_4_with_sp``) are not hub identifiers, so
     we monkey-patch that function to intercept VeOmni names and load the
-    corresponding local FA2/FA3/FA4 kernel functions instead.
+    corresponding local FA2/FA3/FA4/aiter kernel functions instead.
 
     FA2 and FA3 are handled by explicit branches inside ``_lazy_imports`` and
-    never reach the hub-kernel path.  FA4 has no such branch and always goes
-    through the hub-kernel fallback, which is why the patch matters for FA4.
+    never reach the hub-kernel path.  FA4 and aiter have no such branch and
+    always go through the hub-kernel fallback, which is why the patch matters
+    for those two.
     """
     global _veomni_hub_kernel_loader_patch_applied
     global _original_load_and_register_attn_kernel
@@ -165,8 +178,8 @@ def flash_attention_forward(
 ) -> tuple[torch.Tensor, None]:
     """
     VeOmni unified flash-attention forward, registered in Transformers'
-    ``ALL_ATTENTION_FUNCTIONS`` for all three ``veomni_flash_attention_*_with_sp``
-    implementation names.
+    ``ALL_ATTENTION_FUNCTIONS`` for every ``veomni_flash_attention_*_with_sp``
+    implementation name.
 
     Differences from the stock Transformers flash-attention forward:
 
@@ -186,10 +199,10 @@ def flash_attention_forward(
        * FA2/FA3 → plain name (``"flash_attention_2"`` / ``"flash_attention_3"``)
          because ``_lazy_imports`` has an explicit branch for each and resolves
          them without touching the hub-kernel path.
-       * FA4 → kept as ``"veomni_flash_attention_4_with_sp"`` so that
-         Transformers v5's hub-kernel fallback is intercepted by VeOmni's
-         monkey-patch of ``load_and_register_attn_kernel``, which loads
-         ``flash_attn.cute`` locally instead of fetching from the hub.
+       * FA4 and aiter → kept as the VeOmni name so that Transformers v5's
+         hub-kernel fallback is intercepted by VeOmni's monkey-patch of
+         ``load_and_register_attn_kernel``, which loads ``flash_attn.cute`` /
+         ``aiter`` locally instead of fetching from the hub.
     """
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
@@ -270,6 +283,8 @@ def flash_attention_forward(
         fa_kernel_implementation = "flash_attention_3"
     elif module.config._attn_implementation == "veomni_flash_attention_4_with_sp":
         fa_kernel_implementation = "veomni_flash_attention_4_with_sp"  # intercepted by VeOmni hub-kernel patch
+    elif module.config._attn_implementation == "veomni_flash_attention_aiter_with_sp":
+        fa_kernel_implementation = "veomni_flash_attention_aiter_with_sp"  # intercepted by VeOmni hub-kernel patch
     else:
         raise ValueError(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
