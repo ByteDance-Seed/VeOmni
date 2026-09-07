@@ -92,6 +92,11 @@ description: "Create a pull request for the current branch. Handles uncommitted 
 
 ### Step 3: Generate Draft File and Push (automatic)
 
+0. **Run the review gate first.** Unless the branch diff is docs-only or a
+   revert, run `/veomni-review` over `<base>...HEAD` before pushing — this is
+   the point the gate exists for, and once here covers the whole branch. A
+   `risky` verdict stops the PR: report it and wait for the user.
+
 1. Draft PR title in `[{modules}] {type}: {description}` format:
    - Multiple modules separated by comma: `[model, data] feat: ...`
    - Description: concise, lowercase start, no period, under 60 chars

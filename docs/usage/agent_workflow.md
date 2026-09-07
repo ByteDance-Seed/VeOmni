@@ -27,7 +27,7 @@ If you are using Cursor or another AI coding tool on this project, the workflow 
 1. The agent reads `AGENTS.md` on session start.
 2. For each task, the agent selects the appropriate skill from the dispatch table (or auto-discovers it via the `description` frontmatter).
 3. The agent reads the skill's `SKILL.md` and follows its step-by-step instructions.
-4. Before committing, the agent runs the `/veomni-review` skill (a subagent code review).
+4. Before opening a pull request, the agent runs the `/veomni-review` skill (a subagent code review over the branch diff).
 
 **You don't need to do anything special** — just describe your task in natural language. You can also invoke a specific skill with `/skill-name` in chat (e.g., `/veomni-debug`).
 
@@ -54,7 +54,7 @@ Each skill is a folder containing a `SKILL.md` file with YAML frontmatter (`name
 .agents/skills/
 ├── veomni-develop/SKILL.md    # Feature development and refactoring
 ├── veomni-debug/SKILL.md      # Bug fix and debugging (quick path + full protocol)
-├── veomni-review/SKILL.md     # Pre-commit code review (mandatory)
+├── veomni-review/SKILL.md     # Pre-PR code review (mandatory)
 ├── veomni-new-model/SKILL.md  # Add a new model to VeOmni
 ├── veomni-migrate-transformers-v5/SKILL.md  # Migrate model patches to transformers v5
 ├── veomni-new-op/SKILL.md     # Add a new kernel/operator
@@ -107,19 +107,22 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 2. Reference it from the Context Loading section in `AGENTS.md`.
 3. If the knowledge contains hard rules, add them to `constraints.md`.
 
-## Commit Flow
+## Commit and review flow
 
-The agent workflow enforces a structured commit flow:
+Commits stay cheap; the subagent review is owed once per pull request, over the
+whole branch diff, because the PR is the unit that lands:
 
 ```
-Code Change -> /veomni-review (subagent) -> Verdict
-                                             |
-                                     safe -> commit
-                              needs-attention -> fix, then commit
-                                     risky -> report to user, wait
+each commit    -> make quality + your own verification
+
+before the PR  -> /veomni-review (subagent) -> Verdict
+                                                |
+                                        safe -> open the PR
+                                 needs-attention -> fix, then open the PR
+                                        risky -> report to user, wait
 ```
 
 Additional gates:
-- `make quality` must pass (ruff check + format)
+- `make quality` must pass (ruff check + format) on every commit
 - Commit messages must not mention AI/Claude
 - PR title must follow `[{modules}] {type}: {description}` format

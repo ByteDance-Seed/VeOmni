@@ -20,7 +20,7 @@ description: "Use this skill for ANY bug, error, crash, wrong output, loss diver
 3. Write a reproducer test if feasible.
 4. Minimal fix — root cause only, don't touch surrounding code.
 5. Verify: reproducer passes, `pytest tests/<module>/` passes, no regressions across modalities.
-6. Run `/veomni-review`, `make quality`, commit.
+6. Run `make quality`, commit. (The subagent review is owed once before the PR, not per commit.)
 
 If not resolved in 15 min → switch to Full Protocol.
 
@@ -119,7 +119,7 @@ Phase 5: Knowledge capture           -> pending
 2. Implement a SINGLE targeted fix addressing the root cause.
 3. Verify: test passes, training runs correctly, no regressions.
 4. Check for collateral — did the fix break other modalities or trainers?
-5. Before committing: run `/veomni-review` skill.
+5. Before opening the PR: run `/veomni-review` over the branch diff.
 
 ### Phase 5: Knowledge Capture (mandatory)
 
