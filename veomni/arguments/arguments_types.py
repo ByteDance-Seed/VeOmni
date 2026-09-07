@@ -543,6 +543,15 @@ class FSDPConfig:
             )
         },
     )
+    reduce_scatter_with_fp32_accumulation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use BF16 communication with destination-local FP32 accumulation for FSDP2 ReduceScatter. "
+                "Requires mixed_precision.reduce_dtype='bfloat16'."
+            )
+        },
+    )
     max_load_broadcast_size: float = field(
         default=20.0,
         metadata={
@@ -565,6 +574,14 @@ class FSDPConfig:
                 "model.accelerator.fsdp_config.fsdp_mode='eager' is reserved for the "
                 "single-process inference path and is not wired up yet."
             )
+        if self.reduce_scatter_with_fp32_accumulation:
+            if self.fsdp_mode != "fsdp2":
+                raise ValueError("reduce_scatter_with_fp32_accumulation requires fsdp_mode='fsdp2'.")
+            if not self.mixed_precision.enable or self.mixed_precision.reduce_dtype != "bfloat16":
+                raise ValueError(
+                    "reduce_scatter_with_fp32_accumulation requires mixed precision with "
+                    "mixed_precision.reduce_dtype='bfloat16'."
+                )
 
 
 @dataclass
