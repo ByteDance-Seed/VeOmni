@@ -77,6 +77,7 @@ from veomni.lora.moe_layers import (
     apply_independent_moe_lora,
     apply_shared_moe_lora,
 )
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 from .utils import (
     build_toy,
@@ -129,6 +130,8 @@ _MODE_CASES = [
     pytest.param("shared", id="shared"),
     pytest.param("independent", id="independent"),
 ]
+
+_GPU_DEVICE = get_device_type()
 
 
 def _select_yaml_then_build(toy_dir: str):
@@ -281,20 +284,20 @@ def test_independent_eager_gate_up_accumulates_with_addmm(monkeypatch):
     [
         pytest.param("cpu", torch.float64, 1e-12, 1e-12, id="cpu-fp64"),
         pytest.param(
-            "cuda",
+            _GPU_DEVICE,
             torch.float16,
             2e-3,
             2e-3,
-            id="cuda-fp16",
-            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
+            id="gpu-fp16",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="GPU is unavailable"),
         ),
         pytest.param(
-            "cuda",
+            _GPU_DEVICE,
             torch.bfloat16,
             2e-2,
             2e-2,
-            id="cuda-bf16",
-            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
+            id="gpu-bf16",
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="GPU is unavailable"),
         ),
     ],
 )
