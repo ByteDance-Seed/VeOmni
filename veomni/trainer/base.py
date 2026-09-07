@@ -594,6 +594,9 @@ class BaseTrainer(Stateful, ABC):
             ep_sharded_stream_load=args.train.ep_sharded_stream_load,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
+            reduce_scatter_with_fp32_accumulation=(
+                args.train.accelerator.fsdp_config.reduce_scatter_with_fp32_accumulation
+            ),
             compile_config=CompileConfig(
                 **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
             ),

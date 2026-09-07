@@ -31,6 +31,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .fsdp2.reduce_scatter import register_bf16_reduce_scatter_with_fp32_accumulation
 from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
@@ -317,6 +318,7 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    reduce_scatter_with_fp32_accumulation: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -345,6 +347,19 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+
+    if reduce_scatter_with_fp32_accumulation:
+        if get_device_type() != "cuda":
+            raise RuntimeError("BF16-wire FP32-accumulation ReduceScatter is only supported on CUDA/NCCL.")
+        if not mixed_precision.enable or mixed_precision.reduce_dtype != "bfloat16":
+            raise ValueError(
+                "BF16-wire FP32-accumulation ReduceScatter requires mixed precision with reduce_dtype='bfloat16'."
+            )
+        if parallel_state.dp_replicate_size > 1:
+            raise ValueError(
+                "BF16-wire FP32-accumulation ReduceScatter does not support HSDP because its "
+                "replicate-group AllReduce would still accumulate in BF16."
+            )
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
@@ -586,6 +601,7 @@ def parallelize_model_fsdp2(
     #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
+    premul_sum_factors = {}
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
@@ -614,6 +630,7 @@ def parallelize_model_fsdp2(
                 else:
                     # from torch 2.8
                     _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                    premul_sum_factors[_para_mod] = 1.0 / gradient_divide_factor
                 layer_mod._fsdp_modules.append(_para_mod)
 
         # shard module that needs to ignore mixed precision control
@@ -645,6 +662,16 @@ def parallelize_model_fsdp2(
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
     fully_shard(model, **root_fsdp_kwargs)
+
+    if reduce_scatter_with_fp32_accumulation:
+        registered = register_bf16_reduce_scatter_with_fp32_accumulation(
+            model,
+            premul_sum_factors=premul_sum_factors,
+        )
+        logger.info_rank0(
+            "Enabled BF16-wire FP32-accumulation ReduceScatter on "
+            f"{registered} FSDP module{'s' if registered != 1 else ''}."
+        )
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
@@ -782,6 +809,7 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    reduce_scatter_with_fp32_accumulation: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
@@ -837,6 +865,7 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,

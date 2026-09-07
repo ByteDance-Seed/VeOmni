@@ -461,6 +461,15 @@ class FSDPConfig:
         default=False,
         metadata={"help": "Enable CPU offload for FSDP2."},
     )
+    reduce_scatter_with_fp32_accumulation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use BF16 communication with destination-local FP32 accumulation for FSDP2 ReduceScatter. "
+                "Requires mixed_precision.reduce_dtype='bfloat16'."
+            )
+        },
+    )
     max_load_broadcast_size: float = field(
         default=20.0,
         metadata={
@@ -475,6 +484,14 @@ class FSDPConfig:
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
                 "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."
             )
+        if self.reduce_scatter_with_fp32_accumulation:
+            if self.fsdp_mode != "fsdp2":
+                raise ValueError("reduce_scatter_with_fp32_accumulation requires fsdp_mode='fsdp2'.")
+            if not self.mixed_precision.enable or self.mixed_precision.reduce_dtype != "bfloat16":
+                raise ValueError(
+                    "reduce_scatter_with_fp32_accumulation requires mixed precision with "
+                    "mixed_precision.reduce_dtype='bfloat16'."
+                )
 
 
 @dataclass
@@ -899,6 +916,12 @@ class TrainingArguments:
         else:
             acc.dp_replicate_size = 1
             acc.dp_shard_size = acc.dp_size
+
+        if acc.fsdp_config.reduce_scatter_with_fp32_accumulation and acc.dp_replicate_size > 1:
+            raise ValueError(
+                "reduce_scatter_with_fp32_accumulation does not support HSDP "
+                "(dp_replicate_size > 1) because the replicate-group AllReduce would still accumulate in BF16."
+            )
 
         # multi-node warning
         num_nodes = int(os.getenv("WORLD_SIZE", 1)) // int(os.getenv("LOCAL_WORLD_SIZE", 1))
