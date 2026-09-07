@@ -158,6 +158,19 @@ def test_janus_packed_preprocessor_writes_batch_keys():
     assert PACKED_INPUT_IDS in batch
     assert UND_IMAGE_MASK in batch
     assert batch[UND_NUM_REAL] == 1
+    # The carrier is dropped once packed: its per-item pixel tensors are already
+    # copied into pixel_values_und/gen, so keeping it would ship them twice.
+    assert "conversation_list" not in batch
+
+
+def test_janus_packed_preprocessor_keeps_conversation_list_on_inference():
+    preprocessor = JanusTextEncoderPreprocessor(
+        JanusChatTemplate(_FakeTokenizer()), packed_preprocess=True, num_image_tokens=4
+    )
+    conversation = [[ConversationItem(type="text", value="hi", role="user")]]
+    batch = {"conversation_list": conversation}
+    preprocessor(batch, inference=True)
+    assert batch["conversation_list"] is conversation
 
 
 def test_janus_packed_preprocessor_skips_pack_on_inference():

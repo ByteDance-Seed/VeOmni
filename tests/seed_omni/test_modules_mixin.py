@@ -387,9 +387,11 @@ def test_text_encoder_decode_dispatches_pre_shifted_loss(monkeypatch):
 
     assert out["loss"].dim() == 0
     assert out["logits"] is None
-    assert captured["hidden_states"] is hidden_states
-    assert captured["shift_labels"] is shift_labels
-    assert captured["labels"] is shift_labels
+    # IGNORE_INDEX rows are dropped before the linear (packed image placeholders).
+    assert captured["hidden_states"].shape == (3, 16)
+    assert torch.equal(captured["hidden_states"], hidden_states[[0, 1, 3]])
+    assert torch.equal(captured["shift_labels"], torch.tensor([1, 2, 3]))
+    assert torch.equal(captured["labels"], torch.tensor([1, 2, 3]))
     assert captured["weights"] is te.lm_head.weight
     assert captured["loss_reduction_group"] is reduction_group
 
@@ -410,7 +412,7 @@ def test_text_encoder_tied_head_uses_explicit_eager_loss(monkeypatch):
     out = te.decode(hidden_states=hidden_states, shift_labels=shift_labels)
 
     assert torch.isfinite(out["loss"])
-    assert out["logits"].shape == (5, 64)
+    assert out["logits"].shape == (3, 64)
 
 
 def test_text_encoder_decode_all_masked_span_scores_zero(monkeypatch):

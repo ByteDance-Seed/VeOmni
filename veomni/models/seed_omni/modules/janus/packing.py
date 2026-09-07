@@ -14,6 +14,7 @@ conversation packer skipping ``role='dummy'``) and are folded in with
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -53,7 +54,7 @@ def _as_1d_long(value: Any) -> torch.Tensor:
 
 
 def pack_janus_conversations(
-    conversation_list: list[list[ConversationItem]],
+    conversation_list: Iterable[list[ConversationItem]],
     *,
     pad_token_id: int,
     num_image_tokens: int = JANUS_NUM_IMAGE_TOKENS,
@@ -63,6 +64,10 @@ def pack_janus_conversations(
     Image rows (non-dummy) expand to ``num_image_tokens`` pad ids with the
     matching und/gen mask True; dummy rows are collected only as FSDP-anchor
     pixels. Per-sample ``position_ids`` restart at 0 (FlashAttention varlen).
+
+    ``conversation_list`` is consumed exactly once, so the caller may pass a
+    generator that tokenizes each sample on demand instead of materialising
+    every tokenized sample up front.
     """
     ids_chunks: list[torch.Tensor] = []
     label_chunks: list[torch.Tensor] = []

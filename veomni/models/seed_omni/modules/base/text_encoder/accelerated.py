@@ -19,6 +19,7 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
 from veomni.ops.kernels.cross_entropy.eager import eager_cross_entropy
+from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.base_mixin import BaseMixin
@@ -183,6 +184,29 @@ class TrainingMixin(TrainingModuleMixin):
             return self.lm_head(hidden_states)
         return self.emb_parallel_project(hidden_states, self.embed_tokens.weight)
 
+    @staticmethod
+    def _drop_unsupervised_decode_rows(
+        hidden_states: torch.Tensor,
+        labels: torch.LongTensor | None,
+        shift_labels: torch.LongTensor | None,
+        target_labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.LongTensor | None, torch.LongTensor | None, torch.Tensor]:
+        """Keep only rows whose target is not ``IGNORE_INDEX``.
+
+        Fused linear+CE still projects every row it is given; dropping here is
+        what stops image placeholders from paying ``lm_head``.
+        """
+        supervised = target_labels != IGNORE_INDEX
+        if bool(supervised.all()):
+            return hidden_states, labels, shift_labels, target_labels
+        hidden_states = hidden_states[supervised]
+        target_labels = target_labels[supervised]
+        if labels is not None:
+            labels = labels[supervised]
+        if shift_labels is not None:
+            shift_labels = shift_labels[supervised]
+        return hidden_states, labels, shift_labels, target_labels
+
     def decode(
         self,
         hidden_states: torch.Tensor | None = None,
@@ -216,26 +240,47 @@ class TrainingMixin(TrainingModuleMixin):
         (Liger divides by ``n_non_ignore``, chunk_loss recounts the labels), so
         such a span is routed to the eager branch and given an explicit
         denominator instead of dividing 0 by 0.
+
+        (d) ``IGNORE_INDEX`` rows are dropped before the linear. Liger fused
+        linear+CE still GEMMs every remaining row (ignore only zeros the
+        reduction), so packed image placeholders would otherwise pay a full
+        ``lm_head`` matmul. Loss value is unchanged; GEMM volume matches the
+        conversation path that never sent those rows.
         """
         loss: torch.Tensor | None = None
         logits: torch.Tensor | None = None
         target_labels = labels if labels is not None else shift_labels
         fsdp_group = get_parallel_state().fsdp_group
-        num_supervised_tokens = None if target_labels is None else (target_labels != -100).sum()
+        num_supervised_tokens = None if target_labels is None else (target_labels != IGNORE_INDEX).sum()
 
         if target_labels is None:
             # Inference path: materialize logits because no loss is requested.
             logits = self._project(hidden_states)
-        elif self.lm_head is not None and self.lm_head.bias is None and num_supervised_tokens > 0:
-            loss, logits, _ = self.loss_function(
-                logits=None,
-                labels=target_labels,
-                shift_labels=shift_labels,
-                vocab_size=self.config.vocab_size,
-                hidden_states=hidden_states,
-                weights=self.lm_head.weight,
-                loss_reduction_group=fsdp_group,
+        elif num_supervised_tokens > 0:
+            hidden_states, labels, shift_labels, target_labels = self._drop_unsupervised_decode_rows(
+                hidden_states, labels, shift_labels, target_labels
             )
+            if self.lm_head is not None and self.lm_head.bias is None:
+                loss, logits, _ = self.loss_function(
+                    logits=None,
+                    labels=target_labels,
+                    shift_labels=shift_labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    loss_reduction_group=fsdp_group,
+                )
+            else:
+                logits = self._project(hidden_states)
+                loss, _, _ = ForCausalLMLoss(
+                    logits=logits,
+                    labels=target_labels,
+                    shift_labels=shift_labels,
+                    vocab_size=self.config.vocab_size,
+                    num_items_in_batch=num_supervised_tokens.clamp(min=1),
+                    loss_reduction_group=fsdp_group,
+                    cross_entropy_fn=eager_cross_entropy,
+                )
         else:
             logits = self._project(hidden_states)
             loss, _, _ = ForCausalLMLoss(

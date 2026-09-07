@@ -48,15 +48,32 @@ class JanusTextEncoderPreprocessor(TextEncoderPreprocessor):
         inference: bool = False,
         **kwargs: Any,
     ) -> None:
-        super().__call__(batch, inference=inference, **kwargs)
         if not self.packed_preprocess or inference:
+            super().__call__(batch, inference=inference, **kwargs)
             return
-        packed = pack_janus_conversations(
-            batch["conversation_list"],
-            pad_token_id=int(self._chat_template.pad_token_id),
-            num_image_tokens=self._num_image_tokens,
+
+        # Packed training feeds the tokenized parts straight to the packer rather
+        # than writing them back onto ``conversation_list`` (what the base
+        # ``preprocess_conversations`` does) and then walking that list again.
+        #
+        # The carrier is dropped once packed: no node in ``graph_train_packed.yaml``
+        # reads ``conversation_list``, and keeping it would ship every per-item
+        # pixel tensor to the main process a second time — ``pack_janus_conversations``
+        # already *copied* those pixels into ``pixel_values_und`` / ``pixel_values_gen``
+        # via ``torch.stack``, so the carrier's references only pin a duplicate
+        # (~400 MB per micro-batch at mbs=448). This is why the module must be the
+        # last preprocessor in ``config.modules`` order: SigLIP/VQVAE write the pixel
+        # tensors onto the items this reads. ``offline_cache_step`` needs the carrier,
+        # but it is a conversation-path feature — the packed graph never fills items.
+        tc_kwargs = self._tokenize_conversation_kwargs(inference, **kwargs)
+        conversation_list = batch.pop("conversation_list")
+        batch.update(
+            pack_janus_conversations(
+                (self._chat_template.tokenize_conversation(sample, **tc_kwargs) for sample in conversation_list),
+                pad_token_id=int(self._chat_template.pad_token_id),
+                num_image_tokens=self._num_image_tokens,
+            )
         )
-        batch.update(packed)
 
 
 __all__ = ["JanusTextEncoderPreprocessor"]
