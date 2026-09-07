@@ -215,4 +215,6 @@ Core files:
 ## Environment Reproducibility
 
 27. **Exact uv synchronization removes separately installed overlays**
-    - The MagiAttention SM90 CUTLASS overlay is installed by `scripts/kernel/install_magi_sm90.sh` after the locked GPU environment. Reinstall it after a later exact `uv sync` before running MagiAttention on SM90.
+    - MagiAttention itself is the optional `--extra magi` extra (`uv sync --extra gpu --extra magi`).
+      The SM90 CUTLASS overlay is then installed by `scripts/kernel/install_magi_sm90.sh`.
+      Reinstall the overlay after a later exact `uv sync` before running MagiAttention on SM90.

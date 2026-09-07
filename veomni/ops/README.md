@@ -70,7 +70,7 @@ own Triton RMSNorm/rotary. See the per-model table below.
 | `triton` | Triton + CUDA | Validated by the model `extra_backends` registration |
 | `flash_attention_2/3/4` | `flash-attn` / `flash-attn-interface` / `flash-attn.cute` | Validated in `OpsImplementationConfig.__post_init__` |
 | `flex_attention` | PyTorch FlexAttention | Native `BlockMask`; compiled CUDA execution for training |
-| `magi_attention` | `magi-attention==1.1.1`, NVIDIA SM90+ | Native `MagiAttentionMask`; CP1 FFA with optional Ulysses through the SM90 CUTLASS overlay or SM100+ CUTE DSL/JIT backend. |
+| `magi_attention` | `magi-attention==1.1.1` via `--extra magi`, NVIDIA SM90+ | Native `MagiAttentionMask`; CP1 FFA with optional Ulysses through the SM90 CUTLASS overlay or SM100+ CUTE DSL/JIT backend. |
 | `moe_implementation=fused_triton` | Triton, SM70+ | `is_fused_moe_available()` |
 | `moe_implementation=fused_quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
 | `moe_implementation=fused_npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
@@ -78,10 +78,11 @@ own Triton RMSNorm/rotary. See the per-model table below.
 
 #### Installing MagiAttention
 
-The GPU extra installs MagiAttention and its SM100+ CUTE DSL/JIT backend:
+The optional `magi` extra installs MagiAttention and its SM100+ CUTE DSL/JIT backend.
+Always combine it with the `gpu` extra:
 
 ```bash
-uv sync --extra gpu --dev
+uv sync --extra gpu --extra magi --dev
 ```
 
 SM90 additionally requires the precompiled CUTLASS overlay:

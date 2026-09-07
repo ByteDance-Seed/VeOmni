@@ -110,15 +110,15 @@ VeOmni registers `create_magi_mask` as the Transformers mask builder for `veomni
 
 The builder deliberately does not materialize or reverse-engineer an arbitrary Transformers `mask_function`. Predicate-to-range conversion would require an O(sequence length squared) dense mask and cannot preserve every model-specific visibility rule efficiently. A 2D attention mask also does not expose packed boundaries because VeOmni uses an all-ones mask and records boundaries in `position_ids` and precomputed cumulative sequence lengths. Registry calls with a 2D mask but without explicit range metadata are rejected rather than silently allowing cross-sample attention. Models with packed, sliding-window, prefix, multimodal, or mixed visibility must pass declarative metadata explicitly.
 
-The `gpu` extra installs MagiAttention and the CUTE DSL/JIT dependencies used on SM100 and newer GPUs:
+The optional `magi` extra installs MagiAttention and the CUTE DSL/JIT dependencies used on SM100 and newer GPUs:
 
 ```bash
-uv sync --extra gpu --dev
+uv sync --extra gpu --extra magi --dev
 ```
 
 ### Installing the SM90 CUTLASS overlay
 
-SM90 additionally requires a precompiled CUTLASS overlay. Install the verified default matrix after syncing the GPU environment:
+SM90 additionally requires a precompiled CUTLASS overlay. Install the verified default matrix after syncing the `gpu` and `magi` extras:
 
 ```bash
 bash scripts/kernel/install_magi_sm90.sh
@@ -147,7 +147,7 @@ bash scripts/kernel/install_magi_sm90.sh \
 
 Run the script with `--help` for the complete option list. The pinned upstream build always exposes BF16 and provides no corresponding disable flag, so `--dtype fp16` cannot produce a true FP16-only overlay and is rejected. The `--dtype` option controls runtime dtype exposure, but the upstream nfunc generator may still instantiate disabled dtype and feature combinations during compilation. Non-default matrices are forwarded to the pinned upstream build without claiming that they are supported. Dedicated hdim64 or hdim256 arbitrary kernels can fail CUDA 13 compilation with a PTX register-allocation error. In particular, `--dim 64,128,256` is a valid request but is not a verified configuration and does not fall back automatically if compilation fails.
 
-The overlay is intentionally installed after `uv sync`. A later exact `uv sync` can remove it, so rerun the installer before using MagiAttention on SM90.
+The overlay is intentionally installed after `uv sync --extra gpu --extra magi`. A later exact `uv sync` without `--extra magi` can remove it, so rerun the installer before using MagiAttention on SM90.
 
 Standalone `sliding_window` metadata is rejected because all visibility must already be encoded by the range mask. VeOmni's `_MagiFA4Function` passes the prepared argument to MagiAttention's `fa4_fwd` and reuses the same argument for `fa4_bwd`.
 
