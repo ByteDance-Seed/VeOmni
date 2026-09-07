@@ -939,7 +939,7 @@ def test_deepseek_v4_packed_causal_mask_blocks_previous_samples():
     assert causal_mask[0, 0, 4, 4] == 0
 
 
-def test_tilelang_act_quant_shapes_scales_and_inplace():
+def test_tilelang_act_quant_shapes_scales_and_dequant():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4 import act_quant
 
@@ -959,9 +959,7 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     actual_dequantized = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
     torch.testing.assert_close(actual_dequantized, expected_dequantized, rtol=0, atol=0)
 
-    inplace = x.clone()
-    result = act_quant(inplace, block_size=128, inplace=True)
-    assert result.data_ptr() == inplace.data_ptr()
+    result = act_quant(x, block_size=128, dequant=True)
     torch.testing.assert_close(result, expected_dequantized, rtol=0, atol=0)
 
     x_mx = x.clone()
@@ -978,6 +976,46 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
     expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
+
+
+def test_tilelang_act_quant_dequant_fuses_the_round_trip():
+    """The fused path must equal quantizing and dequantizing separately.
+
+    QAT reads the fake-quantized activation straight out of this mode, so a fused
+    product that rounded differently from the two-step one would silently move
+    training away from what an FP8 inference GEMM computes. The operand must also
+    come back untouched: it is a tensor the autograd graph still refers to, and a
+    write would quantize every other consumer of that activation.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import act_quant
+
+    torch.manual_seed(2)
+    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16)
+    x[0].zero_()  # amax clamp floor: must not divide by zero
+
+    for scale_fmt in (None, "ue8m0"):
+        quantized, scales = act_quant(x, block_size=128, scale_fmt=scale_fmt)
+        # The product is taken in FP32 and rounded to BF16 exactly once, which is
+        # what the inference side does when it dequantizes.
+        expected = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
+
+        original = x.clone()
+        result = act_quant(x, block_size=128, scale_fmt=scale_fmt, dequant=True)
+
+        assert result.dtype == torch.bfloat16
+        assert torch.equal(result, expected)
+        assert result.data_ptr() != x.data_ptr()
+        assert torch.equal(x, original)
+
+    # A transposed operand is the layout `fp8_fake_quant_act` sees from attention,
+    # and a sliced one is what `fp8_fake_quant_act_prefix` passes down.
+    transposed = torch.randn(256, 3, device=DEVICE, dtype=torch.bfloat16).t()
+    assert not transposed.is_contiguous()
+    assert torch.equal(
+        act_quant(transposed, block_size=128, scale_fmt="ue8m0", dequant=True),
+        act_quant(transposed.contiguous(), block_size=128, scale_fmt="ue8m0", dequant=True),
+    )
 
 
 def _fp8_weight_quant_reference(x, block_size=128, round_scale=False):
@@ -1144,6 +1182,46 @@ def test_tilelang_fp8_weight_quant_ue8m0_round_trip():
     tile_amax = x.float().view(2, 128, 3, 128).abs().amax(dim=(1, 3))
     tolerance = (tile_amax / 8.0)[:, None, :, None].expand(2, 128, 3, 128).reshape(x.shape)
     assert ((dequantized - x.float()).abs() <= tolerance).all()
+
+
+def test_tilelang_fp8_weight_quant_dequant_fuses_the_round_trip():
+    """The fused path must equal quantizing and dequantizing separately.
+
+    QAT reads the fake-quantized weight straight out of this kernel, so a fused
+    product that rounded differently from the two-step one would silently move
+    training away from what an FP8 inference GEMM computes.
+    """
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant
+
+    x = _weight_quant_test_input()
+    rows, cols = x.shape
+
+    for scale_fmt in (None, "ue8m0"):
+        quantized, scales = fp8_weight_quant(x, block_size=128, scale_fmt=scale_fmt)
+        # The product is taken in FP32 and rounded to BF16 exactly once, which
+        # is what `_dequantize_scaled_weight` does on the inference side.
+        tiles = quantized.float().view(rows // 128, 128, cols // 128, 128)
+        expected = (tiles * scales[:, None, :, None]).view(rows, cols).to(torch.bfloat16)
+
+        original = x.clone()
+        result = fp8_weight_quant(x, block_size=128, scale_fmt=scale_fmt, dequant=True)
+
+        assert result.dtype == torch.bfloat16
+        assert torch.equal(result, expected)
+        # The operand is only read, which is what lets QAT point this at a live
+        # parameter that FSDP2 has just all-gathered.
+        assert result.data_ptr() != x.data_ptr()
+        assert torch.equal(x, original)
+
+    # A non-square tile grid catches a swapped tile index, and the transposed
+    # input catches a layout the kernel would otherwise reinterpret.
+    transposed = x.t().contiguous().t()
+    assert not transposed.is_contiguous()
+    assert torch.equal(
+        fp8_weight_quant(transposed, block_size=128, scale_fmt="ue8m0", dequant=True),
+        fp8_weight_quant(x, block_size=128, scale_fmt="ue8m0", dequant=True),
+    )
 
 
 def test_tilelang_fp8_weight_quant_rejects_unsupported_inputs():
