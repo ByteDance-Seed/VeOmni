@@ -445,21 +445,19 @@ def configure(
     """
     layers = _parse_layer_spec(gradient_checkpoint_layers)
     sac_layers = _parse_layer_spec(selective_gradient_checkpoint_layers)
+
     if not enabled:
-        if gradient_checkpoint_layers is None:
-            reset()
-        else:
-            reset()  # keep layer filter: it gates full checkpointing too
-            if not layers:
-                _warn_once("gradient_checkpoint_layers given but no valid layer parsed; recomputing every layer")
-            _state["layers"] = layers or None
+        reset()  # keep layer filter: it gates full checkpointing too
+        if gradient_checkpoint_layers and not layers:
+            _warn_once("gradient_checkpoint_layers given but no valid layer parsed; recomputing every layer")
+        _state["layers"] = layers or None
         return
 
     exact_ops, failed = resolve_exact_ops(extra_op_names)
     if not exact_ops and not prefix_mode:
         _warn_once(
-            "no attention operators resolved (failed extras: %s); falling back to name-substring policy",
-            failed or "none",
+            f"no attention operators resolved (failed extras: {failed or 'none'}); "
+            "falling back to name-substring policy"
         )
         prefix_mode = True
 
@@ -472,9 +470,9 @@ def configure(
         _state["context_fn"] = functools.partial(
             torch.utils.checkpoint.create_selective_checkpoint_contexts, list(exact_ops)
         )
-    if gradient_checkpoint_layers is not None and not layers:
+    if gradient_checkpoint_layers and not layers:
         _warn_once("gradient_checkpoint_layers given but no valid layer parsed; recomputing every layer")
-    if selective_gradient_checkpoint_layers is not None and not sac_layers:
+    if selective_gradient_checkpoint_layers and not sac_layers:
         _warn_once(
             "selective_gradient_checkpoint_layers given but no valid layer parsed; SAC on every recomputed layer"
         )
