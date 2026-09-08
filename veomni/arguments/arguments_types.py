@@ -465,8 +465,8 @@ class FSDPConfig:
         default=False,
         metadata={
             "help": (
-                "Use BF16 communication with destination-local FP32 accumulation for FSDP2 ReduceScatter. "
-                "Requires mixed_precision.reduce_dtype='bfloat16'."
+                "Use BF16 or FP16 communication with destination-local FP32 accumulation for FSDP2 "
+                "ReduceScatter. Requires mixed_precision.reduce_dtype='bfloat16' or 'float16'."
             )
         },
     )
@@ -487,10 +487,10 @@ class FSDPConfig:
         if self.reduce_scatter_with_fp32_accumulation:
             if self.fsdp_mode != "fsdp2":
                 raise ValueError("reduce_scatter_with_fp32_accumulation requires fsdp_mode='fsdp2'.")
-            if not self.mixed_precision.enable or self.mixed_precision.reduce_dtype != "bfloat16":
+            if not self.mixed_precision.enable or self.mixed_precision.reduce_dtype not in ("bfloat16", "float16"):
                 raise ValueError(
                     "reduce_scatter_with_fp32_accumulation requires mixed precision with "
-                    "mixed_precision.reduce_dtype='bfloat16'."
+                    "mixed_precision.reduce_dtype='bfloat16' or 'float16'."
                 )
 
 
@@ -920,7 +920,8 @@ class TrainingArguments:
         if acc.fsdp_config.reduce_scatter_with_fp32_accumulation and acc.dp_replicate_size > 1:
             raise ValueError(
                 "reduce_scatter_with_fp32_accumulation does not support HSDP "
-                "(dp_replicate_size > 1) because the replicate-group AllReduce would still accumulate in BF16."
+                "(dp_replicate_size > 1) because the replicate-group AllReduce would still accumulate in the "
+                "low-precision reduction dtype."
             )
 
         # multi-node warning

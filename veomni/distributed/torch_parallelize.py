@@ -31,7 +31,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
-from .fsdp2.reduce_scatter import register_bf16_reduce_scatter_with_fp32_accumulation
+from .fsdp2.reduce_scatter import register_bf16_fp16_reduce_scatter_with_fp32_accumulation
 from .parallel_plan import ParallelPlan, get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
@@ -311,6 +311,21 @@ def _can_shard_extra_parallel_dim0(
     return True
 
 
+def _configure_fsdp_gradient_reduction(
+    module: FSDPModule,
+    *,
+    gradient_divide_factor: float,
+    reduce_scatter_group_size: int,
+    low_precision_reduction_scales: Optional[dict[nn.Module, float]],
+) -> None:
+    if low_precision_reduction_scales is not None and reduce_scatter_group_size > 1:
+        low_precision_reduction_scales[module] = 1.0 / gradient_divide_factor
+    else:
+        # FSDP does not call the custom hook for a single-rank shard group, so
+        # that path must retain its native divide factor.
+        module.set_gradient_divide_factor(gradient_divide_factor)
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -350,15 +365,16 @@ def parallelize_model_fsdp2(
 
     if reduce_scatter_with_fp32_accumulation:
         if get_device_type() != "cuda":
-            raise RuntimeError("BF16-wire FP32-accumulation ReduceScatter is only supported on CUDA/NCCL.")
-        if not mixed_precision.enable or mixed_precision.reduce_dtype != "bfloat16":
+            raise RuntimeError("Low-precision FP32-accumulation ReduceScatter is only supported on CUDA/NCCL.")
+        if not mixed_precision.enable or mixed_precision.reduce_dtype not in ("bfloat16", "float16"):
             raise ValueError(
-                "BF16-wire FP32-accumulation ReduceScatter requires mixed precision with reduce_dtype='bfloat16'."
+                "Low-precision FP32-accumulation ReduceScatter requires mixed precision with "
+                "reduce_dtype='bfloat16' or 'float16'."
             )
         if parallel_state.dp_replicate_size > 1:
             raise ValueError(
-                "BF16-wire FP32-accumulation ReduceScatter does not support HSDP because its "
-                "replicate-group AllReduce would still accumulate in BF16."
+                "Low-precision FP32-accumulation ReduceScatter does not support HSDP because its "
+                "replicate-group AllReduce would still accumulate in the low-precision reduction dtype."
             )
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
@@ -601,7 +617,9 @@ def parallelize_model_fsdp2(
     #   e.g. sorted_fqn_list = ['decoder.embed_tokens', 'embed_tokens', 'decoder']
     sorted_fqn_list = sort_fqn_by_submodule_first(list(layer_pairs.keys()))
     layer_pairs_list = [(fqn, layer_pairs[fqn]) for fqn in sorted_fqn_list]
-    premul_sum_factors = {}
+    low_precision_reduction_scales = {} if reduce_scatter_with_fp32_accumulation else None
+    fsdp_reduce_scatter_group_size = parallel_state.fsdp_mesh.size()
+    fsdp_reduction_scale = 1.0 / fsdp_reduce_scatter_group_size
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
@@ -628,9 +646,12 @@ def parallelize_model_fsdp2(
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
                 else:
-                    # from torch 2.8
-                    _para_mod.set_gradient_divide_factor(gradient_divide_factor)
-                    premul_sum_factors[_para_mod] = 1.0 / gradient_divide_factor
+                    _configure_fsdp_gradient_reduction(
+                        _para_mod,
+                        gradient_divide_factor=gradient_divide_factor,
+                        reduce_scatter_group_size=extra_parallel_fsdp_kwargs[para]["mesh"].size(),
+                        low_precision_reduction_scales=low_precision_reduction_scales,
+                    )
                 layer_mod._fsdp_modules.append(_para_mod)
 
         # shard module that needs to ignore mixed precision control
@@ -648,6 +669,8 @@ def parallelize_model_fsdp2(
         #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
             fully_shard(layer_mod, **fsdp_kwargs)
+            if low_precision_reduction_scales is not None and fsdp_reduce_scatter_group_size > 1:
+                low_precision_reduction_scales[layer_mod] = fsdp_reduction_scale
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
@@ -664,12 +687,15 @@ def parallelize_model_fsdp2(
     fully_shard(model, **root_fsdp_kwargs)
 
     if reduce_scatter_with_fp32_accumulation:
-        registered = register_bf16_reduce_scatter_with_fp32_accumulation(
+        assert low_precision_reduction_scales is not None
+        if fsdp_reduce_scatter_group_size > 1:
+            low_precision_reduction_scales[model] = fsdp_reduction_scale
+        registered = register_bf16_fp16_reduce_scatter_with_fp32_accumulation(
             model,
-            premul_sum_factors=premul_sum_factors,
+            reduction_scales=low_precision_reduction_scales,
         )
         logger.info_rank0(
-            "Enabled BF16-wire FP32-accumulation ReduceScatter on "
+            "Enabled low-precision FP32-accumulation ReduceScatter on "
             f"{registered} FSDP module{'s' if registered != 1 else ''}."
         )
 
