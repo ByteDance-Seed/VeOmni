@@ -27,12 +27,11 @@ from ...optional import optional_tensor, unused_like
 
 @dataclass(frozen=True)
 class _Meta:
-    """Activation, which optionals were real, and how many apply inputs to grad."""
+    """Activation and which optional tensors were real."""
 
     activation: str | None
     has_bias: bool
     has_cu_seqlens: bool
-    n_in: int
 
 
 def forward(
@@ -50,7 +49,6 @@ def forward(
     from ...vendor.triton.utils import is_arch35
 
     del seq_idx, backend
-    n_in = 2 + (bias is not None) + (cu_seqlens is not None)
     if bias is None:
         bias = unused_like(weight)
     if cu_seqlens is None:
@@ -74,7 +72,7 @@ def forward(
     )
     return output, SavedState(
         (x, weight_wd, bias, cu_seqlens),
-        _Meta(activation, bias_opt is not None, cu_opt is not None, n_in),
+        _Meta(activation, bias_opt is not None, cu_opt is not None),
     )
 
 
@@ -105,4 +103,4 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
     grad_weight = None if grad_weight_wd is None else grad_weight_wd.transpose(0, 1)
     if not meta.has_bias:
         grad_bias = None
-    return (grad_x, grad_weight, grad_bias, None)[: meta.n_in]
+    return grad_x, grad_weight, grad_bias, None

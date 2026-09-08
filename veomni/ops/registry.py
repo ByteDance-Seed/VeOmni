@@ -24,6 +24,7 @@ triple; ``requirement.device`` (or ``ANY_DEVICE``) fills the fourth key.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from typing import Any, Callable
 
 import torch
@@ -50,6 +51,12 @@ class SavedState:
 
 def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable:
     """Build a modeling wrapper from raw ``forward`` / ``backward``."""
+
+    positional_parameters = tuple(
+        parameter
+        for parameter in signature(raw_forward).parameters.values()
+        if parameter.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+    )
 
     class _OpFn(torch.autograd.Function):
         """Generated Function that calls the raw pair and unpacks ``SavedState``."""
@@ -88,9 +95,20 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
                 raise ValueError(f"raw backward returned {len(grads)} grads, expected {ctx.n_tensors}")
             return (*grads, None)
 
-    def wrapper(*tensors: Tensor, **attrs: Any) -> Output:
-        """Pack keyword attrs as the last ``apply`` argument."""
-        return _OpFn.apply(*tensors, attrs)
+    def wrapper(*tensors: Tensor | None, **attrs: Any) -> Output:
+        """Bind positional tensors, then pack keyword-only attrs for ``apply``."""
+        bound_tensors = list(tensors)
+        attrs = dict(attrs)
+        # Autograd fixes backward arity from the actual ``apply`` arguments,
+        # so materialize the raw signature's optional tensor slots as well.
+        for parameter in positional_parameters[len(bound_tensors) :]:
+            if parameter.name in attrs:
+                bound_tensors.append(attrs.pop(parameter.name))
+            elif parameter.default is not Parameter.empty:
+                bound_tensors.append(parameter.default)
+            else:
+                break
+        return _OpFn.apply(*bound_tensors, attrs)
 
     return wrapper
 

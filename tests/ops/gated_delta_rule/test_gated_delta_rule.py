@@ -324,9 +324,6 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     value = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
     g = torch.randn(shape[:3], dtype=torch.float32, requires_grad=True)
     beta = torch.randn(shape[:3], dtype=torch.bfloat16, requires_grad=True)
-    initial_state = query.new_empty(0)
-    cu_seqlens = query.new_empty(0, dtype=torch.int32)
-
     entry = OpEntry("test_chunk_gdr", "standard", impl, module.forward, module.backward)
     output, _final_state = entry.wrapper(
         query,
@@ -334,8 +331,6 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
         value,
         g,
         beta,
-        initial_state,
-        cu_seqlens,
         use_qk_l2norm_in_kernel=True,
     )
     grad_output = torch.randn_like(output)

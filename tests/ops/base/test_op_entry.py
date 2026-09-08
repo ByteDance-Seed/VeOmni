@@ -58,6 +58,17 @@ def _pair_backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tup
     return grad_sum + y * grad_prod, grad_sum + x * grad_prod
 
 
+def _optional_forward(x: Tensor, y: Tensor | None = None) -> tuple[Tensor, SavedState]:
+    has_y = y is not None
+    if y is None:
+        y = torch.zeros_like(x)
+    return x + y, SavedState((x, y), has_y)
+
+
+def _optional_backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...]:
+    return grad_output, grad_output if saved.metadata else None
+
+
 @pytest.mark.usefixtures("isolated_entries")
 class TestOpEntryValidation:
     def test_forward_without_backward_raises(self):
@@ -239,6 +250,20 @@ class TestGeneratedWrapper:
         (summed + prod).sum().backward()
         assert x.grad is not None
         assert y.grad is not None
+
+    @pytest.mark.parametrize("pass_as_keyword", (False, True))
+    def test_optional_positional_tensor_uses_full_autograd_signature(self, pass_as_keyword):
+        register_op("optional_add", "standard", "eager", _optional_forward, _optional_backward)
+        entry = resolve_op("optional_add", "standard", "eager")
+        x = torch.randn(3, requires_grad=True)
+        y = torch.randn(3, requires_grad=True) if pass_as_keyword else None
+
+        output = entry.wrapper(x, y=y) if pass_as_keyword else entry.wrapper(x)
+        output.sum().backward()
+
+        assert torch.equal(x.grad, torch.ones_like(x))
+        if y is not None:
+            assert torch.equal(y.grad, torch.ones_like(y))
 
 
 @pytest.mark.usefixtures("isolated_entries")
