@@ -15,7 +15,9 @@
 
 import gc
 import os
+import shutil
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -450,6 +452,97 @@ def restore_extra_parallel_dim(
     return dtensor
 
 
+def _local_rank() -> int:
+    """This process's rank within its node, as set by the elastic launcher.
+
+    Used to elect one rank per node for the node-local staging work; defaults to
+    0 so single-process runs still take the leader path.
+    """
+    value = os.environ.get("LOCAL_RANK", "0")
+    return int(value) if value.isdigit() else 0
+
+
+def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
+    """Copy a staged checkpoint to its destination, then drop the staged copy.
+
+    The staging directory is node-local and shared by every rank on the node, so
+    one rank per node copies all of it rather than each rank working out which
+    files it wrote; that keeps this independent of DCP's file naming.
+
+    Runs as four barrier-separated phases, and every rank enters every barrier
+    whether or not its own phase did any work or raised. A rank that bailed out
+    early on failure would leave the others waiting on a collective that never
+    comes -- barriers are untagged, so one rank skipping a barrier makes every
+    later one pair up wrongly and the save hangs instead of failing. Failures are
+    therefore recorded and re-raised only once all collectives are done.
+
+    ``.metadata`` is what DCP reads as "this checkpoint is complete", so the
+    destination's old copy is removed before anything is written and the new one
+    is copied last. A reader arriving mid-promotion then sees no metadata rather
+    than the previous checkpoint's metadata over half-replaced data.
+    """
+    metadata_name = ".metadata"
+    is_node_leader = _local_rank() == 0
+    is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
+    final_metadata = os.path.join(final_path, metadata_name)
+    error: Optional[BaseException] = None
+
+    def _barrier() -> None:
+        """Synchronise every rank between promotion phases.
+
+        A no-op outside distributed runs, so the same code path covers both.
+        """
+        if dist.is_initialized():
+            dist.barrier()
+
+    # Phase 1: invalidate the destination before it is touched.
+    if is_coordinator:
+        try:
+            os.makedirs(final_path, exist_ok=True)
+            if os.path.exists(final_metadata):
+                os.remove(final_metadata)
+        except BaseException as e:  # noqa: BLE001 - re-raised after the barriers
+            error = e
+    _barrier()
+
+    # Phase 2: one rank per node copies that node's staged files.
+    if is_node_leader and error is None:
+        try:
+            names = [n for n in sorted(os.listdir(stage_path)) if n != metadata_name]
+            os.makedirs(final_path, exist_ok=True)
+
+            def _copy(name: str) -> None:
+                """Copy one staged file to the destination, preserving its name."""
+                shutil.copyfile(os.path.join(stage_path, name), os.path.join(final_path, name))
+
+            if names:
+                with ThreadPoolExecutor(max_workers=min(16, len(names))) as pool:
+                    list(pool.map(_copy, names))
+        except BaseException as e:  # noqa: BLE001 - re-raised after the barriers
+            error = e
+    _barrier()
+
+    # Phase 3: the completion marker goes last, once every node's data has landed.
+    if is_coordinator and error is None:
+        try:
+            src = os.path.join(stage_path, metadata_name)
+            if os.path.exists(src):
+                shutil.copyfile(src, final_metadata)
+        except BaseException as e:  # noqa: BLE001 - re-raised after the barriers
+            error = e
+    _barrier()
+
+    # Phase 4: the staged copy is as large as the model plus its optimizer state,
+    # so drop it even when promotion failed rather than filling the scratch disk
+    # for every later run on this node.
+    if is_node_leader:
+        shutil.rmtree(stage_path, ignore_errors=True)
+    _barrier()
+
+    if error is not None:
+        raise error
+
+
 class DistributedCheckpointer(CheckpointerBase):
     """
     Distributed checkpointer for torch.distributed.checkpoint
@@ -470,6 +563,7 @@ class DistributedCheckpointer(CheckpointerBase):
         trainable_only: bool = False,
         save_to_lowest_rank: bool = False,
         parallel_state=None,
+        stage_dir: Optional[str] = None,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -495,11 +589,23 @@ class DistributedCheckpointer(CheckpointerBase):
                 checkpoint. Note this only consolidates *replicated* data: unique shards from
                 expert/tensor/pipeline parallelism are never deduplicated and remain distributed.
                 See ``CheckpointConfig.dcp_save_to_lowest_rank``.
+            stage_dir: write the checkpoint under this directory and copy it to ``path``
+                afterwards, instead of writing straight to ``path``. Intended for a
+                destination far slower than local disk. The caller owns the choice: this
+                does not probe for a usable directory or check free space, and an
+                unusable ``stage_dir`` fails the save rather than silently writing
+                elsewhere. See ``CheckpointConfig.stage_dir``.
         return:
             None
         """
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
+
+        if stage_dir and save_async:
+            # The staged copy is deleted as soon as save() returns, which for an async
+            # save is before the write has finished. Reject the pair up front, before
+            # anything has been created on disk, rather than silently dropping one.
+            raise ValueError("stage_dir cannot be combined with save_async")
 
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
         cls._create_checkpoint_dir(checkpoint_dir)
@@ -518,15 +624,29 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        if storage_writer is None:
-            storage_writer = cls._create_storage_writer(checkpoint_dir)
+        stage_path = None
+        if stage_dir and storage_writer is None:
+            stage_path = os.path.join(stage_dir, os.path.abspath(checkpoint_dir).strip(os.sep).replace(os.sep, "_"))
+            shutil.rmtree(stage_path, ignore_errors=True)  # drop leftovers from a crashed run
+            os.makedirs(stage_path, exist_ok=True)
 
-        cls.execute_save(
-            save_state=save_state,
-            storage_writer=storage_writer,
-            save_async=save_async,
-            save_to_lowest_rank=save_to_lowest_rank,
-        )
+        if storage_writer is None:
+            storage_writer = cls._create_storage_writer(stage_path or checkpoint_dir)
+
+        try:
+            cls.execute_save(
+                save_state=save_state,
+                storage_writer=storage_writer,
+                save_async=save_async,
+                save_to_lowest_rank=save_to_lowest_rank,
+            )
+        except BaseException:
+            if stage_path is not None and _local_rank() == 0:
+                shutil.rmtree(stage_path, ignore_errors=True)
+            raise
+
+        if stage_path is not None:
+            _promote_staged_checkpoint(stage_path, checkpoint_dir)
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 

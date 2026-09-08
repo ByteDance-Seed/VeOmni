@@ -621,6 +621,21 @@ class CheckpointConfig:
         default=False,
         metadata={"help": "Whether to save checkpoint asynchronously."},
     )
+    stage_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Write checkpoints under this directory and copy them to `output_dir` "
+                "afterwards, instead of writing straight to `output_dir`. Intended for a "
+                "destination far slower than local disk, where a direct write can block the "
+                "training loop long enough to trip the collective timeout. The caller owns "
+                "the choice of directory: nothing is probed and free space is not checked, "
+                "so point it at a node-local filesystem that can hold every rank on the node "
+                "writing the model plus its optimizer state at once. Unset (default) writes "
+                "directly. Cannot be combined with `save_async`."
+            )
+        },
+    )
     dcp_save_to_lowest_rank: bool = field(
         default=False,
         metadata={
