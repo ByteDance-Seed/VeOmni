@@ -382,14 +382,15 @@ def parallelize_model_fsdp2(
         )
     )
     if use_low_precision_transport:
-        if get_device_type() != "cuda":
-            raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
         if not mixed_precision.enable or mixed_precision.reduce_dtype != "float32":
             raise ValueError(
-                "Low-precision ReduceScatter transport requires mixed precision with reduce_dtype='float32'."
+                "The custom ReduceScatter transport path supports only mixed precision with "
+                "reduce_dtype='float32' and transport dtype 'bfloat16' or 'float16'."
             )
         if reduce_scatter_transport_dtype not in ("bfloat16", "float16"):
             raise ValueError("Low-precision ReduceScatter transport must use transport dtype 'bfloat16' or 'float16'.")
+        if get_device_type() != "cuda":
+            raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
     elif reduce_scatter_transport_dtype is not None:
         logger.info_rank0("ReduceScatter transport dtype matches reduce dtype; using the native PyTorch collective.")
 
