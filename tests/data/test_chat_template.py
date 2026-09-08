@@ -272,6 +272,51 @@ def _video_metadata(total_num_frames, fps=2.0, frames_indices=None):
     )
 
 
+@pytest.mark.parametrize("sample_fps,max_frames", [(2.0, 4), (2.0, None), (1.0, None)])
+def test_qwen_vl_transform_preserves_video_timestamps(sample_fps, max_frames):
+    import re
+
+    import torch
+    from transformers import Qwen3VLVideoProcessor
+
+    from veomni.data.data_transform import _process_sample_qwen_vl_base
+
+    # Five seconds at 30 FPS. Each frame's pixels identify its source index.
+    frames = torch.arange(150, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 32, 32).numpy()
+    processor = SimpleNamespace(
+        tokenizer=_SpecialTokenTokenizer(),
+        video_processor=Qwen3VLVideoProcessor(size={"shortest_edge": 32 * 32, "longest_edge": 32 * 32}),
+    )
+    template = build_chat_template("qwen3vl", processor)
+    sample = {
+        "source": "LLaVA-Video-178K",
+        "videos": [{"video": frames, "video_fps": 30.0}],
+        "conversations": [{"from": "human", "value": "<image>\nDescribe the video."}],
+    }
+
+    def position_ids(**kwargs):
+        return {"position_ids": torch.arange(kwargs["input_ids"].shape[-1]).view(1, 1, -1)}
+
+    result = _process_sample_qwen_vl_base(
+        sample, processor, template, position_ids, fps=sample_fps, max_frames=max_frames
+    )[0]
+    decoded = "".join(chr(i - 1000) for i in result["input_ids"].tolist() if i >= 1000)
+    timestamps = re.findall(r"<([\d.]+) seconds>", decoded)
+    # Recover the selected frames independently from processor pixel output.
+    # Constant-color patches preserve their source frame value through normalization.
+    pixels = result["pixel_values_videos"]
+    patch_size = processor.video_processor.patch_size
+    temporal = processor.video_processor.temporal_patch_size
+    selected = (pixels.reshape(-1, 3, temporal, patch_size, patch_size)[:, 0, :, 0, 0] * 0.5 + 0.5) * 255
+    selected = selected.round().reshape(-1).tolist()
+    # At 32x32 there are four spatial patches per time block; take one copy.
+    spatial_patches = int(result["video_grid_thw"][0, 1:].prod())
+    source_pairs = [selected[i : i + temporal] for i in range(0, len(selected), spatial_patches * temporal)]
+    expected = [f"{(pair[0] + pair[-1]) / (2 * 30):.1f}" for pair in source_pairs]
+    assert timestamps == expected
+    assert float(timestamps[-1]) > 4.0
+
+
 # Frame/token pairs read off the real Qwen3VLVideoProcessor (temporal_patch_size=2,
 # merge_size=2) at 128x128: the processor pads an odd frame count up, so 15 and 16
 # frames both yield grid_t=8 and 128 tokens.
