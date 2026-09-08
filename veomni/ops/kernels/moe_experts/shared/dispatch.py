@@ -321,7 +321,12 @@ def _moe_scatter_kernel(
 
 
 def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
-    """Expand tokens into the expert-sorted top-k buffer."""
+    """Expand tokens into the expert-sorted top-k buffer.
+
+    ``index`` must be a permutation of ``range(x.shape[0] * index.shape[1])``.
+    Production callers build it with ``compute_expert_scatter_index``; the
+    invariant is validated there in tests to keep this hot path asynchronous.
+    """
     assert is_moe_kernel_supported(x.device) and is_moe_kernel_supported(index.device)
     assert x.shape[0] == index.shape[0]
 
@@ -331,7 +336,6 @@ def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
     topk = index.shape[1]
     out_dtype = out_dtype or x.dtype
     out = torch.empty(M * topk, N, dtype=out_dtype, device=x.device)
-    assert index.unique().numel() == M * topk, "Holes in output?"
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
     with get_torch_device().device(x.device):
