@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from ...utils.device import get_device_id
+from ...utils.device import get_device_id, is_nccl_backend
 from .comm import (
     get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
@@ -237,7 +237,7 @@ class _Gather(torch.autograd.Function):
                 grad_input = grad_input * ctx.seq_world_size
             grad_input = grad_input.contiguous()
         elif (
-            dist.get_backend(ctx.group) == "nccl"
+            is_nccl_backend(dist.get_backend(ctx.group))
             and not grad_output.is_complex()
             and all(size > 0 for size in ctx.dim_size_list)
             and grad_output.numel() > 0

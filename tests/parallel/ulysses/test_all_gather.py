@@ -22,7 +22,7 @@ _DEVICE_COUNT = get_torch_device().device_count() if _HAS_ACCELERATOR_BACKEND el
 _GATHER_BACKWARD_BACKENDS = [
     pytest.param("gloo", marks=pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")),
     pytest.param(
-        "nccl",
+        dist.Backend.NCCL,
         marks=pytest.mark.skipif(
             not IS_CUDA_AVAILABLE or not dist.is_nccl_available() or get_torch_device().device_count() < 2,
             reason="Two CUDA devices and NCCL required",
@@ -133,7 +133,7 @@ class AllToAllCommTest(SequenceParallelTest):
 
 def _check_gather_backward(rank, init_method, backend):
     device = "cpu"
-    if backend == "nccl":
+    if backend == dist.Backend.NCCL:
         get_torch_device().set_device(rank)
         device = get_device_type()
     dist.init_process_group(backend, init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=45))
@@ -203,7 +203,7 @@ def test_gather_backward_scales_only_local_storage(rank, shape, dim, sizes):
 
 def _check_gather_backward_edges(rank, init_method, backend):
     device = "cpu"
-    if backend == "nccl":
+    if backend == dist.Backend.NCCL:
         get_torch_device().set_device(rank)
         device = get_device_type()
     dist.init_process_group(backend, init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=45))
@@ -277,7 +277,7 @@ def _check_gather_backward_edges(rank, init_method, backend):
             reference_local = expected.split(sizes, dim=dim)[rank].contiguous()
             torch.testing.assert_close(result, reference_local, rtol=0, atol=0, equal_nan=True)
             torch.testing.assert_close(upstream, original, rtol=0, atol=0, equal_nan=True)
-            if backend == "nccl" and summed and not dtype.is_complex and all(sizes) and upstream.numel():
+            if backend == dist.Backend.NCCL and summed and not dtype.is_complex and all(sizes) and upstream.numel():
                 assert result.untyped_storage().nbytes() <= reference_local.untyped_storage().nbytes()
     finally:
         dist.destroy_process_group()
