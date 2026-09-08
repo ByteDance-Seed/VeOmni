@@ -188,9 +188,15 @@ def test_reduce_scatter_transport_config_and_native_fallback():
             fsdp_mode="ddp",
             reduce_scatter_transport_dtype="bfloat16",
         )
-    with pytest.raises(ValueError, match="reduce_dtype='float32'"):
+    for reduce_dtype, transport_dtype in (("bfloat16", "float16"), ("float16", "bfloat16")):
+        with pytest.raises(ValueError, match="supports only.*reduce_dtype='float32'"):
+            FSDPConfig(
+                mixed_precision=MixedPrecisionConfig(reduce_dtype=reduce_dtype),
+                reduce_scatter_transport_dtype=transport_dtype,
+            )
+    with pytest.raises(ValueError, match="supports only.*reduce_dtype='float32'"):
         FSDPConfig(
-            mixed_precision=MixedPrecisionConfig(reduce_dtype="float16"),
+            mixed_precision=MixedPrecisionConfig(enable=False, reduce_dtype="float32"),
             reduce_scatter_transport_dtype="bfloat16",
         )
     with pytest.raises(ValueError, match="must be one of"):
@@ -222,6 +228,26 @@ def test_matching_transport_and_reduce_dtype_uses_native_path(dtype):
     assert not _uses_low_precision_reduce_scatter_transport(None, dtype)
     assert not _uses_low_precision_reduce_scatter_transport(dtype, dtype)
     assert _uses_low_precision_reduce_scatter_transport("bfloat16", "float32")
+
+
+@pytest.mark.parametrize(
+    ("reduce_dtype", "transport_dtype"),
+    [("bfloat16", "float16"), ("float16", "bfloat16")],
+)
+def test_parallelize_rejects_cross_16bit_transport_before_backend_check(
+    monkeypatch,
+    reduce_dtype,
+    transport_dtype,
+):
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", object)
+    monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
+
+    with pytest.raises(ValueError, match="supports only.*reduce_dtype='float32'"):
+        torch_parallelize.parallelize_model_fsdp2(
+            nn.Linear(2, 2),
+            mixed_precision=MixedPrecisionConfig(reduce_dtype=reduce_dtype),
+            reduce_scatter_transport_dtype=transport_dtype,
+        )
 
 
 def test_matching_transport_dtype_does_not_register_custom_collective(monkeypatch):

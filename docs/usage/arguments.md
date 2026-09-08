@@ -541,6 +541,16 @@ group ReduceScatter uses the low-precision transport; the replicate-group AllRed
 the transport and reduction dtypes match, VeOmni does not register the custom collective or alter native gradient
 scaling and reduction behavior.
 
+The supported combinations are intentionally narrow:
+
+| `mixed_precision.reduce_dtype` | `reduce_scatter_transport_dtype` | Behavior |
+| --- | --- | --- |
+| Any supported dtype | `None` | Native PyTorch path |
+| Any supported dtype | Same as `reduce_dtype` | Native PyTorch path |
+| `float32` | `bfloat16` or `float16` | With `mixed_precision.enable: true`, custom low-precision transport with FP32 accumulation and output |
+| `bfloat16` | `float16` | Unsupported: both use two bytes per value, while BF16-to-FP16 may overflow |
+| `float16` | `bfloat16` | Unsupported: both use two bytes per value and provide no traffic reduction |
+
 ### MixedPrecisionConfig
 
 `train.accelerator.fsdp_config.mixed_precision.*` — Mixed precision configuration.
