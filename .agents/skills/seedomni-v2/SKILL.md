@@ -46,7 +46,7 @@ task at hand; do not read every reference by default.
   carrier, not by hidden edge payloads. Janus packed training is the
   exception: the text-encoder preprocessor writes packed tensors onto the
   collator `batch` dict, and `pack_*` graph nodes only `masked_scatter` — see
-  `modules/janus/packing.py` and `graph_train_packed.yaml`.
+  `modules/janus/packing.py` and `packed/graph_train.yaml`.
 - Training graphs are flat edge lists over `module[.method]` endpoints.
   `to: end` is the virtual sink. Execution order is derived by topo sort.
 - Generation graphs are FSMs. Each state body is an ordered inline edge list.

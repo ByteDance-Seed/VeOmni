@@ -56,7 +56,7 @@ class JanusTextEncoderPreprocessor(TextEncoderPreprocessor):
         # than writing them back onto ``conversation_list`` (what the base
         # ``preprocess_conversations`` does) and then walking that list again.
         #
-        # The carrier is dropped once packed: no node in ``graph_train_packed.yaml``
+        # The carrier is dropped once packed: no node in ``packed/graph_train.yaml``
         # reads ``conversation_list``, and keeping it would ship every per-item
         # pixel tensor to the main process a second time — ``pack_janus_conversations``
         # already *copied* those pixels into ``pixel_values_und`` / ``pixel_values_gen``

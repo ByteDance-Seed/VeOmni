@@ -1,21 +1,21 @@
 # <Model> SeedOmni V2 launcher.
 #
 # Replace all angle-bracket placeholders and compare with a live config such as
-# configs/seed_omni/Janus/janus_1.3b/base.yaml before committing.
+# configs/seed_omni/Janus/janus_1.3b/train/base.yaml before committing.
 #
 # Launch inference (override modules for eager single-process or fsdp distributed):
-#   python tasks/omni/infer_omni.py configs/seed_omni/<Model>/<variant>/base.yaml \
-#     --model.model_config.modules configs/seed_omni/<Model>/<variant>/modules_infer_eager.yaml \
+#   python tasks/omni/infer_omni.py configs/seed_omni/<Model>/<variant>/train/base.yaml \
+#     --model.model_config.modules configs/seed_omni/<Model>/<variant>/infer/modules_infer_eager.yaml \
 #     --infer.prompt "..." \
 #     --infer.output_dir <model>_out
 
 model:
   model_path: <split_checkpoint_root>
   model_config:
-    modules: configs/seed_omni/<Model>/<variant>/modules_train.yaml
-    train_graph: configs/seed_omni/<Model>/<variant>/graph_train.yaml
+    modules: configs/seed_omni/<Model>/<variant>/train/modules_train.yaml
+    train_graph: configs/seed_omni/<Model>/<variant>/train/graph_train.yaml
     infer_graph:
-      infer_default: configs/seed_omni/<Model>/<variant>/graph_infer.yaml
+      infer_default: configs/seed_omni/<Model>/<variant>/infer/graph_infer.yaml
     infer_type: infer_default
   ops_implementation:
     attn_implementation: flash_attention_2

@@ -274,7 +274,7 @@ post-refactor are `modules/janus/siglip` (vision encoder), `modules/janus/vqvae`
 source .venv/bin/activate
 make quality                          # ruff check + format
 pytest tests/seed_omni/               # 110 tests, must be green
-python scripts/visualize_omni_graph.py configs/seed_omni/<model>/base.yaml   # graph topo + FSM
+python scripts/visualize_omni_graph.py configs/seed_omni/<model>/<task>/base.yaml   # graph topo + FSM
 ```
 
 A successful merge: no import errors, `pytest tests/seed_omni/` green, and your

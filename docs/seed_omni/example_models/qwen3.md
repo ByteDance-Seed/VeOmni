@@ -22,11 +22,11 @@ per-purpose module/graph files. Both training and inference take the **same**
 
 | File | Role |
 |------|------|
-| `qwen3_0.6b/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. |
-| `qwen3_0.6b/modules_train.yaml` | Per-module training overrides. Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
-| `qwen3_0.6b/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
-| `qwen3_0.6b/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
-| `qwen3_0.6b/graph_infer.yaml` | Text chat generation graph (mapped under `infer.infer_graph.infer_text`). |
+| `qwen3_0.6b/train/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. |
+| `qwen3_0.6b/train/modules_train.yaml` | Per-module training overrides. Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
+| `qwen3_0.6b/train/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
+| `qwen3_0.6b/train/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
+| `qwen3_0.6b/train/graph_infer.yaml` | Text chat generation graph (mapped under `infer.infer_graph.infer_text`). |
 
 ---
 
@@ -56,7 +56,7 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 `messages` list to a `[role, ("text", content)]` conversation.
 
 ```yaml
-# configs/seed_omni/Qwen/qwen3_0.6b/data.yaml
+# configs/seed_omni/Qwen/qwen3_0.6b/train/data.yaml
 sources:
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
 names:
@@ -77,7 +77,7 @@ The on-disk row schema is documented in
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml
+  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml
 ```
 
 Key knobs (override on the CLI):
@@ -85,7 +85,7 @@ Key knobs (override on the CLI):
 - `--model.model_path` — split-checkpoint root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
 - `--data.max_seq_len` — packed sequence length.
-- `--model.optimizer.lr` — learning rate (global default; override per module in `modules_train.yaml`).
+- `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
 
@@ -93,7 +93,7 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
   --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
   --train.max_steps 15 \
   --train.global_batch_size 8 \
@@ -106,15 +106,15 @@ bash train.sh tasks/omni/train_omni.py \
 
 Uniform Ulysses SP (Arch B): the `qwen3_text_encoder` (wte) and the `qwen3_llm`
 backbone both shard the packed token sequence at the outer SP size. SP has **no
-dedicated config** — it is the normal `modules_train.yaml` plus
+dedicated config** — it is the normal `train/modules_train.yaml` plus
 `--accelerator.ulysses_size N`. The dataloader replicates each DP shard across the
 SP group; each module slices to its `1/sp` chunk, runs one forward, and all-gathers
 the output back:
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
-  --model.modules configs/seed_omni/Qwen/qwen3_0.6b/modules_train.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
+  --model.modules configs/seed_omni/Qwen/qwen3_0.6b/train/modules_train.yaml \
   --accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
@@ -140,7 +140,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
   --train.checkpoint.load_path outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -156,7 +156,7 @@ this layout, so you can infer directly:
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/train/base.yaml \
   --infer.infer_type infer_text \
   --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
   --infer.prompt "What is 2+2?" \
@@ -273,7 +273,7 @@ default → plain text-only Qwen3):
 
 The grad mask uses **global** row indices, so the module is loaded **`ddp`**
 (replicated, not FSDP-sharded) and with **`weight_decay: 0`** (otherwise AdamW's
-decoupled decay would erode the frozen rows). Both are set in `modules_train.yaml`.
+decoupled decay would erode the frozen rows). Both are set in `train/modules_train.yaml`.
 
 > The special-token rows load verbatim from Qwen3-0.6B (an untrained reserved
 > stub). They start training from there; if you want a better starting point,
@@ -311,17 +311,17 @@ suffix:
 
 | File | Role |
 |------|------|
-| `visual_instruction_tuning.yaml` | Launcher (model paths, accelerator, data, train, infer). |
-| `modules_train_visual_instruction_tuning.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze (`ddp` + `weight_decay: 0`); `qwen3_llm` freeze. Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
-| `graph_train_visual_instruction_tuning.yaml` | `{qwen3vl_vision, qwen3_text_encoder.encode} → qwen3_llm → qwen3_text_encoder.decode → end`. |
-| `data_visual_instruction_tuning.yaml` | ShareGPT4V captions (image + text). |
-| `graph_infer_visual_instruction_tuning.yaml` | I2T generation FSM. |
+| `visual_instruction_tuning/base.yaml` | Launcher (model paths, accelerator, data, train, infer). |
+| `visual_instruction_tuning/modules_train.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze (`ddp` + `weight_decay: 0`); `qwen3_llm` freeze. Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
+| `visual_instruction_tuning/graph_train.yaml` | `{qwen3vl_vision, qwen3_text_encoder.encode} → qwen3_llm → qwen3_text_encoder.decode → end`. |
+| `visual_instruction_tuning/data.yaml` | ShareGPT4V captions (image + text). |
+| `visual_instruction_tuning/graph_infer.yaml` | I2T generation FSM. |
 
 ### 7.5 Train on ShareGPT4V
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml
 ```
 
 Trainable params are exactly `qwen3vl_vision.visual.merger.*` plus the masked
@@ -330,7 +330,7 @@ ViT and LLM are frozen).
 
 **Sequence parallelism** — uniform Ulysses at the outer SP size: the ViT, the
 text-encoder and the LLM backbone all run SP=4. SP has **no dedicated config** — it
-is the normal `modules_train_visual_instruction_tuning.yaml` (the launcher's default
+is the normal `visual_instruction_tuning/modules_train.yaml` (the launcher's default
 `model.modules`) plus `--accelerator.ulysses_size N`. The dataloader replicates each
 DP shard across the SP group; each module slices to its `1/sp` chunk, runs one
 forward, and all-gathers the output back. Same uniform-SP / `TORCH_DISTRIBUTED_DEBUG`
@@ -338,7 +338,7 @@ caveats as [§3.1](#31-sequence-parallelism-ulysses):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
   --accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
@@ -347,7 +347,7 @@ NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
   --infer.infer_type understanding \
   --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning \
   --infer.image /path/to/image.jpg \
@@ -366,7 +366,7 @@ cwd-relative full path double-joins it and fails with a cryptic
 ```bash
 STEP=outputs/qwen3_0.6b_visual_instruction_tuning/checkpoints/global_step_2000
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml \
   --infer.infer_type understanding \
   --infer.model_path "$STEP" \
   --infer.image /path/to/image.jpg \

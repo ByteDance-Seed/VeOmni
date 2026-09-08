@@ -17,17 +17,17 @@ drives the inferencer.
 
 | File | Role |
 |------|------|
-| `base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. References the module/graph files below. |
-| `modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
-| `modules_train_packed.yaml` | Same as `modules_train.yaml` plus `janus_text_encoder.processor_config.packed_preprocess: true`. |
-| `graph_train.yaml` | Training DAG — the file *is* the flat edge list. |
-| `graph_train_packed.yaml` | Packed training DAG (`pack_encode` / `pack_forward` / `pack_decode`). |
-| `base_packed.yaml` | Packed-training launcher (`modules_train_packed.yaml` + packed graph). |
-| `base_model_fsdp.yaml` | Conversation DAG with `fsdp_scope: model` (one FSDP tree over OmniModel). |
-| `data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
-| `modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager (base.yaml's default `infer.modules`). |
-| `modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager` (single-process replica). |
-| `graph_infer_und.yaml` / `graph_infer_gen.yaml` / `graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `infer.infer_graph`). |
+| `train/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. References the module/graph files below. |
+| `train/modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
+| `packed/modules_train.yaml` | Same as `train/modules_train.yaml` plus `janus_text_encoder.processor_config.packed_preprocess: true`. |
+| `train/graph_train.yaml` | Training DAG — the file *is* the flat edge list. |
+| `packed/graph_train.yaml` | Packed training DAG (`pack_encode` / `pack_forward` / `pack_decode`). |
+| `packed/base.yaml` | Packed-training launcher (`packed/modules_train.yaml` + packed graph). |
+| `train/base_model_fsdp.yaml` | Conversation DAG with `fsdp_scope: model` (one FSDP tree over OmniModel). |
+| `../data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
+| `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager (base.yaml's default `infer.modules`). |
+| `infer/modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager` (single-process replica). |
+| `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` / `infer/graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `infer.infer_graph`). |
 
 ---
 
@@ -56,7 +56,7 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 (`SEED_OMNI_PREPROCESSOR_REGISTRY`).
 
 ```yaml
-# configs/seed_omni/Janus/janus_1.3b/data.yaml
+# configs/seed_omni/Janus/data.yaml
 sources:
   - /mnt/hdfs/user_dir/dataset/imagenet1k_train      # text -> image (T2I)
   - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k    # image -> text (I2T)
@@ -84,17 +84,17 @@ or multi-node). Pass the task and config after it.
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml
 ```
 
 Packed training (CPU-built packed tokens/masks; modules only `masked_scatter`) uses
-`base_packed.yaml`. A single FSDP2 tree over the composed OmniModel (old
-`train_janus`-style wrap) uses `base_model_fsdp.yaml`, or add
+`packed/base.yaml`. A single FSDP2 tree over the composed OmniModel (old
+`train_janus`-style wrap) uses `train/base_model_fsdp.yaml`, or add
 `--accelerator.fsdp_config.fsdp_scope model` to either launcher. Combined:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base_packed.yaml \
+  configs/seed_omni/Janus/janus_1.3b/packed/base.yaml \
   --accelerator.fsdp_config.fsdp_scope model
 ```
 
@@ -110,14 +110,14 @@ Key knobs (override on the CLI, e.g. `--train.global_batch_size 32`):
 
 ### Per-module parallelism
 
-Each module can carry its own `accelerator` block in `modules_train.yaml`; when a
+Each module can carry its own `accelerator` block in `train/modules_train.yaml`; when a
 module's topology differs from the top-level one, the trainer builds it its **own**
 `ParallelState` (device mesh + process groups) on the full world, while modules that
 match the global topology reuse it. `janus_text_encoder` ships with a embed-parallel
 **embedding** (`emb`) extra-parallel group:
 
 ```yaml
-# modules_train.yaml — janus_text_encoder
+# train/modules_train.yaml — janus_text_encoder
 accelerator:
   extra_parallel_sizes: [4]            # shard embed_tokens.weight dim-0 (vocab) across 4 ranks
   extra_parallel_names: ["emb"]
@@ -128,7 +128,7 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --train.max_steps 20 \
   --train.checkpoint.save_steps 10 \
   --train.wandb.enable false
@@ -146,7 +146,7 @@ per-module `ulysses_size` overrides). Decision record + deferred future work
 Historical memory/timing experiments that motivated dropping the old looped SP:
 [sp_loop_memory_experiments.md](../sp_loop_memory_experiments.md).
 
-SP has **no dedicated config** — it is the normal `modules_train.yaml` plus
+SP has **no dedicated config** — it is the normal `train/modules_train.yaml` plus
 `--accelerator.ulysses_size N` on the outer trainer; every module inherits that SP
 size. On **4 GPUs** with `ulysses_size 4` this gives `dp=1`. The
 `janus_text_encoder` `emb=4` extra-parallel composes here: on the 4-GPU box the
@@ -157,8 +157,8 @@ its own `1/sp` token shard):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml \
-  --model.modules configs/seed_omni/Janus/janus_1.3b/modules_train.yaml \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  --model.modules configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml \
   --accelerator.ulysses_size 4 \
   --train.global_batch_size 4 --train.micro_batch_size 1
 ```
@@ -177,7 +177,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --train.checkpoint.load_path outputs/janus_1.3b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -202,15 +202,15 @@ distributed run. Two ready-made inference module files ship with the config:
 
 | `infer.modules` file | Layout | Launch |
 |----------------------|--------|--------|
-| `modules_infer_fsdp.yaml` (base.yaml default) | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `ddp`, vision modules eager | **torchrun** (`bash train.sh …`) |
-| `modules_infer_eager.yaml` | every module `eager` — plain per-rank replica | single-process (`python …`) |
+| `infer/modules_infer_fsdp.yaml` (base.yaml default) | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `ddp`, vision modules eager | **torchrun** (`bash train.sh …`) |
+| `infer/modules_infer_eager.yaml` | every module `eager` — plain per-rank replica | single-process (`python …`) |
 
 Four launcher scripts at the repo root wrap the two paths for both scenarios:
 
 | Script | Modules | Launcher |
 |--------|---------|----------|
-| `infer_fsdp_i2t.sh` / `infer_fsdp_t2i.sh` | base default (`modules_infer_fsdp.yaml`) | `bash train.sh` (torchrun) |
-| `infer_eager_i2t.sh` / `infer_eager_t2i.sh` | `--infer.modules …/modules_infer_eager.yaml` | `python` (single process) |
+| `infer_fsdp_i2t.sh` / `infer_fsdp_t2i.sh` | base default (`infer/modules_infer_fsdp.yaml`) | `bash train.sh` (torchrun) |
+| `infer_eager_i2t.sh` / `infer_eager_t2i.sh` | `--infer.modules …/infer/modules_infer_eager.yaml` | `python` (single process) |
 
 The commands below mirror those scripts.
 
@@ -233,15 +233,15 @@ Then pass `--infer.model_path "$ASM"` to any of the commands below. (Verified:
 the `global_step_20` checkpoint loads all four modules and runs both the I2T and
 T2I graphs end-to-end.)
 
-**Image understanding (I2T / VQA)** — `graph_infer_und.yaml`.
+**Image understanding (I2T / VQA)** — `infer/graph_infer_und.yaml`.
 
-Distributed (`infer_fsdp_i2t.sh`) — base default `modules_infer_fsdp.yaml`, torchrun:
+Distributed (`infer_fsdp_i2t.sh`) — base default `infer/modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --infer.infer_type infer_und \
-  --infer.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml \
+  --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
   --infer.prompt "What do you see in this image?" \
   --infer.image /path/to/image.png \
@@ -254,9 +254,9 @@ file so every module loads as a plain replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --infer.infer_type infer_und \
-  --infer.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml \
+  --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
   --infer.prompt "What do you see in this image?" \
   --infer.image /path/to/image.png \
@@ -264,15 +264,15 @@ python tasks/omni/infer_omni.py \
   --infer.generation_kwargs.max_new_tokens 1024
 ```
 
-**Text-to-image (T2I)** — `graph_infer_gen.yaml` (`guidance_scale` enables CFG).
+**Text-to-image (T2I)** — `infer/graph_infer_gen.yaml` (`guidance_scale` enables CFG).
 
-Distributed (`infer_fsdp_t2i.sh`) — base default `modules_infer_fsdp.yaml`, torchrun:
+Distributed (`infer_fsdp_t2i.sh`) — base default `infer/modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --infer.infer_type infer_gen \
-  --infer.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml \
+  --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
@@ -285,9 +285,9 @@ file so every module loads as a plain replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
   --infer.infer_type infer_gen \
-  --infer.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml \
+  --infer.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
@@ -295,5 +295,5 @@ python tasks/omni/infer_omni.py \
   --infer.generation_kwargs.guidance_scale 5.0
 ```
 
-**Interleaved** — `graph_infer_interleave.yaml` (default `infer.infer_type`)
+**Interleaved** — `infer/graph_infer_interleave.yaml` (default `infer.infer_type`)
 mixes text and image generation in one graph.

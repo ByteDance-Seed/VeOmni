@@ -1,10 +1,10 @@
 # VeOmni training / inference config for OmniModel V2 — Qwen3-30B-A3B (MoE).
 #
 # Launch training:
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3_30b_a3b/base.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml
 #
 # Launch inference (text-only chat):
-#   bash train.sh tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3_30b_a3b/base.yaml \
+#   bash train.sh tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
 #     --infer.prompt "What is 2+2?" \
 #     --infer.output_dir qwen3_moe_out
 #
@@ -17,10 +17,10 @@
 model:
   model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-30B-A3B
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3_30b_a3b/modules_train.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3_30b_a3b/graph_train.yaml
+    modules: configs/seed_omni/Qwen/qwen3_30b_a3b/train/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3_30b_a3b/train/graph_train.yaml
     infer_graph:
-      infer_text: configs/seed_omni/Qwen/qwen3_30b_a3b/graph_infer.yaml
+      infer_text: configs/seed_omni/Qwen/qwen3_30b_a3b/train/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
     # Fused Triton MoE kernel for the sparse experts.
@@ -62,7 +62,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/qwen3_0.6b/data.yaml
+  train_path: configs/seed_omni/Qwen/qwen3_30b_a3b/train/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
@@ -96,7 +96,7 @@ train:
 
 infer:
   # For distributed FSDP2 + Expert Parallel inference (torchrun), override with
-  # `--model.model_config.modules configs/seed_omni/Qwen/qwen3_30b_a3b/modules_infer_fsdp.yaml`.
+  # `--model.model_config.modules configs/seed_omni/Qwen/qwen3_30b_a3b/infer/modules_infer_fsdp.yaml`.
   generation_kwargs:
     max_new_tokens: 2048
     temperature: 0.0

@@ -24,13 +24,15 @@ raw data transforms, or request preprocessing.
 6. `post_forward` scatters outputs back to carrier items and returns
    `{"conversation_list": conversation}` or scalar `*_loss` values.
 
-Janus packed training (`graph_train_packed.yaml`) is an optional second
-path: after step 3 the text-encoder preprocessor also writes packed tensors
-onto the collator batch dict. Packed graph nodes (`pack_encode` /
-`pack_forward` / `pack_decode`) read those tensors and `masked_scatter`
-embeddings onto `packed_features` instead of walking `conversation_list`.
-Dummy FSDP-anchor images stay off the packed sequence and are folded with
-`mean() * 0`.
+Janus and Qwen3-VL packed training (`packed/graph_train.yaml`) are an
+optional second path: after step 3 the text-encoder preprocessor also writes
+packed tensors onto the collator batch dict. Packed graph nodes
+(`pack_encode` / `pack_forward` / `pack_decode`) read those tensors and
+`masked_scatter` embeddings onto `packed_features` instead of walking
+`conversation_list`. Dummy FSDP-anchor images stay off the packed sequence
+and are folded with `mean() * 0`. Qwen3-VL additionally CPU-builds 3-row
+M-RoPE and `visual_pos_mask`; DeepStack features still come from the GPU
+vision tower.
 
 ## Preprocessor Contract
 

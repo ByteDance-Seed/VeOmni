@@ -19,15 +19,15 @@
 #
 # Train:
 #   bash train.sh tasks/omni/train_omni.py \
-#     configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml
+#     configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml
 
 model:
   model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3_0.6b/modules_train_visual_instruction_tuning.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3_0.6b/graph_train_visual_instruction_tuning.yaml
+    modules: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/graph_train.yaml
     infer_graph:
-      understanding: configs/seed_omni/Qwen/qwen3_0.6b/graph_infer_visual_instruction_tuning.yaml
+      understanding: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -67,7 +67,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/qwen3_0.6b/data_visual_instruction_tuning.yaml
+  train_path: configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000

@@ -1,15 +1,21 @@
-# VeOmni training / inference config for OmniModel V2 - BAGEL-7B-MoT.
-
+# Qwen3-VL-2B packed training launcher (conversation graph stays in base.yaml).
+#
+# Packed tokens / M-RoPE / visual masks are built in the text-encoder
+# preprocessor; graph nodes are pack_encode / pack_forward / pack_decode.
+# Inference graphs are unchanged (conversation FSM).
+#
+# Launch:
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl_2b/packed/base.yaml
+#
+# Combine with a single FSDP tree over the composed OmniModel:
+#   --accelerator.fsdp_config.fsdp_scope model
 model:
-  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
   model_config:
-    modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_train.yaml
-    train_graph: configs/seed_omni/Bagel/bagel_7b_mot/graph_train.yaml
+    modules: configs/seed_omni/Qwen/qwen3vl_2b/packed/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3vl_2b/packed/graph_train.yaml
     infer_graph:
-      infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
-      infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
-      infer_und: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_und.yaml
-    infer_type: infer_und
+      vision_understanding: configs/seed_omni/Qwen/qwen3vl_2b/infer/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -35,7 +41,7 @@ model:
 
   optimizer:
     type: adamw
-    lr: 1.0e-4
+    lr: 1.0e-5
     lr_min: 1.0e-6
     lr_start: 0.0
     lr_warmup_ratio: 0.03
@@ -49,39 +55,40 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Bagel/bagel_7b_mot/data.yaml
-  # Streaming + VeOmni weighted multisource: no HF schema merge across sources.
+  train_path: configs/seed_omni/Qwen/qwen3vl_2b/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
-  # Iterable has no __len__; train_steps = ceil(train_sample / global_batch_size).
   train_sample: 1000000
-  chat_template: default
   dataloader:
     type: native
     num_workers: 4
     drop_last: true
     pin_memory: true
     prefetch_factor: 2
+  mm_configs:
+    use_audio_in_video: false
+    fps: 2.0
+    min_frames: 4
+    max_frames: 8
 
 train:
   seed: 42
   num_train_epochs: 1
   global_batch_size: 32
-  micro_batch_size: 2
+  micro_batch_size: 1
   dyn_bsz: false
 
   checkpoint:
-    output_dir: outputs/bagel_7b_mot_omni_sft
+    output_dir: outputs/qwen3vl_2b_omni_sft_packed
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
     hf_save_steps: 500
     hf_save_epochs: 0
-
   wandb:
     enable: true
     project: VeOmni_omni
-    name: bagel_7b_mot_omni_sft
+    name: qwen3vl_2b_omni_sft_packed
 
 infer:
   generation_kwargs:
@@ -89,14 +96,3 @@ infer:
     temperature: 0.0
     top_p: 1.0
     do_sample: false
-    image_height: 1024
-    image_width: 1024
-    latent_downsample: 16
-    num_timesteps: 50
-    timestep_shift: 3.0
-    cfg_text_scale: 1.0
-    cfg_img_scale: 1.0
-    cfg_interval: [0.0, 1.0]
-    cfg_renorm_min: 0.0
-    cfg_renorm_type: global
-    enable_taylorseer: false

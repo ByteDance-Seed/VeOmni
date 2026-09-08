@@ -404,7 +404,7 @@ def test_bagel_vae_process_only_skips_preprocessor(tmp_path):
 
 
 def test_bagel_vae_process_only_override_applies_even_when_checkpoint_default_is_full(tmp_path):
-    """`modules_train_with_cache.yaml`'s `model_config: {support_cache: true,
+    """`with_cache/modules_train.yaml`'s `model_config: {support_cache: true,
     train_type: train_with_cache}` override must reach the preprocessor the same
     way it reaches the live model's config — regardless of the checkpoint's own
     on-disk default (regression: `from_pretrained` used to silently re-read the
@@ -673,7 +673,7 @@ def test_qwen3_text_preprocessor_matches_inmodule_pipeline():
 
 
 def test_qwen3_text_preprocessor_from_pretrained_applies_enable_image_override(tmp_path, monkeypatch):
-    """`modules_train_visual_instruction_tuning.yaml`'s `model_config: {enable_image:
+    """`visual_instruction_tuning/modules_train.yaml`'s `model_config: {enable_image:
     true}` override must reach the preprocessor's template choice the same way it
     reaches the live model's config — regardless of the checkpoint's own on-disk
     default (regression: `from_pretrained` used to silently re-read the on-disk

@@ -36,11 +36,11 @@ Config dir: `configs/seed_omni/Qwen/qwen3vl_2b/`
 
 | File | Role |
 |------|------|
-| `base.yaml` | Launcher: `model` / top-level `accelerator` / `data` (incl. `mm_configs`) / `train` + `infer` block. |
-| `modules_train.yaml` | Per-module training overrides (`qwen3vl_vision` / `qwen3vl_text_encoder` / `qwen3vl_llm`). Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
-| `graph_train.yaml` | Training DAG — flat edge list (`{qwen3vl_vision, qwen3vl_text_encoder.encode} → qwen3vl_llm → qwen3vl_text_encoder.decode → end`). |
+| `train/base.yaml` | Launcher: `model` / top-level `accelerator` / `data` (incl. `mm_configs`) / `train` + `infer` block. |
+| `train/modules_train.yaml` | Per-module training overrides (`qwen3vl_vision` / `qwen3vl_text_encoder` / `qwen3vl_llm`). Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
+| `train/graph_train.yaml` | Training DAG — flat edge list (`{qwen3vl_vision, qwen3vl_text_encoder.encode} → qwen3vl_llm → qwen3vl_text_encoder.decode → end`). |
 | `data.yaml` | Weighted multisource data list (ShareGPT4V images + LLaVA-Video). |
-| `graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`infer.infer_type: vision_understanding`). |
+| `infer/graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`infer.infer_type: vision_understanding`). |
 
 ---
 
@@ -100,7 +100,7 @@ no audio modality. The on-disk row schema is documented in
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3vl_2b/base.yaml
+  configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml
 ```
 
 Key knobs (override on the CLI):
@@ -108,7 +108,7 @@ Key knobs (override on the CLI):
 - `--model.model_path` — split-checkpoint root from step 1.
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
 - `--data.max_seq_len` — packed sequence length.
-- `--model.optimizer.lr` — learning rate (global default; override per module in `modules_train.yaml`).
+- `--model.optimizer.lr` — learning rate (global default; override per module in `train/modules_train.yaml`).
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
 
@@ -117,15 +117,15 @@ Key knobs (override on the CLI):
 Uniform Ulysses SP (Arch B): set the SP size **once** on the outer trainer
 (`--accelerator.ulysses_size N`) and every module — vision tower, text encoder and
 LLM backbone — inherits it. SP has **no dedicated config**: it is the normal
-`modules_train.yaml` plus the outer flag. The dataloader replicates each DP shard
+`train/modules_train.yaml` plus the outer flag. The dataloader replicates each DP shard
 across the SP group; each module slices to its `1/sp` chunk, runs one forward, and
 all-gathers the output back — the in-model backbone `qwen3vl_llm` shards its
 DeepStack visual embeds, `visual_pos_masks` and 3-row M-RoPE `position_ids` too:
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3vl_2b/base.yaml \
-  --model.modules configs/seed_omni/Qwen/qwen3vl_2b/modules_train.yaml \
+  configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
+  --model.modules configs/seed_omni/Qwen/qwen3vl_2b/train/modules_train.yaml \
   --accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
@@ -149,7 +149,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3vl_2b/base.yaml \
+  configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
   --train.checkpoint.load_path outputs/qwen3vl_2b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -173,7 +173,7 @@ has this layout, so you can infer directly:
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3vl_2b/base.yaml \
+  configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
   --model.model_config.infer_type vision_understanding \
   --infer.prompt "What is in this image?" \
   --infer.image /path/to/image.jpg \

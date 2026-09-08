@@ -8,14 +8,14 @@
 # is given.
 #
 # Eager single-process T2I (default, no override):
-#   python tasks/omni/infer_omni.py configs/seed_omni/Janus/janus_1.3b_hf/base.yaml \
+#   python tasks/omni/infer_omni.py configs/seed_omni/Janus/janus_1.3b_hf/train/base.yaml \
 #     --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
 #     --infer.output_dir outputs/runtime_hf
 #
 # Distributed T2I (siglip/vqvae ddp, llama fsdp2, text_encoder emb-parallel):
 #   bash train.sh tasks/omni/infer_omni.py \
-#     configs/seed_omni/Janus/janus_1.3b_hf/base.yaml \
-#     --model.model_config.modules configs/seed_omni/Janus/janus_1.3b_hf/modules_infer_fsdp.yaml \
+#     configs/seed_omni/Janus/janus_1.3b_hf/train/base.yaml \
+#     --model.model_config.modules configs/seed_omni/Janus/janus_1.3b_hf/infer/modules_infer_fsdp.yaml \
 #     --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
 #     --infer.output_dir outputs/runtime_hf_fsdp
 model:

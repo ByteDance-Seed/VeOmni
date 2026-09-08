@@ -1,14 +1,14 @@
-# VeOmni cached VAE posterior training config for OmniModel V2 - BAGEL-7B-MoT.
+# VeOmni training / inference config for OmniModel V2 - BAGEL-7B-MoT.
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
   model_config:
-    modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_train_with_cache.yaml
-    train_graph: configs/seed_omni/Bagel/bagel_7b_mot/graph_train_with_cache.yaml
+    modules: configs/seed_omni/Bagel/bagel_7b_mot/train/modules_train.yaml
+    train_graph: configs/seed_omni/Bagel/bagel_7b_mot/train/graph_train.yaml
     infer_graph:
-      infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
-      infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
-      infer_und: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_und.yaml
+      infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/infer/graph_infer_edit.yaml
+      infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/infer/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Bagel/bagel_7b_mot/infer/graph_infer_und.yaml
     infer_type: infer_und
   ops_implementation:
     attn_implementation: flash_attention_2
@@ -47,10 +47,13 @@ model:
     no_decay_modules: []
 
 data:
-  data_type: seedomni_cached
+  data_type: seedomni
   max_seq_len: 4096
-  train_path: outputs/bagel_vae_cached_dataset
+  train_path: configs/seed_omni/Bagel/bagel_7b_mot/data.yaml
+  # Streaming + VeOmni weighted multisource: no HF schema merge across sources.
   datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  # Iterable has no __len__; train_steps = ceil(train_sample / global_batch_size).
   train_sample: 1000000
   chat_template: default
   dataloader:
@@ -61,7 +64,6 @@ data:
     prefetch_factor: 2
 
 train:
-  train_type: train_with_cache
   seed: 42
   num_train_epochs: 1
   global_batch_size: 32
@@ -69,7 +71,7 @@ train:
   dyn_bsz: false
 
   checkpoint:
-    output_dir: outputs/bagel_7b_mot_omni_sft_from_cache
+    output_dir: outputs/bagel_7b_mot_omni_sft
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
@@ -79,7 +81,7 @@ train:
   wandb:
     enable: true
     project: VeOmni_omni
-    name: bagel_7b_mot_omni_sft_from_cache
+    name: bagel_7b_mot_omni_sft
 
 infer:
   generation_kwargs:

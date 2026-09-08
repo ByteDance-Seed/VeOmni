@@ -48,7 +48,7 @@ dense comprehensions for carrier filtering or source routing.
 ## 4. Wire The Runtime
 
 - Add or update graph edges in the appropriate config.
-- Add module config in `modules_train.yaml` and, if needed, inference module
+- Add module config in `train/modules_train.yaml` and, if needed, inference module
   config files.
 - Update split checkpoint conversion if weights or assets come from a monolith.
 - Register and re-export the module class.

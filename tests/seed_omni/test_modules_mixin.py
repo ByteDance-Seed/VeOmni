@@ -88,8 +88,8 @@ def _omni_base_args(*, model_path: str = ""):
         model=OmniModelRuntimeArguments(
             model_path=model_path or ".",
             model_config={
-                "modules": str(_janus_cfg_dir() / "modules_train.yaml"),
-                "train_graph": str(_janus_cfg_dir() / "graph_train.yaml"),
+                "modules": str(_janus_cfg_dir() / "train/modules_train.yaml"),
+                "train_graph": str(_janus_cfg_dir() / "train/graph_train.yaml"),
             },
         ),
         data=OmniDataArguments(train_path=""),
@@ -721,9 +721,9 @@ def _janus_cfg_dir() -> Path:
 
 def test_janus_train_yaml_loads_with_v2_module_names():
     cfg = _load_omni_config(
-        modules_path=_janus_cfg_dir() / "modules_train.yaml",
-        train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=_janus_cfg_dir() / "graph_infer_gen.yaml",
+        modules_path=_janus_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=_janus_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=_janus_cfg_dir() / "infer/graph_infer_gen.yaml",
     )
 
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
@@ -741,12 +741,12 @@ def test_janus_train_yaml_loads_with_v2_module_names():
 
 
 @pytest.mark.parametrize(
-    "infer_graph", ["graph_infer_interleave.yaml", "graph_infer_gen.yaml", "graph_infer_und.yaml"]
+    "infer_graph", ["infer/graph_infer_interleave.yaml", "infer/graph_infer_gen.yaml", "infer/graph_infer_und.yaml"]
 )
 def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = _load_omni_config(
-        modules_path=_janus_cfg_dir() / "modules_train.yaml",
-        train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
+        modules_path=_janus_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=_janus_cfg_dir() / "train/graph_train.yaml",
         infer_graph_path=_janus_cfg_dir() / infer_graph,
     )
     # Training vocabulary still present.
@@ -804,9 +804,9 @@ def test_init_resolves_relative_module_paths():
     root = "seed_omni/janus_1.3b"
     cfg = _load_omni_config(
         model_path=root,
-        modules_path=_janus_cfg_dir() / "modules_train.yaml",
-        train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=_janus_cfg_dir() / "graph_infer_gen.yaml",
+        modules_path=_janus_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=_janus_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=_janus_cfg_dir() / "infer/graph_infer_gen.yaml",
     )
 
     assert cfg.modules["janus_siglip"]["subfolder"] == "janus_siglip"
@@ -819,7 +819,7 @@ def test_init_resolves_relative_module_paths():
     runtime_args = build_module_runtime_args(
         global_args=_omni_base_args(model_path=root),
         model_path=root,
-        modules=str(_janus_cfg_dir() / "modules_infer_fsdp.yaml"),
+        modules=str(_janus_cfg_dir() / "infer/modules_infer_fsdp.yaml"),
         for_inference=True,
     )
     assert runtime_args["janus_siglip"].model_path == f"{root}/janus_siglip"
@@ -832,9 +832,9 @@ def _qwen3_cfg_dir() -> Path:
 
 def test_qwen3_train_yaml_loads_with_v2_module_names():
     cfg = _load_omni_config(
-        modules_path=_qwen3_cfg_dir() / "modules_train.yaml",
-        train_graph_path=_qwen3_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=_qwen3_cfg_dir() / "graph_infer.yaml",
+        modules_path=_qwen3_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=_qwen3_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=_qwen3_cfg_dir() / "train/graph_infer.yaml",
     )
 
     assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
@@ -846,9 +846,9 @@ def test_qwen3_train_yaml_loads_with_v2_module_names():
 
 def test_qwen3_train_plus_infer_merges_generation_graph():
     cfg = _load_omni_config(
-        modules_path=_qwen3_cfg_dir() / "modules_train.yaml",
-        train_graph_path=_qwen3_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=_qwen3_cfg_dir() / "graph_infer.yaml",
+        modules_path=_qwen3_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=_qwen3_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=_qwen3_cfg_dir() / "train/graph_infer.yaml",
     )
     assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
     assert cfg.generation_graph is not None

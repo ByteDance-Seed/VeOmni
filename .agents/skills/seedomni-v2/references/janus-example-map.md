@@ -21,17 +21,17 @@ Use current Janus files instead of synthetic module examples.
 
 | Need | File |
 |---|---|
-| Launcher shape | `configs/seed_omni/Janus/janus_1.3b/base.yaml` |
-| Training module overrides | `configs/seed_omni/Janus/janus_1.3b/modules_train.yaml` |
-| Eager inference module overrides | `configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml` |
-| Distributed inference module overrides | `configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml` |
-| Training graph | `configs/seed_omni/Janus/janus_1.3b/graph_train.yaml` |
-| Packed training graph | `configs/seed_omni/Janus/janus_1.3b/graph_train_packed.yaml` |
-| Packed training launcher | `configs/seed_omni/Janus/janus_1.3b/base_packed.yaml` |
-| Model-level FSDP launcher | `configs/seed_omni/Janus/janus_1.3b/base_model_fsdp.yaml` |
-| Text-to-image FSM | `configs/seed_omni/Janus/janus_1.3b/graph_infer_gen.yaml` |
-| Image understanding FSM | `configs/seed_omni/Janus/janus_1.3b/graph_infer_und.yaml` |
-| Interleave FSM | `configs/seed_omni/Janus/janus_1.3b/graph_infer_interleave.yaml` |
+| Launcher shape | `configs/seed_omni/Janus/janus_1.3b/train/base.yaml` |
+| Training module overrides | `configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml` |
+| Eager inference module overrides | `configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml` |
+| Distributed inference module overrides | `configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml` |
+| Training graph | `configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml` |
+| Packed training graph | `configs/seed_omni/Janus/janus_1.3b/packed/graph_train.yaml` |
+| Packed training launcher | `configs/seed_omni/Janus/janus_1.3b/packed/base.yaml` |
+| Model-level FSDP launcher | `configs/seed_omni/Janus/janus_1.3b/train/base_model_fsdp.yaml` |
+| Text-to-image FSM | `configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_gen.yaml` |
+| Image understanding FSM | `configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_und.yaml` |
+| Interleave FSM | `configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_interleave.yaml` |
 
 ## How To Use
 

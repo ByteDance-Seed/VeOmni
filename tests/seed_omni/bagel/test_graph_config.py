@@ -9,9 +9,9 @@ from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 
 def test_bagel_train_yaml_loads_with_v2_module_names():
     cfg = load_omni_config(
-        modules_path=bagel_cfg_dir() / "modules_train.yaml",
-        train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
+        modules_path=bagel_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=bagel_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=bagel_cfg_dir() / "infer/graph_infer_gen.yaml",
     )
 
     assert set(cfg.modules) == {
@@ -36,7 +36,7 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
 def test_bagel_train_graph_fan_in_execution_order():
     from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 
-    graph = TrainingGraph(yaml.safe_load((bagel_cfg_dir() / "graph_train.yaml").read_text()))
+    graph = TrainingGraph(yaml.safe_load((bagel_cfg_dir() / "train/graph_train.yaml").read_text()))
     order = graph.execution_order
     assert order.index("bagel_qwen2_mot.forward") > order.index("bagel_text_encoder.encode")
     assert order.index("bagel_qwen2_mot.forward") > order.index("bagel_siglip_navit.forward")
@@ -50,7 +50,7 @@ def test_bagel_train_graph_fan_in_execution_order():
 
 
 def test_bagel_infer_gen_graph_uses_siglip_context_without_vae_context():
-    data = yaml.safe_load((bagel_cfg_dir() / "graph_infer_gen.yaml").read_text())
+    data = yaml.safe_load((bagel_cfg_dir() / "infer/graph_infer_gen.yaml").read_text())
     prompt_body = data["states"]["prompt_encode"]["body"]
 
     assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
@@ -60,7 +60,7 @@ def test_bagel_infer_gen_graph_uses_siglip_context_without_vae_context():
 
 
 def test_bagel_edit_prompt_graph_exposes_independent_prompt_producers() -> None:
-    graph_config = yaml.safe_load((bagel_cfg_dir() / "graph_infer_edit.yaml").read_text())
+    graph_config = yaml.safe_load((bagel_cfg_dir() / "infer/graph_infer_edit.yaml").read_text())
     prompt_body = graph_config["states"]["prompt_encode"]["body"]
 
     assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
@@ -84,12 +84,12 @@ def test_bagel_edit_prompt_graph_exposes_independent_prompt_producers() -> None:
 
 @pytest.mark.parametrize(
     "infer_graph",
-    ["graph_infer_und.yaml", "graph_infer_gen.yaml", "graph_infer_edit.yaml"],
+    ["infer/graph_infer_und.yaml", "infer/graph_infer_gen.yaml", "infer/graph_infer_edit.yaml"],
 )
 def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = load_omni_config(
-        modules_path=bagel_cfg_dir() / "modules_train.yaml",
-        train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
+        modules_path=bagel_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=bagel_cfg_dir() / "train/graph_train.yaml",
         infer_graph_path=bagel_cfg_dir() / infer_graph,
     )
     assert set(cfg.modules) == {

@@ -53,7 +53,7 @@ class Qwen3VLTextEncoderPreprocessor(TextEncoderPreprocessor):
             return
 
         # Packed training feeds tokenized parts straight to the packer. The
-        # carrier is dropped once packed: no node in ``graph_train_packed.yaml``
+        # carrier is dropped once packed: no node in ``packed/graph_train.yaml``
         # reads ``conversation_list``, and keeping it would ship every per-item
         # patch tensor to the main process a second time.
         tc_kwargs = self._tokenize_conversation_kwargs(inference, **kwargs)

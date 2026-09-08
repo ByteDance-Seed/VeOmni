@@ -4,7 +4,7 @@ Visualize OmniModel graphs from a VeOmni omni launcher YAML.
 Contract
 --------
 Pass a single launcher ``base.yaml`` (e.g.
-``configs/seed_omni/Janus/janus_1.3b/base.yaml``) as the positional
+``configs/seed_omni/Janus/janus_1.3b/train/base.yaml``) as the positional
 ``config_file`` argument.  Its graph-pointing fields are consumed:
 
 * ``model.model_config.modules`` / ``model.model_config.train_graph`` — training vocabulary + DAG
@@ -12,7 +12,7 @@ Pass a single launcher ``base.yaml`` (e.g.
 
 and writes diagrams to ``graphs/<model_dir>_<stem>/`` (the launcher YAML's
 parent directory name + stem, e.g.
-``configs/seed_omni/Janus/janus_1.3b/base.yaml`` → ``graphs/janus_1.3b_base/``;
+``configs/seed_omni/Janus/janus_1.3b/train/base.yaml`` → ``graphs/janus_1.3b_base/``;
 the parent prefix disambiguates the per-model ``base.yaml`` launchers):
 
 1. ``training.{html|mmd}`` — training DAG from ``training_graph``
@@ -21,10 +21,10 @@ the parent prefix disambiguates the per-model ``base.yaml`` launchers):
 Usage
 -----
   # Default: raw Mermaid (.mmd) → graphs/janus_1.3b_base/
-  python scripts/visualize_omni_graph.py configs/seed_omni/Janus/janus_1.3b/base.yaml
+  python scripts/visualize_omni_graph.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
 
   # Browser-renderable HTML instead
-  python scripts/visualize_omni_graph.py configs/seed_omni/Janus/janus_1.3b/base.yaml \\
+  python scripts/visualize_omni_graph.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml \\
       --visualize.format html
 """
 

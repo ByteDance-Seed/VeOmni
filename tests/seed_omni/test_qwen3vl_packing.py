@@ -61,7 +61,7 @@ class _FakeTokenizer:
 
 
 def test_packed_train_graph_is_a_dag_of_pack_nodes():
-    spec = yaml.safe_load((_cfg_dir() / "graph_train_packed.yaml").read_text())
+    spec = yaml.safe_load((_cfg_dir() / "packed/graph_train.yaml").read_text())
     graph = TrainingGraph(spec)
     names = [node.name for node in graph.iter_nodes()]
     assert names[0] == "qwen3vl_text_encoder.pack_encode"

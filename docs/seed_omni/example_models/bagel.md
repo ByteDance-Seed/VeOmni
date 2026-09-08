@@ -20,19 +20,19 @@ Config dir: `configs/seed_omni/Bagel/bagel_7b_mot/`.
 | `bagel_qwen2_mot` | Qwen2-MoT decoder backbone | text AR and flow-denoise hidden states |
 
 The omni config layout uses the same `base.yaml` for training and inference. The
-training block references `modules_train.yaml` and `graph_train.yaml`; the
+training block references `train/modules_train.yaml` and `train/graph_train.yaml`; the
 inference block maps each scenario to a separate generation graph.
 
 | File | Role |
 |------|------|
-| `base.yaml` | Top-level launcher: model paths, accelerator, data, train, and `infer` block. |
-| `modules_train.yaml` | Per-module training paths. `bagel_qwen2_mot` is the accelerated class with `flex_attention`. |
-| `modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses SDPA. |
-| `modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2; MoT uses FlexAttention. |
-| `graph_train.yaml` | Training DAG. |
-| `graph_infer_und.yaml` | Image/text understanding to text. |
-| `graph_infer_gen.yaml` | Text to image generation. |
-| `graph_infer_edit.yaml` | Text+image to image edit. |
+| `train/base.yaml` | Top-level launcher: model paths, accelerator, data, train, and `infer` block. |
+| `train/modules_train.yaml` | Per-module training paths. `bagel_qwen2_mot` is the accelerated class with `flex_attention`. |
+| `infer/modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses SDPA. |
+| `infer/modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2; MoT uses FlexAttention. |
+| `train/graph_train.yaml` | Training DAG. |
+| `infer/graph_infer_und.yaml` | Image/text understanding to text. |
+| `infer/graph_infer_gen.yaml` | Text to image generation. |
+| `infer/graph_infer_edit.yaml` | Text+image to image edit. |
 | `data.yaml` | Weighted multisource data list. |
 
 The V2 Bagel wiring currently exposes understanding, generation, and edit.
@@ -101,12 +101,12 @@ drive real routing.
 
 ## 3. Train
 
-Training uses the accelerated Qwen2-MoT class from `modules_train.yaml`. The
+Training uses the accelerated Qwen2-MoT class from `train/modules_train.yaml`. The
 default packed attention backend is FlexAttention.
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/base.yaml
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml
 ```
 
 The training DAG is:
@@ -129,7 +129,7 @@ Quick smoke run:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/base.yaml \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
   --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
   --train.max_steps 10 \
   --train.global_batch_size 8 \
@@ -146,16 +146,16 @@ training does not use FlashAttention-2.
 
 | Backend | Class | Config | Use |
 |---------|-------|--------|-----|
-| FlexAttention | accelerated | `modules_train.yaml`, `modules_infer_fsdp.yaml` | Default packed training / FSDP inference |
+| FlexAttention | accelerated | `train/modules_train.yaml`, `infer/modules_infer_fsdp.yaml` | Default packed training / FSDP inference |
 | MagiAttention | accelerated | CLI override onto `bagel_qwen2_mot` | SM90+ fused training; see nfunc below |
-| SDPA | eager | `modules_infer_eager.yaml` | Single-process inference and the dense-mask oracle |
+| SDPA | eager | `infer/modules_infer_eager.yaml` | Single-process inference and the dense-mask oracle |
 
 Leave the YAML on `flex_attention` unless you are opting into Magi. Enable Magi
 from the CLI (the launcher rewrites it to `veomni_magi_attention_with_sp`):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/base.yaml \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
   --model.model_config.modules.bagel_qwen2_mot.ops_implementation.attn_implementation magi_attention \
   --train.micro_batch_size 1
 ```
@@ -195,12 +195,12 @@ and `OfflineEncodingMixin.derive_cache_mode`
 `train.train_type` into that module's cache mode.
 
 **Stage 1 — produce the cache** (`train.train_type: offline_cache` ⇒ VAE cache
-mode `encode_only`). `modules_train_offline_cache.yaml` declares only
+mode `encode_only`). `offline_cache/modules_train.yaml` declares only
 `bagel_vae`, and the DAG is a single edge, so nothing else is built:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/offline_cache.yaml
+  configs/seed_omni/Bagel/bagel_7b_mot/offline_cache/base.yaml
 ```
 
 ```text
@@ -217,7 +217,7 @@ skips CPU image prep entirely). `data.data_type` becomes `seedomni_cached` and
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/train_with_cache.yaml
+  configs/seed_omni/Bagel/bagel_7b_mot/with_cache/base.yaml
 ```
 
 The DAG matches §3 except that `bagel_vae.online_process` replaces
@@ -229,16 +229,16 @@ instead of encoding pixels.
 ## 4. Inference
 
 `tasks/omni/infer_omni.py` selects a generation graph with `--infer.infer_type`.
-Use `modules_infer_eager.yaml` for a single-process run or
-`modules_infer_fsdp.yaml` with `bash train.sh` for a torchrun/FSDP2 run.
+Use `infer/modules_infer_eager.yaml` for a single-process run or
+`infer/modules_infer_fsdp.yaml` with `bash train.sh` for a torchrun/FSDP2 run.
 
 ### 4.1 Understanding
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/base.yaml \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
   --infer.infer_type infer_und \
-  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/modules_infer_eager.yaml \
+  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
   --infer.image /path/to/image.jpg \
   --infer.prompt "Describe this image." \
@@ -253,9 +253,9 @@ decode until `text_done`.
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/base.yaml \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
   --infer.infer_type infer_gen \
-  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/modules_infer_eager.yaml \
+  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
   --infer.prompt "A watercolor painting of a small cabin beside a lake." \
   --infer.output_dir bagel_out \
@@ -281,9 +281,9 @@ decodes the final `BAGEL_GENERATED_LATENT`.
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/base.yaml \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
   --infer.infer_type infer_edit \
-  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/modules_infer_eager.yaml \
+  --infer.modules configs/seed_omni/Bagel/bagel_7b_mot/infer/modules_infer_eager.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT \
   --infer.image /path/to/source.jpg \
   --infer.prompt "Make it look like a snowy evening." \
@@ -301,7 +301,7 @@ the denoise prompt. The downstream denoise loop is shared with `infer_gen`.
 
 ```bash
 python scripts/visualize_omni_graph.py \
-  configs/seed_omni/Bagel/bagel_7b_mot/base.yaml
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml
 # -> graphs/bagel_7b_mot_base/{training,infer_edit,infer_gen,infer_und}.mmd
 ```
 

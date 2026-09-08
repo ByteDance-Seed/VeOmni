@@ -100,9 +100,9 @@ def test_bagel_qwen_first_understanding_step_prefills_prompt_then_decodes_bos(mo
 
 def test_bagel_infer_gen_denoise_signal_smoke():
     cfg = load_omni_config(
-        modules_path=bagel_cfg_dir() / "modules_train.yaml",
-        train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
+        modules_path=bagel_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=bagel_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=bagel_cfg_dir() / "infer/graph_infer_gen.yaml",
     )
     runtime, _model = _make_veomni_runtime(
         cfg,
@@ -138,9 +138,9 @@ def test_bagel_infer_gen_denoise_signal_smoke():
 
 def test_bagel_infer_gen_user_image_runs_siglip_context_only():
     cfg = load_omni_config(
-        modules_path=bagel_cfg_dir() / "modules_train.yaml",
-        train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
+        modules_path=bagel_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=bagel_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=bagel_cfg_dir() / "infer/graph_infer_gen.yaml",
     )
     siglip = _CountingInferGenBagelSiglip()
     runtime, _model = _make_veomni_runtime(
@@ -183,9 +183,9 @@ def test_bagel_infer_gen_user_image_runs_siglip_context_only():
 
 def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
     cfg = load_omni_config(
-        modules_path=bagel_cfg_dir() / "modules_train.yaml",
-        train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
-        infer_graph_path=bagel_cfg_dir() / "graph_infer_edit.yaml",
+        modules_path=bagel_cfg_dir() / "train/modules_train.yaml",
+        train_graph_path=bagel_cfg_dir() / "train/graph_train.yaml",
+        infer_graph_path=bagel_cfg_dir() / "infer/graph_infer_edit.yaml",
     )
     runtime, _model = _make_veomni_runtime(
         cfg,

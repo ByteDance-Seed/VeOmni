@@ -71,7 +71,7 @@ def test_fsdp_scope_defaults_to_module():
 
 
 def test_packed_train_graph_is_a_dag_of_pack_nodes():
-    spec = yaml.safe_load((_janus_cfg_dir() / "graph_train_packed.yaml").read_text())
+    spec = yaml.safe_load((_janus_cfg_dir() / "packed/graph_train.yaml").read_text())
     graph = TrainingGraph(spec)
     names = [node.name for node in graph.iter_nodes()]
     assert names[0] == "janus_text_encoder.pack_encode"

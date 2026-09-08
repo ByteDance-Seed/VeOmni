@@ -28,9 +28,9 @@ def _omni_args(*, model_path: str = "/tmp/janus") -> OmniArguments:
         model=OmniModelRuntimeArguments(
             model_path=model_path,
             model_config={
-                "modules": str(cfg_dir / "modules_train.yaml"),
-                "train_graph": str(cfg_dir / "graph_train.yaml"),
-                "infer_graph": {"infer_gen": str(cfg_dir / "graph_infer_gen.yaml")},
+                "modules": str(cfg_dir / "train/modules_train.yaml"),
+                "train_graph": str(cfg_dir / "train/graph_train.yaml"),
+                "infer_graph": {"infer_gen": str(cfg_dir / "infer/graph_infer_gen.yaml")},
             },
         ),
         data=OmniDataArguments(train_path=""),
@@ -45,9 +45,9 @@ def _janus_model_runtime(**kwargs) -> OmniModelRuntimeArguments:
     return build_omni_model_runtime(
         global_args=args._to_module_global_args(),
         model_path=model_path,
-        train_modules=str(cfg_dir / "modules_train.yaml"),
-        train_graph=kwargs.pop("train_graph", str(cfg_dir / "graph_train.yaml")),
-        infer_graph=kwargs.pop("infer_graph", str(cfg_dir / "graph_infer_gen.yaml")),
+        train_modules=str(cfg_dir / "train/modules_train.yaml"),
+        train_graph=kwargs.pop("train_graph", str(cfg_dir / "train/graph_train.yaml")),
+        infer_graph=kwargs.pop("infer_graph", str(cfg_dir / "infer/graph_infer_gen.yaml")),
         **kwargs,
     )
 
@@ -133,7 +133,7 @@ def test_build_module_runtime_args_resolves_relative_model_paths():
     modules = build_module_runtime_args(
         args._to_module_global_args(),
         "/tmp/janus",
-        str(cfg_dir / "modules_train.yaml"),
+        str(cfg_dir / "train/modules_train.yaml"),
     )
     assert modules["janus_siglip"].model_path.startswith("/tmp/janus")
 
@@ -143,7 +143,7 @@ def test_packed_modules_yaml_sets_text_encoder_processor_config():
     modules = build_module_runtime_args(
         args._to_module_global_args(),
         "/tmp/janus",
-        str(_janus_cfg_dir() / "modules_train_packed.yaml"),
+        str(_janus_cfg_dir() / "packed/modules_train.yaml"),
     )
     encoder = modules["janus_text_encoder"]
     assert encoder.processor_config == {"packed_preprocess": True}
@@ -185,12 +185,12 @@ def test_build_module_runtime_args_merges_module_optimizer():
 def test_omni_arguments_resolve_model_modules_match_builder():
     args = _omni_args()
     cfg_dir = _janus_cfg_dir()
-    args.model.model_config["modules"] = str(cfg_dir / "modules_infer_fsdp.yaml")
+    args.model.model_config["modules"] = str(cfg_dir / "infer/modules_infer_fsdp.yaml")
     built = args.resolve_model(for_inference=True).modules
     direct = build_module_runtime_args(
         args._to_module_global_args(),
         args.model.model_path,
-        str(cfg_dir / "modules_infer_fsdp.yaml"),
+        str(cfg_dir / "infer/modules_infer_fsdp.yaml"),
         for_inference=True,
     )
     assert set(built) == set(direct)
@@ -211,8 +211,8 @@ def test_resolve_model_carries_every_infer_graph_scenario():
     args = _omni_args()
     cfg_dir = _janus_cfg_dir()
     args.model.model_config["infer_graph"] = {
-        "infer_gen": str(cfg_dir / "graph_infer_gen.yaml"),
-        "infer_und": str(cfg_dir / "graph_infer_und.yaml"),
+        "infer_gen": str(cfg_dir / "infer/graph_infer_gen.yaml"),
+        "infer_und": str(cfg_dir / "infer/graph_infer_und.yaml"),
     }
     args.model.set_launcher_config("infer_type", "infer_und")
 
@@ -226,8 +226,8 @@ def test_resolve_model_defaults_infer_type_to_first_scenario():
     args = _omni_args()
     cfg_dir = _janus_cfg_dir()
     args.model.model_config["infer_graph"] = {
-        "infer_gen": str(cfg_dir / "graph_infer_gen.yaml"),
-        "infer_und": str(cfg_dir / "graph_infer_und.yaml"),
+        "infer_gen": str(cfg_dir / "infer/graph_infer_gen.yaml"),
+        "infer_und": str(cfg_dir / "infer/graph_infer_und.yaml"),
     }
     args.model.model_config.pop("infer_type", None)
 
@@ -247,8 +247,8 @@ def test_resolve_model_carries_every_train_graph_scenario():
     args = _omni_args()
     cfg_dir = _janus_cfg_dir()
     args.model.model_config["train_graph"] = {
-        "train": str(cfg_dir / "graph_train.yaml"),
-        "alt": str(cfg_dir / "graph_train.yaml"),
+        "train": str(cfg_dir / "train/graph_train.yaml"),
+        "alt": str(cfg_dir / "train/graph_train.yaml"),
     }
     args.model.set_launcher_config("train_type", "train")
 
@@ -270,8 +270,8 @@ def test_resolve_model_rejects_unknown_train_type():
     args = _omni_args()
     cfg_dir = _janus_cfg_dir()
     args.model.model_config["train_graph"] = {
-        "train": str(cfg_dir / "graph_train.yaml"),
-        "alt": str(cfg_dir / "graph_train.yaml"),
+        "train": str(cfg_dir / "train/graph_train.yaml"),
+        "alt": str(cfg_dir / "train/graph_train.yaml"),
     }
     args.model.set_launcher_config("train_type", "does_not_exist")
     with pytest.raises(KeyError, match="train_type"):
@@ -284,7 +284,7 @@ def test_infer_module_overrides_apply_eager_defaults():
     train_args = args.resolve_model().modules
     assert train_args["janus_llama"].accelerator.fsdp_config.fsdp_mode == "fsdp2"
 
-    args.model.model_config["modules"] = str(cfg_dir / "modules_infer_eager.yaml")
+    args.model.model_config["modules"] = str(cfg_dir / "infer/modules_infer_eager.yaml")
     infer_args = args.resolve_model(for_inference=True).modules
     assert infer_args["janus_llama"].accelerator.fsdp_config.fsdp_mode == "eager"
 

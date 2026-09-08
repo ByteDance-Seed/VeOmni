@@ -1,25 +1,24 @@
-# VeOmni training / inference config for OmniModel V2 — Qwen3-0.6B.
+# Janus-1.3B packed training launcher (conversation graph stays in base.yaml).
 #
-# Launch training:
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3_0.6b/base.yaml
+# Packed tokens/masks are built in the Janus text-encoder preprocessor; graph
+# nodes are pack_encode / pack_forward / pack_decode. Inference graphs are
+# unchanged (conversation FSM).
 #
-# Launch inference (text-only chat):
-#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
-#     --infer.prompt "What is 2+2?" \
-#     --infer.output_dir qwen3_out
+# Launch:
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/packed/base.yaml
 #
-# Prerequisite — split the upstream Qwen3 checkpoint:
-#   python scripts/convert_model.py \
-#     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
-#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
-
+# Combine with a single FSDP tree over the composed OmniModel:
+#   --accelerator.fsdp_config.fsdp_scope model
 model:
-  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3_0.6b/modules_train.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3_0.6b/graph_train.yaml
+    modules: configs/seed_omni/Janus/janus_1.3b/packed/modules_train.yaml
+    train_graph: configs/seed_omni/Janus/janus_1.3b/packed/graph_train.yaml
     infer_graph:
-      infer_text: configs/seed_omni/Qwen/qwen3_0.6b/graph_infer.yaml
+      infer_gen: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_und.yaml
+      infer_interleave: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_interleave.yaml
+    infer_type: infer_interleave
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -60,7 +59,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/qwen3_0.6b/data.yaml
+  train_path: configs/seed_omni/Janus/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
@@ -71,15 +70,16 @@ data:
     pin_memory: true
     prefetch_factor: 2
 
+
 train:
   seed: 42
   num_train_epochs: 1
   global_batch_size: 32
-  micro_batch_size: 2
+  micro_batch_size: 1
   dyn_bsz: false
 
   checkpoint:
-    output_dir: outputs/qwen3_0.6b_omni_sft
+    output_dir: outputs/janus_1.3b_omni_sft_packed
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
@@ -88,11 +88,12 @@ train:
   wandb:
     enable: true
     project: VeOmni_omni
-    name: qwen3_0.6b_omni_sft
+    name: janus_1.3b_omni_sft_packed
 
 infer:
   generation_kwargs:
     max_new_tokens: 2048
     temperature: 0.0
     top_p: 1.0
-    do_sample: false
+    do_sample: False
+    guidance_scale: 5.0

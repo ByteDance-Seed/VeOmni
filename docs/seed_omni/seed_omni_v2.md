@@ -344,7 +344,7 @@ them. No central averaging — token counts stay correct across modules.
 
 ## 3. Training flow (Janus joint SFT)
 
-The default Janus `training_graph` (`configs/seed_omni/Janus/janus_1.3b/graph_train.yaml`):
+The default Janus `training_graph` (`configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml`):
 
 ```mermaid
 flowchart LR
@@ -413,9 +413,9 @@ the FSM — `OmniInferencer` calls `reset()` at request boundaries.
 
 The same node pool backs three different FSMs, selected by
 `infer.infer_type` (a key into the `infer.infer_graph` map, each pointing at one
-`graph_infer_*.yaml`):
+`infer/graph_infer*.yaml`):
 
-**Understanding — `graph_infer_und.yaml` (I2T / VQA):**
+**Understanding — `infer/graph_infer_und.yaml` (I2T / VQA):**
 
 ```mermaid
 stateDiagram-v2
@@ -429,7 +429,7 @@ stateDiagram-v2
 The `token_generate` node (the text encoder's `generate`) samples a token each
 step and emits the `text_done` signal when it hits `</s>`.
 
-**Generation — `graph_infer_gen.yaml` (T2I):**
+**Generation — `infer/graph_infer_gen.yaml` (T2I):**
 
 ```mermaid
 stateDiagram-v2
@@ -444,7 +444,7 @@ stateDiagram-v2
 `vqvae.generate` for 576 VQ steps and emits `image_complete` when the grid is
 full; `image_vq_end` emits `<end_of_image>`.
 
-**Interleave — `graph_infer_interleave.yaml`:** the model decides mid-stream whether
+**Interleave — `infer/graph_infer_interleave.yaml`:** the model decides mid-stream whether
 to open an image span (`start_image_gen` on a sampled `<boi>`), so `text_ar`
 and `image_vq` transition into each other instead of straight to `done`.
 
@@ -498,21 +498,25 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
    / `OMNI_PROCESSOR_REGISTRY`), keyed by `model_type`. The trainer resolves a
    module by reading `config.json` → `model_type` → registry.
 
-4. **Write the YAML** (`configs/seed_omni/<model>/`):
-   - `base.yaml` — top-level launcher: `model.*` (incl. `modules` / `train_graph`
-     paths), top-level `accelerator`, `data.*`, `train.*`, and the `infer` block.
-   - `modules_train.yaml` — per-module training overrides (`model` / `train` /
+4. **Write the YAML** (`configs/seed_omni/<model>/<task>/`, one folder per task —
+   `train/`, `packed/`, `offline_cache/`, … — holding that task's launcher and
+   the fragments only it uses; anything two or more tasks share moves up to
+   `infer/` or, for `data.yaml`, to the model root):
+   - `<task>/base.yaml` — top-level launcher: `model.*` (incl. `modules` /
+     `train_graph` paths), top-level `accelerator`, `data.*`, `train.*`, and the
+     `infer` block.
+   - `train/modules_train.yaml` — per-module training overrides (`model` / `train` /
      `accelerator` per module). A module's `accelerator` block drives its own
      parallel topology on the full world (heterogeneous FSDP2 / FSDP2+`emb`/`ep`
      / DDP); modules matching the global topology reuse it, others build their
      own `ParallelState`.
-   - `graph_train.yaml` — the `training_graph` (a flat list of edges whose
+   - `train/graph_train.yaml` — the `training_graph` (a flat list of edges whose
      endpoints are `module[.method]` strings). Remember: edges only declare
      order; conversation graphs move data via the conversation list. Janus
-     packed graphs (`graph_train_packed.yaml`) use `pack_*` methods and
+     packed graphs (`packed/graph_train.yaml`) use `pack_*` methods and
      packed tensors on the batch dict instead.
-   - `modules_infer.yaml` (optional) — per-module inference overrides.
-   - `graph_infer_*.yaml` — one `generation_graph` (FSM) per scenario, mapped
+   - `infer/modules_infer_*.yaml` (optional) — per-module inference overrides.
+   - `infer/graph_infer*.yaml` — one `generation_graph` (FSM) per scenario, mapped
      under `infer.infer_graph`. `OmniConfig` loads **all** of them into
      `generation_graphs` and `infer.infer_type` selects the active one, so an
      exported checkpoint keeps serving every scenario.
@@ -558,5 +562,5 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `modules/<family>/<sub>/` | per-module `configuration.py`, `modeling.py` (native, incl. `generate`), `accelerated/` (training-graph hooks: `accelerated.py` [+ `packed.py`]) [, `processing.py`] |
 | `veomni/trainer/omni/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
 | `veomni/trainer/omni/omni_inferencer.py` | request loop, `reset` + `finalize` |
-| `configs/seed_omni/<model>/` | `base.yaml` + `modules_train.yaml` + `graph_train.yaml` (+ `modules_infer.yaml` / `graph_infer_*.yaml`) |
+| `configs/seed_omni/<model>/<task>/` | per task: `base.yaml` + `modules_train.yaml` + `graph_train.yaml`; shared across tasks: `infer/graph_infer*.yaml`, `infer/modules_infer_*.yaml`, `data.yaml` |
 ```

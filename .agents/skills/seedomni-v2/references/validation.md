@@ -6,8 +6,8 @@ Use the narrowest validation that proves the changed surface, then broaden.
 
 ```bash
 source .venv/bin/activate
-python scripts/visualize_omni_graph.py configs/seed_omni/<model>/<variant>/base.yaml
-python scripts/visualize_omni_graph.py configs/seed_omni/<model>/<variant>/base.yaml --visualize.format html
+python scripts/visualize_omni_graph.py configs/seed_omni/<model>/<variant>/train/base.yaml
+python scripts/visualize_omni_graph.py configs/seed_omni/<model>/<variant>/train/base.yaml --visualize.format html
 ```
 
 Check:

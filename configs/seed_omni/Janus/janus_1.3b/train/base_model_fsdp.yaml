@@ -1,23 +1,24 @@
-# Janus-1.3B packed training launcher (conversation graph stays in base.yaml).
+# Janus-1.3B training launcher with one FSDP2 tree over the composed OmniModel.
 #
-# Packed tokens/masks are built in the Janus text-encoder preprocessor; graph
-# nodes are pack_encode / pack_forward / pack_decode. Inference graphs are
-# unchanged (conversation FSM).
+# Per-module DDP / embed-parallel overlays in modules_train.yaml are unused:
+# mesh / init / wrap come from this top-level accelerator. Every module is
+# meta-initialized unwrapped, then OmniModel is fully_shard'd once (layer
+# wrap on every child's _no_split_modules, then the root).
 #
 # Launch:
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/base_packed.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base_model_fsdp.yaml
 #
-# Combine with a single FSDP tree over the composed OmniModel:
+# Packed tokens + this wrap: use ../packed/base.yaml and add
 #   --accelerator.fsdp_config.fsdp_scope model
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
   model_config:
-    modules: configs/seed_omni/Janus/janus_1.3b/modules_train_packed.yaml
-    train_graph: configs/seed_omni/Janus/janus_1.3b/graph_train_packed.yaml
+    modules: configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml
+    train_graph: configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml
     infer_graph:
-      infer_gen: configs/seed_omni/Janus/janus_1.3b/graph_infer_gen.yaml
-      infer_und: configs/seed_omni/Janus/janus_1.3b/graph_infer_und.yaml
-      infer_interleave: configs/seed_omni/Janus/janus_1.3b/graph_infer_interleave.yaml
+      infer_gen: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_und.yaml
+      infer_interleave: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_interleave.yaml
     infer_type: infer_interleave
   ops_implementation:
     attn_implementation: flash_attention_2
@@ -29,6 +30,7 @@ model:
       enable_reentrant: false
     fsdp_config:
       fsdp_mode: fsdp2
+      fsdp_scope: model
       reshard_after_forward: true
       reshard_after_backward: true
       forward_prefetch: true
@@ -79,7 +81,7 @@ train:
   dyn_bsz: false
 
   checkpoint:
-    output_dir: outputs/janus_1.3b_omni_sft_packed
+    output_dir: outputs/janus_1.3b_omni_sft_model_fsdp
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
@@ -88,7 +90,7 @@ train:
   wandb:
     enable: true
     project: VeOmni_omni
-    name: janus_1.3b_omni_sft_packed
+    name: janus_1.3b_omni_sft_model_fsdp
 
 infer:
   generation_kwargs:

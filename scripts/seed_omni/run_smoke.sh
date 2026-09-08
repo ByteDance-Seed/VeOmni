@@ -121,11 +121,11 @@ infer_overrides() {
 }
 
 declare -A CONFIG=(
-  [janus]="$CFG_DIR/Janus/janus_1.3b/base.yaml"
-  [qwen3]="$CFG_DIR/Qwen/qwen3_0.6b/base.yaml"
-  [qwen3_it]="$CFG_DIR/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml"
-  [qwen3vl]="$CFG_DIR/Qwen/qwen3vl_2b/base.yaml"
-  [qwen3moe]="$CFG_DIR/Qwen/qwen3_30b_a3b/base.yaml"
+  [janus]="$CFG_DIR/Janus/janus_1.3b/train/base.yaml"
+  [qwen3]="$CFG_DIR/Qwen/qwen3_0.6b/train/base.yaml"
+  [qwen3_it]="$CFG_DIR/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml"
+  [qwen3vl]="$CFG_DIR/Qwen/qwen3vl_2b/train/base.yaml"
+  [qwen3moe]="$CFG_DIR/Qwen/qwen3_30b_a3b/train/base.yaml"
 )
 
 declare -A TRAIN_STATUS
@@ -155,7 +155,7 @@ run_infer() {
       # T2I needs the full image-token grid, so override the shared short cap.
       # shellcheck disable=SC2046
       run_logged "$log" bash train.sh "$INFER_PY" "${CONFIG[$name]}" \
-        --model.model_config.modules "$CFG_DIR/Janus/janus_1.3b/modules_infer_fsdp.yaml" \
+        --model.model_config.modules "$CFG_DIR/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml" \
         --model.model_config.infer_type infer_gen \
         --infer.prompt "A photo of a cat sitting on a chair." \
         $common \
@@ -192,7 +192,7 @@ run_infer() {
       # Distributed (FSDP2 + Expert-Parallel) text inference (eager would OOM at 30B).
       # shellcheck disable=SC2046
       run_logged "$log" bash train.sh "$INFER_PY" "${CONFIG[$name]}" \
-        --model.model_config.modules "$CFG_DIR/Qwen/qwen3_30b_a3b/modules_infer_fsdp.yaml" \
+        --model.model_config.modules "$CFG_DIR/Qwen/qwen3_30b_a3b/infer/modules_infer_fsdp.yaml" \
         --infer.prompt "What is 2+2? Answer briefly." \
         $common
       ;;

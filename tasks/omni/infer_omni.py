@@ -18,7 +18,7 @@ Examples
 Single-process eager (default — ``resolve_model(for_inference=True)`` forces eager
 unless ``modules_infer_*.yaml`` overrides):
 
-    python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/base.yaml \\
+    python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \\
         --model.model_config.infer_type vision_understanding \\
         --infer.prompt "What is in this image?" \\
         --infer.image /path/to/image.jpg \\
@@ -27,8 +27,8 @@ unless ``modules_infer_*.yaml`` overrides):
 Distributed inference (override modules to FSDP2 / DDP in ``modules_infer_fsdp.yaml``):
 
     bash train.sh tasks/omni/infer_omni.py \\
-        configs/seed_omni/Janus/janus_1.3b/base.yaml \\
-        --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml \\
+        configs/seed_omni/Janus/janus_1.3b/train/base.yaml \\
+        --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \\
         --model.model_config.infer_type infer_gen \\
         --infer.prompt "A cat on a windowsill"
 """

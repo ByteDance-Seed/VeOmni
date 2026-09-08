@@ -36,14 +36,14 @@ def _janus_cfg_dir() -> Path:
 def _janus_args(*, modules_override: dict | None = None) -> OmniArguments:
     cfg_dir = _janus_cfg_dir()
     model_config = {
-        "modules": str(cfg_dir / "modules_train.yaml"),
-        "train_graph": str(cfg_dir / "graph_train.yaml"),
-        "infer_graph": {"infer_gen": str(cfg_dir / "graph_infer_gen.yaml")},
+        "modules": str(cfg_dir / "train/modules_train.yaml"),
+        "train_graph": str(cfg_dir / "train/graph_train.yaml"),
+        "infer_graph": {"infer_gen": str(cfg_dir / "infer/graph_infer_gen.yaml")},
     }
     if modules_override is not None:
         from veomni.arguments.omni_parser import load_yaml_with_inherit
 
-        loaded = load_yaml_with_inherit(str(cfg_dir / "modules_train.yaml"))
+        loaded = load_yaml_with_inherit(str(cfg_dir / "train/modules_train.yaml"))
         for name, override in modules_override.items():
             loaded.setdefault(name, {})
             loaded[name] = {**loaded[name], **override}

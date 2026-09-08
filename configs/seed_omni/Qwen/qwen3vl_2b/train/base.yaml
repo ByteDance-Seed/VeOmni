@@ -1,10 +1,10 @@
 # VeOmni training / inference config for OmniModel V2 — Qwen3-VL-2B-Instruct.
 #
 # Launch training (text + image + video understanding SFT):
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl_2b/base.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml
 #
 # Launch inference (image/video understanding):
-#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/base.yaml \
+#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3vl_2b/train/base.yaml \
 #     --infer.image /path/to/image.jpg \
 #     --infer.prompt "What is in this image?" \
 #     --infer.output_dir qwen3vl_out
@@ -20,10 +20,10 @@
 model:
   model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct
   model_config:
-    modules: configs/seed_omni/Qwen/qwen3vl_2b/modules_train.yaml
-    train_graph: configs/seed_omni/Qwen/qwen3vl_2b/graph_train.yaml
+    modules: configs/seed_omni/Qwen/qwen3vl_2b/train/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3vl_2b/train/graph_train.yaml
     infer_graph:
-      vision_understanding: configs/seed_omni/Qwen/qwen3vl_2b/graph_infer.yaml
+      vision_understanding: configs/seed_omni/Qwen/qwen3vl_2b/infer/graph_infer.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 

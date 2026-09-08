@@ -8,14 +8,26 @@ Typical layout:
 
 ```text
 configs/seed_omni/<Model>/<variant>/
-├── base.yaml
-├── modules_train.yaml
-├── modules_infer_eager.yaml
-├── modules_infer_fsdp.yaml
-├── graph_train.yaml
-├── graph_infer.yaml
-└── graph_infer_<scenario>.yaml
+├── data.yaml                        # only if two or more tasks share it
+├── train/                           # one folder per task; the folder name
+│   ├── base.yaml                    # absorbs the task SUFFIX only -- the
+│   ├── modules_train.yaml           # graph_train / modules_train prefixes
+│   └── graph_train.yaml             # stay, so a file still says what it is
+├── packed/                          # a second task, same three files
+│   ├── base.yaml                    # (was base_packed.yaml)
+│   ├── modules_train.yaml           # (was modules_train_packed.yaml)
+│   └── graph_train.yaml             # (was graph_train_packed.yaml)
+└── infer/                           # inference fragments shared across tasks
+    ├── modules_infer_eager.yaml
+    ├── modules_infer_fsdp.yaml
+    ├── graph_infer.yaml
+    └── graph_infer_<scenario>.yaml
 ```
+
+Each task folder holds its launcher plus the fragments only that task uses. A
+fragment two or more tasks share moves up — to `infer/` for inference graphs and
+module overrides, or to the model root for `data.yaml`. A task whose inference
+graph is its own alone keeps it inside its own folder.
 
 `base.yaml` points to module and graph files. **A graph file *is* its graph** —
 the payload sits at the file top level with no wrapper key. Do not redeclare
@@ -59,8 +71,8 @@ name to its file, and `infer.infer_type` picks the active one:
 ```yaml
 infer:
   infer_graph:
-    infer_gen: configs/seed_omni/<Model>/<variant>/graph_infer_gen.yaml
-    infer_und: configs/seed_omni/<Model>/<variant>/graph_infer_und.yaml
+    infer_gen: configs/seed_omni/<Model>/<variant>/infer/graph_infer_gen.yaml
+    infer_und: configs/seed_omni/<Model>/<variant>/infer/graph_infer_und.yaml
   infer_type: infer_gen
 ```
 

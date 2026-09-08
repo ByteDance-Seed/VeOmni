@@ -11,7 +11,7 @@ re-package under an updated config projection.
 Usage::
 
     python scripts/seed_omni/export_omni_checkpoint.py \\
-        configs/seed_omni/Janus/janus_1.3b/base.yaml \\
+        configs/seed_omni/Janus/janus_1.3b/train/base.yaml \\
         --export.output_dir /path/to/Janus-1.3B-hf \\
         --model.model_path /mnt/hdfs/.../Janus-1.3B \\
         --export.verify

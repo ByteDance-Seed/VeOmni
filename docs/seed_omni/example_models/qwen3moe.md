@@ -16,18 +16,18 @@ All paths below assume the upstream HuggingFace checkpoint lives at
 `/mnt/hdfs/veomni/models/Qwen3-30B-A3B`. Adjust to your own storage.
 
 Config dir: `configs/seed_omni/Qwen/qwen3_30b_a3b/`. As with dense Qwen3, both
-training and inference take the **same** `base.yaml`; the data list is shared
-from `configs/seed_omni/Qwen/qwen3_0.6b/data.yaml`.
+training and inference take the **same** `train/base.yaml`; the data list is its
+own copy of the dense-Qwen3 mixture at `train/data.yaml`.
 
 | File | Role |
 |------|------|
-| `base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, `infer` block. |
-| `modules_train.yaml` | Per-module training overrides — `qwen3_moe_llm` carries the `ep` extra-parallel block. |
-| `graph_train.yaml` | Training DAG. |
-| `modules_infer_eager.yaml` | Inference overrides — all eager (single-process). |
-| `modules_infer_fsdp.yaml` | Inference overrides — distributed FSDP2 + EP (mirrors train). |
-| `graph_infer.yaml` | Text chat generation graph (`infer.infer_graph.infer_text`). |
-| `../qwen3_0.6b/data.yaml` | Weighted multisource data list (shared with dense Qwen3). |
+| `train/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, `infer` block. |
+| `train/modules_train.yaml` | Per-module training overrides — `qwen3_moe_llm` carries the `ep` extra-parallel block. |
+| `train/graph_train.yaml` | Training DAG. |
+| `infer/modules_infer_eager.yaml` | Inference overrides — all eager (single-process). |
+| `infer/modules_infer_fsdp.yaml` | Inference overrides — distributed FSDP2 + EP (mirrors train). |
+| `train/graph_infer.yaml` | Text chat generation graph (`infer.infer_graph.infer_text`). |
+| `train/data.yaml` | Weighted multisource data list — a local copy of the dense-Qwen3 mixture. |
 
 ---
 
@@ -55,14 +55,14 @@ Notes:
 
 ## 2. Prepare data
 
-Same weighted multisource mix as dense Qwen3 — the shared
-`configs/seed_omni/Qwen/qwen3_0.6b/data.yaml`. Each `names` entry must match a
+Same weighted multisource mix as dense Qwen3, in this model's own
+`configs/seed_omni/Qwen/qwen3_30b_a3b/train/data.yaml`. Each `names` entry must match a
 preprocessor key in `veomni/data/seed_omni/preprocess.py`
 (`SEED_OMNI_PREPROCESSOR_REGISTRY`); `tulu-3-sft-mixture` maps each row's
 `messages` list to a `[role, ("text", content)]` conversation.
 
 ```yaml
-# configs/seed_omni/Qwen/qwen3_0.6b/data.yaml (shared)
+# configs/seed_omni/Qwen/qwen3_30b_a3b/train/data.yaml
 sources:
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
 names:
@@ -81,10 +81,10 @@ The on-disk row schema is documented in
 
 ## 3. Train
 
-Expert Parallel is configured per-module in `modules_train.yaml`:
+Expert Parallel is configured per-module in `train/modules_train.yaml`:
 
 ```yaml
-# configs/seed_omni/Qwen/qwen3_30b_a3b/modules_train.yaml — qwen3_moe_llm
+# configs/seed_omni/Qwen/qwen3_30b_a3b/train/modules_train.yaml — qwen3_moe_llm
 accelerator:
   ep_size: 4            # EP degree; must divide world size AND num_experts (128)
 ```
@@ -97,14 +97,14 @@ shipped `ep=4` needs ≥ 4 GPUs (`train.sh` auto-detects the count and launches 
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_30b_a3b/base.yaml \
+  configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
   --model.model_path /mnt/hdfs/user_dir/omni_v2/ckpt/Qwen3-30B-A3B
 ```
 
 Key knobs:
 
 - `--model.model_path` — split-checkpoint root from step 1.
-- `accelerator.ep_size` (in `modules_train.yaml`, `qwen3_moe_llm`) — Expert Parallel degree; must divide both the world size and `num_experts` (128).
+- `accelerator.ep_size` (in `train/modules_train.yaml`, `qwen3_moe_llm`) — Expert Parallel degree; must divide both the world size and `num_experts` (128).
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
 - `--data.max_seq_len` — packed sequence length.
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
@@ -113,7 +113,7 @@ Key knobs:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_30b_a3b/base.yaml \
+  configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
   --model.model_path /mnt/hdfs/user_dir/omni_v2/ckpt/Qwen3-30B-A3B \
   --train.max_steps 20 --train.global_batch_size 8 --train.micro_batch_size 1 \
   --data.max_seq_len 2048 --train.checkpoint.save_steps 10 --train.wandb.enable false
@@ -129,7 +129,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_30b_a3b/base.yaml \
+  configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
   --model.model_path /mnt/hdfs/user_dir/omni_v2/ckpt/Qwen3-30B-A3B \
   --train.checkpoint.load_path outputs/qwen3_30b_a3b_omni_sft/checkpoints/global_step_500
 ```
@@ -146,7 +146,7 @@ the full 128-expert weights. No torchrun / EP.
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_30b_a3b/base.yaml \
+  configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
   --infer.model_path /mnt/hdfs/user_dir/omni_v2/ckpt/Qwen3-30B-A3B \
   --infer.infer_type infer_text \
   --infer.prompt "Give me a short introduction to large language models." \
@@ -161,9 +161,9 @@ modules, inits the process group, and runs each module's forward under its own
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
-  configs/seed_omni/Qwen/qwen3_30b_a3b/base.yaml \
+  configs/seed_omni/Qwen/qwen3_30b_a3b/train/base.yaml \
   --infer.model_path /mnt/hdfs/user_dir/omni_v2/ckpt/Qwen3-30B-A3B \
-  --infer.modules configs/seed_omni/Qwen/qwen3_30b_a3b/modules_infer_fsdp.yaml \
+  --infer.modules configs/seed_omni/Qwen/qwen3_30b_a3b/infer/modules_infer_fsdp.yaml \
   --infer.infer_type infer_text \
   --infer.prompt "Give me a short introduction to large language models." \
   --infer.output_dir qwen3moe_out \
