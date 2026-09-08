@@ -1,12 +1,12 @@
 from .clip_grad_norm import clip_grad_norm
 from .reduce_scatter import (
-    BF16FP16ReduceScatterWithFP32Accumulation,
-    register_bf16_fp16_reduce_scatter_with_fp32_accumulation,
+    FP32ReduceScatterWithLowPrecisionTransport,
+    register_fp32_reduce_scatter_with_low_precision_transport,
 )
 
 
 __all__ = [
-    "BF16FP16ReduceScatterWithFP32Accumulation",
+    "FP32ReduceScatterWithLowPrecisionTransport",
     "clip_grad_norm",
-    "register_bf16_fp16_reduce_scatter_with_fp32_accumulation",
+    "register_fp32_reduce_scatter_with_low_precision_transport",
 ]
