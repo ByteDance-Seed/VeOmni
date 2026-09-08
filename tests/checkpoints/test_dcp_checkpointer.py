@@ -1205,38 +1205,40 @@ class TestPromoteStagedCheckpoint:
                     _promote_staged_checkpoint(stage_path, final_path)
         assert not os.path.exists(stage_path)
 
-    @pytest.mark.parametrize("failing_rank", [0, 1])
-    def test_every_rank_runs_the_same_barriers_when_a_copy_fails(self, staged, failing_rank):
+    # (global_rank, local_rank) for the three roles promotion distinguishes.
+    # Rank 8 matters on its own: it leads its node but is not the coordinator, so
+    # it copies data without ever touching `.metadata`.
+    _ROLES = {"coordinator_leader": (0, 0), "leader_only": (8, 0), "participant": (1, 1)}
+
+    @pytest.mark.parametrize("failing_role", list(_ROLES))
+    def test_every_rank_runs_the_same_barriers_when_a_copy_fails(self, staged, failing_role):
         """Collective parity: barriers are untagged, so one rank skipping one hangs the job.
 
-        Ranks 0 and 1 stand in for the two roles that do work -- rank 0 is both
-        coordinator and a node leader, rank 1 is a plain participant. Whatever
-        fails, both must reach the same number of barriers, and the error must
-        surface only after the last one.
+        Whichever role fails, every role must reach the same number of barriers and
+        surface the error only after the last one.
         """
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
         counts = {}
-        for rank in (0, 1):
+        for role, (global_rank, local_rank) in self._ROLES.items():
             stage_path, final_path = staged
             barrier = MagicMock()
-            local_rank = 0 if rank == 0 else 1
             with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
                 with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier", barrier):
-                    with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=rank):
+                    with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=global_rank):
                         with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=local_rank):
                             with patch(
                                 "veomni.checkpoint.dcp_checkpointer.shutil.copyfile",
-                                side_effect=OSError("boom") if rank == failing_rank else None,
+                                side_effect=OSError("boom") if role == failing_role else None,
                             ):
                                 try:
                                     _promote_staged_checkpoint(stage_path, final_path)
                                 except OSError:
                                     pass
-            counts[rank] = barrier.call_count
+            counts[role] = barrier.call_count
 
-        assert counts[0] == counts[1], f"barrier count diverged across ranks: {counts}"
-        assert counts[0] == 4
+        assert len(set(counts.values())) == 1, f"barrier count diverged across roles: {counts}"
+        assert set(counts.values()) == {4}
 
     def test_failure_is_raised_only_after_the_last_barrier(self, staged):
         """Raising early would strand the other ranks on a collective that never completes."""
@@ -1268,6 +1270,31 @@ class TestPromoteStagedCheckpoint:
 
 
 class TestStageDirValidation:
+    def test_stage_dir_with_explicit_storage_writer_is_rejected(self, tmp_path):
+        """Silently ignoring stage_dir would write to the slow destination it was avoiding."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        with pytest.raises(ValueError, match="explicit storage_writer"):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=False,
+                storage_writer=MagicMock(),
+                stage_dir=str(tmp_path / "stage"),
+            )
+        assert not final.exists()
+
+    def test_stage_key_does_not_collide_across_similar_paths(self):
+        """Separator substitution maps /tmp/a_b/c and /tmp/a/b_c onto one directory."""
+        from veomni.checkpoint.dcp_checkpointer import _stage_key
+
+        assert _stage_key("/tmp/a_b/c") != _stage_key("/tmp/a/b_c")
+        assert _stage_key("/tmp/run/step_1") == _stage_key("/tmp/run/step_1")
+        assert _stage_key("/tmp/run/step_1") != _stage_key("/tmp/run/step_2")
+        # relative and absolute spellings of one destination stage together
+        assert _stage_key("/tmp/run/step_1") == _stage_key("/tmp/run/./step_1")
+
     def test_stage_dir_with_save_async_is_rejected_before_any_side_effect(self, tmp_path):
         """The staged copy is dropped when save() returns, i.e. before an async write ends."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer

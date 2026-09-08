@@ -14,6 +14,7 @@
 
 
 import gc
+import hashlib
 import os
 import shutil
 from collections import OrderedDict
@@ -462,6 +463,19 @@ def _local_rank() -> int:
     return int(value) if value.isdigit() else 0
 
 
+def _stage_key(checkpoint_dir: str) -> str:
+    """Directory name that isolates one destination's staged files from another's.
+
+    Two jobs writing different destinations can share a node, and the same job can
+    be retried, so the key must not collide. Separator substitution would: it maps
+    ``/tmp/a_b/c`` and ``/tmp/a/b_c`` onto the same name. A digest of the absolute
+    path cannot, and the readable prefix keeps the directory identifiable on disk.
+    """
+    absolute = os.path.abspath(checkpoint_dir)
+    digest = hashlib.sha256(absolute.encode("utf-8")).hexdigest()[:16]
+    return f"{os.path.basename(absolute) or 'ckpt'}-{digest}"
+
+
 def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
@@ -607,6 +621,12 @@ class DistributedCheckpointer(CheckpointerBase):
             # anything has been created on disk, rather than silently dropping one.
             raise ValueError("stage_dir cannot be combined with save_async")
 
+        if stage_dir and storage_writer is not None:
+            # A caller-supplied writer already points somewhere; redirecting it to the
+            # staging directory is not ours to do, and ignoring stage_dir would write
+            # straight to the slow destination the caller was trying to avoid.
+            raise ValueError("stage_dir cannot be combined with an explicit storage_writer")
+
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
         cls._create_checkpoint_dir(checkpoint_dir)
 
@@ -625,8 +645,8 @@ class DistributedCheckpointer(CheckpointerBase):
             )
 
         stage_path = None
-        if stage_dir and storage_writer is None:
-            stage_path = os.path.join(stage_dir, os.path.abspath(checkpoint_dir).strip(os.sep).replace(os.sep, "_"))
+        if stage_dir:
+            stage_path = os.path.join(stage_dir, _stage_key(checkpoint_dir))
             shutil.rmtree(stage_path, ignore_errors=True)  # drop leftovers from a crashed run
             os.makedirs(stage_path, exist_ok=True)
 
