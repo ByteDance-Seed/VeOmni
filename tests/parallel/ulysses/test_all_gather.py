@@ -11,7 +11,13 @@ from torch.testing._internal.common_utils import run_tests
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
 from veomni.distributed.sequence_parallel.ulysses import _all_gather, _Gather
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    get_device_type,
+    get_dist_comm_backend,
+    get_torch_device,
+)
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 
@@ -26,6 +32,21 @@ _GATHER_BACKWARD_BACKENDS = [
         marks=pytest.mark.skipif(
             not IS_CUDA_AVAILABLE or not dist.is_nccl_available() or get_torch_device().device_count() < 2,
             reason="Two CUDA devices and NCCL required",
+        ),
+    ),
+]
+_SHARED_GRADIENT_BACKENDS = [
+    *_GATHER_BACKWARD_BACKENDS,
+    pytest.param(
+        "hccl",
+        marks=pytest.mark.skipif(
+            not IS_NPU_AVAILABLE
+            or get_device_type() != "npu"
+            or not get_torch_device().is_available()
+            or not dist.is_available()
+            or not dist.is_backend_available("hccl")
+            or get_torch_device().device_count() < 2,
+            reason="Two NPU devices and HCCL required",
         ),
     ),
 ]
@@ -133,7 +154,7 @@ class AllToAllCommTest(SequenceParallelTest):
 
 def _check_gather_backward(rank, init_method, backend):
     device = "cpu"
-    if backend == dist.Backend.NCCL:
+    if backend in (dist.Backend.NCCL, "hccl"):
         get_torch_device().set_device(rank)
         device = get_device_type()
     dist.init_process_group(backend, init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=45))
@@ -175,7 +196,7 @@ def _check_gather_backward(rank, init_method, backend):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("backend", _GATHER_BACKWARD_BACKENDS)
+@pytest.mark.parametrize("backend", _SHARED_GRADIENT_BACKENDS)
 def test_gather_backward_preserves_shared_gradients(tmp_path, backend):
     mp.spawn(
         _check_gather_backward,
