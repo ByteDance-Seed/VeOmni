@@ -24,27 +24,22 @@ from torch.distributed.fsdp import FSDPModule
 _SUPPORTED_TRANSPORT_DTYPES = frozenset((torch.bfloat16, torch.float16))
 
 
-def _accumulate_received(
-    received: torch.Tensor,
-    output: torch.Tensor,
-    world_size: int,
-    scale: float,
-) -> None:
-    reduced = torch.sum(received.view(world_size, -1), dim=0, dtype=torch.float32)
-    if scale != 1.0:
-        reduced.mul_(scale)
-    output.copy_(reduced.view(output.shape))
+class FP32ReduceScatterWithLowPrecisionTransport:
+    """FSDP2 FP32 reduction using BF16/FP16 transport.
 
-
-class BF16FP16ReduceScatterWithFP32Accumulation:
-    """FSDP2 ReduceScatter using BF16/FP16 transport and FP32 accumulation.
-
-    The collective is decomposed into a BF16 or FP16 all-to-all followed by an
-    FP32 sum and scale on the destination rank. FSDP must be configured to pass
-    an unscaled SUM and leave all gradient scaling to this implementation.
+    FSDP keeps its FP32 reduction input and output contract. This implementation
+    converts only the wire buffers to BF16 or FP16, then performs the destination-
+    local sum and scale directly into the FP32 output. FSDP must pass an unscaled
+    SUM and leave all gradient scaling to this implementation.
     """
 
-    def __init__(self, reduction_scale: float) -> None:
+    def __init__(self, transport_dtype: torch.dtype, reduction_scale: float) -> None:
+        if transport_dtype not in _SUPPORTED_TRANSPORT_DTYPES:
+            raise ValueError(
+                "Low-precision ReduceScatter transport must be torch.bfloat16 or torch.float16, "
+                f"got {transport_dtype}."
+            )
+        self._transport_dtype = transport_dtype
         self._reduction_scale = reduction_scale
 
     def allocate(
@@ -65,20 +60,15 @@ class BF16FP16ReduceScatterWithFP32Accumulation:
         op: dist.ReduceOp,
         async_op: bool = False,
     ) -> dist.Work | None:
-        if input_tensor.dtype not in _SUPPORTED_TRANSPORT_DTYPES:
+        if input_tensor.dtype != torch.float32 or output_tensor.dtype != torch.float32:
             raise TypeError(
-                "BF16/FP16 FP32-accumulation ReduceScatter requires a BF16 or FP16 input tensor, "
-                f"got {input_tensor.dtype}."
+                "Low-precision transport requires FP32 ReduceScatter input and output tensors, "
+                f"got {input_tensor.dtype} and {output_tensor.dtype}."
             )
 
         if async_op:
-            raise NotImplementedError("BF16/FP16 FP32-accumulation ReduceScatter does not support async_op=True.")
+            raise NotImplementedError("Low-precision transport ReduceScatter does not support async_op=True.")
 
-        if output_tensor.dtype != input_tensor.dtype:
-            raise TypeError(
-                "BF16/FP16 reduce-scatter requires matching input and output dtypes, "
-                f"got {input_tensor.dtype} and {output_tensor.dtype}."
-            )
         if input_tensor.device != output_tensor.device:
             raise ValueError(
                 "Reduce-scatter input and output must be on the same device, "
@@ -96,22 +86,31 @@ class BF16FP16ReduceScatterWithFP32Accumulation:
             )
 
         if op != dist.ReduceOp.SUM:
-            raise ValueError(f"BF16/FP16 FP32-accumulation ReduceScatter requires SUM, got {op}.")
+            raise ValueError(f"Low-precision transport ReduceScatter requires SUM, got {op}.")
 
-        received = torch.empty_like(input_tensor)
+        transport_input = input_tensor.to(self._transport_dtype)
+        received = torch.empty_like(transport_input)
         dist.all_to_all_single(
             received,
-            input_tensor,
+            transport_input,
             group=group,
             async_op=False,
         )
-        _accumulate_received(received, output_tensor, world_size, self._reduction_scale)
+        torch.sum(
+            received.view(world_size, -1),
+            dim=0,
+            dtype=torch.float32,
+            out=output_tensor.view(-1),
+        )
+        if self._reduction_scale != 1.0:
+            output_tensor.mul_(self._reduction_scale)
         return None
 
 
-def register_bf16_fp16_reduce_scatter_with_fp32_accumulation(
+def register_fp32_reduce_scatter_with_low_precision_transport(
     model: torch.nn.Module,
     *,
+    transport_dtype: torch.dtype,
     reduction_scales: Mapping[torch.nn.Module, float],
 ) -> int:
     """Register custom communication and move gradient scaling into the hook."""
@@ -120,7 +119,10 @@ def register_bf16_fp16_reduce_scatter_with_fp32_accumulation(
         if isinstance(module, FSDPModule) and module in reduction_scales:
             module.set_gradient_divide_factor(1.0)
             module.set_force_sum_reduction_for_comms(True)
-            comm = BF16FP16ReduceScatterWithFP32Accumulation(reduction_scale=reduction_scales[module])
+            comm = FP32ReduceScatterWithLowPrecisionTransport(
+                transport_dtype=transport_dtype,
+                reduction_scale=reduction_scales[module],
+            )
             module.set_custom_reduce_scatter(comm)
             count += 1
     return count
