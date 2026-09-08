@@ -7,14 +7,14 @@
   - [📚 Overview](#-overview)
   - [🚀 Quick Start](#-quick-start)
   - [🔍 How the MTP head works](#-how-the-mtp-head-works)
-  - [⚙️ Plumbing](#️-plumbing)
+  - [⚙️ Plumbing](#-plumbing)
     - [The MTP label row](#the-mtp-label-row)
     - [Why `loss_dict` and not `loss`](#why-loss_dict-and-not-loss)
     - [`mtp_context`](#mtp_context)
   - [💾 Checkpoints](#-checkpoints)
   - [📉 Cost](#-cost)
   - [🚧 Limitations](#-limitations)
-  - [🛠️ Supporting MTP for a new model](#️-supporting-mtp-for-a-new-model)
+  - [🛠️ Supporting MTP for a new model](#-supporting-mtp-for-a-new-model)
 
 ## 📚 Overview
 
