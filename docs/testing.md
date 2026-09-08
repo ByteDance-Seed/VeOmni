@@ -62,8 +62,9 @@ tests/
 │       ├── test_balance_reverse.py        # Balance/recovery precision (8 GPUs)
 │       └── test_balance_sorting_algo.py   # Post-MBS data sorting (CPU)
 │
-├── distributed/                    # Multi-GPU training correctness
+├── distributed/                    # Distributed training and runtime correctness
 │   ├── test_fsdp_equivalence.py         # Single-GPU vs FSDP2 grad equivalence
+│   ├── test_gradient_checkpointing.py   # Checkpoint kwargs and recomputed-input grad cleanup
 │   └── test_dummy_forward.py            # Asymmetric multimodal forward (NCCL hang prevention)
 │
 ├── e2e/                            # End-to-end training integration
@@ -107,7 +108,7 @@ tests/
 | **Ops / kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Fused kernel guards, dispatch, correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
 | **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
-| **FSDP correctness** | `tests/distributed/` | 2+ GPUs | torchrun (subprocess + mp.spawn) | Single-GPU vs FSDP2 equivalence, dummy forward |
+| **Distributed runtime** | `tests/distributed/` | 0-2+ GPUs | pytest + torchrun | FSDP equivalence, dummy forward, gradient checkpointing |
 | **E2E parallel** | `tests/e2e/` | 4+ GPUs | torchrun (subprocess) | SP/EP alignment across full training runs |
 | **Checkpoints** | `tests/checkpoints/` | 0-8 GPUs | pytest + torchrun | Save/load, DCP→HF conversion |
 | **Utilities** | `tests/utils/` | 0-8 GPUs | pytest + torchrun | FLOPs, grad clipping, weight broadcast |
