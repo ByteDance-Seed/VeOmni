@@ -214,7 +214,7 @@ def forward(
     """
     from ...vendor.triton.utils import input_guard
 
-    del cu_seqlens_list, chunk_indices, chunk_indices_list, scale
+    del cu_seqlens_list, chunk_indices, chunk_indices_list
     if initial_state is None:
         initial_state = unused_like(query)
     if cu_seqlens is None:
@@ -245,7 +245,8 @@ def forward(
                 f"i.e., {len(cu_opt) - 1} rather than {initial_opt.shape[0]}."
             )
 
-    scale = key.shape[-1] ** -0.5
+    if scale is None:
+        scale = key.shape[-1] ** -0.5
     if use_qk_l2norm_in_kernel:
         query, query_inv_norm = _l2norm_fwd(query)
         key, key_inv_norm = _l2norm_fwd(key)

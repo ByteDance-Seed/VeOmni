@@ -495,7 +495,6 @@ def forward(
     """
     from ...vendor.triton.utils import input_guard
 
-    del scale
     if initial_state is None:
         initial_state = unused_like(query)
     if cu_seqlens is None:
@@ -563,7 +562,8 @@ def forward(
         query_inv_norm = unused_like(query_h)
         key_inv_norm = unused_like(key_h)
 
-    scale = key_h.shape[-1] ** -0.5
+    if scale is None:
+        scale = key_h.shape[-1] ** -0.5
     guarded_fwd = input_guard(_chunk_fwd)
     g_cum, output, a, final_state = guarded_fwd(
         query_h,

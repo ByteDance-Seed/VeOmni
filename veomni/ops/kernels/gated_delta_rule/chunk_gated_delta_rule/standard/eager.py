@@ -50,7 +50,7 @@ def wrapper(
     Layout is FLA ``[B, T, H, D]``. Nonempty *cu_seqlens* is unsupported.
     NPU-only varlen tables are accepted and ignored.
     """
-    del cu_seqlens_list, chunk_indices, chunk_indices_list, scale
+    del cu_seqlens_list, chunk_indices, chunk_indices_list
     if optional_tensor(cu_seqlens) is not None:
         raise ValueError("chunk_gated_delta_rule eager does not support cu_seqlens")
 
@@ -71,7 +71,8 @@ def wrapper(
     beta = F.pad(beta, (0, pad_size))
     g = F.pad(g, (0, pad_size))
     total_sequence_length = sequence_length + pad_size
-    scale = 1 / (query.shape[-1] ** 0.5)
+    if scale is None:
+        scale = query.shape[-1] ** -0.5
     query = query * scale
 
     v_beta = value * beta.unsqueeze(-1)

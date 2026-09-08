@@ -46,13 +46,14 @@ def wrapper(
     """
     from flash_qla.ops.gated_delta_rule import chunk_gated_delta_rule
 
-    del chunk_size, cu_seqlens_list, chunk_indices, chunk_indices_list, scale
+    del chunk_size, cu_seqlens_list, chunk_indices, chunk_indices_list
     return chunk_gated_delta_rule(
         query,
         key,
         value,
         g=g,
         beta=beta,
+        scale=scale,
         initial_state=optional_tensor(initial_state),
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,

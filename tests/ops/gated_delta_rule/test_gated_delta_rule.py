@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import sys
 from importlib import import_module
+from types import ModuleType
 
 import pytest
 import torch
@@ -282,6 +284,69 @@ def test_chunk_gated_delta_rule_eager_matches_hf():
     assert torch.allclose(b_e.grad, b_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+def test_chunk_gated_delta_rule_eager_uses_explicit_scale():
+    torch.manual_seed(3)
+    batch, seq, heads, dim = 1, 16, 2, 8
+    tensors = (
+        torch.randn(batch, seq, heads, dim),
+        torch.randn(batch, seq, heads, dim),
+        torch.randn(batch, seq, heads, dim),
+        -torch.rand(batch, seq, heads) * 0.5,
+        torch.rand(batch, seq, heads),
+    )
+    explicit_scale = 0.25
+    default_scale = dim**-0.5
+    eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
+
+    q_e, k_e, v_e, g_e, b_e = _clone(*tensors)
+    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, chunk_size=8, scale=explicit_scale)
+
+    q_r, k_r, v_r, g_r, b_r = _clone(*tensors)
+    out_r, _ = eager(q_r * (explicit_scale / default_scale), k_r, v_r, g_r, b_r, chunk_size=8)
+    assert torch.allclose(out_e, out_r, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+    out_r.backward(grad_output)
+    for actual, expected in zip((q_e, k_e, v_e, g_e, b_e), (q_r, k_r, v_r, g_r, b_r), strict=True):
+        assert torch.allclose(actual.grad, expected.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+@pytest.mark.parametrize(
+    "impl,vendor_module",
+    (
+        ("fla", "fla.ops.gated_delta_rule"),
+        ("flash_qla", "flash_qla.ops.gated_delta_rule"),
+    ),
+)
+def test_chunk_gated_delta_rule_adapter_forwards_scale(
+    impl: str,
+    vendor_module: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    fake_vendor = ModuleType(vendor_module)
+
+    def fake_chunk_gated_delta_rule(*args, **kwargs):
+        captured.update(kwargs)
+        return args[0], None
+
+    fake_vendor.chunk_gated_delta_rule = fake_chunk_gated_delta_rule
+    monkeypatch.setitem(sys.modules, vendor_module, fake_vendor)
+
+    shape = (1, 4, 2, 8)
+    query = torch.randn(shape)
+    key = torch.randn(shape)
+    value = torch.randn(shape)
+    g = torch.randn(shape[:3])
+    beta = torch.randn(shape[:3])
+    explicit_scale = 0.375
+    module = import_module(f"veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.{impl}")
+    module.wrapper(query, key, value, g, beta, scale=explicit_scale)
+
+    assert captured["scale"] == explicit_scale
+
+
 @pytest.mark.parametrize("impl", ("npu", "npu_ascendc"))
 def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     impl: str,
@@ -293,16 +358,20 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     monkeypatch.setattr(triton_utils, "input_guard", lambda fn: fn)
 
     head_first = impl == "npu_ascendc"
+    explicit_scale = 0.375
+    seen_scales: list[tuple[str, float]] = []
 
-    def fake_chunk_fwd(query, key, value, g, beta, *args):
+    def fake_chunk_fwd(query, key, value, g, beta, scale, *args):
         del beta, args
+        seen_scales.append(("forward", scale))
         output = query + 2 * key
         if head_first:
             output = output.transpose(1, 2).contiguous()
         return g, output, query.new_empty(0), None
 
     def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, *args):
-        del a, scale, initial_state, args
+        del a, initial_state, args
+        seen_scales.append(("backward", scale))
         if head_first:
             grad_output = grad_output.transpose(1, 2).contiguous()
         grads = (
@@ -332,6 +401,7 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
         g,
         beta,
         use_qk_l2norm_in_kernel=True,
+        scale=explicit_scale,
     )
     grad_output = torch.randn_like(output)
     output.backward(grad_output)
@@ -344,6 +414,7 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
 
     assert torch.allclose(query.grad, query_ref.grad, atol=2e-2, rtol=2e-2)
     assert torch.allclose(key.grad, key_ref.grad, atol=2e-2, rtol=2e-2)
+    assert seen_scales == [("forward", explicit_scale), ("backward", explicit_scale)]
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA chunk_gated_delta_rule needs CUDA")

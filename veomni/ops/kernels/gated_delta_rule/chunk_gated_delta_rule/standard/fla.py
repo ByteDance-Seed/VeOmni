@@ -44,7 +44,7 @@ def wrapper(
     common face so callers can pass it; this adapter ignores it. Fused-vs-eager
     tests must compare at the vendor default (64), not an eager-only override.
     """
-    del chunk_size, cu_seqlens_list, chunk_indices, chunk_indices_list, scale
+    del chunk_size, cu_seqlens_list, chunk_indices, chunk_indices_list
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     return chunk_gated_delta_rule(
@@ -53,6 +53,7 @@ def wrapper(
         value,
         g=g,
         beta=beta,
+        scale=scale,
         initial_state=optional_tensor(initial_state),
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
