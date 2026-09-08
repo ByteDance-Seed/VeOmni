@@ -46,14 +46,12 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     collate_multimodal_metadata,
     compute_mtp_loss,
     get_position_id,
-    make_mtp_labels,
     mm_token_type_ids_from_input_ids,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forconditional_generation_forward_patched,
     qwen3_5_forconditional_generation_get_extra_collate_infos,
     qwen3_5_forconditional_generation_get_metadata_collate_func,
     qwen3_5_forconditional_generation_get_position_id_func,
-    qwen3_5_forconditional_generation_get_sample_collate_func,
     qwen3_5_forconditional_generation_init_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
@@ -183,7 +181,6 @@ config.add_helper(_Qwen3_5FakeForPosID)
 # MTP helpers shared with the GPU patch.
 config.add_helper(_mtp_loss_weight)
 config.add_helper(compute_mtp_loss)
-config.add_helper(make_mtp_labels)
 config.add_helper_after("Qwen3_5DecoderLayer", Qwen3_5MTP)
 config.add_helper_after("Qwen3_5ModelOutputWithPast", Qwen3_5MTPContextOutput)
 
@@ -895,13 +892,6 @@ config.override_method(
     "Qwen3_5ForConditionalGeneration.get_extra_collate_infos",
     replacement=qwen3_5_forconditional_generation_get_extra_collate_infos,
     description="Declare the MTP label collate rule for the VeOmni collator",
-)
-
-
-config.override_method(
-    "Qwen3_5ForConditionalGeneration.get_sample_collate_func",
-    replacement=qwen3_5_forconditional_generation_get_sample_collate_func,
-    description="Expose the per-sample MTP label shift to the VeOmni collator",
 )
 
 

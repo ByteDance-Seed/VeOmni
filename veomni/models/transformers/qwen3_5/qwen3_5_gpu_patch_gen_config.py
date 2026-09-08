@@ -712,19 +712,6 @@ def _mtp_loss_weight(text_config):
 
 
 @config.add_helper
-def make_mtp_labels(feature, num_depths=1):
-    """Create one future-token target row per MTP depth before packing."""
-    labels = feature["labels"]
-    feature["mtp_labels"] = torch.stack(
-        [
-            F.pad(labels, (0, depth + 2), value=IGNORE_INDEX)[..., depth + 2 :].contiguous()  # noqa: F821
-            for depth in range(num_depths)
-        ],
-        dim=-2,
-    )
-
-
-@config.add_helper
 def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size, **kwargs):
     """Compute one token-normalized loss over all MTP depths."""
     if mtp_labels.ndim != 3:
@@ -1823,17 +1810,6 @@ def qwen3_5_forconditional_generation_get_extra_collate_infos(self):
     if self.mtp is None:
         return {}
     return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
-
-
-@config.override_method(
-    "Qwen3_5ForConditionalGeneration.get_sample_collate_func",
-    description="Expose the per-sample MTP label shift to the VeOmni collator",
-)
-def qwen3_5_forconditional_generation_get_sample_collate_func(self):
-    """Return the per-sample MTP label builder when the head is enabled."""
-    if self.mtp is None:
-        return None
-    return partial(make_mtp_labels, num_depths=len(self.mtp.layers))  # noqa: F821 defined via add_helper
 
 
 @config.override_method(

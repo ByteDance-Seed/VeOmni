@@ -103,12 +103,9 @@ def test_model_output_subclass_field_order_is_still_loss_first():
     assert issubclass(_OutputWithLossDict, ModelOutput)
 
 
-def test_text_trainer_routes_model_sample_hook_to_data_transform(monkeypatch):
+def test_text_trainer_uses_model_collate_info_without_sample_hook(monkeypatch):
     import veomni.data.data_collator as data_collator
     import veomni.trainer.text_trainer as text_trainer
-
-    def sample_hook(feature):
-        return feature
 
     captured = {}
 
@@ -117,10 +114,7 @@ def test_text_trainer_routes_model_sample_hook_to_data_transform(monkeypatch):
         captured.update(kwargs)
         return object()
 
-    model = SimpleNamespace(
-        get_extra_collate_infos=lambda: {"mtp_labels": (-1, True, -100, 1)},
-        get_sample_collate_func=lambda: sample_hook,
-    )
+    model = SimpleNamespace(get_extra_collate_infos=lambda: {"mtp_labels": (-1, True, -100, 1)})
     trainer = text_trainer.TextTrainer.__new__(text_trainer.TextTrainer)
     trainer.base = SimpleNamespace(
         model=model,
@@ -142,16 +136,12 @@ def test_text_trainer_routes_model_sample_hook_to_data_transform(monkeypatch):
     trainer._build_collate_fn()
 
     assert captured["transform_name"] == "conversation"
-    assert captured["sample_collate_func"] is sample_hook
-    assert not hasattr(trainer.base.collate_fn, "sample_collate_func")
+    assert "sample_collate_func" not in captured
     assert "mtp_labels" in trainer.base.collate_fn.collate_infos
 
 
-def test_vlm_trainer_routes_model_sample_hook_to_qwen_transform(monkeypatch):
+def test_vlm_trainer_does_not_add_a_sample_hook_to_qwen_transform(monkeypatch):
     import veomni.trainer.vlm_trainer as vlm_trainer
-
-    def sample_hook(feature):
-        return feature
 
     captured = {}
 
@@ -160,10 +150,7 @@ def test_vlm_trainer_routes_model_sample_hook_to_qwen_transform(monkeypatch):
         captured.update(kwargs)
         return object()
 
-    model = SimpleNamespace(
-        get_position_id_func=lambda: object(),
-        get_sample_collate_func=lambda: sample_hook,
-    )
+    model = SimpleNamespace(get_position_id_func=lambda: object())
     trainer = vlm_trainer.VLMTrainer.__new__(vlm_trainer.VLMTrainer)
     trainer.base = SimpleNamespace(
         model=model,
@@ -177,4 +164,4 @@ def test_vlm_trainer_routes_model_sample_hook_to_qwen_transform(monkeypatch):
     trainer._build_data_transform()
 
     assert captured["transform_name"] == "qwen3_5"
-    assert captured["sample_collate_func"] is sample_hook
+    assert "sample_collate_func" not in captured

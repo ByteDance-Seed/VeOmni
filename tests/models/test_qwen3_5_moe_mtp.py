@@ -115,21 +115,6 @@ def test_qwen3_5_eval_text_model_returns_mtp_context_on_demand(
         assert mtp_context["attention_mask"] is causal_mask
 
 
-def test_qwen3_5_mtp_labels_advance_once_per_depth():
-    feature = {"labels": torch.tensor([10, 11, 12, 13, 14])}
-
-    dense_modeling.make_mtp_labels(feature, num_depths=3)
-
-    expected = torch.tensor(
-        [
-            [12, 13, 14, -100, -100],
-            [13, 14, -100, -100, -100],
-            [14, -100, -100, -100, -100],
-        ]
-    )
-    assert torch.equal(feature["mtp_labels"], expected)
-
-
 @pytest.mark.parametrize(
     ("mtp_cls", "config_path"),
     [

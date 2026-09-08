@@ -55,8 +55,6 @@
 #      Build the MTP head when enabled
 #    - method_override: Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos
 #      Declare the MTP label collate rule
-#    - method_override: Qwen3_5MoeForConditionalGeneration.get_sample_collate_func
-#      Expose the per-sample MTP label shift
 #    - method_override: Qwen3_5MoeForConditionalGeneration.forward
 #      Support fused cross entropy path in Qwen3_5MoeForConditionalGeneration.forward
 #    - method_override: Qwen3_5MoeForConditionalGeneration.get_parallel_plan
@@ -211,18 +209,6 @@ def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size
         **loss_kwargs,
     )
     return mtp_loss * has_valid_target.to(mtp_loss.dtype)
-
-
-def make_mtp_labels(feature, num_depths=1):
-    """Create one future-token target row per MTP depth before packing."""
-    labels = feature["labels"]
-    feature["mtp_labels"] = torch.stack(
-        [
-            F.pad(labels, (0, depth + 2), value=IGNORE_INDEX)[..., depth + 2 :].contiguous()  # noqa: F821
-            for depth in range(num_depths)
-        ],
-        dim=-2,
-    )
 
 
 def compute_mtp_router_aux_loss(
@@ -3069,7 +3055,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, get_sample_collate_func, forward, get_parallel_plan
+# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -3528,12 +3514,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         if self.mtp is None:
             return {}
         return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
-
-    def get_sample_collate_func(self):
-        """Return the per-sample hook that creates all configured MTP depth labels."""
-        if self.mtp is None:
-            return None
-        return partial(make_mtp_labels, num_depths=len(self.mtp.layers))  # noqa: F821
 
     # ── Expert parallel plan ─────────────────────────────────────────────────────
     def get_parallel_plan(self):

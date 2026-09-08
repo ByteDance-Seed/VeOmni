@@ -7,14 +7,14 @@
   - [📚 Overview](#-overview)
   - [🚀 Quick Start](#-quick-start)
   - [🔍 How the MTP head works](#-how-the-mtp-head-works)
-  - [⚙️ Plumbing](#-plumbing)
+  - [⚙️ Plumbing](#️-plumbing)
     - [The MTP label row](#the-mtp-label-row)
     - [Why `loss_dict` and not `loss`](#why-loss_dict-and-not-loss)
     - [`mtp_context`](#mtp_context)
   - [💾 Checkpoints](#-checkpoints)
   - [📉 Cost](#-cost)
   - [🚧 Limitations](#-limitations)
-  - [🛠️ Supporting MTP for a new model](#-supporting-mtp-for-a-new-model)
+  - [🛠️ Supporting MTP for a new model](#️-supporting-mtp-for-a-new-model)
 
 ## 📚 Overview
 
@@ -132,13 +132,13 @@ transform therefore builds `mtp_labels` with shape `[batch, depth, sequence]`, a
 the model supplies it as an explicit `shift_labels=` argument that bypasses the
 internal shift.
 
-The row is built by a **per-sample** model hook
-(`Qwen3_5ForConditionalGeneration.get_sample_collate_func`) invoked by the text
-conversation/plaintext transforms and `_process_sample_qwen_vl_base`, before the
-sample reaches `MainCollator`. That ordering is the whole point: shifting by two
-inside an already-packed row would pull the next sample's first tokens into the
-tail of the current one. Doing every depth shift per sample makes that impossible
-by construction, so no `cu_seq_lens` boundary arithmetic is needed.
+The row is built on the **per-sample encode path**, before the sample reaches
+`MainCollator`: `ChatTemplate.encode_messages` adds it for conversation and
+Qwen-VL samples, while `process_plaintext_example` adds it after constructing
+plain-text labels. That ordering is the whole point: shifting by two inside an
+already-packed row would pull the next sample's first tokens into the tail of the
+current one. Doing every depth shift per sample makes that impossible by
+construction, so no `cu_seq_lens` boundary arithmetic is needed.
 
 `mtp_labels` is registered via `get_extra_collate_infos()` as
 `(-1, True, IGNORE_INDEX, 1)`. The depth dimension is retained while samples are
@@ -150,9 +150,9 @@ The model flattens batch and depth for one fused loss call, so `mtp_tokens` is t
 exact denominator across all valid depth targets, including under gradient
 accumulation.
 
-`TextTrainer` and `VLMTrainer` pass `get_sample_collate_func` to their data
-transforms. Their collators only resolve `get_extra_collate_infos` and pack the
-resulting field.
+`TextTrainer` and `VLMTrainer` configure the template's MTP depth from the
+model config. When MTP is disabled, the depth is zero and no extra batch key is
+emitted, so it cannot leak into `model.forward`.
 
 ### Why `loss_dict` and not `loss`
 
@@ -239,9 +239,9 @@ MTP per step (median, +3.9%). Peak memory increased from 43.95GB to 44.89GB (+2.
 
 ## 🛠️ Supporting MTP for a new model
 
-The trainer-side plumbing (the text/VLM data-transform hook lookup,
-`loss_dict` in `postforward`, and `count_loss_token`'s `{prefix}_tokens`) is
-model-agnostic. Per model you need, in its patch config:
+The trainer-side loss plumbing (`loss_dict` in `postforward` and
+`count_loss_token`'s `{prefix}_tokens`) is model-agnostic. Per model you need,
+in its patch config:
 
 1. An MTP `nn.Module` whose submodule names match the checkpoint's `mtp.*` FQNs,
    added with `config.add_helper_after(...)`.
@@ -250,9 +250,9 @@ model-agnostic. Per model you need, in its patch config:
    `mtp_context`.
 3. `__init__` overridden to construct the module under the FQN the checkpoint uses,
    plus the SP/EP asserts.
-4. `get_extra_collate_infos` / `get_sample_collate_func` returning the label rule
-   and the per-sample hook (module-level functions only — they are pickled to
-   DataLoader workers).
+4. `get_extra_collate_infos` returning the `mtp_labels` packing rule. Ensure
+   the model's `ChatTemplate.encode_messages` (and, for plaintext data,
+   `process_plaintext_example`) constructs the labels before packing.
 5. `forward` extended with an explicit `mtp_labels` parameter (never left in
    `**kwargs`, which would leak it into the attention and CE kernels) returning
    `loss_dict`.

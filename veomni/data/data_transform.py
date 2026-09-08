@@ -20,6 +20,8 @@ import torch
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.registry import Registry
 
+from .chat_template import add_mtp_labels
+
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
@@ -28,16 +30,6 @@ if TYPE_CHECKING:
 
 
 DATA_TRANSFORM_REGISTRY = Registry("DataTransform")
-SampleCollateFunc = Callable[[Dict[str, Any]], None]
-
-
-def _apply_sample_collate_func(
-    samples: List[Dict[str, "torch.Tensor"]], sample_collate_func: SampleCollateFunc | None
-) -> List[Dict[str, "torch.Tensor"]]:
-    if sample_collate_func is not None:
-        for sample in samples:
-            sample_collate_func(sample)
-    return samples
 
 
 def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_token: str | None = None) -> int:
@@ -74,7 +66,7 @@ def process_plaintext_example(
     tokenizer: "PreTrainedTokenizer",
     max_seq_len: int,
     text_keys: Union[str, List[str]] = "content_split",
-    sample_collate_func: SampleCollateFunc | None = None,
+    mtp_num_hidden_layers: int = 0,
     **kwargs,
 ) -> List[Dict[str, "torch.Tensor"]]:
     examples = []
@@ -100,8 +92,9 @@ def process_plaintext_example(
                 "position_ids": torch.arange(len(input_ids), dtype=torch.long),
             }
         )
+        add_mtp_labels(examples[-1], mtp_num_hidden_layers)
 
-    return _apply_sample_collate_func(examples, sample_collate_func)
+    return examples
 
 
 @DATA_TRANSFORM_REGISTRY.register("conversation")
@@ -110,7 +103,6 @@ def process_conversation_example(
     chat_template: "ChatTemplate",
     max_seq_len: int,
     text_keys: Union[str, List[str]] = "messages",
-    sample_collate_func: SampleCollateFunc | None = None,
     **kwargs,
 ) -> List[Dict[str, "torch.Tensor"]]:
     if isinstance(text_keys, str):
@@ -126,11 +118,11 @@ def process_conversation_example(
         raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
 
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
-    tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+    tokenized_example = {k: torch.as_tensor(v) for k, v in tokenized_example.items()}
     tokenized_example.setdefault(
         "position_ids", torch.arange(tokenized_example["input_ids"].size(-1), dtype=torch.long)
     )
-    return _apply_sample_collate_func([tokenized_example], sample_collate_func)
+    return [tokenized_example]
 
 
 @DATA_TRANSFORM_REGISTRY.register("dpo")
@@ -212,7 +204,6 @@ def process_classification_example(
     max_seq_len: int,
     text_keys: Union[str, list[str]] = "text",
     label_key: str = "label",
-    sample_collate_func: SampleCollateFunc | None = None,
     **kwargs,
 ) -> list[dict[str, "torch.Tensor"]]:
     """
@@ -296,7 +287,7 @@ def process_classification_example(
         tokens = tokens[:max_seq_len]
 
     examples.append(build_sample(tokens))
-    return _apply_sample_collate_func(examples, sample_collate_func)
+    return examples
 
 
 def _process_sample_qwen_vl_base(
@@ -304,7 +295,6 @@ def _process_sample_qwen_vl_base(
     processor: "ProcessorMixin",
     chat_template: "ChatTemplate",
     position_id_func: "Callable",
-    sample_collate_func: SampleCollateFunc | None = None,
     **kwargs,
 ):
     from .multimodal import conv_preprocess
@@ -395,7 +385,7 @@ def _process_sample_qwen_vl_base(
     # pack_dim=0) and the model's metadata_collate_func hook derives the ViT
     # metadata from them. No per-sample `.tolist()` sidecar needed here.
 
-    return _apply_sample_collate_func([tokenized_example], sample_collate_func)
+    return [tokenized_example]
 
 
 @DATA_TRANSFORM_REGISTRY.register("qwen2_vl")
@@ -409,7 +399,6 @@ def process_sample_qwen_vl(
     processor: "ProcessorMixin",
     chat_template: "ChatTemplate",
     position_id_func: "Callable",
-    sample_collate_func: SampleCollateFunc | None = None,
     **kwargs,
 ):
     """
@@ -421,7 +410,6 @@ def process_sample_qwen_vl(
         processor,
         chat_template,
         position_id_func,
-        sample_collate_func=sample_collate_func,
         **kwargs,
     )
 
@@ -432,7 +420,6 @@ def process_sample_qwen_omni(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",
     position_id_func: "Callable",
-    sample_collate_func: SampleCollateFunc | None = None,
     **kwargs,
 ):
     from .multimodal import conv_preprocess
@@ -573,4 +560,4 @@ def process_sample_qwen_omni(
             user_i += 1
         labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
     model_inputs["labels"] = labels
-    return _apply_sample_collate_func([model_inputs], sample_collate_func)
+    return [model_inputs]

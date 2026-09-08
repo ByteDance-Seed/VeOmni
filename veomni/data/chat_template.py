@@ -18,6 +18,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Sequence, Union
 
 import torch
+import torch.nn.functional as F
 
 from veomni.utils import logging
 
@@ -33,6 +34,19 @@ logger = logging.get_logger(__name__)
 
 ROLE_SUPPORTED = ["system", "user", "assistant", "tool"]
 CHAT_TEMPLATE_REGISTRY = Registry("ChatTemplate")
+
+
+def add_mtp_labels(feature: Dict[str, torch.Tensor | List[int]], num_depths: int) -> None:
+    """Add future-token labels to one un-packed sample when MTP is enabled."""
+    if num_depths <= 0:
+        return
+    labels = feature["labels"]
+    if not isinstance(labels, torch.Tensor):
+        labels = torch.tensor(labels)
+    feature["mtp_labels"] = torch.stack(
+        [F.pad(labels, (0, depth + 2), value=IGNORE_INDEX)[..., depth + 2 :] for depth in range(num_depths)],
+        dim=-2,
+    )
 
 
 def build_chat_template(
@@ -60,6 +74,7 @@ class ChatTemplate(ABC):
 
     def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
         self.tokenizer = tokenizer
+        self.mtp_num_hidden_layers = 0
 
     def save_pretrained(self, output_dir: str) -> None:
         self.tokenizer.chat_template = self.get_jinja_template()
@@ -99,6 +114,7 @@ class DefaultTemplate(ChatTemplate):
 
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
+        add_mtp_labels(model_inputs, self.mtp_num_hidden_layers)
         return model_inputs
 
     def get_jinja_template(self) -> str:
@@ -154,11 +170,9 @@ class TokenizerTemplate(ChatTemplate):
 
         input_ids = input_ids[-max_seq_len:]
         labels = labels[-max_seq_len:]
-        return {
-            "input_ids": input_ids,
-            "attention_mask": [1] * len(input_ids),
-            "labels": labels,
-        }
+        model_inputs = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+        add_mtp_labels(model_inputs, self.mtp_num_hidden_layers)
+        return model_inputs
 
     def get_jinja_template(self) -> str:
         if not self.tokenizer.chat_template:
@@ -228,6 +242,7 @@ class Llama2Template(ChatTemplate):
 
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
+        add_mtp_labels(model_inputs, self.mtp_num_hidden_layers)
         return model_inputs
 
     def get_jinja_template(self) -> str:
@@ -272,6 +287,7 @@ class ChatmlTemplate(ChatTemplate):
 
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
+        add_mtp_labels(model_inputs, self.mtp_num_hidden_layers)
         return model_inputs
 
     def get_jinja_template(self) -> str:
@@ -392,6 +408,7 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
         video_mask = tokenized_example["input_ids"] == self.video_token_id
         tokenized_example["input_ids"][video_mask] = TYPE2INDEX["input"]["video"]
 
+        add_mtp_labels(tokenized_example, self.mtp_num_hidden_layers)
         return tokenized_example
 
     @abstractmethod

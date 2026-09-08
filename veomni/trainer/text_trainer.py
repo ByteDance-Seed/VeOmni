@@ -79,19 +79,31 @@ class TextTrainer:
             self.base.chat_template = None
         else:
             self.base.chat_template = build_chat_template(args.data.chat_template, self.base.tokenizer)
+            if args.data.data_type == "conversation":
+                text_config = getattr(model_config, "text_config", model_config)
+                num_depths = getattr(text_config, "mtp_num_hidden_layers", 0) or 0
+                mtp_loss_weight = getattr(text_config, "mtp_loss_weight", None)
+                self.base.chat_template.mtp_num_hidden_layers = (
+                    num_depths if mtp_loss_weight is not None and float(mtp_loss_weight) > 0.0 else 0
+                )
             self.base.model_assets = [model_config, self.base.chat_template]
 
     def _build_data_transform(self):
         args: VeOmniArguments = self.base.args
-        get_sample_func = getattr(self.base.model, "get_sample_collate_func", None)
-        self.base.data_transform = build_data_transform(
-            args.data.data_type,
-            tokenizer=self.base.tokenizer,
-            chat_template=self.base.chat_template,
-            max_seq_len=args.data.max_seq_len,
-            text_keys=args.data.text_keys,
-            sample_collate_func=get_sample_func() if get_sample_func is not None else None,
-        )
+        transform_kwargs = {
+            "tokenizer": self.base.tokenizer,
+            "chat_template": self.base.chat_template,
+            "max_seq_len": args.data.max_seq_len,
+            "text_keys": args.data.text_keys,
+        }
+        if args.data.data_type == "plaintext":
+            text_config = getattr(self.base.model_config, "text_config", self.base.model_config)
+            num_depths = getattr(text_config, "mtp_num_hidden_layers", 0) or 0
+            mtp_loss_weight = getattr(text_config, "mtp_loss_weight", None)
+            transform_kwargs["mtp_num_hidden_layers"] = (
+                num_depths if mtp_loss_weight is not None and float(mtp_loss_weight) > 0.0 else 0
+            )
+        self.base.data_transform = build_data_transform(args.data.data_type, **transform_kwargs)
 
     def _build_collate_fn(self):
         model = self.base.model

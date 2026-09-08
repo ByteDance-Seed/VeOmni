@@ -69,7 +69,6 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     compute_mtp_loss,
     compute_mtp_router_aux_loss,
     get_position_id,
-    make_mtp_labels,
     mm_token_type_ids_from_input_ids,
     qwen3_5_moe_causal_lm_get_parallel_plan_patched,
     qwen3_5_moe_forcausallm_forward_patched,
@@ -77,7 +76,6 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     qwen3_5_moe_forconditional_generation_get_extra_collate_infos,
     qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     qwen3_5_moe_forconditional_generation_get_position_id_func,
-    qwen3_5_moe_forconditional_generation_get_sample_collate_func,
     qwen3_5_moe_forconditional_generation_init_patched,
     qwen3_5_moe_get_parallel_plan_patched,
     qwen3_5_moe_model_forward_patched,
@@ -281,7 +279,6 @@ config.add_helper_after("Qwen3_5MoeModelOutputWithPast", Qwen3_5MoeMTPContextOut
 config.add_helper(_mtp_loss_weight)
 config.add_helper(compute_mtp_loss)
 config.add_helper(compute_mtp_router_aux_loss)
-config.add_helper(make_mtp_labels)
 
 
 config.override_method(
@@ -307,12 +304,6 @@ config.override_method(
     "Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos",
     replacement=qwen3_5_moe_forconditional_generation_get_extra_collate_infos,
     description="Declare the MTP label collate rule",
-)
-
-config.override_method(
-    "Qwen3_5MoeForConditionalGeneration.get_sample_collate_func",
-    replacement=qwen3_5_moe_forconditional_generation_get_sample_collate_func,
-    description="Expose the per-sample MTP label shift",
 )
 
 

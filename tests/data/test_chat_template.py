@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from veomni.data.chat_template import (
     CHAT_TEMPLATE_REGISTRY,
@@ -9,6 +10,7 @@ from veomni.data.chat_template import (
     Qwen2VLChatTemplate,
     Qwen3VLChatTemplate,
     TokenizerTemplate,
+    add_mtp_labels,
     build_chat_template,
 )
 from veomni.utils.constants import IGNORE_INDEX, TYPE2INDEX
@@ -43,6 +45,33 @@ def test_tokenizer_template_masks_non_assistant_turns_and_truncates():
         "attention_mask": [1, 1, 1, 1],
         "labels": [IGNORE_INDEX, 3, 20, 21],
     }
+
+
+def test_add_mtp_labels_builds_each_depth_before_packing():
+    feature = {"labels": torch.tensor([10, 11, 12, 13, 14])}
+
+    add_mtp_labels(feature, num_depths=3)
+
+    expected = torch.tensor(
+        [
+            [12, 13, 14, IGNORE_INDEX, IGNORE_INDEX],
+            [13, 14, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+            [14, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+        ]
+    )
+    assert torch.equal(feature["mtp_labels"], expected)
+
+
+def test_tokenizer_template_emits_mtp_labels_when_enabled():
+    template = TokenizerTemplate(_PrefixStableTokenizer())
+    template.mtp_num_hidden_layers = 2
+
+    encoded = template.encode_messages(
+        [{"role": "user", "content": [10, 11]}, {"role": "assistant", "content": [20, 21]}],
+        max_seq_len=4,
+    )
+
+    assert torch.equal(encoded["mtp_labels"], torch.tensor([[20, 21, -100, -100], [21, -100, -100, -100]]))
 
 
 def test_gpt_oss_tokenizer_template_supports_terminal_token_rewrite():
@@ -260,6 +289,20 @@ class _Processor:
     def __init__(self, tokenizer, temporal_patch_size=2):
         self.tokenizer = tokenizer
         self.video_processor = SimpleNamespace(temporal_patch_size=temporal_patch_size)
+
+
+def test_qwen_vl_template_emits_mtp_labels_when_enabled():
+    template = build_chat_template("qwen2vl", _Processor(_SpecialTokenTokenizer()))
+    template.mtp_num_hidden_layers = 2
+
+    encoded = template.encode_messages([("user", ("text", "hi")), ("assistant", ("text", "ok"))], {})
+    labels = encoded["labels"]
+
+    assert encoded["mtp_labels"].shape == (2, labels.numel())
+    assert torch.equal(encoded["mtp_labels"][0, :-2], labels[2:])
+    assert torch.equal(encoded["mtp_labels"][1, :-3], labels[3:])
+    assert torch.all(encoded["mtp_labels"][0, -2:] == IGNORE_INDEX)
+    assert torch.all(encoded["mtp_labels"][1, -3:] == IGNORE_INDEX)
 
 
 def _video_metadata(total_num_frames, fps=2.0, frames_indices=None):

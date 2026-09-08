@@ -41,8 +41,6 @@
 #      Build the MTP head when enabled
 #    - method_override: Qwen3_5MoeForConditionalGeneration.get_extra_collate_infos
 #      Declare the MTP label collate rule
-#    - method_override: Qwen3_5MoeForConditionalGeneration.get_sample_collate_func
-#      Expose the per-sample MTP label shift
 #    - class_replacement: Qwen3_5MoeExperts
 #      Remove @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 #    - method_override: Qwen3_5MoeGatedDeltaNet.__init__
@@ -383,18 +381,6 @@ def compute_mtp_router_aux_loss(
         flattened_attention_mask,
     )
     return aux_loss, combined_router_logits
-
-
-def make_mtp_labels(feature, num_depths=1):
-    """Create one future-token target row per MTP depth before packing."""
-    labels = feature["labels"]
-    feature["mtp_labels"] = torch.stack(
-        [
-            F.pad(labels, (0, depth + 2), value=IGNORE_INDEX)[..., depth + 2 :].contiguous()  # noqa: F821
-            for depth in range(num_depths)
-        ],
-        dim=-2,
-    )
 
 
 logger = logging.get_logger(__name__)
@@ -3079,7 +3065,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5MoeForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, get_sample_collate_func, forward, get_parallel_plan
+# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, forward, get_parallel_plan
 # ======================================================================
 
 
@@ -3538,12 +3524,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         if self.mtp is None:
             return {}
         return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
-
-    def get_sample_collate_func(self):
-        """Return the per-sample hook that creates all configured MTP depth labels."""
-        if self.mtp is None:
-            return None
-        return partial(make_mtp_labels, num_depths=len(self.mtp.layers))  # noqa: F821
 
     # ── Expert parallel plan ─────────────────────────────────────────────────────
     def get_parallel_plan(self):

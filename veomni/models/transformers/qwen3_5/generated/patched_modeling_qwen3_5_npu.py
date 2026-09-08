@@ -51,8 +51,6 @@
 #      Build the MTP head when text_config.mtp_loss_weight is set
 #    - method_override: Qwen3_5ForConditionalGeneration.get_extra_collate_infos
 #      Declare the MTP label collate rule for the VeOmni collator
-#    - method_override: Qwen3_5ForConditionalGeneration.get_sample_collate_func
-#      Expose the per-sample MTP label shift to the VeOmni collator
 #    - method_override: Qwen3_5ForConditionalGeneration.forward
 #      Support fused cross entropy path in Qwen3_5ForConditionalGeneration.forward
 #
@@ -300,18 +298,6 @@ def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size
         **loss_kwargs,
     )
     return mtp_loss * has_valid_target.to(mtp_loss.dtype)
-
-
-def make_mtp_labels(feature, num_depths=1):
-    """Create one future-token target row per MTP depth before packing."""
-    labels = feature["labels"]
-    feature["mtp_labels"] = torch.stack(
-        [
-            F.pad(labels, (0, depth + 2), value=IGNORE_INDEX)[..., depth + 2 :].contiguous()  # noqa: F821
-            for depth in range(num_depths)
-        ],
-        dim=-2,
-    )
 
 
 logger = logging.get_logger(__name__)
@@ -2733,7 +2719,7 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3_5ForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, get_sample_collate_func, forward
+# Methods patched: get_position_id_func, get_metadata_collate_func, __init__, get_extra_collate_infos, forward
 # ======================================================================
 
 
@@ -3155,12 +3141,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if self.mtp is None:
             return {}
         return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
-
-    def get_sample_collate_func(self):
-        """Return the per-sample MTP label builder when the head is enabled."""
-        if self.mtp is None:
-            return None
-        return partial(make_mtp_labels, num_depths=len(self.mtp.layers))  # noqa: F821 defined via add_helper
 
 
 class Qwen3_5TextForSequenceClassification(GenericForSequenceClassification, Qwen3_5PreTrainedModel):

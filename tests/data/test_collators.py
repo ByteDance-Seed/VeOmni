@@ -3,6 +3,7 @@ import types
 import pytest
 import torch
 
+from veomni.data.chat_template import add_mtp_labels
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -25,6 +26,37 @@ def features_two_samples():
         "labels": torch.tensor([1], dtype=torch.long),
     }
     return [f1, f2]
+
+
+def test_mtp_labels_pack_on_the_sequence_dim_without_crossing_samples(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    features = [
+        {
+            "input_ids": torch.tensor([10, 11, 12, 13]),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "labels": torch.tensor([10, 11, 12, 13]),
+        },
+        {
+            "input_ids": torch.tensor([20, 21, 22]),
+            "attention_mask": torch.ones(3, dtype=torch.long),
+            "labels": torch.tensor([20, 21, 22]),
+        },
+    ]
+    for feature in features:
+        add_mtp_labels(feature, num_depths=2)
+
+    collator = m.MainCollator(data_collate_info={"mtp_labels": (-1, True, IGNORE_INDEX, 1)})
+    out = collator(features)
+
+    expected = torch.tensor(
+        [
+            [12, 13, IGNORE_INDEX, IGNORE_INDEX, 22, IGNORE_INDEX, IGNORE_INDEX],
+            [13, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX],
+        ]
+    ).unsqueeze(0)
+    assert torch.equal(out["mtp_labels"], expected)
 
 
 def test_seqcls_collator_sp_disabled(monkeypatch, features_two_samples):

@@ -241,6 +241,12 @@ class VLMTrainer:
         self.base.processor = build_processor(args.model.tokenizer_path, max_pixels=MAX_PIXELS)
         if self.base.model_config.model_type not in ("qwen2_5_omni", "qwen3_omni_moe"):
             self.base.chat_template = build_chat_template(args.data.chat_template, self.base.processor)
+            text_config = getattr(self.base.model_config, "text_config", self.base.model_config)
+            num_depths = getattr(text_config, "mtp_num_hidden_layers", 0) or 0
+            mtp_loss_weight = getattr(text_config, "mtp_loss_weight", None)
+            self.base.chat_template.mtp_num_hidden_layers = (
+                num_depths if mtp_loss_weight is not None and float(mtp_loss_weight) > 0.0 else 0
+            )
             self.base.model_assets = [self.base.processor, self.base.chat_template]
         else:
             self.base.chat_template = None
@@ -249,14 +255,12 @@ class VLMTrainer:
     def _build_data_transform(self):
         args: VeOmniVLMArguments = self.base.args
         model_type = self.base.model_config.model_type
-        get_sample_func = getattr(self.base.model, "get_sample_collate_func", None)
 
         self.base.data_transform = build_data_transform(
             model_type,
             processor=self.base.processor,
             chat_template=self.base.chat_template,
             position_id_func=self.base.model.get_position_id_func(),
-            sample_collate_func=get_sample_func() if get_sample_func is not None else None,
             **args.data.mm_configs,
         )
 

@@ -57,7 +57,6 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     _mtp_loss_weight,
     compute_mtp_loss,
-    make_mtp_labels,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
@@ -111,7 +110,6 @@ config.add_import(
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_helper(_mtp_loss_weight)
 config.add_helper(compute_mtp_loss)
-config.add_helper(make_mtp_labels)
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -1170,17 +1168,6 @@ def qwen3_5_moe_forconditional_generation_get_extra_collate_infos(self):
     if self.mtp is None:
         return {}
     return {"mtp_labels": (-1, True, IGNORE_INDEX, 1)}  # noqa: F821
-
-
-@config.override_method(
-    "Qwen3_5MoeForConditionalGeneration.get_sample_collate_func",
-    description="Expose the per-sample MTP label shift",
-)
-def qwen3_5_moe_forconditional_generation_get_sample_collate_func(self):
-    """Return the per-sample hook that creates all configured MTP depth labels."""
-    if self.mtp is None:
-        return None
-    return partial(make_mtp_labels, num_depths=len(self.mtp.layers))  # noqa: F821
 
 
 @config.override_method(
