@@ -45,8 +45,8 @@ device first, followed by a device-agnostic row.
 | `rope` | `full`, `partial`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `npu`, and `triton` where supported |
 | `rope_vision` | `full` | `eager`, `npu` |
 | `swiglu_mlp` | `standard` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `triton`, `quack`, `npu`, `mlu` as supported by the variant |
-| `moe_experts_lora` | `independent`, `shared` | `eager`, `triton`, `npu` |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu` as supported by the variant |
+| `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla`, `flash_qla`, `npu`, `npu_ascendc` as supported by the family |

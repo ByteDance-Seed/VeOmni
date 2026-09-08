@@ -251,7 +251,7 @@ def test_wrapper_selects_kernel_impl(mode: str):
             freeze_base_model=True,
         )
         wrapper_f = model_f.get_submodule(fqn_f)
-        assert wrapper_f.veomni_moe_lora.impl == "triton"
+        assert wrapper_f.veomni_moe_lora.impl == "fused_triton"
     finally:
         set_kernels_config(saved_cfg)
 

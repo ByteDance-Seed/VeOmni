@@ -371,8 +371,8 @@ Each MoE-LoRA wrapper dispatches based on `model.ops_implementation.moe_implemen
 
 | `moe_implementation` | non-EP | EP | Notes |
 |---|---|---|---|
-| `triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
-| `npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
+| `fused_triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
+| `fused_npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
 | `eager` | eager loop (reference) | not supported (raises) | Portable reference path. |
 
 The fused GPU path lives in `veomni/kernels/_kernels/moe_experts_lora/` and reuses the same
@@ -382,7 +382,7 @@ inherits the same EP `all-to-all` dispatch pipeline. Each wrapper constructs
 
 ### 5.4 Expert Parallelism (EP)
 
-Both `triton` and `npu` support the EP path; `npu` uses the
+Both `fused_triton` and `fused_npu` support the EP path; `fused_npu` uses the
 Ascend GroupGEMM implementation in `veomni/kernels/_kernels/moe_experts_lora/{shared,independent}/npu.py`.
 
 When `train.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
@@ -558,7 +558,7 @@ model:
   model_path: Qwen3-30B-A3B-merge
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: eager           # EP (ep_size > 1) REQUIRES triton
+    moe_implementation: eager           # EP (ep_size > 1) REQUIRES fused_triton
   lora_config:
     rank: 16
     alpha: 32
@@ -570,7 +570,7 @@ train:
   init_device: meta
   accelerator:
     ulysses_size: 1
-    ep_size: 1                          # set >1 to enable EP; also set moe_implementation: triton
+    ep_size: 1                          # set >1 to enable EP; also set moe_implementation: fused_triton
     fsdp_config:
       fsdp_mode: fsdp2
 ```

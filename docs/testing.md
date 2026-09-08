@@ -152,8 +152,8 @@ Additional per-directory helpers:
 | Dimension | Values |
 |---|---|
 | Modeling backend | HuggingFace, VeOmni |
-| Attention implementation | `eager`, `flash_attention_2`, `flash_attention_3`, `veomni_flash_attention_2_with_sp`, `veomni_flash_attention_3_with_sp` |
-| MoE implementation | `eager`, hardware fused backend (`triton` on GPU, `npu` on NPU where supported) |
+| Attention implementation | `eager`, `flash_attention_2`, `flash_attention_3`, `veomni_flash_attention_2`, `veomni_flash_attention_3` |
+| MoE implementation | `eager`, hardware fused backend (`fused_triton` on GPU, `fused_npu` on NPU where supported) |
 | Liger kernel | `True`, `False` (VeOmni only) |
 
 **Models covered**:

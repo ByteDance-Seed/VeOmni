@@ -27,11 +27,11 @@ selection knob.
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniKernel` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniKernel` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | Model `__init__` via an instance-local `VeomniKernel` |
-| MoE experts | `moe_implementation` | `eager`, `triton`, `quack` (SM90+), `npu`, `mlu` | `"triton"` (GPU) | Model `__init__` via an instance-local `VeomniKernel` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU) | Model `__init__` via an instance-local `VeomniKernel` |
 
 **Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
 equal to the dataclass defaults automatically resolve to `npu` for RMSNorm,
-rotary embedding, vision rotary embedding, and cross-entropy; to `npu`
+rotary embedding and vision rotary embedding; to `chunk_loss` for cross-entropy; to `fused_npu`
 for MoE; and to `eager` for SwiGLU and load-balancing loss. Explicit
 non-default overrides are retained and rejected when unsupported. Qwen3.5's
 three GatedDeltaNet fields are
@@ -355,18 +355,18 @@ the tuple of per-layer router logits into the raw kernel's `[N, E]` input.
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: triton   # Triton group-gemm (GPU SM70+ or MLU)
-    # moe_implementation: quack   # Quack CUTLASS/CuTe (GPU, SM90+)
-    # moe_implementation: npu     # NPU group-gemm (Ascend)
-    # moe_implementation: mlu     # Apex grouped-GEMM (MLU)
+    moe_implementation: fused_triton   # Triton group-gemm (GPU SM70+ or MLU)
+    # moe_implementation: fused_quack  # Quack CUTLASS/CuTe (GPU, SM90+)
+    # moe_implementation: fused_npu    # NPU group-gemm (Ascend)
+    # moe_implementation: fused_mlu    # Apex grouped-GEMM (MLU)
     # moe_implementation: eager   # Reference PyTorch loop (very slow, debug only)
 ```
 
 **Field:** `OpsImplementationConfig.moe_implementation`
-**Default:** `"triton"` (GPU). On NPU, a value still equal to this
+**Default:** `"fused_triton"` (GPU). On NPU, a value still equal to this
 dataclass default—including an explicit YAML value—is normalized to
-`"npu"`. Set `"npu"` explicitly for clarity; incompatible
-non-default overrides such as `"quack"` raise at config validation time.
+`"fused_npu"`. Set `"fused_npu"` explicitly for clarity; incompatible
+non-default overrides such as `"fused_quack"` raise at config validation time.
 
 The mode and kernel backend are expressed as a single field. After the
 default-value compatibility normalization above, remaining hardware mismatches
@@ -375,19 +375,19 @@ raise during config validation or kernel binding.
 | Value | Kernel | Hardware | EP support |
 |-------|--------|----------|:----------:|
 | `eager` | PyTorch expert loop | Any | No |
-| `triton` | Triton group-gemm | GPU SM70+ or MLU | Yes |
-| `quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
-| `npu` | NPU group-gemm | Ascend NPU | Yes |
-| `mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
+| `fused_triton` | Triton group-gemm | GPU SM70+ or MLU | Yes |
+| `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
+| `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
+| `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` indexer and attention implementations. Its MoE path
 uses the independent `moe_implementation` selection and therefore defaults to
-`triton` on GPU.
+`fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
 directly to `fused_moe_forward(...)` and forwards `swiglu_limit` so every
 supported fused backend preserves V4's clamped SwiGLU pre-activation semantics.
-On Ascend, `npu` keeps the existing `torch_npu.npu_swiglu` path when no
+On Ascend, `fused_npu` keeps the existing `torch_npu.npu_swiglu` path when no
 limit is configured and uses a forward/backward `triton-ascend` kernel for the
 clamped DeepSeek-V4 path when the Ascend backend is available. The import stays lazy, so
 other NPU MoE models do not gain a Triton dependency. An NPU environment
@@ -476,9 +476,9 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | Each patched experts module constructs `VeomniKernel("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, Triton, Quack, NPU, or MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
-| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"triton"` / `"quack"` / `"npu"` / `"mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
-| **EP support** | `triton` and `npu` paths support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
+| **Mechanism** | Each patched experts module constructs `VeomniKernel("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **EP support** | `fused_triton` and `fused_npu` paths support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Handle resolution in model `__init__`; dispatch at forward time | Decorator at class definition time; dispatch at forward time |
 
 **Note:** Transformers v5 hardcodes two MoE experts implementations (`batched_mm` and `grouped_mm`) and does not expose a registration interface for external fused kernels, so VeOmni models call their local `VeomniKernel` handles rather than routing through `ALL_EXPERTS_FUNCTIONS`.
@@ -605,7 +605,7 @@ currently exist in the `kernels-community` hub.
 model:
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: triton
+    moe_implementation: fused_triton
     cross_entropy_loss_implementation: liger_kernel
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: eager           # disable Liger for MLP only

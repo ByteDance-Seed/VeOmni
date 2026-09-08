@@ -7,13 +7,13 @@ model:
     # attention sink, in-block compressor concatenation resizes BlockMask).
     # Must be eager on both GPU and NPU.
     attn_implementation: eager
-    # Default moe_implementation is triton and falls back to npu on NPU
-    # (veomni/arguments/arguments_types.py _NPU_DEFAULT_FALLBACK). Set npu
+    # Default moe_implementation is fused_triton and falls back to fused_npu on NPU
+    # (veomni/arguments/arguments_types.py _NPU_DEFAULT_FALLBACK). Set fused_npu
     # here so the NPU backend choice is visible in the config.
-    moe_implementation: npu
+    moe_implementation: fused_npu
     # Fused-CE default ('liger_kernel') is GPU-only; use the NPU chunk_loss
     # gate instead.
-    cross_entropy_loss_implementation: npu
+    cross_entropy_loss_implementation: chunk_loss
     # Triton load-balancing kernel is CUDA-only; NPU falls back to eager
     # (this is also the automatic NPU default-normalization target).
     load_balancing_loss_implementation: eager

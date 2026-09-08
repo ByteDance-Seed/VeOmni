@@ -4,9 +4,9 @@
 
 VeOmni uses custom attention implementation names:
 
-- `veomni_flash_attention_2_with_sp`
-- `veomni_flash_attention_3_with_sp`
-- `veomni_flash_attention_4_with_sp`
+- `veomni_flash_attention_2`
+- `veomni_flash_attention_3`
+- `veomni_flash_attention_4`
 
 These names are registered into `ALL_ATTENTION_FUNCTIONS` and routed to VeOmni's SP-aware attention wrapper.
 
@@ -14,7 +14,7 @@ With Transformers 5.x, model init and flash-attention preload logic may still ca
 `transformers.modeling_flash_attention_utils._lazy_imports(...)` for the configured implementation string.
 For non-native names, `_lazy_imports` falls back to hub-kernel loading and can fail with:
 
-`ValueError: Could not find the currently requested flash attention implementation at veomni_flash_attention_2_with_sp`
+`ValueError: Could not find the currently requested flash attention implementation at veomni_flash_attention_2`
 
 even though VeOmni already registered the custom attention function.
 
@@ -44,11 +44,11 @@ For VeOmni names, the adapter returns a local kernel-like object exposing:
 
 mapped to local FA2/FA3/FA4 backends:
 
-- `veomni_flash_attention_2_with_sp` -> `flash_attn.flash_attn_func` / `flash_attn.flash_attn_varlen_func`
-- `veomni_flash_attention_3_with_sp` -> `flash_attn_interface.flash_attn_func` / `flash_attn_interface.flash_attn_varlen_func`
-- `veomni_flash_attention_4_with_sp` -> `flash_attn.cute.flash_attn_func` / `flash_attn.cute.flash_attn_varlen_func`
+- `veomni_flash_attention_2` -> `flash_attn.flash_attn_func` / `flash_attn.flash_attn_varlen_func`
+- `veomni_flash_attention_3` -> `flash_attn_interface.flash_attn_func` / `flash_attn_interface.flash_attn_varlen_func`
+- `veomni_flash_attention_4` -> `flash_attn.cute.flash_attn_func` / `flash_attn.cute.flash_attn_varlen_func`
 
-For simplicity, paged VeOmni aliases (for example `paged|veomni_flash_attention_2_with_sp`) are not handled by this adapter.
+For simplicity, paged VeOmni aliases (for example `paged|veomni_flash_attention_2`) are not handled by this adapter.
 
 All non-VeOmni implementations are delegated to the original Transformers loader unchanged.
 
@@ -65,7 +65,7 @@ All non-VeOmni implementations are delegated to the original Transformers loader
 After `import veomni`:
 
 - VeOmni custom names remain registered in `ALL_ATTENTION_FUNCTIONS`.
-- `_lazy_imports("veomni_flash_attention_2_with_sp")` and `_lazy_imports("veomni_flash_attention_4_with_sp")` can resolve through the adapter.
+- `_lazy_imports("veomni_flash_attention_2")` and `_lazy_imports("veomni_flash_attention_4")` can resolve through the adapter.
 - No spurious "kernel hub name not found" error for VeOmni custom names.
 - Paged VeOmni aliases are outside the adapter scope.
 
@@ -77,7 +77,7 @@ After `import veomni`:
 - FA2 and FA3 have dedicated branches in `_lazy_imports` and are resolved
   directly without reaching the hub-kernel path. The adapter is therefore a
   no-op for those two in practice, but is kept for safety.
-- FA4 (`veomni_flash_attention_4_with_sp`) has no such branch in
+- FA4 (`veomni_flash_attention_4`) has no such branch in
   `_lazy_imports` and always falls through to the hub-kernel path. The
   adapter is the **critical** component that makes FA4 usable.
 - FA4 requires the `flash-attn-cute` package (`flash_attn.cute`), shipped

@@ -66,7 +66,7 @@ def _call(impl: str, variant: str, hidden, routing, selected, fc1, fc2, loras, *
 
 def _run_fused_vs_eager(impl: str, variant: str):
     torch.manual_seed(0)
-    device = torch.device("npu" if impl == "npu" else "cuda")
+    device = torch.device("npu" if impl == "fused_npu" else "cuda")
     dtype = torch.bfloat16
     B, H, I, E, top_k, r = 32, 64, 96, 4, 2, 8
     hidden = 0.1 * torch.randn(B, H, device=device, dtype=dtype)
@@ -130,10 +130,10 @@ def _build_lora_leaves(variant: str, *, E: int, H: int, I: int, r: int, dtype: t
 def test_moe_experts_lora_registered_impls(variant):
     registered = KERNEL_REGISTRY.list_registered("moe_experts_lora", variant)
     assert "eager" in registered
-    assert "triton" in registered
-    assert "npu" in registered
-    assert "quack" not in registered
-    assert "mlu" not in registered
+    assert "fused_triton" in registered
+    assert "fused_npu" in registered
+    assert "fused_quack" not in registered
+    assert "fused_mlu" not in registered
 
 
 @pytest.mark.parametrize("variant", ["shared", "independent"])
@@ -162,16 +162,16 @@ def test_moe_experts_lora_eager_forward_smoke(variant):
 def test_moe_experts_lora_triton_available_on_cuda(variant):
     if not IS_CUDA_AVAILABLE:
         pytest.skip("triton LoRA row is CUDA-gated")
-    assert "triton" in KERNEL_REGISTRY.list_available("moe_experts_lora", variant)
-    resolve_kernel("moe_experts_lora", variant, "triton")
+    assert "fused_triton" in KERNEL_REGISTRY.list_available("moe_experts_lora", variant)
+    resolve_kernel("moe_experts_lora", variant, "fused_triton")
 
 
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_moe_experts_lora_npu_available_on_npu(variant):
     if not IS_NPU_AVAILABLE:
         pytest.skip("npu LoRA row is NPU-gated")
-    assert "npu" in KERNEL_REGISTRY.list_available("moe_experts_lora", variant)
-    resolve_kernel("moe_experts_lora", variant, "npu")
+    assert "fused_npu" in KERNEL_REGISTRY.list_available("moe_experts_lora", variant)
+    resolve_kernel("moe_experts_lora", variant, "fused_npu")
 
 
 @pytest.mark.skipif(
@@ -180,13 +180,13 @@ def test_moe_experts_lora_npu_available_on_npu(variant):
 )
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_triton_matches_eager(variant):
-    _run_fused_vs_eager("triton", variant)
+    _run_fused_vs_eager("fused_triton", variant)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="npu moe_experts_lora needs torch_npu")
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_npu_matches_eager(variant):
-    _run_fused_vs_eager("npu", variant)
+    _run_fused_vs_eager("fused_npu", variant)
 
 
 @pytest.mark.skipif(

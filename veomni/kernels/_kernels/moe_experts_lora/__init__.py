@@ -15,8 +15,8 @@
 """MoE experts LoRA kernel family.
 
 ``shared`` is one LoRA pair per logical spec across experts. ``independent``
-is a per-expert pair. Eager is the per-expert loop. Triton and NPU wrap the
-local fused Functions. ``quack`` / ``mlu`` are not registered; callers remap
+is a per-expert pair. Eager is the per-expert loop. ``fused_triton`` and
+``fused_npu`` wrap the local fused Functions. ``fused_quack`` / ``fused_mlu`` are not registered; callers remap
 those ``moe_implementation`` values to eager.
 """
 
@@ -35,7 +35,7 @@ register_kernel("moe_experts_lora", "shared", "eager", wrapper=shared_eager.wrap
 register_kernel(
     "moe_experts_lora",
     "shared",
-    "triton",
+    "fused_triton",
     wrapper=shared_triton.wrapper,
     requirement=CudaKernelRequirement(min_cc=70),
 )
@@ -43,7 +43,7 @@ register_kernel(
 register_kernel(
     "moe_experts_lora",
     "shared",
-    "npu",
+    "fused_npu",
     wrapper=shared_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )
@@ -53,7 +53,7 @@ register_kernel("moe_experts_lora", "independent", "eager", wrapper=independent_
 register_kernel(
     "moe_experts_lora",
     "independent",
-    "triton",
+    "fused_triton",
     wrapper=independent_triton.wrapper,
     requirement=CudaKernelRequirement(min_cc=70),
 )
@@ -61,7 +61,7 @@ register_kernel(
 register_kernel(
     "moe_experts_lora",
     "independent",
-    "npu",
+    "fused_npu",
     wrapper=independent_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )

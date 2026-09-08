@@ -18,14 +18,14 @@ from .launch_utils import find_free_port
 
 
 # NPU ops_implementation overrides per model. The public
-# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton) and
+# ``OpsImplementationConfig`` defaults are GPU-optimal (Liger / Triton / fused Triton MoE) and
 # raise on NPU at config validation time, so every NPU test must override
 # every per-op field. ``_NPU_OPS_DEFAULTS`` is the baseline; entries in
 # ``_NPU_PER_MODEL_OVERRIDES`` (DeepSeek-V3/V4, Qwen-VL family) pin
 # specific fields to ``eager`` where the model has no NPU kernel.
 _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "attn_implementation": "flash_attention_2",
-    "moe_implementation": "npu",
+    "moe_implementation": "fused_npu",
     "cross_entropy_loss_implementation": "chunk_loss",
     "rms_norm_implementation": "npu",
     "rotary_pos_emb_implementation": "npu",
@@ -118,7 +118,7 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # shared-expert MLP use their default Liger kernels.
     "deepseek_v4": {
         "attn_implementation": "eager",
-        "moe_implementation": "triton",
+        "moe_implementation": "fused_triton",
         "rotary_pos_emb_implementation": "triton",
     },
 }

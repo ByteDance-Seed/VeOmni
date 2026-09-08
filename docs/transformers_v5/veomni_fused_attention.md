@@ -25,16 +25,16 @@ hard-codes SDPA/FlashAttention, constructs only dense masks, or bypasses
 Transformers' mask registry needs model-level patchgen adaptation first.
 
 With `MODELING_BACKEND=veomni`, `OpsImplementationConfig` rewrites this public
-value to `veomni_flex_attention_with_sp`. Flash values are rewritten in the
+value to `veomni_flex_attention`. Flash values are rewritten in the
 same way:
 
 | Public value | VeOmni registry name |
 |---|---|
-| `flash_attention_2` | `veomni_flash_attention_2_with_sp` |
-| `flash_attention_3` | `veomni_flash_attention_3_with_sp` |
-| `flash_attention_4` | `veomni_flash_attention_4_with_sp` |
-| `flex_attention` | `veomni_flex_attention_with_sp` |
-| `magi_attention` | `veomni_magi_attention_with_sp` |
+| `flash_attention_2` | `veomni_flash_attention_2` |
+| `flash_attention_3` | `veomni_flash_attention_3` |
+| `flash_attention_4` | `veomni_flash_attention_4` |
+| `flex_attention` | `veomni_flex_attention` |
+| `magi_attention` | `veomni_magi_attention` |
 
 The native Transformers `flex_attention` registry entry is left unchanged.
 Only the VeOmni-specific name routes through VeOmni's SP-aware facade.
@@ -102,7 +102,7 @@ The current adapter requires `cp_size == 1`, batch size 1, zero attention dropou
 
 ### Unified MagiAttention mask builder
 
-VeOmni registers `create_magi_mask` as the Transformers mask builder for `veomni_magi_attention_with_sp`. Canonical unpacked causal and bidirectional models that call the Transformers mask registry without a 2D attention mask can therefore select MagiAttention without defining another mask builder. Models with richer visibility call the same builder directly with one of these metadata forms:
+VeOmni registers `magi_attention_mask_builder` as the Transformers mask builder for `veomni_magi_attention`. Canonical unpacked causal and bidirectional models that call the Transformers mask registry without a 2D attention mask can therefore select MagiAttention without defining another mask builder. Models with richer visibility call the same builder directly with one of these metadata forms:
 
 - `cu_seq_lens_q` and `cu_seq_lens_k` for packed causal or bidirectional sequences;
 - explicit `q_ranges`, `k_ranges`, and `attn_type_map` for mixed or asymmetric visibility;

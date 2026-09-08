@@ -1017,7 +1017,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "swiglu_mlp_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset({"triton"}),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
-    "moe_implementation": frozenset({"npu"}),
+    "moe_implementation": frozenset({"fused_npu"}),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
@@ -1025,7 +1025,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "cross_entropy_loss_implementation": frozenset({"npu"}),
-    "moe_implementation": frozenset({"npu"}),
+    "moe_implementation": frozenset({"fused_npu"}),
 }
 
 _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
@@ -1034,14 +1034,14 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
     "rotary_pos_emb_vision_implementation": "npu",
     "swiglu_mlp_implementation": "eager",
     "load_balancing_loss_implementation": "eager",
-    "cross_entropy_loss_implementation": "npu",
-    "moe_implementation": "npu",
+    "cross_entropy_loss_implementation": "chunk_loss",
+    "moe_implementation": "fused_npu",
 }
 
 # MLU compatibility tables for ``_validate_implementations``.
-# ``triton`` is the same group-gemm as on GPU; ``mlu`` is Apex grouped-GEMM.
+# ``fused_triton`` is the same group-gemm as on GPU; ``fused_mlu`` is Apex grouped-GEMM.
 _MLU_ALLOWED: Dict[str, frozenset] = {
-    "moe_implementation": frozenset({"mlu", "triton"}),
+    "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
 
 _MLU_DEFAULT_FALLBACK: Dict[str, str] = {
@@ -1057,7 +1057,7 @@ _MLU_DEFAULT_FALLBACK: Dict[str, str] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton). On NPU, values
+    Defaults are GPU-optimal (Liger / Triton / fused Triton MoE). On NPU, values
     still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
     are automatically mapped to NPU-compatible or eager implementations;
     explicit non-default overrides are validated and unsupported values raise.
@@ -1115,11 +1115,12 @@ class OpsImplementationConfig:
         },
     )
     moe_implementation: str = field(
-        default="triton",
+        default="fused_triton",
         metadata={
-            "help": "MoE experts forward. 'triton' (default, GPU SM70+ or MLU) | "
-            "'quack' (GPU SM90+) | 'npu' (NPU) | 'mlu' (MLU Apex grouped-GEMM) | 'eager'. "
-            "On NPU, a default-valued 'triton' selection maps to 'npu'; "
+            "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+ or MLU) | "
+            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | "
+            "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
+            "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
             "incompatible non-default overrides raise."
         },
     )
@@ -1323,8 +1324,8 @@ class OpsImplementationConfig:
             if value == "eager":
                 continue
             if on_mlu:
-                if value == "mlu" and not is_apex_mlu_available():
-                    raise ValueError("moe_implementation='mlu' requires apex_mlu installed on Cambricon MLU.")
+                if value == "fused_mlu" and not is_apex_mlu_available():
+                    raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
                 if value not in mlu_ok:
                     allowed = sorted(mlu_ok | {"eager"})
                     raise ValueError(

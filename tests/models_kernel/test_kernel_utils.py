@@ -76,7 +76,7 @@ def test_attention_kernel_reads_kernels_config():
 def test_resolve_moe_impl_reads_kernels_config():
     from veomni.models_kernel.utils.kernel_utils import resolve_moe_impl
 
-    set_kernels_config(SimpleNamespace(moe_implementation="triton"))
-    assert resolve_moe_impl() == "triton"
+    set_kernels_config(SimpleNamespace(moe_implementation="fused_triton"))
+    assert resolve_moe_impl() == "fused_triton"
     set_kernels_config(SimpleNamespace(moe_implementation="eager"))
     assert resolve_moe_impl() == "eager"

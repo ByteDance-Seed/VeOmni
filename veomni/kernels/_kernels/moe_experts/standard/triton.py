@@ -14,7 +14,7 @@
 
 """standard MoE experts Triton implementation.
 
-Registered as ``triton`` on CUDA and MLU. Device is the registry 4th key.
+Registered as ``fused_triton`` on CUDA and MLU. Device is the registry 4th key.
 """
 
 from __future__ import annotations

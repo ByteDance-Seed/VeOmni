@@ -63,8 +63,8 @@ VeOmni uses YAML configuration files for training. You can directly modify the c
 model:
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: npu
-    cross_entropy_loss_implementation: npu
+    moe_implementation: fused_npu
+    cross_entropy_loss_implementation: chunk_loss
     rms_norm_implementation: npu
     rotary_pos_emb_implementation: npu
     swiglu_mlp_implementation: eager           # no NPU backend available

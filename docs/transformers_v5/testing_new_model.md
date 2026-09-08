@@ -29,8 +29,8 @@ asymmetric-forward path:
 Runs one forward + backward step on dummy data for every combination of:
 
 - HF attention backends (`eager`, `flash_attention_2`, `flash_attention_3`)
-- VeOmni attention backends (`veomni_flash_attention_2_with_sp`,
-  `veomni_flash_attention_3_with_sp`)
+- VeOmni attention backends (`veomni_flash_attention_2`,
+  `veomni_flash_attention_3`)
 - MoE backends (for MoE models: `eager`, `fused`)
 
 Then asserts that loss and grad norm match across all combinations within
@@ -65,7 +65,7 @@ block in `test_models_patch_fwd_bwd` keyed on `case_id`:
 if case_id == "<new_model>":
     hf_model_modes = [mode for mode in hf_model_modes if mode.attn_implementation != "flash_attention_3"]
     veomni_model_modes = [
-        mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3_with_sp"
+        mode for mode in veomni_model_modes if mode.attn_implementation != "veomni_flash_attention_3"
     ]
 ```
 

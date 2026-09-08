@@ -661,7 +661,7 @@ def test_gpt_oss_parallel_uses_fa4_and_quack():
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
-        assert "--model.ops_implementation.moe_implementation=quack" in cmd
+        assert "--model.ops_implementation.moe_implementation=fused_quack" in cmd
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)

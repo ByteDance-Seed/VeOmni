@@ -84,7 +84,7 @@ __all__ = [
 def _fused_ops_override() -> str:
     from veomni.utils.import_utils import is_torch_npu_available
 
-    backend = "npu" if is_torch_npu_available() else "triton"
+    backend = "fused_npu" if is_torch_npu_available() else "fused_triton"
     return f"--model.ops_implementation.moe_implementation={backend}"
 
 

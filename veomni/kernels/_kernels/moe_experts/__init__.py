@@ -35,7 +35,7 @@ register_kernel("moe_experts", "standard", "eager", wrapper=standard_eager.wrapp
 register_kernel(
     "moe_experts",
     "standard",
-    "triton",
+    "fused_triton",
     wrapper=standard_triton.wrapper,
     requirement=CudaKernelRequirement(min_cc=70),
 )
@@ -43,7 +43,7 @@ register_kernel(
 register_kernel(
     "moe_experts",
     "standard",
-    "triton",
+    "fused_triton",
     wrapper=standard_triton.wrapper,
     requirement=MluKernelRequirement(),
 )
@@ -51,7 +51,7 @@ register_kernel(
 register_kernel(
     "moe_experts",
     "standard",
-    "quack",
+    "fused_quack",
     wrapper=standard_quack.wrapper,
     requirement=CudaKernelRequirement(min_cc=90),
 )
@@ -59,7 +59,7 @@ register_kernel(
 register_kernel(
     "moe_experts",
     "standard",
-    "npu",
+    "fused_npu",
     wrapper=standard_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )
@@ -67,7 +67,7 @@ register_kernel(
 register_kernel(
     "moe_experts",
     "standard",
-    "mlu",
+    "fused_mlu",
     wrapper=standard_mlu.wrapper,
     requirement=MluKernelRequirement(),
 )
@@ -77,7 +77,7 @@ register_kernel("moe_experts", "gpt_oss", "eager", wrapper=gpt_oss_eager.wrapper
 register_kernel(
     "moe_experts",
     "gpt_oss",
-    "quack",
+    "fused_quack",
     wrapper=gpt_oss_quack.wrapper,
     requirement=CudaKernelRequirement(min_cc=90),
 )

@@ -116,8 +116,8 @@ EP-aware rank-0 broadcast / per-rank load paths slice the disk-side
 
 Both wrappers always call ``VeomniKernel("moe_experts_lora", variant, impl)``.
 ``variant`` is the wrapper class (``shared`` / ``independent``). ``impl``
-comes from kernels ``moe_implementation`` (``triton`` / ``npu``; everything
-else remaps to ``eager``).
+comes from kernels ``moe_implementation`` (``fused_triton`` / ``fused_npu``;
+everything else remaps to ``eager``).
 
 PEFT-format save/load compatibility (PEFT-aligned FQN layout)
 -------------------------------------------------------------
@@ -158,7 +158,7 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-_FUSED_MOE_LORA_IMPLS = frozenset({"triton", "npu"})
+_FUSED_MOE_LORA_IMPLS = frozenset({"fused_triton", "fused_npu"})
 
 
 def _resolve_moe_lora_impl() -> str:
@@ -672,7 +672,7 @@ class LoraSharedExperts(nn.Module):
         if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraSharedExperts: eager forward does not support expert parallelism (EP). "
-                "Set moe_implementation='triton' (GPU) or 'npu' (NPU) "
+                "Set moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
                 "to use the EP-aware fused LoRA path, or disable EP."
             )
 
@@ -946,7 +946,7 @@ class LoraIndependentExperts(nn.Module):
         if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
-                "Set moe_implementation='triton' (GPU) or 'npu' (NPU) "
+                "Set moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
                 "to use the EP-aware fused LoRA path, or disable EP."
             )
 
