@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -39,6 +41,7 @@ from tests.ops.tol import (
     GDN_NPU_RTOL,
 )
 from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops.registry import OpEntry
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 
 
@@ -277,6 +280,75 @@ def test_chunk_gated_delta_rule_eager_matches_hf():
     assert torch.allclose(v_e.grad, v_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(g_e.grad, g_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     assert torch.allclose(b_e.grad, b_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+@pytest.mark.parametrize("impl", ("npu", "npu_ascendc"))
+def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
+    impl: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the NPU raw-pair autograd glue without requiring NPU hardware."""
+    module = import_module(f"veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.{impl}")
+    triton_utils = import_module("veomni.ops.kernels.gated_delta_rule.vendor.triton.utils")
+    monkeypatch.setattr(triton_utils, "input_guard", lambda fn: fn)
+
+    head_first = impl == "npu_ascendc"
+
+    def fake_chunk_fwd(query, key, value, g, beta, *args):
+        del beta, args
+        output = query + 2 * key
+        if head_first:
+            output = output.transpose(1, 2).contiguous()
+        return g, output, query.new_empty(0), None
+
+    def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, *args):
+        del a, scale, initial_state, args
+        if head_first:
+            grad_output = grad_output.transpose(1, 2).contiguous()
+        grads = (
+            grad_output,
+            2 * grad_output,
+            torch.zeros_like(value),
+            torch.zeros_like(beta),
+            torch.zeros_like(g),
+        )
+        return grads if head_first else (*grads, None)
+
+    monkeypatch.setattr(module, "_chunk_fwd", fake_chunk_fwd)
+    monkeypatch.setattr(module, "_chunk_bwd", fake_chunk_bwd)
+
+    torch.manual_seed(6)
+    shape = (1, 4, 2, 8)
+    query = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(shape[:3], dtype=torch.float32, requires_grad=True)
+    beta = torch.randn(shape[:3], dtype=torch.bfloat16, requires_grad=True)
+    initial_state = query.new_empty(0)
+    cu_seqlens = query.new_empty(0, dtype=torch.int32)
+
+    entry = OpEntry("test_chunk_gdr", "standard", impl, module.forward, module.backward)
+    output, _final_state = entry.wrapper(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+        cu_seqlens,
+        use_qk_l2norm_in_kernel=True,
+    )
+    grad_output = torch.randn_like(output)
+    output.backward(grad_output)
+
+    query_ref = query.detach().requires_grad_(True)
+    key_ref = key.detach().requires_grad_(True)
+    query_norm = query_ref * torch.rsqrt((query_ref * query_ref).sum(dim=-1, keepdim=True) + 1e-6)
+    key_norm = key_ref * torch.rsqrt((key_ref * key_ref).sum(dim=-1, keepdim=True) + 1e-6)
+    (query_norm + 2 * key_norm).backward(grad_output)
+
+    assert torch.allclose(query.grad, query_ref.grad, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(key.grad, key_ref.grad, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA chunk_gated_delta_rule needs CUDA")

@@ -26,9 +26,11 @@ from . import eager as _eager
 
 @dataclass(frozen=True)
 class _Meta:
-    """Whether the empty-tensor path ran."""
+    """Execution path and requested input gradients."""
 
     empty: bool
+    hidden_needs_grad: bool
+    weight_needs_grad: bool
 
 
 def forward(
@@ -52,7 +54,7 @@ def forward(
         output, saved = _eager.forward(
             hidden, labels, weight, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch
         )
-        return output, SavedState(saved.tensors, _Meta(True))
+        return output, SavedState(saved.tensors, _Meta(True, hidden.requires_grad, weight.requires_grad))
 
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_forward
 
@@ -63,7 +65,10 @@ def forward(
     weight_needs_grad = weight.requires_grad
     hidden_flat = hidden_flat.contiguous()
     weight_c = weight.contiguous()
-    if hidden_needs_grad and not hidden_flat.requires_grad:
+    # Liger gates both grad buffers on the input's ``requires_grad`` flag.
+    # Force it on when either input needs a gradient, then discard unrequested
+    # gradients in ``backward``.
+    if (hidden_needs_grad or weight_needs_grad) and not hidden_flat.requires_grad:
         hidden_flat.requires_grad_(True)
     if weight_needs_grad and not weight_c.requires_grad:
         weight_c.requires_grad_(True)
@@ -76,17 +81,27 @@ def forward(
         ignore_index=ignore_index,
         reduction=reduction,
     )
-    if grad_hidden is None or grad_weight is None:
-        raise RuntimeError("liger fused CE did not allocate input/weight grads")
+    if (hidden_needs_grad or weight_needs_grad) and grad_hidden is None:
+        raise RuntimeError("liger fused CE did not allocate the input grad buffer")
+    if weight_needs_grad and grad_weight is None:
+        raise RuntimeError("liger fused CE did not allocate the requested weight grad buffer")
     if num_items_in_batch is not None:
         scale = 1.0 / num_items_in_batch
         loss = loss * scale
-        grad_hidden = grad_hidden * scale
-        grad_weight = grad_weight * scale
-    return loss, SavedState((hidden, grad_hidden.detach(), grad_weight.detach()), _Meta(False))
+        if grad_hidden is not None:
+            grad_hidden = grad_hidden * scale
+        if grad_weight is not None:
+            grad_weight = grad_weight * scale
+
+    grad_hidden_saved = grad_hidden.detach() if grad_hidden is not None else hidden.new_empty(0)
+    grad_weight_saved = grad_weight.detach() if grad_weight is not None else weight.new_empty(0)
+    return loss, SavedState(
+        (hidden, grad_hidden_saved, grad_weight_saved),
+        _Meta(False, hidden_needs_grad, weight_needs_grad),
+    )
 
 
-def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None, Tensor]:
+def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, None, Tensor | None]:
     """Return ``(grad_hidden, None, grad_weight)``. Empty inputs reuse eager."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
@@ -95,8 +110,9 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None, Tens
 
     from liger_kernel.ops.fused_linear_cross_entropy import fused_linear_cross_entropy_backward
 
-    hidden, grad_hidden, grad_weight = saved.tensors
+    hidden, grad_hidden, grad_weight_saved = saved.tensors
+    grad_weight = grad_weight_saved if meta.weight_needs_grad else None
     grad_hidden, grad_weight, _grad_bias = fused_linear_cross_entropy_backward(
         grad_output, grad_hidden, grad_weight, None
     )
-    return grad_hidden.view_as(hidden), None, grad_weight
+    return grad_hidden.view_as(hidden) if meta.hidden_needs_grad else None, None, grad_weight

@@ -41,6 +41,7 @@ class _Meta:
     scale: float
     chunk_size: int
     output_final_state: bool
+    use_qk_l2norm: bool
     has_initial_state: bool
     has_cu_seqlens: bool
     cu_seqlens_list: list[int] | None
@@ -48,11 +49,17 @@ class _Meta:
     chunk_indices_list: dict[str, list[int] | None] | None
 
 
-def _l2norm(x: Tensor, dim: int = -1, eps: float = 1e-6) -> Tensor:
-    """Match the FLA / vendored eager ``l2norm`` used before the fused kernels."""
+def _l2norm_fwd(x: Tensor, dim: int = -1, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
+    """Return the FLA-style L2-normalized tensor and reciprocal norm."""
     original_dtype = x.dtype
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return (x * inv_norm).to(original_dtype)
+    return (x * inv_norm).to(original_dtype), inv_norm
+
+
+def _l2norm_bwd(y: Tensor, inv_norm: Tensor, grad_y: Tensor, dim: int = -1) -> Tensor:
+    """Apply the L2-normalization Jacobian to ``grad_y``."""
+    projection = (grad_y * y).sum(dim=dim, keepdim=True)
+    return ((grad_y - y * projection) * inv_norm).to(y)
 
 
 def _cdiv(a: Tensor, b: int) -> Tensor:
@@ -550,8 +557,11 @@ def forward(
             )
 
     if use_qk_l2norm_in_kernel:
-        query_h = _l2norm(query_h)
-        key_h = _l2norm(key_h)
+        query_h, query_inv_norm = _l2norm_fwd(query_h)
+        key_h, key_inv_norm = _l2norm_fwd(key_h)
+    else:
+        query_inv_norm = unused_like(query_h)
+        key_inv_norm = unused_like(key_h)
 
     scale = key_h.shape[-1] ** -0.5
     guarded_fwd = input_guard(_chunk_fwd)
@@ -573,11 +583,23 @@ def forward(
     if final_state is None:
         final_state = output.new_empty(0)
     return (output.to(query_h.dtype), final_state), SavedState(
-        (query_h, key_h, value_h, g_cum, beta, a, initial_state, cu_seqlens),
+        (
+            query_h,
+            key_h,
+            value_h,
+            g_cum,
+            beta,
+            a,
+            initial_state,
+            cu_seqlens,
+            query_inv_norm,
+            key_inv_norm,
+        ),
         _Meta(
             scale,
             chunk_size,
             output_final_state,
+            use_qk_l2norm_in_kernel,
             initial_opt is not None,
             cu_opt is not None,
             cu_seqlens_list,
@@ -597,7 +619,18 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
 
     meta = saved.metadata
     assert isinstance(meta, _Meta)
-    query_h, key_h, value_h, g_cum, beta, a, initial_state, cu_seqlens = saved.tensors
+    (
+        query_h,
+        key_h,
+        value_h,
+        g_cum,
+        beta,
+        a,
+        initial_state,
+        cu_seqlens,
+        query_inv_norm,
+        key_inv_norm,
+    ) = saved.tensors
     do, _dht = grad_output
     initial_opt = initial_state if meta.has_initial_state else None
     cu_opt = cu_seqlens if meta.has_cu_seqlens else None
@@ -619,6 +652,9 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
         meta.chunk_indices_list,
         meta.chunk_size,
     )
+    if meta.use_qk_l2norm:
+        grad_q_h = _l2norm_bwd(query_h, query_inv_norm, grad_q_h)
+        grad_k_h = _l2norm_bwd(key_h, key_inv_norm, grad_k_h)
     return (
         grad_q_h.transpose(1, 2).to(query_h),
         grad_k_h.transpose(1, 2).to(key_h),
