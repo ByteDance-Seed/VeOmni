@@ -30,7 +30,9 @@ class FP32ReduceScatterWithLowPrecisionTransport:
     FSDP keeps its FP32 reduction input and output contract. This implementation
     converts only the wire buffers to BF16 or FP16, then performs the destination-
     local sum and scale directly into the FP32 output. FSDP must pass an unscaled
-    SUM and leave all gradient scaling to this implementation.
+    SUM and leave all gradient scaling to this implementation. BF16 preserves the
+    FP32 exponent range; FP16 transport follows normal cast semantics and can
+    overflow finite FP32 values outside the FP16 range.
     """
 
     def __init__(self, transport_dtype: torch.dtype, reduction_scale: float) -> None:
