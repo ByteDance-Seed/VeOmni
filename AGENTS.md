@@ -40,8 +40,10 @@ source .venv/bin/activate
 ```
 
 This installs `transformers==5.9.0` via the `transformers-stable` dependency
-group. `gpu` / `npu` / `npu_aarch64` are the only extras — each a complete
-superset, mutually exclusive. New code must target transformers v5 and FSDP2.
+group. `gpu` / `npu` / `npu_aarch64` are mutually exclusive hardware extras;
+each is a complete superset for that accelerator. MagiAttention is an
+optional `--extra magi` that combines with `gpu` (`uv sync --extra gpu --extra magi`).
+New code must target transformers v5 and FSDP2.
 See `.agents/knowledge/uv.md` and `.agents/knowledge/constraints.md`.
 
 ---

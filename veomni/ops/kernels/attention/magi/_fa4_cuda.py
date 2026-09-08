@@ -78,7 +78,7 @@ def _prepare_default_magi_kernel(device: torch.device) -> tuple[str, dict[str, o
         except (ImportError, OSError, RuntimeError) as error:
             raise ImportError(
                 "VeOmni `magi_attention` on SM90 requires MagiAttention's precompiled CUTLASS FFA backend. "
-                "Run `uv sync --extra gpu --dev`, then `bash scripts/kernel/install_magi_sm90.sh`."
+                "Run `uv sync --extra gpu --extra magi --dev`, then `bash scripts/kernel/install_magi_sm90.sh`."
             ) from error
 
         build_flags = CONFIG.get("build_flags", {})
@@ -370,7 +370,7 @@ def _fa4_cuda_attention_forward(
         except ImportError as error:
             raise ImportError(
                 "VeOmni `magi_attention` requires the optional `magi-attention` package. "
-                "Install VeOmni with the `gpu` extra."
+                "Install VeOmni with `--extra gpu --extra magi`."
             ) from error
 
     attn_arg = _get_or_prepare_fa4_attn_arg(
