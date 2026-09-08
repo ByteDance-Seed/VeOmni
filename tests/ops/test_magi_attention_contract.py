@@ -593,7 +593,7 @@ def test_magi_sm90_reports_cutlass_installer(monkeypatch):
     monkeypatch.setattr(magi_fa4_backend, "get_gpu_compute_capability", lambda device: 90)
     _set_fake_cutlass_backend(monkeypatch, available=False)
 
-    with pytest.raises(ImportError, match=r"install_magi_sm90\.sh"):
+    with pytest.raises(ImportError, match=r"--extra magi.*install_magi_sm90\.sh"):
         magi_fa4_backend._prepare_default_magi_kernel(torch.device("cuda"))
 
 

@@ -8,6 +8,8 @@ startup update script already runs `uv sync --extra gpu --dev`, so `.venv` is
 ready — activate it with `source .venv/bin/activate` before any command. `uv`
 is installed under `~/.local/bin` (on `PATH` via `~/.bashrc`); the `gpu` extra's
 CUDA torch wheels install fine here and `torch.cuda.is_available()` is `False`.
+Do not add `--extra magi` on this VM: MagiAttention source-builds CUDA
+extensions and is NVIDIA SM90+ only.
 
 ## What works CPU-only (use these to validate changes without hardware)
 

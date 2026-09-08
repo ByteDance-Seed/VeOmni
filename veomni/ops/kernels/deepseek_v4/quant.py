@@ -29,11 +29,7 @@
 #
 # Adapted through radixark/miles; modified for VeOmni.
 
-"""Block-wise FP8 activation quantization for DeepSeek-V4.
-
-Ported verbatim from deepseek-ai/DeepSeek-V4-Pro/inference/kernel.py to keep
-bit-exact parity with the upstream inference kernel. Keep this file in sync
-when DeepSeek updates the reference implementation.
+"""Block-wise FP8 and FP4 quantization for DeepSeek-V4.
 
 Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/kernel.py
 """
@@ -78,19 +74,19 @@ def fast_round_scale(amax, fp8_max_inv):
 
 @tilelang.jit(pass_configs=pass_configs)
 def act_quant_kernel(
-    N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False, inplace=False
+    N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False, dequant=False
 ):
-    """Block-wise FP8 quantization. inplace=True does fused quant+dequant back to BF16."""
+    """Block-wise FP8 quantization. dequant=True writes the fused quant+dequant round trip to Y as BF16."""
     M = T.symbolic("M")
     fp8_min = -448.0
     fp8_max = 448.0
     fp8_max_inv = 1 / fp8_max
-    num_stages = 0 if round_scale or inplace else 2
+    num_stages = 0 if round_scale or dequant else 2
     blk_m = 32
     group_size = block_size
     # Internal computation in FP32; scale_dtype controls output storage format.
     compute_dtype = FP32
-    out_dtype = in_dtype if inplace else out_dtype
+    out_dtype = in_dtype if dequant else out_dtype
 
     @T.prim_func
     def act_quant_kernel_(
@@ -119,7 +115,7 @@ def act_quant_kernel(
                         s_local[i] = fast_round_scale(amax_local[i], fp8_max_inv)
                     else:
                         s_local[i] = amax_local[i] * fp8_max_inv
-                if inplace:
+                if dequant:
                     for i, j in T.Parallel(blk_m, group_size):
                         y_local[i, j] = T.Cast(
                             out_dtype,
@@ -143,28 +139,27 @@ def act_quant(
     block_size: int = 128,
     scale_fmt: str | None = None,
     scale_dtype: torch.dtype = torch.float32,
-    inplace: bool = False,
-) -> torch.Tensor:
-    """Block-wise FP8 quantization. inplace=True does fused quant+dequant back to BF16.
+    dequant: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise FP8 quantization. dequant=True does fused quant+dequant back to BF16.
     When scale_fmt is set, scales are rounded to power-of-2 (MXFP).
     """
     N = x.size(-1)
     assert N % block_size == 0
     tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
     z = x.contiguous()
-    y = torch.empty_like(z) if inplace else torch.empty_like(z, dtype=torch.float8_e4m3fn)
+    y = torch.empty_like(z) if dequant else torch.empty_like(z, dtype=torch.float8_e4m3fn)
     s = z.new_empty(*z.size()[:-1], N // block_size, dtype=scale_dtype)
     kernel = act_quant_kernel(
         N,
         block_size,
         scale_dtype=tl_dtype,
         round_scale=scale_fmt is not None,
-        inplace=inplace,
+        dequant=dequant,
     )
     kernel(z.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
-    if inplace:
-        x.copy_(y)
-        return x
+    if dequant:
+        return y
     return y, s
 
 
@@ -175,24 +170,28 @@ def fp8_weight_quant_kernel(
     block_size=128,
     scale_dtype=FP32,
     round_scale=False,
+    dequant=False,
 ):
     """Block-wise ``block_size x block_size`` FP8 quantization, one tile per CTA.
     round_scale=True rounds each tile scale up to a power of two (MXFP).
+    dequant=True writes the fused quant+dequant round trip to Y as BF16.
     """
     assert M % block_size == 0 and N % block_size == 0
     fp8_min = -448.0
     fp8_max = 448.0
     fp8_max_inv = 1 / fp8_max
+    # Internal computation stays in FP32; this is the storage format of Y.
+    out_dtype = BF16 if dequant else FP8
 
     @T.prim_func
     def fp8_weight_quant_kernel_(
         X: T.Tensor[(M, N), BF16],
-        Y: T.Tensor[(M, N), FP8],
+        Y: T.Tensor[(M, N), out_dtype],
         S: T.Tensor[(M // block_size, N // block_size), scale_dtype],
     ):
         with T.Kernel(N // block_size, M // block_size, threads=128) as (bx, by):
             x_shared = T.alloc_shared((block_size, block_size), BF16)
-            y_shared = T.alloc_shared((block_size, block_size), FP8)
+            y_shared = T.alloc_shared((block_size, block_size), out_dtype)
             amax_row_local = T.alloc_fragment((block_size,), FP32)
             scale_local = T.alloc_fragment((1,), FP32)
             scale_shared = T.alloc_shared((1,), FP32)
@@ -207,8 +206,19 @@ def fp8_weight_quant_kernel(
                 scale_local[0] = scale_local[0] * fp8_max_inv
             T.copy(scale_local, scale_shared)
 
-            for i, j in T.Parallel(block_size, block_size):
-                y_shared[i, j] = T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max)
+            if dequant:
+                # The dequantizing product is taken in FP32 against the same
+                # scale the division used, so the result is the one an FP8
+                # inference GEMM would see, rounded to BF16 exactly once.
+                for i, j in T.Parallel(block_size, block_size):
+                    y_shared[i, j] = T.Cast(
+                        out_dtype,
+                        T.Cast(FP32, T.Cast(FP8, T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max)))
+                        * scale_shared[0],
+                    )
+            else:
+                for i, j in T.Parallel(block_size, block_size):
+                    y_shared[i, j] = T.clamp(x_shared[i, j] / scale_shared[0], fp8_min, fp8_max)
 
             T.copy(y_shared, Y[by * block_size, bx * block_size])
             if T.get_thread_binding(0) == 0:
@@ -222,7 +232,8 @@ def fp8_weight_quant(
     block_size: int = 128,
     scale_fmt: str | None = None,
     scale_dtype: torch.dtype = torch.float32,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    dequant: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Block-wise ``block_size x block_size`` FP8 quantization of a 2D weight.
 
     Args:
@@ -233,8 +244,16 @@ def fp8_weight_quant(
         scale_dtype (torch.dtype): Storage dtype of the returned scales, either
             ``torch.float32`` or ``torch.float8_e8m0fnu``. E8M0 carries no
             mantissa, so it is only usable together with ``scale_fmt``.
+        dequant (bool): Fuse the dequantization into the kernel and return the
+            BF16 round trip alone, which is what QAT consumes. ``x`` is only
+            read, so this is safe to call on a live tensor such as a parameter.
+            It is also the cheapest form: neither the FP8 tiles nor an FP32 copy
+            of the weight is ever materialized.
 
     Returns:
+        When ``dequant``, a single BF16 tensor holding the quantize-dequantize
+        round trip. Otherwise a tuple of:
+
         weight (torch.float8_e4m3fn): Quantized weight, same shape as ``x``.
         scale (``scale_dtype``): One scale per ``block_size x block_size`` tile.
     """
@@ -253,7 +272,7 @@ def fp8_weight_quant(
         f"weight shape {(M, N)} is not divisible by block_size {block_size}"
     )
     z = x.contiguous()
-    y = torch.empty_like(z, dtype=torch.float8_e4m3fn)
+    y = torch.empty_like(z) if dequant else torch.empty_like(z, dtype=torch.float8_e4m3fn)
     s = z.new_empty((M // block_size, N // block_size), dtype=scale_dtype)
     kernel = fp8_weight_quant_kernel(
         M,
@@ -261,21 +280,24 @@ def fp8_weight_quant(
         block_size,
         scale_dtype=scale_dtype,
         round_scale=scale_fmt is not None,
+        dequant=dequant,
     )
     kernel(z, y, s)
+    if dequant:
+        return y
     return y, s
 
 
 @tilelang.jit(pass_configs=pass_configs)
-def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, inplace=False):
-    """Block-wise FP4 quantization. Power-of-2 scale via bit ops. inplace=True does fused quant+dequant."""
+def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, dequant=False):
+    """Block-wise FP4 quantization. Power-of-2 scale via bit ops. dequant=True does fused quant+dequant."""
     M = T.symbolic("M")
     fp4_max = 6.0
     fp4_max_inv = 1.0 / fp4_max
     blk_m = 32
     group_size = block_size
     compute_dtype = FP32
-    out_dtype = in_dtype if inplace else FP4
+    out_dtype = in_dtype if dequant else FP4
 
     @T.prim_func
     def fp4_quant_kernel_(
@@ -301,7 +323,7 @@ def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, inplace
                 for i in T.Parallel(blk_m):
                     amax_local[i] = T.max(amax_local[i], 6 * (2**-126))
                     s_local[i] = fast_round_scale(amax_local[i], fp4_max_inv)
-                if inplace:
+                if dequant:
                     for i, j in T.Parallel(blk_m, group_size):
                         y_local[i, j] = T.Cast(
                             out_dtype,
@@ -322,17 +344,16 @@ def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, inplace
 def fp4_act_quant(
     x: torch.Tensor,
     block_size: int = 32,
-    inplace: bool = False,
-) -> torch.Tensor:
-    """Block-wise FP4 quantization. inplace=True does fused quant+dequant back to BF16."""
+    dequant: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise FP4 quantization. dequant=True does fused quant+dequant back to BF16."""
     N = x.size(-1)
     assert N % block_size == 0
     z = x.contiguous()
-    y = torch.empty_like(z) if inplace else z.new_empty(*z.shape[:-1], N // 2, dtype=torch.float4_e2m1fn_x2)
+    y = torch.empty_like(z) if dequant else z.new_empty(*z.shape[:-1], N // 2, dtype=torch.float4_e2m1fn_x2)
     s = z.new_empty(*z.size()[:-1], N // block_size, dtype=torch.float8_e8m0fnu)
-    kernel = fp4_quant_kernel(N, block_size, inplace=inplace)
+    kernel = fp4_quant_kernel(N, block_size, dequant=dequant)
     kernel(z.view(-1, N), y.view(-1, y.size(-1)), s.view(-1, N // block_size))
-    if inplace:
-        x.copy_(y)
-        return x
+    if dequant:
+        return y
     return y, s

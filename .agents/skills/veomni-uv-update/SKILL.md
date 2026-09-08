@@ -9,8 +9,8 @@ Read `.agents/knowledge/uv.md` for the full dependency architecture. The key thi
 
 - uv version is pinned in **three places** (must update together)
 - torch uses **direct wheel URLs** (not just version bumps)
-- only three extras: `gpu` / `npu` / `npu_aarch64`, mutually exclusive,
-  each a complete superset
+- three mutually exclusive hardware extras (`gpu` / `npu` / `npu_aarch64`),
+  each a complete superset, plus optional `--extra magi` (combine with `gpu`)
 
 ## Scenario 1: Update uv Version
 
