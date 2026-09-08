@@ -136,8 +136,11 @@ class TrainingMixin(TrainingModuleMixin):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
+        sample_starts: list[int] = []
+        decode_len = 0
 
         for sample in conversation_list:
+            sample_start = decode_len
             for part in sample:
                 if is_dummy(part):
                     continue
@@ -149,14 +152,27 @@ class TrainingMixin(TrainingModuleMixin):
                     assert labels.shape[0] == hidden_states.shape[0]
                     hidden_states_chunks.append(hidden_states)
                     label_chunks.append(labels)
+                    decode_len += labels.shape[0]
                 elif part.type in ("image", "video"):
                     # Vision segment carries projected patch embeds; keep one row
                     # (no label) so the sequence stays aligned, like the backbone.
                     hidden_states_chunks.append(hidden_states[-1:])
                     label_chunks.append(torch.full((1,), -100, dtype=torch.long))
+                    decode_len += 1
+            if decode_len > sample_start:
+                sample_starts.append(sample_start)
 
         hidden_states = torch.cat(hidden_states_chunks, dim=0)
         labels = torch.cat(label_chunks, dim=0)  # CPU
+
+        # The shift below is global over the concatenated samples, so sample k's
+        # first label would become the target of sample k-1's last position -- a
+        # token in a different attention span. Mask it, exactly as
+        # ``PackingCollator`` does on the single-model path, instead of relying on
+        # the chat template happening to emit a masked leading marker. ``torch.cat``
+        # copied, so each part's own ``meta["labels"]`` stays intact.
+        for start in sample_starts[1:]:
+            labels[start] = IGNORE_INDEX
 
         labels = labels[..., 1:].contiguous()
         shift_labels = F.pad(labels, (0, 1), "constant", -100)

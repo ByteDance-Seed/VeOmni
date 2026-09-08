@@ -136,6 +136,53 @@ def test_pack_qwen3vl_two_samples_cu_seqlens():
     assert int(packed[VISUAL_POS_MASK].sum()) == 8
 
 
+def test_pack_qwen3vl_masks_sample_boundary_labels():
+    """Each packed sample's first label is IGNORE, whatever the template emitted.
+
+    The shift is global over the packed sequence, so an unmasked first label would
+    make sample k-1's last position predict a token ``packed_cu_seqlens`` already
+    cut attention at. These samples train every token (no masked leading marker),
+    which is exactly the case the chat template would otherwise be covering up.
+    """
+    samples = [
+        [
+            ConversationItem(
+                type="text",
+                value=torch.tensor([1, 2, 3]),
+                role="assistant",
+                meta={"labels": torch.tensor([1, 2, 3])},
+            ),
+            # FSDP anchor only — dummies stay off the packed sequence.
+            ConversationItem(
+                type="image",
+                value=torch.zeros(16, 8),
+                role="dummy",
+                source="qwen3vl_vision",
+                meta={_OMNI_GRID: [1, 4, 4]},
+            ),
+        ],
+        [
+            ConversationItem(
+                type="text",
+                value=torch.tensor([4, 5]),
+                role="assistant",
+                meta={"labels": torch.tensor([4, 5])},
+            )
+        ],
+    ]
+    packed = pack_qwen3vl_conversations(samples, pad_token_id=0, spatial_merge_size=2)
+    cu = packed[PACKED_CU_SEQLENS].tolist()
+    assert cu == [0, 3, 5]
+    # Sample 0 keeps its first label (the shift drops it anyway); sample 1's is masked.
+    assert packed[PACKED_LABELS][0].tolist() == [1, 2, 3, IGNORE_INDEX, 5]
+    # The carrier's own labels must not have been mutated in place.
+    assert samples[1][0].meta["labels"].tolist() == [4, 5]
+
+    shifted = shift_packed_labels(packed[PACKED_LABELS])[0]
+    for boundary in cu[1:-1]:
+        assert shifted[boundary - 1] == IGNORE_INDEX
+
+
 def test_masked_scatter_and_fold_dummy():
     packed = torch.zeros(1, 6, 2)
     mask = torch.tensor([[False, False, True, True, False, False]])

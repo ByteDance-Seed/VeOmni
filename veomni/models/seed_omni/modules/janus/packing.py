@@ -128,8 +128,17 @@ def pack_janus_conversations(
         if not sample_ids:
             continue
         cat_ids = torch.cat(sample_ids, dim=0)
+        cat_labels = torch.cat(sample_labels, dim=0)
+        # ``shift_packed_labels`` shifts globally, so sample k's first label would
+        # become the target of sample k-1's last position -- a token that sits in a
+        # different packed span. Mask it, exactly as ``PackingCollator`` does on the
+        # single-model path, instead of relying on the chat template happening to
+        # emit a masked leading marker. ``torch.cat`` copied, so the conversation
+        # carrier's labels stay intact.
+        if ids_chunks:
+            cat_labels[0] = IGNORE_INDEX
         ids_chunks.append(cat_ids)
-        label_chunks.append(torch.cat(sample_labels, dim=0))
+        label_chunks.append(cat_labels)
         mask_chunks.append(torch.ones(cat_ids.numel(), dtype=torch.long))
         position_chunks.append(torch.arange(cat_ids.numel(), dtype=torch.long))
         und_mask_chunks.append(torch.cat(sample_und, dim=0))

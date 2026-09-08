@@ -345,6 +345,40 @@ def test_text_encoder_decode_returns_single_loss_key():
     assert "lm_loss" not in graph_out
 
 
+def test_text_encoder_decode_pre_masks_sample_boundary_labels():
+    """Sample k's first label is IGNORE regardless of what the chat template emitted.
+
+    ``_prepare_decode_inputs`` concatenates the batch's samples and shifts once
+    over the whole thing, so an unmasked first label would make sample k-1's last
+    position predict a token in a different attention span. Asserted on the base
+    mixin because every conversation-path family inherits this ``decode_pre``.
+    These samples supervise every token — no masked leading marker to hide behind.
+    """
+    from veomni.utils.constants import IGNORE_INDEX
+
+    TextEncoder = _accelerated_model_cls("text_encoder")
+    TextEncoderConfig = _config_cls("text_encoder")
+    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=8))
+
+    def _text(labels: list[int]) -> ConversationItem:
+        return ConversationItem(
+            type="text",
+            value=torch.randn(len(labels), 8),
+            role="assistant",
+            meta={"labels": torch.tensor(labels)},
+        )
+
+    conversation_list = [[_text([1, 2, 3])], [_text([4, 5])]]
+    out = te.decode_pre(conversation_list=conversation_list)
+
+    # Concatenated labels are [1, 2, 3, IGNORE, 5]; the global shift then drops
+    # index 0 and pads the tail, so sample 0's last position (index 2) scores
+    # IGNORE instead of sample 1's first token.
+    assert out["shift_labels"].tolist() == [2, 3, IGNORE_INDEX, 5, IGNORE_INDEX]
+    # The carrier's own labels must not have been mutated in place.
+    assert conversation_list[1][0].meta["labels"].tolist() == [4, 5]
+
+
 def test_text_encoder_decode_inference_returns_logits_only():
     """Base ``TextEncoder.decode`` without labels returns logits only."""
     TextEncoder = _model_cls("text_encoder")

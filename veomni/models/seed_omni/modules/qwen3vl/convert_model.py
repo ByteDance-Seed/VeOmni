@@ -72,9 +72,7 @@ def convert_qwen3vl_checkpoint(model_path: str, output_dir: str, **kwargs) -> No
     print("Extracting qwen3vl_text_encoder ...")
     # Official Qwen3-VL puts `tie_word_embeddings` on the top-level config
     # (2B=True, 8B=False). Nested `text_config` often omits the field.
-    tie_word_embeddings = bool(
-        getattr(cfg, "tie_word_embeddings", getattr(text_cfg, "tie_word_embeddings", True))
-    )
+    tie_word_embeddings = bool(getattr(cfg, "tie_word_embeddings", getattr(text_cfg, "tie_word_embeddings", True)))
     te_cfg = Qwen3VLTextEncoderConfig(
         vocab_size=text_cfg.vocab_size,
         hidden_size=text_cfg.hidden_size,
