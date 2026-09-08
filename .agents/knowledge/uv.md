@@ -56,9 +56,9 @@ pyproject.toml
 
 ## Hardware Extras
 
-`gpu` / `npu` / `npu_aarch64` are declared as conflicts. trl is not included
-— VeOmni's DPO trainer is from-scratch. MagiAttention is a fourth extra that
-combines with `gpu` and conflicts with the NPU extras.
+`gpu` / `npu` / `npu_aarch64` are declared as conflicts. MagiAttention is a
+fourth extra that requires `gpu` (`veomni[gpu]` in the magi extra) and
+conflicts with the NPU extras.
 
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
@@ -72,8 +72,8 @@ FA3, and FlashMLA wheels. FA2 is installed from prebuilt wheels on x86_64 and
 omitted on aarch64. FA4 is a pure-Python wheel; only FlashQLA builds from git.
 The aarch64 FA3 wheel requires glibc 2.34 or newer. uv caches built wheels
 under `~/.cache/uv`. MagiAttention is not part of that default GPU set:
-`--extra magi` source-builds SM90/SM100 CUDA extensions and should be omitted
-on Ampere/Ada (SM80/SM89) and CPU environments.
+`--extra magi` also pulls `gpu` and source-builds SM90/SM100 CUDA extensions.
+Omit it on Ampere/Ada (SM80/SM89) and CPU environments.
 
 The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`

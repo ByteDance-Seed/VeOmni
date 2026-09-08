@@ -34,12 +34,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Three mutually-exclusive hardware extras (see `[tool.uv].conflicts`): a
-# typical install is `uv sync --extra <gpu|npu|npu_aarch64>`. MagiAttention
-# is an optional NVIDIA SM90+ extra combined with gpu:
-# `uv sync --extra gpu --extra magi`. trl is NOT included — VeOmni's DPO
-# trainer (veomni/trainer/text_dpo_trainer.py) is from-scratch and the
-# trl<=0.9.6 pin is transformers v4-era anyway.
+# Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
+# (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM90+ and
+# requires gpu: `uv sync --extra gpu --extra magi`.
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",
@@ -95,10 +92,9 @@ gpu = [
   "hf_transfer",
 ]
 
-# MagiAttention FFA (NVIDIA SM90+). Combine with the gpu extra; do not use
-# with npu / npu_aarch64. Source-builds CUDA extensions, so Ampere/Ada
-# (SM80/SM89) and CPU environments should omit this extra.
+# MagiAttention FFA (NVIDIA SM90+). Requires gpu via veomni[gpu]; conflicts with npu extras.
 magi = [
+  "veomni[gpu]",
   # MagiAttention 1.1.1 imports debugpy unconditionally from
   # magi_attention.utils.debug but omits it from package metadata.
   "debugpy",

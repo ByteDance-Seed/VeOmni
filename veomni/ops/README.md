@@ -78,8 +78,8 @@ own Triton RMSNorm/rotary. See the per-model table below.
 
 #### Installing MagiAttention
 
-The optional `magi` extra installs MagiAttention and its SM100+ CUTE DSL/JIT backend.
-Always combine it with the `gpu` extra:
+The optional `magi` extra requires `gpu` (`veomni[gpu]`) and installs MagiAttention
+and its SM100+ CUTE DSL/JIT backend:
 
 ```bash
 uv sync --extra gpu --extra magi --dev

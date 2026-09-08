@@ -110,7 +110,7 @@ VeOmni registers `create_magi_mask` as the Transformers mask builder for `veomni
 
 The builder deliberately does not materialize or reverse-engineer an arbitrary Transformers `mask_function`. Predicate-to-range conversion would require an O(sequence length squared) dense mask and cannot preserve every model-specific visibility rule efficiently. A 2D attention mask also does not expose packed boundaries because VeOmni uses an all-ones mask and records boundaries in `position_ids` and precomputed cumulative sequence lengths. Registry calls with a 2D mask but without explicit range metadata are rejected rather than silently allowing cross-sample attention. Models with packed, sliding-window, prefix, multimodal, or mixed visibility must pass declarative metadata explicitly.
 
-The optional `magi` extra installs MagiAttention and the CUTE DSL/JIT dependencies used on SM100 and newer GPUs:
+The optional `magi` extra requires `gpu` (`veomni[gpu]`) and installs MagiAttention and the CUTE DSL/JIT dependencies used on SM100 and newer GPUs:
 
 ```bash
 uv sync --extra gpu --extra magi --dev
