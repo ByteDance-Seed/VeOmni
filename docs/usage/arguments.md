@@ -582,13 +582,14 @@ configured and never round-trip through a saved config.
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
-| reduce_scatter_with_fp32_accumulation | `bool` | `False` | Use BF16 transport with destination-local FP32 accumulation for FSDP2 ReduceScatter. Requires `mixed_precision.reduce_dtype: bfloat16`; HSDP is not supported. |
+| reduce_scatter_with_fp32_accumulation | `bool` | `False` | Use BF16 or FP16 transport with destination-local FP32 accumulation for FSDP2 ReduceScatter. Requires `mixed_precision.reduce_dtype: bfloat16` or `float16`; HSDP is not supported. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
 The FP32-accumulation ReduceScatter option trades memory for communication precision: each reduction temporarily
-allocates a full-size BF16 receive buffer and an FP32 output-shard accumulator. It only replaces the FSDP shard-group
-ReduceScatter, so HSDP is rejected rather than leaving its replicate-group AllReduce with BF16 accumulation.
+allocates a full-size receive buffer in the configured low-precision reduction dtype and an FP32 output-shard
+accumulator. It only replaces the FSDP shard-group ReduceScatter, so HSDP is rejected rather than leaving its
+replicate-group AllReduce with low-precision accumulation.
 
 ### MixedPrecisionConfig
 

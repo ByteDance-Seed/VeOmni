@@ -547,8 +547,8 @@ class FSDPConfig:
         default=False,
         metadata={
             "help": (
-                "Use BF16 communication with destination-local FP32 accumulation for FSDP2 ReduceScatter. "
-                "Requires mixed_precision.reduce_dtype='bfloat16'."
+                "Use BF16 or FP16 communication with destination-local FP32 accumulation for FSDP2 "
+                "ReduceScatter. Requires mixed_precision.reduce_dtype='bfloat16' or 'float16'."
             )
         },
     )
@@ -577,10 +577,10 @@ class FSDPConfig:
         if self.reduce_scatter_with_fp32_accumulation:
             if self.fsdp_mode != "fsdp2":
                 raise ValueError("reduce_scatter_with_fp32_accumulation requires fsdp_mode='fsdp2'.")
-            if not self.mixed_precision.enable or self.mixed_precision.reduce_dtype != "bfloat16":
+            if not self.mixed_precision.enable or self.mixed_precision.reduce_dtype not in ("bfloat16", "float16"):
                 raise ValueError(
                     "reduce_scatter_with_fp32_accumulation requires mixed precision with "
-                    "mixed_precision.reduce_dtype='bfloat16'."
+                    "mixed_precision.reduce_dtype='bfloat16' or 'float16'."
                 )
 
 
