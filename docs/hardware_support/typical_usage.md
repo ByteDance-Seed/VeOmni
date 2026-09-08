@@ -27,17 +27,18 @@ Modify the annotation file to match the expected format for VeOmni:
 
 ```python
 import json
-with open('sharegpt4v_instruct_gpt4-vision_cap100k.json', 'r', encoding='utf-8') as f:
+
+with open("sharegpt4v_instruct_gpt4-vision_cap100k.json", "r", encoding="utf-8") as f:
     data = json.load(f)
 filtered_data = []
 for item in data:
-    if item.get('image', '').startswith('coco'):
+    if item.get("image", "").startswith("coco"):
         new_item = item.copy()
-        image_path = new_item.pop('image')
+        image_path = new_item.pop("image")
         # Update the image path to point to your downloaded COCO dataset
-        new_item['images'] = [f'./train2017/{image_path.split("/")[-1]}']
+        new_item["images"] = [f"./train2017/{image_path.split('/')[-1]}"]
         filtered_data.append(new_item)
-with open('sharegpt4v_instruct_gpt4-vision_cap100k_coco.json', 'w', encoding='utf-8') as f:
+with open("sharegpt4v_instruct_gpt4-vision_cap100k_coco.json", "w", encoding="utf-8") as f:
     json.dump(filtered_data, f, ensure_ascii=False, indent=4)
 ```
 

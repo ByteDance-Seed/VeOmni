@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen2.5-Omni transformers>=5.9.0 code generation.
+Patch configuration for Qwen2.5-Omni transformers>=5.16.1 code generation.
 
 Covers the thinker training path (text + vision + audio, dense — no MoE):
   - PreTrained.get_rope_index with per-video use_audio_in_video derived from
@@ -51,7 +51,7 @@ patchgen veomni.models.transformers.qwen2_5_omni.qwen2_5_omni_gpu_patch_gen_conf
 import copy
 from functools import partial
 from types import SimpleNamespace
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -228,15 +228,13 @@ def get_position_id(main_func, self, **kwargs):
 )
 def qwen2_5_omni_get_rope_index_patched(
     self,
-    input_ids: Optional[torch.LongTensor] = None,
-    image_grid_thw: Optional[torch.LongTensor] = None,
-    video_grid_thw: Optional[torch.LongTensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    # --- Patch.1 ---
-    # use_audio_in_video removed from the signature; decided per-video below.
-    # --- Patch.1 ---
-    audio_seqlens: Optional[torch.LongTensor] = None,
-    second_per_grids: Optional[torch.Tensor] = None,
+    input_ids: torch.LongTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    use_audio_in_video: bool | None = None,
+    audio_seqlens: torch.LongTensor | None = None,
+    second_per_grids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     spatial_merge_size = self.spatial_merge_size
     image_token_id = self.config.image_token_id
@@ -354,14 +352,16 @@ def qwen2_5_omni_get_rope_index_patched(
 
                 elif min_ed == ed_video:
                     # --- Patch.1 ---
-                    if audio_seqlens[audio_idx] == 0:
-                        use_audio_in_video = False
-                        audio_idx += 1  # consume zero-length placeholder
-                    else:
-                        use_audio_in_video = True
+                    # None selects VeOmni's per-video placeholder convention;
+                    # explicit booleans retain HF generation's global contract.
+                    video_has_audio = use_audio_in_video
+                    if video_has_audio is None:
+                        video_has_audio = audio_seqlens[audio_idx] != 0
+                        if not video_has_audio:
+                            audio_idx += 1  # consume zero-length placeholder
                     # --- Patch.1 ---
 
-                    if not use_audio_in_video:
+                    if not video_has_audio:
                         text_len = min_ed - st - 1
                         if text_len != 0:
                             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
@@ -701,15 +701,16 @@ def qwen2_5_omni_vision_attention_forward_patched(
     self,
     hidden_states: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    rotary_pos_emb: Optional[torch.Tensor] = None,
+    position_embeddings: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
     **kwargs,
 ) -> torch.Tensor:
     seq_length = hidden_states.shape[0]
     query_states = self.q(hidden_states).reshape(seq_length, self.num_heads, -1)
     key_states = self.k(hidden_states).reshape(seq_length, self.num_heads, -1)
     value_states = self.v(hidden_states).reshape(seq_length, self.num_heads, -1)
-    query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
-    key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
+    query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), position_embeddings).squeeze(0)
+    key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), position_embeddings).squeeze(0)
 
     query_states = query_states.transpose(0, 1).unsqueeze(0)
     key_states = key_states.transpose(0, 1).unsqueeze(0)
@@ -721,7 +722,13 @@ def qwen2_5_omni_vision_attention_forward_patched(
 
     # --- Patch.1 ---
     if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        # Upstream calls `get_max_seqlen(...)` here, which returns None for
+        # VeOmni's custom `veomni_flash_attention_*` names because it gates on
+        # HF's built-in `is_flash_attention_requested`. Honour a caller-supplied
+        # value (upstream threads one down from the encoder, avoiding a host
+        # sync) and otherwise reduce locally.
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         attn_output, _ = attention_interface(
             self,
             query_states,
@@ -924,7 +931,7 @@ def qwen2_5_omni_vision_forward_patched(
         hidden_states = blk(
             hidden_states,
             cu_seqlens=cu_seqlens_now,
-            rotary_pos_emb=rotary_pos_emb,
+            position_embeddings=rotary_pos_emb,
             **kwargs,
         )
 
@@ -990,6 +997,67 @@ def qwen2_5_omni_vision_dummy_forward_patched(self):
         grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
         vit_metadata = _dummy_vit_metadata(1, 4, 4)
     return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
+
+
+# ================================================================
+# Patch: Qwen2_5OmniThinkerForConditionalGeneration.get_image_features
+# 1. skip the upstream `torch.split(pooler_output, split_sizes)` that
+#    transformers 5.16 added — VeOmni needs the flat tensor for the SP
+#    all-to-all, and the downstream masked_scatter is indexed by a single
+#    n_image_tokens slice rather than a per-image list. Mirrors the same patch
+#    on qwen3_vl / qwen3_5.
+# ================================================================
+@config.override_method(
+    "Qwen2_5OmniThinkerForConditionalGeneration.get_image_features",
+    description="Return flat image_embeds tensor (skip per-image torch.split)",
+)
+def qwen2_5_omni_thinker_get_image_features_patched(
+    self,
+    pixel_values: torch.FloatTensor,
+    image_grid_thw: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | BaseModelOutputWithPooling:
+    r"""
+    pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+        The tensors corresponding to the input images.
+    image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+        The temporal, height and width of feature shape of each image in LLM.
+    """
+    pixel_values = pixel_values.type(self.visual.dtype)
+    # --- Patch.1 ---
+    # vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
+    # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+    # vision_outputs.pooler_output = list(torch.split(vision_outputs.pooler_output, split_sizes))
+    # return vision_outputs
+    # --- Patch.1 ---
+    return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
+
+
+# ================================================================
+# Patch: Qwen2_5OmniThinkerForConditionalGeneration.get_video_features
+# 1. same as get_image_features above — keep pooler_output flat.
+# ================================================================
+@config.override_method(
+    "Qwen2_5OmniThinkerForConditionalGeneration.get_video_features",
+    description="Return flat video_embeds tensor (skip per-video torch.split)",
+)
+def qwen2_5_omni_thinker_get_video_features_patched(
+    self,
+    pixel_values_videos: torch.FloatTensor,
+    video_grid_thw: torch.LongTensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> tuple | BaseModelOutputWithPooling:
+    r"""
+    pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+        The tensors corresponding to the input videos.
+    video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+        The temporal, height and width of feature shape of each video in LLM.
+    """
+    pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+    # --- Patch.1 ---
+    # See get_image_features: upstream 5.16 splits pooler_output per video.
+    # --- Patch.1 ---
+    return self.visual(pixel_values_videos, grid_thw=video_grid_thw, **kwargs)
 
 
 # ================================================================
@@ -1083,30 +1151,30 @@ def qwen2_5_omni_thinker_get_position_id_func_patched(self):
 )
 def qwen2_5_omni_thinker_forward_patched(
     self,
-    input_ids: Optional[torch.LongTensor] = None,
-    input_features: Optional[torch.FloatTensor] = None,
-    pixel_values: Optional[torch.FloatTensor] = None,
-    pixel_values_videos: Optional[torch.FloatTensor] = None,
-    image_grid_thw: Optional[torch.LongTensor] = None,
-    video_grid_thw: Optional[torch.LongTensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
+    input_ids: torch.LongTensor | None = None,
+    input_features: torch.FloatTensor | None = None,
+    pixel_values: torch.FloatTensor | None = None,
+    pixel_values_videos: torch.FloatTensor | None = None,
+    image_grid_thw: torch.LongTensor | None = None,
+    video_grid_thw: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
     # --- Patch.1 ---
     # feature_attention_mask removed: VeOmni's collator already produces flat
     # audio_feature_lengths so this signature drops the redundant mask.
     # --- Patch.1 ---
-    audio_feature_lengths: Optional[torch.LongTensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
+    audio_feature_lengths: torch.LongTensor | None = None,
+    position_ids: torch.LongTensor | None = None,
     past_key_values=None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    rope_deltas: Optional[torch.LongTensor] = None,
-    labels: Optional[torch.LongTensor] = None,
-    use_cache: Optional[bool] = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    rope_deltas: torch.LongTensor | None = None,
+    labels: torch.LongTensor | None = None,
+    use_cache: bool | None = None,
     # --- Patch.1 ---
     # use_audio_in_video removed: handled per-video in get_rope_index via
     # the audio_seqlens[audio_idx] == 0 convention.
     # --- Patch.1 ---
-    cache_position: Optional[torch.LongTensor] = None,
-    video_second_per_grid: Optional[torch.LongTensor] = None,
+    cache_position: torch.LongTensor | None = None,
+    video_second_per_grid: torch.LongTensor | None = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithLogProbs:
     r"""

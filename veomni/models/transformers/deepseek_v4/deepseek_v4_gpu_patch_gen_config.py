@@ -124,8 +124,6 @@ Intentionally NOT patched:
   rather than via FA's ``veomni_flash_attention_*_with_sp`` path.
 """
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -2406,14 +2404,14 @@ def deepseek_v4_hash_router_forward_patched(
 )
 def deepseek_v4_forcausallm_forward_patched(
     self,
-    input_ids: Optional[torch.LongTensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_values: Optional[Cache] = None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    labels: Optional[torch.LongTensor] = None,
-    use_cache: Optional[bool] = None,
-    output_router_logits: Optional[bool] = None,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    labels: torch.LongTensor | None = None,
+    use_cache: bool | None = None,
+    output_router_logits: bool | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> MoeCausalLMOutputWithLogProbs:
@@ -2636,3 +2634,31 @@ def deepseek_v4_get_parallel_plan_patched(self):
     from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
+
+
+@config.override_method(
+    "DeepseekV4Indexer.__init__", description="Preserve VeOmni model and optimizer checkpoint parameter names"
+)
+def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
+    nn.Module.__init__(self)
+    self.compress_rate = config.compress_rates["compressed_sparse_attention"]
+    self.num_heads = config.index_n_heads
+    self.head_dim = config.index_head_dim
+    self.index_topk = config.index_topk
+    self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+    self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+    self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
+    self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+    self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+    self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+    self.softmax_scale = config.index_head_dim**-0.5
+    self.weights_scaling = config.index_n_heads**-0.5
+    self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
+
+
+@config.override_method(
+    "DeepseekV4PreTrainedModel.__init__", description="Keep the checkpoint-compatible scorer out of FP8 conversion"
+)
+def deepseek_v4_pretrained_init(self, config):
+    super().__init__(config)
+    self._keep_in_fp32_modules = [name.replace(".indexer.scorer.", ".indexer.") for name in self._keep_in_fp32_modules]

@@ -7,7 +7,7 @@ description: "Author or refresh a VeOmni model's patchgen-generated modeling und
 
 Purpose: add or refresh a model's patchgen-generated modeling under
 `veomni/models/transformers/<model>/generated/`. VeOmni pins
-`transformers==5.9.0` and ships patchgen-generated modeling for every
+`transformers==5.16.1` and ships patchgen-generated modeling for every
 supported transformers-family model. The non-transformers architectures
 (`flux`, `movqgan`, `wan`) have no `generated/` directory and are out of scope.
 
@@ -41,14 +41,14 @@ never replace a phase.
 
 ### 0.1 Verify transformers venv
 
-Patchgen runs against `transformers==5.9.0`. Before touching code:
+Patchgen runs against `transformers==5.16.1`. Before touching code:
 
 ```bash
 source .venv/bin/activate
 python -c "import transformers; print(transformers.__version__)"
 ```
 
-If not `5.9.0`, re-sync the default env:
+If not `5.16.1`, re-sync the default env:
 
 ```bash
 uv sync --frozen --extra gpu --group dev
@@ -93,6 +93,27 @@ curl -fsSL -o .agents_workspace/hf_reference/<m>/new/modeling_<m>.py \
   "https://github.com/huggingface/transformers/raw/<new_ver>/src/transformers/models/<m>/modeling_<m>.py"
 diff -u .agents_workspace/hf_reference/<m>/{old,new}/modeling_<m>.py | less
 ```
+
+### 0.3 For a pin bump: survey signature drift across *all* configs first
+
+`patchgen <config>` (without `--dry-run`) runs the generated file through ruff,
+so a patch body referencing a symbol upstream no longer defines fails loudly
+with `F821` / `F811`. That catches removed *names*. It does **not** catch a
+patch whose target still exists but whose **signature changed** — the patch
+keeps applying and silently runs against the wrong contract.
+
+Before touching any config, index both upstream versions with `ast` and compare
+the parameter lists of every target named in each config's `override_method` /
+`replace_class` / `replace_function` call. Targets missing from *both* versions
+are VeOmni-added methods (patchgen uses `override_method` to inject them) and
+should be filtered out, or they drown the real findings.
+
+`docs/transformers_v5/upgrade_5_9_to_5_16.md` records what that survey turned up
+for the 5.9 → 5.16 bump and how each class of breakage was resolved — read it
+before starting a new bump, the categories repeat.
+
+Note that `--dry-run` returns before the ruff step, so it reports success on
+files that cannot even import. Never use it as the pass/fail signal.
 
 Things to watch for in upstream contracts:
 

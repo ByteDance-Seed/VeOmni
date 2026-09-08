@@ -5,6 +5,7 @@ Download the [tulu-3-sft-mixture](https://huggingface.co/datasets/allenai/tulu-3
 
 ```python
 import pyarrow.parquet as pq
+
 input_path = "tulu-3-sft-mixture/data/train-00000-of-00006.parquet"
 output_path = "tulu-first2000.parquet"
 # Read parquet file and extract the first 2000 rows

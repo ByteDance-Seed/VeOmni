@@ -20,9 +20,12 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 
-# TODO: glm_moe_dsa GPU and NPU configs are currently full copies of each
-# other. Consider consolidating (NPU config imports shared patch functions
-# from the GPU module) once NPU-specific divergence is clearer.
+# This config is much smaller than the GPU sibling: it only patches
+# `GlmMoeDsaForCausalLM.forward` and shares no patch bodies with it, so the
+# GPU indexer / attention ports do not reach the NPU build. The DSA top-k
+# selection therefore relies on upstream's `indices=` hand-off here;
+# VeOmni's `flash_attention_forward` rejects that kwarg rather than
+# silently running dense attention.
 config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
@@ -50,6 +53,11 @@ def glm_moe_dsa_forcausallm_forward_patched(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
+    r"""
+    cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+        Indices depicting the position of the input sequence tokens in the sequence. Retained in the
+        signature for callers that pass it positionally; transformers 5.16 moved it into `**kwargs`.
+    """
     outputs = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,

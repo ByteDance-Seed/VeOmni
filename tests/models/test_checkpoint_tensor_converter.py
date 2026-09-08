@@ -498,6 +498,14 @@ class TestDeepseekV4ConverterConvert:
             ("model.head.weight", "lm_head.weight"),
             ("norm.weight", "model.norm.weight"),
             ("model.norm.weight", "model.norm.weight"),
+            (
+                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
+                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
+            ),
+            (
+                "model.layers.2.self_attn.compressor.indexer.scorer.weights_proj.weight",
+                "model.layers.2.self_attn.compressor.indexer.weights_proj.weight",
+            ),
             ("hc_head_fn", "model.hc_head.hc_fn"),
             ("model.hc_head_fn", "model.hc_head.hc_fn"),
             ("layers.2.attn_norm.weight", "model.layers.2.input_layernorm.weight"),

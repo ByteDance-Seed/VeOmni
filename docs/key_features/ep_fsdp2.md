@@ -85,7 +85,7 @@ For EP+FSDP2, a simplified view looks like:
 ```python
 for layers in model:
     if layers.mlp.experts:
-        fully_shard(layers.mlp.experts) # along dim-1 by placement_fn
+        fully_shard(layers.mlp.experts)  # along dim-1 by placement_fn
     fully_shard(layer)
 fully_shard(model)
 ```

@@ -53,7 +53,7 @@ pyproject.toml
 │   ├── lint                 pre-commit, ruff
 │   ├── test                 pytest, expecttest, rich
 │   ├── patchgen             patchgen (path source under patchgen-pkg/)
-│   └── transformers-stable  transformers==5.9.0 (default, in default-groups)
+│   └── transformers-stable  transformers==5.16.1 (default, in default-groups)
 ├── [tool.uv]
 │   ├── required-version     Allowed uv version range
 │   ├── override-dependencies  Per-extra torch/CUDA pins (markers scoped to gpu/npu/npu_aarch64)
@@ -93,7 +93,7 @@ video decoding is required.
 
 ## Transformers Version
 
-`transformers==5.9.0` is pinned by the `transformers-stable` group (in
+`transformers==5.16.1` is pinned by the `transformers-stable` group (in
 `default-groups`). Kept out of `[project.dependencies]` so pip users are not
 forced into a specific 5.x patch.
 
@@ -161,5 +161,5 @@ uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
    Bumping torch / Python / cuda requires matching PyTorch/Luosuu releases.
 4. **uv bumps require Docker rebuilds**; concrete pins must stay in range.
 5. **`override-dependencies` `extra == '...'` markers are load-bearing.**
-6. **`transformers==5.9.0` is the only supported version.** New code targets
+6. **`transformers==5.16.1` is the only supported version.** New code targets
    v5 + FSDP2 + patchgen-generated modeling.

@@ -95,10 +95,10 @@ shell and, if the SP attention implementation is configured, installs the
 
 ```python
 def save_pretrained(self, path, **kwargs):
-    hf_config = copy.deepcopy(self.config)      # 1. stash VeOmni config
-    self.config = self.config.to_diffuser_dict() # 2. swap in pure diffusers dict
+    hf_config = copy.deepcopy(self.config)  # 1. stash VeOmni config
+    self.config = self.config.to_diffuser_dict()  # 2. swap in pure diffusers dict
     _WanTransformer3DModel.save_pretrained(self, path, **kwargs)  # 3. delegate
-    self.config = hf_config                      # 4. restore VeOmni config
+    self.config = hf_config  # 4. restore VeOmni config
 ```
 
 Step 2 calls `to_diffuser_dict()`, which returns **only the parameters that
@@ -159,12 +159,9 @@ version changes:
 ```python
 WAN_INIT_SIGNATURE = inspect.signature(WanTransformer3DModel.__init__)
 
+
 def to_diffuser_dict(self):
-    return {
-        key: getattr(self, key)
-        for key in WAN_INIT_SIGNATURE.parameters
-        if key != "self"
-    }
+    return {key: getattr(self, key) for key in WAN_INIT_SIGNATURE.parameters if key != "self"}
 ```
 
 `to_dict()` overrides the transformers default to produce a diffusers-format
@@ -173,9 +170,9 @@ def to_diffuser_dict(self):
 ```python
 def to_dict(self):
     d = super().to_dict()
-    d["_class_name"] = "WanTransformer3DModel"   # diffusers loader key
+    d["_class_name"] = "WanTransformer3DModel"  # diffusers loader key
     d["_diffusers_version"] = diffusers.__version__
-    del d["dtype"]   # transformers adds this; diffusers configs don't have it
+    del d["dtype"]  # transformers adds this; diffusers configs don't have it
     return d
 ```
 
@@ -244,6 +241,7 @@ so `from_pretrained(path)` works automatically.
 ```python
 from transformers import PretrainedConfig
 
+
 class YourConditionModelConfig(PretrainedConfig):
     model_type = "YourConditionModel"  # must be unique; used as registry key
 
@@ -292,7 +290,7 @@ Subclass `transformers.PreTrainedModel`. Implement the two methods that
 def get_condition(self, inputs, videos, **kwargs) -> dict:
     # inputs: list[str]  — text prompts, one per sample
     # videos: list[list[Tensor]]  — raw video frames, one list per sample
-    prompt_embeds = self._encode_text(inputs)        # list of (1, seq, dim)
+    prompt_embeds = self._encode_text(inputs)  # list of (1, seq, dim)
     latents_list = [self._encode_video(v) for v in videos]  # list of (1, C, F, H, W)
     return {"latents": latents_list, "context": prompt_embeds}
 ```
@@ -333,14 +331,18 @@ separately for logging/visualization).
 # veomni/models/diffusers/your_dit/your_condition/__init__.py
 from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
+
 @MODEL_CONFIG_REGISTRY.register("YourConditionModel")
 def register_config():
     from .configuration_your_condition import YourConditionModelConfig
+
     return YourConditionModelConfig
+
 
 @MODELING_REGISTRY.register("YourConditionModel")
 def register_modeling(architecture: str = None):
     from .modeling_your_condition import YourConditionModel
+
     return YourConditionModel
 ```
 
@@ -364,9 +366,10 @@ from transformers import PretrainedConfig
 
 _DIFFUSERS_INIT_SIGNATURE = inspect.signature(_YourDiffusersModel.__init__)
 
+
 class YourTransformerConfig(PretrainedConfig):
-    model_type = "YourTransformerModel"             # registry key for this model
-    condition_model_type = "YourConditionModel"     # registry key for companion
+    model_type = "YourTransformerModel"  # registry key for this model
+    condition_model_type = "YourConditionModel"  # registry key for companion
 
     def __init__(self, num_layers=28, hidden_size=1024, **kwargs):
         self.num_layers = num_layers
@@ -376,11 +379,7 @@ class YourTransformerConfig(PretrainedConfig):
 
     def to_diffuser_dict(self) -> dict:
         """Return only the kwargs accepted by the diffusers model __init__."""
-        return {
-            key: getattr(self, key)
-            for key in _DIFFUSERS_INIT_SIGNATURE.parameters
-            if key != "self"
-        }
+        return {key: getattr(self, key) for key in _DIFFUSERS_INIT_SIGNATURE.parameters if key != "self"}
 
     def to_dict(self) -> dict:
         d = super().to_dict()
@@ -402,6 +401,7 @@ model. Call them in the right order and resolve the config-dict conflict.
 from diffusers import YourDiffusersTransformerModel as _YourDiffusersModel
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
 
 class YourTransformerModel(PreTrainedModel, _YourDiffusersModel):
     config_class = YourTransformerConfig
@@ -456,13 +456,12 @@ class YourModelOutput(ModelOutput):
     loss: dict[str, torch.FloatTensor] | None = None
     predictions: list[torch.FloatTensor] | None = None
 
+
 def forward(self, hidden_states, timestep, encoder_hidden_states, training_target, **kwargs):
     per_sample_losses = []
     predictions = []
     for hs, ts, enc_hs, target in zip(hidden_states, timestep, encoder_hidden_states, training_target):
-        prediction = _YourDiffusersModel.forward(
-            self, hidden_states=hs, timestep=ts, encoder_hidden_states=enc_hs
-        )
+        prediction = _YourDiffusersModel.forward(self, hidden_states=hs, timestep=ts, encoder_hidden_states=enc_hs)
         predictions.append(prediction)
         loss = F.mse_loss(prediction.float(), target.float(), reduction="none")
         per_sample_losses.append(loss.view(loss.shape[0], -1).mean(dim=1))
@@ -577,6 +576,7 @@ For diffusers models this is done via an **attention processor** installed with
    from types import SimpleNamespace
    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+
    class YourSPAttnProcessor:
        def __init__(self, attn_implementation: str):
            self.attn_implementation = attn_implementation
@@ -634,15 +634,19 @@ For diffusers models this is done via an **attention processor** installed with
 # veomni/models/diffusers/your_dit/your_transformer/__init__.py
 from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
+
 @MODEL_CONFIG_REGISTRY.register("YourTransformerModel")
 def register_config():
     from .configuration_your_transformer import YourTransformerConfig
+
     return YourTransformerConfig
+
 
 @MODELING_REGISTRY.register("YourTransformerModel")
 def register_modeling(architecture: str):
     from .modeling_your_transformer import YourTransformerModel, apply_veomni_sp_patch
-    apply_veomni_sp_patch()   # patch base diffusers class at load time
+
+    apply_veomni_sp_patch()  # patch base diffusers class at load time
     return YourTransformerModel
 ```
 

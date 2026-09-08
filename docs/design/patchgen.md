@@ -91,8 +91,10 @@ apply_xpu_patch()
 
 ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = my_impl
 
-class OptimizedQwen3Model(Qwen3Model):
-    ...
+
+class OptimizedQwen3Model(Qwen3Model): ...
+
+
 Qwen3Model = OptimizedQwen3Model  # Who knows what this is now?
 ```
 
@@ -241,7 +243,7 @@ The generated file includes:
     #  AUTO-GENERATED FILE - DO NOT EDIT DIRECTLY
     # ==============================================================================
     #  Source: transformers.models.qwen3.modeling_qwen3
-    #  Based on: transformers==5.9.0
+    #  Based on: transformers==5.16.1
     #
     #  Patches applied:
     #    - class_replacement: Qwen3RMSNorm
@@ -264,8 +266,7 @@ The generated file includes:
     # [PATCHED CLASS] Qwen3RMSNorm
     # Reason: Use fused RMSNorm kernel for better performance
     # ======================================================================
-    class Qwen3RMSNorm(nn.Module):
-        ...
+    class Qwen3RMSNorm(nn.Module): ...
     ```
 
 1. **Preserved comments** in patched methods:
@@ -359,9 +360,7 @@ from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import config
 
 generator = ModelingCodeGenerator(config)
 generator.load_source()
-output = generator.generate(
-    Path("veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py")
-)
+output = generator.generate(Path("veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py"))
 ```
 
 ### Init Modification
@@ -551,9 +550,9 @@ When the `patchgen` console script doesn't fit (e.g. you want to mount your own 
 from patchgen import (
     PatchConfig,
     DiscoveryConfig,
-    ModelingCodeGenerator,        # programmatic codegen
-    build_run_codegen_cli,        # main()-shaped CLI factory
-    build_check_cli,              # main()-shaped drift-check factory
+    ModelingCodeGenerator,  # programmatic codegen
+    build_run_codegen_cli,  # main()-shaped CLI factory
+    build_check_cli,  # main()-shaped drift-check factory
     list_patch_configs,
     run_codegen,
 )

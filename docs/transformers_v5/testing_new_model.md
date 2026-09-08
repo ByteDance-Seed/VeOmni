@@ -41,13 +41,15 @@ Then asserts that loss and grad norm match across all combinations within
 Append a `pytest.param(...)` to the test-cases list:
 
 ```python
-pytest.param(
-    "./tests/toy_config/<new_model>_toy/config.json",
-    False,  # is_moe — set True for MoE models
-    _DEFAULT_RTOL,
-    _DEFAULT_ATOL,
-    id="<new_model>",
-),
+(
+    pytest.param(
+        "./tests/toy_config/<new_model>_toy/config.json",
+        False,  # is_moe — set True for MoE models
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="<new_model>",
+    ),
+)
 ```
 
 The `id=` string controls test node naming (`pytest -k <id>`). Patchgen model
@@ -97,14 +99,16 @@ match across all SP/EP configurations within `(rtol, atol)`.
 Add an entry to `text_test_cases` (for text-only models):
 
 ```python
-pytest.param(
-    "<new_model>",
-    "./tests/toy_config/<new_model>_toy/config.json",
-    False,  # is_moe
-    _DEFAULT_RTOL,
-    _DEFAULT_ATOL,
-    None,  # max_sp_size
-),
+(
+    pytest.param(
+        "<new_model>",
+        "./tests/toy_config/<new_model>_toy/config.json",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+    ),
+)
 ```
 
 ### Parametrize fields
@@ -129,14 +133,16 @@ If the model does not support SP yet, set `max_sp_size=1` to only run with
 `sp_size=1`:
 
 ```python
-pytest.param(
-    "qwen3_5",
-    "./tests/toy_config/qwen3_5_toy/config.json",
-    False,  # is_moe
-    _DEFAULT_RTOL,
-    _DEFAULT_ATOL,
-    1,  # max_sp_size — remove once SP is supported
-),
+(
+    pytest.param(
+        "qwen3_5",
+        "./tests/toy_config/qwen3_5_toy/config.json",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        1,  # max_sp_size — remove once SP is supported
+    ),
+)
 ```
 
 ### VLM / multimodal models
@@ -163,7 +169,7 @@ catch model wrapper path changes such as `model.visual` vs `model.model.visual`.
 Add your toy config to the freeze-ViT VLM cases list:
 
 ```python
-pytest.param("./tests/toy_config/<new_vlm_model>_toy/config.json", id="<new_vlm_model>"),
+(pytest.param("./tests/toy_config/<new_vlm_model>_toy/config.json", id="<new_vlm_model>"),)
 ```
 
 ## 4. `tests/distributed/test_dummy_forward.py` (VLM / Omni only)

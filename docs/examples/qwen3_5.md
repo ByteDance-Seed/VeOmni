@@ -20,16 +20,17 @@ Modify the sharegpt4v_instruct_gpt4-vision_cap100k.json:
 
 ```python
 import json
-with open('sharegpt4v_instruct_gpt4-vision_cap100k.json', 'r', encoding='utf-8') as f:
+
+with open("sharegpt4v_instruct_gpt4-vision_cap100k.json", "r", encoding="utf-8") as f:
     data = json.load(f)
 filtered_data = []
 for item in data:
-    if item.get('image', '').startswith('coco'):
+    if item.get("image", "").startswith("coco"):
         new_item = item.copy()
-        image_path = new_item.pop('image')
-        new_item['images'] = [image_path]
+        image_path = new_item.pop("image")
+        new_item["images"] = [image_path]
         filtered_data.append(new_item)
-with open('sharegpt4v_instruct_gpt4-vision_cap100k_coco.json', 'w', encoding='utf-8') as f:
+with open("sharegpt4v_instruct_gpt4-vision_cap100k_coco.json", "w", encoding="utf-8") as f:
     json.dump(filtered_data, f, ensure_ascii=False, indent=4)
 ```
 
@@ -39,6 +40,7 @@ If you want to train on text-only data, download the [tulu-3-sft-mixture](https:
 
 ```python
 import pyarrow.parquet as pq
+
 input_path = "tulu-3-sft-mixture/data/train-00000-of-00006.parquet"
 output_path = "tulu-first2000.parquet"
 # Read parquet file and extract the first 2000 rows

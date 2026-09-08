@@ -35,11 +35,13 @@ VeOmni offers a unified argument management system, which can be easily extended
 from dataclasses import dataclass, field
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, VeOmniArguments
 
+
 @dataclass
 class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
+
 
 if __name__ == "__main__":
     args = parse_args(Arguments)
@@ -55,6 +57,7 @@ class CustomTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Enable me if necessary."},
     )
+
 
 @dataclass
 class Arguments(VeOmniArguments):
@@ -115,11 +118,9 @@ VeOmni registers five dataset builders in [veomni/data/dataset.py](https://githu
 
 ```python
 from veomni.data import build_dataset
+
 train_dataset = build_dataset(
-    dataset_name=args.data.dataset_name,
-    transform=transform,
-    seed=args.train.seed,
-    **asdict(args.data)
+    dataset_name=args.data.dataset_name, transform=transform, seed=args.train.seed, **asdict(args.data)
 )
 ```
 
@@ -179,7 +180,7 @@ def build_custom_dataset(
     seed: int = 42,
     source_name: Optional[str] = None,
     **kwargs,
-)-> Dataset:
+) -> Dataset:
     # Implement your custom dataset logic
     pass
 ```
@@ -264,6 +265,7 @@ You can add your custom chat template by implementing the `ChatTemplate` class â
 ```python
 from veomni.data.chat_template import ChatTemplate
 
+
 class CustomTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         # Implement encoding logic
@@ -283,25 +285,26 @@ VeOmni offered a flexible and powerful dataloader implementation, which supports
 
 ```python
 from veomni.data import build_dataloader
+
 train_dataloader = build_dataloader(
     dataloader_type=args.data.dataloader.type,
     dataset=train_dataset,
-    micro_batch_size=args.train.micro_batch_size, # micro batch size
-    global_batch_size=args.train.global_batch_size, # global batch size
-    dataloader_batch_size=args.train.dataloader_batch_size, # dataloader batch size, how many micro batches to get with next(train_dataloader), automatically calculate
-    max_seq_len=args.data.max_seq_len, # max sequence length
-    train_steps=args.train_steps, # calculated by args.compute_train_steps
-    dyn_bsz=args.train.dyn_bsz, # enable dynamic batching
-    bsz_warmup_ratio=args.train.bsz_warmup_ratio, # bsz warmup ratio
-    bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken, # bsz warmup init micro batch token
-    dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size, # dynamic batching buffer size
-    num_workers=args.data.dataloader.num_workers, # dataloader num workers
+    micro_batch_size=args.train.micro_batch_size,  # micro batch size
+    global_batch_size=args.train.global_batch_size,  # global batch size
+    dataloader_batch_size=args.train.dataloader_batch_size,  # dataloader batch size, how many micro batches to get with next(train_dataloader), automatically calculate
+    max_seq_len=args.data.max_seq_len,  # max sequence length
+    train_steps=args.train_steps,  # calculated by args.compute_train_steps
+    dyn_bsz=args.train.dyn_bsz,  # enable dynamic batching
+    bsz_warmup_ratio=args.train.bsz_warmup_ratio,  # bsz warmup ratio
+    bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,  # bsz warmup init micro batch token
+    dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,  # dynamic batching buffer size
+    num_workers=args.data.dataloader.num_workers,  # dataloader num workers
     drop_last=args.data.dataloader.drop_last,  # dataloader drop last
     pin_memory=args.data.dataloader.pin_memory,  # dataloader pin memory
-    prefetch_factor=args.data.dataloader.prefetch_factor, # dataloader prefetch factor
-    seed=args.train.seed, # random seed
+    prefetch_factor=args.data.dataloader.prefetch_factor,  # dataloader prefetch factor
+    seed=args.train.seed,  # random seed
     build_collate_fn=True,
-    collate_fn_kwargs=collate_fn_kwargs, # kwargs for collate_fn
+    collate_fn_kwargs=collate_fn_kwargs,  # kwargs for collate_fn
 )
 ```
 
@@ -340,9 +343,9 @@ An example of usage in `def build_data_collate_info` in [veomni/trainer/vlm_trai
 from veomni.models import build_foundation_model
 
 model = build_foundation_model(
-    config_path=args.model.config_path, # model config path, can be None if weights_path is not None
-    weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
-    init_device=args.model.accelerator.init_device, # model init device
+    config_path=args.model.config_path,  # model config path, can be None if weights_path is not None
+    weights_path=args.model.model_path,  # model weights path, can be None if config_path is not None
+    init_device=args.model.accelerator.init_device,  # model init device
     torch_dtype="float32" if args.model.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
     ops_implementation=args.model.ops_implementation,
     config_kwargs=config_kwargs,
@@ -355,21 +358,24 @@ model = build_foundation_model(
 ### Parallelization your model
 ```python
 from veomni.distributed.torch_parallelize import build_parallelize_model
+
 model = build_parallelize_model(
     model,
-    init_device=args.model.accelerator.init_device, # model init device
+    init_device=args.model.accelerator.init_device,  # model init device
     weights_path=args.model.model_path,
-    enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward, # enable reshard after forward for FSDP2
-    mixed_precision=args.model.accelerator.fsdp_config.mixed_precision, # enable mixed precision
-    enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable, # enable gradient checkpointing
-    enable_fsdp_offload=args.model.accelerator.fsdp_config.offload, # enable fsdp offload
-    basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)), # FSDP basic modules
+    enable_reshard_after_forward=args.model.accelerator.fsdp_config.reshard_after_forward,  # enable reshard after forward for FSDP2
+    mixed_precision=args.model.accelerator.fsdp_config.mixed_precision,  # enable mixed precision
+    enable_gradient_checkpointing=args.model.accelerator.gradient_checkpointing.enable,  # enable gradient checkpointing
+    enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,  # enable fsdp offload
+    basic_modules=list(
+        set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
+    ),  # FSDP basic modules
     enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
     early_stop=args.model.accelerator.gradient_checkpointing.early_stop,
     enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
-    broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0, # load model weights
+    broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,  # load model weights
     ep_sharded_stream_load=args.model.ep_sharded_stream_load,
-    max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
+    max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,  # max load broadcast size
     # Muon's zero-comm expert layout is decided here, not by build_optimizer.
     muon_expert_zero_comm=args.model.optimizer.type == "muon" and args.model.optimizer.muon_expert_zero_comm,
 )
@@ -566,8 +572,10 @@ import torch
 
 loss_fct = torch.nn.CrossEntropyLoss()
 
+
 def loss_func(logits, labels):
     return loss_fct(logits, labels)
+
 
 # In train loop:
 output = model(**micro_batch)

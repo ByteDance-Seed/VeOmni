@@ -47,12 +47,8 @@ ep_plan = {
     "model.layers.*.mlp.experts.up_proj": Shard(0),
     "model.layers.*.mlp.experts.down_proj": Shard(0),
 }
-extra_parallel_1_plan = {
-    ...
-}
-extra_parallel_2_plan = {
-    ...
-}
+extra_parallel_1_plan = {...}
+extra_parallel_2_plan = {...}
 parallel_plan = ParallelPlan(
     extra_parallel_plan={
         "ep": ep_plan,

@@ -269,21 +269,13 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # qwen3_5_vl-sdpa: like qwen3_vl-fa2 below, the ViT forward consumes the
     # precomputed multimodal metadata (fast path) — so the ViT's own
     # `.tolist()` + host-side cu_seqlens build do not appear here. What remains:
-    #  - Qwen3_5VisionAttention.forward: the non-FA varlen-attention branch
-    #    does `torch.split(t, lengths.tolist(), ...)`, an HF-verbatim D2H.
-    #    This is eager/SDPA-only — production qwen3_5-VL uses FA2 (the
-    #    `is_flash_attention_requested` branch, which hands cu_seqlens to
-    #    flash_attn_varlen_func directly, no `.tolist()`). This case is forced
-    #    onto SDPA only because FA2 NaNs on the toy config, so the sync is on
-    #    a path production bypasses → tagged HF-eager-only.
     #  - get_rope_index: the HF-verbatim mrope algorithm (same as qwen3_vl).
+    #
+    # The `Qwen3_5VisionAttention.forward` entry (the non-FA branch's
+    # `torch.split(t, lengths.tolist(), ...)` D2H) was dropped for the
+    # transformers 5.16 bump: the gate no longer observes a sync there, and it
+    # deliberately fails on stale allowlist entries so this list cannot rot.
     "qwen3_5_vl-sdpa": {
-        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5VisionAttention.forward"): (
-            "HF-eager-only: the non-FA branch's `torch.split(t, lengths.tolist(), ...)` "
-            "varlen split is an HF-verbatim D2H. Production qwen3_5-VL uses FA2, which "
-            "passes cu_seqlens to flash_attn_varlen_func directly and bypasses this; the "
-            "case runs SDPA only because FA2 NaNs on the toy config."
-        ),
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
@@ -295,16 +287,15 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # + host-side cu_seqlens build that would otherwise fire ~4 syncs. The
     # entries below are therefore the residual syncs that survive even on the
     # fast path — not eliminable by precompute:
-    #  - rot_pos_emb: an algorithm-essential `rot_pos_ids(...).to(device)` H2D
-    #    copy (CPU-side lru_cached helper output, over-reported by sync-debug).
     #  - get_rope_index: the HF-verbatim mrope algorithm; see the long comment
     #    above _ALG_ESSENTIAL_VL_GET_ROPE_INDEX for why the in-place override
     #    was reverted and the collator-side fix tracked as follow-up.
+    #
+    # The `rot_pos_emb` entry (a `rot_pos_ids(...).to(device)` H2D copy that
+    # torch sync-debug over-reported) was dropped for the transformers 5.16
+    # bump — the gate no longer observes it. `rot_pos_emb` itself is still
+    # patched and still called from the patched ViT forward.
     "qwen3_vl-fa2": {
-        ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLVisionModel.rot_pos_emb"): (
-            "algorithm-essential: `rot_pos_ids(...).to(device)` H2D copy of a CPU tensor "
-            "returned by the lru_cached helper; over-reported by torch sync-debug mode."
-        ),
         ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLModel.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
@@ -312,9 +303,6 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # vision forward / rot_pos_emb / fast_pos_embed_interpolate helpers from
     # qwen3_vl and registers its own Model.forward + get_rope_index).
     "qwen3_vl_moe-fa2-fused": {
-        ("patched_modeling_qwen3_vl_moe_gpu.py", "Qwen3VLMoeVisionModel.rot_pos_emb"): (
-            "algorithm-essential: see qwen3_vl-fa2 (rot_pos_ids H2D copy)."
-        ),
         ("patched_modeling_qwen3_vl_moe_gpu.py", "Qwen3VLMoeModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         (
             "patched_modeling_qwen3_vl_moe_gpu.py",

@@ -91,7 +91,8 @@ if get_parallel_state().sp_enabled:
 hidden_states = hidden_states + pos_embeds
 
 cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-    dim=0, dtype=torch.int32,
+    dim=0,
+    dtype=torch.int32,
 )
 cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
@@ -132,18 +133,14 @@ After ViT processing, image embeddings must be scattered into the correct positi
 ```python
 if get_parallel_state().sp_enabled:
     # (batch, seq//sp, hidden) → (batch, seq, hidden//sp)
-    inputs_embeds = gather_outputs(
-        inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group
-    )
+    inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
 ```
 
 **Step 2a:** Apply the same transform to image embeddings:
 ```python
 if get_parallel_state().sp_enabled:
     # (seq//sp, hidden) → (seq, hidden//sp)
-    image_embeds = gather_outputs(
-        image_embeds, gather_dim=0, group=get_parallel_state().sp_group
-    )
+    image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 ```
 
 **Step 2b:** Fill back using `image_mask` (pre-computed in `process_sample`, kept unsliced):
@@ -157,9 +154,7 @@ inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 ```python
 if get_parallel_state().sp_enabled:
     # (batch, seq, hidden//sp) → (batch, seq//sp, hidden)
-    inputs_embeds = slice_input_tensor(
-        inputs_embeds, dim=1, group=get_parallel_state().sp_group
-    )
+    inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 ```
 
 The same logic applies to video embeddings.
@@ -210,6 +205,7 @@ The HF model stores expert weights as a fused `gate_up_proj` of shape `(num_expe
 from torch.distributed._tensor import Shard
 from ....distributed.parallel_plan import ParallelPlan
 
+
 def get_parallel_plan():
     ep_plan = {
         "model.language_model.layers.*.mlp.experts.gate_up_proj": Shard(0),
@@ -227,18 +223,18 @@ def fused_moe_forward(self, hidden_states, router_weights, router_indices, routi
     hidden_states = hidden_states.reshape(-1, self.hidden_size)
 
     # Split the fused gate_up_proj along the last dim
-    gate_proj = self.gate_up_proj[..., : self.expert_dim]   # (num_experts, hidden_size, expert_dim)
-    up_proj   = self.gate_up_proj[..., self.expert_dim :]   # (num_experts, hidden_size, expert_dim)
+    gate_proj = self.gate_up_proj[..., : self.expert_dim]  # (num_experts, hidden_size, expert_dim)
+    up_proj = self.gate_up_proj[..., self.expert_dim :]  # (num_experts, hidden_size, expert_dim)
 
     # Transpose to (num_experts, expert_dim, hidden_size) as expected by fused_moe_forward
     gate_proj_t = gate_proj.transpose(1, 2).contiguous()
-    up_proj_t   = up_proj.transpose(1, 2).contiguous()
+    up_proj_t = up_proj.transpose(1, 2).contiguous()
     down_proj_t = self.down_proj.transpose(1, 2).contiguous()  # (num_experts, hidden_size, expert_dim)
 
     next_states = fused_moe_forward(
         module=self,
         num_experts=self.num_experts,
-        routing_weights=routing_weights,   # compact top-k weights, not the full scatter tensor
+        routing_weights=routing_weights,  # compact top-k weights, not the full scatter tensor
         selected_experts=router_indices,
         hidden_states=hidden_states,
         fc1_1_weight=gate_proj_t,
@@ -274,8 +270,9 @@ def forward(self, hidden_states, router_weights, router_indices, routing_weights
     if self.training and self.moe_implementation == "fused":
         return self.fused_moe_forward(hidden_states, router_weights, router_indices, routing_weights)
     else:
-        assert not get_parallel_state().ep_enabled or not self.training, \
+        assert not get_parallel_state().ep_enabled or not self.training, (
             "_moe_implementation='eager' does not support EP"
+        )
         return super().forward(hidden_states, router_weights, router_indices)
 ```
 
@@ -330,20 +327,26 @@ In your model's `__init__.py`:
 ```python
 from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
+
 @MODEL_CONFIG_REGISTRY.register("qwen3_vl_moe")
 def register_qwen3_vl_moe_config():
     from .configuration_qwen3_vl_moe import Qwen3VLMoeConfig
+
     return Qwen3VLMoeConfig
+
 
 @MODELING_REGISTRY.register("qwen3_vl_moe")
 def register_qwen3_vl_moe_modeling(architecture: str):
     from .modeling_qwen3_vl_moe import Qwen3VLMoeForCausalLM, apply_veomni_qwen3vlmoe_patch
+
     apply_veomni_qwen3vlmoe_patch()
     return Qwen3VLMoeForCausalLM
+
 
 @MODEL_PROCESSOR_REGISTRY.register("Qwen3VLMoeProcessor")
 def register_qwen3_vl_moe_processor():
     from .processing_qwen3_vl_moe import Qwen3VLMoeProcessor
+
     return Qwen3VLMoeProcessor
 ```
 
@@ -356,10 +359,12 @@ from types import SimpleNamespace
 
 from ....utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 
+
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
 
 class Qwen3VLMoeForConditionalGeneration(_Qwen3VLMoeForConditionalGeneration):
     def get_position_id_func(self):

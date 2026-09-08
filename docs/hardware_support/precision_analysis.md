@@ -53,6 +53,7 @@ pip install mindstudio-probe
 
 ```python
 from msprobe.pytorch import seed_all
+
 seed_all(mode=True)
 ```
 
@@ -62,13 +63,15 @@ Or use this custom implementation:
 # def main():
 #     pass
 
+
 def seed_all(seed=42, mode=True, is_gpu=False):
     print("======================seed_all=============================")
     import random
     import numpy as np
     import torch
+
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(mode)
@@ -80,12 +83,15 @@ def seed_all(seed=42, mode=True, is_gpu=False):
         torch.backends.cudnn.benchmark = False
     else:
         import torch_npu
+
         torch_npu.npu.manual_seed_all(seed)
         torch_npu.npu.manual_seed(seed)
 
+
 if __name__ == "__main__":
     import os
-    seed_all(mode=os.environ.get('DETERM_COMP', "true") == "true")
+
+    seed_all(mode=os.environ.get("DETERM_COMP", "true") == "true")
     main()
 ```
 
@@ -169,6 +175,7 @@ For most cases, using "statistics" as the task is sufficient:
 
 ```python
 from mindstudio_probe import Debugger
+
 debugger = Debugger(config_path="path/to/config.json")
 
 # Simulated training code
