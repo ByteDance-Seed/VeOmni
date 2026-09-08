@@ -191,7 +191,7 @@ pip list | grep fla_npu   # verify it is installed
 ```
 
 If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error when
-the model constructs its `VeomniKernel` handle (pointing back to the install step or to `npu` / `eager`).
+the model constructs its `VeomniOp` handle (pointing back to the install step or to `npu` / `eager`).
 
 ### Qwen3.5-9B VL Training
 

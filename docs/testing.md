@@ -107,7 +107,7 @@ tests/
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
 | **Model patch** | `tests/models/` | 1 GPU | pytest | Fwd/bwd correctness across attn/MoE backends |
-| **Kernels** | `tests/kernels/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
+| **Kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Registry contracts, hardware guards, numerical correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
 | **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
 | **FSDP correctness** | `tests/distributed/` | 2+ GPUs | torchrun (subprocess + mp.spawn) | Single-GPU vs FSDP2 equivalence, dummy forward |
@@ -167,10 +167,10 @@ DeepSeek-V4's fused-MoE-specific merged `gate_up_proj` and `swiglu_limit`
 forwarding are covered by `tests/models/test_deepseek_v4_fused_moe.py` (CPU).
 Its kernel package import behavior, hardware guards, BF16/FP32 utility, and
 TileLang DSA indexer/attention numerical checks are covered by
-`tests/kernels/dsa/`. The guard and utility cases run on CPU; optimized
+`tests/ops/dsa/`. The guard and utility cases run on CPU; optimized
 numerical tests require TileLang on an SM90+ NVIDIA GPU.
 Registry binding plus mHC pre/post/head forward and backward parity are covered
-by `tests/kernels/mhc/test_mhc.py`, which requires TileKernels on an SM90+
+by `tests/ops/mhc/test_mhc.py`, which requires TileKernels on an SM90+
 NVIDIA GPU for kernel execution.
 
 ---
@@ -270,7 +270,7 @@ NVIDIA GPU for kernel execution.
 
 ---
 
-### 11. Kernel Tests (`tests/kernels/`)
+### 11. Kernel Tests (`tests/ops/`)
 
 | Test | Purpose | GPU |
 |---|---|---|
@@ -281,14 +281,14 @@ NVIDIA GPU for kernel execution.
 | `attention/magi/` | Magi mask, installer, FA4 metadata, and numerical contracts | CPU for guards; SM90/SM100 for optimized kernels |
 | `batch_invariant/test_batch_invariant.py` | Batch-invariant ATen patch lifecycle and math | CPU for lifecycle; CUDA for Triton kernels |
 
-Cross-entropy is covered at two layers: `tests/kernels/loss/test_cross_entropy_loss.py`
+Cross-entropy is covered at two layers: `tests/ops/loss/test_cross_entropy_loss.py`
 checks token-level eager parity with HF plus chunked/Liger forward and backward;
 `tests/models_kernel/test_loss_utils.py` checks causal target selection,
 sequence-classification policy, SP reduction, logits ownership, and log-probs
 side-path dispatch. Chunked log-probs and top-k distillation have focused tests
 in `tests/models_kernel/`.
 
-Load-balancing loss is covered at two layers: `tests/kernels/loss/test_load_balancing_loss.py`
+Load-balancing loss is covered at two layers: `tests/ops/loss/test_load_balancing_loss.py`
 checks the raw `[N, E]` eager and Triton kernels against HF/eager across the
 configuration matrix, forward/backward, masks, determinism, and peak memory;
 `tests/models_kernel/test_model_load_balancing_loss.py` checks tuple
@@ -337,7 +337,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
 | **MoE with fused experts** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
 | **Custom checkpoint layout** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests for any on-disk HF↔VeOmni key or tensor-layout conversion. |
-| **Custom fused kernels** | `tests/kernels/<family>/` | Add kernel-specific correctness and registration tests. |
+| **Custom fused kernels** | `tests/ops/<family>/` | Add kernel-specific correctness and registration tests. |
 | **New data modality** | `tests/data/` | Add data processing and collation tests. |
 
 ### Verification Commands
@@ -368,8 +368,8 @@ pytest tests/e2e/test_e2e_parallel.py -k <model_name>
 pytest → test_models_patch_fwd_bwd(config, is_moe, ...)
   → prepare_model_modes(is_moe) → [(HF, eager), (HF, fa2), (VeOmni, fa2_sp), ...]
   → for each mode:
-      set_kernels_config(mode-specific OpsImplementationConfig)
-      BaseTrainer._build_model() → models_kernel.build_foundation_model(config, kernels_implementation=...)
+      set_ops_config(mode-specific OpsImplementationConfig)
+      BaseTrainer._build_model() → models_kernel.build_foundation_model(config, ops_implementation=...)
       TrainerTest.forward_backward_step(dummy_batch)
       → record loss, grad_norm
   → compare_multi_items(all_results, rtol, atol)

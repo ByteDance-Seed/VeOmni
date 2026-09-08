@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-facing loss policy around local ``VeomniKernel`` handles."""
+"""Model-facing loss policy around local ``VeomniOp`` handles."""
 
 from .chunk_logprobs import chunk_logprobs_function
 from .chunk_topk_distill import chunk_topk_distill_function

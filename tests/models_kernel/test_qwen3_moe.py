@@ -27,10 +27,10 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_config() -> Qwen3MoeConfig:
@@ -76,37 +76,37 @@ def _qwen3_moe_cls():
     return Qwen3MoeForCausalLM
 
 
-def _build_ours(config: Qwen3MoeConfig, kernels: SimpleNamespace | None = None):
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+def _build_ours(config: Qwen3MoeConfig, ops: SimpleNamespace | None = None):
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return _qwen3_moe_cls()(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_qwen3_moe_constructs_local_kernels():
     model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_lb, VeomniKernel)
+    assert isinstance(model.veomni_lb, VeomniOp)
     assert model.veomni_lb.impl == "eager"
     layer = model.model.layers[0]
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
     assert layer.mlp.experts.veomni_moe.impl == "eager"
-    assert layer.mlp.experts.veomni_moe.kernel == "moe_experts"
+    assert layer.mlp.experts.veomni_moe.op == "moe_experts"
 
 
 def test_qwen3_moe_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_kernels_config())
-    fused_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_config(), eager_ops_config())
+    fused_cfg = eager_ops_config()
     fused_cfg.moe_implementation = "fused_triton"
     fused = _build_ours(_tiny_config(), fused_cfg)
 
     assert eager.model.layers[0].mlp.experts.veomni_moe.impl == "eager"
     assert fused.model.layers[0].mlp.experts.veomni_moe.impl == "fused_triton"
 
-    set_kernels_config(fused_cfg)
+    set_ops_config(fused_cfg)
     assert eager.model.layers[0].mlp.experts.veomni_moe.impl == "eager"
 
 

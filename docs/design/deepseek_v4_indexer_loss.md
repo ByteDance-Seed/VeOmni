@@ -128,8 +128,8 @@ overrides, so a bound checked in `DeepseekV4Config.__post_init__` would read
 fields cannot live there either: they are `OpsImplementationConfig` fields, and
 neither dataclass can see the disagreement alone.
 `validate_build_prerequisites` is the earliest point that holds the finished model
-config and installed kernel-selection config together, and it runs before any rank
-reads a weight. It reads the kernel config from the installed singleton rather than taking it as an argument,
+config and installed ops-selection config together, and it runs before any rank
+reads a weight. It reads the ops config from the installed singleton rather than taking it as an argument,
 which is what keeps the builder's hook a no-argument call that any config can
 implement.
 
@@ -177,7 +177,7 @@ the same forward. This ownership has three useful properties:
   model-agnostic dataclass can be set on any model, so it had to be refused for
   every model that does not implement it; a field on `DeepseekV4Config` cannot be
   set on GLM MoE DSA at all.
-- `self.config` is per-instance, just like the `VeomniKernel` handles constructed
+- `self.config` is per-instance, just like the `VeomniOp` handles constructed
   by each generated model instance. A DPO policy and reference can therefore
   retain independent model objectives and resolved kernels.
 - Declaring the fields is load-bearing, not tidiness. `model.model_config`

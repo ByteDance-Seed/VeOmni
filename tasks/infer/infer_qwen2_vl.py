@@ -43,7 +43,7 @@ def main() -> None:
     helper.set_seed(args.infer.seed)
     helper.enable_third_party_logging()
     model = (
-        build_foundation_model(args.infer.model_path, args.infer.model_path, kernels_implementation=_INFERENCE_OPS)
+        build_foundation_model(args.infer.model_path, args.infer.model_path, ops_implementation=_INFERENCE_OPS)
         .eval()
         .to(get_device_type())
     )

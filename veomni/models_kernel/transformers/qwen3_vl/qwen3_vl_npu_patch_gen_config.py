@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL NPU VeomniKernel replacements.
+Patch configuration for Qwen3-VL NPU VeomniOp replacements.
 
 Inherits every GPU patch from `qwen3_vl_gpu_patch_gen_config`.
 
@@ -50,7 +50,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.qwen3_vl.modeling_qwen3_vl",
     target_file="patched_modeling_qwen3_vl_npu.py",
-    description="Qwen3-VL with VeOmni v5 patches and VeomniKernel NPU replacements",
+    description="Qwen3-VL with VeOmni v5 patches and VeomniOp NPU replacements",
 )
 
 # Mirror additional imports + post-import helpers from the GPU config so the
@@ -70,12 +70,12 @@ config.drop_imported_names.update(gpu_config.drop_imported_names)
 config.override_method(
     "Qwen3VLTextRMSNorm.__init__",
     replacement=qwen3_vl_rmsnorm_init_patched,
-    description="Construct a local rms_norm VeomniKernel",
+    description="Construct a local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3VLTextRMSNorm.forward",
     replacement=qwen3_vl_rmsnorm_forward_patched,
-    description="Always call the local rms_norm VeomniKernel",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3VLVisionAttention.forward",
@@ -145,20 +145,20 @@ config.override_method(
 config.override_method(
     "Qwen3VLForConditionalGeneration.__init__",
     replacement=qwen3_vl_for_conditional_generation_init_patched,
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 config.override_method(
     "Qwen3VLForConditionalGeneration.forward",
     replacement=qwen3_vl_for_conditional_generation_forward_patched,
-    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniKernel",
+    description="Always call rope full VeomniOp",
 )
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision_patched,
-    description="Always call rope_vision full VeomniKernel",
+    description="Always call rope_vision full VeomniOp",
 )

@@ -28,11 +28,11 @@ from veomni.distributed.sequence_parallel.comm import (
 )
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
-from veomni.kernels._kernels.attention.standard import flash as flash_backend
-from veomni.kernels._kernels.attention.standard import flex as flex_backend
-from veomni.kernels._kernels.attention.standard import magi as magi_backend
-from veomni.kernels._kernels.attention.standard.magi import _kernel as magi_kernel
-from veomni.kernels.mask import MagiAttentionMask
+from veomni.ops.kernels.attention.standard import flash as flash_backend
+from veomni.ops.kernels.attention.standard import flex as flex_backend
+from veomni.ops.kernels.attention.standard import magi as magi_backend
+from veomni.ops.kernels.attention.standard.magi import _kernel as magi_kernel
+from veomni.ops.mask import MagiAttentionMask
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
 
 from .attention import Attention

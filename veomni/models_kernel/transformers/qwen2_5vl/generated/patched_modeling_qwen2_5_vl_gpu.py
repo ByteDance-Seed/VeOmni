@@ -28,13 +28,13 @@
 #    - method_override: Qwen2_5_VLForConditionalGeneration.get_position_id_func
 #      Use VeOmni precomputed position-id function and unified multimodal token ids
 #    - method_override: Qwen2_5_VLForConditionalGeneration.__init__
-#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Qwen2_5_VLForConditionalGeneration.forward
-#      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
 #    - method_override: Qwen2_5_VLForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side window-attention ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen2_5_VLAttention.forward
-#      Dispatch attention through the interned VeomniKernel
+#      Dispatch attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -87,9 +87,9 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
     unpad_tensor,
 )
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (
     Qwen2_5_VLCausalLMOutputWithLogProbs,
@@ -483,7 +483,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_kernel()
+        attention_interface = attention_op()
 
         if is_flash_attention_requested(self.config):
             # --- Patch.1 ---
@@ -1141,7 +1141,7 @@ class Qwen2_5_VLAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -1932,16 +1932,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
     # ================================================================
     # Patch: Qwen2_5_VLForConditionalGeneration.__init__ + forward
-    # Bind ForCausalLMLoss to a local VeomniKernel. Always call
+    # Bind ForCausalLMLoss to a local VeomniOp. Always call
     # self.loss_function when labels are present.
     # ================================================================
     def __init__(self, config):
         super().__init__(config)
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @auto_docstring

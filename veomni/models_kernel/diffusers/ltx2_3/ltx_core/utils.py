@@ -5,20 +5,20 @@ from typing import Any
 
 import torch
 
-from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1e-6) -> torch.Tensor:
     """Root-mean-square (RMS) normalize `x` over its last dimension.
 
-    Always calls the interned ``VeomniKernel`` handle. Missing weight uses
+    Always calls the interned ``VeomniOp`` handle. Missing weight uses
     the ``unweighted`` variant.
     """
-    impl = resolve_kernel_impl("rms_norm_implementation")
+    impl = resolve_op_impl("rms_norm_implementation")
     if weight is None:
-        return VeomniKernel("rms_norm", "unweighted", impl)(x, eps=eps)
-    return VeomniKernel("rms_norm", "standard", impl)(x, weight, eps=eps)
+        return VeomniOp("rms_norm", "unweighted", impl)(x, eps=eps)
+    return VeomniOp("rms_norm", "standard", impl)(x, weight, eps=eps)
 
 
 def check_config_value(config: dict, key: str, expected: Any) -> None:  # noqa: ANN401

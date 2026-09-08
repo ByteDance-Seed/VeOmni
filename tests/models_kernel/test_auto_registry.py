@@ -19,8 +19,7 @@ from __future__ import annotations
 import pytest
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-from tests.models_kernel.compare import eager_kernels_config
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from tests.models_kernel.compare import eager_ops_config
 from veomni.models_kernel import (
     MODEL_CONFIG_REGISTRY,
     MODELING_REGISTRY,
@@ -30,6 +29,7 @@ from veomni.models_kernel import (
     check_model_build_prerequisites,
     get_model_class,
 )
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_qwen3_config() -> Qwen3Config:
@@ -60,25 +60,25 @@ def test_get_model_class_hf_backend(monkeypatch):
 
 
 def test_build_foundation_model_requires_kernels_config():
-    previous = get_kernels_config()
+    previous = get_ops_config()
     try:
-        set_kernels_config(None)
-        with pytest.raises(ValueError, match="kernels_implementation"):
+        set_ops_config(None)
+        with pytest.raises(ValueError, match="ops_implementation"):
             build_foundation_model(_tiny_qwen3_config())
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_build_foundation_model_installs_kernels_config():
-    previous = get_kernels_config()
-    cfg = eager_kernels_config()
+    previous = get_ops_config()
+    cfg = eager_ops_config()
     try:
-        set_kernels_config(None)
+        set_ops_config(None)
         with pytest.raises(RuntimeError, match="not registered in veomni.models_kernel"):
-            build_foundation_model(_tiny_qwen3_config(), kernels_implementation=cfg)
-        assert get_kernels_config() is cfg
+            build_foundation_model(_tiny_qwen3_config(), ops_implementation=cfg)
+        assert get_ops_config() is cfg
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_modeling_registry_starts_without_qwen3():
@@ -133,10 +133,10 @@ def test_a_config_that_cannot_ask_for_the_objective_is_left_alone():
 def test_the_generic_hook_reaches_the_model_that_implements_it():
     from veomni.models_kernel.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
-    previous = get_kernels_config()
-    cfg = eager_kernels_config()
+    previous = get_ops_config()
+    cfg = eager_ops_config()
     cfg.dsa_indexer_implementation = "eager"
-    set_kernels_config(cfg)
+    set_ops_config(cfg)
     try:
         config = DeepseekV4Config(
             num_hidden_layers=2,
@@ -146,7 +146,7 @@ def test_the_generic_hook_reaches_the_model_that_implements_it():
         with pytest.raises(ValueError, match="dsa_indexer_implementation"):
             check_model_build_prerequisites(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_context_parallel_is_refused_on_npu(monkeypatch: pytest.MonkeyPatch):

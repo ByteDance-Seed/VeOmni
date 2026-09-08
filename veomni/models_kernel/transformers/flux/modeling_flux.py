@@ -27,8 +27,8 @@ from veomni.distributed.sequence_parallel import (
     gather_seq_scatter_heads,
     slice_input_tensor,
 )
-from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 
 from .config_flux import FluxConfig
 from .utils_flux import (
@@ -156,7 +156,7 @@ class RMSNorm(torch.nn.Module):
         else:
             self.weight = None
             variant = "unweighted"
-        self.veomni_rms_norm = VeomniKernel("rms_norm", variant, resolve_kernel_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", variant, resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states):
         """Apply the interned ``rms_norm`` handle."""

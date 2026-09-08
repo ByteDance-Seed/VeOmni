@@ -27,13 +27,13 @@ from diffusers import WanTransformer3DModel as OfficialWanTransformer3DModel
 
 from tests.models_kernel.compare import (
     assert_outputs_and_grads_match,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
 from veomni.models_kernel.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
     WanTransformer3DModelConfig,
 )
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_kwargs() -> dict:
@@ -58,17 +58,17 @@ def _tiny_ours_config() -> WanTransformer3DModelConfig:
     return WanTransformer3DModelConfig(**_tiny_kwargs(), attn_implementation="eager")
 
 
-def _build_ours(config: WanTransformer3DModelConfig, kernels: SimpleNamespace | None = None):
+def _build_ours(config: WanTransformer3DModelConfig, ops: SimpleNamespace | None = None):
     from veomni.models_kernel.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import (
         WanTransformer3DModel,
     )
 
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return WanTransformer3DModel(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def _wan_inputs() -> dict[str, torch.Tensor]:
@@ -82,21 +82,21 @@ def _wan_inputs() -> dict[str, torch.Tensor]:
 def test_wan_t2v_constructs_local_kernels():
     model = _build_ours(_tiny_ours_config())
     processor = model.blocks[0].attn1.processor
-    assert isinstance(processor.veomni_attn, VeomniKernel)
-    assert processor.veomni_attn.kernel == "attention"
+    assert isinstance(processor.veomni_attn, VeomniOp)
+    assert processor.veomni_attn.op == "attention"
     assert processor.veomni_attn.impl == "eager"
 
 
 def test_wan_t2v_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_ours_config(), eager_kernels_config())
-    other_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_ours_config(), eager_ops_config())
+    other_cfg = eager_ops_config()
     other_cfg.attn_implementation = "sdpa"
     other = _build_ours(_tiny_ours_config(), other_cfg)
 
     assert eager.blocks[0].attn1.processor.veomni_attn.impl == "eager"
     assert other.blocks[0].attn1.processor.veomni_attn.impl == "sdpa"
 
-    set_kernels_config(other_cfg)
+    set_ops_config(other_cfg)
     assert eager.blocks[0].attn1.processor.veomni_attn.impl == "eager"
 
 
@@ -115,9 +115,9 @@ def test_wan_t2v_eager_matches_official():
 
 
 def test_wan_t2v_flash2_kernel_passes_full_sequence_varlen_kwargs():
-    kernels = eager_kernels_config()
-    kernels.attn_implementation = "veomni_flash_attention_2"
-    model = _build_ours(_tiny_ours_config(), kernels).to(dtype=torch.bfloat16)
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_flash_attention_2"
+    model = _build_ours(_tiny_ours_config(), ops).to(dtype=torch.bfloat16)
     attn = model.blocks[0].attn1
     processor = attn.processor
     assert processor.veomni_attn.impl == "veomni_flash_attention_2"

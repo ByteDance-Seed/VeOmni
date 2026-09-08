@@ -27,44 +27,44 @@ import torch
 
 from tests.models_kernel.compare import (
     assert_outputs_and_grads_match,
-    eager_kernels_config,
+    eager_ops_config,
 )
 from tests.models_kernel.refs import flux as ref_flux
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
-def _build_ours_rms(dim: int, *, elementwise_affine: bool = True, kernels: SimpleNamespace | None = None):
+def _build_ours_rms(dim: int, *, elementwise_affine: bool = True, ops: SimpleNamespace | None = None):
     from veomni.models_kernel.transformers.flux.modeling_flux import RMSNorm
 
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return RMSNorm(dim, eps=1e-6, elementwise_affine=elementwise_affine)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_flux_constructs_local_kernels():
     weighted = _build_ours_rms(32)
     unweighted = _build_ours_rms(32, elementwise_affine=False)
-    assert isinstance(weighted.veomni_rms_norm, VeomniKernel)
-    assert weighted.veomni_rms_norm.kernel == "rms_norm"
+    assert isinstance(weighted.veomni_rms_norm, VeomniOp)
+    assert weighted.veomni_rms_norm.op == "rms_norm"
     assert weighted.veomni_rms_norm.variant == "standard"
     assert weighted.veomni_rms_norm.impl == "eager"
     assert unweighted.veomni_rms_norm.variant == "unweighted"
 
 
 def test_flux_instances_keep_distinct_impls():
-    eager = _build_ours_rms(32, kernels=eager_kernels_config())
-    other_cfg = eager_kernels_config()
+    eager = _build_ours_rms(32, ops=eager_ops_config())
+    other_cfg = eager_ops_config()
     other_cfg.rms_norm_implementation = "liger_kernel"
-    other = _build_ours_rms(32, kernels=other_cfg)
+    other = _build_ours_rms(32, ops=other_cfg)
 
     assert eager.veomni_rms_norm.impl == "eager"
     assert other.veomni_rms_norm.impl == "liger_kernel"
 
-    set_kernels_config(other_cfg)
+    set_ops_config(other_cfg)
     assert eager.veomni_rms_norm.impl == "eager"
 
 
@@ -96,12 +96,12 @@ def test_flux_joint_attention_matches_official():
     head_dim = dim // num_heads
     official = ref_flux.FluxJointAttention(dim, dim, num_heads, head_dim)
 
-    previous = get_kernels_config()
-    set_kernels_config(eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(eager_ops_config())
     try:
         ours = ours_flux.FluxJointAttention(dim, dim, num_heads, head_dim)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
     ours.load_state_dict(official.state_dict())
 
     hidden_a = torch.randn(2, 4, dim)

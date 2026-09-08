@@ -77,10 +77,10 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor,
     unpad_tensor,
 )
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -116,10 +116,10 @@ config.add_import(
     ],
 )
 config.add_import("veomni.models_kernel.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "resolve_kernel_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "resolve_op_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -722,7 +722,7 @@ def qwen2_5_omni_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_kernel()
+    attention_interface = attention_op()
 
     # --- Patch.1 ---
     if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1072,7 +1072,7 @@ def qwen2_5_omni_thinker_get_position_id_func_patched(self):
 # 4. [PosIDs] Transpose precomputed position_ids from (bs, 3, L) to
 #    (3, bs, L) so the model layer's mrope handler sees the canonical axis
 #    order.
-# 5. [Loss] Always call `self.loss_function` (ForCausalLMLoss + VeomniKernel).
+# 5. [Loss] Always call `self.loss_function` (ForCausalLMLoss + VeomniOp).
 # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
 #    for videos without audio) before forwarding the audio tower.
 # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
@@ -1082,7 +1082,7 @@ def qwen2_5_omni_thinker_get_position_id_func_patched(self):
 # ================================================================
 @config.override_method(
     "Qwen2_5OmniThinkerForConditionalGeneration.__init__",
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 def qwen2_5_omni_thinker_init_patched(self, config):
     super().__init__(config)
@@ -1093,9 +1093,9 @@ def qwen2_5_omni_thinker_init_patched(self, config):
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
     self.spatial_merge_size = config.vision_config.spatial_merge_size
     self.rope_deltas = None
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 
@@ -1660,7 +1660,7 @@ def qwen2_5_omni_top_get_metadata_collate_func_patched(self):
 
 @config.override_method(
     "Qwen2_5OmniAudioAttention.forward",
-    description="Dispatch audio attention through the interned VeomniKernel",
+    description="Dispatch audio attention through the interned VeomniOp",
 )
 def qwen2_5_omni_audio_attention_forward_patched(
     self,
@@ -1678,7 +1678,7 @@ def qwen2_5_omni_audio_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_kernel()
+    attention_interface = attention_op()
 
     if is_flash_attention_requested(self.config):
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -1723,7 +1723,7 @@ def qwen2_5_omni_audio_attention_forward_patched(
 
 @config.override_method(
     "Qwen2_5OmniAttention.forward",
-    description="Dispatch thinker attention through the interned VeomniKernel",
+    description="Dispatch thinker attention through the interned VeomniOp",
 )
 def qwen2_5_omni_attention_forward_patched(
     self,
@@ -1755,7 +1755,7 @@ def qwen2_5_omni_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_kernel()(
+    attn_output, attn_weights = attention_op()(
         self,
         query_states,
         key_states,

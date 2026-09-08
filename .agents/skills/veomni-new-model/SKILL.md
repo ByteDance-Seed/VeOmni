@@ -42,9 +42,9 @@ Phase 6: Test                          -> pending
    - `generated/patched_modeling_<model_name>_{gpu,npu}.py` — patchgen output (do NOT edit manually)
 
 3. **Patch patterns** — follow existing models:
-   - Sequence parallel: construct an instance-local attention `VeomniKernel` and override `forward` via patchgen
-   - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and store a `moe_experts` `VeomniKernel` on the expert module
-   - Cross-entropy: bind a `cross_entropy_loss` `VeomniKernel` on the model instance and return `CausalLMOutputWithLogProbs`
+   - Sequence parallel: construct an instance-local attention `VeomniOp` and override `forward` via patchgen
+   - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and store a `moe_experts` `VeomniOp` on the expert module
+   - Cross-entropy: bind a `cross_entropy_loss` `VeomniOp` on the model instance and return `CausalLMOutputWithLogProbs`
    - Register the model class in the model package `__init__.py` (no entry in `veomni/models_kernel/auto.py` is needed for transformers models — registration happens via the per-model `MODELING_REGISTRY` decorators)
 
 4. **Run patchgen**: `make patchgen` regenerates every `generated/patched_modeling_*.py` from the matching `*_patch_gen_config.py`.

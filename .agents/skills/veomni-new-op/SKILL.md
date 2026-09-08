@@ -1,19 +1,19 @@
 ---
 name: veomni-new-op
-description: "Add or optimize a tensor-level kernel in veomni/kernels, register its variants, integrate it with models_kernel, and add numerical and registry tests. Trigger: 'add op', 'new kernel', 'add attention variant', 'new fused op', 'add triton kernel', 'optimize operator'."
+description: "Add or optimize a tensor-level kernel in veomni/ops, register its variants, integrate it with models_kernel, and add numerical and registry tests. Trigger: 'add op', 'new kernel', 'add attention variant', 'new fused op', 'add triton kernel', 'optimize operator'."
 ---
 
 ## Before You Start
 
 1. Read `.agents/knowledge/constraints.md`, especially device guards and patchgen rules.
-2. Read `veomni/kernels/README.md` and `docs/design/kernel_selection.md`.
-3. Inspect the closest family under `veomni/kernels/_kernels/` and its tests under `tests/kernels/`.
+2. Read `veomni/ops/README.md` and `docs/design/kernel_selection.md`.
+3. Inspect the closest family under `veomni/ops/kernels/` and its tests under `tests/ops/`.
 
-## Kernel Architecture
+## Ops Architecture
 
-`veomni.kernels.KERNEL_REGISTRY` is the tensor-kernel source of truth. Each
-row has the identity `(kernel, variant, implementation, device)`. Callers
-select the public `(kernel, variant, implementation)` triple; the registry
+`veomni.ops.OP_REGISTRY` is the tensor-kernel source of truth. Each
+row has the identity `(op, variant, implementation, device)`. Callers
+select the public `(op, variant, implementation)` triple; the registry
 derives the device from the row's `KernelRequirement` and resolves the current
 device before a device-agnostic row.
 
@@ -28,18 +28,18 @@ For a raw pair, `forward` returns `(output, SavedState)` and `backward` returns
 one gradient entry per positional tensor input. Pass tensors positionally and
 non-tensor attributes by keyword.
 
-Model classes construct an instance-local `VeomniKernel` handle and call it
+Model classes construct an instance-local `VeomniOp` handle and call it
 directly. Input normalization, HuggingFace-compatible signatures, and loss
 policy belong in `veomni/models_kernel/`; do not add consumer-specific adapters
 to the registry. The public CLI/YAML field remains
 `model.ops_implementation`, while model builders receive it through the
-`kernels_implementation` keyword.
+`ops_implementation` keyword.
 
 Use these separate mechanisms only when their semantics require them:
 
-- `veomni/kernels/batch_invariant/` for the opt-in ATen patch controlled by
+- `veomni/ops/batch_invariant/` for the opt-in ATen patch controlled by
   `set_batch_invariant_mode(...)`;
-- `veomni/kernels/install.py` for idempotent process-wide integrations such as
+- `veomni/ops/install.py` for idempotent process-wide integrations such as
   registration with a third-party framework;
 - `veomni/distributed/hccl_premul_sum.py` for the NPU collective compatibility
   patch used by distributed ExtraParallel code.
@@ -48,7 +48,7 @@ Use these separate mechanisms only when their semantics require them:
 
 1. Define the stable tensor contract and decide whether consumer-specific
    preprocessing belongs in `models_kernel`.
-2. Choose the kernel name, semantic variant, implementation name, and device
+2. Choose the op name, semantic variant, implementation name, and device
    requirement. A variant changes the tensor contract; an implementation keeps
    that contract and changes how it is computed.
 3. Decide whether the implementation is a raw pair or an opaque wrapper. Never
@@ -59,17 +59,17 @@ Use these separate mechanisms only when their semantics require them:
 ## Phase 2: Implement
 
 1. Create or extend a family under
-   `veomni/kernels/_kernels/<kernel_name>/`.
+   `veomni/ops/kernels/<kernel_name>/`.
 2. Keep implementations in variant/device-oriented modules consistent with the
    neighboring families.
-3. Register every row through `register_kernel`:
+3. Register every row through `register_op`:
 
    ```python
-   from veomni.kernels import register_kernel
-   from veomni.kernels.requirement import CudaKernelRequirement
+   from veomni.ops import register_op
+   from veomni.ops.requirement import CudaKernelRequirement
 
-   register_kernel("example", "standard", "eager", wrapper=eager_example)
-   register_kernel(
+   register_op("example", "standard", "eager", wrapper=eager_example)
+   register_op(
        "example",
        "standard",
        "triton",
@@ -79,22 +79,22 @@ Use these separate mechanisms only when their semantics require them:
    )
    ```
 
-4. Import the family from `veomni/kernels/_kernels/__init__.py` so registration
-   happens when `veomni.kernels` is imported.
-5. In each consuming model, construct a `VeomniKernel` from
-   `resolve_kernel_impl(...)` and store it on the model/module instance.
+4. Import the family from `veomni/ops/kernels/__init__.py` so registration
+   happens when `veomni.ops` is imported.
+5. In each consuming model, construct a `VeomniOp` from
+   `resolve_op_impl(...)` and store it on the model/module instance.
 6. For a compound raw kernel, call the nested row's raw `forward`/`backward`
-   and use the saved-state helpers in `veomni/kernels/compound.py`; do not call
+   and use the saved-state helpers in `veomni/ops/compound.py`; do not call
    the nested autograd wrapper.
 7. Guard optional device packages and attach an explicit requirement. A
    registered implementation must fail clearly when its requirement is not
    satisfied; it must not silently fall back to eager.
 8. Add English module, class, and function docstrings. VeOmni-owned kernel code
-   is checked by `tests/kernels/base/test_kernel_documentation.py`.
+   is checked by `tests/ops/base/test_op_documentation.py`.
 
 ## Phase 3: Test
 
-1. Add tests under `tests/kernels/<kernel_name>/` for:
+1. Add tests under `tests/ops/<kernel_name>/` for:
    - forward parity against an independent eager reference;
    - backward parity for every differentiable input;
    - dtype/shape/edge contracts;
@@ -105,7 +105,7 @@ Use these separate mechanisms only when their semantics require them:
 3. Run the family tests plus the registry and documentation guards:
 
    ```bash
-   pytest -q tests/kernels/<kernel_name>/ tests/kernels/base/
+   pytest -q tests/ops/<kernel_name>/ tests/ops/base/
    ```
 
 4. Add a benchmark only when performance is part of the acceptance criteria;
@@ -113,7 +113,7 @@ Use these separate mechanisms only when their semantics require them:
 
 ## Phase 4: Document
 
-1. Update `veomni/kernels/README.md` with the family, variants, and supported
+1. Update `veomni/ops/README.md` with the family, variants, and supported
    implementations.
 2. Update `docs/design/kernel_selection.md` when selection behavior changes.
 3. Update `.agents/knowledge/architecture.md` when the layout or call chain
@@ -123,7 +123,7 @@ Use these separate mechanisms only when their semantics require them:
 
 1. Run `/veomni-review`.
 2. Run `make quality` and the relevant kernel/model integration tests.
-3. Verify `KERNEL_REGISTRY.list_registered(...)` and
+3. Verify `OP_REGISTRY.list_registered(...)` and
    `list_available(...)` report the expected rows.
 
 ## Common Pitfalls
@@ -132,7 +132,7 @@ Use these separate mechanisms only when their semantics require them:
 - Adding model-specific reshaping or reduction policy to the tensor registry.
 - Calling a nested autograd wrapper from a compound custom-autograd function.
 - Importing NPU/CUDA-only libraries without guards or requirements.
-- Registering a row without importing its family from `_kernels/__init__.py`.
+- Registering a row without importing its family from `kernels/__init__.py`.
 - Letting an unavailable optimized implementation fall back silently.
 - Editing patchgen-generated files instead of their patch config.
 - Renaming `ops_implementation` while changing the internal kernel plumbing.

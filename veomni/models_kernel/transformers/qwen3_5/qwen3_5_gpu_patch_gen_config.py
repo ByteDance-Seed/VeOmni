@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3_5 VeomniKernel replacements.
+Patch configuration for Qwen3_5 VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_5/generated --diff
 
-Sequence parallel, vision, GDN, and fused loss call local VeomniKernel.
+Sequence parallel, vision, GDN, and fused loss call local VeomniOp.
 """
 
 from copy import copy
@@ -47,9 +47,9 @@ from transformers.utils import TransformersKwargs, logging
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
@@ -95,10 +95,10 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "resolve_kernel_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "resolve_op_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -115,7 +115,7 @@ config.add_post_import_block(
     """
     # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
     # used to come from `try: from fla.modules import ... except ImportError`
-    # at module import time. GatedDeltaNet constructs VeomniKernel handles
+    # at module import time. GatedDeltaNet constructs VeomniOp handles
     # instead. These None placeholders only exist so:
     #   (1) the upstream HF module-level
     #       `is_fast_path_available = all((causal_conv1d_fn, ...))`
@@ -165,23 +165,23 @@ is_flash_attention_requested = None
 _VEOMNI_VISION_ATTENTION_PATCHED = True
 
 
-# ── RMSNorm (always call local qwen3_5 VeomniKernel) ─────────────────────────
+# ── RMSNorm (always call local qwen3_5 VeomniOp) ─────────────────────────
 
 
 @config.override_method(
     "Qwen3_5RMSNorm.__init__",
-    description="Construct a local rms_norm qwen3_5 VeomniKernel",
+    description="Construct a local rms_norm qwen3_5 VeomniOp",
 )
 def qwen3_5_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6) -> None:
     nn.Module.__init__(self)
     self.eps = eps
     self.weight = nn.Parameter(torch.zeros(dim))
-    self.veomni_rms_norm = VeomniKernel("rms_norm", "qwen3_5", resolve_kernel_impl("rms_norm_implementation"))
+    self.veomni_rms_norm = VeomniOp("rms_norm", "qwen3_5", resolve_op_impl("rms_norm_implementation"))
 
 
 @config.override_method(
     "Qwen3_5RMSNorm.forward",
-    description="Always call the local rms_norm qwen3_5 VeomniKernel",
+    description="Always call the local rms_norm qwen3_5 VeomniOp",
 )
 def qwen3_5_rmsnorm_forward_patched(self, x):
     return self.veomni_rms_norm(x, self.weight, eps=self.eps)
@@ -189,7 +189,7 @@ def qwen3_5_rmsnorm_forward_patched(self, x):
 
 @config.override_method(
     "Qwen3_5GatedDeltaNet.__init__",
-    description="Construct local GDN VeomniKernels; keep Qwen3_5RMSNormGated for the weight",
+    description="Construct local GDN VeomniOps; keep Qwen3_5RMSNormGated for the weight",
 )
 def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: int):
     super().__init__()
@@ -226,20 +226,20 @@ def qwen3_5_gated_deltanet_init_patched(self, config: Qwen3_5Config, layer_idx: 
     self.A_log = nn.Parameter(torch.log(A))
 
     self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-    self.veomni_rms_norm_gated = VeomniKernel(
+    self.veomni_rms_norm_gated = VeomniOp(
         "rms_norm_gated",
         "standard",
-        resolve_kernel_impl("rms_norm_gated_implementation"),
+        resolve_op_impl("rms_norm_gated_implementation"),
     )
-    self.veomni_causal_conv1d = VeomniKernel(
+    self.veomni_causal_conv1d = VeomniOp(
         "causal_conv1d",
         "standard",
-        resolve_kernel_impl("causal_conv1d_implementation"),
+        resolve_op_impl("causal_conv1d_implementation"),
     )
-    self.veomni_chunk_gated_delta_rule = VeomniKernel(
+    self.veomni_chunk_gated_delta_rule = VeomniOp(
         "chunk_gated_delta_rule",
         "standard",
-        resolve_kernel_impl("chunk_gated_delta_rule_implementation"),
+        resolve_op_impl("chunk_gated_delta_rule_implementation"),
     )
 
     self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
@@ -995,7 +995,7 @@ def qwen3_5_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_kernel()
+    attention_interface = attention_op()
 
     if is_flash_attention_requested(self.config):
         # Modification: prefer the int max_seqlen pre-computed once in
@@ -1291,20 +1291,20 @@ def qwen3_5_model_forward(
 
 @config.override_method(
     "Qwen3_5ForCausalLM.__init__",
-    description="Bind ForCausalLMLoss VeomniKernel on Qwen3_5ForCausalLM",
+    description="Bind ForCausalLMLoss VeomniOp on Qwen3_5ForCausalLM",
 )
 def qwen3_5_forcausallm_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3_5TextModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 
-@config.override_method("Qwen3_5ForCausalLM.forward", description="Always call ForCausalLMLoss VeomniKernel")
+@config.override_method("Qwen3_5ForCausalLM.forward", description="Always call ForCausalLMLoss VeomniOp")
 def qwen3_5_forcausallm_forward_patched(
     self,
     input_ids: torch.LongTensor | None = None,
@@ -1544,21 +1544,21 @@ def qwen3_5_forconditional_generation_get_metadata_collate_func(self):
 
 @config.override_method(
     "Qwen3_5ForConditionalGeneration.__init__",
-    description="Bind ForCausalLMLoss VeomniKernel on Qwen3_5ForConditionalGeneration",
+    description="Bind ForCausalLMLoss VeomniOp on Qwen3_5ForConditionalGeneration",
 )
 def qwen3_5_forconditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3_5Model(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 
 @config.override_method(
     "Qwen3_5ForConditionalGeneration.forward",
-    description="Always call ForCausalLMLoss VeomniKernel",
+    description="Always call ForCausalLMLoss VeomniOp",
 )
 def qwen3_5_forconditional_generation_forward_patched(
     self,
@@ -1623,7 +1623,7 @@ def qwen3_5_forconditional_generation_forward_patched(
 
 @config.override_method(
     "Qwen3_5Attention.forward",
-    description="Dispatch attention through the interned VeomniKernel",
+    description="Dispatch attention through the interned VeomniOp",
 )
 def qwen3_5_attention_forward_patched(
     self,
@@ -1649,7 +1649,7 @@ def qwen3_5_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_kernel()(
+    attn_output, attn_weights = attention_op()(
         self,
         query_states,
         key_states,

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE VeomniKernel replacements.
+Patch configuration for Qwen3-VL-MoE VeomniOp replacements.
 
 Reuses the qwen3_vl VLM patches via `name_map={"Qwen3VL": "Qwen3VLMoe"}`
-and adds MoE-specific VeomniKernel calls on top.
+and adds MoE-specific VeomniOp calls on top.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_vl_moe/generated --diff
@@ -42,7 +42,6 @@ from veomni.distributed.sequence_parallel import (
     gather_outputs,
     slice_input_tensor,
 )
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     apply_rotary_pos_emb_patched,
@@ -65,7 +64,8 @@ from veomni.models_kernel.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config im
 from veomni.models_kernel.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     config as qwen3_vl_config,
 )
-from veomni.models_kernel.utils.kernel_utils import empty_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.op_utils import empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
@@ -73,7 +73,7 @@ from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 config = PatchConfig(
     source_module="transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
     target_file="patched_modeling_qwen3_vl_moe_gpu.py",
-    description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniKernel replacements",
+    description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniOp replacements",
 )
 
 # Reuse the same post-import block / helpers / imports that the qwen3_vl GPU
@@ -103,10 +103,10 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen3VLMoeCausalLMOutputWithLogProbs"],
 )
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "empty_bias", "resolve_op_impl", "resolve_moe_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -148,13 +148,13 @@ config.override_method(
     "Qwen3VLMoeTextRMSNorm.__init__",
     replacement=qwen3_vl_rmsnorm_init_patched,
     name_map=_NAME_MAP,
-    description="Construct a local rms_norm VeomniKernel",
+    description="Construct a local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3VLMoeTextRMSNorm.forward",
     replacement=qwen3_vl_rmsnorm_forward_patched,
     name_map=_NAME_MAP,
-    description="Always call the local rms_norm VeomniKernel",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",
@@ -231,30 +231,30 @@ config.override_method(
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniKernel",
+    description="Always call rope full VeomniOp",
 )
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision_patched,
-    description="Always call rope_vision full VeomniKernel",
+    description="Always call rope_vision full VeomniOp",
 )
 
 
 # ================================================================
 # Patch: Qwen3VLMoeTextExperts
 # 1. drop the upstream `@use_experts_implementation` decorator
-# 2. always call a local moe_experts VeomniKernel; pass `gate_up_proj`
+# 2. always call a local moe_experts VeomniOp; pass `gate_up_proj`
 #    as merged `fc1_1_2_weight` (v5 already stores `[E, 2*I, H]`)
 # ================================================================
 @config.replace_class(
     "Qwen3VLMoeTextExperts",
-    description="Drop @use_experts_implementation and always call moe_experts VeomniKernel",
+    description="Drop @use_experts_implementation and always call moe_experts VeomniOp",
 )
 class PatchedQwen3VLMoeTextExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors.
 
     Replaces the HF class to remove the `@use_experts_implementation`
-    decorator and to call a local ``moe_experts`` VeomniKernel.
+    decorator and to call a local ``moe_experts`` VeomniOp.
     """
 
     def __init__(self, config):
@@ -265,7 +265,7 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_moe = VeomniKernel("moe_experts", "standard", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
         self,
@@ -580,36 +580,36 @@ def qwen3_vl_moe_model_forward_patched(
 
 # ================================================================
 # Patch: Qwen3VLMoeForConditionalGeneration.__init__
-# Bind ForCausalLMLoss + a local load_balancing_loss VeomniKernel.
+# Bind ForCausalLMLoss + a local load_balancing_loss VeomniOp.
 # ================================================================
 @config.override_method(
     "Qwen3VLMoeForConditionalGeneration.__init__",
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def qwen3_vl_moe_for_conditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3VLMoeModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
-    self.veomni_lb = VeomniKernel(
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_kernel_impl("load_balancing_loss_implementation"),
+        resolve_op_impl("load_balancing_loss_implementation"),
     )
-    self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
+    self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()
 
 
 # ================================================================
 # Patch: Qwen3VLMoeForConditionalGeneration.forward
-# 1. always call self.loss_function (ForCausalLMLoss + VeomniKernel)
+# 1. always call self.loss_function (ForCausalLMLoss + VeomniOp)
 # 2. aux_loss via the model-facing load_balancing_loss helper
 # ================================================================
 @config.override_method(
     "Qwen3VLMoeForConditionalGeneration.forward",
-    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def qwen3_vl_moe_for_conditional_generation_forward_patched(
     self,

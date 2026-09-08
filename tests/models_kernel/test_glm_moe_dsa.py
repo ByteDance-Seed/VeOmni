@@ -27,10 +27,10 @@ from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCau
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_config() -> GlmMoeDsaConfig:
@@ -67,42 +67,42 @@ def _tiny_config() -> GlmMoeDsaConfig:
     )
 
 
-def _build_ours(config: GlmMoeDsaConfig, kernels: SimpleNamespace | None = None):
+def _build_ours(config: GlmMoeDsaConfig, ops: SimpleNamespace | None = None):
     from veomni.models_kernel.transformers.glm_moe_dsa.generated.patched_modeling_glm_moe_dsa_gpu import (
         GlmMoeDsaForCausalLM,
     )
 
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return GlmMoeDsaForCausalLM(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_glm_moe_dsa_constructs_local_kernels():
     model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
     attn = model.model.layers[0].self_attn
-    assert attn.veomni_dsa_attention.kernel == "dsa_attention"
+    assert attn.veomni_dsa_attention.op == "dsa_attention"
     assert attn.veomni_dsa_attention.variant == "glm"
     assert attn.veomni_dsa_attention.impl == "eager"
-    assert attn.indexer.veomni_dsa_indexer.kernel == "dsa_indexer"
+    assert attn.indexer.veomni_dsa_indexer.op == "dsa_indexer"
     assert attn.indexer.veomni_dsa_indexer.variant == "glm"
     assert attn.indexer.veomni_dsa_indexer.impl == "eager"
 
 
 def test_glm_moe_dsa_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_kernels_config())
-    chunk_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_config(), eager_ops_config())
+    chunk_cfg = eager_ops_config()
     chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
     chunk = _build_ours(_tiny_config(), chunk_cfg)
 
     assert eager.veomni_ce.impl == "eager"
     assert chunk.veomni_ce.impl == "chunk_loss"
 
-    set_kernels_config(chunk_cfg)
+    set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
     assert eager.model.layers[0].self_attn.veomni_dsa_attention.impl == "eager"
 

@@ -32,8 +32,8 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor_scale_grad,
 )
 from veomni.distributed.sequence_parallel.utils import padding_tensor_for_seqeunce_parallel
-from veomni.kernels import VeomniKernel
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 
 from ....utils import logging
 from .config_wan import WanConfig
@@ -103,7 +103,7 @@ def rope_apply(x, **kwargs):
     """``rope`` / ``wan``. Impl from ``rotary_pos_emb_implementation``, else eager."""
     freqs = kwargs.pop("freqs")
     head_dim = kwargs.pop("head_dim")
-    rope = VeomniKernel("rope", "wan", resolve_kernel_impl("rotary_pos_emb_implementation"))
+    rope = VeomniOp("rope", "wan", resolve_op_impl("rotary_pos_emb_implementation"))
     return rope(x, freqs, head_dim=head_dim)
 
 
@@ -122,7 +122,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        self.veomni_rms_norm = VeomniKernel("rms_norm", "standard", resolve_kernel_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, x):
         """Apply the interned ``rms_norm`` handle."""
@@ -140,11 +140,11 @@ class AttentionModule(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        impl = resolve_kernel_impl("attn_implementation")
+        impl = resolve_op_impl("attn_implementation")
         if impl in {"sageattention", "veomni_sage_attention"}:
-            self.veomni_attn = VeomniKernel("attention", "standard", "veomni_sage_attention")
+            self.veomni_attn = VeomniOp("attention", "standard", "veomni_sage_attention")
         else:
-            self.veomni_attn = attention_kernel()
+            self.veomni_attn = attention_op()
         self.is_causal = False
         self.config = config
 
@@ -217,7 +217,7 @@ class SelfAttention(nn.Module):
             k = self.norm_k(self.k(x))
             v = self.v(x)
         else:
-            q, k, v = VeomniKernel("async_ulysses_qkv", "dit")(
+            q, k, v = VeomniOp("async_ulysses_qkv", "dit")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,
@@ -240,7 +240,7 @@ class SelfAttention(nn.Module):
         if not self.sp_async:
             x = self.o(x)
         else:
-            x = VeomniKernel("async_ulysses_o", "dit")(
+            x = VeomniOp("async_ulysses_o", "dit")(
                 hidden_states=x,
                 seq_dimension=1,
                 head_dimension=2,

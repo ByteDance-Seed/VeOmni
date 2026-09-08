@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for DeepseekV4 NPU VeomniKernel replacements.
+Patch configuration for DeepseekV4 NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.deepseek_v4.deepseek_v4_npu_patch_gen_config -o veomni/models_kernel/transformers/deepseek_v4/generated --diff
@@ -30,13 +30,13 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     apply_rotary_pos_emb,
 )
 
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.transformers.deepseek_v4.packed_utils import (
     compress_packed_windows,
     packed_compressed_block_bias,
     shard_packed_compression_metadata,
 )
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 
 from .deepseek_v4_gpu_patch_gen_config import (
@@ -83,7 +83,7 @@ plan_compressor_shard = None
 config = PatchConfig(
     source_module="transformers.models.deepseek_v4.modeling_deepseek_v4",
     target_file="patched_modeling_deepseek_v4_npu.py",
-    description="DeepseekV4 with VeomniKernel NPU replacements plus FSDP2 hardening",
+    description="DeepseekV4 with VeomniOp NPU replacements plus FSDP2 hardening",
 )
 
 config.additional_imports.extend(gpu_config.additional_imports)
@@ -94,22 +94,22 @@ config.drop_imported_names.update(gpu_config.drop_imported_names)
 config.override_method(
     "DeepseekV4RMSNorm.__init__",
     replacement=deepseek_v4_rms_norm_init_patched,
-    description="Construct a local rms_norm VeomniKernel",
+    description="Construct a local rms_norm VeomniOp",
 )
 config.override_method(
     "DeepseekV4RMSNorm.forward",
     replacement=deepseek_v4_rms_norm_forward_patched,
-    description="Always call the local rms_norm VeomniKernel",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "DeepseekV4UnweightedRMSNorm.__init__",
     replacement=deepseek_v4_unweighted_rmsnorm_init_patched,
-    description="Construct a local unweighted rms_norm VeomniKernel",
+    description="Construct a local unweighted rms_norm VeomniOp",
 )
 config.override_method(
     "DeepseekV4UnweightedRMSNorm.forward",
     replacement=deepseek_v4_unweighted_rmsnorm_forward_patched,
-    description="Always call the local unweighted rms_norm VeomniKernel",
+    description="Always call the local unweighted rms_norm VeomniOp",
 )
 config.override_method(
     "DeepseekV4RotaryEmbedding.forward",
@@ -119,17 +119,17 @@ config.override_method(
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope deepseek_v4 VeomniKernel",
+    description="Always call rope deepseek_v4 VeomniOp",
 )
 config.override_method(
     "DeepseekV4MLP.__init__",
     replacement=deepseek_v4_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniKernel",
+    description="Construct a local swiglu_mlp VeomniOp",
 )
 config.override_method(
     "DeepseekV4MLP.forward",
     replacement=deepseek_v4_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniKernel",
+    description="Always call the local swiglu_mlp VeomniOp",
 )
 config.override_method(
     "DeepseekV4TopKRouter.forward",
@@ -144,42 +144,42 @@ config.override_method(
 config.override_method(
     "DeepseekV4HyperConnection.__init__",
     replacement=deepseek_v4_hyper_connection_init_patched,
-    description="Construct a local mhc pre VeomniKernel",
+    description="Construct a local mhc pre VeomniOp",
 )
 config.override_method(
     "DeepseekV4HyperConnection.forward",
     replacement=deepseek_v4_hyper_connection_forward_patched,
-    description="Always call the local mhc pre VeomniKernel",
+    description="Always call the local mhc pre VeomniOp",
 )
 config.override_method(
     "DeepseekV4HyperHead.__init__",
     replacement=deepseek_v4_hyper_head_init_patched,
-    description="Construct a local mhc head VeomniKernel",
+    description="Construct a local mhc head VeomniOp",
 )
 config.override_method(
     "DeepseekV4HyperHead.forward",
     replacement=deepseek_v4_hyper_head_forward_patched,
-    description="Always call the local mhc head VeomniKernel",
+    description="Always call the local mhc head VeomniOp",
 )
 config.override_method(
     "DeepseekV4DecoderLayer.__init__",
     replacement=deepseek_v4_decoder_layer_init_patched,
-    description="Construct a local mhc post VeomniKernel",
+    description="Construct a local mhc post VeomniOp",
 )
 config.override_method(
     "DeepseekV4DecoderLayer.forward",
     replacement=deepseek_v4_decoder_layer_forward_patched,
-    description="Always call the local mhc post VeomniKernel",
+    description="Always call the local mhc post VeomniOp",
 )
 config.override_method(
     "DeepseekV4Indexer.forward",
     replacement=deepseek_v4_indexer_forward_patched,
-    description="Always call the local dsa_indexer deepseek_v4 VeomniKernel",
+    description="Always call the local dsa_indexer deepseek_v4 VeomniOp",
 )
 config.override_method(
     "DeepseekV4Attention.__init__",
     replacement=deepseek_v4_attention_init_patched,
-    description="Construct a local dsa_attention deepseek_v4 VeomniKernel",
+    description="Construct a local dsa_attention deepseek_v4 VeomniOp",
 )
 config.override_method(
     "DeepseekV4Attention.forward",
@@ -188,7 +188,7 @@ config.override_method(
 )
 config.replace_function(
     "eager_attention_forward",
-    description="Always call the local dsa_attention deepseek_v4 VeomniKernel",
+    description="Always call the local dsa_attention deepseek_v4 VeomniOp",
 )(deepseek_v4_eager_attention_forward_patched)
 config.override_method(
     "DeepseekV4Model.forward",
@@ -198,17 +198,17 @@ config.override_method(
 config.replace_class(
     "DeepseekV4Experts",
     replacement=PatchedDeepseekV4Experts,
-    description="Always call moe_experts VeomniKernel on v5 gate_up_proj weights",
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 config.override_method(
     "DeepseekV4ForCausalLM.__init__",
     replacement=deepseek_v4_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "DeepseekV4ForCausalLM.forward",
     replacement=deepseek_v4_forcausallm_forward_patched,
-    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "DeepseekV4ForCausalLM.get_parallel_plan",
@@ -272,10 +272,10 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
     self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
-    self.veomni_dsa_indexer = VeomniKernel(
+    self.veomni_dsa_indexer = VeomniOp(
         "dsa_indexer",
         "deepseek_v4",
-        resolve_kernel_impl("dsa_indexer_implementation"),
+        resolve_op_impl("dsa_indexer_implementation"),
     )
 
 

@@ -10,59 +10,59 @@
 #
 #  Patches applied:
 #    - method_override: DeepseekV4RMSNorm.__init__
-#      Construct a local rms_norm VeomniKernel
+#      Construct a local rms_norm VeomniOp
 #    - method_override: DeepseekV4RMSNorm.forward
-#      Always call the local rms_norm VeomniKernel
+#      Always call the local rms_norm VeomniOp
 #    - method_override: DeepseekV4UnweightedRMSNorm.__init__
-#      Construct a local unweighted rms_norm VeomniKernel
+#      Construct a local unweighted rms_norm VeomniOp
 #    - method_override: DeepseekV4UnweightedRMSNorm.forward
-#      Always call the local unweighted rms_norm VeomniKernel
+#      Always call the local unweighted rms_norm VeomniOp
 #    - method_override: DeepseekV4RotaryEmbedding.forward
 #      Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training
 #    - function_replacement: apply_rotary_pos_emb
-#      Always call rope deepseek_v4 VeomniKernel
+#      Always call rope deepseek_v4 VeomniOp
 #    - method_override: DeepseekV4HyperConnection.__init__
-#      Construct a local mhc pre VeomniKernel
+#      Construct a local mhc pre VeomniOp
 #    - method_override: DeepseekV4HyperConnection.forward
-#      Always call the local mhc pre VeomniKernel
+#      Always call the local mhc pre VeomniOp
 #    - method_override: DeepseekV4HyperHead.__init__
-#      Construct a local mhc head VeomniKernel
+#      Construct a local mhc head VeomniOp
 #    - method_override: DeepseekV4HyperHead.forward
-#      Always call the local mhc head VeomniKernel
+#      Always call the local mhc head VeomniOp
 #    - method_override: DeepseekV4DecoderLayer.__init__
-#      Construct a local mhc post VeomniKernel
+#      Construct a local mhc post VeomniOp
 #    - method_override: DeepseekV4DecoderLayer.forward
-#      Always call the local mhc post VeomniKernel
+#      Always call the local mhc post VeomniOp
 #    - method_override: DeepseekV4HCACompressor.forward
 #      Keep HCA compression local to packed sequences
 #    - method_override: DeepseekV4CSACompressor.forward
 #      Keep CSA compression and indexing local to packed sequences
 #    - method_override: DeepseekV4Indexer.__init__
-#      Construct a local dsa_indexer deepseek_v4 VeomniKernel
+#      Construct a local dsa_indexer deepseek_v4 VeomniOp
 #    - method_override: DeepseekV4Indexer.forward
-#      Always call the local dsa_indexer deepseek_v4 VeomniKernel
+#      Always call the local dsa_indexer deepseek_v4 VeomniOp
 #    - method_override: DeepseekV4Attention.__init__
-#      Construct a local dsa_attention deepseek_v4 VeomniKernel
+#      Construct a local dsa_attention deepseek_v4 VeomniOp
 #    - method_override: DeepseekV4Attention.forward
 #      Packed compressor path + Ulysses SP for DeepSeek-V4 sparse attention
 #    - function_replacement: eager_attention_forward
-#      Always call the local dsa_attention deepseek_v4 VeomniKernel
+#      Always call the local dsa_attention deepseek_v4 VeomniOp
 #    - method_override: DeepseekV4Model.forward
 #      Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
-#      Always call moe_experts VeomniKernel on v5 gate_up_proj weights
+#      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: DeepseekV4MLP.__init__
-#      Construct a local swiglu_mlp VeomniKernel
+#      Construct a local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV4MLP.forward
-#      Always call the local swiglu_mlp VeomniKernel
+#      Always call the local swiglu_mlp VeomniOp
 #    - method_override: DeepseekV4TopKRouter.forward
 #      Match the official DeepSeek-V4 FP32 router projection
 #    - method_override: DeepseekV4HashRouter.forward
 #      Match the official DeepSeek-V4 FP32 hash-router projection
 #    - method_override: DeepseekV4ForCausalLM.__init__
-#      Bind ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: DeepseekV4ForCausalLM.forward
-#      Always call ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: DeepseekV4ForCausalLM.get_parallel_plan
 #      Register DeepseekV4 expert parallel plan for v5 generated modeling
 #
@@ -105,8 +105,6 @@ from veomni.distributed.sequence_parallel import (
     gather_seq_scatter_heads,
     reduce_sequence_parallel_loss,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels._kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.transformers.deepseek_v4.indexer_loss import (
     _builds_indexer_kl,
@@ -127,7 +125,9 @@ from veomni.models_kernel.transformers.deepseek_v4.packed_utils import (
     scatter_topk_block_bias,
     shard_packed_compression_metadata,
 )
-from veomni.models_kernel.utils.kernel_utils import empty_bias, linear_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.op_utils import empty_bias, linear_bias, resolve_moe_impl, resolve_op_impl
+from veomni.ops import VeomniOp
+from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -147,7 +147,7 @@ class DeepseekV4RMSNorm(nn.Module):
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniKernel("rms_norm", "standard", resolve_kernel_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -166,8 +166,8 @@ class DeepseekV4UnweightedRMSNorm(nn.Module):
     def __init__(self, eps: float = 1.0e-6) -> None:
         nn.Module.__init__(self)
         self.eps = eps
-        impl = resolve_kernel_impl("rms_norm_implementation")
-        self.veomni_unweighted_rms_norm = VeomniKernel("rms_norm", "unweighted", impl)
+        impl = resolve_op_impl("rms_norm_implementation")
+        self.veomni_unweighted_rms_norm = VeomniOp("rms_norm", "unweighted", impl)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.veomni_unweighted_rms_norm(x, eps=self.eps)
@@ -448,16 +448,16 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope deepseek_v4 VeomniKernel
+# Reason: Always call rope deepseek_v4 VeomniOp
 # Source: veomni.models_kernel.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ) -> torch.Tensor:
-    impl = resolve_kernel_impl("rotary_pos_emb_implementation")
+    impl = resolve_op_impl("rotary_pos_emb_implementation")
     if impl in {"npu", "liger_kernel"}:
         impl = "eager"
-    rope = VeomniKernel("rope", "deepseek_v4", impl)
+    rope = VeomniOp("rope", "deepseek_v4", impl)
     return rope(x, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
@@ -719,10 +719,10 @@ class DeepseekV4Indexer(nn.Module):
         self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        self.veomni_dsa_indexer = VeomniKernel(
+        self.veomni_dsa_indexer = VeomniOp(
             "dsa_indexer",
             "deepseek_v4",
-            resolve_kernel_impl("dsa_indexer_implementation"),
+            resolve_op_impl("dsa_indexer_implementation"),
         )
 
     def forward(
@@ -1200,12 +1200,12 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 # ======================================================================
 # [PATCHED FUNCTION] eager_attention_forward
-# Reason: Always call the local dsa_attention deepseek_v4 VeomniKernel
+# Reason: Always call the local dsa_attention deepseek_v4 VeomniOp
 # Source: veomni.models_kernel.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config
 # ======================================================================
 # ================================================================
 # Patch: eager_attention_forward
-# Always call the local dsa_attention deepseek_v4 VeomniKernel. Convert a
+# Always call the local dsa_attention deepseek_v4 VeomniOp. Convert a
 # dense additive mask into compact top-k indices when the caller did not
 # already provide them.
 # ================================================================
@@ -1360,10 +1360,10 @@ class DeepseekV4Attention(nn.Module):
         self.compressor = (
             COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
         )
-        self.veomni_dsa_attention = VeomniKernel(
+        self.veomni_dsa_attention = VeomniOp(
             "dsa_attention",
             "deepseek_v4",
-            resolve_kernel_impl("dsa_attention_implementation"),
+            resolve_op_impl("dsa_attention_implementation"),
         )
 
     def forward(
@@ -1636,7 +1636,7 @@ class DeepseekV4HyperConnection(nn.Module):
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size))
         self.base = nn.Parameter(torch.empty(mix))
         self.scale = nn.Parameter(torch.empty(3))
-        self.veomni_mhc_pre = VeomniKernel("mhc", "pre", resolve_kernel_impl("mhc_implementation"))
+        self.veomni_mhc_pre = VeomniOp("mhc", "pre", resolve_op_impl("mhc_implementation"))
 
     def forward(
         self,
@@ -1671,7 +1671,7 @@ class DeepseekV4HyperHead(nn.Module):
         self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * config.hidden_size))
         self.hc_base = nn.Parameter(torch.empty(self.hc_mult))
         self.hc_scale = nn.Parameter(torch.empty(1))
-        self.veomni_mhc_head = VeomniKernel("mhc", "head", resolve_kernel_impl("mhc_implementation"))
+        self.veomni_mhc_head = VeomniOp("mhc", "head", resolve_op_impl("mhc_implementation"))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.veomni_mhc_head(
@@ -1706,9 +1706,7 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
-        self.veomni_swiglu_mlp = VeomniKernel(
-            "swiglu_mlp", "standard", resolve_kernel_impl("swiglu_mlp_implementation")
-        )
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.veomni_swiglu_mlp(
@@ -1726,7 +1724,7 @@ class DeepseekV4MLP(nn.Module):
 # ======================================================================
 # [PATCHED CLASS] DeepseekV4Experts
 # Original class replaced with: PatchedDeepseekV4Experts
-# Reason: Always call moe_experts VeomniKernel on v5 gate_up_proj weights
+# Reason: Always call moe_experts VeomniOp on v5 gate_up_proj weights
 # Source: veomni.models_kernel.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config
 # ======================================================================
 # ================================================================
@@ -1751,7 +1749,7 @@ class DeepseekV4Experts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
-        self.veomni_moe = VeomniKernel("moe_experts", "standard", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
         self,
@@ -1900,7 +1898,7 @@ class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn_hc = DeepseekV4HyperConnection(config)
         self.ffn_hc = DeepseekV4HyperConnection(config)
-        self.veomni_mhc_post = VeomniKernel("mhc", "post", resolve_kernel_impl("mhc_implementation"))
+        self.veomni_mhc_post = VeomniOp("mhc", "post", resolve_op_impl("mhc_implementation"))
 
     def forward(
         self,
@@ -2153,7 +2151,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             # or host tensors, and its dense fallback needs the mask to stay causal,
             # so mirror those two runtime conditions before dropping the mask.
             mask_free_sparse = (
-                resolve_kernel_impl("dsa_attention_implementation") == "tilelang"
+                resolve_op_impl("dsa_attention_implementation") == "tilelang"
                 and not isinstance(attention_mask, dict)
                 and inputs_embeds.dtype == torch.bfloat16
                 and inputs_embeds.is_cuda
@@ -2391,15 +2389,15 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
-        self.veomni_lb = VeomniKernel(
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+        self.veomni_lb = VeomniOp(
             "load_balancing_loss",
             "standard",
-            resolve_kernel_impl("load_balancing_loss_implementation"),
+            resolve_op_impl("load_balancing_loss_implementation"),
         )
-        self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
+        self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
         self.post_init()
 
     @can_return_tuple

@@ -1,33 +1,33 @@
-# Kernel Selection in VeOmni
+# Ops Selection in VeOmni
 
-VeOmni selects optimized kernel implementations for attention, mHC,
+VeOmni selects optimized implementations for attention, mHC,
 cross-entropy loss, Liger fused ops (RMSNorm, RoPE, SwiGLU), MoE, and
 load-balancing loss.
 All selections are driven by config fields in `OpsImplementationConfig`.
 
 ## Quick Reference
 
-Every configurable kernel lives under `model.ops_implementation.*` in YAML and
+Every configurable op lives under `model.ops_implementation.*` in YAML and
 maps to a field on `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`).
-Below is the full list — if a field is not in this table, it is not a kernel
+Below is the full list — if a field is not in this table, it is not an op
 selection knob.
 
-| Kernel | Config field | Available values | Default | Selection time |
+| Op | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
-| DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniKernel` |
-| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniKernel` |
-| mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model `__init__` via three instance-local `VeomniKernel`s (`pre`, `post`, `head`) |
-| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniKernel` |
-| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniKernel` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniKernel` |
-| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniKernel` |
-| Vision rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `npu` | `"eager"` | Model `__init__` via an instance-local `VeomniKernel` |
-| Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniKernel` |
-| Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniKernel` |
-| Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniKernel` |
-| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | Model `__init__` via an instance-local `VeomniKernel` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU) | Model `__init__` via an instance-local `VeomniKernel` |
+| DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
+| Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
+| RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Vision rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `npu` | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
+| Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
+| Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
+| Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
+| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | Model `__init__` via an instance-local `VeomniOp` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
 
 **Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
 equal to the dataclass defaults automatically resolve to `npu` for RMSNorm,
@@ -40,7 +40,7 @@ the causal-convolution and gated-delta-rule `eager` fallbacks do not support
 dynamic-batch `cu_seqlens`.
 
 The general per-op fields are typed as plain `str` (not `Literal`), so
-third-party backends can call `register_kernel(...)` without modifying
+third-party backends can call `register_op(...)` without modifying
 `OpsImplementationConfig`.
 
 ---
@@ -49,8 +49,8 @@ third-party backends can call `register_kernel(...)` without modifying
 
 ```
 import veomni                                 # (1) import time
-  └─ import veomni.kernels
-       └─ apply_kernel_patch()
+  └─ import veomni.ops
+       └─ apply_ops_patch()
             └─ apply_veomni_attention_patch() # register Flash/Flex facade names with SP
 
 OpsImplementationConfig.__post_init__()       # (2) config parse time
@@ -58,17 +58,17 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
   └─ rewrite attn_implementation for SP
 
 BaseTrainer._build_model()                    # (3) model build time
-  └─ models_kernel.build_foundation_model(..., kernels_implementation=ops)
-       ├─ set_kernels_config(ops)
+  └─ models_kernel.build_foundation_model(..., ops_implementation=ops)
+       ├─ set_ops_config(ops)
        └─ model init + weight loading
-            ├─ patched modules construct their local VeomniKernel handles
-            ├─ self.veomni_ce = VeomniKernel("cross_entropy_loss", ...)
-            ├─ self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+            ├─ patched modules construct their local VeomniOp handles
+            ├─ self.veomni_ce = VeomniOp("cross_entropy_loss", ...)
+            ├─ self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
             └─ MoE models bind experts and load-balancing helpers to local handles
 
 model.forward()                               # (4) runtime
   ├─ attention: ALL_ATTENTION_FUNCTIONS[config._attn_implementation]
-  ├─ loss: self.loss_function(...) -> model helper -> instance-local VeomniKernel
+  ├─ loss: self.loss_function(...) -> model helper -> instance-local VeomniOp
   ├─ RMSNorm/RoPE/SwiGLU: Liger or HF default (set at registration)
   ├─ mHC: TileKernels pre/post/head or original Transformers implementation
   └─ MoE: fused_moe_forward(...) or eager loop
@@ -76,13 +76,13 @@ model.forward()                               # (4) runtime
 
 **No global loss mutation.** The current `models_kernel` stack does not replace
 Transformers' `LOSS_MAPPING`. Each model resolves its configured CE row once,
-stores an instance-local `VeomniKernel`, and binds that handle to the model
+stores an instance-local `VeomniOp`, and binds that handle to the model
 helper with `functools.partial`; there is no per-forward implementation lookup.
 
 **Ownership.** `models_kernel.build_foundation_model` installs the supplied
-`kernels_implementation` through `set_kernels_config` before constructing the
+`ops_implementation` through `set_ops_config` before constructing the
 model. Callers that provide neither an explicit config nor a previously
-installed kernel config receive `ValueError`; there is no silent all-eager
+installed ops config receive `ValueError`; there is no silent all-eager
 fallback.
 
 ---
@@ -126,15 +126,15 @@ not rebased for head-specific masks. See
 ### Key files
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
-- Installation: `veomni/kernels/install.py` — `apply_kernel_patch()` / `apply_veomni_attention_patch()`
-- Plumbing: `veomni/models_kernel/auto.py` — `build_foundation_model(kernels_implementation=...)`
+- Installation: `veomni/ops/install.py` — `apply_ops_patch()` / `apply_veomni_attention_patch()`
+- Plumbing: `veomni/models_kernel/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ### DeepSeek V4 DSA and mHC
 
 DeepSeek V4 exposes three independent model-specific selections. The TileLang
 indexer and sparse attention backends support packed dynamic batches; the
 TileKernels mHC backend replaces the pre/Sinkhorn/collapse, residual post-mix,
-and final head collapse through three instance-local `VeomniKernel` handles:
+and final head collapse through three instance-local `VeomniOp` handles:
 
 ```yaml
 model:
@@ -177,7 +177,7 @@ All registered rows implement the same token-level `standard` contract:
 `(hidden_or_logits, labels, weight, *, ignore_index, num_items_in_batch)`.
 An empty weight marks a logits input and is supported by eager; the fused rows
 require a projection weight. Causal shifting, sequence-classification label
-policy, and SP reduction are outside the kernel in
+policy, and SP reduction are outside the op in
 `models_kernel/loss_utils/cross_entropy_loss.py`, so chunked CE is no longer
 causal-only.
 
@@ -194,8 +194,8 @@ model cannot be patched.
 
 ### Key files
 
-- Registration: `veomni/kernels/_kernels/loss/__init__.py`
-- Implementations: `veomni/kernels/_kernels/loss/cross_entropy_loss/standard/`
+- Registration: `veomni/ops/kernels/loss/__init__.py`
+- Implementations: `veomni/ops/kernels/loss/cross_entropy_loss/standard/`
 - Model policy: `veomni/models_kernel/loss_utils/cross_entropy_loss.py`
 - Log-probs/distillation side paths: `veomni/models_kernel/loss_utils/`
 
@@ -248,7 +248,7 @@ model:
 ### What gets patched
 
 For each selected backend, patchgen-generated modeling constructs a
-model-local `VeomniKernel` handle and calls it from the relevant method.
+model-local `VeomniOp` handle and calls it from the relevant method.
 Registry wrappers preserve model-specific call contracts and can accept
 model-specific arguments such as an optional RMSNorm weight:
 
@@ -268,20 +268,20 @@ Seed-OSS. DeepSeek-V4 supports weighted and unweighted RMSNorm plus a
 clamp-preserving Liger silu*mul path for shared experts. Its partial
 interleaved RoPE has no Liger equivalent, so `liger_kernel` is rejected for
 `rotary_pos_emb_implementation` on that model; the supported values are
-`triton` (the fused kernel above) and `eager`.
+`triton` (the fused op above) and `eager`.
 
 ### Key files
 
-- Config singleton: `veomni/kernels/config.py` — `get_kernels_config()`, `set_kernels_config()`
-- Unified registry: `veomni/kernels/registry.py` — `register_kernel()`, `resolve_kernel()`, `VeomniKernel`
-- Backend registration: `veomni/kernels/_kernels/{rms_norm,rope,swiglu_mlp}/__init__.py`
+- Config singleton: `veomni/ops/config.py` — `get_ops_config()`, `set_ops_config()`
+- Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
+- Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp}/__init__.py`
 - Model integration: `veomni/models_kernel/transformers/{model}/*_patch_gen_config.py`
 
 ---
 
 ## 4. Qwen3.5 GatedDeltaNet Ops
 
-Qwen3.5 exposes three additional model-specific kernel fields. They default to
+Qwen3.5 exposes three additional model-specific op fields. They default to
 the GPU `fla` implementations, so NPU users must select `npu` explicitly:
 
 ```yaml
@@ -303,7 +303,7 @@ delta-rule implementations additionally require `triton-ascend`. For the gated
 delta rule there are two NPU backends: `npu` (the vendored MindSpeed-MM Triton
 kernel) and `npu_ascendc` (an AscendC fused `torch.ops.npu.*` path), the latter
 requiring a manual `fla_npu` install. Registrations live in
-`veomni/kernels/_kernels/gated_delta_rule/__init__.py`; field defaults and allowed
+`veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
 values are documented by `OpsImplementationConfig`.
 
 ---
@@ -334,21 +334,21 @@ The optimized `triton` implementation is CUDA-only; select `eager` in current
 NPU configs.
 
 This loss has no compatibility facade or process-global dispatch. Each MoE model creates
-`VeomniKernel("load_balancing_loss", "standard", impl)` in `__init__`, then
+`VeomniOp("load_balancing_loss", "standard", impl)` in `__init__`, then
 binds the model-facing helper with `partial(load_balancing_loss,
-kernel=self.veomni_lb)`. The helper preserves the HF-shaped API and converts
-the tuple of per-layer router logits into the raw kernel's `[N, E]` input.
+op=self.veomni_lb)`. The helper preserves the HF-shaped API and converts
+the tuple of per-layer router logits into the raw op's `[N, E]` input.
 
 ### Key files
 
 - Model helper: `veomni/models_kernel/loss_utils/load_balancing_loss.py`
-- Triton impl: `veomni/kernels/_kernels/loss/load_balancing_loss/standard/triton.py`
-- Eager impl: `veomni/kernels/_kernels/loss/load_balancing_loss/standard/eager.py`
-- Registration: `veomni/kernels/_kernels/loss/__init__.py`
+- Triton impl: `veomni/ops/kernels/loss/load_balancing_loss/standard/triton.py`
+- Eager impl: `veomni/ops/kernels/loss/load_balancing_loss/standard/eager.py`
+- Registration: `veomni/ops/kernels/loss/__init__.py`
 
 ---
 
-## 6. MoE Kernel
+## 6. MoE Experts Op
 
 ### Config
 
@@ -368,9 +368,9 @@ dataclass default—including an explicit YAML value—is normalized to
 `"fused_npu"`. Set `"fused_npu"` explicitly for clarity; incompatible
 non-default overrides such as `"fused_quack"` raise at config validation time.
 
-The mode and kernel backend are expressed as a single field. After the
+The mode and op backend are expressed as a single field. After the
 default-value compatibility normalization above, remaining hardware mismatches
-raise during config validation or kernel binding.
+raise during config validation or op binding.
 
 | Value | Kernel | Hardware | EP support |
 |-------|--------|----------|:----------:|
@@ -399,9 +399,9 @@ CANN and `torch_npu` stack to enable the fused activation.
 ### Key files
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
-- Registration: `veomni/kernels/_kernels/moe_experts/__init__.py`
+- Registration: `veomni/ops/kernels/moe_experts/__init__.py`
 - Model integration: `veomni/models_kernel/transformers/*/*_patch_gen_config.py`
-- Plumbing: `veomni/models_kernel/auto.py` — `build_foundation_model(kernels_implementation=...)`
+- Plumbing: `veomni/models_kernel/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ---
 
@@ -411,7 +411,7 @@ CANN and `torch_npu` stack to enable the fused activation.
 |---------|---------|-------|-------|
 | `MODELING_BACKEND` | `"veomni"` | Global | `"veomni"` or `"hf"` — controls whether VeOmni ops patches are applied |
 
-Kernel selection is otherwise driven by `OpsImplementationConfig` fields.
+Op selection is otherwise driven by `OpsImplementationConfig` fields.
 The `VEOMNI_USE_LIGER_KERNEL` and `USE_GROUP_GEMM` environment variables
 have been removed in favor of the per-op config fields.
 
@@ -448,7 +448,7 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | An instance-local `VeomniKernel` selects `liger_kernel`, `npu`, or a model-specific `triton` row | `@use_kernel_forward_from_hub("RMSNorm")` decorator on `Qwen3MoeRMSNorm`; at `model.kernelize()` time the `kernels` library downloads and swaps in `LigerRMSNorm` from `kernels-community/liger_kernels` |
+| **Mechanism** | An instance-local `VeomniOp` selects `liger_kernel`, `npu`, or a model-specific `triton` row | `@use_kernel_forward_from_hub("RMSNorm")` decorator on `Qwen3MoeRMSNorm`; at `model.kernelize()` time the `kernels` library downloads and swaps in `LigerRMSNorm` from `kernels-community/liger_kernels` |
 | **Config** | `OpsImplementationConfig.rms_norm_implementation` field (default `"liger_kernel"` on GPU) | `USE_HUB_KERNELS` env var + `model.kernelize()` call |
 | **When** | Model registration (import time) | Deferred — `kernelize()` after model init |
 | **SP support** | N/A (norm is local) | N/A |
@@ -458,7 +458,7 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | An instance-local `VeomniKernel` selects `liger_kernel`, `npu`, or a model-specific `triton` row | `@use_kernel_func_from_hub("rotary_pos_emb")` on the `apply_rotary_pos_emb` function; `kernels` library downloads `apply_rotary_transformers` from `kernels-community/rotary`. The function is also attached to the Attention module via `@use_kernelized_func(apply_rotary_pos_emb)` so `kernelize()` can find it. |
+| **Mechanism** | An instance-local `VeomniOp` selects `liger_kernel`, `npu`, or a model-specific `triton` row | `@use_kernel_func_from_hub("rotary_pos_emb")` on the `apply_rotary_pos_emb` function; `kernels` library downloads `apply_rotary_transformers` from `kernels-community/rotary`. The function is also attached to the Attention module via `@use_kernelized_func(apply_rotary_pos_emb)` so `kernelize()` can find it. |
 | **Config** | `OpsImplementationConfig.rotary_pos_emb_implementation` field (default `"liger_kernel"` on GPU) | `USE_HUB_KERNELS` env var |
 | **When** | Model registration (import time) | Import time (decorator) + `kernelize()` |
 | **Qwen3.5 MoE gap** | Covered on NPU by the `rope/partial` registry variant | **Partially annotated.** `apply_rotary_pos_emb` in `Qwen3_5MoeAttention` is annotated with `@use_kernelized_func` but **not** with `@use_kernel_func_from_hub("rotary_pos_emb")`. This is because Qwen3.5 MoE uses *partial RoPE* (`partial_rotary_factor < 1.0`): it splits Q/K into rotary and pass-through parts, applies RoPE only to the rotary part, then concatenates. The standard hub kernel `apply_rotary_transformers` does not handle this split-and-concat pattern. A dedicated partial-RoPE kernel could still be used. |
@@ -476,16 +476,16 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | Each patched experts module constructs `VeomniKernel("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
+| **Mechanism** | Each patched experts module constructs `VeomniOp("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
 | **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
 | **EP support** | `fused_triton` and `fused_npu` paths support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Handle resolution in model `__init__`; dispatch at forward time | Decorator at class definition time; dispatch at forward time |
 
-**Note:** Transformers v5 hardcodes two MoE experts implementations (`batched_mm` and `grouped_mm`) and does not expose a registration interface for external fused kernels, so VeOmni models call their local `VeomniKernel` handles rather than routing through `ALL_EXPERTS_FUNCTIONS`.
+**Note:** Transformers v5 hardcodes two MoE experts implementations (`batched_mm` and `grouped_mm`) and does not expose a registration interface for external fused kernels, so VeOmni models call their local `VeomniOp` handles rather than routing through `ALL_EXPERTS_FUNCTIONS`.
 
 ### 7.3 Gaps — What Transformers v5 Does NOT Cover
 
-The following areas have kernel selection in VeOmni but **no corresponding
+The following areas have op selection in VeOmni but **no corresponding
 mechanism** in Transformers v5:
 
 #### 1. Fused Cross-Entropy Loss
@@ -496,7 +496,7 @@ up `LOSS_MAPPING[self.loss_type]` — this returns a standard PyTorch
 env-var-based kernel swap for the loss function.
 
 VeOmni's `models_kernel` stack leaves that global mapping untouched. Generated
-model classes construct a local `VeomniKernel` and bind it to
+model classes construct a local `VeomniOp` and bind it to
 `models_kernel.loss_utils.ForCausalLMLoss` (or the sequence-classification
 helper). The fused Liger and chunked implementations compute loss without
 materializing the full logits tensor, while wrapper-only input policy remains
@@ -510,7 +510,7 @@ loss. This function is called directly in `Qwen3MoeForCausalLM.forward()` —
 there is no kernel selection, no registry, and no hub kernel for it.
 
 VeOmni adds a configurable Triton implementation through an instance-local
-`VeomniKernel`. `models_kernel/loss_utils/load_balancing_loss.py` preserves the
+`VeomniOp`. `models_kernel/loss_utils/load_balancing_loss.py` preserves the
 HF input policy while the registered eager/Triton kernels operate only on a
 concatenated `[N, E]` tensor. Transformers itself still has no corresponding
 selection surface for this function.
@@ -588,14 +588,14 @@ currently exist in the `kernels-community` hub.
 
 | Component | VeOmni mechanism | Transformers v5 mechanism | Compatible? | Gap |
 |-----------|-----------------|--------------------------|:-----------:|-----|
-| RMSNorm | Instance-local `VeomniKernel` with variants | `@use_kernel_forward_from_hub` | Parallel — both can apply | VeOmni covers Qwen3.5's `+1` variant explicitly |
-| RoPE | Instance-local `VeomniKernel` with variants | `@use_kernel_func_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
-| SwiGLU MLP | Instance-local `VeomniKernel` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
+| RMSNorm | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` | Parallel — both can apply | VeOmni covers Qwen3.5's `+1` variant explicitly |
+| RoPE | Instance-local `VeomniOp` with variants | `@use_kernel_func_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
+| SwiGLU MLP | Instance-local `VeomniOp` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
 | Attention | `ALL_ATTENTION_FUNCTIONS` (shared registry) | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | `apply_veomni_fused_moe_patch` (Triton/Quack) | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses custom Triton kernels; HF uses PyTorch native `grouped_mm` |
-| Cross-entropy | Instance-local `VeomniKernel` + model helper | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
-| MoE aux loss | Instance-local eager/Triton `VeomniKernel` + model helper | Eager `load_balancing_loss_func` | VeOmni only | HF has no fused selection surface |
-| RMSNormGated | Instance-local `VeomniKernel` (`fla`/`npu`/`eager`) | Hard-coded `fla.modules.FusedRMSNormGated` if `fla` is installed, else eager | Different dispatch | VeOmni adds explicit hardware selection |
+| Cross-entropy | Instance-local `VeomniOp` + model helper | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
+| MoE aux loss | Instance-local eager/Triton `VeomniOp` + model helper | Eager `load_balancing_loss_func` | VeOmni only | HF has no fused selection surface |
+| RMSNormGated | Instance-local `VeomniOp` (`fla`/`npu`/`eager`) | Hard-coded `fla.modules.FusedRMSNormGated` if `fla` is installed, else eager | Different dispatch | VeOmni adds explicit hardware selection |
 
 ---
 

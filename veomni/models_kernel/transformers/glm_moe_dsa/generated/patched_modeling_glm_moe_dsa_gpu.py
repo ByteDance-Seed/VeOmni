@@ -10,17 +10,17 @@
 #
 #  Patches applied:
 #    - method_override: GlmMoeDsaIndexer.__init__
-#      Construct a local dsa_indexer glm VeomniKernel
+#      Construct a local dsa_indexer glm VeomniOp
 #    - method_override: GlmMoeDsaIndexer.forward
-#      Always call the local dsa_indexer glm VeomniKernel
+#      Always call the local dsa_indexer glm VeomniOp
 #    - method_override: GlmMoeDsaAttention.__init__
-#      Construct a local dsa_attention glm VeomniKernel
+#      Construct a local dsa_attention glm VeomniOp
 #    - method_override: GlmMoeDsaAttention.forward
-#      Always call the local dsa_attention glm VeomniKernel
+#      Always call the local dsa_attention glm VeomniOp
 #    - method_override: GlmMoeDsaForCausalLM.__init__
-#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: GlmMoeDsaForCausalLM.forward
-#      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
 #
 # ==============================================================================
 
@@ -50,9 +50,9 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -153,10 +153,10 @@ class GlmMoeDsaIndexer(nn.Module):
         self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
         self.register_buffer("_cached_keys", None, persistent=False)
-        self.veomni_dsa_indexer = VeomniKernel(
+        self.veomni_dsa_indexer = VeomniOp(
             "dsa_indexer",
             "glm",
-            resolve_kernel_impl("dsa_indexer_implementation"),
+            resolve_op_impl("dsa_indexer_implementation"),
         )
 
     @torch.no_grad()
@@ -318,10 +318,10 @@ class GlmMoeDsaAttention(nn.Module):
         )
         self.register_buffer("_cached_k_pe", None, persistent=False)
         self.register_buffer("_cached_kv", None, persistent=False)
-        self.veomni_dsa_attention = VeomniKernel(
+        self.veomni_dsa_attention = VeomniOp(
             "dsa_attention",
             "glm",
-            resolve_kernel_impl("dsa_attention_implementation"),
+            resolve_op_impl("dsa_attention_implementation"),
         )
 
     def forward(
@@ -793,9 +793,9 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         self.model = GlmMoeDsaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @can_return_tuple

@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 """
-Patch configuration for Qwen3 NPU VeomniKernel replacements.
+Patch configuration for Qwen3 NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3.qwen3_npu_patch_gen_config -o veomni/models_kernel/transformers/qwen3/generated --diff
@@ -46,7 +46,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.qwen3.modeling_qwen3",
     target_file="patched_modeling_qwen3_npu.py",
-    description="Qwen3 with VeomniKernel-based NPU kernel replacements",
+    description="Qwen3 with VeomniOp-based NPU kernel replacements",
 )
 
 config.additional_imports.extend(gpu_config.additional_imports)
@@ -58,55 +58,55 @@ config.drop_imported_names.update(gpu_config.drop_imported_names)
 config.override_method(
     "Qwen3RMSNorm.__init__",
     replacement=qwen3_rmsnorm_init_patched,
-    description="Construct a local rms_norm VeomniKernel",
+    description="Construct a local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3RMSNorm.forward",
     replacement=qwen3_rmsnorm_forward_patched,
-    description="Always call the local rms_norm VeomniKernel",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3MLP.__init__",
     replacement=qwen3_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniKernel",
+    description="Construct a local swiglu_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3MLP.forward",
     replacement=qwen3_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniKernel",
+    description="Always call the local swiglu_mlp VeomniOp",
 )
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniKernel",
+    description="Always call rope full VeomniOp",
 )
 config.override_method(
     "Qwen3Attention.__init__",
     replacement=qwen3_attention_init_patched,
-    description="Construct local rope and attention VeomniKernels",
+    description="Construct local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3Attention.forward",
     replacement=qwen3_attention_forward_patched,
-    description="Always call the local rope and attention VeomniKernels",
+    description="Always call the local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3ForCausalLM.__init__",
     replacement=qwen3_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 config.override_method(
     "Qwen3ForCausalLM.forward",
     replacement=qwen3_forcausallm_forward_patched,
-    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 config.override_method(
     "Qwen3ForSequenceClassification.__init__",
     replacement=qwen3_seq_cls_init_patched,
-    description="Bind ForSequenceClassificationLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForSequenceClassificationLoss to a local cross_entropy_loss VeomniOp",
 )
 config.override_method(
     "Qwen3ForSequenceClassification.forward",
     replacement=qwen3forsequenceclassification_forward_patched,
-    description="Always call self.loss_function (seq-cls helper + VeomniKernel)",
+    description="Always call self.loss_function (seq-cls helper + VeomniOp)",
 )

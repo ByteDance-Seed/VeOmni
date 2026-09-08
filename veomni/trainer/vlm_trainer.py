@@ -161,7 +161,7 @@ class VLMTrainer:
             init_device=args.train.init_device,
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
-            kernels_implementation=args.model.ops_implementation,
+            ops_implementation=args.model.ops_implementation,
             config_kwargs=args.model.model_config,
         )
         self.base.model_config = self.base.model.config

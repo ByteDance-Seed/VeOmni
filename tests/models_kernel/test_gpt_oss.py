@@ -27,10 +27,10 @@ from transformers.models.gpt_oss.modeling_gpt_oss import GptOssForCausalLM as HF
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_config() -> GptOssConfig:
@@ -62,41 +62,41 @@ def _tiny_config() -> GptOssConfig:
     )
 
 
-def _build_ours(config: GptOssConfig, kernels: SimpleNamespace | None = None):
+def _build_ours(config: GptOssConfig, ops: SimpleNamespace | None = None):
     from veomni.models_kernel.transformers.gpt_oss.generated.patched_modeling_gpt_oss_gpu import (
         GptOssForCausalLM,
     )
 
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return GptOssForCausalLM(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_gpt_oss_constructs_local_kernels():
     model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_lb, VeomniKernel)
+    assert isinstance(model.veomni_lb, VeomniOp)
     assert model.veomni_lb.impl == "eager"
     layer = model.model.layers[0]
     assert layer.mlp.experts.veomni_moe.impl == "eager"
-    assert layer.mlp.experts.veomni_moe.kernel == "moe_experts"
+    assert layer.mlp.experts.veomni_moe.op == "moe_experts"
     assert layer.mlp.experts.veomni_moe.variant == "gpt_oss"
 
 
 def test_gpt_oss_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_kernels_config())
-    chunk_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_config(), eager_ops_config())
+    chunk_cfg = eager_ops_config()
     chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
     chunk = _build_ours(_tiny_config(), chunk_cfg)
 
     assert eager.veomni_ce.impl == "eager"
     assert chunk.veomni_ce.impl == "chunk_loss"
 
-    set_kernels_config(chunk_cfg)
+    set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
 
 

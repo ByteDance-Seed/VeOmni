@@ -14,7 +14,7 @@
 
 
 # Temporary: ops and older tests still import these from distributed.moe.
-from ...kernels._kernels.moe_experts.shared.ep import EPGroupGemm, EPMergedFc1GroupGemm
+from ...ops.kernels.moe_experts.shared.ep import EPGroupGemm, EPMergedFc1GroupGemm
 from .moe_layer import (
     dispatch_to_ep_class,
     preprocess,

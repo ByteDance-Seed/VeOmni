@@ -12,12 +12,12 @@
 # See the License for the specific language governing limitations
 # under the License.
 """
-Patch configuration for SeedOss NPU VeomniKernel replacements.
+Patch configuration for SeedOss NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.seed_oss.seed_oss_npu_patch_gen_config -o veomni/models_kernel/transformers/seed_oss/generated --diff
 
-Mirrors the GPU package. RoPE and RMSNorm call local VeomniKernel.
+Mirrors the GPU package. RoPE and RMSNorm call local VeomniOp.
 """
 
 from veomni.models_kernel.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (
@@ -39,7 +39,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.seed_oss.modeling_seed_oss",
     target_file="patched_modeling_seed_oss_npu.py",
-    description="SeedOss with VeomniKernel-based NPU kernel replacements",
+    description="SeedOss with VeomniOp-based NPU kernel replacements",
 )
 
 config.additional_imports.extend(gpu_config.additional_imports)
@@ -50,41 +50,41 @@ config.drop_imported_names.update(gpu_config.drop_imported_names)
 config.override_method(
     "SeedOssRMSNorm.__init__",
     replacement=seed_oss_rmsnorm_init_patched,
-    description="Construct a local rms_norm VeomniKernel",
+    description="Construct a local rms_norm VeomniOp",
 )
 config.override_method(
     "SeedOssRMSNorm.forward",
     replacement=seed_oss_rmsnorm_forward_patched,
-    description="Always call the local rms_norm VeomniKernel",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "SeedOssMLP.__init__",
     replacement=seed_oss_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniKernel",
+    description="Construct a local swiglu_mlp VeomniOp",
 )
 config.override_method(
     "SeedOssMLP.forward",
     replacement=seed_oss_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniKernel, then residual dropout",
+    description="Always call the local swiglu_mlp VeomniOp, then residual dropout",
 )
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniKernel",
+    description="Always call rope full VeomniOp",
 )
 config.override_method(
     "SeedOssForCausalLM.__init__",
     replacement=seed_oss_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 config.override_method(
     "SeedOssForCausalLM.forward",
     replacement=seed_oss_forcausallm_forward_patched,
-    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 
 config.override_method(
     "SeedOssAttention.forward",
     replacement=seed_oss_attention_forward_patched,
-    description="Dispatch attention through the interned VeomniKernel",
+    description="Dispatch attention through the interned VeomniOp",
 )

@@ -10,25 +10,25 @@
 #
 #  Patches applied:
 #    - method_override: LlamaRMSNorm.__init__
-#      Construct a local rms_norm VeomniKernel
+#      Construct a local rms_norm VeomniOp
 #    - method_override: LlamaRMSNorm.forward
-#      Always call the local rms_norm VeomniKernel
+#      Always call the local rms_norm VeomniOp
 #    - method_override: LlamaMLP.__init__
-#      Construct a local swiglu_mlp VeomniKernel
+#      Construct a local swiglu_mlp VeomniOp
 #    - method_override: LlamaMLP.forward
-#      Always call the local swiglu_mlp VeomniKernel
+#      Always call the local swiglu_mlp VeomniOp
 #    - function_replacement: apply_rotary_pos_emb
-#      Always call rope full VeomniKernel
+#      Always call rope full VeomniOp
 #    - method_override: LlamaForCausalLM.__init__
-#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: LlamaForCausalLM.forward
-#      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
 #    - method_override: LlamaForSequenceClassification.__init__
-#      Bind ForSequenceClassificationLoss to a local cross_entropy_loss VeomniKernel
+#      Bind ForSequenceClassificationLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: LlamaForSequenceClassification.forward
-#      Always call self.loss_function (seq-cls helper + VeomniKernel)
+#      Always call self.loss_function (seq-cls helper + VeomniOp)
 #    - method_override: LlamaAttention.forward
-#      Dispatch attention through the interned VeomniKernel
+#      Dispatch attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -64,9 +64,9 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, linear_bias, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, linear_bias, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -85,7 +85,7 @@ class LlamaRMSNorm(nn.Module):
         nn.Module.__init__(self)
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.veomni_rms_norm = VeomniKernel("rms_norm", "standard", resolve_kernel_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
@@ -168,7 +168,7 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope full VeomniKernel
+# Reason: Always call rope full VeomniOp
 # Source: veomni.models_kernel.transformers.llama.llama_gpu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(
@@ -178,7 +178,7 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniKernel("rope", "full", resolve_kernel_impl("rotary_pos_emb_implementation"))
+    rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
     return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
@@ -198,9 +198,7 @@ class LlamaMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniKernel(
-            "swiglu_mlp", "standard", resolve_kernel_impl("swiglu_mlp_implementation")
-        )
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
 
     def forward(self, x):
         return self.veomni_swiglu_mlp(
@@ -305,7 +303,7 @@ class LlamaAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -474,9 +472,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @can_return_tuple
@@ -542,9 +540,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForSequenceClassificationLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
 
     def forward(
         self,

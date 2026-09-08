@@ -30,7 +30,7 @@
 #    - method_override: Qwen2_5OmniThinkerForConditionalGeneration.get_position_id_func
 #      Multiprocessing-safe per-sample position-id closure with VeOmni multimodal token ids
 #    - method_override: Qwen2_5OmniThinkerForConditionalGeneration.__init__
-#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Qwen2_5OmniThinkerForConditionalGeneration.forward
 #      VeOmni SP + FSDP + precomputed masks + always-call ForCausalLMLoss
 #    - method_override: Qwen2_5OmniForConditionalGeneration.__init__
@@ -50,9 +50,9 @@
 #    - method_override: Qwen2_5OmniForConditionalGeneration.get_metadata_collate_func
 #      Delegate ViT multimodal-metadata derivation to the thinker submodule
 #    - method_override: Qwen2_5OmniAudioAttention.forward
-#      Dispatch audio attention through the interned VeomniKernel
+#      Dispatch audio attention through the interned VeomniOp
 #    - method_override: Qwen2_5OmniAttention.forward
-#      Dispatch thinker attention through the interned VeomniKernel
+#      Dispatch thinker attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -110,10 +110,10 @@ from transformers.vision_utils import get_vision_position_ids, get_vision_window
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, unpad_tensor
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 
@@ -813,7 +813,7 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_kernel()
+        attention_interface = attention_op()
 
         if is_flash_attention_requested(self.config):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -1367,7 +1367,7 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_kernel()
+        attention_interface = attention_op()
 
         # --- Patch.1 ---
         if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -2010,7 +2010,7 @@ class Qwen2_5OmniAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -2255,7 +2255,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
     # 4. [PosIDs] Transpose precomputed position_ids from (bs, 3, L) to
     #    (3, bs, L) so the model layer's mrope handler sees the canonical axis
     #    order.
-    # 5. [Loss] Always call `self.loss_function` (ForCausalLMLoss + VeomniKernel).
+    # 5. [Loss] Always call `self.loss_function` (ForCausalLMLoss + VeomniOp).
     # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
     #    for videos without audio) before forwarding the audio tower.
     # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
@@ -2272,9 +2272,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.spatial_merge_size = config.vision_config.spatial_merge_size
         self.rope_deltas = None
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     def get_input_embeddings(self):

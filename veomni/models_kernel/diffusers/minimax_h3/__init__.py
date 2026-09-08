@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""MiniMax H3 modeling that calls local VeomniKernel handles."""
+"""MiniMax H3 modeling that calls local VeomniOp handles."""

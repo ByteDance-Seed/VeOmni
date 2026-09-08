@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 """
-Patch configuration for GLM-MoE-DSA GPU VeomniKernel replacements.
+Patch configuration for GLM-MoE-DSA GPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.glm_moe_dsa.glm_moe_dsa_gpu_patch_gen_config -o veomni/models_kernel/transformers/glm_moe_dsa/generated --diff
@@ -32,9 +32,9 @@ from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaC
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -46,7 +46,7 @@ from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generate
 config = PatchConfig(
     source_module="transformers.models.glm_moe_dsa.modeling_glm_moe_dsa",
     target_file="patched_modeling_glm_moe_dsa_gpu.py",
-    description="GLM-MoE-DSA with VeomniKernel DSA indexer / attention and fused loss",
+    description="GLM-MoE-DSA with VeomniOp DSA indexer / attention and fused loss",
 )
 
 config.add_import("functools", names=["partial"])
@@ -54,10 +54,10 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["resolve_kernel_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["resolve_op_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -68,7 +68,7 @@ apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling 
 
 @config.override_method(
     "GlmMoeDsaIndexer.__init__",
-    description="Construct a local dsa_indexer glm VeomniKernel",
+    description="Construct a local dsa_indexer glm VeomniOp",
 )
 def glm_moe_dsa_indexer_init_patched(self, config: "GlmMoeDsaConfig", layer_idx: int):
     nn.Module.__init__(self)
@@ -88,16 +88,16 @@ def glm_moe_dsa_indexer_init_patched(self, config: "GlmMoeDsaConfig", layer_idx:
     self.weights_proj = nn.Linear(self.hidden_size, self.n_heads, bias=False)
     self.softmax_scale = self.head_dim**-0.5
     self.register_buffer("_cached_keys", None, persistent=False)
-    self.veomni_dsa_indexer = VeomniKernel(
+    self.veomni_dsa_indexer = VeomniOp(
         "dsa_indexer",
         "glm",
-        resolve_kernel_impl("dsa_indexer_implementation"),
+        resolve_op_impl("dsa_indexer_implementation"),
     )
 
 
 @config.override_method(
     "GlmMoeDsaIndexer.forward",
-    description="Always call the local dsa_indexer glm VeomniKernel",
+    description="Always call the local dsa_indexer glm VeomniOp",
 )
 def glm_moe_dsa_indexer_forward_patched(
     self,
@@ -148,7 +148,7 @@ def glm_moe_dsa_indexer_forward_patched(
 
 @config.override_method(
     "GlmMoeDsaAttention.__init__",
-    description="Construct a local dsa_attention glm VeomniKernel",
+    description="Construct a local dsa_attention glm VeomniOp",
 )
 def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx: int):
     nn.Module.__init__(self)
@@ -198,16 +198,16 @@ def glm_moe_dsa_attention_init_patched(self, config: GlmMoeDsaConfig, layer_idx:
     )
     self.register_buffer("_cached_k_pe", None, persistent=False)
     self.register_buffer("_cached_kv", None, persistent=False)
-    self.veomni_dsa_attention = VeomniKernel(
+    self.veomni_dsa_attention = VeomniOp(
         "dsa_attention",
         "glm",
-        resolve_kernel_impl("dsa_attention_implementation"),
+        resolve_op_impl("dsa_attention_implementation"),
     )
 
 
 @config.override_method(
     "GlmMoeDsaAttention.forward",
-    description="Always call the local dsa_attention glm VeomniKernel",
+    description="Always call the local dsa_attention glm VeomniOp",
 )
 def glm_moe_dsa_attention_forward_patched(
     self,
@@ -305,22 +305,22 @@ def glm_moe_dsa_attention_forward_patched(
 
 @config.override_method(
     "GlmMoeDsaForCausalLM.__init__",
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 def glm_moe_dsa_forcausallm_init_patched(self, config):
     super().__init__(config)
     self.model = GlmMoeDsaModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 
 @config.override_method(
     "GlmMoeDsaForCausalLM.forward",
-    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 def glm_moe_dsa_forcausallm_forward_patched(
     self,

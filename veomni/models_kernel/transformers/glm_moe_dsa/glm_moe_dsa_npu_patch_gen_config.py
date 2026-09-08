@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 """
-Patch configuration for GLM-MoE-DSA NPU VeomniKernel replacements.
+Patch configuration for GLM-MoE-DSA NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.glm_moe_dsa.glm_moe_dsa_npu_patch_gen_config -o veomni/models_kernel/transformers/glm_moe_dsa/generated --diff
@@ -34,7 +34,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.glm_moe_dsa.modeling_glm_moe_dsa",
     target_file="patched_modeling_glm_moe_dsa_npu.py",
-    description="GLM-MoE-DSA with VeomniKernel fused loss",
+    description="GLM-MoE-DSA with VeomniOp fused loss",
 )
 
 config.additional_imports.extend(gpu_config.additional_imports)
@@ -45,10 +45,10 @@ config.drop_imported_names.update(gpu_config.drop_imported_names)
 config.override_method(
     "GlmMoeDsaForCausalLM.__init__",
     replacement=glm_moe_dsa_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 config.override_method(
     "GlmMoeDsaForCausalLM.forward",
     replacement=glm_moe_dsa_forcausallm_forward_patched,
-    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )

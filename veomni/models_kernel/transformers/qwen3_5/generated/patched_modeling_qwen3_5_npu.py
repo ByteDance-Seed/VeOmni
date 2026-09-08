@@ -10,13 +10,13 @@
 #
 #  Patches applied:
 #    - method_override: Qwen3_5RMSNorm.__init__
-#      Construct a local rms_norm qwen3_5 VeomniKernel
+#      Construct a local rms_norm qwen3_5 VeomniOp
 #    - method_override: Qwen3_5RMSNorm.forward
-#      Always call the local rms_norm qwen3_5 VeomniKernel
+#      Always call the local rms_norm qwen3_5 VeomniOp
 #    - function_replacement: apply_rotary_pos_emb
-#      Always call rope partial VeomniKernel
+#      Always call rope partial VeomniOp
 #    - function_replacement: apply_rotary_pos_emb_vision
-#      Always call rope_vision full VeomniKernel
+#      Always call rope_vision full VeomniOp
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
 #      Use device-agnostic get_device_id() for FusedRMSNormGated init
 #    - method_override: Qwen3_5GatedDeltaNet._get_local_conv1d_weight
@@ -44,19 +44,19 @@
 #    - method_override: Qwen3_5Model.forward
 #      Optimized multimodal forward supporting Ulysses SP (multimodal scattering), FSDP-safe dummy vision processing, position_ids shape alignment, and CPU-NPU sync avoidance via pre-computed metadata.
 #    - method_override: Qwen3_5ForCausalLM.__init__
-#      Bind ForCausalLMLoss VeomniKernel on Qwen3_5ForCausalLM
+#      Bind ForCausalLMLoss VeomniOp on Qwen3_5ForCausalLM
 #    - method_override: Qwen3_5ForCausalLM.forward
-#      Always call ForCausalLMLoss VeomniKernel
+#      Always call ForCausalLMLoss VeomniOp
 #    - method_override: Qwen3_5ForConditionalGeneration.get_position_id_func
 #      Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.
 #    - method_override: Qwen3_5ForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen3_5ForConditionalGeneration.__init__
-#      Bind ForCausalLMLoss VeomniKernel on Qwen3_5ForConditionalGeneration
+#      Bind ForCausalLMLoss VeomniOp on Qwen3_5ForConditionalGeneration
 #    - method_override: Qwen3_5ForConditionalGeneration.forward
-#      Always call ForCausalLMLoss VeomniKernel
+#      Always call ForCausalLMLoss VeomniOp
 #    - method_override: Qwen3_5Attention.forward
-#      Dispatch attention through the interned VeomniKernel
+#      Dispatch attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -109,16 +109,16 @@ from transformers.utils.output_capturing import capture_outputs
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
 
 
 # Additional import blocks for patches
 # NPU has no fla/flash_qla backend registered today; selecting a
-# non-eager linear-attention impl raises at VeomniKernel construct
+# non-eager linear-attention impl raises at VeomniOp construct
 # time. These None placeholders preserve the upstream HF top-level
 # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
 # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
@@ -574,20 +574,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
 
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        self.veomni_rms_norm_gated = VeomniKernel(
+        self.veomni_rms_norm_gated = VeomniOp(
             "rms_norm_gated",
             "standard",
-            resolve_kernel_impl("rms_norm_gated_implementation"),
+            resolve_op_impl("rms_norm_gated_implementation"),
         )
-        self.veomni_causal_conv1d = VeomniKernel(
+        self.veomni_causal_conv1d = VeomniOp(
             "causal_conv1d",
             "standard",
-            resolve_kernel_impl("causal_conv1d_implementation"),
+            resolve_op_impl("causal_conv1d_implementation"),
         )
-        self.veomni_chunk_gated_delta_rule = VeomniKernel(
+        self.veomni_chunk_gated_delta_rule = VeomniOp(
             "chunk_gated_delta_rule",
             "standard",
-            resolve_kernel_impl("chunk_gated_delta_rule_implementation"),
+            resolve_op_impl("chunk_gated_delta_rule_implementation"),
         )
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
@@ -820,11 +820,11 @@ def rotate_half(x):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb
-# Reason: Always call rope partial VeomniKernel
+# Reason: Always call rope partial VeomniOp
 # Source: veomni.models_kernel.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    rope = VeomniKernel("rope", "partial", resolve_kernel_impl("rotary_pos_emb_implementation"))
+    rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
     return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
@@ -925,7 +925,7 @@ class Qwen3_5Attention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -966,12 +966,12 @@ class Qwen3_5MLP(nn.Module):
 
 
 class Qwen3_5RMSNorm(nn.Module):
-    # ── RMSNorm (always call local qwen3_5 VeomniKernel) ─────────────────────────
+    # ── RMSNorm (always call local qwen3_5 VeomniOp) ─────────────────────────
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.veomni_rms_norm = VeomniKernel("rms_norm", "qwen3_5", resolve_kernel_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "qwen3_5", resolve_op_impl("rms_norm_implementation"))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -1143,13 +1143,13 @@ class Qwen3_5VisionPatchMerger(nn.Module):
 
 # ======================================================================
 # [PATCHED FUNCTION] apply_rotary_pos_emb_vision
-# Reason: Always call rope_vision full VeomniKernel
+# Reason: Always call rope_vision full VeomniOp
 # Source: veomni.models_kernel.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniKernel("rope_vision", "full", resolve_kernel_impl("rotary_pos_emb_vision_implementation"))
+    rope = VeomniOp("rope_vision", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     return rope(q, k, cos, sin)
 
 
@@ -1732,7 +1732,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
         if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
-            from veomni.kernels._kernels.gated_delta_rule.chunk_gated_delta_rule.standard.npu_ascendc import (
+            from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.npu_ascendc import (
                 precompute_varlen_metadata,
             )
 
@@ -2347,9 +2347,9 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         self.model = Qwen3_5TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @can_return_tuple
@@ -2500,9 +2500,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @auto_docstring

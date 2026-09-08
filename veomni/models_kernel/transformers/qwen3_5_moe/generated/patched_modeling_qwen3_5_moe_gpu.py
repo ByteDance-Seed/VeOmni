@@ -10,9 +10,9 @@
 #
 #  Patches applied:
 #    - method_override: Qwen3_5MoeRMSNorm.__init__
-#      Construct a local rms_norm qwen3_5 VeomniKernel
+#      Construct a local rms_norm qwen3_5 VeomniOp
 #    - method_override: Qwen3_5MoeRMSNorm.forward
-#      Always call the local rms_norm qwen3_5 VeomniKernel
+#      Always call the local rms_norm qwen3_5 VeomniOp
 #    - method_override: Qwen3_5MoeModel.__init__
 #      Propagate _moe_implementation from top-level config to text_config
 #    - method_override: Qwen3_5MoeSparseMoeBlock.forward
@@ -38,7 +38,7 @@
 #    - method_override: Qwen3_5MoeForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
 #    - class_replacement: Qwen3_5MoeExperts
-#      Always call moe_experts VeomniKernel on v5 gate_up_proj weights
+#      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: Qwen3_5MoeGatedDeltaNet.__init__
 #      Use device-agnostic get_device_id() for FusedRMSNormGated init
 #    - method_override: Qwen3_5MoeGatedDeltaNet._get_local_conv1d_weight
@@ -50,17 +50,17 @@
 #    - method_override: Qwen3_5MoeDecoderLayer.forward
 #      Extract and pass cu_seq_lens_q for varlen linear attention in Qwen3_5MoeDecoderLayer.forward
 #    - method_override: Qwen3_5MoeForCausalLM.__init__
-#      Bind ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen3_5MoeForCausalLM.forward
-#      Always call ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen3_5MoeForConditionalGeneration.__init__
-#      Bind ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen3_5MoeForConditionalGeneration.forward
-#      Always call ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen3_5MoeForConditionalGeneration.get_parallel_plan
 #      Register Qwen3_5Moe expert parallel plan for v5 generated modeling
 #    - method_override: Qwen3_5MoeAttention.forward
-#      Dispatch attention through the interned VeomniKernel
+#      Dispatch attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -112,9 +112,9 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, empty_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.op_utils import attention_op, empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -122,7 +122,7 @@ from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indic
 
 # Additional import blocks for patches
 # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
-# now lives on local VeomniKernel handles (reused from qwen3_5 GDN).
+# now lives on local VeomniOp handles (reused from qwen3_5 GDN).
 # These None placeholders preserve two pieces of the original module:
 #   (1) the upstream HF top-level
 #       `is_fast_path_available = all((causal_conv1d_fn, ...))` resolves
@@ -581,20 +581,20 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
 
         self.norm = Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        self.veomni_rms_norm_gated = VeomniKernel(
+        self.veomni_rms_norm_gated = VeomniOp(
             "rms_norm_gated",
             "standard",
-            resolve_kernel_impl("rms_norm_gated_implementation"),
+            resolve_op_impl("rms_norm_gated_implementation"),
         )
-        self.veomni_causal_conv1d = VeomniKernel(
+        self.veomni_causal_conv1d = VeomniOp(
             "causal_conv1d",
             "standard",
-            resolve_kernel_impl("causal_conv1d_implementation"),
+            resolve_op_impl("causal_conv1d_implementation"),
         )
-        self.veomni_chunk_gated_delta_rule = VeomniKernel(
+        self.veomni_chunk_gated_delta_rule = VeomniOp(
             "chunk_gated_delta_rule",
             "standard",
-            resolve_kernel_impl("chunk_gated_delta_rule_implementation"),
+            resolve_op_impl("chunk_gated_delta_rule_implementation"),
         )
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
@@ -972,7 +972,7 @@ class Qwen3_5MoeAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -1009,7 +1009,7 @@ class Qwen3_5MoeMLP(nn.Module):
 # ======================================================================
 # [PATCHED CLASS] Qwen3_5MoeExperts
 # Original class replaced with: PatchedQwen3_5MoeExperts
-# Reason: Always call moe_experts VeomniKernel on v5 gate_up_proj weights
+# Reason: Always call moe_experts VeomniOp on v5 gate_up_proj weights
 # Source: veomni.models_kernel.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config
 # ======================================================================
 # ── MoE Expert replacement (merged gate_up_proj layout) ─────────────────────────
@@ -1025,7 +1025,7 @@ class Qwen3_5MoeExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_moe = VeomniKernel("moe_experts", "standard", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
         self,
@@ -1123,12 +1123,12 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
 
 class Qwen3_5MoeRMSNorm(nn.Module):
-    # ── RMSNorm (always call local qwen3_5 VeomniKernel) ─────────────────────────
+    # ── RMSNorm (always call local qwen3_5 VeomniOp) ─────────────────────────
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.veomni_rms_norm = VeomniKernel("rms_norm", "qwen3_5", resolve_kernel_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "qwen3_5", resolve_op_impl("rms_norm_implementation"))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -1354,7 +1354,7 @@ class Qwen3_5MoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_kernel()
+        attention_interface = attention_op()
 
         if is_flash_attention_requested(self.config):
             # Modification: prefer the int max_seqlen pre-computed once in
@@ -2648,15 +2648,15 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
-        self.veomni_lb = VeomniKernel(
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+        self.veomni_lb = VeomniOp(
             "load_balancing_loss",
             "standard",
-            resolve_kernel_impl("load_balancing_loss_implementation"),
+            resolve_op_impl("load_balancing_loss_implementation"),
         )
-        self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
+        self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
         self.post_init()
 
     @can_return_tuple
@@ -2778,15 +2778,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         super().__init__(config)
         self.model = Qwen3_5MoeModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
-        self.veomni_lb = VeomniKernel(
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+        self.veomni_lb = VeomniOp(
             "load_balancing_loss",
             "standard",
-            resolve_kernel_impl("load_balancing_loss_implementation"),
+            resolve_op_impl("load_balancing_loss_implementation"),
         )
-        self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
+        self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
         self.post_init()
 
     @auto_docstring

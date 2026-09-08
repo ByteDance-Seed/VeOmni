@@ -28,15 +28,16 @@ from torch import Tensor, nn
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import reduce_sequence_parallel_loss
-from veomni.kernels import VeomniKernel
+from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import FusedLinearAuxOutput
 
 from .chunk_logprobs import chunk_logprobs_function
 from .chunk_topk_distill import chunk_topk_distill_function
 
 
-def _default_kernel() -> VeomniKernel:
-    return VeomniKernel("cross_entropy_loss", "standard", "eager")
+def _default_op() -> VeomniOp:
+    """Return the default eager token-level cross-entropy op."""
+    return VeomniOp("cross_entropy_loss", "standard", "eager")
 
 
 def _select_hidden_weight(
@@ -65,7 +66,7 @@ def _select_causal_target(
     ignore_index: int,
     sp_enabled: bool,
 ) -> Tensor:
-    """Return the token targets the CE kernel should consume.
+    """Return the token targets the CE op should consume.
 
     A provided ``shift_labels`` always wins, including when SP is on.
     SeedOmni V2 BAGEL builds segment-aware pre-shifted targets that a
@@ -110,15 +111,15 @@ def ForCausalLMLoss(
     ignore_index: int = -100,
     shift_labels: Tensor | None = None,
     *,
-    kernel: Callable | None = None,
+    op: Callable | None = None,
     loss_reduction_group: Any = None,
     **kwargs,
 ) -> tuple[Tensor | None, Tensor | None, FusedLinearAuxOutput | None]:
     """Causal LM helper: choose target, flatten, token CE, optional reduce.
 
-    ``kernel`` is a token-level ``cross_entropy_loss`` handle. A provided
+    ``op`` is a token-level ``cross_entropy_loss`` handle. A provided
     ``shift_labels`` is the final target. ``loss_reduction_group`` stays here
-    and must not reach the kernel.
+    and must not reach the op.
     """
     del vocab_size
     hidden_states = kwargs.pop("hidden_states", None)
@@ -178,7 +179,7 @@ def ForCausalLMLoss(
         )
         return None, None, FusedLinearAuxOutput(log_probs=log_probs, entropy=entropy)
 
-    token_kernel = kernel if kernel is not None else _default_kernel()
+    token_op = op if op is not None else _default_op()
     device = logits.device if logits is not None else hidden_states.device
     sp_enabled = get_parallel_state().sp_enabled
     target = _select_causal_target(labels, shift_labels, ignore_index=ignore_index, sp_enabled=sp_enabled)
@@ -191,7 +192,7 @@ def ForCausalLMLoss(
     target = target.to(device)
 
     hidden, weight, out_logits = _select_hidden_weight(logits, hidden_states, weights)
-    loss = token_kernel(
+    loss = token_op(
         hidden,
         target,
         weight,
@@ -215,7 +216,7 @@ def ForSequenceClassificationLoss(
     num_items_in_batch: int | None = None,
     ignore_index: int = -100,
     *,
-    kernel: Callable | None = None,
+    op: Callable | None = None,
     **kwargs,
 ) -> tuple[Tensor, Tensor | None, None]:
     """Seq-cls helper: flatten, token CE, SP reduce. No label shift."""
@@ -235,7 +236,7 @@ def ForSequenceClassificationLoss(
     if num_labels is None:
         raise ValueError("num_labels must be provided.")
 
-    token_kernel = kernel if kernel is not None else _default_kernel()
+    token_op = op if op is not None else _default_op()
     device = logits.device if logits is not None else hidden_states.device
     target = labels.view(-1)
     if hidden_states is not None:
@@ -245,7 +246,7 @@ def ForSequenceClassificationLoss(
     target = target.to(device)
 
     hidden, weight, out_logits = _select_hidden_weight(logits, hidden_states, weights)
-    loss = token_kernel(
+    loss = token_op(
         hidden,
         target,
         weight,

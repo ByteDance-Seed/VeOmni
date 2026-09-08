@@ -1071,7 +1071,7 @@ class OpsImplementationConfig:
       ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
       ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
       model-agnostic allow-list.
-    - **Model-build time** (instance-local ``VeomniKernel`` resolution) for
+    - **Model-build time** (instance-local ``VeomniOp`` resolution) for
       model-specific ops such as ``rms_norm_gated``, ``causal_conv1d``, and
       ``chunk_gated_delta_rule``. Keeping this compatibility check at the
       consuming model avoids forcing unrelated models to configure them.
@@ -1292,7 +1292,7 @@ class OpsImplementationConfig:
 
         Only checks things cheaper to catch here than at model-build time.
         Package availability (liger / torch_npu) and model-specific backend
-        compatibility are validated by instance-local ``VeomniKernel``
+        compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
         from ..utils.import_utils import (
@@ -1335,7 +1335,7 @@ class OpsImplementationConfig:
                     )
 
         # Surface a missing Triton package before a model tries to construct
-        # its instance-local load-balancing-loss ``VeomniKernel`` handle.
+        # its instance-local load-balancing-loss ``VeomniOp`` handle.
         if self.load_balancing_loss_implementation == "triton" and not is_package_available("triton"):
             raise ValueError(
                 "load_balancing_loss_implementation='triton' requires the 'triton' package "

@@ -357,7 +357,7 @@ model = build_foundation_model(
     weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
     init_device=args.train.init_device, # model init device
     torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-    kernels_implementation=args.model.ops_implementation,
+    ops_implementation=args.model.ops_implementation,
     config_kwargs=config_kwargs,
 )
 

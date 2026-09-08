@@ -23,29 +23,29 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tests.models_kernel.compare import eager_kernels_config
+from tests.models_kernel.compare import eager_ops_config
 from veomni.distributed.parallel_state import ParallelState
-from veomni.kernels.config import get_kernels_config, set_kernels_config
 from veomni.models_kernel.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from veomni.models_kernel.transformers.deepseek_v4.indexer_loss import (
     _builds_indexer_kl,
     _indexer_loss_enabled,
     indexer_kl_terms,
 )
+from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.model_outputs import MoeModelOutputWithIndexerKL
 
 
 @contextmanager
 def _kernels_config_installed(**overrides):
-    previous = get_kernels_config()
-    installed = eager_kernels_config()
+    previous = get_ops_config()
+    installed = eager_ops_config()
     for key, value in overrides.items():
         setattr(installed, key, value)
-    set_kernels_config(installed)
+    set_ops_config(installed)
     try:
         yield installed
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def _module_with_config(**overrides):
@@ -298,12 +298,12 @@ def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest
         attn_implementation="eager",
         experts_implementation="eager",
     )
-    previous = get_kernels_config()
-    set_kernels_config(eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(eager_ops_config())
     try:
         model = DeepseekV4ForCausalLM(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
     hidden = torch.randn(1, 4, config.hidden_size)
     kl_total = torch.tensor(8.0)
@@ -358,12 +358,12 @@ def test_the_flag_is_refused_when_no_layer_can_build_a_kl(monkeypatch: pytest.Mo
         attn_implementation="eager",
         experts_implementation="eager",
     )
-    previous = get_kernels_config()
-    set_kernels_config(eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(eager_ops_config())
     try:
         model = gpu.DeepseekV4ForCausalLM(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
     monkeypatch.setattr(
         "veomni.models_kernel.transformers.deepseek_v4.indexer_loss._indexer_loss_enabled",

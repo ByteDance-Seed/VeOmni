@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Transformer modeling that calls local ``VeomniKernel`` handles.
+"""Transformer modeling that calls local ``VeomniOp`` handles.
 
 Import classes from ``transformers.<model>.generated``. Construct helpers
 live on this package: ``build_foundation_model``, ``get_model_class``, and

@@ -25,9 +25,9 @@ import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
-from tests.kernels.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _eager_kernels_config() -> SimpleNamespace:
@@ -80,14 +80,14 @@ def _qwen3_classes():
     return Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 
-def _build_qwen3(config: Qwen3Config, kernels: SimpleNamespace | None = None):
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else _eager_kernels_config())
+def _build_qwen3(config: Qwen3Config, ops: SimpleNamespace | None = None):
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else _eager_kernels_config())
     try:
         causal_cls, _ = _qwen3_classes()
         return causal_cls(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def _named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -97,7 +97,7 @@ def _named_trainable(model: torch.nn.Module) -> dict[str, torch.Tensor]:
 def test_qwen3_constructs_local_kernels():
     model = _build_qwen3(_tiny_config())
     assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     layer = model.model.layers[0]
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
     assert layer.mlp.veomni_swiglu_mlp.impl == "eager"
@@ -114,7 +114,7 @@ def test_qwen3_instances_keep_distinct_impls():
     assert eager.veomni_ce.impl == "eager"
     assert chunk.veomni_ce.impl == "chunk_loss"
 
-    set_kernels_config(chunk_cfg)
+    set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
 
 
@@ -151,12 +151,12 @@ def test_qwen3_eager_matches_hf_logits_and_loss():
 
 def test_qwen3_seq_cls_forward():
     _, seq_cls = _qwen3_classes()
-    previous = get_kernels_config()
-    set_kernels_config(_eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(_eager_kernels_config())
     try:
         model = seq_cls(_tiny_config(num_labels=4))
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
     assert model.veomni_ce.impl == "eager"
 
     input_ids = torch.randint(3, 128, (2, 6))

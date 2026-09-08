@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HF-style modeling helper around a tensor-native load-balancing kernel."""
+"""HF-style modeling helper around a tensor-native load-balancing op."""
 
 from __future__ import annotations
 
@@ -31,14 +31,14 @@ def load_balancing_loss(
     top_k: int = 2,
     attention_mask: Tensor | None = None,
     *,
-    kernel: Callable,
+    op: Callable,
 ) -> Tensor | int:
-    """Adapt HF per-layer router logits to the unified ``[N, E]`` kernel.
+    """Adapt HF per-layer router logits to the unified ``[N, E]`` op.
 
     The helper owns modeling policy only: the legacy ``None``/non-tuple
     behavior, concatenating per-layer logits, optional expert-count
     validation, and the empty-mask sentinel. Backend selection stays on the
-    instance-local ``kernel`` handle.
+    instance-local ``op`` handle.
     """
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
@@ -51,4 +51,4 @@ def load_balancing_loss(
         raise ValueError(f"gate_logits last dim ({concatenated.shape[-1]}) != num_experts ({num_experts})")
 
     mask = attention_mask if attention_mask is not None else concatenated.new_empty(0)
-    return kernel(concatenated, mask, top_k=top_k)
+    return op(concatenated, mask, top_k=top_k)

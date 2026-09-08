@@ -27,10 +27,10 @@ from transformers.models.seed_oss.modeling_seed_oss import SeedOssForCausalLM as
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_config() -> SeedOssConfig:
@@ -72,18 +72,18 @@ def _seed_oss_cls():
     return SeedOssForCausalLM
 
 
-def _build_ours(config: SeedOssConfig, kernels: SimpleNamespace | None = None):
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+def _build_ours(config: SeedOssConfig, ops: SimpleNamespace | None = None):
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return _seed_oss_cls()(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_seed_oss_constructs_local_kernels():
     model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
     layer = model.model.layers[0]
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
@@ -91,15 +91,15 @@ def test_seed_oss_constructs_local_kernels():
 
 
 def test_seed_oss_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_kernels_config())
-    chunk_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_config(), eager_ops_config())
+    chunk_cfg = eager_ops_config()
     chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
     chunk = _build_ours(_tiny_config(), chunk_cfg)
 
     assert eager.veomni_ce.impl == "eager"
     assert chunk.veomni_ce.impl == "chunk_loss"
 
-    set_kernels_config(chunk_cfg)
+    set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
 
 

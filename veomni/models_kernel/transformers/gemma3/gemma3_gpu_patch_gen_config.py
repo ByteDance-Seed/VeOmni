@@ -12,12 +12,12 @@
 # See the License for the specific language governing limitations
 # under the License.
 """
-Patch configuration for the text-only Gemma 3 VeomniKernel replacements.
+Patch configuration for the text-only Gemma 3 VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.gemma3.gemma3_gpu_patch_gen_config -o veomni/models_kernel/transformers/gemma3/generated --diff
 
-TextModel mask prep uses ``veomni.kernels.mask``. Multimodal
+TextModel mask prep uses ``veomni.ops.mask``. Multimodal
 ``Gemma3Model.forward`` keeps HuggingFace ``create_causal_mask``.
 """
 
@@ -30,10 +30,10 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.kernels import VeomniKernel
-from veomni.kernels.mask import causal_mask, packed_causal_mask, sliding_window_mask
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
+from veomni.ops.mask import causal_mask, packed_causal_mask, sliding_window_mask
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -45,7 +45,7 @@ from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generate
 config = PatchConfig(
     source_module="transformers.models.gemma3.modeling_gemma3",
     target_file="patched_modeling_gemma3_gpu.py",
-    description="Gemma 3 text model with VeomniKernel fused-loss integration",
+    description="Gemma 3 text model with VeomniOp fused-loss integration",
 )
 
 config.add_import("functools", names=["partial"])
@@ -53,17 +53,17 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "resolve_kernel_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "resolve_op_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
     names=["ForCausalLMLoss"],
 )
 config.add_import(
-    "veomni.kernels.mask",
+    "veomni.ops.mask",
     names=["causal_mask", "packed_causal_mask", "sliding_window_mask"],
 )
 apply_rotary_pos_emb = None  # noqa: E305  resolved from the generated modeling file
@@ -72,7 +72,7 @@ _bidirectional_window_overlay = None  # noqa: E305  resolved from the generated 
 
 @config.override_method(
     "Gemma3TextModel.forward",
-    description="Build full / sliding masks through veomni.kernels.mask",
+    description="Build full / sliding masks through veomni.ops.mask",
 )
 def gemma3_textmodel_forward_patched(
     self,
@@ -99,7 +99,7 @@ def gemma3_textmodel_forward_patched(
         position_ids = position_ids.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
-        impl = resolve_kernel_impl("attn_implementation")
+        impl = resolve_op_impl("attn_implementation")
         q_len = inputs_embeds.shape[1]
         past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
         kv_len = q_len + past_seen
@@ -163,22 +163,22 @@ def gemma3_textmodel_forward_patched(
 
 @config.override_method(
     "Gemma3ForCausalLM.__init__",
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 def gemma3_forcausallm_init_patched(self, config):
     super().__init__(config)
     self.model = Gemma3TextModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 
 @config.override_method(
     "Gemma3ForCausalLM.forward",
-    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 def gemma3_forcausallm_forward_patched(
     self,
@@ -250,7 +250,7 @@ def gemma3_forcausallm_forward_patched(
 
 @config.override_method(
     "Gemma3Attention.forward",
-    description="Dispatch attention through the interned VeomniKernel",
+    description="Dispatch attention through the interned VeomniOp",
 )
 def gemma3_attention_forward_patched(
     self,
@@ -276,7 +276,7 @@ def gemma3_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_kernel()(
+    attn_output, attn_weights = attention_op()(
         self,
         query_states,
         key_states,

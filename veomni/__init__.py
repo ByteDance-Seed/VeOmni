@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .kernels import apply_kernel_patch
+from .ops import apply_ops_patch
 from .utils.env import format_envs
 from .utils.logging import get_logger
 

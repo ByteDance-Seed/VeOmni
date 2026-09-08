@@ -310,11 +310,11 @@ instance-local registry handle to get fused selection and correct SP loss reduct
 ```python
 from functools import partial
 
-from veomni.kernels import VeomniKernel
+from veomni.ops import VeomniOp
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
 
 # In the model constructor:
-self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", implementation)
+self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", implementation)
 self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
 
 if labels is not None:

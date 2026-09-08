@@ -29,8 +29,8 @@ from einops import reduce, repeat
 from PIL import Image
 from tqdm import tqdm
 
-from veomni.kernels.config import set_kernels_config
 from veomni.models_kernel.checkpoint.weights import init_empty_weights, load_model_weights
+from veomni.ops.config import set_ops_config
 from veomni.utils.device import get_device_type
 
 from .minimax_h3_condition.configuration_minimax_h3_condition import MiniMaxH3ConditionModelConfig
@@ -375,7 +375,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         transformer_config_path: str = None,
         transformer_weights_path: str = None,
         transformer_config_kwargs: dict = None,
-        kernels_implementation=None,
+        ops_implementation=None,
     ):
         """Load the pipeline from the staged condition and DiT classes.
 
@@ -383,8 +383,8 @@ class MiniMaxH3Pipeline(BasePipeline):
           tokenizer/processor) via MiniMaxH3ConditionModel.
         - DiT via MiniMaxH3DiTModel on meta, then load_model_weights on CPU.
         """
-        if kernels_implementation is not None:
-            set_kernels_config(kernels_implementation)
+        if ops_implementation is not None:
+            set_ops_config(ops_implementation)
 
         pipe = MiniMaxH3Pipeline(device=device, torch_dtype=torch_dtype)
 

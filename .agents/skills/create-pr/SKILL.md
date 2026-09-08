@@ -59,7 +59,7 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    | `veomni/trainer/` | `trainer` |
    | `veomni/data/` | `data` |
    | `veomni/distributed/` | `dist` |
-   | `veomni/kernels/` | `ops` |
+   | `veomni/ops/` | `ops` |
    | `veomni/checkpoint/` | `ckpt` |
    | `veomni/optim/` | `optim` |
    | `veomni/lora/` | `lora` |

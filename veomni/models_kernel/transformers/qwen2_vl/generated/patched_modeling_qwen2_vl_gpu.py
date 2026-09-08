@@ -26,11 +26,11 @@
 #    - method_override: Qwen2VLForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen2VLForConditionalGeneration.__init__
-#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Qwen2VLForConditionalGeneration.forward
-#      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
 #    - method_override: Qwen2VLAttention.forward
-#      Dispatch attention through the interned VeomniKernel
+#      Dispatch attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -73,9 +73,9 @@ from transformers.vision_utils import get_vision_position_ids
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, pad_tensor, slice_input_tensor, sp_pad_and_slice
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (
     Qwen2VLCausalLMOutputWithLogProbs,
@@ -540,7 +540,7 @@ class VisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_kernel()
+        attention_interface = attention_op()
 
         if is_flash_attention_requested(self.config):
             # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -706,7 +706,7 @@ class Qwen2VLAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -1622,9 +1622,9 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen2VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @auto_docstring

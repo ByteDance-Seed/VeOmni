@@ -32,7 +32,7 @@ placeholder `__init__.py` files must not be copied as registration examples.
   - Use this package as the source of truth for registry wiring.
 
 - **Text LLM (dense)** — `veomni/models_kernel/transformers/qwen3/`, `veomni/models_kernel/transformers/llama/`, `veomni/models_kernel/transformers/qwen2/`, `veomni/models_kernel/transformers/seed_oss/`
-  - `<m>_gpu_patch_gen_config.py` — kernel-aware SP and fused-CE patches. Llama is the minimal reference for instance-local RMSNorm, MLP, RoPE, attention, and loss `VeomniKernel` handles.
+  - `<m>_gpu_patch_gen_config.py` — kernel-aware SP and fused-CE patches. Llama is the minimal reference for instance-local RMSNorm, MLP, RoPE, attention, and loss `VeomniOp` handles.
 - **Text LLM with NPU patchgen** — `veomni/models_kernel/transformers/seed_oss/`
   - Sibling configs produce separate `generated/*_{gpu,npu}.py` outputs.
 - **MoE** — `veomni/models_kernel/transformers/qwen3_moe/`
@@ -970,7 +970,7 @@ Extra e2e gotchas:
   test calls the registries directly in the wrong order. Confirmed on
   qwen2_5_omni / qwen3_omni_moe.
 - **A selected implementation is unavailable on NPU CI** —
-  `VeomniKernel` resolves the exact `(kernel, variant, implementation)` row and
+  `VeomniOp` resolves the exact `(op, variant, implementation)` row and
   fails when its device requirement is not satisfied. Pin the affected model
   to a registered NPU or eager implementation through
   `_NPU_PER_MODEL_OVERRIDES` in `tests/tools/training_utils.py`:

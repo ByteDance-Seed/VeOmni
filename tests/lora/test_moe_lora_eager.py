@@ -212,9 +212,9 @@ def test_layout_validate_and_wrap(toy_dir: str, mode: str):
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
-def test_wrapper_selects_kernel_impl(mode: str):
-    """Wrapper constructs ``moe_experts_lora`` from kernels ``moe_implementation``."""
-    from veomni.kernels.config import get_kernels_config, set_kernels_config
+def test_wrapper_selects_op_impl(mode: str):
+    """Wrapper constructs ``moe_experts_lora`` from the ops config's ``moe_implementation``."""
+    from veomni.ops.config import get_ops_config, set_ops_config
 
     model, lora_cfg = _select_yaml_then_build("qwen3_moe_toy")
     patterns = lora_cfg["target_parameters"]
@@ -228,13 +228,13 @@ def test_wrapper_selects_kernel_impl(mode: str):
         freeze_base_model=True,
     )
     wrapper_e = model.get_submodule(sample_fqn)
-    assert wrapper_e.veomni_moe_lora.kernel == "moe_experts_lora"
+    assert wrapper_e.veomni_moe_lora.op == "moe_experts_lora"
     assert wrapper_e.veomni_moe_lora.variant == mode
     assert wrapper_e.veomni_moe_lora.impl == "eager"
 
     if not IS_CUDA_AVAILABLE:
         return
-    saved_cfg = get_kernels_config()
+    saved_cfg = get_ops_config()
     try:
         torch.manual_seed(0)
         with warnings.catch_warnings():
@@ -253,7 +253,7 @@ def test_wrapper_selects_kernel_impl(mode: str):
         wrapper_f = model_f.get_submodule(fqn_f)
         assert wrapper_f.veomni_moe_lora.impl == "fused_triton"
     finally:
-        set_kernels_config(saved_cfg)
+        set_ops_config(saved_cfg)
 
 
 @pytest.mark.parametrize("mode", _MODE_CASES)

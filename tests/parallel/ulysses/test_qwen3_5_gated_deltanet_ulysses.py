@@ -39,9 +39,9 @@ _PATCHED_MODULE = "veomni.models_kernel.transformers.qwen3_5.generated.patched_m
 
 
 def _install_fla_kernel_config() -> None:
-    from veomni.kernels.config import set_kernels_config
+    from veomni.ops.config import set_ops_config
 
-    set_kernels_config(
+    set_ops_config(
         SimpleNamespace(
             rms_norm_gated_implementation="fla",
             causal_conv1d_implementation="fla",
@@ -53,14 +53,14 @@ def _install_fla_kernel_config() -> None:
 @pytest.fixture(scope="module", autouse=True)
 def _configured_qwen3_5_kernels():
     """Install the FLA selections used by directly constructed test layers."""
-    from veomni.kernels.config import get_kernels_config, set_kernels_config
+    from veomni.ops.config import get_ops_config, set_ops_config
 
-    previous = get_kernels_config()
+    previous = get_ops_config()
     _install_fla_kernel_config()
     try:
         yield
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def _set_deterministic(seed=42):

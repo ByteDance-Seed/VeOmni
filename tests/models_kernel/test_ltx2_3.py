@@ -23,20 +23,20 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from tests.kernels.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
-from tests.models_kernel.compare import eager_kernels_config
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from tests.models_kernel.compare import eager_ops_config
+from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
-def _call_rms(x: torch.Tensor, weight: torch.Tensor | None, kernels: SimpleNamespace | None = None):
+def _call_rms(x: torch.Tensor, weight: torch.Tensor | None, ops: SimpleNamespace | None = None):
     from veomni.models_kernel.diffusers.ltx2_3.ltx_core.utils import rms_norm
 
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return rms_norm(x, weight=weight, eps=1e-6)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_ltx2_3_rms_norm_matches_official():
@@ -93,7 +93,7 @@ def test_ltx_core_rebinds_away_from_another_copy(tmp_path):
         bound_utils = importlib.import_module("ltx_core.utils")
         package_utils = importlib.import_module("veomni.models_kernel.diffusers.ltx2_3.ltx_core.utils")
         assert bound_utils.__file__ == package_utils.__file__
-        assert "VeomniKernel" in bound_utils.rms_norm.__doc__
+        assert "VeomniOp" in bound_utils.rms_norm.__doc__
         assert not hasattr(bound_utils, "MARKER")
     finally:
         sys.path[:] = saved_path

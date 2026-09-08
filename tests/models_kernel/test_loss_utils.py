@@ -26,9 +26,9 @@ from torch import Tensor
 from transformers.loss.loss_utils import fixed_cross_entropy
 
 import veomni.models_kernel.loss_utils.cross_entropy_loss as loss_utils
-from tests.kernels.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
-from veomni.kernels import VeomniKernel
+from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
+from veomni.ops import VeomniOp
 
 
 IGNORE_INDEX = -100
@@ -36,8 +36,8 @@ VOCAB = 16
 HIDDEN = 8
 
 
-class _RecordingKernel:
-    def __init__(self, inner: VeomniKernel) -> None:
+class _RecordingOp:
+    def __init__(self, inner: VeomniOp) -> None:
         self.inner = inner
         self.labels: Tensor | None = None
         self.kwargs: dict | None = None
@@ -81,19 +81,19 @@ def test_packed_shift_labels_match_hf_loss_and_grads(monkeypatch):
 
     hidden_o = hidden.detach().clone().requires_grad_(True)
     weight_o = weight.detach().clone().requires_grad_(True)
-    kernel = _RecordingKernel(VeomniKernel("cross_entropy_loss", "standard", "eager"))
+    op = _RecordingOp(VeomniOp("cross_entropy_loss", "standard", "eager"))
     loss, _logits, _aux = ForCausalLMLoss(
         hidden_states=hidden_o,
         weights=weight_o,
         labels=_labels,
         shift_labels=packed_shift,
         ignore_index=IGNORE_INDEX,
-        kernel=kernel,
+        op=op,
     )
-    assert kernel.kwargs is not None
-    assert "shift_labels" not in kernel.kwargs
-    assert "loss_reduction_group" not in kernel.kwargs
-    torch.testing.assert_close(kernel.labels, packed_shift.reshape(-1))
+    assert op.kwargs is not None
+    assert "shift_labels" not in op.kwargs
+    assert "loss_reduction_group" not in op.kwargs
+    torch.testing.assert_close(op.labels, packed_shift.reshape(-1))
     torch.testing.assert_close(loss, expected, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     loss.backward()
@@ -127,16 +127,16 @@ def test_shift_labels_win_when_sp_enabled(monkeypatch):
 
     hidden_o = hidden.detach().clone().requires_grad_(True)
     weight_o = weight.detach().clone().requires_grad_(True)
-    kernel = _RecordingKernel(VeomniKernel("cross_entropy_loss", "standard", "eager"))
+    op = _RecordingOp(VeomniOp("cross_entropy_loss", "standard", "eager"))
     loss, _logits, _aux = ForCausalLMLoss(
         hidden_states=hidden_o,
         weights=weight_o,
         labels=labels,
         shift_labels=packed_shift,
         ignore_index=IGNORE_INDEX,
-        kernel=kernel,
+        op=op,
     )
-    torch.testing.assert_close(kernel.labels, packed_shift.reshape(-1))
+    torch.testing.assert_close(op.labels, packed_shift.reshape(-1))
     assert recorded["num_valid_tokens"] == int((packed_shift != IGNORE_INDEX).sum())
     assert recorded["num_valid_tokens"] != int((labels != IGNORE_INDEX).sum())
     assert recorded["group"] is None
@@ -163,7 +163,7 @@ def test_explicit_reduction_group_without_sp(monkeypatch):
     _labels, _naive_shift, packed_shift = _packed_targets()
     hidden = torch.randn(1, 6, HIDDEN, dtype=torch.float32)
     weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float32)
-    kernel = _RecordingKernel(VeomniKernel("cross_entropy_loss", "standard", "eager"))
+    op = _RecordingOp(VeomniOp("cross_entropy_loss", "standard", "eager"))
 
     ForCausalLMLoss(
         hidden_states=hidden,
@@ -171,13 +171,13 @@ def test_explicit_reduction_group_without_sp(monkeypatch):
         labels=None,
         shift_labels=packed_shift,
         ignore_index=IGNORE_INDEX,
-        kernel=kernel,
+        op=op,
         loss_reduction_group=sentinel_group,
     )
     assert recorded["group"] is sentinel_group
     assert recorded["num_valid_tokens"] == int((packed_shift != IGNORE_INDEX).sum())
-    assert kernel.kwargs is not None
-    assert "loss_reduction_group" not in kernel.kwargs
+    assert op.kwargs is not None
+    assert "loss_reduction_group" not in op.kwargs
 
 
 def test_no_reduce_when_sp_off_and_group_missing(monkeypatch):
@@ -191,15 +191,15 @@ def test_no_reduce_when_sp_off_and_group_missing(monkeypatch):
     labels, naive_shift, _packed_shift = _packed_targets()
     hidden = torch.randn(1, 6, HIDDEN, dtype=torch.float32)
     weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float32)
-    kernel = _RecordingKernel(VeomniKernel("cross_entropy_loss", "standard", "eager"))
+    op = _RecordingOp(VeomniOp("cross_entropy_loss", "standard", "eager"))
     ForCausalLMLoss(
         hidden_states=hidden,
         weights=weight,
         labels=labels,
         ignore_index=IGNORE_INDEX,
-        kernel=kernel,
+        op=op,
     )
-    torch.testing.assert_close(kernel.labels, naive_shift.reshape(-1))
+    torch.testing.assert_close(op.labels, naive_shift.reshape(-1))
 
 
 def test_sp_without_shift_labels_uses_collator_labels(monkeypatch):
@@ -209,15 +209,15 @@ def test_sp_without_shift_labels_uses_collator_labels(monkeypatch):
     _labels, naive_shift, _packed_shift = _packed_targets()
     hidden = torch.randn(1, 6, HIDDEN, dtype=torch.float32)
     weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float32)
-    kernel = _RecordingKernel(VeomniKernel("cross_entropy_loss", "standard", "eager"))
+    op = _RecordingOp(VeomniOp("cross_entropy_loss", "standard", "eager"))
     ForCausalLMLoss(
         hidden_states=hidden,
         weights=weight,
         labels=naive_shift,
         ignore_index=IGNORE_INDEX,
-        kernel=kernel,
+        op=op,
     )
-    torch.testing.assert_close(kernel.labels, naive_shift.reshape(-1))
+    torch.testing.assert_close(op.labels, naive_shift.reshape(-1))
 
 
 def test_causal_logits_path_matches_hf_and_returns_flattened_logits(monkeypatch):
@@ -231,7 +231,7 @@ def test_causal_logits_path_matches_hf_and_returns_flattened_logits(monkeypatch)
         logits=logits,
         labels=labels,
         vocab_size=VOCAB,
-        kernel=VeomniKernel("cross_entropy_loss", "standard", "eager"),
+        op=VeomniOp("cross_entropy_loss", "standard", "eager"),
     )
 
     expected = fixed_cross_entropy(logits.float().view(-1, VOCAB), shifted.view(-1))
@@ -254,9 +254,9 @@ def test_causal_logprobs_dispatch_returns_aux_without_calling_ce(monkeypatch):
         seen["kwargs"] = kwargs
         return expected_log_probs, expected_entropy
 
-    class FailKernel:
+    class FailOp:
         def __call__(self, *_args, **_kwargs):
-            raise AssertionError("plain CE kernel must not run on return_log_probs=True")
+            raise AssertionError("plain CE op must not run on return_log_probs=True")
 
     monkeypatch.setattr(loss_utils, "chunk_logprobs_function", fake_chunk_logprobs)
     loss, logits, aux = ForCausalLMLoss(
@@ -266,7 +266,7 @@ def test_causal_logprobs_dispatch_returns_aux_without_calling_ce(monkeypatch):
         return_log_probs=True,
         temperature=0.7,
         chunk_size=2,
-        kernel=FailKernel(),
+        op=FailOp(),
     )
 
     assert loss is None and logits is None
@@ -300,7 +300,7 @@ def test_seqcls_logits_path_matches_hf(monkeypatch):
         logits=logits,
         labels=labels,
         num_labels=5,
-        kernel=VeomniKernel("cross_entropy_loss", "standard", "eager"),
+        op=VeomniOp("cross_entropy_loss", "standard", "eager"),
     )
 
     expected = fixed_cross_entropy(logits.float().view(-1, 5), labels.view(-1))
@@ -327,7 +327,7 @@ def test_seqcls_hidden_weight_path_matches_hf_and_does_not_materialize_output_lo
         num_labels=5,
         hidden_states=hidden,
         weights=weight,
-        kernel=VeomniKernel("cross_entropy_loss", "standard", impl),
+        op=VeomniOp("cross_entropy_loss", "standard", impl),
     )
     loss.backward()
 
@@ -344,7 +344,7 @@ def test_seqcls_prefers_fused_inputs_and_preserves_caller_logits(monkeypatch):
     hidden = torch.randn(1, 3, HIDDEN)
     weight = torch.randn(5, HIDDEN)
     labels = torch.tensor([[IGNORE_INDEX, 1, 2]])
-    kernel = _RecordingKernel(VeomniKernel("cross_entropy_loss", "standard", "eager"))
+    op = _RecordingOp(VeomniOp("cross_entropy_loss", "standard", "eager"))
 
     loss, out_logits, _aux = ForSequenceClassificationLoss(
         logits=logits,
@@ -352,7 +352,7 @@ def test_seqcls_prefers_fused_inputs_and_preserves_caller_logits(monkeypatch):
         num_labels=5,
         hidden_states=hidden,
         weights=weight,
-        kernel=kernel,
+        op=op,
     )
 
     expected = fixed_cross_entropy(F.linear(hidden.view(-1, HIDDEN), weight), labels.view(-1))
@@ -373,7 +373,7 @@ def test_seqcls_sp_reduces_with_valid_target_count(monkeypatch):
         logits=torch.randn(1, 4, 3),
         labels=torch.tensor([[0, IGNORE_INDEX, 1, IGNORE_INDEX]]),
         num_labels=3,
-        kernel=VeomniKernel("cross_entropy_loss", "standard", "eager"),
+        op=VeomniOp("cross_entropy_loss", "standard", "eager"),
     )
     assert seen["num_valid_tokens"] == 2
 

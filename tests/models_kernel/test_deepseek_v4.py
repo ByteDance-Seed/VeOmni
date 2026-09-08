@@ -27,10 +27,10 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCa
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_config() -> DeepseekV4Config:
@@ -77,20 +77,20 @@ def _dsv4_cls():
     return DeepseekV4ForCausalLM
 
 
-def _build_ours(config: DeepseekV4Config, kernels: SimpleNamespace | None = None):
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+def _build_ours(config: DeepseekV4Config, ops: SimpleNamespace | None = None):
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return _dsv4_cls()(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_deepseek_v4_constructs_local_kernels():
     model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
-    assert isinstance(model.veomni_lb, VeomniKernel)
+    assert isinstance(model.veomni_lb, VeomniOp)
     assert model.config.layer_types == [
         "heavily_compressed_attention",
         "heavily_compressed_attention",
@@ -100,15 +100,15 @@ def test_deepseek_v4_constructs_local_kernels():
     assert model.config.mlp_layer_types == ["hash_moe", "hash_moe", "hash_moe", "moe"]
     layer = model.model.layers[0]
     assert layer.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert layer.attn_hc.veomni_mhc_pre.kernel == "mhc"
+    assert layer.attn_hc.veomni_mhc_pre.op == "mhc"
     assert layer.veomni_mhc_post.variant == "post"
-    assert layer.self_attn.veomni_dsa_attention.kernel == "dsa_attention"
+    assert layer.self_attn.veomni_dsa_attention.op == "dsa_attention"
     assert layer.self_attn.veomni_dsa_attention.variant == "deepseek_v4"
     csa = model.model.layers[3].self_attn.compressor
-    assert csa.indexer.veomni_dsa_indexer.kernel == "dsa_indexer"
+    assert csa.indexer.veomni_dsa_indexer.op == "dsa_indexer"
     assert csa.indexer.veomni_dsa_indexer.variant == "deepseek_v4"
-    assert layer.mlp.experts.veomni_moe.kernel == "moe_experts"
-    assert layer.mlp.shared_experts.veomni_swiglu_mlp.kernel == "swiglu_mlp"
+    assert layer.mlp.experts.veomni_moe.op == "moe_experts"
+    assert layer.mlp.shared_experts.veomni_swiglu_mlp.op == "swiglu_mlp"
     assert layer.mlp.shared_experts.limit == model.config.swiglu_limit
     assert model.model.hc_head.veomni_mhc_head.variant == "head"
 
@@ -129,15 +129,15 @@ def test_deepseek_v4_shared_mlp_passes_swiglu_limit():
 
 
 def test_deepseek_v4_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_kernels_config())
-    chunk_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_config(), eager_ops_config())
+    chunk_cfg = eager_ops_config()
     chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
     chunk = _build_ours(_tiny_config(), chunk_cfg)
 
     assert eager.veomni_ce.impl == "eager"
     assert chunk.veomni_ce.impl == "chunk_loss"
 
-    set_kernels_config(chunk_cfg)
+    set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
     assert eager.model.layers[0].self_attn.veomni_dsa_attention.impl == "eager"
 

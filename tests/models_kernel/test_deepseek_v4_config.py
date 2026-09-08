@@ -23,9 +23,9 @@ from pathlib import Path
 import pytest
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
 
-from tests.models_kernel.compare import eager_kernels_config
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from tests.models_kernel.compare import eager_ops_config
 from veomni.models_kernel.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _config_asking_for_the_loss(coef: float = 1.0, **overrides) -> DeepseekV4Config:
@@ -40,15 +40,15 @@ def _config_asking_for_the_loss(coef: float = 1.0, **overrides) -> DeepseekV4Con
 
 @contextmanager
 def _kernels_config_installed(**overrides):
-    previous = get_kernels_config()
-    installed = eager_kernels_config()
+    previous = get_ops_config()
+    installed = eager_ops_config()
     for key, value in overrides.items():
         setattr(installed, key, value)
-    set_kernels_config(installed)
+    set_ops_config(installed)
     try:
         yield installed
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_the_two_fields_are_declared_on_the_model_config():

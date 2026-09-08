@@ -134,7 +134,7 @@ Root config — assembles `model`, `data`, and `train`.
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
-| ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
+| ops_implementation | `OpsImplementationConfig` | — | Attention / MoE op configuration. |
 
 ### OpsImplementationConfig
 
@@ -169,7 +169,7 @@ NPU validation runs at two times:
   `swiglu_mlp`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
   `load_balancing_loss`). Errors fire
   immediately with a model-agnostic allow-list.
-- **Model-build time** (instance-local `VeomniKernel` resolution via the
+- **Model-build time** (instance-local `VeomniOp` resolution via the
   registry row's hardware requirement) for Qwen3.5-only ops (`rms_norm_gated`,
   `causal_conv1d`, `chunk_gated_delta_rule`). Validating these at config
   parse would force every NPU user to override them even when training

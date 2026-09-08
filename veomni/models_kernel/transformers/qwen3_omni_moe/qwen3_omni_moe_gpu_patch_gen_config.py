@@ -31,7 +31,7 @@ Covers the thinker training path (text + vision + audio + MoE):
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_omni_moe/generated --diff
 
-Thinker MoE, CE, and load-balancing loss call local VeomniKernel.
+Thinker MoE, CE, and load-balancing loss call local VeomniOp.
 """
 
 import copy
@@ -68,10 +68,10 @@ from veomni.distributed.sequence_parallel import (
     unpad_tensor,
 )
 from veomni.distributed.sequence_parallel.ulysses import _Gather
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, empty_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.op_utils import attention_op, empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -108,10 +108,10 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_Gather"])
 config.add_import("veomni.models_kernel.utils.attention_utils", names=["VARLEN_ATTENTION_TYPES"])
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "empty_bias", "resolve_op_impl", "resolve_moe_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -565,7 +565,7 @@ def qwen3_omni_moe_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_kernel()
+    attention_interface = attention_op()
 
     # --- Patch.1 ---
     if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1072,10 +1072,10 @@ def qwen3_omni_moe_thinker_text_deepstack_process_patched(
 # ================================================================
 @config.replace_class(
     "Qwen3OmniMoeThinkerTextExperts",
-    description="Always call moe_experts VeomniKernel on v5 gate_up_proj weights",
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
-    """Collection of expert weights stored as 3D tensors with VeomniKernel dispatch."""
+    """Collection of expert weights stored as 3D tensors with VeomniOp dispatch."""
 
     def __init__(self, config):
         super().__init__()
@@ -1085,7 +1085,7 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_moe = VeomniKernel("moe_experts", "standard", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
         self,
@@ -1108,7 +1108,7 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
 
 @config.override_method(
     "Qwen3OmniMoeThinkerForConditionalGeneration.__init__",
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def qwen3_omni_moe_thinker_init_patched(self, config):
     super().__init__(config)
@@ -1122,15 +1122,15 @@ def qwen3_omni_moe_thinker_init_patched(self, config):
     self.num_experts = config.text_config.num_experts
     self.num_experts_per_tok = config.text_config.num_experts_per_tok
     self.router_aux_loss_coef = config.text_config.router_aux_loss_coef
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
-    self.veomni_lb = VeomniKernel(
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_kernel_impl("load_balancing_loss_implementation"),
+        resolve_op_impl("load_balancing_loss_implementation"),
     )
-    self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
+    self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()
 
 
@@ -1710,7 +1710,7 @@ def qwen3_omni_moe_get_parallel_plan_patched(self):
 
 @config.override_method(
     "Qwen3OmniMoeAudioAttention.forward",
-    description="Dispatch audio attention through the interned VeomniKernel",
+    description="Dispatch audio attention through the interned VeomniOp",
 )
 def qwen3_omni_moe_audio_attention_forward_patched(
     self,
@@ -1728,7 +1728,7 @@ def qwen3_omni_moe_audio_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_kernel()
+    attention_interface = attention_op()
 
     if is_flash_attention_requested(self.config):
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -1773,7 +1773,7 @@ def qwen3_omni_moe_audio_attention_forward_patched(
 
 @config.override_method(
     "Qwen3OmniMoeThinkerTextAttention.forward",
-    description="Dispatch thinker attention through the interned VeomniKernel",
+    description="Dispatch thinker attention through the interned VeomniOp",
 )
 def qwen3_omni_moe_thinker_text_attention_forward_patched(
     self,
@@ -1796,7 +1796,7 @@ def qwen3_omni_moe_thinker_text_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_kernel()(
+    attn_output, attn_weights = attention_op()(
         self,
         query_states,
         key_states,

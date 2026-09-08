@@ -12,13 +12,13 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Cross-model kernel construction and attention helpers."""
+"""Cross-model op construction and attention helpers."""
 
-from .kernel_utils import linear_bias, resolve_kernel_impl, resolve_moe_impl
+from .op_utils import linear_bias, resolve_moe_impl, resolve_op_impl
 
 
 __all__ = [
     "linear_bias",
-    "resolve_kernel_impl",
+    "resolve_op_impl",
     "resolve_moe_impl",
 ]

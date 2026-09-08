@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE NPU VeomniKernel replacements.
+Patch configuration for Qwen3-VL-MoE NPU VeomniOp replacements.
 
 Inherits every GPU patch from `qwen3_vl_moe_gpu_patch_gen_config`.
 
@@ -54,7 +54,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
     target_file="patched_modeling_qwen3_vl_moe_npu.py",
-    description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniKernel NPU replacements",
+    description="Qwen3-VL-MoE with VeOmni v5 patches and VeomniOp NPU replacements",
 )
 
 # Mirror additional imports + post-import helpers from the GPU config so the
@@ -77,13 +77,13 @@ config.override_method(
     "Qwen3VLMoeTextRMSNorm.__init__",
     replacement=qwen3_vl_rmsnorm_init_patched,
     name_map=_NAME_MAP,
-    description="Construct a local rms_norm VeomniKernel",
+    description="Construct a local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3VLMoeTextRMSNorm.forward",
     replacement=qwen3_vl_rmsnorm_forward_patched,
     name_map=_NAME_MAP,
-    description="Always call the local rms_norm VeomniKernel",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",
@@ -167,17 +167,17 @@ config.override_method(
 config.replace_class(
     "Qwen3VLMoeTextExperts",
     replacement=PatchedQwen3VLMoeTextExperts,
-    description="Drop @use_experts_implementation and always call moe_experts VeomniKernel",
+    description="Drop @use_experts_implementation and always call moe_experts VeomniOp",
 )
 config.override_method(
     "Qwen3VLMoeForConditionalGeneration.__init__",
     replacement=qwen3_vl_moe_for_conditional_generation_init_patched,
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "Qwen3VLMoeForConditionalGeneration.forward",
     replacement=qwen3_vl_moe_for_conditional_generation_forward_patched,
-    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "Qwen3VLMoeForConditionalGeneration.get_parallel_plan",
@@ -187,10 +187,10 @@ config.override_method(
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniKernel",
+    description="Always call rope full VeomniOp",
 )
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision_patched,
-    description="Always call rope_vision full VeomniKernel",
+    description="Always call rope_vision full VeomniOp",
 )

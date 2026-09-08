@@ -12,13 +12,13 @@
 # See the License for the specific language governing limitations
 # under the License.
 """
-Patch configuration for DeepseekV3 NPU VeomniKernel replacements.
+Patch configuration for DeepseekV3 NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.deepseek_v3.deepseek_v3_npu_patch_gen_config -o veomni/models_kernel/transformers/deepseek_v3/generated --diff
 
-Reuses the GPU structural patches. ``VeomniKernel`` reads NPU impl names from
-the installed kernel config. No local ``triton_bmm`` on NPU.
+Reuses the GPU structural patches. ``VeomniOp`` reads NPU impl names from
+the installed ops config. No local ``triton_bmm`` on NPU.
 """
 
 from veomni.models_kernel.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config import (
@@ -44,7 +44,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.deepseek_v3.modeling_deepseek_v3",
     target_file="patched_modeling_deepseek_v3_npu.py",
-    description="DeepseekV3 with VeomniKernel NPU replacements",
+    description="DeepseekV3 with VeomniOp NPU replacements",
 )
 
 config.additional_imports.extend(gpu_config.additional_imports)
@@ -55,12 +55,12 @@ config.drop_imported_names.update(gpu_config.drop_imported_names)
 config.override_method(
     "DeepseekV3RMSNorm.__init__",
     replacement=deepseek_v3_rmsnorm_init_patched,
-    description="Construct a local rms_norm VeomniKernel",
+    description="Construct a local rms_norm VeomniOp",
 )
 config.override_method(
     "DeepseekV3RMSNorm.forward",
     replacement=deepseek_v3_rmsnorm_forward_patched,
-    description="Always call the local rms_norm VeomniKernel",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "DeepseekV3RotaryEmbedding.forward",
@@ -70,22 +70,22 @@ config.override_method(
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniKernel",
+    description="Always call rope full VeomniOp",
 )
 config.override_method(
     "DeepseekV3MLP.__init__",
     replacement=deepseek_v3_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniKernel",
+    description="Construct a local swiglu_mlp VeomniOp",
 )
 config.override_method(
     "DeepseekV3MLP.forward",
     replacement=deepseek_v3_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniKernel",
+    description="Always call the local swiglu_mlp VeomniOp",
 )
 config.replace_class(
     "DeepseekV3NaiveMoe",
     replacement=PatchedDeepseekV3NaiveMoe,
-    description="Always call moe_experts VeomniKernel on v5 gate_up_proj weights",
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 config.override_method(
     "DeepseekV3TopkRouter.forward",
@@ -100,12 +100,12 @@ config.override_method(
 config.override_method(
     "DeepseekV3ForCausalLM.__init__",
     replacement=deepseek_v3_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 config.override_method(
     "DeepseekV3ForCausalLM.forward",
     replacement=deepseek_v3_forcausallm_forward_patched,
-    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 config.override_method(
     "DeepseekV3ForCausalLM.get_parallel_plan",

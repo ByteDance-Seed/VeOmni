@@ -27,10 +27,10 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCa
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_config() -> DeepseekV3Config:
@@ -78,38 +78,38 @@ def _dsv3_cls():
     return DeepseekV3ForCausalLM
 
 
-def _build_ours(config: DeepseekV3Config, kernels: SimpleNamespace | None = None):
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+def _build_ours(config: DeepseekV3Config, ops: SimpleNamespace | None = None):
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return _dsv3_cls()(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_deepseek_v3_constructs_local_kernels():
     model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
     dense = model.model.layers[0]
     assert dense.input_layernorm.veomni_rms_norm.impl == "eager"
-    assert dense.mlp.veomni_swiglu_mlp.kernel == "swiglu_mlp"
+    assert dense.mlp.veomni_swiglu_mlp.op == "swiglu_mlp"
     moe = model.model.layers[3]
-    assert moe.mlp.experts.veomni_moe.kernel == "moe_experts"
+    assert moe.mlp.experts.veomni_moe.op == "moe_experts"
     assert moe.mlp.experts.veomni_moe.impl == "eager"
-    assert moe.mlp.shared_experts.veomni_swiglu_mlp.kernel == "swiglu_mlp"
+    assert moe.mlp.shared_experts.veomni_swiglu_mlp.op == "swiglu_mlp"
 
 
 def test_deepseek_v3_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_kernels_config())
-    chunk_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_config(), eager_ops_config())
+    chunk_cfg = eager_ops_config()
     chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
     chunk = _build_ours(_tiny_config(), chunk_cfg)
 
     assert eager.veomni_ce.impl == "eager"
     assert chunk.veomni_ce.impl == "chunk_loss"
 
-    set_kernels_config(chunk_cfg)
+    set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
     assert eager.model.layers[3].mlp.experts.veomni_moe.impl == "eager"
 

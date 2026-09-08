@@ -9,7 +9,7 @@ Transformers v5 introduced expert-dispatch integration points (`use_experts_impl
 
 For VeOmni's qwen3_moe path, we use a simpler approach:
 - patch experts behavior in `models_kernel` patchgen-generated modeling;
-- construct an instance-local `VeomniKernel("moe_experts", "standard", impl)`;
+- construct an instance-local `VeomniOp("moe_experts", "standard", impl)`;
 - always call that handle from the patched expert forward. The eager reference
   is itself a registry row, so no separate module-global gate is needed.
 
@@ -157,7 +157,7 @@ The script auto-detects the input format (fused `gate_up_proj` or legacy separat
 VeOmni models construct the entrypoint with:
 
 ```python
-moe = VeomniKernel("moe_experts", "standard", implementation)
+moe = VeomniOp("moe_experts", "standard", implementation)
 ```
 
 Current signature supports both split and fused gate/up weights:

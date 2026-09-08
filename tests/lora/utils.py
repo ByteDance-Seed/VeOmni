@@ -129,10 +129,10 @@ def full_eager_ops() -> OpsImplementationConfig:
 def fused_triton_moe_ops() -> OpsImplementationConfig:
     """Eager everywhere *except* MoE, which uses the Triton group-gemm backend.
 
-    Selecting ``moe_implementation="fused_triton"`` installs the kernels config that
+    Selecting ``moe_implementation="fused_triton"`` installs the ops config that
     ``LoraSharedExperts`` / ``LoraIndependentExperts`` read via
     ``resolve_moe_impl``-style lookup to construct
-    ``VeomniKernel("moe_experts_lora", variant, "fused_triton")``.
+    ``VeomniOp("moe_experts_lora", variant, "fused_triton")``.
     """
     return OpsImplementationConfig(
         attn_implementation="eager",
@@ -148,8 +148,8 @@ def fused_triton_moe_ops() -> OpsImplementationConfig:
 def fused_npu_moe_ops() -> OpsImplementationConfig:
     """Eager everywhere *except* MoE, which uses the Ascend NPU group-gemm backend.
 
-    Selecting ``moe_implementation="fused_npu"`` installs the kernels config that
-    LoRA wrappers read to construct ``VeomniKernel("moe_experts_lora", variant, "fused_npu")``.
+    Selecting ``moe_implementation="fused_npu"`` installs the ops config that
+    LoRA wrappers read to construct ``VeomniOp("moe_experts_lora", variant, "fused_npu")``.
     """
     return OpsImplementationConfig(
         attn_implementation="eager",

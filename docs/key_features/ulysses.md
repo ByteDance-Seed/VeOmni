@@ -188,7 +188,7 @@ After the collator, the model receives:
 
 For standard softmax attention layers (e.g., `Qwen3_5Attention`), Ulysses SP is handled
 **internally** by `flash_attention_forward` in
-`veomni/kernels/_kernels/attention/standard/flash.py`.
+`veomni/ops/kernels/attention/standard/flash.py`.
 
 The flow through a softmax attention layer:
 
@@ -198,7 +198,7 @@ hidden_states [B, S_local, D]           # already local from collator
   -> apply_rotary_pos_emb(q, k, cos, sin)  # RoPE on local-length q/k
   -> flash_attention_forward:
        gather_seq_scatter_heads(q,k,v)   # [B, S_full, local_heads, head_dim]
-       flash_attention_kernel(...)       # attention on full sequence, local heads
+       flash_attention_op(...)       # attention on full sequence, local heads
        gather_heads_scatter_seq(output)  # [B, S_local, num_heads, head_dim]
   -> output projection                   # [B, S_local, D]
 ```

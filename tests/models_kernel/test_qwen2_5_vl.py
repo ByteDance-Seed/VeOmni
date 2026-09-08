@@ -34,10 +34,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 IMAGE_TOKEN_ID = 120
@@ -85,17 +85,17 @@ def _tiny_config() -> Qwen2_5_VLConfig:
     )
 
 
-def _build_ours(config: Qwen2_5_VLConfig, kernels: SimpleNamespace | None = None):
+def _build_ours(config: Qwen2_5_VLConfig, ops: SimpleNamespace | None = None):
     from veomni.models_kernel.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
         Qwen2_5_VLForConditionalGeneration,
     )
 
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return Qwen2_5_VLForConditionalGeneration(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def _mask_kwargs(input_ids: torch.Tensor) -> dict:
@@ -131,20 +131,20 @@ def _image_inputs(config: Qwen2_5_VLConfig, input_ids: torch.Tensor) -> dict:
 
 def test_qwen2_5_vl_constructs_local_kernels():
     model = _build_ours(_tiny_config())
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
 
 
 def test_qwen2_5_vl_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_config(), eager_kernels_config())
-    chunk_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_config(), eager_ops_config())
+    chunk_cfg = eager_ops_config()
     chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
     chunk = _build_ours(_tiny_config(), chunk_cfg)
 
     assert eager.veomni_ce.impl == "eager"
     assert chunk.veomni_ce.impl == "chunk_loss"
 
-    set_kernels_config(chunk_cfg)
+    set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
 
 

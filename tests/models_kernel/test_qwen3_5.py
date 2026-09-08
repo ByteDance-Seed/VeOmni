@@ -36,10 +36,10 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, to
 
 from tests.models_kernel.compare import (
     assert_eager_matches_hf,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 IMAGE_TOKEN_ID = 120
@@ -112,24 +112,24 @@ def _qwen3_5_classes():
     return Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 
 
-def _build_causal(config: Qwen3_5TextConfig, kernels: SimpleNamespace | None = None):
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+def _build_causal(config: Qwen3_5TextConfig, ops: SimpleNamespace | None = None):
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         causal_cls, _ = _qwen3_5_classes()
         return causal_cls(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
-def _build_vlm(config: Qwen3_5Config, kernels: SimpleNamespace | None = None):
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+def _build_vlm(config: Qwen3_5Config, ops: SimpleNamespace | None = None):
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         _, vlm_cls = _qwen3_5_classes()
         return vlm_cls(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def _empty_cu_seq_lens() -> torch.Tensor:
@@ -185,7 +185,7 @@ def _image_inputs(config: Qwen3_5Config, input_ids: torch.Tensor) -> dict:
 
 def test_qwen3_5_constructs_local_kernels():
     model = _build_causal(_tiny_text_config(layer_types=["linear_attention", "full_attention"]))
-    assert isinstance(model.veomni_ce, VeomniKernel)
+    assert isinstance(model.veomni_ce, VeomniOp)
     assert model.veomni_ce.impl == "eager"
     layer0 = model.model.layers[0]
     assert layer0.input_layernorm.veomni_rms_norm.impl == "eager"
@@ -197,14 +197,14 @@ def test_qwen3_5_constructs_local_kernels():
 
 def test_qwen3_5_instances_keep_distinct_impls():
     eager = _build_causal(_tiny_text_config(layer_types=["full_attention", "full_attention"]))
-    chunk_cfg = eager_kernels_config()
+    chunk_cfg = eager_ops_config()
     chunk_cfg.cross_entropy_loss_implementation = "chunk_loss"
     chunk = _build_causal(_tiny_text_config(layer_types=["full_attention", "full_attention"]), chunk_cfg)
 
     assert eager.veomni_ce.impl == "eager"
     assert chunk.veomni_ce.impl == "chunk_loss"
 
-    set_kernels_config(chunk_cfg)
+    set_ops_config(chunk_cfg)
     assert eager.veomni_ce.impl == "eager"
 
 

@@ -20,10 +20,11 @@ from types import SimpleNamespace
 
 import torch
 
-from tests.kernels.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
+from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 
 
-def eager_kernels_config() -> SimpleNamespace:
+def eager_ops_config() -> SimpleNamespace:
+    """Return an all-eager ops selection for model parity tests."""
     return SimpleNamespace(
         attn_implementation="eager",
         cross_entropy_loss_implementation="eager",
@@ -47,7 +48,7 @@ def pin_eager_attn_implementation(model: torch.nn.Module) -> None:
 
     Composite VL/omni configs drop ``attn_implementation`` when nested
     configs go through ``to_dict()``, so HuggingFace defaults to ``sdpa``.
-    models_kernel consume reads kernels ``attn_implementation`` (eager in
+    models_kernel consume reads the ops config's ``attn_implementation`` (eager in
     these tests). Pin HF to the same impl before comparing.
     """
     configs: list[object] = []

@@ -86,7 +86,7 @@ from veomni.models_kernel import build_foundation_model
 model = build_foundation_model(
     config_path=args.model.config_path,
     weights_path=args.model.model_path,
-    kernels_implementation=args.model.ops_implementation,
+    ops_implementation=args.model.ops_implementation,
     # Add other optional keyword arguments as needed.
 )
 ```

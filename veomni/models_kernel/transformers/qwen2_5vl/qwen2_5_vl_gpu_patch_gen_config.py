@@ -51,9 +51,9 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
     unpad_tensor,
 )
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2_5_VLCausalLMOutputWithLogProbs
@@ -90,10 +90,10 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen2_5_VLCausalLMOutputWithLogProbs"],
 )
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "resolve_kernel_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "resolve_op_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -133,7 +133,7 @@ def qwen2_5_vl_vision_attention_forward_patched(
     key_states = key_states.transpose(0, 1).unsqueeze(0)
     value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-    attention_interface = attention_kernel()
+    attention_interface = attention_op()
 
     if is_flash_attention_requested(self.config):
         # --- Patch.1 ---
@@ -865,26 +865,26 @@ def qwen2_5_vl_get_position_id_func_patched(self):
 
 # ================================================================
 # Patch: Qwen2_5_VLForConditionalGeneration.__init__ + forward
-# Bind ForCausalLMLoss to a local VeomniKernel. Always call
+# Bind ForCausalLMLoss to a local VeomniOp. Always call
 # self.loss_function when labels are present.
 # ================================================================
 @config.override_method(
     "Qwen2_5_VLForConditionalGeneration.__init__",
-    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel",
+    description="Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp",
 )
 def qwen2_5_vl_for_conditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen2_5_VLModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
 
 
 @config.override_method(
     "Qwen2_5_VLForConditionalGeneration.forward",
-    description="Always call self.loss_function (ForCausalLMLoss + VeomniKernel)",
+    description="Always call self.loss_function (ForCausalLMLoss + VeomniOp)",
 )
 def qwen2_5_vl_for_conditional_generation_forward_patched(
     self,
@@ -1134,7 +1134,7 @@ def qwen2_5_vl_get_metadata_collate_func_patched(self):
 
 @config.override_method(
     "Qwen2_5_VLAttention.forward",
-    description="Dispatch attention through the interned VeomniKernel",
+    description="Dispatch attention through the interned VeomniOp",
 )
 def qwen2_5_vl_attention_forward_patched(
     self,
@@ -1166,7 +1166,7 @@ def qwen2_5_vl_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_kernel()(
+    attn_output, attn_weights = attention_op()(
         self,
         query_states,
         key_states,

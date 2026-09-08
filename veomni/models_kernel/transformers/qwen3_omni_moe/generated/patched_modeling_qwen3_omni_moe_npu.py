@@ -28,9 +28,9 @@
 #    - method_override: Qwen3OmniMoeThinkerTextModel._deepstack_process
 #      Handle visual_pos_masks=None by adding 0.0 so FSDP reduce-scatter stays in sync
 #    - class_replacement: Qwen3OmniMoeThinkerTextExperts
-#      Always call moe_experts VeomniKernel on v5 gate_up_proj weights
+#      Always call moe_experts VeomniOp on v5 gate_up_proj weights
 #    - method_override: Qwen3OmniMoeThinkerForConditionalGeneration.__init__
-#      Bind ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: Qwen3OmniMoeThinkerForConditionalGeneration.get_audio_features
 #      Simplify get_audio_features for VeOmni flat (len, mel) inputs — no feature_attention_mask
 #    - method_override: Qwen3OmniMoeThinkerForConditionalGeneration.get_position_id_func
@@ -52,9 +52,9 @@
 #    - method_override: Qwen3OmniMoeForConditionalGeneration.get_parallel_plan
 #      Register Qwen3-Omni-MoE thinker expert parallel plan for v5 generated modeling
 #    - method_override: Qwen3OmniMoeAudioAttention.forward
-#      Dispatch audio attention through the interned VeomniKernel
+#      Dispatch audio attention through the interned VeomniOp
 #    - method_override: Qwen3OmniMoeThinkerTextAttention.forward
-#      Dispatch thinker attention through the interned VeomniKernel
+#      Dispatch thinker attention through the interned VeomniOp
 #    - function_replacement: apply_rotary_pos_emb_vision
 #      Replace with the fusion operator on Ascend.
 #    - method_override: Qwen3OmniMoeThinkerTextRMSNorm.forward
@@ -121,10 +121,10 @@ from transformers.vision_utils import (
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice, unpad_tensor
 from veomni.distributed.sequence_parallel.ulysses import _Gather
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models_kernel.utils.attention_utils import VARLEN_ATTENTION_TYPES
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, empty_bias, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.op_utils import attention_op, empty_bias, resolve_moe_impl, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
 
@@ -667,7 +667,7 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_kernel()
+        attention_interface = attention_op()
 
         if is_flash_attention_requested(self.config):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -1175,7 +1175,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_kernel()
+        attention_interface = attention_op()
 
         # --- Patch.1 ---
         if self.config._attn_implementation in VARLEN_ATTENTION_TYPES:
@@ -1695,7 +1695,7 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(nn.Module):
 # ======================================================================
 # [PATCHED CLASS] Qwen3OmniMoeThinkerTextExperts
 # Original class replaced with: PatchedQwen3OmniMoeThinkerTextExperts
-# Reason: Always call moe_experts VeomniKernel on v5 gate_up_proj weights
+# Reason: Always call moe_experts VeomniOp on v5 gate_up_proj weights
 # Source: veomni.models_kernel.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_config
 # ======================================================================
 # ================================================================
@@ -1705,7 +1705,7 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(nn.Module):
 # stores it in the fused `[E, 2*I, H]` layout).
 # ================================================================
 class Qwen3OmniMoeThinkerTextExperts(nn.Module):
-    """Collection of expert weights stored as 3D tensors with VeomniKernel dispatch."""
+    """Collection of expert weights stored as 3D tensors with VeomniOp dispatch."""
 
     def __init__(self, config):
         super().__init__()
@@ -1715,7 +1715,7 @@ class Qwen3OmniMoeThinkerTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_moe = VeomniKernel("moe_experts", "standard", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_moe_impl())
 
     def forward(
         self,
@@ -1884,7 +1884,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -2311,15 +2311,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.num_experts = config.text_config.num_experts
         self.num_experts_per_tok = config.text_config.num_experts_per_tok
         self.router_aux_loss_coef = config.text_config.router_aux_loss_coef
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
-        self.veomni_lb = VeomniKernel(
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+        self.veomni_lb = VeomniOp(
             "load_balancing_loss",
             "standard",
-            resolve_kernel_impl("load_balancing_loss_implementation"),
+            resolve_op_impl("load_balancing_loss_implementation"),
         )
-        self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
+        self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
         self.post_init()
 
     def get_input_embeddings(self):

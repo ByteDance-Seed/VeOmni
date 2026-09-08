@@ -17,7 +17,7 @@ Patch configuration for Qwen3-Omni-Moe.
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_omni_moe.qwen3_omni_moe_npu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_omni_moe/generated --diff
 
-NPU keeps torch_npu fused rope/rmsnorm. MoE, CE, and load-balancing loss call local VeomniKernel.
+NPU keeps torch_npu fused rope/rmsnorm. MoE, CE, and load-balancing loss call local VeomniOp.
 """
 
 import torch

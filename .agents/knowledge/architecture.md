@@ -24,7 +24,7 @@ veomni/
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── registry.py     Import-time model/config/processor registries
 │   ├── checkpoint/     Weight loading, saving, and tensor conversion
-│   ├── transformers/   Model classes/configs with instance-local VeomniKernel handles
+│   ├── transformers/   Model classes/configs with instance-local VeomniOp handles
 │   ├── diffusers/      Diffusion model families
 │   └── loss_utils/     Model-facing CE, load-balancing, and chunked-loss policy
 ├── kernels/            Tensor-native unified kernel registry and implementations
@@ -113,17 +113,17 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Model Loading Flow
 
-1. `models_kernel.build_foundation_model()` installs the supplied kernel selection.
+1. `models_kernel.build_foundation_model()` installs the supplied ops selection.
 2. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`.
 3. Determine the model class via `MODELING_REGISTRY` (keyed by `model_type`); an unregistered model fails explicitly unless `MODELING_BACKEND=hf` selects the upstream class.
 4. Instantiate model on meta device (`init_empty_weights()`)
-5. Construct instance-local `VeomniKernel` handles from the installed selection.
+5. Construct instance-local `VeomniOp` handles from the installed selection.
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
 
 The public configuration field remains `model.ops_implementation`. Trainer and
 inference entry points pass it to the model builder as
-`kernels_implementation`; changing the config field would break existing CLI
+`ops_implementation`; changing the config field would break existing CLI
 and YAML inputs.
 
 ## Parallelization Flow
@@ -176,7 +176,7 @@ tests/
 | Change in | Test command |
 |-----------|-------------|
 | `veomni/models_kernel/` | `pytest tests/models_kernel/` |
-| `veomni/kernels/` | `pytest tests/kernels/` |
+| `veomni/ops/` | `pytest tests/ops/` |
 | `veomni/data/` | `pytest tests/data/` |
 | `veomni/distributed/` | `pytest tests/parallel/` |
 | `veomni/checkpoint/` | `pytest tests/checkpoints/` |

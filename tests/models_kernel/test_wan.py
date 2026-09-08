@@ -28,16 +28,16 @@ import torch
 
 from tests.models_kernel.compare import (
     assert_outputs_and_grads_match,
-    eager_kernels_config,
+    eager_ops_config,
 )
 from tests.models_kernel.refs.wan import WanConfig as RefWanConfig
 from tests.models_kernel.refs.wan import WanModel as RefWanModel
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
 from veomni.models_kernel.transformers.wan import fa3_fp8
 from veomni.models_kernel.transformers.wan import modeling_wan as wan_modeling
 from veomni.models_kernel.transformers.wan.config_wan import WanConfig
 from veomni.models_kernel.transformers.wan.fa3_fp8 import should_use_fa3_fp8
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
 def _tiny_kwargs() -> dict:
@@ -66,15 +66,15 @@ def _tiny_ref_config() -> RefWanConfig:
     return RefWanConfig(**_tiny_kwargs(), has_image_input="false")
 
 
-def _build_ours(config: WanConfig, kernels: SimpleNamespace | None = None):
+def _build_ours(config: WanConfig, ops: SimpleNamespace | None = None):
     from veomni.models_kernel.transformers.wan.modeling_wan import WanModel
 
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return WanModel(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def _wan_inputs(in_dim: int, text_len: int, text_dim: int) -> dict[str, torch.Tensor]:
@@ -86,10 +86,10 @@ def _wan_inputs(in_dim: int, text_len: int, text_dim: int) -> dict[str, torch.Te
 
 
 def test_wan_sage_constructs_veomni_sage_attention():
-    sage_cfg = eager_kernels_config()
+    sage_cfg = eager_ops_config()
     sage_cfg.attn_implementation = "sageattention"
     model = _build_ours(_tiny_ours_config(), sage_cfg)
-    assert model.blocks[0].self_attn.attn.veomni_attn.kernel == "attention"
+    assert model.blocks[0].self_attn.attn.veomni_attn.op == "attention"
     assert model.blocks[0].self_attn.attn.veomni_attn.impl == "veomni_sage_attention"
 
 
@@ -104,16 +104,16 @@ def test_should_use_fa3_fp8_policy():
 
 
 def test_wan_fa3_constructs_generic_flash_attention_3():
-    fa3_cfg = eager_kernels_config()
+    fa3_cfg = eager_ops_config()
     fa3_cfg.attn_implementation = "flash_attention_3"
     model = _build_ours(_tiny_ours_config(), fa3_cfg)
     handle = model.blocks[0].self_attn.attn.veomni_attn
-    assert handle.kernel == "attention"
+    assert handle.op == "attention"
     assert handle.impl == "flash_attention_3"
 
 
 def test_wan_fa3_finite_last_loss_quantizes(monkeypatch):
-    fa3_cfg = eager_kernels_config()
+    fa3_cfg = eager_ops_config()
     fa3_cfg.attn_implementation = "flash_attention_3"
     model = _build_ours(_tiny_ours_config(), fa3_cfg)
     attn = model.blocks[0].self_attn.attn
@@ -147,7 +147,7 @@ def test_wan_fa3_finite_last_loss_quantizes(monkeypatch):
     ),
 )
 def test_wan_fa3_skips_fp8_outside_policy(monkeypatch, kwargs):
-    fa3_cfg = eager_kernels_config()
+    fa3_cfg = eager_ops_config()
     fa3_cfg.attn_implementation = "flash_attention_3"
     model = _build_ours(_tiny_ours_config(), fa3_cfg)
     attn = model.blocks[0].self_attn.attn
@@ -175,22 +175,22 @@ def test_wan_fa3_skips_fp8_outside_policy(monkeypatch, kwargs):
 def test_wan_constructs_local_kernels():
     model = _build_ours(_tiny_ours_config())
     block = model.blocks[0]
-    assert isinstance(block.self_attn.norm_q.veomni_rms_norm, VeomniKernel)
+    assert isinstance(block.self_attn.norm_q.veomni_rms_norm, VeomniOp)
     assert block.self_attn.norm_q.veomni_rms_norm.impl == "eager"
-    assert block.self_attn.attn.veomni_attn.kernel == "attention"
+    assert block.self_attn.attn.veomni_attn.op == "attention"
     assert block.self_attn.attn.veomni_attn.impl == "eager"
 
 
 def test_wan_instances_keep_distinct_impls():
-    eager = _build_ours(_tiny_ours_config(), eager_kernels_config())
-    other_cfg = eager_kernels_config()
+    eager = _build_ours(_tiny_ours_config(), eager_ops_config())
+    other_cfg = eager_ops_config()
     other_cfg.rms_norm_implementation = "liger_kernel"
     other = _build_ours(_tiny_ours_config(), other_cfg)
 
     assert eager.blocks[0].self_attn.norm_q.veomni_rms_norm.impl == "eager"
     assert other.blocks[0].self_attn.norm_q.veomni_rms_norm.impl == "liger_kernel"
 
-    set_kernels_config(other_cfg)
+    set_ops_config(other_cfg)
     assert eager.blocks[0].self_attn.norm_q.veomni_rms_norm.impl == "eager"
 
 

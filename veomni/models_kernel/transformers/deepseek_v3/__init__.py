@@ -12,4 +12,4 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""DeepSeek-V3 modeling that calls local VeomniKernel handles. Not on ``MODELING_REGISTRY``."""
+"""DeepSeek-V3 modeling that calls local VeomniOp handles. Not on ``MODELING_REGISTRY``."""

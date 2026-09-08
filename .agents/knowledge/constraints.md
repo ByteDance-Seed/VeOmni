@@ -193,7 +193,7 @@ Core files:
 
 22. **NPU (Ascend) code paths require guards**
     - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
-    - NPU kernels live in `veomni/kernels/_kernels/` (RMSNorm is `rms_norm/<variant>/npu.py`, RoPE is `rope/<variant>/npu.py`). The HCCL collective compatibility patch lives in `veomni/distributed/hccl_premul_sum.py` and is applied only for NPU ExtraParallel. NPU-only dependencies must not be imported on GPU-only environments.
+    - NPU kernels live in `veomni/ops/kernels/` (RMSNorm is `rms_norm/<variant>/npu.py`, RoPE is `rope/<variant>/npu.py`). The HCCL collective compatibility patch lives in `veomni/distributed/hccl_premul_sum.py` and is applied only for NPU ExtraParallel. NPU-only dependencies must not be imported on GPU-only environments.
 
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
@@ -206,7 +206,7 @@ Core files:
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
 25. **Kernel handles belong to model instances**
-   - Modeling classes construct `VeomniKernel` handles from the installed kernel selection and store them on the instance. Do not introduce mutable module-level dispatch callables.
+   - Modeling classes construct `VeomniOp` handles from the installed ops selection and store them on the instance. Do not introduce mutable module-level dispatch callables.
    - Model-specific input normalization and loss policy stay in `models_kernel`; the registered wrapper remains a tensor-level contract shared by every consumer.
 
 26. **DCP full resume skips HF weight materialization**

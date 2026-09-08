@@ -27,9 +27,9 @@ from transformers import (
 )
 
 from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
-from veomni.kernels.config import get_kernels_config, set_kernels_config
 from veomni.models_kernel.loader import get_loader
 from veomni.models_kernel.registry import get_model_config, get_model_processor
+from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils import logging
 from veomni.utils.device import is_torch_npu_available
 
@@ -62,14 +62,14 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     generic builder, and a list is a thing the next model has to be remembered into.
 
     What a config cannot see on its own is the rest of the run, so the convention is
-    that the hook reads whatever singletons it needs (the installed kernels config,
+    that the hook reads whatever singletons it needs (the installed ops config,
     the parallel state) and takes no arguments. Kept as a plain ``getattr`` for the
     same reason: a config that has nothing to refuse should not have to say so.
 
     ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
     today. It refuses a Lightning Indexer KL objective configured without the TileLang
     indexer and attention it is defined in terms of -- a disagreement between a model
-    field and two kernel selections, which no single dataclass can see.
+    field and two op selections, which no single dataclass can see.
     """
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):
@@ -157,23 +157,23 @@ def build_foundation_model(
     config_kwargs: dict[str, Any] | None = None,
     encoder_data_balance: bool | None = False,
     encoder_data_balance_sorting_algo: str | None = "post_mbs_balancing_greedy_without_pad",
-    kernels_implementation: OpsImplementationConfig | None = None,
+    ops_implementation: OpsImplementationConfig | None = None,
 ) -> PreTrainedModel:
     """Build a foundation model from the models_kernel registry.
 
-    Callers must pass ``kernels_implementation`` or pre-install a config with
-    ``set_kernels_config``. There is no silent all-eager fallback.
+    Callers must pass ``ops_implementation`` or pre-install a config with
+    ``set_ops_config``. There is no silent all-eager fallback.
     """
-    if kernels_implementation is not None:
-        attn_implementation = kernels_implementation.attn_implementation
+    if ops_implementation is not None:
+        attn_implementation = ops_implementation.attn_implementation
         _validate_attention_parallelism(attn_implementation)
-        set_kernels_config(kernels_implementation)
+        set_ops_config(ops_implementation)
     else:
-        installed = get_kernels_config()
+        installed = get_ops_config()
         if installed is None:
             raise ValueError(
-                "build_foundation_model requires `kernels_implementation` (or a prior "
-                "`set_kernels_config(...)` call). There is no silent all-eager fallback."
+                "build_foundation_model requires `ops_implementation` (or a prior "
+                "`set_ops_config(...)` call). There is no silent all-eager fallback."
             )
         if attn_implementation is None:
             attn_implementation = installed.attn_implementation

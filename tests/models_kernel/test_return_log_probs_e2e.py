@@ -144,8 +144,8 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
     """
     from transformers import AutoConfig
 
-    from tests.models_kernel.compare import eager_kernels_config, pin_eager_attn_implementation
-    from veomni.kernels.config import get_kernels_config, set_kernels_config
+    from tests.models_kernel.compare import eager_ops_config, pin_eager_attn_implementation
+    from veomni.ops.config import get_ops_config, set_ops_config
 
     config = AutoConfig.from_pretrained(toy_path)
     if config.model_type == "qwen3":
@@ -159,14 +159,14 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
     else:
         raise ValueError(f"Unsupported toy model type: {config.model_type}")
 
-    kernels = eager_kernels_config()
-    kernels.cross_entropy_loss_implementation = ce_impl
-    previous = get_kernels_config()
-    set_kernels_config(kernels)
+    ops = eager_ops_config()
+    ops.cross_entropy_loss_implementation = ce_impl
+    previous = get_ops_config()
+    set_ops_config(ops)
     try:
         model = ModelClass(config)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
     pin_eager_attn_implementation(model)
     return model.to(device=get_device_type(), dtype=torch.float32)
 
@@ -226,7 +226,7 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     bi_active = _have_python_dev_headers()
     bi_ctx = None
     if bi_active:
-        from veomni.kernels.batch_invariant import set_batch_invariant_mode
+        from veomni.ops.batch_invariant import set_batch_invariant_mode
 
         bi_ctx = set_batch_invariant_mode(True)
         bi_ctx.__enter__()

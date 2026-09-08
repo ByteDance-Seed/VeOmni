@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3_5 NPU VeomniKernel replacements.
+Patch configuration for Qwen3_5 NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_5.qwen3_5_npu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_5/generated --diff
@@ -33,7 +33,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     _Qwen3_5FakeForPosID,
     collate_multimodal_metadata,
@@ -58,7 +57,8 @@ from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config impo
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_rot_pos_emb,
 )
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
     FusedLinearAuxOutput,
@@ -96,10 +96,10 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )  # noqa: F401
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "resolve_kernel_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "resolve_op_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -115,7 +115,7 @@ config.drop_import_names(
 config.add_post_import_block(
     """
     # NPU has no fla/flash_qla backend registered today; selecting a
-    # non-eager linear-attention impl raises at VeomniKernel construct
+    # non-eager linear-attention impl raises at VeomniOp construct
     # time. These None placeholders preserve the upstream HF top-level
     # `is_fast_path_available = all((causal_conv1d_fn, ...))` (resolves to
     # False — legacy warning) and let the `<fla_name> or <torch_fallback>`
@@ -169,32 +169,32 @@ config.add_helper(_Qwen3_5FakeForPosID)
 config.override_method(
     "Qwen3_5RMSNorm.__init__",
     replacement=qwen3_5_rmsnorm_init_patched,
-    description="Construct a local rms_norm qwen3_5 VeomniKernel",
+    description="Construct a local rms_norm qwen3_5 VeomniOp",
 )
 config.override_method(
     "Qwen3_5RMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
-    description="Always call the local rms_norm qwen3_5 VeomniKernel",
+    description="Always call the local rms_norm qwen3_5 VeomniOp",
 )
 
 
 @config.replace_function(
     "apply_rotary_pos_emb",
-    description="Always call rope partial VeomniKernel",
+    description="Always call rope partial VeomniOp",
 )
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    rope = VeomniKernel("rope", "partial", resolve_kernel_impl("rotary_pos_emb_implementation"))
+    rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
     return rope(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
 
 @config.replace_function(
     "apply_rotary_pos_emb_vision",
-    description="Always call rope_vision full VeomniKernel",
+    description="Always call rope_vision full VeomniOp",
 )
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rope = VeomniKernel("rope_vision", "full", resolve_kernel_impl("rotary_pos_emb_vision_implementation"))
+    rope = VeomniOp("rope_vision", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
     return rope(q, k, cos, sin)
 
 
@@ -520,7 +520,7 @@ def qwen3_5_text_model_forward_patched(
     # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
     if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
-        from veomni.kernels._kernels.gated_delta_rule.chunk_gated_delta_rule.standard.npu_ascendc import (
+        from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.npu_ascendc import (
             precompute_varlen_metadata,
         )
 
@@ -797,12 +797,12 @@ config.override_method(
 config.override_method(
     "Qwen3_5ForCausalLM.__init__",
     replacement=qwen3_5_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss VeomniKernel on Qwen3_5ForCausalLM",
+    description="Bind ForCausalLMLoss VeomniOp on Qwen3_5ForCausalLM",
 )
 config.override_method(
     "Qwen3_5ForCausalLM.forward",
     replacement=qwen3_5_forcausallm_forward_patched,
-    description="Always call ForCausalLMLoss VeomniKernel",
+    description="Always call ForCausalLMLoss VeomniOp",
 )
 
 
@@ -823,12 +823,12 @@ config.override_method(
 config.override_method(
     "Qwen3_5ForConditionalGeneration.__init__",
     replacement=qwen3_5_forconditional_generation_init_patched,
-    description="Bind ForCausalLMLoss VeomniKernel on Qwen3_5ForConditionalGeneration",
+    description="Bind ForCausalLMLoss VeomniOp on Qwen3_5ForConditionalGeneration",
 )
 config.override_method(
     "Qwen3_5ForConditionalGeneration.forward",
     replacement=qwen3_5_forconditional_generation_forward_patched,
-    description="Always call ForCausalLMLoss VeomniKernel",
+    description="Always call ForCausalLMLoss VeomniOp",
 )
 
 
@@ -850,5 +850,5 @@ class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Causal
 config.override_method(
     "Qwen3_5Attention.forward",
     replacement=qwen3_5_attention_forward_patched,
-    description="Dispatch attention through the interned VeomniKernel",
+    description="Dispatch attention through the interned VeomniOp",
 )

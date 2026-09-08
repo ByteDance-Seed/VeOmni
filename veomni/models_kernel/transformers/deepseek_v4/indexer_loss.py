@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import resolve_op_impl
 
 
 def _indexer_loss_enabled(module) -> bool:
@@ -76,12 +76,12 @@ def _indexer_loss_enabled(module) -> bool:
         return False
     if getattr(module.config, "dsa_indexer_loss_coef", 1.0) <= 0:
         return False
-    if resolve_kernel_impl("dsa_indexer_implementation") != "tilelang":
+    if resolve_op_impl("dsa_indexer_implementation") != "tilelang":
         raise ValueError(
             "dsa_indexer_loss requires dsa_indexer_implementation='tilelang'; the eager "
             "indexer discards its scores, so the loss would have nothing to train against"
         )
-    if resolve_kernel_impl("dsa_attention_implementation") != "tilelang":
+    if resolve_op_impl("dsa_attention_implementation") != "tilelang":
         raise ValueError(
             "dsa_indexer_loss requires dsa_attention_implementation='tilelang'; the teacher "
             "distribution is derived from the TileLang attention LSE"

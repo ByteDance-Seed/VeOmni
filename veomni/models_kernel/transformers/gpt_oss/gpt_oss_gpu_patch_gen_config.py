@@ -12,13 +12,13 @@
 # See the License for the specific language governing limitations
 # under the License.
 """
-Patch configuration for GPT-OSS GPU VeomniKernel replacements.
+Patch configuration for GPT-OSS GPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.gpt_oss.gpt_oss_gpu_patch_gen_config -o veomni/models_kernel/transformers/gpt_oss/generated --diff
 
 FA4 allowlist, hub-decorator drop, and EP plan stay. MoE, CE, and
-load-balancing loss call local VeomniKernel.
+load-balancing loss call local VeomniOp.
 """
 
 from functools import partial
@@ -39,9 +39,9 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring
 from transformers.utils.output_capturing import OutputRecorder
 
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_moe_impl, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -49,7 +49,7 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 config = PatchConfig(
     source_module="transformers.models.gpt_oss.modeling_gpt_oss",
     target_file="patched_modeling_gpt_oss_gpu.py",
-    description="GPT-OSS with VeOmni FA4-compatible attention dispatch and VeomniKernel replacements",
+    description="GPT-OSS with VeOmni FA4-compatible attention dispatch and VeomniOp replacements",
 )
 
 config.add_import("functools", names=["partial"])
@@ -57,10 +57,10 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
 )
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "resolve_kernel_impl", "resolve_moe_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "resolve_op_impl", "resolve_moe_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -119,7 +119,7 @@ class PatchedGptOssPreTrainedModel(PreTrainedModel):
 
 @config.replace_class(
     "GptOssExperts",
-    description="Always call moe_experts gpt_oss VeomniKernel",
+    description="Always call moe_experts gpt_oss VeomniOp",
 )
 class PatchedGptOssExperts(nn.Module):
     def __init__(self, config):
@@ -133,7 +133,7 @@ class PatchedGptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
-        self.veomni_moe = VeomniKernel("moe_experts", "gpt_oss", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_moe_impl())
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         return self.veomni_moe(
@@ -181,7 +181,7 @@ def gpt_oss_get_parallel_plan_patched(self):
 
 @config.override_method(
     "GptOssForCausalLM.__init__",
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def gpt_oss_forcausallm_init_patched(self, config):
     super().__init__(config)
@@ -191,21 +191,21 @@ def gpt_oss_forcausallm_init_patched(self, config):
     self.router_aux_loss_coef = config.router_aux_loss_coef
     self.num_experts = config.num_local_experts
     self.num_experts_per_tok = config.num_experts_per_tok
-    impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-    self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-    self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
-    self.veomni_lb = VeomniKernel(
+    impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+    self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+    self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+    self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_kernel_impl("load_balancing_loss_implementation"),
+        resolve_op_impl("load_balancing_loss_implementation"),
     )
-    self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
+    self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()
 
 
 @config.override_method(
     "GptOssForCausalLM.forward",
-    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 def gpt_oss_forcausallm_forward_patched(
     self,
@@ -279,7 +279,7 @@ def gpt_oss_forcausallm_forward_patched(
 
 @config.override_method(
     "GptOssAttention.forward",
-    description="Dispatch attention through the interned VeomniKernel",
+    description="Dispatch attention through the interned VeomniOp",
 )
 def gpt_oss_attention_forward_patched(
     self,
@@ -302,7 +302,7 @@ def gpt_oss_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_output, attn_weights = attention_kernel()(
+    attn_output, attn_weights = attention_op()(
         self,
         query_states,
         key_states,

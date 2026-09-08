@@ -12,17 +12,17 @@
 #    - class_replacement: GptOssPreTrainedModel
 #      Allow VeOmni FA4 implementation names during Transformers attention backend validation
 #    - class_replacement: GptOssExperts
-#      Always call moe_experts gpt_oss VeomniKernel
+#      Always call moe_experts gpt_oss VeomniOp
 #    - class_replacement: GptOssMLP
 #      Drop upstream MegaBlocks hub decorator and route through patched GptOssExperts
 #    - method_override: GptOssForCausalLM.get_parallel_plan
 #      Expose GPT-OSS expert-parallel plan
 #    - method_override: GptOssForCausalLM.__init__
-#      Bind ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Bind ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: GptOssForCausalLM.forward
-#      Always call ForCausalLMLoss and load_balancing_loss VeomniKernels
+#      Always call ForCausalLMLoss and load_balancing_loss VeomniOps
 #    - method_override: GptOssAttention.forward
-#      Dispatch attention through the interned VeomniKernel
+#      Dispatch attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -58,9 +58,9 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl, resolve_moe_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_moe_impl, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
@@ -88,7 +88,7 @@ class GptOssRMSNorm(nn.Module):
 # ======================================================================
 # [PATCHED CLASS] GptOssExperts
 # Original class replaced with: PatchedGptOssExperts
-# Reason: Always call moe_experts gpt_oss VeomniKernel
+# Reason: Always call moe_experts gpt_oss VeomniOp
 # Source: veomni.models_kernel.transformers.gpt_oss.gpt_oss_gpu_patch_gen_config
 # ======================================================================
 class GptOssExperts(nn.Module):
@@ -103,7 +103,7 @@ class GptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
-        self.veomni_moe = VeomniKernel("moe_experts", "gpt_oss", resolve_moe_impl())
+        self.veomni_moe = VeomniOp("moe_experts", "gpt_oss", resolve_moe_impl())
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         return self.veomni_moe(
@@ -341,7 +341,7 @@ class GptOssAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -627,15 +627,15 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
-        self.veomni_lb = VeomniKernel(
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+        self.veomni_lb = VeomniOp(
             "load_balancing_loss",
             "standard",
-            resolve_kernel_impl("load_balancing_loss_implementation"),
+            resolve_op_impl("load_balancing_loss_implementation"),
         )
-        self.load_balancing_loss = partial(load_balancing_loss, kernel=self.veomni_lb)
+        self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
         self.post_init()
 
     @can_return_tuple

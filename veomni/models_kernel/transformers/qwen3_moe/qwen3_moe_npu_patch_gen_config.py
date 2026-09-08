@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3Moe NPU VeomniKernel replacements.
+Patch configuration for Qwen3Moe NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_moe.qwen3_moe_npu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_moe/generated --diff
@@ -41,7 +41,7 @@ from veomni.patchgen.patch_spec import PatchConfig
 config = PatchConfig(
     source_module="transformers.models.qwen3_moe.modeling_qwen3_moe",
     target_file="patched_modeling_qwen3_moe_npu.py",
-    description="Qwen3Moe with VeOmni patches and VeomniKernel NPU replacements",
+    description="Qwen3Moe with VeOmni patches and VeomniOp NPU replacements",
 )
 
 # Mirror additional imports + post-import helpers from the GPU config so the
@@ -59,29 +59,29 @@ config.drop_imported_names.update(gpu_config.drop_imported_names)
 config.override_method(
     "Qwen3MoeRMSNorm.__init__",
     replacement=qwen3_moe_rmsnorm_init_patched,
-    description="Construct a local rms_norm VeomniKernel",
+    description="Construct a local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3MoeRMSNorm.forward",
     replacement=qwen3_moe_rmsnorm_forward_patched,
-    description="Always call the local rms_norm VeomniKernel",
+    description="Always call the local rms_norm VeomniOp",
 )
 config.override_method(
     "Qwen3MoeMLP.__init__",
     replacement=qwen3_moe_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniKernel",
+    description="Construct a local swiglu_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3MoeMLP.forward",
     replacement=qwen3_moe_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniKernel",
+    description="Always call the local swiglu_mlp VeomniOp",
 )
 
 
 config.replace_class(
     "Qwen3MoeExperts",
     replacement=PatchedQwen3MoeExperts,
-    description="Always call moe_experts VeomniKernel on v5 gate_up_proj weights",
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 
 
@@ -99,7 +99,7 @@ config.override_method(
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb_patched,
-    description="Always call rope full VeomniKernel",
+    description="Always call rope full VeomniOp",
 )
 
 # Dummy reference resolved at codegen time from the generated module.
@@ -116,12 +116,12 @@ config.override_method(
 config.override_method(
     "Qwen3MoeForCausalLM.__init__",
     replacement=qwen3_moe_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "Qwen3MoeForCausalLM.forward",
     replacement=qwen3_moe_forcausallm_forward_patched,
-    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 
 
@@ -134,5 +134,5 @@ config.override_method(
 config.override_method(
     "Qwen3MoeAttention.forward",
     replacement=qwen3_moe_attention_forward_patched,
-    description="Dispatch attention through the interned VeomniKernel",
+    description="Dispatch attention through the interned VeomniOp",
 )

@@ -45,7 +45,7 @@ def main() -> None:
     model = build_foundation_model(
         config_path=args.infer.model_path,
         weights_path=args.infer.model_path,
-        kernels_implementation=_INFERENCE_OPS,
+        ops_implementation=_INFERENCE_OPS,
         # A training objective baked into a checkpoint's ``config.json`` would
         # otherwise follow it here: DeepSeek-V4 serialises ``dsa_indexer_loss``,
         # which demands the TileLang DSA stack that ``_INFERENCE_OPS`` has just

@@ -10,11 +10,11 @@
 #
 #  Patches applied:
 #    - method_override: Qwen3_5RMSNorm.__init__
-#      Construct a local rms_norm qwen3_5 VeomniKernel
+#      Construct a local rms_norm qwen3_5 VeomniOp
 #    - method_override: Qwen3_5RMSNorm.forward
-#      Always call the local rms_norm qwen3_5 VeomniKernel
+#      Always call the local rms_norm qwen3_5 VeomniOp
 #    - method_override: Qwen3_5GatedDeltaNet.__init__
-#      Construct local GDN VeomniKernels; keep Qwen3_5RMSNormGated for the weight
+#      Construct local GDN VeomniOps; keep Qwen3_5RMSNormGated for the weight
 #    - method_override: Qwen3_5GatedDeltaNet._get_local_conv1d_weight
 #      Shard depthwise conv1d weights for local heads under Ulysses SP
 #    - method_override: Qwen3_5GatedDeltaNet.forward
@@ -40,19 +40,19 @@
 #    - method_override: Qwen3_5Model.forward
 #      Optimized multimodal forward supporting Ulysses SP (multimodal scattering), FSDP-safe dummy vision processing, position_ids shape alignment, and CPU-GPU sync avoidance via pre-computed metadata.
 #    - method_override: Qwen3_5ForCausalLM.__init__
-#      Bind ForCausalLMLoss VeomniKernel on Qwen3_5ForCausalLM
+#      Bind ForCausalLMLoss VeomniOp on Qwen3_5ForCausalLM
 #    - method_override: Qwen3_5ForCausalLM.forward
-#      Always call ForCausalLMLoss VeomniKernel
+#      Always call ForCausalLMLoss VeomniOp
 #    - method_override: Qwen3_5ForConditionalGeneration.get_position_id_func
 #      Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.
 #    - method_override: Qwen3_5ForConditionalGeneration.get_metadata_collate_func
 #      Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator
 #    - method_override: Qwen3_5ForConditionalGeneration.__init__
-#      Bind ForCausalLMLoss VeomniKernel on Qwen3_5ForConditionalGeneration
+#      Bind ForCausalLMLoss VeomniOp on Qwen3_5ForConditionalGeneration
 #    - method_override: Qwen3_5ForConditionalGeneration.forward
-#      Always call ForCausalLMLoss VeomniKernel
+#      Always call ForCausalLMLoss VeomniOp
 #    - method_override: Qwen3_5Attention.forward
-#      Dispatch attention through the interned VeomniKernel
+#      Dispatch attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -105,9 +105,9 @@ from transformers.utils.output_capturing import capture_outputs
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.kernels import VeomniKernel
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
 
@@ -115,7 +115,7 @@ from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAu
 # Additional import blocks for patches
 # Selection of FusedRMSNormGated / causal_conv1d / chunk_gated_delta_rule
 # used to come from `try: from fla.modules import ... except ImportError`
-# at module import time. GatedDeltaNet constructs VeomniKernel handles
+# at module import time. GatedDeltaNet constructs VeomniOp handles
 # instead. These None placeholders only exist so:
 #   (1) the upstream HF module-level
 #       `is_fast_path_available = all((causal_conv1d_fn, ...))`
@@ -574,20 +574,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
 
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        self.veomni_rms_norm_gated = VeomniKernel(
+        self.veomni_rms_norm_gated = VeomniOp(
             "rms_norm_gated",
             "standard",
-            resolve_kernel_impl("rms_norm_gated_implementation"),
+            resolve_op_impl("rms_norm_gated_implementation"),
         )
-        self.veomni_causal_conv1d = VeomniKernel(
+        self.veomni_causal_conv1d = VeomniOp(
             "causal_conv1d",
             "standard",
-            resolve_kernel_impl("causal_conv1d_implementation"),
+            resolve_op_impl("causal_conv1d_implementation"),
         )
-        self.veomni_chunk_gated_delta_rule = VeomniKernel(
+        self.veomni_chunk_gated_delta_rule = VeomniOp(
             "chunk_gated_delta_rule",
             "standard",
-            resolve_kernel_impl("chunk_gated_delta_rule_implementation"),
+            resolve_op_impl("chunk_gated_delta_rule_implementation"),
         )
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
@@ -963,7 +963,7 @@ class Qwen3_5Attention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -1004,12 +1004,12 @@ class Qwen3_5MLP(nn.Module):
 
 
 class Qwen3_5RMSNorm(nn.Module):
-    # ── RMSNorm (always call local qwen3_5 VeomniKernel) ─────────────────────────
+    # ── RMSNorm (always call local qwen3_5 VeomniOp) ─────────────────────────
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        self.veomni_rms_norm = VeomniKernel("rms_norm", "qwen3_5", resolve_kernel_impl("rms_norm_implementation"))
+        self.veomni_rms_norm = VeomniOp("rms_norm", "qwen3_5", resolve_op_impl("rms_norm_implementation"))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -1225,7 +1225,7 @@ class Qwen3_5VisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface = attention_kernel()
+        attention_interface = attention_op()
 
         if is_flash_attention_requested(self.config):
             # Modification: prefer the int max_seqlen pre-computed once in
@@ -2364,9 +2364,9 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         self.model = Qwen3_5TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @can_return_tuple
@@ -2527,9 +2527,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @auto_docstring

@@ -27,41 +27,41 @@ from torch import nn
 
 from tests.models_kernel.compare import (
     assert_outputs_and_grads_match,
-    eager_kernels_config,
+    eager_ops_config,
 )
-from veomni.kernels import VeomniKernel
-from veomni.kernels.config import get_kernels_config, set_kernels_config
+from veomni.ops import VeomniOp
+from veomni.ops.config import get_ops_config, set_ops_config
 
 
-def _build_ours(size: int = 16, kernels: SimpleNamespace | None = None):
+def _build_ours(size: int = 16, ops: SimpleNamespace | None = None):
     from veomni.models_kernel.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import VeomniRMSNorm
 
-    previous = get_kernels_config()
-    set_kernels_config(kernels if kernels is not None else eager_kernels_config())
+    previous = get_ops_config()
+    set_ops_config(ops if ops is not None else eager_ops_config())
     try:
         return VeomniRMSNorm(size, eps=1e-6)
     finally:
-        set_kernels_config(previous)
+        set_ops_config(previous)
 
 
 def test_minimax_h3_constructs_local_kernels():
     norm = _build_ours()
-    assert isinstance(norm.veomni_rms_norm, VeomniKernel)
-    assert norm.veomni_rms_norm.kernel == "rms_norm"
+    assert isinstance(norm.veomni_rms_norm, VeomniOp)
+    assert norm.veomni_rms_norm.op == "rms_norm"
     assert norm.veomni_rms_norm.variant == "standard"
     assert norm.veomni_rms_norm.impl == "eager"
 
 
 def test_minimax_h3_instances_keep_distinct_impls():
-    eager = _build_ours(kernels=eager_kernels_config())
-    other_cfg = eager_kernels_config()
+    eager = _build_ours(ops=eager_ops_config())
+    other_cfg = eager_ops_config()
     other_cfg.rms_norm_implementation = "liger_kernel"
-    other = _build_ours(kernels=other_cfg)
+    other = _build_ours(ops=other_cfg)
 
     assert eager.veomni_rms_norm.impl == "eager"
     assert other.veomni_rms_norm.impl == "liger_kernel"
 
-    set_kernels_config(other_cfg)
+    set_ops_config(other_cfg)
     assert eager.veomni_rms_norm.impl == "eager"
 
 

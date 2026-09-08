@@ -10,13 +10,13 @@
 #
 #  Patches applied:
 #    - method_override: Gemma3TextModel.forward
-#      Build full / sliding masks through veomni.kernels.mask
+#      Build full / sliding masks through veomni.ops.mask
 #    - method_override: Gemma3ForCausalLM.__init__
-#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Gemma3ForCausalLM.forward
-#      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
+#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
 #    - method_override: Gemma3Attention.forward
-#      Dispatch attention through the interned VeomniKernel
+#      Dispatch attention through the interned VeomniOp
 #
 # ==============================================================================
 
@@ -58,10 +58,10 @@ from transformers.utils import (
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-from veomni.kernels import VeomniKernel
-from veomni.kernels.mask import causal_mask, packed_causal_mask, sliding_window_mask
 from veomni.models_kernel.loss_utils import ForCausalLMLoss
-from veomni.models_kernel.utils.kernel_utils import attention_kernel, resolve_kernel_impl
+from veomni.models_kernel.utils.op_utils import attention_op, resolve_op_impl
+from veomni.ops import VeomniOp
+from veomni.ops.mask import causal_mask, packed_causal_mask, sliding_window_mask
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -383,7 +383,7 @@ class Gemma3Attention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_output, attn_weights = attention_kernel()(
+        attn_output, attn_weights = attention_op()(
             self,
             query_states,
             key_states,
@@ -561,7 +561,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            impl = resolve_kernel_impl("attn_implementation")
+            impl = resolve_op_impl("attn_implementation")
             q_len = inputs_embeds.shape[1]
             past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             kv_len = q_len + past_seen
@@ -641,9 +641,9 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
         self.model = Gemma3TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
+        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
         self.post_init()
 
     @can_return_tuple

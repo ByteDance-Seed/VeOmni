@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3_5Moe NPU VeomniKernel replacements.
+Patch configuration for Qwen3_5Moe NPU VeomniOp replacements.
 
 Regen command:
 patchgen veomni.models_kernel.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config -o veomni/models_kernel/transformers/qwen3_5_moe/generated --diff
@@ -94,10 +94,10 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
-config.add_import("veomni.kernels", names=["VeomniKernel"])
+config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import(
-    "veomni.models_kernel.utils.kernel_utils",
-    names=["attention_kernel", "empty_bias", "resolve_kernel_impl", "resolve_moe_impl"],
+    "veomni.models_kernel.utils.op_utils",
+    names=["attention_op", "empty_bias", "resolve_op_impl", "resolve_moe_impl"],
 )
 config.add_import(
     "veomni.models_kernel.loss_utils",
@@ -113,7 +113,7 @@ config.drop_import_names(
 config.add_post_import_block(
     """
     # NPU has no fla/flash_qla backend registered today; selecting a
-    # non-eager linear-attention impl raises at VeomniKernel construct
+    # non-eager linear-attention impl raises at VeomniOp construct
     # time. These None placeholders preserve the upstream HF top-level
     # `is_fast_path_available = all((causal_conv1d_fn, ...))`.
     FusedRMSNormGated = None
@@ -155,24 +155,24 @@ config.add_helper(_Qwen3_5MoeFakeForPosID)
 config.override_method(
     "Qwen3_5MoeRMSNorm.__init__",
     replacement=qwen3_5_moe_rmsnorm_init_patched,
-    description="Construct a local rms_norm qwen3_5 VeomniKernel",
+    description="Construct a local rms_norm qwen3_5 VeomniOp",
 )
 config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
-    description="Always call the local rms_norm qwen3_5 VeomniKernel",
+    description="Always call the local rms_norm qwen3_5 VeomniOp",
 )
 
 config.replace_function(
     "apply_rotary_pos_emb",
     replacement=apply_rotary_pos_emb,
-    description="Always call rope partial VeomniKernel",
+    description="Always call rope partial VeomniOp",
 )
 
 config.replace_function(
     "apply_rotary_pos_emb_vision",
     replacement=apply_rotary_pos_emb_vision,
-    description="Always call rope_vision full VeomniKernel",
+    description="Always call rope_vision full VeomniOp",
 )
 
 # ── Propagate _moe_implementation from top-level config to text_config ────────
@@ -268,7 +268,7 @@ config.override_method(
 config.replace_class(
     "Qwen3_5MoeExperts",
     replacement=PatchedQwen3_5MoeExperts,
-    description="Always call moe_experts VeomniKernel on v5 gate_up_proj weights",
+    description="Always call moe_experts VeomniOp on v5 gate_up_proj weights",
 )
 
 
@@ -388,24 +388,24 @@ config.override_method(
 config.override_method(
     "Qwen3_5MoeForCausalLM.__init__",
     replacement=qwen3_5_moe_forcausallm_init_patched,
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "Qwen3_5MoeForCausalLM.forward",
     replacement=qwen3_5_moe_forcausallm_forward_patched,
-    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 
 
 config.override_method(
     "Qwen3_5MoeForConditionalGeneration.__init__",
     replacement=qwen3_5_moe_forconditional_generation_init_patched,
-    description="Bind ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Bind ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 config.override_method(
     "Qwen3_5MoeForConditionalGeneration.forward",
     replacement=qwen3_5_moe_forconditional_generation_forward_patched,
-    description="Always call ForCausalLMLoss and load_balancing_loss VeomniKernels",
+    description="Always call ForCausalLMLoss and load_balancing_loss VeomniOps",
 )
 
 
@@ -421,5 +421,5 @@ config.override_method(
 config.override_method(
     "Qwen3_5MoeAttention.forward",
     replacement=qwen3_5_moe_attention_forward_patched,
-    description="Dispatch attention through the interned VeomniKernel",
+    description="Dispatch attention through the interned VeomniOp",
 )

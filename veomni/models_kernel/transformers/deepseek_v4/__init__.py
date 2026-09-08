@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""DeepSeek-V4 modeling that calls local VeomniKernel handles."""
+"""DeepSeek-V4 modeling that calls local VeomniOp handles."""
 
 from functools import partial
 

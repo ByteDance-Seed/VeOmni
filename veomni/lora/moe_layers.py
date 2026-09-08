@@ -114,9 +114,9 @@ still finds and EP-shards the base experts after wrapping, and so the
 EP-aware rank-0 broadcast / per-rank load paths slice the disk-side
 ``[E, ...]`` tensors down to ``[E_local, ...]`` correctly.
 
-Both wrappers always call ``VeomniKernel("moe_experts_lora", variant, impl)``.
+Both wrappers always call ``VeomniOp("moe_experts_lora", variant, impl)``.
 ``variant`` is the wrapper class (``shared`` / ``independent``). ``impl``
-comes from kernels ``moe_implementation`` (``fused_triton`` / ``fused_npu``;
+comes from the ops config's ``moe_implementation`` (``fused_triton`` / ``fused_npu``;
 everything else remaps to ``eager``).
 
 PEFT-format save/load compatibility (PEFT-aligned FQN layout)
@@ -162,19 +162,19 @@ _FUSED_MOE_LORA_IMPLS = frozenset({"fused_triton", "fused_npu"})
 
 
 def _resolve_moe_lora_impl() -> str:
-    """Map kernels ``moe_implementation`` onto a registered LoRA impl."""
-    from veomni.kernels.config import get_kernels_config
+    """Map the ops config's ``moe_implementation`` onto a registered LoRA impl."""
+    from veomni.ops.config import get_ops_config
 
-    cfg = get_kernels_config()
+    cfg = get_ops_config()
     impl = "eager" if cfg is None else getattr(cfg, "moe_implementation", "eager")
     return impl if impl in _FUSED_MOE_LORA_IMPLS else "eager"
 
 
-def _moe_lora_kernel(variant: str):
+def _moe_lora_op(variant: str):
     """Intern the ``moe_experts_lora`` handle for ``variant`` and the active impl."""
-    from veomni.kernels import VeomniKernel
+    from veomni.ops import VeomniOp
 
-    return VeomniKernel("moe_experts_lora", variant, _resolve_moe_lora_impl())
+    return VeomniOp("moe_experts_lora", variant, _resolve_moe_lora_impl())
 
 
 # Module FQNs of PEFT-wrapped models gain a ``base_model.model.`` prefix.
@@ -488,7 +488,7 @@ class LoraSharedExperts(nn.Module):
         # sync inside the autograd.Function. Kept in lock-step with
         # ``lora_scaling``.
         self._lora_scale_value: float = float(scaling)
-        self.veomni_moe_lora = _moe_lora_kernel("shared")
+        self.veomni_moe_lora = _moe_lora_op("shared")
 
         # Freeze base, then unfreeze lora_*. ``_is_lora_param_name``
         # detects the canonical ``lora_A`` / ``lora_B`` segments in the
@@ -773,7 +773,7 @@ class LoraIndependentExperts(nn.Module):
         out_t           = W_dn_e @ mid_t + B_dn_e @ (A_dn_e @ mid_t) * scale
 
     The wrapper's ``forward`` always calls
-    ``VeomniKernel("moe_experts_lora", "independent", impl)``.
+    ``VeomniOp("moe_experts_lora", "independent", impl)``.
     """
 
     def __init__(
@@ -851,7 +851,7 @@ class LoraIndependentExperts(nn.Module):
         # the scale as a plain float to avoid a host/device sync inside the
         # autograd.Function. Kept in lock-step with ``lora_scaling``.
         self._lora_scale_value: float = float(scaling)
-        self.veomni_moe_lora = _moe_lora_kernel("independent")
+        self.veomni_moe_lora = _moe_lora_op("independent")
 
         # Freeze base, then unfreeze lora_*. ``_is_lora_param_name`` looks
         # at canonical ``lora_A`` / ``lora_B`` segments so it works under

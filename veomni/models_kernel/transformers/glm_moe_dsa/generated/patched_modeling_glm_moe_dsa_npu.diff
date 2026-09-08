@@ -29,9 +29,9 @@
 -# limitations under the License.
 +#  Patches applied:
 +#    - method_override: GlmMoeDsaForCausalLM.__init__
-+#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniKernel
++#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 +#    - method_override: GlmMoeDsaForCausalLM.forward
-+#      Always call self.loss_function (ForCausalLMLoss + VeomniKernel)
++#      Always call self.loss_function (ForCausalLMLoss + VeomniOp)
 +#
 +# ==============================================================================
 
@@ -78,9 +78,9 @@
 +from transformers.utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 +from transformers.utils.output_capturing import capture_outputs
 +
-+from veomni.kernels import VeomniKernel
 +from veomni.models_kernel.loss_utils import ForCausalLMLoss
-+from veomni.models_kernel.utils.kernel_utils import resolve_kernel_impl
++from veomni.models_kernel.utils.op_utils import resolve_op_impl
++from veomni.ops import VeomniOp
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -104,9 +104,9 @@
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 -
 -        # Initialize weights and apply final processing
-+        impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
-+        self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
-+        self.loss_function = partial(ForCausalLMLoss, kernel=self.veomni_ce)
++        impl = resolve_op_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
++        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
++        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
          self.post_init()
 
      @can_return_tuple
