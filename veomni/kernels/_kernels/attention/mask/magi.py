@@ -45,6 +45,7 @@ class MagiAttentionMask:
     attn_type_map: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
+        """Validate range tensors after dataclass construction."""
         _validate_ranges(self.q_ranges, self.k_ranges)
         if self.attn_type_map is not None:
             _validate_attn_type_map(self.attn_type_map, num_ranges=self.q_ranges.shape[0], device=self.q_ranges.device)
@@ -148,6 +149,7 @@ def magi_attention_mask_builder(
 
 
 def _full_sequence_lengths(q_length: int, kv_length: int, *, skip_ulysses: bool) -> tuple[int, int]:
+    """Return sequence lengths after the optional Ulysses all-gather."""
     if not should_apply_ulysses(skip_ulysses=skip_ulysses):
         return q_length, kv_length
     scale = get_parallel_state().ulysses_size
@@ -155,6 +157,7 @@ def _full_sequence_lengths(q_length: int, kv_length: int, *, skip_ulysses: bool)
 
 
 def _ranges_from_cu_seqlens(cu_seqlens: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Convert cumulative sequence lengths to contiguous half-open ranges."""
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError(f"cu_seqlens must have shape [num_sequences + 1], got {tuple(cu_seqlens.shape)}.")
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
@@ -164,6 +167,7 @@ def _ranges_from_cu_seqlens(cu_seqlens: torch.Tensor, device: torch.device) -> t
 
 
 def _validate_ranges(q_ranges: torch.Tensor, k_ranges: torch.Tensor) -> None:
+    """Validate paired query and key ranges for the Magi FFA contract."""
     for name, ranges in (("q_ranges", q_ranges), ("k_ranges", k_ranges)):
         if ranges.dtype != torch.int32 or ranges.ndim != 2 or ranges.shape[1] != 2 or ranges.shape[0] == 0:
             raise ValueError(f"MagiAttentionMask {name} must have shape [num_ranges, 2] and dtype int32.")
@@ -175,6 +179,7 @@ def _validate_ranges(q_ranges: torch.Tensor, k_ranges: torch.Tensor) -> None:
 
 
 def _validate_attn_type_map(attn_type_map: torch.Tensor, *, num_ranges: int, device: torch.device) -> None:
+    """Validate optional per-range Magi attention type codes."""
     if attn_type_map.dtype != torch.int32 or attn_type_map.ndim != 1 or attn_type_map.shape[0] != num_ranges:
         raise ValueError("MagiAttentionMask attn_type_map must have shape [num_ranges] and dtype int32.")
     if attn_type_map.device != device:

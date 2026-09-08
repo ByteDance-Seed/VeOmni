@@ -130,6 +130,7 @@ def _packed_segment_ids(
 
 
 def _segment_ids(cu_seqlens: Tensor, length: int, device: torch.device) -> Tensor:
+    """Expand cumulative sequence lengths into one segment id per token."""
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError(f"cu_seqlens must have shape [n_seg + 1], got {tuple(cu_seqlens.shape)}")
     cu_seqlens = cu_seqlens.to(device=device)

@@ -348,7 +348,7 @@ class TestLegacySaveModelWeights(unittest.TestCase):
 
         from safetensors.torch import load_file
 
-        from veomni.models.module_utils import _get_shard_info, save_model_weights
+        from veomni.models_kernel.checkpoint.weights import _get_shard_info, save_model_weights
 
         state_dict = {
             "weight": torch.ones(4, dtype=torch.float32),
@@ -370,7 +370,7 @@ class TestLegacySaveModelWeights(unittest.TestCase):
         torch.testing.assert_close(loaded["expert_ids"], state_dict["expert_ids"])
 
     def test_native_dtypes_use_actual_size_for_torch_serialization(self):
-        from veomni.models.module_utils import _get_shard_info
+        from veomni.models_kernel.checkpoint.weights import _get_shard_info
 
         state_dict = {
             "complex": torch.ones(3, dtype=torch.complex64),
@@ -382,13 +382,13 @@ class TestLegacySaveModelWeights(unittest.TestCase):
         self.assertEqual(total_size, expected_size)
 
     def test_safetensors_rejects_unsupported_native_dtype(self):
-        from veomni.models.module_utils import _get_shard_info
+        from veomni.models_kernel.checkpoint.weights import _get_shard_info
 
         with self.assertRaisesRegex(ValueError, "Unsupported dtype for safetensors serialization: torch.complex64"):
             _get_shard_info({"complex": torch.ones(1, dtype=torch.complex64)}, None, 5_000_000_000, True)
 
     def test_invalid_save_dtype_is_rejected_for_integer_only_state(self):
-        from veomni.models.module_utils import _get_shard_info
+        from veomni.models_kernel.checkpoint.weights import _get_shard_info
 
         with self.assertRaisesRegex(ValueError, "Unknown save dtype: not_a_dtype"):
             _get_shard_info({"ids": torch.arange(4)}, "not_a_dtype", 5_000_000_000, False)

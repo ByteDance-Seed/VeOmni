@@ -107,7 +107,7 @@ a config that does not declare it cannot be asked for the objective; and the che
 a *method* on that class, so `build_foundation_model` does not know the objective
 exists. All it does is `getattr(config, "validate_build_prerequisites", None)` and
 call whatever it finds, which `check_model_build_prerequisites` in
-`veomni/models/auto.py` is the whole of. A second model gaining the objective
+`veomni/models_kernel/auto.py` is the whole of. A second model gaining the objective
 declares the field and the method on its own config and needs no edit to the builder.
 
 Every constraint is keyed on the objective being *on*, and a coefficient of `0.0`
@@ -127,9 +127,9 @@ overrides, so a bound checked in `DeepseekV4Config.__post_init__` would read
 `config.json` and never the YAML line contradicting it. The two implementation
 fields cannot live there either: they are `OpsImplementationConfig` fields, and
 neither dataclass can see the disagreement alone.
-`validate_build_prerequisites` is the earliest point that holds the finished config
-and the installed ops config together, and it runs before any rank reads a weight. It
-reads the ops config off the installed singleton rather than taking it as an argument,
+`validate_build_prerequisites` is the earliest point that holds the finished model
+config and installed kernel-selection config together, and it runs before any rank
+reads a weight. It reads the kernel config from the installed singleton rather than taking it as an argument,
 which is what keeps the builder's hook a no-argument call that any config can
 implement.
 
@@ -167,23 +167,19 @@ projections' gradients under both settings, not on `kl.grad_fn`, because the pro
 is exactly what a refactor could satisfy while delivering nothing.
 
 **The two flags are fields of `DeepseekV4Config`, not of
-`OpsImplementationConfig`.** They started on the ops config next to
-`dsa_indexer_implementation`, which reads naturally — the objective needs those
-two kernels — but conflates a training objective with a kernel backend, and the
-model already had the right precedent one field away: `output_router_logits` /
-`router_aux_loss_coef` configure this model's other auxiliary objective, live on
-its config, and are folded into the loss from `self.config` in the same forward.
-Three things followed from moving them:
+`OpsImplementationConfig`.** The model config owns training objectives, while
+`OpsImplementationConfig` selects kernel backends. This matches
+`output_router_logits` / `router_aux_loss_coef`, which configure the model's
+other auxiliary objective and are folded into the loss from `self.config` in
+the same forward. This ownership has three useful properties:
 
 - The model-type allow-list became unnecessary and was deleted. A flag on a
   model-agnostic dataclass can be set on any model, so it had to be refused for
   every model that does not implement it; a field on `DeepseekV4Config` cannot be
   set on GLM MoE DSA at all.
-- The old module-global kernel config slots only held implementation strings.
-  Two models built from one generated modeling module — a DPO policy and its
-  reference — therefore shared one value, and the second bind decided for both.
-  `self.config` is per-instance; the current kernel registry also uses
-  instance-local handles.
+- `self.config` is per-instance, just like the `VeomniKernel` handles constructed
+  by each generated model instance. A DPO policy and reference can therefore
+  retain independent model objectives and resolved kernels.
 - Declaring the fields is load-bearing, not tidiness. `model.model_config`
   overrides reach the config as `from_dict` kwargs, which are applied only for
   keys the constructed config already answers `hasattr` for and dropped silently
@@ -196,10 +192,10 @@ is not available: `PatchConfig` targets `modeling_*` modules and there is no
 precedent or mechanism for patching a `transformers` configuration class. VeOmni's
 mechanism is `MODEL_CONFIG_REGISTRY` with a hand-written subclass, as
 `qwen3_omni_moe` already does, and that is what
-`veomni/models/transformers/deepseek_v4/configuration_deepseek_v4.py` is.
+`veomni/models_kernel/transformers/deepseek_v4/configuration_deepseek_v4.py` is.
 
 **The check moved onto the config class, and the builder kept only a hook.** It
-was first written as `check_indexer_loss_prerequisites` in `veomni/models/auto.py`,
+was first written as `check_indexer_loss_prerequisites` in `veomni/models_kernel/auto.py`,
 called from `build_foundation_model` — which worked, and left a generic model
 builder holding a function about one model's training objective. Two of the three
 things that function reads are `DeepseekV4Config` fields, and the third is which
@@ -222,7 +218,7 @@ the same reason `_indexer_loss_enabled` reads the parallel state rather than
 receiving it.
 
 This is what a second model gaining the objective now costs: declare the two
-fields, implement the method. No edit to `veomni/models/auto.py`, which no longer
+fields, implement the method. No edit to `veomni/models_kernel/auto.py`, which no longer
 knows the objective exists.
 
 `check_context_parallel_supported` in that same file is the remaining gate of this
@@ -253,7 +249,7 @@ silently produces nothing.) Threading the decision is both smaller and stronger:
 one evaluation per layer per forward cannot disagree with itself mid-call, and the
 HCA compressor takes the same parameter and ignores it only because its shared
 call site demands one signature —
-`tests/models/test_generated_call_site_signatures.py` is what enforces that, and
+`tests/models_kernel/test_generated_call_site_signatures.py` is what enforces that, and
 it is what caught the NPU compressors missing it.
 
 The layer gate keys on `layer_type` rather than on `module.compressor.indexer`

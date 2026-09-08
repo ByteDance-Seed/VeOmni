@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFETENSORS_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from torch import distributed as dist
 
-from ..models.module_utils import _save_state_dict
+from ..models_kernel.checkpoint.weights import _save_state_dict
 from . import logging
 from .helper import empty_cache, get_dtype_size
 

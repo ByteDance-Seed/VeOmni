@@ -156,7 +156,7 @@ test = [
   "expecttest",
 ]
 # Sibling project under ./patchgen-pkg/ (build-time tool — regenerates
-# veomni/models/transformers/*/generated/; not imported at runtime).
+# veomni/models_kernel/transformers/*/generated/; not imported at runtime).
 # Outer dir is `patchgen-pkg` because a flat `patchgen/` would shadow the
 # editable install via namespace-package discovery.
 patchgen = [
@@ -244,7 +244,7 @@ torchcodec = [
 #     Ampere/Ada/Hopper/Blackwell on NGC25.11 (cp312) and cp311 local dev.
 #   - FA3 cp310-abi3 sm90 (v0.0.5) — abi3 loads on cp310+. Non-Hopper users
 #     never import flash_attn_interface (lazy in
-#     veomni/ops/kernels/attention/__init__.py), so sm90-only is no-loss.
+#     veomni/kernels/_kernels/attention/standard/flash.py), so sm90-only is no-loss.
 # FA4 4.0.0b16 is resolved from PyPI.
 flash-attn = [
   { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
@@ -332,9 +332,8 @@ where = ["."]
 exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts", "patchgen-pkg*"]
 
 [tool.patchgen]
-search_root = "veomni/models/transformers"
-package_prefix = "veomni.models.transformers"
-legacy_patches_prefix = "veomni.models.transformers.qwen3.patches"
+search_root = "veomni/models_kernel/transformers"
+package_prefix = "veomni.models_kernel.transformers"
 
 [tool.ruff]
 target-version = "py311"

@@ -145,7 +145,7 @@ def test_qwen3_vl_metadata_hook_is_picklable_and_correct():
     cu_seqlens + SP-pad tail from the packed ``image_grid_thw`` tensor."""
     import pickle
 
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+    from veomni.models_kernel.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         collate_multimodal_metadata,
     )
 

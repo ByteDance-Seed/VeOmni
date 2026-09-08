@@ -20,13 +20,12 @@ veomni/
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
-├── models/             Model loading and patching
+├── models_kernel/      Model loading, patchgen configs, and kernel-aware modeling
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
-│   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
-│   ├── transformers/   Per-model patches (one subpackage per model family)
-│   └── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
-├── models_kernel/      Kernel-registry model implementations and patchgen configs
+│   ├── registry.py     Import-time model/config/processor registries
+│   ├── checkpoint/     Weight loading, saving, and tensor conversion
 │   ├── transformers/   Model classes/configs with instance-local VeomniKernel handles
+│   ├── diffusers/      Diffusion model families
 │   └── loss_utils/     Model-facing CE, load-balancing, and chunked-loss policy
 ├── kernels/            Tensor-native unified kernel registry and implementations
 │   ├── install.py      Idempotent process-wide integrations for registered kernels
@@ -52,13 +51,6 @@ veomni/
 │   │                   experts go through one all-to-all-gather over the
 │   │                   ep_fsdp mesh.
 │   └── lr_scheduler.py LR scheduler construction
-├── ops/                Legacy model-integration dispatch pending migration/removal
-│   ├── config/         Legacy ops registry + singleton resolved config
-│   │   ├── registry.py OpSpec/BackendSpec/OpScope + register_op/apply_*
-│   │   └── singleton.py  get_ops_config()/set_ops_config() for patch files
-│   └── kernels/        Remaining legacy model-integration implementations
-│       ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
-│       └── deepseek_sparse_attention/
 ├── patchgen/           Auto-generate model patches from HuggingFace models
 ├── schedulers/         LR scheduler implementations (flow matching)
 ├── trainer/            Training loop implementations
@@ -121,13 +113,18 @@ YAML Config -> VeOmniArguments -> Trainer
 
 ## Model Loading Flow
 
-1. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`
-2. If registered: use VeOmni custom config class; else: use HF config
-3. Determine model class via `MODELING_REGISTRY` (keyed by `model_type`)
+1. `models_kernel.build_foundation_model()` installs the supplied kernel selection.
+2. Read `config.json` -> `AutoConfig.from_pretrained()` -> check `MODEL_CONFIG_REGISTRY`.
+3. Determine the model class via `MODELING_REGISTRY` (keyed by `model_type`); an unregistered model fails explicitly unless `MODELING_BACKEND=hf` selects the upstream class.
 4. Instantiate model on meta device (`init_empty_weights()`)
-5. Apply VeOmni patches (flash attention, sequence parallel hooks)
+5. Construct instance-local `VeomniKernel` handles from the installed selection.
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
+
+The public configuration field remains `model.ops_implementation`. Trainer and
+inference entry points pass it to the model builder as
+`kernels_implementation`; changing the config field would break existing CLI
+and YAML inputs.
 
 ## Parallelization Flow
 
@@ -163,9 +160,9 @@ configs/
 
 ```
 tests/
-├── models/         Model loading, patching, registry tests
+├── models_kernel/  Kernel-aware model loading, integration, and helper tests
+├── kernels/        Registry contracts and per-family kernel tests
 ├── data/           Data pipeline, collator, transform tests
-├── ops/            Kernel operation tests
 ├── parallel/       Distributed parallelism tests (ulysses, data balance)
 ├── checkpoints/    Checkpoint save/load tests
 ├── utils/          Utility function tests
@@ -178,9 +175,9 @@ tests/
 
 | Change in | Test command |
 |-----------|-------------|
-| `veomni/models/` | `pytest tests/models/` |
+| `veomni/models_kernel/` | `pytest tests/models_kernel/` |
+| `veomni/kernels/` | `pytest tests/kernels/` |
 | `veomni/data/` | `pytest tests/data/` |
-| `veomni/ops/` | `pytest tests/ops/` |
 | `veomni/distributed/` | `pytest tests/parallel/` |
 | `veomni/checkpoint/` | `pytest tests/checkpoints/` |
 | `veomni/utils/` | `pytest tests/utils/` |

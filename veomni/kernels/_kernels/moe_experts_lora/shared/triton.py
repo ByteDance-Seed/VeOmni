@@ -67,6 +67,7 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         lora_scale_up,
         lora_scale_down,
     ):
+        """Run non-EP fused MoE with LoRA weights shared by all experts."""
         splits = expert_histogram(expert_index, num_experts)
         scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
         scatter_output = moe_scatter(hidden_states, scatter_index)  # [T, H]   T = B*S*topk
@@ -156,6 +157,7 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Backpropagate through non-EP fused MoE and shared LoRA."""
         (
             gate_weights,
             fc1_1_2_weight,
@@ -361,6 +363,7 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
         lora_scale_up,
         lora_scale_down,
     ):
+        """Run EP-local grouped GEMM with LoRA weights shared by all experts."""
         max_t = permute_tokens.shape[0]
 
         # Base fc1: [T_local, 2I]
@@ -428,6 +431,7 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Backpropagate through EP-local grouped GEMM and shared LoRA."""
         # grad_output: [T_local, H] — already routing-weight-aware via the upstream
         # tokens_post_all2all chain, so no per-row scattered-gate-weight handling here.
         (

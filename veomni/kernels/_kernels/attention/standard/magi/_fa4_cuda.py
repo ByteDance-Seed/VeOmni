@@ -45,6 +45,7 @@ class _MagiFA4Function(torch.autograd.Function):
         softcap: float,
         attn_arg: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute FA4 forward and save tensors required by its backward pass."""
         softmax_scale = query.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
         with cuda_device_context(query.device):
             from magi_attention.functional.fa4 import fa4_fwd
@@ -68,6 +69,7 @@ class _MagiFA4Function(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, *args: object) -> tuple[torch.Tensor | None, ...]:
+        """Execute FA4 backward for query, key, and value."""
         query, key, value, output, lse, _, _, _ = ctx.saved_tensors
         with cuda_device_context(query.device):
             from magi_attention.functional.fa4 import fa4_bwd

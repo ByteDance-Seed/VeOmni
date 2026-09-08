@@ -56,9 +56,11 @@ def _bind_deltas(
     """Close shared LoRA tensors over the helper skeleton callbacks."""
 
     def gate_up(x: Tensor, _group_list: Tensor) -> Tensor:
+        """Apply shared gate and up LoRA deltas."""
         return _gate_up_delta(x, lora_a_gate, lora_b_gate, lora_a_up, lora_b_up, lora_scale_gate, lora_scale_up)
 
     def down(mid: Tensor, _group_list: Tensor) -> Tensor:
+        """Apply the shared down-projection LoRA delta."""
         return _down_delta(mid, lora_a_down, lora_b_down, lora_scale_down)
 
     return gate_up, down

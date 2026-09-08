@@ -6,7 +6,7 @@ description: "Use this skill when adding or refreshing a patchgen-generated mode
 # VeOmni Transformers v5 Patchgen Protocol
 
 Purpose: add or refresh a model's patchgen-generated modeling under
-`veomni/models/transformers/<model>/generated/`. VeOmni pins
+`veomni/models_kernel/transformers/<model>/generated/`. VeOmni pins
 `transformers==5.9.0` and ships patchgen-generated modeling for every
 supported model; legacy v4 monkey-patches have been retired.
 
@@ -22,35 +22,38 @@ supported model; legacy v4 monkey-patches have been retired.
 
 Examples grouped by complexity / capability — pick the closest one and adapt:
 
-- **Text LLM (dense)** — `veomni/models/transformers/qwen3/`, `veomni/models/transformers/llama/`, `veomni/models/transformers/qwen2/`, `veomni/models/transformers/seed_oss/`
-  - `__init__.py` — registers a patchgen-generated `<Model>ForCausalLM` / `<Model>Model` / `<Model>ForSequenceClassification` via `MODELING_REGISTRY`.
-  - `<m>_gpu_patch_gen_config.py` — Liger + SP + fused-CE patches. Llama is the minimal reference (5 OpSlot patches: RMSNorm, MLP, RoPE, ForCausalLM, ForSequenceClassification — no SP or MoE specifics).
-- **Text LLM with NPU patchgen** — `veomni/models/transformers/seed_oss/`
-  - `__init__.py` — branches on `IS_NPU_AVAILABLE` between `patched_modeling_seed_oss_{gpu,npu}`.
+`deepseek_v4/` is currently the only package wired into the public
+`models_kernel` registry. The other directories below are patchgen and focused
+consume-test references whose generated classes are constructed directly; their
+placeholder `__init__.py` files must not be copied as registration examples.
+
+- **Complete runtime registration** — `veomni/models_kernel/transformers/deepseek_v4/`
+  - `__init__.py` registers the config and GPU/NPU modeling classes at import time.
+  - Use this package as the source of truth for registry wiring.
+
+- **Text LLM (dense)** — `veomni/models_kernel/transformers/qwen3/`, `veomni/models_kernel/transformers/llama/`, `veomni/models_kernel/transformers/qwen2/`, `veomni/models_kernel/transformers/seed_oss/`
+  - `<m>_gpu_patch_gen_config.py` — kernel-aware SP and fused-CE patches. Llama is the minimal reference for instance-local RMSNorm, MLP, RoPE, attention, and loss `VeomniKernel` handles.
+- **Text LLM with NPU patchgen** — `veomni/models_kernel/transformers/seed_oss/`
   - Sibling configs produce separate `generated/*_{gpu,npu}.py` outputs.
-- **MoE** — `veomni/models/transformers/qwen3_moe/`
-  - `__init__.py` — attaches `_create_checkpoint_tensor_converter` as a `staticmethod` on every patchgen-generated class.
+- **MoE** — `veomni/models_kernel/transformers/qwen3_moe/`
   - `qwen3_moe_gpu_patch_gen_config.py` — replaces `Qwen3MoeExperts` with the fused-MoE layout and overrides `get_parallel_plan`.
   - `checkpoint_tensor_converter.py` — HF per-expert → fused runtime converter.
   - `parallel_plan.py` — single `get_parallel_plan()` sharding the fused `gate_up_proj`.
-- **MoE + NPU patchgen** — `veomni/models/transformers/deepseek_v3/`
+- **MoE + NPU patchgen** — `veomni/models_kernel/transformers/deepseek_v3/`
   - Sibling `deepseek_v3_{gpu,npu}_patch_gen_config.py`; both generated files committed.
-  - Runtime kernel choice (deterministic Triton RoPE + batch-invariant RMSNorm) is wired in `__init__.py` via `apply_veomni_deepseek_v3_device_patch(gen_module)` for actor/rollout numerical parity. No Liger kernels in the generated file itself.
-- **VLM (non-MoE) + GPU+NPU patchgen** — `veomni/models/transformers/qwen3_vl/`
-  - `__init__.py` — registers the patchgen-generated classes, branching on `IS_NPU_AVAILABLE` between `patched_modeling_qwen3_vl_{gpu,npu}`.
+  - The generated implementations demonstrate deterministic Triton RoPE and batch-invariant RMSNorm for actor/rollout numerical parity.
+- **VLM (non-MoE) + GPU+NPU patchgen** — `veomni/models_kernel/transformers/qwen3_vl/`
   - `qwen3_vl_gpu_patch_gen_config.py` — full VLM forward with Ulysses SP, async Ulysses text attention, deepstack, precomputed mrope via `get_position_id_func`, and a SP-aware `dummy_forward`.
   - `qwen3_vl_npu_patch_gen_config.py` — demonstrates the **NPU-inherits-GPU** pattern: a thin NPU config that extends `gpu_config.helpers` / `gpu_config.post_import_blocks` / `gpu_config.additional_imports` and only overrides RMSNorm / rotary with `torch_npu.npu_rms_norm` / `torch_npu.npu_rotary_mul`. Avoids duplicating ~1K lines of shared VLM SP/deepstack patches.
-- **Omni (thinker+talker subtree, non-MoE)** — `veomni/models/transformers/qwen2_5_omni/`
-  - `__init__.py` — imports `Qwen2_5OmniForConditionalGeneration` / `Qwen2_5OmniThinkerForConditionalGeneration` from the patchgen-generated module **and** `Qwen2_5OmniTalkerModel` / `Qwen2_5OmniTalkerForConditionalGeneration` directly from `transformers.models.qwen2_5_omni.modeling_qwen2_5_omni` (talker classes are excluded from the generated file but the registry still needs to return them when `architecture` mentions `Talker...`). `MODEL_CONFIG_REGISTRY` applies the `tie_word_embeddings=False` config patch.
+- **Omni (thinker+talker subtree, non-MoE)** — `veomni/models_kernel/transformers/qwen2_5_omni/`
   - `qwen2_5_omni_gpu_patch_gen_config.py` — the canonical **non-MoE Omni** template: excludes talker + token2wav + DiT + BigVGAN subtrees, overrides `_init_weights` to drop excluded `UpSample1d`/`DownSample1d` branches, overrides `ForConditionalGeneration.__init__` to force `has_talker=False` and pin `_no_split_modules=[DecoderLayer, VisionBlock, AudioEncoderLayer]` (use a `list[str]` to match the upstream HF convention — `modeling_utils.py` converts it to a set internally, so either works at runtime, but staying with `list[str]` keeps the patched class isomorphic with the upstream base class attr), registers a load-state-dict pre-hook to strip `talker.*`/`token2wav.*` keys, overrides `enable_talker`/`generate` to raise `NotImplementedError`, and forwards `ForConditionalGeneration.forward` to thinker only — **minus** all MoE/EP machinery (no `replace_class("…Experts")`, no `parallel_plan.py`, no `checkpoint_tensor_converter.py`). Thinker uses `Qwen2_5OmniThinkerCausalLMOutputWithLogProbs` from `veomni.utils.model_outputs` to carry `log_probs`/`entropy` as constructor fields (same FSDP2 unshard-hook rationale as qwen3_omni_moe). Audio encoder uses 1D convs (`conv1`/`conv2`) — pull dummy-forward dtype from `self.conv1.weight.dtype`, not `self.conv2d1` (that's qwen3_omni_moe-specific).
   - **No `parallel_plan.py` / no `checkpoint_tensor_converter.py`** — qwen2.5-Omni's thinker text model is dense (Qwen2-class MLP, not MoE), so neither EP nor fused-expert weight conversion applies. If you start from the qwen3_omni_moe template and forget to delete these, you'll get import errors from dangling references.
-- **VLM + MoE + GPU+NPU patchgen** — `veomni/models/transformers/qwen3_vl_moe/`
-  - `__init__.py` — registers three classes (`Qwen3VLMoeForConditionalGeneration`, `Qwen3VLMoeModel`, `Qwen3VLMoeTextModel`) and attaches `_create_checkpoint_tensor_converter` as a `staticmethod` on each (the inner text submodel is also loadable standalone and must carry the converter).
+- **VLM + MoE + GPU+NPU patchgen** — `veomni/models_kernel/transformers/qwen3_vl_moe/`
   - `qwen3_vl_moe_gpu_patch_gen_config.py` — minimal config that imports *most* VLM SP / deepstack / async-Ulysses / dummy_forward patches from `qwen3_vl` via `name_map={"Qwen3VL": "Qwen3VLMoe"}`, and only writes MoE-specific deltas: `replace_class("Qwen3VLMoeExperts")` with fused layout, `override_method("Qwen3VLMoeModel.__init__")` to propagate `_moe_implementation` into `config.text_config`, a hand-cloned `Qwen3VLMoeModel.forward` (see below), `Qwen3VLMoeForConditionalGeneration.forward` with fused loss + aux_loss, and `get_parallel_plan`. This is the canonical template for any new VLM+MoE migration. **Exception — do NOT reuse `Model.forward` via name_map**: `Qwen3VLMoeModelOutputWithPast` carries an extra `router_logits` field absent from the dense `Qwen3VLModelOutputWithPast`; rewriting class names at the AST level keeps the dense constructor's argument list, silently dropping `router_logits` and collapsing MoE routing. Clone the forward body and hand-author the return.
   - `checkpoint_tensor_converter.py` — HF ships *fused* expert tensors under the *same key names* as VeOmni but in transposed layout (`[E, H, 2*I]` vs `[E, 2*I, H]`). Uses dim-1 shape dispatch to recognize HF vs VeOmni layout, passes VeOmni-native tensors through untouched, and hard-errors on unrecognized shapes — see Phase 3 "round-trip safety".
-- **Text + linear attention (`qwen3_5`) / VLM + MoE (`qwen3_5_moe`)** — `veomni/models/transformers/qwen3_5/`, `qwen3_5_moe/`
+- **Text + linear attention (`qwen3_5`) / VLM + MoE (`qwen3_5_moe`)** — `veomni/models_kernel/transformers/qwen3_5/`, `qwen3_5_moe/`
   - `qwen3_5_moe_gpu_patch_gen_config.py` — demonstrates `config.drop_import_names(...)`, `config.add_post_import_block(...)`, cross-config reuse via `from ...qwen3_5.qwen3_5_gpu_patch_gen_config import <fn>`, and `name_map={"Qwen3_5": "Qwen3_5Moe"}` on `override_method` to share patches between sibling configs.
-- **MLA + MoE (GLM)** — `veomni/models/transformers/glm_moe_dsa/`
+- **MLA + MoE (GLM)** — `veomni/models_kernel/transformers/glm_moe_dsa/`
   - Sibling `glm_moe_dsa_{gpu,npu}_patch_gen_config.py` produces separate `generated/*_{gpu,npu}.py` outputs.
 
 ---
@@ -165,10 +168,10 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
 
 **Operations:**
 
-1. Confirm model exists at `veomni/models/transformers/<M>/`. If not, the task is
+1. Confirm model exists at `veomni/models_kernel/transformers/<M>/`. If not, the task is
    "add new model" — use `/veomni-new-model` instead.
 2. If a patchgen-generated file already exists under
-   `veomni/models/transformers/<M>/generated/` you are **refreshing** an
+   `veomni/models_kernel/transformers/<M>/generated/` you are **refreshing** an
    existing config (e.g. picking up upstream changes, adding NPU sibling,
    fixing a bug). Otherwise you are adding patchgen support to a model whose
    `__init__.py` previously imported HF classes directly. Either way, the rest
@@ -194,7 +197,7 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
    diverge between sibling models — see
    `docs/transformers_v5/transformers_v5_moe_weight_loading.md`.
 6. Note related configs/loaders to preserve: `MODELING_REGISTRY`,
-   `MODEL_CONFIG_REGISTRY` in `veomni/models/loader.py`; any auto-config
+   `MODEL_CONFIG_REGISTRY` in `veomni/models_kernel/registry.py`; any auto-config
    registrations.
 7. Look for a **sibling model** you can borrow patches from: e.g. qwen3_5_moe
    reuses GatedDeltaNet/ViT patches from `qwen3_5` via direct import +
@@ -209,7 +212,7 @@ model directory to mirror, and the backend/category decision pinned down.
 
 ## Phase 2: Draft `<M>_gpu_patch_gen_config.py`
 
-Create `veomni/models/transformers/<M>/<M>_gpu_patch_gen_config.py` at the model root.
+Create `veomni/models_kernel/transformers/<M>/<M>_gpu_patch_gen_config.py` at the model root.
 
 **Skeleton (mirror `qwen3_gpu_patch_gen_config.py`):**
 
@@ -299,7 +302,7 @@ generated file, and the TTS path is excluded anyway.
 **Cross-config reuse pattern** (qwen3_5_moe reusing qwen3_5):
 
 ```python
-from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+from veomni.models_kernel.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_vision_model_forward,
     # ...
@@ -439,12 +442,12 @@ Guidelines:
 
 ```
 patchgen \
-    veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
-    -o veomni/models/transformers/<m>/generated --diff
+    veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config \
+    -o veomni/models_kernel/transformers/<m>/generated --diff
 ```
 
 **Validation**: file is syntactically valid (import it: `python -c "import
-veomni.models.transformers.<m>.<m>_gpu_patch_gen_config"`) and every behaviour
+veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config"`) and every behaviour
 identified in Phase 1 has a corresponding decorator here.
 
 ---
@@ -494,12 +497,12 @@ Two authoritative sources:
 **Pick the template by the verified HF layout, not by model family:**
 
 - **HF ships per-expert split keys** (`*.mlp.experts.{j}.{gate|up|down}_proj.weight`)
-  → template = `veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`.
+  → template = `veomni/models_kernel/transformers/qwen3_moe/checkpoint_tensor_converter.py`.
   The regex only matches *HF-side* keys, so a v5-saved fused-key checkpoint
   passes through the converter untouched — no round-trip hazard.
 - **HF ships fused expert keys with same names as v5** (`*.mlp.experts.{gate_up_proj|down_proj}`
   at the module level, not per-expert) → template =
-  `veomni/models/transformers/qwen3_vl_moe/checkpoint_tensor_converter.py`.
+  `veomni/models_kernel/transformers/qwen3_vl_moe/checkpoint_tensor_converter.py`.
   Key names collide with v5 output, so you **must** use shape-based dispatch
   (see "Round-trip safety" below); blindly transposing corrupts v5-saved ckpts.
 
@@ -551,10 +554,10 @@ tensors through and confirm they come out identical (no transpose applied).
 
 Pick one of three patterns based on Phase 1's backend + capability decision.
 
-**Pattern A — text LLM / dense (qwen3 style):**
+**Pattern A — text LLM / dense:**
 
 ```python
-from ...loader import MODELING_REGISTRY
+from veomni.models_kernel.registry import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("<m>")
@@ -569,7 +572,7 @@ def register_<m>_modeling(architecture: str):
     return <M>Model
 ```
 
-**Pattern B — MoE (qwen3_moe style):** same as A, plus register the converter
+**Pattern B — MoE:** same as A, plus register the converter
 on each generated model class:
 
 ```python
@@ -584,12 +587,12 @@ for model_cls in (<M>ForCausalLM, <M>Model, ...):
 `staticmethod(...)` is required — the loader calls it as
 `model._create_checkpoint_tensor_converter(model)`.
 
-**Pattern C — GPU + NPU sibling (glm_moe_dsa / qwen3_vl style):** branch on
+**Pattern C — GPU + NPU sibling (see the registered DeepSeek-V4 package):** branch on
 `IS_NPU_AVAILABLE` between the two generated modules:
 
 ```python
 from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+from veomni.models_kernel.registry import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("<m>")
@@ -619,8 +622,8 @@ def register_<m>_modeling(architecture: str):
 1. Regenerate:
    ```bash
    patchgen \
-       veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
-       -o veomni/models/transformers/<m>/generated --diff -v
+       veomni.models_kernel.transformers.<m>.<m>_gpu_patch_gen_config \
+       -o veomni/models_kernel/transformers/<m>/generated --diff -v
    ```
 2. Inspect `generated/patched_modeling_<m>_gpu.py`:
    - Header lists every patch you defined under "Patches applied".
@@ -680,7 +683,7 @@ Follow `docs/transformers_v5/testing_new_model.md`. Minimum coverage:
    covers single-GPU vs FSDP2 `grad_norm` for *text* models only. If the model
    is text-only, append to the text test cases list. VLM/Omni models are out
    of scope for this suite (no VLM scaffolding exists).
-7. **MoE only** — `tests/models/test_checkpoint_tensor_converter.py`: add a
+7. **MoE only** — `tests/models_kernel/test_checkpoint_tensor_converter.py`: add a
    test group mirroring the existing `qwen3_moe` / `qwen3_vl_moe` blocks.
    Minimum coverage:
    - `can_handle` — matches the expected key regex, rejects non-expert keys.
@@ -966,13 +969,11 @@ Extra e2e gotchas:
   hits the right order and the error never fires. Only matters if your smoke
   test calls the registries directly in the wrong order. Confirmed on
   qwen2_5_omni / qwen3_omni_moe.
-- **Text/MoE models silently fail on NPU CI with `KeyError: "Unknown kernel
-  'npu' for op='rotary_pos_emb'/'rms_norm'"`** — the `KERNEL_REGISTRY` (used
-  by the OpSlot path in patchgen-generated modeling) currently registers only
-  the `liger_kernel` GPU backend for `rotary_pos_emb/full` and
-  `rms_norm/standard`. Until matching NPU `KernelSpec`s are added, every
-  patchgen-generated text/MoE model that runs on NPU CI must be pinned to
-  eager via `_NPU_PER_MODEL_OVERRIDES` in `tests/tools/training_utils.py`:
+- **A selected implementation is unavailable on NPU CI** —
+  `VeomniKernel` resolves the exact `(kernel, variant, implementation)` row and
+  fails when its device requirement is not satisfied. Pin the affected model
+  to a registered NPU or eager implementation through
+  `_NPU_PER_MODEL_OVERRIDES` in `tests/tools/training_utils.py`:
   ```python
   "<model_name>": {
       "rms_norm_implementation": "eager",
@@ -981,10 +982,9 @@ Extra e2e gotchas:
   ```
   Match the `model_name` exactly to the key used in `test_e2e_parallel.py`'s
   parametrize (e.g. `"qwen2"`, `"qwen3_moe"`, `"llama3.1"`, `"qwen2_5_omni"`).
-  Skipping this step is the canonical "GPU CI is green but NPU CI explodes at
-  model build" symptom. Multimodal/Omni models often need the override on
-  **both** `rms_norm_implementation` and `rotary_pos_emb_implementation`
-  because the audio/vision encoders pull the same OpSlots as the text tower.
+  Multimodal/Omni models often need the override on **both**
+  `rms_norm_implementation` and `rotary_pos_emb_implementation` because the
+  audio/vision encoders resolve the same kernel families as the text tower.
 - **`pytest -k` mismatch on e2e** — `test_e2e_parallel.py` uses the first
   positional arg (`model_name`) as id, not the registry `<m>` id. For VL
   models that's the HF short name (`qwen25vl`, `qwen3vl`, `qwen3vlmoe`, …),
@@ -1005,23 +1005,23 @@ Extra e2e gotchas:
   leave `gate_up_proj` un-sharded and EP training hits
   `AssertionError: len(cumsum_M) == b.shape[0]` inside `group_gemm_same_nk`
   (cumsum length = `E_local`, but the weight has all `E` experts). See
-  `veomni/models/transformers/deepseek_v3/parallel_plan.py`.
+  `veomni/models_kernel/transformers/deepseek_v3/parallel_plan.py`.
 - **Checkpoint converters must detect the fused layout** — HF checkpoints may
   already ship `experts.gate_up_proj` / `experts.down_proj`. A
   `CheckpointTensorConverter` that unconditionally stacks per-expert
   `gate_proj`/`up_proj`/`down_proj` will raise
   `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence check,
   skip stacking when fused keys are already present, and cover both layouts in
-  `tests/models/test_checkpoint_tensor_converter.py`.
+  `tests/models_kernel/test_checkpoint_tensor_converter.py`.
 
 ---
 
 ## Scope Guard
 
 This skill adds or refreshes patchgen-generated modeling for an **existing**
-model directory under `veomni/models/transformers/`. For:
+model directory under `veomni/models_kernel/transformers/`. For:
 
-- New model (does not yet exist under `veomni/models/transformers/`): use
+- New model (does not yet exist under `veomni/models_kernel/transformers/`): use
   `/veomni-new-model`.
 - New op / kernel: use `/veomni-new-op`.
 - uv / dependency bumps (e.g. upgrading the `transformers-stable` pin): use

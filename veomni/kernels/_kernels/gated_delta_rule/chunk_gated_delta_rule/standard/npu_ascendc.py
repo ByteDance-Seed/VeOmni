@@ -56,19 +56,23 @@ def _l2norm(x: Tensor, dim: int = -1, eps: float = 1e-6) -> Tensor:
 
 
 def _cdiv(a: Tensor, b: int) -> Tensor:
+    """Compute integer ceiling division elementwise."""
     return (a + b - 1) // b
 
 
 def _prepare_lens(cu_seqlens: Tensor) -> Tensor:
+    """Return individual sequence lengths from cumulative boundaries."""
     return cu_seqlens[1:] - cu_seqlens[:-1]
 
 
 def _prepare_chunk_indices(cu_seqlens: Tensor, chunk_size: int) -> Tensor:
+    """Build device-side sequence and chunk indices for variable lengths."""
     indices = torch.cat([torch.arange(n) for n in _cdiv(_prepare_lens(cu_seqlens), chunk_size).tolist()])
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
 
 
 def _prepare_chunk_indices_list(cu_seqlens: list[int] | Tensor, chunk_size: int) -> list[int]:
+    """Build the flattened host-side sequence and chunk index table."""
     if isinstance(cu_seqlens, Tensor):
         cu_seqlens = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
 
@@ -83,6 +87,7 @@ def _prepare_chunk_indices_list(cu_seqlens: list[int] | Tensor, chunk_size: int)
 
 
 def _as_int_list(value: list[int] | Tensor | None) -> list[int] | None:
+    """Normalize an optional integer tensor or sequence to a Python list."""
     if value is None:
         return None
     if isinstance(value, Tensor):
@@ -94,6 +99,7 @@ def _as_chunk_dict(
     value: dict[str, Tensor | None] | Tensor | None,
     chunk_size: int,
 ) -> dict[str, Tensor | None]:
+    """Normalize device chunk metadata to a mapping keyed by chunk size."""
     if value is None:
         return {}
     if isinstance(value, dict):
@@ -105,6 +111,7 @@ def _as_chunk_list_dict(
     value: dict[str, list[int] | None] | list[int] | Tensor | None,
     chunk_size: int,
 ) -> dict[str, list[int] | None]:
+    """Normalize host chunk metadata to a mapping keyed by chunk size."""
     if value is None:
         return {}
     if isinstance(value, dict):
@@ -113,11 +120,13 @@ def _as_chunk_list_dict(
 
 
 def _next_power_of_2(value: int) -> int:
+    """Return the smallest power of two greater than or equal to ``value``."""
     value = max(1, int(value))
     return 1 << (value - 1).bit_length()
 
 
 def _cumsum_block_t(g: Tensor, chunk_size: int) -> int:
+    """Choose the sequence tile used by the cumulative-sum kernel."""
     heads = int(g.shape[-1])
     return _next_power_of_2((1 << 17) // max(1, heads * int(chunk_size)))
 
@@ -130,6 +139,7 @@ def _ensure_varlen_metadata(
     chunk_indices: dict[str, Tensor | None] | Tensor | None = None,
     chunk_indices_list: dict[str, list[int] | None] | list[int] | Tensor | None = None,
 ) -> tuple[Tensor, list[int], dict[str, Tensor | None], dict[str, list[int] | None]]:
+    """Materialize every host and device table needed by variable-length kernels."""
     cu_seqlens = cu_seqlens.to(device=g.device, dtype=torch.int64)
     cu_seqlens_list = _as_int_list(cu_seqlens_list) or _as_int_list(cu_seqlens)
     assert cu_seqlens_list is not None
@@ -181,6 +191,7 @@ def _chunk_tensor(
     chunk_indices: dict[str, Tensor | None] | None,
     chunk_size: int,
 ) -> Tensor | None:
+    """Select device chunk metadata for one chunk size."""
     if chunk_indices is None:
         return None
     return chunk_indices.get(str(chunk_size))
@@ -190,6 +201,7 @@ def _chunk_list(
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
 ) -> list[int] | None:
+    """Select host chunk metadata for one chunk size."""
     if chunk_indices_list is None:
         return None
     return chunk_indices_list.get(str(chunk_size))
@@ -230,6 +242,7 @@ def _chunk_fwd(
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    """Run the AscendC forward stages and return backward intermediates."""
     _ensure_fla_npu_registered()
 
     from ...vendor.triton.cumsum import chunk_local_cumsum
@@ -326,6 +339,7 @@ def _chunk_bwd(
     chunk_indices_list: dict[str, list[int] | None] | None,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Run the AscendC backward stages for the chunked recurrence."""
     _ensure_fla_npu_registered()
 
     from ...vendor.triton.cumsum import chunk_local_cumsum

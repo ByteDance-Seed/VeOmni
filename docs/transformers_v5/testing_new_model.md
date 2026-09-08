@@ -1,6 +1,6 @@
 # Testing a New Model
 
-When adding a new model under `veomni/models/transformers/<model>/`, two test
+When adding a new model under `veomni/models_kernel/transformers/<model>/`, two test
 suites need updating:
 
 1. **`tests/models/test_models_patch.py`** — single-GPU forward/backward

@@ -66,10 +66,28 @@ def _release():
 
 
 def _apply_determinism():
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_backend_flags():
+    """Scope mutable CUDA backend flags so test order cannot freeze or leak them."""
+    if not IS_CUDA_AVAILABLE:
+        yield
+        return
+
+    prev_deterministic = torch.are_deterministic_algorithms_enabled()
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled,
+        benchmark=False,
+        benchmark_limit=torch.backends.cudnn.benchmark_limit,
+        deterministic=True,
+        allow_tf32=False,
+    ):
+        try:
+            yield
+        finally:
+            torch.use_deterministic_algorithms(prev_deterministic, warn_only=True)
 
 
 def _have_python_dev_headers() -> bool:

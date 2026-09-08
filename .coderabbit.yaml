@@ -21,6 +21,7 @@ reviews:
     - "!**/*.diff"
     - "!docs/assets/**"
     - "!veomni/models/transformers/**/generated/**"
+    - "!veomni/models_kernel/transformers/**/generated/**"
     - "!uv.lock"
   path_instructions:
     - path: "veomni/distributed/**"
@@ -39,10 +40,10 @@ reviews:
         - IGNORE_INDEX is -100 and must be preserved for loss masking, including packed-sample boundaries.
         - Dynamic batching token counting must match dyn_bsz_count_mode.
         - Multimodal placeholder IDs and masks must stay consistent with TYPE2INDEX.
-    - path: "veomni/models/**"
+    - path: "veomni/models_kernel/**"
       instructions: |
         Focus on model loading and patchgen.
-        - Do not request edits under veomni/models/transformers/*/generated/. Change patch_spec.py or modeling_*_patch.py instead.
+        - Do not request edits under veomni/models_kernel/transformers/*/generated/. Change the patchgen config instead.
         - Model registration must happen at import time.
         - config model_type must match the registry key.
         - New modeling must target transformers 5.9.0 and FSDP2.

@@ -55,6 +55,7 @@ def _chunk_fwd(
     cu_seqlens: Tensor | None,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    """Run the vendored Triton forward stages and return backward intermediates."""
     from ...vendor.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
     from ...vendor.triton.chunk_o import chunk_fwd_o
     from ...vendor.triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -110,6 +111,7 @@ def _chunk_bwd(
     cu_seqlens: Tensor | None,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor | None]:
+    """Run the vendored Triton backward stages for the chunked recurrence."""
     from ...vendor.triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
     from ...vendor.triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local
     from ...vendor.triton.cumsum import chunk_local_cumsum

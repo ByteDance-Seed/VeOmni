@@ -3,7 +3,7 @@ from PIL import Image
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.multimodal.video_utils import write_video_audio
-from veomni.models.diffusers.minimax_h3.inference import MiniMaxH3Pipeline
+from veomni.models_kernel.diffusers.minimax_h3.inference import MiniMaxH3Pipeline
 from veomni.utils.device import get_device_type
 
 
@@ -19,7 +19,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     },
     transformer_config_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json",
     transformer_weights_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer",
-    ops_implementation=OpsImplementationConfig(
+    kernels_implementation=OpsImplementationConfig(
         attn_implementation="eager",
         rotary_pos_emb_implementation="eager",
         rms_norm_implementation="eager",

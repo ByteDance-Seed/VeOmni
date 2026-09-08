@@ -48,9 +48,11 @@ logger = logging.get_logger(__name__)
 
 
 def raise_unsupported_veomni_modeling(model_name: str) -> None:
+    """Raise a model-build error that names the available VeOmni model types."""
+    supported = ", ".join(sorted(MODELING_REGISTRY.valid_keys())) or "none"
     raise RuntimeError(
-        f"{model_name} does not have a VeOmni modeling path. Set MODELING_BACKEND=hf "
-        f"to bypass VeOmni patches and load upstream HuggingFace classes directly."
+        f"{model_name} is not registered in veomni.models_kernel; registered model types: {supported}. "
+        "Set MODELING_BACKEND=hf to load the upstream HuggingFace class without VeOmni model kernels."
     )
 
 
@@ -116,6 +118,7 @@ def get_model_class(model_config: PretrainedConfig):
     """Return the registered modeling class, or the HuggingFace Auto class."""
 
     def get_model_arch_from_config(model_config):
+        """Return the first architecture name declared by a model config."""
         arch_name = model_config.architectures
         if isinstance(arch_name, list):
             arch_name = arch_name[0]
@@ -125,6 +128,8 @@ def get_model_class(model_config: PretrainedConfig):
     model_type = model_config.model_type
     modeling_backend = get_env("MODELING_BACKEND")
     if modeling_backend != "hf":
+        if model_type not in MODELING_REGISTRY.valid_keys():
+            raise_unsupported_veomni_modeling(model_type)
         return MODELING_REGISTRY[model_type](arch_name)
     if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():
         load_class = AutoModelForImageTextToText

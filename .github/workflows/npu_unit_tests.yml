@@ -157,6 +157,7 @@ jobs:
           uv run --frozen pytest -v -s -x tests/parallel/test_parallel_state_registry.py
       - name: Run models tests
         run: |
+          uv run --frozen pytest -v -s -x tests/models_kernel
           uv run --frozen pytest -v -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -v -s -x tests/models/test_models_patch.py
           uv run --frozen pytest -v -s -x tests/models/test_padded_packed_loss.py
@@ -187,10 +188,9 @@ jobs:
       - name: Run data tests
         run: |
           uv run --frozen pytest -v -s -x tests/data
-      - name: Run ops tests
+      - name: Run kernels tests
         run: |
-          uv run --frozen pytest -v -s -x tests/ops/test_comp.py
-          uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
+          uv run --frozen pytest -v -s -x tests/kernels
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py

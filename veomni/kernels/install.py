@@ -128,6 +128,7 @@ def patch_transformers_hub_kernel_loader_for_veomni() -> None:
         attention_wrapper: Callable | None = None,
         allow_all_kernels: bool = False,
     ) -> SimpleNamespace | object:
+        """Load VeOmni FlashAttention locally and delegate every other name."""
         if attn_implementation in VEOMNI_FLASH_ATTN_IMPL_MAPPING:
             return _load_veomni_local_flash_kernel(attn_implementation)
 

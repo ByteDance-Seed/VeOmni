@@ -371,7 +371,7 @@ def parallelize_model_fsdp2(
         parallel_plan = get_runtime_parallel_plan(model)
         assert parallel_plan is not None, (
             "ExtraParallel needs parallel plan defined in the model! \
-            Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
+            Please see veomni/models_kernel/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
             Please see tests/utils/test_extra_parallel_clip_grad_norm.py::test_clip_grad_norm_fsdp2_ep2_emb4 \
             for example of expert parallelism + embed parallelism."
         )

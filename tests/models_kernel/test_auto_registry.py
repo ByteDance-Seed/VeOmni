@@ -48,7 +48,7 @@ def _tiny_qwen3_config() -> Qwen3Config:
 
 
 def test_get_model_class_unknown_type_raises():
-    with pytest.raises(ValueError, match="Unknown Modeling"):
+    with pytest.raises(RuntimeError, match="qwen3.*not registered in veomni.models_kernel.*deepseek_v4"):
         get_model_class(_tiny_qwen3_config())
 
 
@@ -74,7 +74,7 @@ def test_build_foundation_model_installs_kernels_config():
     cfg = eager_kernels_config()
     try:
         set_kernels_config(None)
-        with pytest.raises(ValueError, match="Unknown Modeling"):
+        with pytest.raises(RuntimeError, match="not registered in veomni.models_kernel"):
             build_foundation_model(_tiny_qwen3_config(), kernels_implementation=cfg)
         assert get_kernels_config() is cfg
     finally:

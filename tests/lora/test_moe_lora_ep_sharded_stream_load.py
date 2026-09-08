@@ -22,7 +22,7 @@ weights to the reference broadcast loader.
 What ``ep_sharded_stream_load`` does for a PEFT model
 -----------------------------------------------------
 ``load_model_weights_ep_sharded`` under ``is_peft_model=True`` (wired in
-``veomni/models/module_utils.py``):
+``veomni/models_kernel/checkpoint/weights.py``):
 
   * **Base experts** — the fused ``...experts.gate_up_proj`` /
     ``down_proj`` tensors are streamed from the base checkpoint straight

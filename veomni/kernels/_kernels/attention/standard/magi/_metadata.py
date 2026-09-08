@@ -22,6 +22,8 @@ import torch
 
 @dataclass(frozen=True)
 class _CacheEntry:
+    """One prepared attention argument and the tensor identity key it serves."""
+
     key: tuple[object, ...]
     attn_arg: object
 

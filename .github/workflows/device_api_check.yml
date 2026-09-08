@@ -32,3 +32,7 @@ jobs:
       - name: Run device api usage normativity in VeOmni/tests
         run: |
           python tests/special_sanity/check_device_api_usage.py -d tests
+      - name: Run kernel architecture guards
+        run: |
+          python -c "from tests.special_sanity.test_kernel_architecture import test_active_tree_uses_kernel_architecture_paths, test_model_entry_points_forward_kernel_selection; test_active_tree_uses_kernel_architecture_paths(); test_model_entry_points_forward_kernel_selection()"
+          python -c "from tests.kernels.base.test_kernel_documentation import test_owned_kernel_modules_and_callables_have_docstrings; test_owned_kernel_modules_and_callables_have_docstrings()"

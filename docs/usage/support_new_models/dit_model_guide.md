@@ -5,8 +5,8 @@
 > follow a different integration pattern from the LLM/VLM guide.
 
 For reference, the complete Wan2.1 I2V integration lives in:
-- `veomni/models/diffusers/wan_t2v/wan_condition/` — condition model
-- `veomni/models/diffusers/wan_t2v/wan_transformer/` — transformer model
+- `veomni/models_kernel/diffusers/wan_t2v/wan_condition/` — condition model
+- `veomni/models_kernel/diffusers/wan_t2v/wan_transformer/` — transformer model
 
 ---
 
@@ -138,8 +138,8 @@ Qwen-Image follows the same condition/transformer split as Wan, with a
 text-to-image condition model and a trainable `QwenImageTransformer2DModel`
 wrapper:
 
-- `veomni/models/diffusers/qwen_image/qwen_image_condition/`
-- `veomni/models/diffusers/qwen_image/qwen_image_transformer/`
+- `veomni/models_kernel/diffusers/qwen_image/qwen_image_condition/`
+- `veomni/models_kernel/diffusers/qwen_image/qwen_image_transformer/`
 - `configs/dit/qwen_image_sft.yaml`
 
 Qwen-Image supports GPU FSDP2 full-parameter training and Ulysses sequence
@@ -214,23 +214,33 @@ the diffusers `__init__` runs.
 ## Step 1: Create the Directory Structure
 
 ```bash
-mkdir -p veomni/models/diffusers/your_dit/your_condition/
-mkdir -p veomni/models/diffusers/your_dit/your_transformer/
+mkdir -p veomni/models_kernel/diffusers/your_dit/your_condition/
+mkdir -p veomni/models_kernel/diffusers/your_dit/your_transformer/
 
-touch veomni/models/diffusers/your_dit/__init__.py
-touch veomni/models/diffusers/your_dit/your_condition/__init__.py
-touch veomni/models/diffusers/your_dit/your_condition/configuration_your_condition.py
-touch veomni/models/diffusers/your_dit/your_condition/modeling_your_condition.py
-touch veomni/models/diffusers/your_dit/your_transformer/__init__.py
-touch veomni/models/diffusers/your_dit/your_transformer/configuration_your_transformer.py
-touch veomni/models/diffusers/your_dit/your_transformer/modeling_your_transformer.py
+touch veomni/models_kernel/diffusers/your_dit/__init__.py
+touch veomni/models_kernel/diffusers/your_dit/your_condition/__init__.py
+touch veomni/models_kernel/diffusers/your_dit/your_condition/configuration_your_condition.py
+touch veomni/models_kernel/diffusers/your_dit/your_condition/modeling_your_condition.py
+touch veomni/models_kernel/diffusers/your_dit/your_transformer/__init__.py
+touch veomni/models_kernel/diffusers/your_dit/your_transformer/configuration_your_transformer.py
+touch veomni/models_kernel/diffusers/your_dit/your_transformer/modeling_your_transformer.py
 ```
 
-Then add your module to `veomni/models/diffusers/__init__.py`:
+Then add your module to `veomni/models_kernel/diffusers/__init__.py`:
 
 ```python
 from . import your_dit
 ```
+
+Also expose the diffusers registration side effects from
+`veomni/models_kernel/__init__.py`:
+
+```python
+from . import diffusers, transformers
+```
+
+Add that root import only when the family is fully registered. The current
+placeholder diffusers packages are intentionally not public registry entries.
 
 ---
 
@@ -330,8 +340,8 @@ separately for logging/visualization).
 ## Step 4: Register the Condition Model
 
 ```python
-# veomni/models/diffusers/your_dit/your_condition/__init__.py
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+# veomni/models_kernel/diffusers/your_dit/your_condition/__init__.py
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("YourConditionModel")
 def register_config():
@@ -560,7 +570,7 @@ Ulysses SP requires an AllToAll before and after the attention kernel.
 For diffusers models this is done via an **attention processor** installed with
 `attn.set_processor(...)`.
 
-### Pattern (mirrors `veomni/ops/kernels/attention` registration)
+### Pattern (uses the registered attention interfaces in `veomni/kernels`)
 
 1. Implement a `your_eager_attention_forward` function — the non-flash fallback.
    It must follow the `ALL_ATTENTION_FUNCTIONS` calling convention:
@@ -570,7 +580,7 @@ For diffusers models this is done via an **attention processor** installed with
 
 2. In `YourSPAttnProcessor.__init__`, store the implementation name and expose
    the attributes that `flash_attention_forward` (from
-   `veomni/ops/kernels/attention`)
+   `veomni/kernels/_kernels/attention/standard/flash.py`)
    reads from `module`:
 
    ```python
@@ -609,9 +619,8 @@ For diffusers models this is done via an **attention processor** installed with
    )[0]  # returns (B, seq, heads, head_dim)
    ```
 
-   The `veomni_flash_attention_*_with_sp` functions registered in
-   `ALL_ATTENTION_FUNCTIONS` (see
-   `veomni/ops/kernels/attention/__init__.py`) will
+   The `veomni_flash_attention_*` functions registered in
+   `ALL_ATTENTION_FUNCTIONS` (see `veomni/kernels/install.py`) will
    select the correct FA2/FA3/FA4 kernel automatically.
 
 5. Install the processor on every attention block:
@@ -631,8 +640,8 @@ For diffusers models this is done via an **attention processor** installed with
 ## Step 10: Register the Transformer Model
 
 ```python
-# veomni/models/diffusers/your_dit/your_transformer/__init__.py
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+# veomni/models_kernel/diffusers/your_dit/your_transformer/__init__.py
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("YourTransformerModel")
 def register_config():
@@ -662,7 +671,7 @@ model:
   config_path: ./configs/model_configs/your_model/your_model.json
   condition_model_path: YourOrg/YourModel-Diffusers
   ops_implementation:
-    attn_implementation: veomni_flash_attention_2_with_sp
+    attn_implementation: veomni_flash_attention_2
 
 train:
   accelerator:
@@ -730,8 +739,9 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 
 ### Any New DiT Model
 
-- [ ] `veomni/models/diffusers/your_dit/__init__.py` (imports sub-packages)
-- [ ] `veomni/models/diffusers/__init__.py` updated with `from . import your_dit`
+- [ ] `veomni/models_kernel/diffusers/your_dit/__init__.py` (imports sub-packages)
+- [ ] `veomni/models_kernel/diffusers/__init__.py` updated with `from . import your_dit`
+- [ ] `veomni/models_kernel/__init__.py` imports `diffusers` so registration runs
 - [ ] Condition model config: `PretrainedConfig` subclass with `get_config_dict` override
 - [ ] Condition model: `get_condition()` and `process_condition()` implemented
 - [ ] Condition model registered in `MODEL_CONFIG_REGISTRY` and `MODELING_REGISTRY`
@@ -746,7 +756,7 @@ Copy the remaining fields from the Diffusers transformer config into the same JS
 
 ### If Supporting Ulysses SP
 
-- [ ] `_VEOMNI_SP_ATTN_IMPLS` frozenset defined (the three `veomni_flash_attention_*_with_sp` names)
+- [ ] The model recognizes the three `veomni_flash_attention_*` names as SP-aware attention
 - [ ] `YourEagerAttentionForward` function with `ALL_ATTENTION_FUNCTIONS` convention
 - [ ] `YourSPAttnProcessor` with `SimpleNamespace` config, `is_causal=False`, `layer_idx=None`
 - [ ] SP guard in forward patch: slice/gather only when `ulysses_enabled and attn_impl in _VEOMNI_SP_ATTN_IMPLS`

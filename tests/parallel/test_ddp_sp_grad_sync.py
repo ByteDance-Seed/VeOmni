@@ -83,7 +83,7 @@ def main() -> None:
     from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state, init_parallel_state
     from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
     from veomni.distributed.torch_parallelize import build_parallelize_model
-    from veomni.models.module_utils import init_empty_weights
+    from veomni.models_kernel.checkpoint.weights import init_empty_weights
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ulysses-size", type=int, required=True)

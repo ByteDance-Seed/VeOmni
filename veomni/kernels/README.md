@@ -5,8 +5,7 @@ implementations. Model-specific input normalization, Hugging Face-compatible
 signatures, and loss policy belong in `veomni.models_kernel`.
 
 Importing `veomni.kernels` registers every built-in kernel family and applies
-the process-wide attention integration from `install.py`. The old
-`veomni.ops` dispatch layer is not part of this design.
+the process-wide attention integration from `install.py`.
 
 ## Layout
 
@@ -21,6 +20,10 @@ veomni/kernels/
 ├── batch_invariant/     Opt-in ATen patch; not a registered kernel family
 └── _kernels/            Tensor-level implementations and registrations
 ```
+
+Python modules maintained by VeOmni document every module, class, and
+callable. Directories named `vendor/` mirror external implementations and
+retain their upstream source layout and documentation style.
 
 Registered rows use the identity:
 

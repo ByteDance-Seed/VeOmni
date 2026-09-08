@@ -11,7 +11,7 @@ from safetensors.torch import safe_open
 from tqdm import tqdm
 from transformers import AutoConfig
 
-from veomni.models import save_model_weights
+from veomni.models_kernel import save_model_weights
 
 
 _DEPRECATION_MESSAGE = (

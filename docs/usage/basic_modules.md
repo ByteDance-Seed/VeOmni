@@ -210,7 +210,7 @@ The text transforms are registered in [veomni/data/data_transform.py](https://gi
 **Pretrain Example**:  
 ```python
 from veomni.data import build_data_transform
-from veomni.models import build_tokenizer
+from veomni.models_kernel import build_tokenizer
 
 tokenizer = build_tokenizer(args.model.tokenizer_path)
 # Can replace with the following code if you want to use the AutoTokenizer from transformers.
@@ -247,7 +247,7 @@ VeOmni offers unified multimodal transform functions in [veomni/data/data_transf
 Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
 ```python
 from veomni.data import build_chat_template, build_data_transform
-from veomni.models import build_processor
+from veomni.models_kernel import build_processor
 
 processor = build_processor(args.model.tokenizer_path)
 chat_template = build_chat_template(args.data.chat_template, processor)
@@ -347,17 +347,17 @@ An example of usage in `def build_data_collate_info` in [veomni/trainer/vlm_trai
 - meta device init
 - init model from model config or weights path
 
-- source code [veomni/models/auto.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/auto.py)
+- source code [veomni/models_kernel/auto.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models_kernel/auto.py)
 
 ```python
-from veomni.models import build_foundation_model
+from veomni.models_kernel import build_foundation_model
 
 model = build_foundation_model(
     config_path=args.model.config_path, # model config path, can be None if weights_path is not None
     weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
     init_device=args.train.init_device, # model init device
     torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-    ops_implementation=args.model.ops_implementation,
+    kernels_implementation=args.model.ops_implementation,
     config_kwargs=config_kwargs,
 )
 

@@ -74,6 +74,7 @@ def npu_group_gemm(x, weight, group_list):
 
 
 def _eager_clamped_swiglu(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """Apply clamped SwiGLU with eager PyTorch operations."""
     gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(max=limit)
     up = up.clamp(min=-limit, max=limit)
@@ -98,6 +99,7 @@ def _fc1_weight(
 
 
 def _is_triton_ascend_available() -> bool:
+    """Return whether the installed Triton runtime includes the Ascend backend."""
     try:
         from triton._C import libtriton
     except ImportError:

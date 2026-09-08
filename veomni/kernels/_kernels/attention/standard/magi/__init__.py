@@ -68,6 +68,7 @@ def _magi_attention_forward(
 
 
 def _validate_qkv(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> None:
+    """Validate the Q/K/V layout, batch size, head ratio, and device."""
     for name, tensor in (("query", query), ("key", key), ("value", value)):
         if tensor.ndim != 4:
             raise ValueError(

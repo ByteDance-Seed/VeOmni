@@ -222,7 +222,7 @@ pipe = MiniMaxH3Pipeline.from_pretrained(
     },
     transformer_config_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json",
     transformer_weights_path="pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer",
-    ops_implementation=OpsImplementationConfig(
+    kernels_implementation=OpsImplementationConfig(
         attn_implementation="eager",
         rotary_pos_emb_implementation="eager",
         rms_norm_implementation="eager",

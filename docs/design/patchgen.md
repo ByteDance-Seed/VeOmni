@@ -12,23 +12,23 @@ such as `from veomni.patchgen import PatchConfig`.
 
 ```bash
 # Generate patched Qwen3 GPU modeling code
-# (writes to veomni/models/transformers/qwen3/generated/)
-patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
+# (writes to veomni/models_kernel/transformers/qwen3/generated/)
+patchgen veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config
 
 # With verbose output
-patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -v
+patchgen veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config -v
 
 # Dry run (preview without writing)
-patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --dry-run
+patchgen veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config --dry-run
 
 # Custom output directory
-patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -o /path/to/output
+patchgen veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config -o /path/to/output
 
 # List available patch configurations
 patchgen --list
 
 # Save unified diff alongside generated modeling code
-patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
+patchgen veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
 
 # Drift gate (CI mode): exit 1 if checked-in generated files are stale
 patchgen --check
@@ -38,9 +38,8 @@ The `patchgen` console script reads `[tool.patchgen]` from the nearest `pyprojec
 
 ```toml
 [tool.patchgen]
-search_root = "veomni/models/transformers"
-package_prefix = "veomni.models.transformers"
-legacy_patches_prefix = "veomni.models.transformers.qwen3.patches"
+search_root = "veomni/models_kernel/transformers"
+package_prefix = "veomni.models_kernel.transformers"
 ```
 
 ## Project Structure
@@ -57,11 +56,9 @@ Open-VeOmni/
 │       ├── _normalize.py            # Shared ruff fix+format pipeline
 │       └── cli.py                   # `patchgen` console-script entry
 ├── veomni/
-│   ├── patchgen.py                  # back-compat shim: from patchgen import *
-│   └── models/transformers/qwen3/
+│   ├── patchgen/                    # package-level forwarding modules
+│   └── models_kernel/transformers/qwen3/
 │       ├── qwen3_gpu_patch_gen_config.py      # Qwen3 GPU patch config
-│       ├── patches/
-│       │   └── qwen3_gpu_patches.py            # Qwen3 GPU patch implementations
 │       └── generated/
 │           ├── patched_modeling_qwen3_gpu.py   # Generated output
 │           └── patched_modeling_qwen3_gpu.diff # Unified diff vs original
@@ -84,8 +81,8 @@ When adapting HuggingFace models for training frameworks (VeOmni, veRL, etc.), w
 Current approaches have significant drawbacks:
 
 ```python
-# BAD: Runtime monkey patching - hard to debug, order-dependent
-legacy_apply_runtime_patches()
+# Runtime mutation is hard to debug and order-dependent
+apply_runtime_patches()
 apply_logprobs_patch()
 apply_xpu_patch()
 
@@ -141,7 +138,7 @@ class Qwen3RMSNorm(nn.Module):
 
 ### 1. Create a Patch Configuration
 
-Create a new file under `veomni/models/transformers/<model>/`:
+Create a new file under `veomni/models_kernel/transformers/<model>/`:
 
 ```python
 # Either form works — patchgen.* is the canonical import path; the
@@ -219,7 +216,7 @@ config.exclude_from_output("Qwen3ForTokenClassification")
 ### 4. Generate Code
 
 ```bash
-patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -v
+patchgen veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config -v
 ```
 
 ## Patch Types Reference
@@ -286,7 +283,7 @@ The generated file includes:
 
 ## Example: Qwen3 GPU Patches
 
-See `veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py` for a complete example that includes:
+See `veomni/models_kernel/transformers/qwen3/qwen3_gpu_patch_gen_config.py` for a complete example that includes:
 
 - **LigerRMSNorm**: Fused kernel replacement for `Qwen3RMSNorm`
 - **LigerSwiGLUMLP**: Fused SwiGLU MLP replacement for `Qwen3MLP`
@@ -295,10 +292,10 @@ See `veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py` for a compl
 Run it:
 
 ```bash
-patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -v
+patchgen veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config -v
 ```
 
-Output: `veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py` (~600 lines of self-contained code)
+Output: `veomni/models_kernel/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py` (~600 lines of self-contained code)
 
 ## Comparing Generated vs Original Code
 
@@ -306,7 +303,7 @@ Use the `--diff` flag to save a unified diff file next to the generated modeling
 
 ```bash
 # Generate patched modeling code and save a .diff file in output directory
-patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
+patchgen veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
 ```
 
 With `--diff`, `patchgen` writes:
@@ -355,12 +352,12 @@ config.patches.append(patch)
 ```python
 from pathlib import Path
 from patchgen import ModelingCodeGenerator
-from veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config import config
+from veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config import config
 
 generator = ModelingCodeGenerator(config)
 generator.load_source()
 output = generator.generate(
-    Path("veomni/models/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py")
+    Path("veomni/models_kernel/transformers/qwen3/generated/patched_modeling_qwen3_gpu.py")
 )
 ```
 
@@ -383,7 +380,7 @@ usage: patchgen [-h] [-o OUTPUT_DIR] [-c CONFIG_NAME] [--list] [--all]
                 [patch_module]
 
 positional arguments:
-  patch_module          Patch module to use (e.g., 'veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config')
+  patch_module          Patch module to use (e.g., 'veomni.models_kernel.transformers.qwen3.qwen3_gpu_patch_gen_config')
 
 options:
   -h, --help            Show help message
@@ -417,8 +414,8 @@ make patchgen
 ### CI check
 
 The `check_patchgen.yml` workflow runs on PRs that touch `patchgen-pkg/**`,
-`veomni/patchgen/**`, `veomni/models/transformers/**`, `pyproject.toml`, or
-`uv.lock`. It:
+`veomni/patchgen/**`, `veomni/models_kernel/transformers/**`, `pyproject.toml`, or
+`uv.lock`. It checks the complete discovered config set. The workflow:
 
 1. Discovers all `*_patch_gen_config.py` files via the `[tool.patchgen]` section
 2. Regenerates each config to a temp file
@@ -447,11 +444,11 @@ patchgen --list
 
 ### Adding a new model
 
-1. Create `veomni/models/transformers/<model>/` with an `__init__.py` that
+1. Create `veomni/models_kernel/transformers/<model>/` with an `__init__.py` that
    registers the generated class in `MODELING_REGISTRY` under the config's
    exact `model_type`. Register a custom config or processor in
    `MODEL_CONFIG_REGISTRY` or `MODEL_PROCESSOR_REGISTRY` when the integration
-   provides one. Import the package from `veomni.models.transformers` so all
+   provides one. Import the package from `veomni.models_kernel.transformers` so all
    module-level registration runs at import time.
 2. Create `<model>_gpu_patch_gen_config.py` at the model root. Point its
    `PatchConfig` at the pinned Transformers source module and declare only the
@@ -461,10 +458,10 @@ patchgen --list
    metadata passed through model forward. Add only the narrow patchgen
    overrides that the model requires.
 4. Run
-   `patchgen veomni.models.transformers.<model>.<model>_gpu_patch_gen_config --dry-run`,
+   `patchgen veomni.models_kernel.transformers.<model>.<model>_gpu_patch_gen_config --dry-run`,
    then regenerate with `--diff -v`.
 5. Review both the generated output under
-   `veomni/models/transformers/<model>/generated/` and its diff against the
+   `veomni/models_kernel/transformers/<model>/generated/` and its diff against the
    upstream source. Never patch the generated file directly.
 6. Add a toy config plus registry, forward/backward, backend-routing, and
    parallelism tests appropriate to the model. Follow
@@ -480,7 +477,7 @@ patchgen --list
 
 ## Using patchgen from a dependent project
 
-`patchgen` is a standalone PyPI-shaped package, so projects that want to patch their own models — i.e. that hold patch configs **outside** the `veomni/models/transformers/` tree — depend on it directly and do not need to vendor any code or write their own CLI wrapper.
+`patchgen` is a standalone PyPI-shaped package, so projects that want to patch their own models — i.e. that hold patch configs **outside** the `veomni/models_kernel/transformers/` tree — depend on it directly and do not need to vendor any code or write their own CLI wrapper.
 
 ### 1. Depend on patchgen
 
@@ -506,9 +503,6 @@ ruff_extra_ignore = ["E501"]
 # Run ruff with --isolated so normalization is deterministic regardless
 # of which pyproject.toml ruff happens to discover. Recommended.
 ruff_isolated = true
-# Legacy patches.<name> shorthand expansion (rarely needed; VeOmni uses
-# this for its qwen3 tree).
-# legacy_patches_prefix = "<your_project>.models.qwen3.patches"
 ```
 
 The `patchgen` console script walks up from CWD looking for the nearest `pyproject.toml` with a `[tool.patchgen]` section and builds its `DiscoveryConfig` from that. CLI flags are unchanged.

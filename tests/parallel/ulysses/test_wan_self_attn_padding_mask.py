@@ -9,7 +9,7 @@ CPU with no distributed setup.
 
 import torch
 
-from veomni.models.transformers.wan.modeling_wan import eager_attention_forward
+from veomni.models_kernel.transformers.wan.modeling_wan import eager_attention_forward
 
 
 class _Module:

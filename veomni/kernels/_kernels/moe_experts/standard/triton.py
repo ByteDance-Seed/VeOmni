@@ -87,7 +87,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         )
 
         # MOE Step 5a: gpt-oss-style clamped SwiGLU. No-op when swiglu_limit
-        # is None (the legacy path). Saved tensors use the clamped values so
+        # is None. Saved tensors use the clamped values so
         # backward recomputation stays consistent.
         fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
             fc1_1_output, fc1_2_output, swiglu_limit
@@ -547,8 +547,8 @@ def group_gemm_fused_moe_forward(
 
     ``swiglu_limit``: gpt-oss / DeepSeek-V4 style clamp on the SwiGLU
     pre-activations (``gate.clamp(max=L)``, ``up.clamp(min=-L, max=L)``).
-    ``None`` disables the clamp (default, zero overhead — used by every legacy
-    MoE model).
+    ``None`` disables the clamp with zero overhead for models that use standard
+    SwiGLU.
     """
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:

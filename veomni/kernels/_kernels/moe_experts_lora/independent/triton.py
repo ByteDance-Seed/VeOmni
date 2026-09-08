@@ -171,6 +171,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
         lora_scale_up,
         lora_scale_down,
     ):
+        """Run non-EP fused MoE with independent expert LoRA weights."""
         splits = expert_histogram(expert_index, num_experts)
         scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
         scatter_output = moe_scatter(hidden_states, scatter_index)  # [T, H]   T = B*S*topk
@@ -283,6 +284,7 @@ class MergedFc1IndependentTritonFusedLoRAMoeExpertFunction(torch.autograd.Functi
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Backpropagate through non-EP fused MoE and independent LoRA."""
         (
             gate_weights,
             fc1_1_2_weight,
@@ -491,6 +493,7 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
         lora_scale_up,
         lora_scale_down,
     ):
+        """Run EP-local grouped GEMM with independent expert LoRA weights."""
         max_t = permute_tokens.shape[0]
 
         # Base fc1: [T_local, 2I]
@@ -583,6 +586,7 @@ class EPMergedFc1IndependentLoRAGroupGemm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Backpropagate through EP-local grouped GEMM and independent LoRA."""
         (
             permute_tokens,
             cumsum,

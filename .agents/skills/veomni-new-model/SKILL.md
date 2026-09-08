@@ -21,18 +21,18 @@ Phase 6: Test                          -> pending
 1. **Identify the model** on HuggingFace. Read its `config.json`, `modeling_*.py`, and any processor configs.
 
 2. **Determine model category**:
-   - Text-only LLM -> `veomni/models/transformers/<model_name>/`
-   - Vision-Language -> `veomni/models/transformers/<model_name>/` + `veomni/data/multimodal/`
+   - Text-only LLM -> `veomni/models_kernel/transformers/<model_name>/`
+   - Vision-Language -> `veomni/models_kernel/transformers/<model_name>/` + `veomni/data/multimodal/`
    - MoE model -> additional `veomni/distributed/moe/` integration
-   - Diffusion model -> `veomni/models/diffusers/<model_name>/`
+   - Diffusion model -> `veomni/models_kernel/diffusers/<model_name>/`
 
-3. **Check existing similar models**: Find the closest existing model in `veomni/models/transformers/` and use it as a reference. E.g., if adding a new Qwen variant, reference `qwen3/` or `qwen3_vl/`.
+3. **Check existing similar models**: Find the closest existing model in `veomni/models_kernel/transformers/` and use it as a reference. E.g., if adding a new Qwen variant, reference `qwen3/` or `qwen3_vl/`.
 
 4. **Identify required patches**: VeOmni uses a patchgen system (`veomni/patchgen/`) to auto-generate model patches from HuggingFace models. Check if a patch spec already exists or if one needs to be created.
 
 ## Phase 2: Create Model Patch
 
-1. **Create the model directory**: `veomni/models/transformers/<model_name>/`
+1. **Create the model directory**: `veomni/models_kernel/transformers/<model_name>/`
 
 2. **Required files**:
    - `__init__.py` — model registration (`MODELING_REGISTRY` / `MODEL_CONFIG_REGISTRY` / `MODEL_PROCESSOR_REGISTRY`)
@@ -42,10 +42,10 @@ Phase 6: Test                          -> pending
    - `generated/patched_modeling_<model_name>_{gpu,npu}.py` — patchgen output (do NOT edit manually)
 
 3. **Patch patterns** — follow existing models:
-   - Sequence parallel: declare an `OpSlot` for attention/loss and override `forward` via patchgen
-   - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and add a `veomni_moe_experts_forward` `OpSlot`
-   - Cross-entropy: add a `veomni_causal_lm_loss` `OpSlot` and return `CausalLMOutputWithLogProbs`
-   - Register the model class in the model package `__init__.py` (no entry in `veomni/models/auto.py` is needed for transformers models — registration happens via the per-model `MODELING_REGISTRY` decorators)
+   - Sequence parallel: construct an instance-local attention `VeomniKernel` and override `forward` via patchgen
+   - MoE: stack per-expert weights (`gate_up_proj [E, 2*I, H]` / `down_proj [E, H, I]`) and store a `moe_experts` `VeomniKernel` on the expert module
+   - Cross-entropy: bind a `cross_entropy_loss` `VeomniKernel` on the model instance and return `CausalLMOutputWithLogProbs`
+   - Register the model class in the model package `__init__.py` (no entry in `veomni/models_kernel/auto.py` is needed for transformers models — registration happens via the per-model `MODELING_REGISTRY` decorators)
 
 4. **Run patchgen**: `make patchgen` regenerates every `generated/patched_modeling_*.py` from the matching `*_patch_gen_config.py`.
 
@@ -60,7 +60,7 @@ Phase 6: Test                          -> pending
 
 3. If the model is MoE, define expert parallelism plan in addition to FSDP.
 
-4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`).
+4. Reference existing parallel plans for guidance (e.g., `veomni/models_kernel/transformers/qwen3_moe/parallel_plan.py`).
 
 ## Phase 4: Write Training Config
 
@@ -102,14 +102,14 @@ Phase 6: Test                          -> pending
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
 
-2. **Unit tests**: Add tests in `tests/models/` to verify:
-   - Model loads correctly via `veomni.models.auto`
+2. **Unit tests**: Add tests in `tests/models_kernel/` to verify:
+   - Model loads correctly via `veomni.models_kernel.auto`
    - Forward pass produces correct output shape
    - Model patch applies without errors
 
 3. **E2e tests** (if feasible): Test a short training run using the toy config.
 
-4. Run `make quality` and `pytest tests/models/`.
+4. Run `make quality` and `pytest tests/models_kernel/`.
 
 5. **Update documentation**:
    - Add usage example to `docs/` (training command, config reference).

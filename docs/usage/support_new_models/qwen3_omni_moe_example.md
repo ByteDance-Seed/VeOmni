@@ -5,8 +5,8 @@
 This document provides in-depth implementation details for each patch applied in the **Qwen3-Omni-MoE** integration — VeOmni's most complex model type, covering image, video, and audio modalities with MoE and Expert Parallelism. Use this alongside [guide_and_checklist.md](./guide_and_checklist.md).
 
 > **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`. The actual patches live in
-> [veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
+> `veomni/models_kernel/transformers/<model>/generated/`. The actual patches live in
+> [veomni/models_kernel/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models_kernel/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
 > patterns (config fix, FSDP dummy, SP, fused MoE, EP plan, processor patch)
 > are unchanged; what has changed is *where* the patches are declared

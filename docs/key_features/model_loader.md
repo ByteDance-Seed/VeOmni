@@ -18,8 +18,8 @@ To enable users to quickly train models from HuggingFace and flexibly train cust
 
 Users can directly load models from HuggingFace and start the training process by specifying the model name or model path. Additionally, they can implement their own custom models or enhance existing HuggingFace models with advanced features such as sequence parallelism or expert parallelism. Custom modeling can be implemented in one of the supported modeling paths:
 
-- `veomni/models/transformers/`
-- `veomni/models/diffusers/`
+- `veomni/models_kernel/transformers/`
+- `veomni/models_kernel/diffusers/`
 
 
 
@@ -27,7 +27,9 @@ Users can directly load models from HuggingFace and start the training process b
 
 ### 1. Create Your Model Implementation
 
-First, create new modeling file for your model implementation. Note that the custom models should inherit from `PreTrainedModel` and implement the necessary methods.
+Create a model package under `veomni/models_kernel/transformers/`. Declare
+model changes in a patchgen config and generate the modeling file; do not edit
+the generated output directly.
 
 
 ### 2. Register Your Model
@@ -48,44 +50,43 @@ class YourCustomConfig(PretrainedConfig):
 You can also use the model configuration from HuggingFace if you are only modifying the modeling component of an existing HuggingFace model.
 
 
-Here's a complete example of adding a new model:
+Register the generated model class from the package's `__init__.py`:
 
 ```python
-# veomni/models/transformers/your_custom_model.py
+# veomni/models_kernel/transformers/your_custom_model/__init__.py
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
-from transformers import PreTrainedModel, PretrainedConfig
+from .configuration_your_custom_model import YourCustomConfig
 
-class YourCustomConfig(PretrainedConfig):
-    model_type = "your_custom_model"
-    architectures = ["YourCustomModel"]
 
-class YourCustomModel(PreTrainedModel):
-    config_class = YourCustomConfig
+@MODEL_CONFIG_REGISTRY.register("your_custom_model")
+def register_config():
+    return YourCustomConfig
 
-    def __init__(self, config):
-        super().__init__(config)
-        # Initialize your model components
 
-    def forward(self, input_ids, **kwargs):
-        ...
+@MODELING_REGISTRY.register("your_custom_model")
+def register_modeling(architecture: str):
+    from .generated.patched_modeling_your_custom_model_gpu import YourCustomModel
 
-# Register your model
-ModelClass = YourCustomModel
+    return YourCustomModel
 ```
 
-Check existing model implementations in the `veomni/models/transformers/` and `veomni/models/diffusers/` directory for reference.
+Import the package from `veomni/models_kernel/transformers/__init__.py` so the
+decorators run at package import time. See the
+[new-model guide](../usage/support_new_models/guide_and_checklist.md) for the
+patchgen config and validation workflow.
 
 ### 4. Loading Your Model
 
 The framework will automatically handle model loading based on the configuration. You can load your model using:
 
 ```python
-from veomni.models import build_foundation_model
+from veomni.models_kernel import build_foundation_model
 
 model = build_foundation_model(
     config_path=args.model.config_path,
     weights_path=args.model.model_path,
-    ops_implementation=args.model.ops_implementation,
+    kernels_implementation=args.model.ops_implementation,
     # Add other optional keyword arguments as needed.
 )
 ```

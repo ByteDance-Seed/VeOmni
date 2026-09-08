@@ -232,7 +232,7 @@ def save_hf_safetensor(
             model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
         )
     else:
-        # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
+        # The single-writer path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
             _save_hf_safetensor_legacy(
                 save_checkpoint_path,

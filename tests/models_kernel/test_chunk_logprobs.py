@@ -69,29 +69,33 @@ def _bitwise_setup(monkeypatch):
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required for bitwise parity (deterministic + batch-invariant mode).")
 
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    prev_deterministic = torch.are_deterministic_algorithms_enabled()
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled,
+        benchmark=False,
+        benchmark_limit=torch.backends.cudnn.benchmark_limit,
+        deterministic=True,
+        allow_tf32=False,
+    ):
+        prev_deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
-    bi_ctx = None
-    if _have_python_dev_headers():
-        from veomni.kernels.batch_invariant import set_batch_invariant_mode
+        bi_ctx = None
+        if _have_python_dev_headers():
+            from veomni.kernels.batch_invariant import set_batch_invariant_mode
 
-        bi_ctx = set_batch_invariant_mode(True)
-        bi_ctx.__enter__()
+            bi_ctx = set_batch_invariant_mode(True)
+            bi_ctx.__enter__()
 
-    # Default: SP disabled. Individual tests opt into sp_enabled=True via
-    # ``monkeypatch.setattr(cl, "get_parallel_state", ...)`` again.
-    monkeypatch.setattr(cl, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
+        # Default: SP disabled. Individual tests opt into sp_enabled=True via
+        # ``monkeypatch.setattr(cl, "get_parallel_state", ...)`` again.
+        monkeypatch.setattr(cl, "get_parallel_state", lambda: _FakePS(sp_enabled=False))
 
-    try:
-        yield
-    finally:
-        if bi_ctx is not None:
-            bi_ctx.__exit__(None, None, None)
-        torch.use_deterministic_algorithms(prev_deterministic, warn_only=True)
+        try:
+            yield
+        finally:
+            if bi_ctx is not None:
+                bi_ctx.__exit__(None, None, None)
+            torch.use_deterministic_algorithms(prev_deterministic, warn_only=True)
 
 
 def _device():

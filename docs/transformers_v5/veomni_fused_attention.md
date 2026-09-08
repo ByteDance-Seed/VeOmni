@@ -184,7 +184,7 @@ Before enabling `attn_implementation: flex_attention` for a new model:
 4. Register the generated class in `MODELING_REGISTRY` under the exact config
    `model_type`. If the integration adds a custom config or processor, register
    those in `MODEL_CONFIG_REGISTRY` and `MODEL_PROCESSOR_REGISTRY` as well.
-   Import the model package from `veomni.models.transformers` so every
+   Import the model package from `veomni.models_kernel.transformers` so every
    module-level registration runs at import time.
 5. Regenerate with `patchgen ... --diff -v`, review the generated output, run
    `patchgen --check`, and add model-level tests for registry routing, native

@@ -58,6 +58,7 @@ def lookup(impl: str) -> Callable:
         softcap: Optional[float] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Dispatch one attention call through the selected Transformers interface."""
         eager_default = _module_eager_forward(module)
         forward = ALL_ATTENTION_FUNCTIONS.get_interface(impl, eager_default)
         if forward is None:

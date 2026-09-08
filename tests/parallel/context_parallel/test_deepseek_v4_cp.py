@@ -35,7 +35,7 @@ from veomni.utils.device import (
 )
 
 
-_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
+_PATCHED_MODULE = "veomni.models_kernel.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
 
 
 def _cuda_device_count() -> int:
@@ -195,7 +195,7 @@ def _init_cp_attention(
     from transformers import AutoConfig
 
     from veomni.distributed.parallel_state import init_parallel_state
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
@@ -459,8 +459,8 @@ def _run_compressor_cp(
 
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models_kernel.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
     init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
 
@@ -605,8 +605,8 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int) ->
 
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models_kernel.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
     init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     # The TileLang kernel is the production scorer and the only one with a query
@@ -736,7 +736,7 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     """
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -777,7 +777,7 @@ def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
     """
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     class_name, role = _WINDOW_COMPRESSORS[kind]
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
@@ -821,7 +821,7 @@ def _build_toy_model(seq_len: int):
     """A whole toy model on CPU plus one batch of ids, for the model-forward guards."""
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(0)
@@ -1194,7 +1194,7 @@ def _run_model_cp_packed(rank: int, world_size: int, init_file: str, dtype: torc
 
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models_kernel.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
     init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type)
     if tilelang:

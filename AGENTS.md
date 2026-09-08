@@ -28,7 +28,7 @@ On session start, read the following:
 - **Search Before You Act**: On unexpected behavior, search codebase + check constraints + review `git log` before attempting fixes.
 - **Planning Discipline**: Complex tasks (multi-file, >30 min) -> TodoWrite. Plan must state which skills will be used (e.g. `/veomni-develop` + `/veomni-review`). Simple tasks -> just do them.
 - **Cross-modality Awareness**: Changes in shared code (`BaseTrainer`, `data_collator`, `distributed/`) affect all modalities.
-- **No Patchgen Edits**: Never edit files under `veomni/models/transformers/*/generated/`.
+- **No Patchgen Edits**: Never edit files under `veomni/{models,models_kernel}/transformers/*/generated/`.
 
 ---
 

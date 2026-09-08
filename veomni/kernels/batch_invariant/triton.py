@@ -15,6 +15,7 @@ from ...utils.device import get_compute_units
 
 
 def _matmul_launch_metadata(grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Describe a persistent-matmul launch for Triton profiling."""
     ret = {}
     m, n, k = args["M"], args["N"], args["K"]
     ret["name"] = f"{kernel.name} [M={m}, N={n}, K={k}]"
@@ -31,6 +32,7 @@ def _matmul_launch_metadata(grid: Callable[..., Any], kernel: Any, args: Dict[st
 
 @triton.jit
 def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
+    """Map a persistent tile id to grouped matrix coordinates."""
     group_id = tile_id // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -64,6 +66,7 @@ def matmul_kernel_persistent(
     C_LARGE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
+    """Compute a matrix product with a fixed persistent tile schedule."""
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -121,6 +124,7 @@ def matmul_kernel_persistent(
 
 
 def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
+    """Launch the deterministic persistent matmul implementation."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -135,6 +139,7 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
+        """Choose one persistent program per available matrix tile or SM."""
         return (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),)
 
     configs = {
@@ -427,19 +432,23 @@ def mean_dim(input: torch.Tensor, dim: int, keepdim: bool = False, dtype: torch.
 
 
 def mm_batch_invariant(a, b):
+    """Implement ``aten::mm`` with the persistent matmul schedule."""
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
+    """Implement ``aten::addmm`` with fused bias in persistent matmul."""
     return matmul_persistent(a, b, bias=bias)
 
 
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
+    """Implement ``aten::_log_softmax`` with a deterministic reduction order."""
     assert not _half_to_float, "not implemented"
     return log_softmax(input, dim=dim)
 
 
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
+    """Implement ``aten::mean.dim`` with deterministic reduction behavior."""
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
@@ -457,4 +466,5 @@ AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])
 
 
 def get_batch_invariant_attention_block_size() -> AttentionBlockSize:
+    """Return attention tile sizes compatible with batch-invariant execution."""
     return AttentionBlockSize(block_m=16, block_n=16)

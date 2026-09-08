@@ -54,7 +54,7 @@ For each changed file, check:
 ### VeOmni-Specific Checks
 - PR title format: `[{modules}] {type}: {description}`?
 - All comments and docstrings in English?
-- No auto-generated files (`veomni/models/transformers/*/generated/`) edited directly?
+- No auto-generated files (`veomni/models_kernel/transformers/*/generated/`) edited directly?
 - Ruff-compliant (`make quality` passes)?
 
 ## Output

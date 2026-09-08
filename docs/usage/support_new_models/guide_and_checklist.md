@@ -6,7 +6,7 @@
 
 > **Scope note:** VeOmni now pins `transformers==5.9.0` and ships
 > patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`. The runtime monkey-patch
+> `veomni/models_kernel/transformers/<model>/generated/`. The runtime monkey-patch
 > flow this document was originally written for has been retired. The high-level
 > checklists (registration, parallel plan, multimodal data transform, trainer
 > wiring, tests) still apply, but the modeling-patch steps below should be
@@ -22,9 +22,9 @@
 
 | Model Type | Files Required | Key Additions |
 |---|---|---|
-| Dense text-only LLM | `__init__.py` | SP position embedding slicing |
-| VLM (image/video) | `__init__.py` + `modeling_*.py` | FSDP dummy forward, SP in ViT + LM, position ID func |
-| Omni-modal MoE | `__init__.py` + 4 more files | All of the above + audio encoder, fused MoE, EP plan, processor patch |
+| Dense text-only LLM | `__init__.py` + GPU patchgen config | SP position embedding slicing |
+| VLM (image/video) | `__init__.py` + GPU/NPU patchgen configs | FSDP dummy forward, SP in ViT + LM, position ID func |
+| Omni-modal MoE | `__init__.py` + patchgen configs and helpers | All of the above + audio encoder, fused MoE, EP plan, processor patch |
 
 ---
 
@@ -44,47 +44,53 @@ Before writing any VeOmni code, answer:
 ### Step 1: Create the Model Directory
 
 ```bash
-mkdir veomni/models/transformers/your_model_name/
-touch veomni/models/transformers/your_model_name/__init__.py
+mkdir veomni/models_kernel/transformers/your_model_name/
+touch veomni/models_kernel/transformers/your_model_name/__init__.py
 # For complex models, also add:
-touch veomni/models/transformers/your_model_name/modeling_your_model_name.py
-touch veomni/models/transformers/your_model_name/configuration_your_model_name.py  # if config fix needed
-touch veomni/models/transformers/your_model_name/processing_your_model_name.py    # if multimodal
-touch veomni/models/transformers/your_model_name/parallel_plan.py                 # if MoE
+touch veomni/models_kernel/transformers/your_model_name/your_model_name_gpu_patch_gen_config.py
+touch veomni/models_kernel/transformers/your_model_name/your_model_name_npu_patch_gen_config.py  # if NPU supported
+touch veomni/models_kernel/transformers/your_model_name/configuration_your_model_name.py  # if config fix needed
+touch veomni/models_kernel/transformers/your_model_name/processing_your_model_name.py    # if multimodal
+touch veomni/models_kernel/transformers/your_model_name/parallel_plan.py                 # if MoE
 ```
 
 ### Step 2: Register Your Model (`__init__.py`)
 
 **Minimal (text-only):**
 ```python
-from ...loader import MODELING_REGISTRY
+from veomni.models_kernel.registry import MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 @MODELING_REGISTRY.register("your_model_type")
 def register_modeling(architecture: str):
-    from transformers.models.your_model import YourModelForCausalLM
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_your_model_npu import YourModelForCausalLM
+    else:
+        from .generated.patched_modeling_your_model_gpu import YourModelForCausalLM
     return YourModelForCausalLM
 ```
 
 **Full (multimodal MoE):**
 ```python
-from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+from veomni.models_kernel.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 @MODEL_CONFIG_REGISTRY.register("your_model_type")
 def register_config():
-    from .configuration_your_model import YourModelConfig, apply_veomni_patch
-    apply_veomni_patch()
+    from .configuration_your_model import YourModelConfig
     return YourModelConfig
 
 @MODELING_REGISTRY.register("your_model_type")
 def register_modeling(architecture: str):
-    from .modeling_your_model import YourModelForCausalLM, apply_veomni_patch
-    apply_veomni_patch()
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_your_model_npu import YourModelForCausalLM
+    else:
+        from .generated.patched_modeling_your_model_gpu import YourModelForCausalLM
     return YourModelForCausalLM
 
 @MODEL_PROCESSOR_REGISTRY.register("YourModelProcessor")  # exact class name from processor_config.json
 def register_processor():
-    from .processing_your_model import YourModelProcessor, apply_veomni_patch
-    apply_veomni_patch()
+    from .processing_your_model import YourModelProcessor
     return YourModelProcessor
 ```
 
@@ -94,7 +100,7 @@ def register_processor():
 
 ### Step 3: Add to Package `__init__.py`
 
-Add your module to [veomni/models/transformers/__init__.py](../../../veomni/models/transformers/__init__.py):
+Add your module to [veomni/models_kernel/transformers/__init__.py](../../../veomni/models_kernel/transformers/__init__.py):
 
 ```python
 from . import (
@@ -103,20 +109,15 @@ from . import (
 )
 ```
 
-### Step 4: Patch the Model (`modeling_*.py`)
+### Step 4: Declare the Patchgen Config
 
-Standard pattern — import HF module as alias, define patches, apply at end:
-
-```python
-import transformers.models.your_model.modeling_your_model as hf_your_model
-
-# ... define patches ...
-
-def apply_veomni_patch():
-    hf_your_model.YourClass.method = patched_method
-```
-
-Which patches to apply depends on model type (see checklist below). For implementation details of each patch, see the example docs.
+Define model changes in `<model>_gpu_patch_gen_config.py` using patchgen
+decorators such as `replace_class`, `override_method`, and
+`add_post_import_block`. Add a sibling NPU config when needed, then regenerate
+the checked-in `generated/*.py` and `generated/*.diff` files with `patchgen`.
+Never edit generated files directly, and do not add runtime monkey-patch
+helpers. See the [patchgen design guide](../../design/patchgen.md) and
+`veomni-migrate-transformers-v5` skill for the complete workflow.
 
 ### Step 5: Define Expert Parallelism Plan (`parallel_plan.py`, MoE only)
 
@@ -185,8 +186,8 @@ For implementation details of each patch, refer to the example docs.
 
 ### Any New Model
 
-- [ ] `veomni/models/transformers/your_model/__init__.py` with `@MODELING_REGISTRY.register`
-- [ ] `veomni/models/transformers/__init__.py` updated
+- [ ] `veomni/models_kernel/transformers/your_model/__init__.py` with `@MODELING_REGISTRY.register`
+- [ ] `veomni/models_kernel/transformers/__init__.py` updated
 
 ### VLMs (image/video)
 

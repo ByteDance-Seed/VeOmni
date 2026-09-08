@@ -37,7 +37,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ..distributed.parallel_state import get_parallel_state
-from ..models.module_utils import BroadcastMetadata, _dispatch_parameter
+from ..models_kernel.checkpoint.weights import BroadcastMetadata, _dispatch_parameter
 from ..utils import logging
 from ..utils.device import get_device_type
 from .state_dict import insert_adapter_name, load_adapter_state_dict
@@ -98,7 +98,7 @@ def make_peft_key_mapper(model: nn.Module, is_peft_model: bool) -> Callable[[str
     """Return a fn mapping a *bare* base-model FQN to its live-model destination.
 
     Centralises the checkpoint-key remap every weight loader
-    (:func:`~veomni.models.module_utils.load_model_weights` /
+    (:func:`~veomni.models_kernel.checkpoint.weights.load_model_weights` /
     ``load_model_weights_ep_sharded`` / ``rank0_load_and_broadcast_weights``)
     needs when a base checkpoint is loaded into a LoRA-wrapped model:
 

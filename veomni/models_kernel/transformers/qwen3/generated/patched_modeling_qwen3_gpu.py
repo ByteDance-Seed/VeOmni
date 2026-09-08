@@ -488,7 +488,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
-        super().__init__(config)
+        super(Qwen3ForCausalLM, self).__init__(config)
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -559,7 +559,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
     def __init__(self, config):
-        super().__init__(config)
+        super(Qwen3ForSequenceClassification, self).__init__(config)
         impl = resolve_kernel_impl("cross_entropy_loss_implementation", npu_as="chunk_loss")
         self.veomni_ce = VeomniKernel("cross_entropy_loss", "standard", impl)
         self.loss_function = partial(ForSequenceClassificationLoss, kernel=self.veomni_ce)

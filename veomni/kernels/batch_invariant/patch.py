@@ -19,6 +19,7 @@ def is_batch_invariant_mode_enabled() -> bool:
 
 
 def _batch_invariant_implementations():
+    """Return the ATen names and deterministic CUDA implementations to install."""
     # Keep Triton out of the import path until the patch is actually enabled.
     from .triton import (
         _log_softmax_batch_invariant,
@@ -67,8 +68,8 @@ def disable_batch_invariant_mode() -> None:
 def set_batch_invariant_mode(enabled: bool = True) -> Iterator[None]:
     """Temporarily set batch-invariant mode and restore its previous state.
 
-    The public API and enabled-on-CUDA behavior match the legacy ops helper.
-    Restoration is exception-safe and supports nested enabled/disabled scopes.
+    The mode is active only when CUDA is available. Restoration is
+    exception-safe and supports nested enabled/disabled scopes.
     """
     restore_enabled = is_batch_invariant_mode_enabled()
     target_enabled = enabled and IS_CUDA_AVAILABLE

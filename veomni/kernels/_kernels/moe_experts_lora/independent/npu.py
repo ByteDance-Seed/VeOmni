@@ -79,6 +79,7 @@ def _bind_deltas(
     """Close per-expert LoRA tensors over the helper skeleton callbacks."""
 
     def gate_up(x: Tensor, group_list: Tensor) -> Tensor:
+        """Apply independent per-expert gate and up LoRA deltas."""
         return _gate_up_delta(
             x,
             group_list,
@@ -91,6 +92,7 @@ def _bind_deltas(
         )
 
     def down(mid: Tensor, group_list: Tensor) -> Tensor:
+        """Apply independent per-expert down-projection LoRA deltas."""
         return _down_delta(mid, group_list, lora_a_down, lora_b_down, lora_scale_down)
 
     return gate_up, down

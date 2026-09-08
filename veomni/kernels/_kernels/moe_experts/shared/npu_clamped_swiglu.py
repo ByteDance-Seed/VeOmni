@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ascend Triton implementation of DeepSeek-V4 clamped SwiGLU."""
+
 import torch
 import triton
 import triton.language as tl
@@ -19,12 +21,14 @@ import triton.language as tl
 
 @triton.jit
 def _silu(x):
+    """Compute SiLU in fp32 inside a Triton kernel."""
     x = x.to(tl.float32)
     return x * tl.sigmoid(x)
 
 
 @triton.jit
 def _silu_grad(x):
+    """Compute the SiLU derivative in fp32 inside a Triton kernel."""
     x = x.to(tl.float32)
     f = tl.sigmoid(x)
     return f + x * (f - f * f)
@@ -42,6 +46,7 @@ def _clamped_swiglu_forward_kernel(
     limit,
     BLOCK_SIZE: tl.constexpr,
 ):
+    """Apply clamped SwiGLU to one row tile."""
     row = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = cols < hidden_size
@@ -64,6 +69,7 @@ def _clamped_swiglu_backward_kernel(
     limit,
     BLOCK_SIZE: tl.constexpr,
 ):
+    """Compute clamped SwiGLU input gradients for one row tile."""
     row = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = cols < hidden_size
@@ -85,8 +91,11 @@ def _clamped_swiglu_backward_kernel(
 
 
 class _ClampedSwiGLU(torch.autograd.Function):
+    """Autograd bridge for the Ascend Triton clamped SwiGLU kernels."""
+
     @staticmethod
     def forward(ctx, x: torch.Tensor, limit: float) -> torch.Tensor:
+        """Launch clamped SwiGLU forward and retain its input."""
         hidden_size = x.shape[-1] // 2
         output = torch.empty((*x.shape[:-1], hidden_size), dtype=x.dtype, device=x.device)
         ctx.limit = limit
@@ -107,6 +116,7 @@ class _ClampedSwiGLU(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        """Launch clamped SwiGLU backward for the saved input."""
         (x,) = ctx.saved_tensors
         grad_input = torch.empty_like(x)
         if grad_input.numel() == 0:

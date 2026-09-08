@@ -58,7 +58,7 @@ from torch.distributed.tensor import DTensor, Shard
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models.checkpoint_tensor_loading import ConvertedCheckpointTensor
+from veomni.models_kernel.checkpoint.convert import ConvertedCheckpointTensor
 from veomni.utils import helper
 from veomni.utils.device import get_dist_comm_backend, get_torch_device
 

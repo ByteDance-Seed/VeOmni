@@ -55,11 +55,11 @@ description: "Create a pull request for the current branch. Handles uncommitted 
 
    | Path prefix | Module |
    |------------|--------|
-   | `veomni/models/` | `model` |
+   | `veomni/models_kernel/` | `model` |
    | `veomni/trainer/` | `trainer` |
    | `veomni/data/` | `data` |
    | `veomni/distributed/` | `dist` |
-   | `veomni/ops/` | `ops` |
+   | `veomni/kernels/` | `ops` |
    | `veomni/checkpoint/` | `ckpt` |
    | `veomni/optim/` | `optim` |
    | `veomni/lora/` | `lora` |

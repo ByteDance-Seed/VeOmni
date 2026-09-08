@@ -70,9 +70,9 @@ model:
 VeOmni automatically maps default-valued general operator settings to NPU-compatible
 implementations:
 
-- `npu_group_gemm`: [MoE GroupGEMM operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/moe/npu_group_gemm.py)
-- `npu_rms_norm`: [RMS normalization operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rms_norm/npu.py)
-- `npu_rotary_mul`: [RoPE positional encoding operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rotary/npu.py)
+- `npu_group_gemm`: [MoE GroupGEMM kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/kernels/_kernels/moe_experts/standard/npu.py)
+- `npu_rms_norm`: [RMS normalization kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/kernels/_kernels/rms_norm/standard/npu.py)
+- `npu_rotary_mul`: [RoPE positional encoding kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/kernels/_kernels/rope/full/npu.py)
 
 **Note**: Only fields that still equal their dataclass defaults are auto-mapped. Explicit
 non-default overrides are preserved and rejected if unsupported. Attention continues to use

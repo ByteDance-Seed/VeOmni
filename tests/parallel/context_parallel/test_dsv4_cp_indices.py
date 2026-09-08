@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from veomni.models.transformers.deepseek_v4.packed_utils import (
+from veomni.models_kernel.transformers.deepseek_v4.packed_utils import (
     CompressedCandidates,
     build_packed_sparse_attention_indices,
     build_sparse_attention_indices,

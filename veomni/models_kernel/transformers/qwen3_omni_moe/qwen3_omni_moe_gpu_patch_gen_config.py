@@ -1034,7 +1034,7 @@ def qwen3_omni_moe_thinker_text_model_forward_patched(
 # Patch: Qwen3OmniMoeThinkerTextModel._deepstack_process
 # 1. [FSDP] If visual_pos_masks is None (no visual input on this rank) still
 #    touch visual_embeds so FSDP reduce-scatter stays in sync across ranks.
-# 2. [Mask] Squeeze trailing dim when mask is still 3D (legacy path).
+# 2. [Mask] Squeeze the trailing dimension for a 3D input mask.
 # ================================================================
 @config.override_method(
     "Qwen3OmniMoeThinkerTextModel._deepstack_process",

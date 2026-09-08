@@ -12,9 +12,9 @@ Before implementing, check which areas your change affects:
 | `veomni/trainer/` | All trainer subclasses (`TextTrainer`, `VLMTrainer`, `DitTrainer`, RL trainers) | Changing `BaseTrainer` method signatures breaks all subclasses |
 | `veomni/data/data_collator.py` | All modalities (text, VLM, DiT) | Collators are tightly coupled to model-specific preprocessing |
 | `veomni/distributed/` | FSDP2 + ExtraParallel/MoE/SP paths | Shared distributed code is used by many downstream modalities |
-| `veomni/models/auto.py`, `loader.py` | Model registry, import-time side effects | `MODELING_REGISTRY` is populated at import time; moving registrations breaks loading |
+| `veomni/models_kernel/auto.py`, `registry.py` | Model registry, import-time side effects | `MODELING_REGISTRY` is populated at import time; moving registrations breaks loading |
 | `configs/` | YAML config keys | Renaming config keys breaks existing training configs silently |
-| `veomni/models/transformers/*/` | `__init__.py` registration entry points | All models ship a patchgen-generated v5 path under `generated/`; never import or call legacy `modeling_<m>.py` or `apply_veomni_<m>_patch()` (these no longer exist) |
+| `veomni/models_kernel/transformers/*/` | `__init__.py` registration entry points | Model packages own patchgen configs and generated v5 modeling; edit the config and regenerate instead of editing generated files |
 
 ## Refactoring Safety Rules
 
@@ -27,7 +27,7 @@ When restructuring code (same behavior, better structure):
 
 ## Common Traps
 
-- `veomni.models.auto` registration depends on **import-time side effects** — moving registrations into functions or delaying them breaks model loading.
+- `veomni.models_kernel` registration depends on **import-time side effects** — moving registrations into functions or delaying them breaks model loading.
 - Renaming config keys **silently breaks** existing YAML configs in `configs/` — grep all YAML files first.
 - `veomni.distributed` modules feed into ExtraParallel/MoE/SP — touching shared code may affect every modality, so run the cross-cutting parallel tests.
 - Data collators in `veomni/data/data_collator.py` are coupled to `DEFAULT_DATA_COLLATE_INFO` — adding new tensor keys requires updating the collate info table.

@@ -27,7 +27,7 @@ from veomni.distributed.torch_parallelize import (
     parallelize_model_ddp,
     parallelize_model_fsdp2,
 )
-from veomni.models.module_utils import init_empty_weights
+from veomni.models_kernel.checkpoint.weights import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 

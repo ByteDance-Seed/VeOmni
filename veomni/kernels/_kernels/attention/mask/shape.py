@@ -46,6 +46,7 @@ _EAGER = frozenset({"eager"})
 
 
 def _compose_or_and(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Compose optional OR/AND predicates into one Transformers mask function."""
     extra = dict(kwargs)
     mask_function = extra.pop("mask_function", causal_mask_function)
     or_mask_function = extra.pop("or_mask_function", None)
@@ -82,6 +83,7 @@ def _sdpa_or_eager_mask(
     sliding_window: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ):
+    """Build an SDPA boolean mask or convert it to eager additive form."""
     dtype = extra.pop("dtype", torch.float32)
     if sliding_window is not None:
         extra["sliding_window"] = sliding_window
@@ -111,6 +113,7 @@ def _flex_mask(
     cu_seqlens: torch.Tensor | None = None,
     device: torch.device | str,
 ):
+    """Build a FlexAttention block mask for causal, sliding, or packed input."""
     extra.pop("dtype", None)
     mask_function = extra.get("mask_function", causal_mask_function)
     if sliding_window is not None:

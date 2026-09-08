@@ -120,7 +120,7 @@ If 3 consecutive fix attempts fail:
 - **DCP checkpoint format**: model state dict keys must match exactly between save and load — renamed parameters break checkpoint loading silently.
 - **Multi-modality data collators**: text-only collators crash on multimodal data and vice versa — always check `data_collator` type matches the dataset.
 - **Sequence parallel**: attention outputs must be gathered before loss computation — partial outputs produce incorrect loss values.
-- **Patchgen**: model patches in `veomni/models/transformers/*/` are auto-generated — editing generated files directly will be overwritten.
+- **Patchgen**: model patches in `veomni/models_kernel/transformers/*/generated/` are auto-generated — editing generated files directly will be overwritten.
 
 ## Domain-Specific Checklists
 

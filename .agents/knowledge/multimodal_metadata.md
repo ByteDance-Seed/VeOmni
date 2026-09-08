@@ -247,7 +247,7 @@ guarantees:
 - `veomni/data/data_transform.py` — transforms emit the `*_grid_thw` tensors +
   `position_ids`.
 - `veomni/trainer/vlm_trainer.py` — `_build_collate_fn` resolves the two model hooks.
-- `veomni/models/transformers/<model>/<model>_{gpu,npu}_patch_gen_config.py` —
+- `veomni/models_kernel/transformers/<model>/<model>_{gpu,npu}_patch_gen_config.py` —
   `collate_multimodal_metadata` helper + `get_metadata_collate_func` /
   `get_extra_collate_infos` overrides; regenerated `generated/` files.
 - `tests/data/test_mm_metadata.py` — collator-hook handoff + hook picklability.

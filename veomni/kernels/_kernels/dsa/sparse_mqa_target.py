@@ -26,6 +26,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
 def _require_tilelang_sm90() -> None:
+    """Require the NVIDIA architecture supported by the TileLang target kernel."""
     if torch.version.hip is not None or not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90:
         raise RuntimeError("DeepSeek V4 TileLang kernels require an SM90 or later NVIDIA CUDA GPU")
 

@@ -64,7 +64,7 @@ The methods discussed in the following sections are transparent to the end users
 
 > File: veomni/distributed/parallel_plan.py
 
-As a model-centric framework, VeOmni registers leaf expert weight keys, i.e, "fully qualified name" (fqn) in the model's definition as an attribute. (see `veomni/models/transformers/qwen3_moe/parallel_plan.py` for example.)
+As a model-centric framework, VeOmni registers leaf expert weight keys, i.e, "fully qualified name" (fqn) in the model's definition as an attribute. (see `veomni/models_kernel/transformers/qwen3_moe/parallel_plan.py` for example.)
 
 In this way, each model exposes `get_parallel_plan()` method which returns a `ParallelPlan` containing an `ep_plan` dict. Keys are parameter FQN patterns that identify expert weights; values are `Shard(dim=...)` telling which tensor dimension is sharded across EP ranks (in this case always dim-0 to shard expert number).
 

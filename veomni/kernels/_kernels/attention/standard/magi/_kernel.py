@@ -104,6 +104,7 @@ def validate_cutlass_inputs(
 
 
 def _prepare_cutlass(device: torch.device) -> dict[str, object]:
+    """Validate and prepare the SM90 CUTLASS FFA backend."""
     try:
         from flash_attn_cute.ffa_fa3 import flash_attn_interface
         from flash_attn_cute.ffa_fa3.flash_attn_config import CONFIG
@@ -136,6 +137,7 @@ def _prepare_cutlass(device: torch.device) -> dict[str, object]:
 
 
 def _install_tile_size_compatibility() -> None:
+    """Expose the tile-size helper where MagiAttention expects to import it."""
     # MagiAttention 1.1.1 imports this helper from ``utils``, while the
     # corresponding flash-attn-cute revision publishes it from ``tile_size``.
     # Expose the expected name before importing MagiAttention so FA4AttnArg
