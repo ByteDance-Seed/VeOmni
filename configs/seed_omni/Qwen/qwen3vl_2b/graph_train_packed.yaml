@@ -1,0 +1,15 @@
+# Qwen3-VL-2B packed training DAG — image/video understanding SFT (I2T).
+#
+# Packed path: the text-encoder preprocessor builds packed tokens / M-RoPE /
+# visual masks on CPU. Each module only mask-selects its embeddings and
+# masked_scatters them back. Dummy FSDP-anchor visuals stay off the packed
+# sequence (folded via mean()*0).
+#
+#   qwen3vl_text_encoder.pack_encode
+#       -> qwen3vl_vision.pack_encode
+#       -> qwen3vl_llm.pack_forward
+#           -> qwen3vl_text_encoder.pack_decode -> end
+- { from: qwen3vl_text_encoder.pack_encode, to: qwen3vl_vision.pack_encode }
+- { from: qwen3vl_vision.pack_encode,       to: qwen3vl_llm.pack_forward }
+- { from: qwen3vl_llm.pack_forward,         to: qwen3vl_text_encoder.pack_decode }
+- { from: qwen3vl_text_encoder.pack_decode, to: end }

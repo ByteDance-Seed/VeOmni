@@ -70,23 +70,28 @@ def convert_qwen3vl_checkpoint(model_path: str, output_dir: str, **kwargs) -> No
     print(f"  saved → {vision_dir}")
 
     print("Extracting qwen3vl_text_encoder ...")
+    # Official Qwen3-VL puts `tie_word_embeddings` on the top-level config
+    # (2B=True, 8B=False). Nested `text_config` often omits the field.
+    tie_word_embeddings = bool(
+        getattr(cfg, "tie_word_embeddings", getattr(text_cfg, "tie_word_embeddings", True))
+    )
     te_cfg = Qwen3VLTextEncoderConfig(
         vocab_size=text_cfg.vocab_size,
         hidden_size=text_cfg.hidden_size,
-        tie_word_embeddings=text_cfg.tie_word_embeddings,
+        tie_word_embeddings=tie_word_embeddings,
         lm_head_bias=False,
     )
     with no_init_weights(), init_empty_weights():
         te = Qwen3VLTextEncoder._from_config(te_cfg)
     te.embed_tokens.load_state_dict(inner.language_model.embed_tokens.state_dict(), assign=True)
-    if not text_cfg.tie_word_embeddings and model.lm_head is not None:
+    if not tie_word_embeddings and model.lm_head is not None:
         src_sd = {k: v.detach().clone() for k, v in model.lm_head.state_dict().items()}
         te.lm_head.load_state_dict(src_sd, assign=True)
     te_dir = os.path.join(output_dir, "qwen3vl_text_encoder")
     te.save_pretrained(te_dir, safe_serialization=True)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.save_pretrained(te_dir)
-    print(f"  saved → {te_dir} (tie_word_embeddings={text_cfg.tie_word_embeddings})")
+    print(f"  saved → {te_dir} (tie_word_embeddings={tie_word_embeddings})")
 
     print("Extracting qwen3vl_llm ...")
     llm_cfg = Qwen3VLLlmConfig(

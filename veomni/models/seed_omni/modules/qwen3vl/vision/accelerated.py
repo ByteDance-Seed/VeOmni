@@ -22,6 +22,7 @@ from .modeling import (
     process_qwen3vl_visual_items,
     scatter_qwen3vl_visual_embeds,
 )
+from .packed import PackedTrainingMixin
 from .processing import _SOURCE
 
 
@@ -158,7 +159,7 @@ class TrainingMixin(TrainingModuleMixin):
         return {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw, "vit_metadata": vit_metadata}
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin):
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin):
     """``generate()`` already lives on the native :class:`~.modeling.Qwen3VLVisionEncoder`
     (via its own :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.
     """

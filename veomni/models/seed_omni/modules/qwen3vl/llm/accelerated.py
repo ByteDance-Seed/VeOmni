@@ -19,6 +19,7 @@ from ....utils.conversation import ConversationItem, is_dummy
 from ...base.llm_packing import scatter_llm_hidden_states
 from .configuration import Qwen3VLLlmConfig
 from .modeling import Qwen3VLLlm, pack_qwen3vl_conversations_for_forward
+from .packed import PackedTrainingMixin
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -181,7 +182,7 @@ class TrainingMixin(TrainingModuleMixin):
         return {"conversation_list": conversation}
 
 
-class VeOmniMixin(BaseMixin, TrainingMixin):
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin):
     """``_spatial_merge_size`` is inherited from the native :class:`Qwen3VLLlm`.
 
     ``generate()`` and inference-state reset already live on that native class

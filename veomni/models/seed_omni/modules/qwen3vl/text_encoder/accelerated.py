@@ -19,6 +19,7 @@ from ...base.text_encoder.accelerated import (
 from .chat_template import Qwen3VLChatTemplate
 from .configuration import Qwen3VLTextEncoderConfig
 from .modeling import Qwen3VLTextEncoder
+from .packed import PackedTrainingMixin
 
 
 class TrainingMixin(BaseTrainingMixin):
@@ -51,7 +52,7 @@ class TrainingMixin(BaseTrainingMixin):
         return super().decode_post(**outputs)
 
 
-class VeOmniMixin(TrainingMixin, BaseVeOmniMixin):
+class VeOmniMixin(PackedTrainingMixin, TrainingMixin, BaseVeOmniMixin):
     """Qwen3-VL ``TextEncoder`` accelerated wrapper — chat-template binding only.
 
     The encode/decode plumbing and ChatML ``generate`` FSM live on the native
