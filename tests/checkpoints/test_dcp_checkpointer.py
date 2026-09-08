@@ -1120,14 +1120,27 @@ class TestPromoteStagedCheckpoint:
     """
 
     @pytest.fixture
-    def staged(self, tmp_path):
-        """A staged checkpoint (two data files plus `.metadata`) and its destination."""
-        stage_path = tmp_path / "stage"
-        final_path = tmp_path / "final"
-        stage_path.mkdir()
-        for name in ("__0_0.distcp", "__0_1.distcp", ".metadata"):
-            (stage_path / name).write_text(name)
-        return str(stage_path), str(final_path)
+    def make_staged(self, tmp_path):
+        """Build an independent staged checkpoint and destination on each call.
+
+        Promotion consumes the staged copy, so anything exercising it more than
+        once needs a fresh one per run rather than a shared directory.
+        """
+
+        def _make(name: str = "default"):
+            stage_path = tmp_path / name / "stage"
+            final_path = tmp_path / name / "final"
+            stage_path.mkdir(parents=True)
+            for entry in ("__0_0.distcp", "__0_1.distcp", ".metadata"):
+                (stage_path / entry).write_text(entry)
+            return str(stage_path), str(final_path)
+
+        return _make
+
+    @pytest.fixture
+    def staged(self, make_staged):
+        """A single staged checkpoint (two data files plus `.metadata`) and its destination."""
+        return make_staged()
 
     def test_copies_everything_and_removes_the_staged_copy(self, staged):
         """The happy path: the destination ends up complete and the scratch copy is gone."""
@@ -1209,20 +1222,24 @@ class TestPromoteStagedCheckpoint:
     # Rank 8 matters on its own: it leads its node but is not the coordinator, so
     # it copies data without ever touching `.metadata`.
     _ROLES = {"coordinator_leader": (0, 0), "leader_only": (8, 0), "participant": (1, 1)}
+    # The participant copies nothing, so it cannot be a copy-failure source.
+    _COPYING_ROLES = ["coordinator_leader", "leader_only"]
 
-    @pytest.mark.parametrize("failing_role", list(_ROLES))
-    def test_every_rank_runs_the_same_barriers_when_a_copy_fails(self, staged, failing_role):
+    @pytest.mark.parametrize("failing_role", _COPYING_ROLES)
+    def test_every_rank_runs_the_same_barriers_when_a_copy_fails(self, make_staged, failing_role):
         """Collective parity: barriers are untagged, so one rank skipping one hangs the job.
 
-        Whichever role fails, every role must reach the same number of barriers and
-        surface the error only after the last one.
+        Whichever role fails, every role -- including the participant that copies
+        nothing -- must reach the same number of barriers, and the error must
+        surface only after the last one.
         """
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
         counts = {}
         for role, (global_rank, local_rank) in self._ROLES.items():
-            stage_path, final_path = staged
+            stage_path, final_path = make_staged(f"{failing_role}-{role}")
             barrier = MagicMock()
+            raised = False
             with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
                 with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier", barrier):
                     with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=global_rank):
@@ -1234,8 +1251,9 @@ class TestPromoteStagedCheckpoint:
                                 try:
                                     _promote_staged_checkpoint(stage_path, final_path)
                                 except OSError:
-                                    pass
+                                    raised = True
             counts[role] = barrier.call_count
+            assert raised == (role == failing_role), f"{role}: unexpected raise={raised}"
 
         assert len(set(counts.values())) == 1, f"barrier count diverged across roles: {counts}"
         assert set(counts.values()) == {4}
@@ -1292,8 +1310,8 @@ class TestStageDirValidation:
         assert _stage_key("/tmp/a_b/c") != _stage_key("/tmp/a/b_c")
         assert _stage_key("/tmp/run/step_1") == _stage_key("/tmp/run/step_1")
         assert _stage_key("/tmp/run/step_1") != _stage_key("/tmp/run/step_2")
-        # relative and absolute spellings of one destination stage together
-        assert _stage_key("/tmp/run/step_1") == _stage_key("/tmp/run/./step_1")
+        # a relative destination and its absolute spelling stage together
+        assert _stage_key("run/step_1") == _stage_key(os.path.join(os.getcwd(), "run", "step_1"))
 
     def test_stage_dir_with_save_async_is_rejected_before_any_side_effect(self, tmp_path):
         """The staged copy is dropped when save() returns, i.e. before an async write ends."""
