@@ -140,7 +140,10 @@ def test_offline_encoding_mixin_is_not_module_mixin_subclass() -> None:
 
 
 def test_bagel_vae_accelerated_patches_config_in_init() -> None:
-    from veomni.models.seed_omni.modules.bagel.vae.accelerated import BagelVAEAccelerated, BagelVAEOfflineMixin
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated.accelerated import (
+        BagelVAEAccelerated,
+        BagelVAEOfflineMixin,
+    )
     from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
     from veomni.models.seed_omni.modules.bagel.vae.modeling import BagelVAE
 
@@ -163,7 +166,10 @@ def test_bagel_vae_accelerated_patches_config_in_init() -> None:
 
 
 def test_bagel_vae_offline_mixin_wins_mro_over_abstract_stubs() -> None:
-    from veomni.models.seed_omni.modules.bagel.vae.accelerated import BagelVAEAccelerated, BagelVAEOfflineMixin
+    from veomni.models.seed_omni.modules.bagel.vae.accelerated.accelerated import (
+        BagelVAEAccelerated,
+        BagelVAEOfflineMixin,
+    )
     from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
 
     model = BagelVAEAccelerated(

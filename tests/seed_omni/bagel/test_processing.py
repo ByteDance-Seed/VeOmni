@@ -12,7 +12,7 @@ from tests.seed_omni.bagel.helpers import (
     native_model_cls,
     tiny_bagel_qwen2_cfg,
 )
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import TrainingMixin
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import TrainingMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
@@ -114,7 +114,7 @@ def test_bagel_mot_forward_pre_returns_sample_local_tensor_contract():
 
 
 def test_bagel_mot_forward_pre_keeps_metadata_full_and_marks_sequence_padding(monkeypatch):
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import accelerated
 
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")

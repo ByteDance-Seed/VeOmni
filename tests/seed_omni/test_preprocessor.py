@@ -38,7 +38,7 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import (
 from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
     BagelTextEncoderPreprocessor,
 )
-from veomni.models.seed_omni.modules.bagel.vae.accelerated import VeOmniMixin
+from veomni.models.seed_omni.modules.bagel.vae.accelerated.accelerated import VeOmniMixin
 from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
 from veomni.models.seed_omni.modules.bagel.vae.processing import (
     BAGEL_VAE_PIXEL_SHAPE,

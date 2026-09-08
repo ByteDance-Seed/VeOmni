@@ -12,7 +12,7 @@ from veomni.models.seed_omni.modules import (
     OMNI_PROCESSOR_REGISTRY,
 )
 from veomni.models.seed_omni.modules.qwen3vl.llm.modeling import qwen3vl_vision_position_ids
-from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import build_qwen3vl_vit_metadata
+from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated import build_qwen3vl_vit_metadata
 
 
 def _save_fake_fast_tokenizer(module_path: Path) -> None:
@@ -54,7 +54,7 @@ def test_vision_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
     """Off-FSDP the dummy vision forward skips the ViT but must still emit zeros
     shaped exactly like a real encode (image_embeds + one feature per deepstack
     layer, no ``None``), so forward_post never branches on the dummy."""
-    import veomni.models.seed_omni.modules.qwen3vl.vision.accelerated as vision_accelerated
+    import veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated as vision_accelerated
 
     monkeypatch.setattr(
         vision_accelerated, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False, sp_enabled=False)
@@ -99,7 +99,7 @@ def test_vision_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
 def test_vision_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
     """Inference (eval) needs no gradient anchor, so the dummy vision forward
     fabricates zeros even with FSDP enabled — the real ViT must not run."""
-    import veomni.models.seed_omni.modules.qwen3vl.vision.accelerated as vision_accelerated
+    import veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated as vision_accelerated
 
     monkeypatch.setattr(
         vision_accelerated, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True, sp_enabled=False)

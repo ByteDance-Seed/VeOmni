@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import BagelQwen2MoTAttentionAccelerated
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import BagelQwen2MoTAttentionAccelerated
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.masking import (
     build_mot_attention_metadata,
     build_mot_magi_mask,

@@ -295,7 +295,7 @@ def test_bagel_qwen2_mot_eager_denoise_branch_runs_serial_forward_inference(monk
 
 
 def test_bagel_qwen2_mot_accelerated_denoise_branch_packs_cfg_branches(monkeypatch):
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import BagelQwen2MoTAccelerated
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import BagelQwen2MoTAccelerated
 
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoTAccelerated(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))

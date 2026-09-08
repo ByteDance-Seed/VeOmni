@@ -35,7 +35,7 @@ Follow the existing folder shape:
   `InferenceMixin` (`generate()` + FSM state, listed before
   `OmniPreTrainedModel` in the model class's bases; see §2.1 of
   `docs/seed_omni/seed_omni_v2.md`).
-- `accelerated.py`: composable `TrainingMixin` / `VeOmniMixin` hooks (no
+- `accelerated/accelerated.py`: composable `TrainingMixin` / `VeOmniMixin` hooks (no
   `InferenceMixin` — that lives on `modeling.py` now), CPU preprocessor, and
   **IDE type stubs** for modeling APIs (see
   `references/modulemixin-ide-stubs.md`).

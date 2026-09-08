@@ -17,7 +17,7 @@ A SeedOmni V2 module is usually:
     `class Xxx(InferenceMixin, OmniPreTrainedModel)` (`OmniPreTrainedModel`
     ships no-op defaults for those three methods; MRO resolves left-to-right,
     so `InferenceMixin` must come first or those no-ops shadow it).
-- An `accelerated.py` with composable training-graph mixins:
+- An `accelerated/accelerated.py` with composable training-graph mixins:
   - `TrainingMixin(TrainingModuleMixin)` — `@pre_forward` / `@post_forward` hooks.
   - optional `MeterMixin(MetricMeterMixin)`.
   - `VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin)` — family assembly +
@@ -35,7 +35,10 @@ Use short filenames inside the module folder:
 modules/<family>/<submodule>/
 ├── configuration.py
 ├── modeling.py
-├── accelerated.py
+├── accelerated/
+│   ├── __init__.py      # re-exports the accelerated class for the registry
+│   ├── accelerated.py
+│   └── packed.py        # only if the family has a packed graph
 └── processing.py
 ```
 
@@ -52,7 +55,7 @@ modules/<family>/<submodule>/
 - Tokenizers and processors are module-owned assets.
 - Do not add a top-level tokenizer path.
 
-## IDE type stubs (`accelerated.py`)
+## IDE type stubs (`accelerated/accelerated.py`)
 
 `TrainingMixin` hooks call modeling APIs through `self`, but implementation
 stays in `modeling.py`. `TrainingMixin` declares **only the names its hooks
@@ -66,11 +69,11 @@ use**:
   ```
 
 `generate()` and its FSM helpers live entirely on the native class's
-`InferenceMixin` — `accelerated.py` needs no IDE stub for `generate` itself
+`InferenceMixin` — `accelerated/accelerated.py` needs no IDE stub for `generate` itself
 unless a training hook calls a `generate`-only helper.
 
 Full style guide: `references/modulemixin-ide-stubs.md`. Reference implementation:
-`modules/bagel/flow_connector/accelerated.py` (IDE stubs + module-level helpers).
+`modules/bagel/flow_connector/accelerated/accelerated.py` (IDE stubs + module-level helpers).
 
 ## Optional Per-Module Metric Meter
 

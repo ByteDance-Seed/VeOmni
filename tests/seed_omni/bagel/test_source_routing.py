@@ -91,7 +91,7 @@ def test_bagel_qwen2_mot_forward_pre_rejects_only_upstream_dummy_anchor(monkeypa
 
 
 def test_bagel_qwen2_mot_rejects_context_parallel_training(monkeypatch) -> None:
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot import accelerated
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import accelerated
 
     model = _tiny_qwen2_mot()
     monkeypatch.setattr(

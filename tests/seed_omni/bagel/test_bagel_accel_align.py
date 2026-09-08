@@ -24,7 +24,7 @@ from tests.seed_omni.bagel.helpers import (
     run_eager_mot,
     tiny_align_qwen2_cfg,
 )
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import BagelQwen2MoTAccelerated
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import BagelQwen2MoTAccelerated
 from veomni.ops.kernels.attention.magi import _fa4_cuda as magi_fa4_backend
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 

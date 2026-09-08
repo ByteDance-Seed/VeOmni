@@ -1,11 +1,11 @@
 # Accelerated Mixin IDE Type Stubs
 
-Read this when editing `accelerated.py` `TrainingMixin` hooks that call into
+Read this when editing `accelerated/accelerated.py` `TrainingMixin` hooks that call into
 the sibling `modeling.py` class.
 
 ## Why
 
-Training-graph hooks live on `TrainingMixin` (`accelerated.py`), but weights,
+Training-graph hooks live on `TrainingMixin` (`accelerated/accelerated.py`), but weights,
 `forward` / `encode` / … **and** `generate()` / FSM inference live on the
 native model class in `modeling.py`:
 
@@ -18,7 +18,7 @@ class InferenceMixin:
 class BagelFlowConnector(InferenceMixin, OmniPreTrainedModel):
     ...
 
-# accelerated.py
+# accelerated/accelerated.py
 class BagelFlowConnectorAccelerated(VeOmniMixin, BagelFlowConnector): ...
 ```
 
@@ -27,7 +27,7 @@ the final `Accelerated` model class. **Class-level annotations and `...`
 method stubs** tell the IDE which attributes and modeling methods exist,
 without copying implementation into the mixin file.
 
-Live reference: `veomni/models/seed_omni/modules/bagel/flow_connector/accelerated.py`.
+Live reference: `veomni/models/seed_omni/modules/bagel/flow_connector/accelerated/accelerated.py`.
 
 ## File shape
 
@@ -46,7 +46,7 @@ class Xxx(InferenceMixin, OmniPreTrainedModel):
     shadow the real implementations above."""
     def forward(self, ...): ...
 
-# accelerated.py — VeOmni-only training-graph hooks. No InferenceMixin here:
+# accelerated/accelerated.py — VeOmni-only training-graph hooks. No InferenceMixin here:
 # generate() / reset_* / finalize already reach XxxAccelerated unshadowed via
 # normal inheritance from Xxx.
 class TrainingMixin(TrainingModuleMixin):
@@ -84,7 +84,7 @@ On `TrainingMixin`, at the top of the body (before `__init__` or hooks):
 
 **Scope rule:** `TrainingMixin` declares **only what its own hooks use**. Do
 not duplicate the full model surface. `generate()` and its FSM helpers live
-entirely on the native class's `InferenceMixin` now — `accelerated.py` needs
+entirely on the native class's `InferenceMixin` now — `accelerated/accelerated.py` needs
 no IDE stub for `generate` itself unless a training hook calls a
 `generate`-only helper.
 
@@ -110,7 +110,7 @@ Conventions:
 - Replace `BagelFlowConnector` with the concrete class from that module's
   `modeling.py` (`TextEncoder`, `Qwen3Llm`, `BagelVAE`, …).
 - Signatures must match `modeling.py` exactly (args, types, return type).
-- Import config / processor types at the top of `accelerated.py` when used in
+- Import config / processor types at the top of `accelerated/accelerated.py` when used in
   annotations (`from __future__ import annotations` is fine).
 
 ## Property stubs
@@ -130,7 +130,7 @@ in this file, not in `modeling.py`.
 
 ## Checklist for a new / changed hook
 
-1. Grep `accelerated.py` for `self.<name>` calls not defined in the file.
+1. Grep `accelerated/accelerated.py` for `self.<name>` calls not defined in the file.
 2. If `<name>` is implemented in `modeling.py`, add or update a stub on
    `TrainingMixin`.
 3. If `<name>` is a class attribute on the model, add a typed class attribute
@@ -147,7 +147,7 @@ Training hooks and the native `InferenceMixin`'s `generate()` often share
 carrier logic (select items, pack tensors, scatter outputs). When a helper
 does **not** need hook-local `self._*` state, define it as a plain function at
 the top of `modeling.py` and call it from both `modeling.py` and
-`accelerated.py` — do not hang it on `TrainingMixin` and reach it via MRO from
+`accelerated/accelerated.py` — do not hang it on `TrainingMixin` and reach it via MRO from
 the native class.
 
 Reference: `modules/bagel/flow_connector/modeling.py`
@@ -166,7 +166,7 @@ methods.
 
 ## Modules with full stub coverage
 
-All `modules/**/accelerated.py` files follow this pattern. When adding a
+All `modules/**/accelerated/accelerated.py` files follow this pattern. When adding a
 module, mirror an adjacent example:
 
 | Pattern | Example module |

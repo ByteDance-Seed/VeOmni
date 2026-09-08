@@ -396,7 +396,7 @@ def test_text_encoder_decode_dispatches_pre_shifted_loss(monkeypatch):
     Asserted on the ACCELERATED class: it overrides ``decode``, so the fused
     dispatch has to live there to be what training actually runs.
     """
-    import veomni.models.seed_omni.modules.base.text_encoder.accelerated as text_encoder_accelerated
+    import veomni.models.seed_omni.modules.base.text_encoder.accelerated.accelerated as text_encoder_accelerated
 
     reduction_group = object()
     captured = {}
@@ -587,7 +587,7 @@ def test_janus_siglip_forward_returns_image_embeds():
 def test_janus_siglip_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
     """Off-FSDP the dummy forward skips the ViT but must still emit zeros shaped
     exactly like a real encode (no ``None``), so forward_post never branches."""
-    import veomni.models.seed_omni.modules.janus.siglip.accelerated as siglip_accelerated
+    import veomni.models.seed_omni.modules.janus.siglip.accelerated.accelerated as siglip_accelerated
 
     monkeypatch.setattr(siglip_accelerated, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
 
@@ -606,7 +606,7 @@ def test_janus_siglip_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeyp
 def test_janus_siglip_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
     """Inference (eval) needs no gradient anchor, so the dummy forward fabricates
     zeros even with FSDP enabled — the real ViT must not run."""
-    import veomni.models.seed_omni.modules.janus.siglip.accelerated as siglip_accelerated
+    import veomni.models.seed_omni.modules.janus.siglip.accelerated.accelerated as siglip_accelerated
 
     monkeypatch.setattr(siglip_accelerated, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
 
