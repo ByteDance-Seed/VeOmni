@@ -13,8 +13,9 @@ from veomni.distributed.sequence_parallel.ulysses import (
     _Gather,
 )
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.recompute_utils import checkpoint_forward as gradient_checkpoint_forward
 
-from .core import attention_forward, gradient_checkpoint_forward
+from .core import attention_forward
 
 
 if IS_NPU_AVAILABLE:
@@ -612,6 +613,7 @@ class MiniMaxH3DiT(nn.Module):
                 cu_seqlens=cu_bounds,
                 max_seqlen=max_seqlen,
                 use_ulysses=sp_world > 1,
+                layer_index=i,  # positive layer selection (configure gradient_checkpoint_layers)
             )
 
         if self._block_offload_enabled:

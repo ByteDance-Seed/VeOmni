@@ -39,7 +39,6 @@ data:
   data_type: diffusion
   source_name: minimax_h3
   data_transform: minimax_h3_online
-  datasets_type: minimax_h3_online
   log_sample: false
   shuffle: false
   text_keys: text

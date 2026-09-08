@@ -400,6 +400,47 @@ class GradientCheckpointingConfig:
             )
         },
     )
+    selective: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Selective activation checkpointing: keep attention-op outputs "
+                "(default set), recompute the rest (GEMM/MLP). Requires "
+                "enable=True and enable_reentrant=False."
+            )
+        },
+    )
+    selective_ops: list = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Extra operator strings to keep (MUST_SAVE) under selective mode, "
+                "e.g. ['aten._scaled_dot_product_attention.default']. Empty = auto default set."
+            )
+        },
+    )
+    gradient_checkpoint_layers: list = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Layers to recompute (empty = all layers, the default). Each "
+                "entry: int or inclusive range 'a-b', e.g. [0, '2-9'] = layers "
+                "0 and 2..9 only."
+            )
+        },
+    )
+    selective_gradient_checkpoint_layers: list = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Layers to run selective checkpointing (SAC) among recomputed "
+                "layers. Each entry: int or inclusive range 'a-b'. Empty = "
+                "follow 'selective' (SAC everywhere). Example: [10, '11-19'] on "
+                "a 20-layer model = layers 0-9 full recompute, 10-19 SAC. "
+                "Ignored when selective is off."
+            )
+        },
+    )
 
 
 @dataclass
