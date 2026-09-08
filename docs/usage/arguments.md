@@ -541,13 +541,17 @@ group ReduceScatter uses the low-precision transport; the replicate-group AllRed
 the transport and reduction dtypes match, VeOmni does not register the custom collective or alter native gradient
 scaling and reduction behavior.
 
+`bfloat16` is the recommended transport dtype because it retains FP32's exponent range. `float16` can be
+faster on some systems, but casting the FP32 reduction buffer follows normal IEEE FP16 semantics: finite
+values with magnitude above `65504` become infinity. Use FP16 only when gradient ranges are known to be safe.
+
 The supported combinations are intentionally narrow:
 
 | `mixed_precision.reduce_dtype` | `reduce_scatter_transport_dtype` | Behavior |
 | --- | --- | --- |
 | Any supported dtype | `None` | Native PyTorch path |
 | Any supported dtype | Same as `reduce_dtype` | Native PyTorch path |
-| `float32` | `bfloat16` or `float16` | With `mixed_precision.enable: true`, custom low-precision transport with FP32 accumulation and output |
+| `float32` | `bfloat16` or `float16` | With `mixed_precision.enable: true`, custom low-precision transport with FP32 accumulation and output; FP16 has the range limitation described above |
 | `bfloat16` | `float16` | Unsupported: both use two bytes per value, while BF16-to-FP16 may overflow |
 | `float16` | `bfloat16` | Unsupported: both use two bytes per value and provide no traffic reduction |
 

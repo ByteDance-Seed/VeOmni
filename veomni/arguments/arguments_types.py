@@ -468,7 +468,8 @@ class FSDPConfig:
                 "Optional BF16 or FP16 wire dtype for FSDP2 ReduceScatter while keeping FP32 reduction "
                 "buffers and accumulation. None or a value equal to mixed_precision.reduce_dtype uses "
                 "the native PyTorch path. The custom path supports only float32 reduction with bfloat16 "
-                "or float16 transport."
+                "or float16 transport. BF16 preserves the FP32 exponent range; FP16 may overflow values "
+                "outside its finite range."
             )
         },
     )

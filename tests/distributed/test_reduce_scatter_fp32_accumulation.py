@@ -45,6 +45,29 @@ def test_low_precision_transport_accumulates_and_outputs_fp32(monkeypatch, dtype
     torch.testing.assert_close(output_tensor, expected, rtol=0, atol=0)
 
 
+def test_fp16_transport_obeys_fp16_finite_range(monkeypatch):
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        dist,
+        "all_to_all_single",
+        lambda output, input, group, async_op: output.copy_(input),
+    )
+
+    input_tensor = torch.tensor([70000.0, 0.0], dtype=torch.float32)
+    fp16_output = torch.empty(1, dtype=torch.float32)
+    bf16_output = torch.empty(1, dtype=torch.float32)
+
+    FP32ReduceScatterWithLowPrecisionTransport(torch.float16, reduction_scale=1.0)(
+        fp16_output, input_tensor, object(), dist.ReduceOp.SUM
+    )
+    FP32ReduceScatterWithLowPrecisionTransport(torch.bfloat16, reduction_scale=1.0)(
+        bf16_output, input_tensor, object(), dist.ReduceOp.SUM
+    )
+
+    assert torch.isinf(fp16_output).all()
+    assert torch.isfinite(bf16_output).all()
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_low_precision_reduce_scatter_rejects_async(dtype):
     with pytest.raises(NotImplementedError, match="async_op=True"):
@@ -279,6 +302,71 @@ def test_matching_transport_dtype_does_not_register_custom_collective(monkeypatc
     )
 
     assert result is model
+
+
+@pytest.mark.parametrize(
+    ("mesh_dim_names", "sizes"),
+    [
+        (("dp_shard",), {"dp_shard": 4}),
+        (("dp_replicate", "dp_shard"), {"dp_replicate": 2, "dp_shard": 2}),
+    ],
+)
+def test_parallelize_registers_active_transport_for_fsdp_and_hsdp(monkeypatch, mesh_dim_names, sizes):
+    class FakeMeshDimension:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+    class FakeMesh:
+        def __init__(self):
+            self.mesh_dim_names = mesh_dim_names
+
+        def __getitem__(self, name):
+            return FakeMeshDimension(sizes[name])
+
+        def size(self):
+            result = 1
+            for size in sizes.values():
+                result *= size
+            return result
+
+    class ParallelState:
+        any_extra_parallel_enabled = False
+        extra_parallel_names = []
+        fsdp_mesh = FakeMesh()
+
+    registration_calls = []
+
+    def record_registration(model, *, transport_dtype, reduction_scales):
+        registration_calls.append((model, transport_dtype, dict(reduction_scales)))
+        return len(reduction_scales)
+
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: ParallelState())
+    monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cuda")
+    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch_parallelize, "_materialize_and_load_weights", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        torch_parallelize,
+        "register_fp32_reduce_scatter_with_low_precision_transport",
+        record_registration,
+    )
+
+    model = nn.Linear(2, 2)
+    result = torch_parallelize.parallelize_model_fsdp2(
+        model,
+        mixed_precision=MixedPrecisionConfig(
+            enable=True,
+            param_dtype="bfloat16",
+            reduce_dtype="float32",
+        ),
+        reduce_scatter_transport_dtype="bfloat16",
+        init_device="meta",
+    )
+
+    assert result is model
+    assert registration_calls == [(model, torch.bfloat16, {model: 0.25})]
 
 
 def _run_reduce_scatter_nccl() -> None:
