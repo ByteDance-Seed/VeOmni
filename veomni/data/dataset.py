@@ -127,7 +127,10 @@ class IterativeDataset(IterableDataset):
 
 
 class ShardedIterableDataset(IterableDataset):
-    """Row-level DP shard. Each pass drops an incomplete last round; ``repeat`` replays."""
+    """Row-level DP shard. One pass drops an incomplete last round.
+
+    ``repeat=True`` replays so training can reach ``max_steps`` on a short dump.
+    """
 
     def __init__(self, dataset, dp_rank: int = 0, dp_size: int = 1, repeat: bool = False, seed: int = 42):
         self._dataset = dataset
@@ -1594,7 +1597,7 @@ def build_iterable_dataset(
         source_name (Optional[str]): source name
         split_by_node (bool): shard the stream across DP ranks
         shuffle (bool): shuffle examples with a streaming buffer
-        dataset_repeat (bool): replay the stream when one pass is exhausted
+        dataset_repeat (bool): if True, replay so training can reach max_steps; if False, one pass ends the epoch
     Returns:
         IterableDataset: iterative dataset
     """

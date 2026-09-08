@@ -1521,7 +1521,12 @@ class DataArguments:
     )
     dataset_repeat: bool = field(
         default=False,
-        metadata={"help": "Iterable-only. Replay the stream after one pass. Mapping ignores this."},
+        metadata={
+            "help": (
+                "Iterable-only. If True, replay the stream so one epoch can reach "
+                "train.max_steps when the dump is shorter. Mapping ignores this."
+            )
+        },
     )
     multisource_datasets_type: str = field(
         default="interleave",
