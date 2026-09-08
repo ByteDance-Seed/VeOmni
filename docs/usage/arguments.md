@@ -530,14 +530,16 @@ distinct from the first emission.
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
-| reduce_scatter_with_fp32_accumulation | `bool` | `False` | Use BF16 or FP16 transport with destination-local FP32 accumulation for FSDP2 ReduceScatter. Requires `mixed_precision.reduce_dtype: bfloat16` or `float16`; HSDP is not supported. |
+| reduce_scatter_transport_dtype | `Optional[str]` | `None` | Optional `bfloat16` or `float16` wire dtype for FSDP2 ReduceScatter while keeping `mixed_precision.reduce_dtype: float32`. `None` or a value equal to `reduce_dtype` uses native PyTorch communication. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
-The FP32-accumulation ReduceScatter option trades memory for communication precision: each reduction temporarily
-allocates a full-size receive buffer in the configured low-precision reduction dtype and an FP32 output-shard
-accumulator. It only replaces the FSDP shard-group ReduceScatter, so HSDP is rejected rather than leaving its
-replicate-group AllReduce with low-precision accumulation.
+When `reduce_scatter_transport_dtype` differs from `mixed_precision.reduce_dtype`, VeOmni converts the FP32
+ReduceScatter input to the configured wire dtype, performs an all-to-all over the shard group, and accumulates
+directly into the FP32 output. This allocates low-precision send and receive buffers. Under HSDP, only the shard-
+group ReduceScatter uses the low-precision transport; the replicate-group AllReduce remains native FP32. When
+the transport and reduction dtypes match, VeOmni does not register the custom collective or alter native gradient
+scaling and reduction behavior.
 
 ### MixedPrecisionConfig
 
