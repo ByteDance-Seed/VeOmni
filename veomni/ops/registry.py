@@ -23,7 +23,7 @@ triple; ``requirement.device`` (or ``ANY_DEVICE``) fills the fourth key.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any, Callable
 
@@ -118,12 +118,14 @@ class OpEntry:
     """One registered row.
 
     Either a raw ``forward`` / ``backward`` pair (the wrapper is generated)
-    or an opaque ``wrapper``. Hardware ``requirement`` is optional.
+    or an opaque ``wrapper``. ``description`` records stable implementation
+    semantics for discovery. Hardware ``requirement`` is optional.
     """
 
     op: str
     variant: str
     impl: str
+    description: str = field(kw_only=True)
     forward: Callable | None = None
     backward: Callable | None = None
     wrapper: Callable | None = None
@@ -131,6 +133,8 @@ class OpEntry:
 
     def __post_init__(self) -> None:
         """Validate the raw/wrapper pairing and generate the wrapper if needed."""
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise ValueError("description must be a non-empty string")
         if (self.forward is None) != (self.backward is None):
             raise ValueError("forward and backward must both be set or both be None")
         if self.forward is None and self.wrapper is None:
@@ -229,6 +233,18 @@ class OpRegistry:
                 seen.append(impl)
         return seen
 
+    def list_entries(self, op: str, variant: str) -> list[OpEntry]:
+        """Return every registered row for ``(op, variant)``.
+
+        Device-specific rows are kept distinct, so the same implementation
+        name can appear more than once with different requirements.
+        """
+        return [
+            entry
+            for (entry_op, entry_variant, _impl, _device), entry in self._entries.items()
+            if entry_op == op and entry_variant == variant
+        ]
+
 
 OP_REGISTRY = OpRegistry()
 
@@ -240,20 +256,24 @@ def register_op(
     forward: Callable | None = None,
     backward: Callable | None = None,
     *,
+    description: str,
     wrapper: Callable | None = None,
     requirement: KernelRequirement | None = None,
 ) -> None:
     """Register one row on ``OP_REGISTRY``.
 
-    Pass a raw pair or an opaque ``wrapper``, not both. ``requirement.device``
-    (or ``ANY_DEVICE``) is the fourth key. ``resolve_op`` still takes the
-    public triple.
+    Pass a raw pair or an opaque ``wrapper``, not both. ``description`` is
+    required discovery metadata and should describe stable implementation
+    semantics rather than duplicating hardware constraints.
+    ``requirement.device`` (or ``ANY_DEVICE``) is the fourth key.
+    ``resolve_op`` still takes the public triple.
     """
     OP_REGISTRY.register(
         OpEntry(
             op=op,
             variant=variant,
             impl=impl,
+            description=description,
             forward=forward,
             backward=backward,
             wrapper=wrapper,

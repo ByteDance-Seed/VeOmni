@@ -25,7 +25,14 @@ from .full import eager as full_eager
 from .full import npu as full_npu
 
 
-register_op("rope_vision", "full", "eager", full_eager.forward, full_eager.backward)
+register_op(
+    "rope_vision",
+    "full",
+    "eager",
+    full_eager.forward,
+    full_eager.backward,
+    description="PyTorch vision rotary embedding over every channel",
+)
 
 register_op(
     "rope_vision",
@@ -33,5 +40,6 @@ register_op(
     "npu",
     full_npu.forward,
     full_npu.backward,
+    description="torch_npu vision rotary embedding over every channel",
     requirement=NpuKernelRequirement(),
 )

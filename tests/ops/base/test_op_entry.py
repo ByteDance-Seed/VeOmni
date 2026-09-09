@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from inspect import Parameter, signature
+
 import pytest
 import torch
 from torch import Tensor
@@ -32,6 +34,7 @@ from veomni.ops.registry import OpEntry, SavedState
 
 
 _GPU = GpuKernelRequirement()
+_TEST_DESCRIPTION = "Test operation"
 
 
 @pytest.fixture
@@ -80,13 +83,29 @@ def _optional_backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor |
 
 @pytest.mark.usefixtures("isolated_entries")
 class TestOpEntryValidation:
+    @pytest.mark.parametrize("target", (OpEntry, register_op))
+    def test_description_is_required_keyword_only(self, target):
+        parameter = signature(target).parameters["description"]
+        assert parameter.kind is Parameter.KEYWORD_ONLY
+        assert parameter.default is Parameter.empty
+
     def test_forward_without_backward_raises(self):
         with pytest.raises(ValueError, match="both be set or both be None"):
-            OpEntry(op="add", variant="standard", impl="eager", forward=_add_forward)
+            OpEntry(
+                op="add",
+                variant="standard",
+                impl="eager",
+                description=_TEST_DESCRIPTION,
+                forward=_add_forward,
+            )
 
     def test_wrapper_required_when_raw_is_none(self):
         with pytest.raises(ValueError, match="wrapper is required"):
-            OpEntry(op="add", variant="standard", impl="eager")
+            OpEntry(op="add", variant="standard", impl="eager", description=_TEST_DESCRIPTION)
+
+    def test_description_must_be_non_empty(self):
+        with pytest.raises(ValueError, match="description must be a non-empty string"):
+            OpEntry(op="add", variant="standard", impl="eager", description=" ", wrapper=lambda: None)
 
     def test_raw_plus_wrapper_raises(self):
         with pytest.raises(ValueError, match="do not pass wrapper"):
@@ -94,6 +113,7 @@ class TestOpEntryValidation:
                 op="add",
                 variant="standard",
                 impl="eager",
+                description=_TEST_DESCRIPTION,
                 forward=_add_forward,
                 backward=_add_backward,
                 wrapper=lambda *args, **kwargs: None,
@@ -103,22 +123,23 @@ class TestOpEntryValidation:
 @pytest.mark.usefixtures("isolated_entries")
 class TestRegisterAndResolve:
     def test_register_and_resolve_eager(self):
-        register_op("add", "standard", "eager", _add_forward, _add_backward)
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
         entry = resolve_op("add", "standard", "eager")
         assert entry.forward is _add_forward
         assert entry.backward is _add_backward
+        assert entry.description == _TEST_DESCRIPTION
         assert entry.wrapper is not None
         assert "eager" in OP_REGISTRY.list_available("add", "standard")
 
     def test_unknown_impl_raises_keyerror(self):
-        register_op("add", "standard", "eager", _add_forward, _add_backward)
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
         with pytest.raises(KeyError, match="Unknown op"):
             resolve_op("add", "standard", "missing")
 
     def test_duplicate_row_raises(self):
-        register_op("add", "standard", "eager", _add_forward, _add_backward)
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
         with pytest.raises(ValueError, match="Duplicate op registration"):
-            register_op("add", "standard", "eager", _add_forward, _add_backward)
+            register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
 
     def test_same_impl_can_register_per_device(self):
         OP_REGISTRY.register(
@@ -126,6 +147,7 @@ class TestRegisterAndResolve:
                 op="add",
                 variant="standard",
                 impl="fused",
+                description="GPU fused add",
                 forward=_add_forward,
                 backward=_add_backward,
                 requirement=_GPU,
@@ -136,6 +158,7 @@ class TestRegisterAndResolve:
                 op="add",
                 variant="standard",
                 impl="fused",
+                description="NPU fused add",
                 forward=_add_forward,
                 backward=_add_backward,
                 requirement=NpuKernelRequirement(),
@@ -146,6 +169,7 @@ class TestRegisterAndResolve:
                 op="add",
                 variant="standard",
                 impl="fused",
+                description="MLU fused add",
                 forward=_add_forward,
                 backward=_add_backward,
                 requirement=MluKernelRequirement(),
@@ -155,12 +179,16 @@ class TestRegisterAndResolve:
         assert ("add", "standard", "fused", "cuda") in OP_REGISTRY._entries
         assert ("add", "standard", "fused", "mlu") in OP_REGISTRY._entries
         assert ("add", "standard", "fused", "npu") in OP_REGISTRY._entries
+        entries = OP_REGISTRY.list_entries("add", "standard")
+        assert [entry.description for entry in entries] == ["GPU fused add", "NPU fused add", "MLU fused add"]
+        assert OP_REGISTRY.list_entries("add", "other") == []
         with pytest.raises(ValueError, match="device='cuda'"):
             OP_REGISTRY.register(
                 OpEntry(
                     op="add",
                     variant="standard",
                     impl="fused",
+                    description="Duplicate GPU fused add",
                     forward=_add_forward,
                     backward=_add_backward,
                     requirement=_GPU,
@@ -177,9 +205,23 @@ class TestRegisterAndResolve:
         def any_wrapper(x: Tensor) -> Tensor:
             return x + 3
 
-        register_op("add", "standard", "fused", wrapper=cuda_wrapper, requirement=_GPU)
-        register_op("add", "standard", "fused", wrapper=mlu_wrapper, requirement=MluKernelRequirement())
-        register_op("add", "standard", "eager", wrapper=any_wrapper)
+        register_op(
+            "add",
+            "standard",
+            "fused",
+            description="GPU fused add",
+            wrapper=cuda_wrapper,
+            requirement=_GPU,
+        )
+        register_op(
+            "add",
+            "standard",
+            "fused",
+            description="MLU fused add",
+            wrapper=mlu_wrapper,
+            requirement=MluKernelRequirement(),
+        )
+        register_op("add", "standard", "eager", description="Eager add", wrapper=any_wrapper)
         monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "mlu")
         monkeypatch.setattr("veomni.ops.platform.requirement.IS_MLU_AVAILABLE", True)
         assert resolve_op("add", "standard", "fused").wrapper is mlu_wrapper
@@ -197,6 +239,7 @@ class TestRegisterAndResolve:
             "cuda_only",
             _add_forward,
             _add_backward,
+            description="CUDA-only add",
             requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=999),)),
         )
         assert "cuda_only" in OP_REGISTRY.list_registered("add", "standard")
@@ -211,7 +254,7 @@ class TestRegisterAndResolve:
             OP_REGISTRY.register(object())  # type: ignore[arg-type]
 
     def test_resolve_returns_same_entry(self):
-        register_op("add", "standard", "eager", _add_forward, _add_backward)
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
         entry = OP_REGISTRY.resolve("add", "standard", "eager")
         assert entry is resolve_op("add", "standard", "eager")
 
@@ -219,7 +262,7 @@ class TestRegisterAndResolve:
         def opaque(x: Tensor) -> Tensor:
             return x * 2
 
-        register_op("scale", "standard", "eager", wrapper=opaque)
+        register_op("scale", "standard", "eager", description="Opaque scale", wrapper=opaque)
         entry = resolve_op("scale", "standard", "eager")
         assert entry.forward is None
         assert entry.backward is None
@@ -232,7 +275,7 @@ class TestRegisterAndResolve:
 @pytest.mark.usefixtures("isolated_entries")
 class TestGeneratedWrapper:
     def test_wrapper_matches_raw_grads(self):
-        register_op("add", "standard", "eager", _add_forward, _add_backward)
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
         entry = resolve_op("add", "standard", "eager")
         x = torch.randn(4, requires_grad=True)
         y = torch.randn(4, requires_grad=True)
@@ -249,7 +292,7 @@ class TestGeneratedWrapper:
         assert torch.allclose(y.grad, gy)
 
     def test_multi_output_wrapper(self):
-        register_op("pair", "standard", "eager", _pair_forward, _pair_backward)
+        register_op("pair", "standard", "eager", _pair_forward, _pair_backward, description=_TEST_DESCRIPTION)
         entry = resolve_op("pair", "standard", "eager")
         x = torch.randn(3, requires_grad=True)
         y = torch.randn(3, requires_grad=True)
@@ -262,7 +305,14 @@ class TestGeneratedWrapper:
 
     @pytest.mark.parametrize("pass_as_keyword", (False, True))
     def test_optional_positional_tensor_uses_full_autograd_signature(self, pass_as_keyword):
-        register_op("optional_add", "standard", "eager", _optional_forward, _optional_backward)
+        register_op(
+            "optional_add",
+            "standard",
+            "eager",
+            _optional_forward,
+            _optional_backward,
+            description=_TEST_DESCRIPTION,
+        )
         entry = resolve_op("optional_add", "standard", "eager")
         x = torch.randn(3, requires_grad=True)
         y = torch.randn(3, requires_grad=True) if pass_as_keyword else None
@@ -278,7 +328,7 @@ class TestGeneratedWrapper:
 @pytest.mark.usefixtures("isolated_entries")
 class TestVeomniOp:
     def test_call_equals_wrapper(self):
-        register_op("add", "standard", "eager", _add_forward, _add_backward)
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
         handle = VeomniOp("add", "standard", "eager")
         x = torch.tensor([1.0, 2.0])
         y = torch.tensor([3.0, 4.0])
@@ -288,8 +338,8 @@ class TestVeomniOp:
         def scale2_forward(x: Tensor, y: Tensor, *, scale: float) -> tuple[Tensor, SavedState]:
             return _add_forward(x, y, scale=scale * 2)
 
-        register_op("add", "standard", "eager", _add_forward, _add_backward)
-        register_op("add", "standard", "double", scale2_forward, _add_backward)
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description="Eager add")
+        register_op("add", "standard", "double", scale2_forward, _add_backward, description="Doubled add")
         eager = VeomniOp("add", "standard", "eager")
         double = VeomniOp("add", "standard", "double")
         x = torch.tensor([1.0])
@@ -298,5 +348,5 @@ class TestVeomniOp:
         assert eager is not double
 
     def test_intern_by_triple(self):
-        register_op("add", "standard", "eager", _add_forward, _add_backward)
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
         assert VeomniOp("add", "standard") is VeomniOp("add", "standard", "eager")

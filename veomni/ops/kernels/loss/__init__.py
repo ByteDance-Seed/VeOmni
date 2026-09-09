@@ -35,7 +35,14 @@ from .load_balancing_loss.standard import triton as lb_triton
 _GPU = GpuKernelRequirement()
 
 
-register_op("load_balancing_loss", "standard", "eager", lb_eager.forward, lb_eager.backward)
+register_op(
+    "load_balancing_loss",
+    "standard",
+    "eager",
+    lb_eager.forward,
+    lb_eager.backward,
+    description="PyTorch token-level MoE load-balancing loss",
+)
 
 register_op(
     "load_balancing_loss",
@@ -43,10 +50,18 @@ register_op(
     "triton",
     lb_triton.forward,
     lb_triton.backward,
+    description="Triton token-level MoE load-balancing loss",
     requirement=_GPU,
 )
 
-register_op("cross_entropy_loss", "standard", "eager", ce_eager.forward, ce_eager.backward)
+register_op(
+    "cross_entropy_loss",
+    "standard",
+    "eager",
+    ce_eager.forward,
+    ce_eager.backward,
+    description="PyTorch token-level cross-entropy loss",
+)
 
 register_op(
     "cross_entropy_loss",
@@ -54,7 +69,15 @@ register_op(
     "liger_kernel",
     ce_liger.forward,
     ce_liger.backward,
+    description="Liger Kernel token-level cross-entropy loss",
     requirement=_GPU,
 )
 
-register_op("cross_entropy_loss", "standard", "chunk_loss", ce_chunk.forward, ce_chunk.backward)
+register_op(
+    "cross_entropy_loss",
+    "standard",
+    "chunk_loss",
+    ce_chunk.forward,
+    ce_chunk.backward,
+    description="Chunked token-level cross-entropy loss",
+)

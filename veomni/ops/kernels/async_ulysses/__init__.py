@@ -26,7 +26,35 @@ from .qkv_proj.dit import eager as qkv_dit
 from .qkv_proj.standard import eager as qkv_standard
 
 
-register_op("async_ulysses_qkv", "standard", "eager", qkv_standard.forward, qkv_standard.backward)
-register_op("async_ulysses_qkv", "dit", "eager", qkv_dit.forward, qkv_dit.backward)
-register_op("async_ulysses_o", "standard", "eager", o_standard.forward, o_standard.backward)
-register_op("async_ulysses_o", "dit", "eager", o_dit.forward, o_dit.backward)
+register_op(
+    "async_ulysses_qkv",
+    "standard",
+    "eager",
+    qkv_standard.forward,
+    qkv_standard.backward,
+    description="VeOmni asynchronous Ulysses QKV projection for transformer models",
+)
+register_op(
+    "async_ulysses_qkv",
+    "dit",
+    "eager",
+    qkv_dit.forward,
+    qkv_dit.backward,
+    description="VeOmni asynchronous Ulysses QKV projection for diffusion transformers",
+)
+register_op(
+    "async_ulysses_o",
+    "standard",
+    "eager",
+    o_standard.forward,
+    o_standard.backward,
+    description="VeOmni asynchronous Ulysses output projection for transformer models",
+)
+register_op(
+    "async_ulysses_o",
+    "dit",
+    "eager",
+    o_dit.forward,
+    o_dit.backward,
+    description="VeOmni asynchronous Ulysses output projection for diffusion transformers",
+)

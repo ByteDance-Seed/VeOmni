@@ -400,6 +400,7 @@ def test_nested_rms_handle_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
         op="dummy_rms",
         variant="standard",
         impl="eager",
+        description="Test RMSNorm",
         forward=dummy_forward,
         backward=dummy_backward,
     )

@@ -115,12 +115,19 @@ def _independent_triton_wrapper(
     )
 
 
-register_op("moe_experts_lora", "shared", "eager", wrapper=shared_eager.wrapper)
+register_op(
+    "moe_experts_lora",
+    "shared",
+    "eager",
+    description="PyTorch routed MoE experts with LoRA weights shared across experts",
+    wrapper=shared_eager.wrapper,
+)
 
 register_op(
     "moe_experts_lora",
     "shared",
     "fused_triton",
+    description="Triton routed MoE experts with LoRA weights shared across experts",
     wrapper=_shared_triton_wrapper,
     requirement=_GPU_SM70_OR_ROCM,
 )
@@ -129,16 +136,24 @@ register_op(
     "moe_experts_lora",
     "shared",
     "fused_npu",
+    description="torch_npu routed MoE experts with LoRA weights shared across experts",
     wrapper=shared_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )
 
-register_op("moe_experts_lora", "independent", "eager", wrapper=independent_eager.wrapper)
+register_op(
+    "moe_experts_lora",
+    "independent",
+    "eager",
+    description="PyTorch routed MoE experts with independent per-expert LoRA weights",
+    wrapper=independent_eager.wrapper,
+)
 
 register_op(
     "moe_experts_lora",
     "independent",
     "fused_triton",
+    description="Triton routed MoE experts with independent per-expert LoRA weights",
     wrapper=_independent_triton_wrapper,
     requirement=_GPU_SM70_OR_ROCM,
 )
@@ -147,6 +162,7 @@ register_op(
     "moe_experts_lora",
     "independent",
     "fused_npu",
+    description="torch_npu routed MoE experts with independent per-expert LoRA weights",
     wrapper=independent_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )

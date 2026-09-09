@@ -34,34 +34,68 @@ from .indexer.glm import eager as glm_indexer_eager
 _TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 _NVIDIA = GpuKernelRequirement(platforms=(NVIDIA_GPU,))
 
-register_op("dsa_attention", "deepseek_v4", "eager", wrapper=dsv4_attn_eager.wrapper)
+register_op(
+    "dsa_attention",
+    "deepseek_v4",
+    "eager",
+    description="PyTorch DeepSeek-V4 sparse attention",
+    wrapper=dsv4_attn_eager.wrapper,
+)
 
 register_op(
     "dsa_attention",
     "deepseek_v4",
     "tilelang",
+    description="TileLang DeepSeek-V4 sparse attention",
     wrapper=dsv4_attn_tilelang.wrapper,
     requirement=_TILELANG,
 )
-register_op("dsa_attention", "glm", "eager", wrapper=glm_attn_eager.wrapper)
+register_op(
+    "dsa_attention",
+    "glm",
+    "eager",
+    description="PyTorch GLM sparse attention",
+    wrapper=glm_attn_eager.wrapper,
+)
 
 register_op(
     "dsa_attention",
     "glm",
     "flashmla_cudnn",
+    description="FlashMLA cuDNN GLM sparse attention",
     wrapper=glm_attn_flashmla.wrapper,
     requirement=_NVIDIA,
 )
 
-register_op("dsa_indexer", "deepseek_v4", "eager", wrapper=dsv4_indexer_eager.wrapper)
+register_op(
+    "dsa_indexer",
+    "deepseek_v4",
+    "eager",
+    description="PyTorch DeepSeek-V4 sparse-attention indexer",
+    wrapper=dsv4_indexer_eager.wrapper,
+)
 
 register_op(
     "dsa_indexer",
     "deepseek_v4",
     "tilelang",
+    description="TileLang DeepSeek-V4 sparse-attention indexer",
     wrapper=dsv4_indexer_tilelang.wrapper,
     requirement=_TILELANG,
 )
-register_op("dsa_indexer", "glm", "eager", wrapper=glm_indexer_eager.wrapper)
+register_op(
+    "dsa_indexer",
+    "glm",
+    "eager",
+    description="PyTorch GLM sparse-attention indexer",
+    wrapper=glm_indexer_eager.wrapper,
+)
 
-register_op("dsa_indexer", "glm", "cudnn", wrapper=glm_indexer_cudnn.wrapper, requirement=_NVIDIA)
+register_op(
+    "dsa_indexer",
+    "glm",
+    "cudnn",
+    description="cuDNN GLM sparse-attention indexer",
+    wrapper=glm_indexer_cudnn.wrapper,
+    requirement=_NVIDIA,
+)

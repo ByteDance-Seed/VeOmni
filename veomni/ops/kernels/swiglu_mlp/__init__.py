@@ -27,7 +27,14 @@ from .standard import liger_kernel as standard_liger
 _GPU = GpuKernelRequirement()
 
 
-register_op("swiglu_mlp", "standard", "eager", standard_eager.forward, standard_eager.backward)
+register_op(
+    "swiglu_mlp",
+    "standard",
+    "eager",
+    standard_eager.forward,
+    standard_eager.backward,
+    description="PyTorch SwiGLU MLP with optional activation clamping",
+)
 
 register_op(
     "swiglu_mlp",
@@ -35,5 +42,6 @@ register_op(
     "liger_kernel",
     standard_liger.forward,
     standard_liger.backward,
+    description="Liger Kernel SwiGLU MLP with optional activation clamping",
     requirement=_GPU,
 )

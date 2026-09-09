@@ -32,14 +32,54 @@ from .pre import tilelang as pre_tilelang
 
 _TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
-register_op("mhc", "pre", "eager", wrapper=pre_eager.wrapper)
+register_op(
+    "mhc",
+    "pre",
+    "eager",
+    description="PyTorch DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
+    wrapper=pre_eager.wrapper,
+)
 
-register_op("mhc", "pre", "tilelang", wrapper=pre_tilelang.wrapper, requirement=_TILELANG)
+register_op(
+    "mhc",
+    "pre",
+    "tilelang",
+    description="TileKernels DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse",
+    wrapper=pre_tilelang.wrapper,
+    requirement=_TILELANG,
+)
 
-register_op("mhc", "post", "eager", wrapper=post_eager.wrapper)
+register_op(
+    "mhc",
+    "post",
+    "eager",
+    description="PyTorch DeepSeek-V4 mHC residual post-mix",
+    wrapper=post_eager.wrapper,
+)
 
-register_op("mhc", "post", "tilelang", post_tilelang.forward, post_tilelang.backward, requirement=_TILELANG)
+register_op(
+    "mhc",
+    "post",
+    "tilelang",
+    post_tilelang.forward,
+    post_tilelang.backward,
+    description="TileKernels DeepSeek-V4 mHC residual post-mix",
+    requirement=_TILELANG,
+)
 
-register_op("mhc", "head", "eager", wrapper=head_eager.wrapper)
+register_op(
+    "mhc",
+    "head",
+    "eager",
+    description="PyTorch DeepSeek-V4 final mHC collapse",
+    wrapper=head_eager.wrapper,
+)
 
-register_op("mhc", "head", "tilelang", wrapper=head_tilelang.wrapper, requirement=_TILELANG)
+register_op(
+    "mhc",
+    "head",
+    "tilelang",
+    description="TileKernels DeepSeek-V4 final mHC collapse",
+    wrapper=head_tilelang.wrapper,
+    requirement=_TILELANG,
+)

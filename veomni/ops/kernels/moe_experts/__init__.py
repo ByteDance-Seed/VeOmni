@@ -41,12 +41,19 @@ _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
 
-register_op("moe_experts", "standard", "eager", wrapper=standard_eager.wrapper)
+register_op(
+    "moe_experts",
+    "standard",
+    "eager",
+    description="PyTorch routed SwiGLU MoE experts with split or merged gate/up weights",
+    wrapper=standard_eager.wrapper,
+)
 
 register_op(
     "moe_experts",
     "standard",
     "fused_triton",
+    description="Triton grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_triton.wrapper,
     requirement=_GPU_SM70_OR_ROCM,
 )
@@ -55,6 +62,7 @@ register_op(
     "moe_experts",
     "standard",
     "fused_triton",
+    description="Triton grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_triton.wrapper,
     requirement=MluKernelRequirement(),
 )
@@ -63,6 +71,7 @@ register_op(
     "moe_experts",
     "standard",
     "fused_quack",
+    description="Quack CUTLASS/CuTe routed SwiGLU MoE experts",
     wrapper=standard_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
 )
@@ -71,6 +80,7 @@ register_op(
     "moe_experts",
     "standard",
     "fused_npu",
+    description="torch_npu grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )
@@ -79,16 +89,24 @@ register_op(
     "moe_experts",
     "standard",
     "fused_mlu",
+    description="Apex grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_mlu.wrapper,
     requirement=MluKernelRequirement(),
 )
 
-register_op("moe_experts", "gpt_oss", "eager", wrapper=gpt_oss_eager.wrapper)
+register_op(
+    "moe_experts",
+    "gpt_oss",
+    "eager",
+    description="PyTorch GPT-OSS MoE experts with interleaved gate/up weights and bias",
+    wrapper=gpt_oss_eager.wrapper,
+)
 
 register_op(
     "moe_experts",
     "gpt_oss",
     "fused_quack",
+    description="Quack CUTLASS/CuTe GPT-OSS MoE experts with interleaved gate/up weights and bias",
     wrapper=gpt_oss_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
 )

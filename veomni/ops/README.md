@@ -61,10 +61,14 @@ from veomni.ops import OP_REGISTRY
 
 OP_REGISTRY.list_registered("rms_norm", "standard")
 OP_REGISTRY.list_available("rms_norm", "standard")
+OP_REGISTRY.list_entries("rms_norm", "standard")
 ```
 
 `list_registered` includes every known implementation. `list_available`
 filters those rows using the current device and hardware requirement.
+`list_entries` returns the complete device-specific rows, including their
+descriptions and requirements; an implementation registered for multiple
+devices therefore appears more than once.
 
 ## Registering an op
 
@@ -85,6 +89,7 @@ register_op(
     "example",
     "standard",
     "eager",
+    description="PyTorch reference implementation of the example operation",
     wrapper=eager_example,
 )
 
@@ -94,9 +99,14 @@ register_op(
     "triton",
     forward=triton_forward,
     backward=triton_backward,
+    description="Triton implementation of the example operation",
     requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
 )
 ```
+
+Descriptions identify the implementation source, algorithm, layout, or other
+stable semantic differences. Device and compute-capability support belong in
+the requirement instead of the description so the metadata cannot drift apart.
 
 For a raw pair, `forward` returns `(output, SavedState)`, and `backward`
 returns one gradient entry for every positional tensor passed to the generated

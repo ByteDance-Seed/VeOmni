@@ -51,12 +51,19 @@ _GPU = GpuKernelRequirement()
 _FLASH_QLA_GPU = GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=100),))
 
 
-register_op("rms_norm_gated", "standard", "eager", wrapper=rms_eager.wrapper)
+register_op(
+    "rms_norm_gated",
+    "standard",
+    "eager",
+    description="PyTorch RMSNorm with a SiLU gate",
+    wrapper=rms_eager.wrapper,
+)
 
 register_op(
     "rms_norm_gated",
     "standard",
     "fla",
+    description="flash-linear-attention fused RMSNorm with a SiLU gate",
     wrapper=rms_fla.wrapper,
     requirement=_GPU,
 )
@@ -65,6 +72,7 @@ register_op(
     "rms_norm_gated",
     "standard",
     "fla",
+    description="flash-linear-attention fused RMSNorm with a SiLU gate",
     wrapper=rms_fla.wrapper,
     requirement=MluKernelRequirement(),
 )
@@ -73,16 +81,24 @@ register_op(
     "rms_norm_gated",
     "standard",
     "npu",
+    description="Fused RMSNorm with a SiLU gate using torch_npu",
     wrapper=rms_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )
 
-register_op("causal_conv1d", "standard", "eager", wrapper=conv_eager.wrapper)
+register_op(
+    "causal_conv1d",
+    "standard",
+    "eager",
+    description="PyTorch depthwise causal convolution",
+    wrapper=conv_eager.wrapper,
+)
 
 register_op(
     "causal_conv1d",
     "standard",
     "fla",
+    description="flash-linear-attention depthwise causal convolution with variable-length support",
     wrapper=conv_fla.wrapper,
     requirement=_GPU,
 )
@@ -91,6 +107,7 @@ register_op(
     "causal_conv1d",
     "standard",
     "fla",
+    description="flash-linear-attention depthwise causal convolution with variable-length support",
     wrapper=conv_fla.wrapper,
     requirement=MluKernelRequirement(),
 )
@@ -101,15 +118,23 @@ register_op(
     "npu",
     conv_npu.forward,
     conv_npu.backward,
+    description="Vendored Triton depthwise causal convolution with variable-length support",
     requirement=NpuKernelRequirement(),
 )
 
-register_op("chunk_gated_delta_rule", "standard", "eager", wrapper=chunk_eager.wrapper)
+register_op(
+    "chunk_gated_delta_rule",
+    "standard",
+    "eager",
+    description="PyTorch chunked gated delta rule",
+    wrapper=chunk_eager.wrapper,
+)
 
 register_op(
     "chunk_gated_delta_rule",
     "standard",
     "fla",
+    description="flash-linear-attention chunked gated delta rule with variable-length support",
     wrapper=chunk_fla.wrapper,
     requirement=_GPU,
 )
@@ -118,6 +143,7 @@ register_op(
     "chunk_gated_delta_rule",
     "standard",
     "fla",
+    description="flash-linear-attention chunked gated delta rule with variable-length support",
     wrapper=chunk_fla.wrapper,
     requirement=MluKernelRequirement(),
 )
@@ -126,6 +152,7 @@ register_op(
     "chunk_gated_delta_rule",
     "standard",
     "flash_qla",
+    description="FlashQLA chunked gated delta rule",
     wrapper=chunk_flash_qla.wrapper,
     requirement=_FLASH_QLA_GPU,
 )
@@ -136,6 +163,7 @@ register_op(
     "npu",
     chunk_npu.forward,
     chunk_npu.backward,
+    description="Vendored Triton chunked gated delta rule with variable-length support",
     requirement=NpuKernelRequirement(),
 )
 
@@ -145,5 +173,6 @@ register_op(
     "npu_ascendc",
     chunk_ascendc.forward,
     chunk_ascendc.backward,
+    description="AscendC chunked gated delta rule with variable-length support",
     requirement=NpuKernelRequirement(),
 )

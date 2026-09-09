@@ -35,7 +35,14 @@ from .unweighted import liger_kernel as unweighted_liger
 _GPU = GpuKernelRequirement()
 
 
-register_op("rms_norm", "standard", "eager", standard_eager.forward, standard_eager.backward)
+register_op(
+    "rms_norm",
+    "standard",
+    "eager",
+    standard_eager.forward,
+    standard_eager.backward,
+    description="PyTorch standard RMSNorm with Llama-style casting",
+)
 
 register_op(
     "rms_norm",
@@ -43,6 +50,7 @@ register_op(
     "liger_kernel",
     standard_liger.forward,
     standard_liger.backward,
+    description="Liger Kernel standard RMSNorm with Llama-style casting",
     requirement=_GPU,
 )
 
@@ -52,6 +60,7 @@ register_op(
     "npu",
     standard_npu.forward,
     standard_npu.backward,
+    description="torch_npu standard RMSNorm with Llama-style casting",
     requirement=NpuKernelRequirement(),
 )
 
@@ -61,10 +70,18 @@ register_op(
     "triton",
     standard_triton.forward,
     standard_triton.backward,
+    description="Triton standard RMSNorm with Llama-style casting",
     requirement=_GPU,
 )
 
-register_op("rms_norm", "qwen3_5", "eager", qwen3_5_eager.forward, qwen3_5_eager.backward)
+register_op(
+    "rms_norm",
+    "qwen3_5",
+    "eager",
+    qwen3_5_eager.forward,
+    qwen3_5_eager.backward,
+    description="PyTorch Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
+)
 
 register_op(
     "rms_norm",
@@ -72,6 +89,7 @@ register_op(
     "liger_kernel",
     qwen3_5_liger.forward,
     qwen3_5_liger.backward,
+    description="Liger Kernel Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
     requirement=_GPU,
 )
 
@@ -81,6 +99,7 @@ register_op(
     "npu",
     qwen3_5_npu.forward,
     qwen3_5_npu.backward,
+    description="torch_npu Qwen3.5 RMSNorm with offset weights and Gemma-style scaling",
     requirement=NpuKernelRequirement(),
 )
 
@@ -90,6 +109,7 @@ register_op(
     "eager",
     unweighted_eager.forward,
     unweighted_eager.backward,
+    description="PyTorch RMSNorm without an affine weight",
 )
 
 register_op(
@@ -98,5 +118,6 @@ register_op(
     "liger_kernel",
     unweighted_liger.forward,
     unweighted_liger.backward,
+    description="Liger Kernel RMSNorm without an affine weight",
     requirement=_GPU,
 )

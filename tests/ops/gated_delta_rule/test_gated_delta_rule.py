@@ -446,7 +446,14 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     value = torch.randn(shape, dtype=torch.bfloat16, requires_grad=True)
     g = torch.randn(shape[:3], dtype=torch.float32, requires_grad=True)
     beta = torch.randn(shape[:3], dtype=torch.bfloat16, requires_grad=True)
-    entry = OpEntry("test_chunk_gdr", "standard", impl, module.forward, module.backward)
+    entry = OpEntry(
+        "test_chunk_gdr",
+        "standard",
+        impl,
+        module.forward,
+        module.backward,
+        description="Test chunked gated delta rule",
+    )
     output, _final_state = entry.wrapper(
         query,
         key,

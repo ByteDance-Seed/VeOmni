@@ -37,7 +37,14 @@ from .wan import triton as wan_triton
 _GPU = GpuKernelRequirement()
 
 
-register_op("rope", "full", "eager", full_eager.forward, full_eager.backward)
+register_op(
+    "rope",
+    "full",
+    "eager",
+    full_eager.forward,
+    full_eager.backward,
+    description="PyTorch rotary embedding over every channel",
+)
 
 register_op(
     "rope",
@@ -45,6 +52,7 @@ register_op(
     "liger_kernel",
     full_liger.forward,
     full_liger.backward,
+    description="Liger Kernel rotary embedding over every channel",
     requirement=_GPU,
 )
 
@@ -54,10 +62,18 @@ register_op(
     "npu",
     full_npu.forward,
     full_npu.backward,
+    description="torch_npu rotary embedding over every channel",
     requirement=NpuKernelRequirement(),
 )
 
-register_op("rope", "partial", "eager", partial_eager.forward, partial_eager.backward)
+register_op(
+    "rope",
+    "partial",
+    "eager",
+    partial_eager.forward,
+    partial_eager.backward,
+    description="PyTorch rotary embedding over a channel prefix",
+)
 
 register_op(
     "rope",
@@ -65,10 +81,18 @@ register_op(
     "npu",
     partial_npu.forward,
     partial_npu.backward,
+    description="torch_npu rotary embedding over a channel prefix",
     requirement=NpuKernelRequirement(),
 )
 
-register_op("rope", "deepseek_v4", "eager", dsv4_eager.forward, dsv4_eager.backward)
+register_op(
+    "rope",
+    "deepseek_v4",
+    "eager",
+    dsv4_eager.forward,
+    dsv4_eager.backward,
+    description="PyTorch DeepSeek-V4 rotary embedding over a trailing interleaved slice",
+)
 
 register_op(
     "rope",
@@ -76,10 +100,18 @@ register_op(
     "triton",
     dsv4_triton.forward,
     dsv4_triton.backward,
+    description="Triton DeepSeek-V4 rotary embedding over a trailing interleaved slice",
     requirement=_GPU,
 )
 
-register_op("rope", "wan", "eager", wan_eager.forward, wan_eager.backward)
+register_op(
+    "rope",
+    "wan",
+    "eager",
+    wan_eager.forward,
+    wan_eager.backward,
+    description="PyTorch Wan rotary embedding using complex multiplication",
+)
 
 register_op(
     "rope",
@@ -87,6 +119,7 @@ register_op(
     "triton",
     wan_triton.forward,
     wan_triton.backward,
+    description="Triton Wan rotary embedding using complex multiplication",
     requirement=_GPU,
 )
 
@@ -96,5 +129,6 @@ register_op(
     "npu",
     wan_npu.forward,
     wan_npu.backward,
+    description="torch_npu Wan rotary embedding using complex multiplication",
     requirement=NpuKernelRequirement(),
 )

@@ -85,23 +85,24 @@ def lookup(impl: str) -> Callable:
     return wrapper
 
 
-_STANDARD_IMPLS = (
-    "eager",
-    "sdpa",
-    "flash_attention_2",
-    "flash_attention_3",
-    "flash_attention_4",
-    "flex_attention",
-    "magi_attention",
-    "native-sparse",
-    "veomni_flash_attention_2",
-    "veomni_flash_attention_3",
-    "veomni_flash_attention_4",
-    "veomni_flex_attention",
-    "veomni_magi_attention",
-    "veomni_sage_attention",
-    "veomni_sdpa",
-)
+_STANDARD_IMPL_DESCRIPTIONS = {
+    "eager": "Transformers model-local eager attention",
+    "sdpa": "PyTorch scaled dot-product attention through Transformers",
+    "flash_attention_2": "FlashAttention 2 through Transformers",
+    "flash_attention_3": "FlashAttention 3 through Transformers",
+    "flash_attention_4": "FlashAttention 4 through Transformers",
+    "flex_attention": "PyTorch FlexAttention through Transformers",
+    "magi_attention": "MagiAttention through Transformers",
+    "native-sparse": "Transformers native sparse attention",
+    "veomni_flash_attention_2": "VeOmni FlashAttention 2 adapter through Transformers",
+    "veomni_flash_attention_3": "VeOmni FlashAttention 3 adapter through Transformers",
+    "veomni_flash_attention_4": "VeOmni FlashAttention 4 adapter through Transformers",
+    "veomni_flex_attention": "VeOmni FlexAttention adapter through Transformers",
+    "veomni_magi_attention": "VeOmni MagiAttention adapter through Transformers",
+    "veomni_sage_attention": "VeOmni SageAttention adapter through Transformers",
+    "veomni_sdpa": "VeOmni scaled dot-product attention adapter through Transformers",
+}
+_STANDARD_IMPLS = tuple(_STANDARD_IMPL_DESCRIPTIONS)
 
-for _impl in _STANDARD_IMPLS:
-    register_op("attention", "standard", _impl, wrapper=lookup(_impl))
+for _impl, _description in _STANDARD_IMPL_DESCRIPTIONS.items():
+    register_op("attention", "standard", _impl, description=_description, wrapper=lookup(_impl))
