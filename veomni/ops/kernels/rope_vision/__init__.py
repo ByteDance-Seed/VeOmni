@@ -19,8 +19,8 @@ inputs are ``[S, H, D]`` query/key with ``cos`` / ``sin`` unsqueezed on the
 head axis. Registers eager plus an NPU adapter.
 """
 
+from ...platform import NpuKernelRequirement
 from ...registry import register_op
-from ...requirement import NpuKernelRequirement
 from .full import eager as full_eager
 from .full import npu as full_npu
 

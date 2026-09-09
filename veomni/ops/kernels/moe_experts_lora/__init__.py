@@ -20,14 +20,99 @@ is a per-expert pair. Eager is the per-expert loop. ``fused_triton`` and
 those ``moe_implementation`` values to eager.
 """
 
+from __future__ import annotations
+
+from torch import Tensor
+
+from ...platform import NVIDIA_SM70_PLUS, ROCM_GPU, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement, NpuKernelRequirement
 from .independent import eager as independent_eager
 from .independent import npu as independent_npu
-from .independent import triton as independent_triton
 from .shared import eager as shared_eager
 from .shared import npu as shared_npu
-from .shared import triton as shared_triton
+
+
+_GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
+
+
+def _shared_triton_wrapper(
+    hidden_states: Tensor,
+    routing_weights: Tensor,
+    selected_experts: Tensor,
+    fc1_1_2_weight: Tensor,
+    fc2_weight: Tensor,
+    lora_a_gate: Tensor,
+    lora_b_gate: Tensor,
+    lora_a_up: Tensor,
+    lora_b_up: Tensor,
+    lora_a_down: Tensor,
+    lora_b_down: Tensor,
+    *,
+    num_experts: int,
+    lora_scale_gate: float,
+    lora_scale_up: float,
+    lora_scale_down: float,
+) -> Tensor:
+    """Lazy-load and call the shared Triton MoE-LoRA implementation."""
+    from .shared.triton import wrapper
+
+    return wrapper(
+        hidden_states,
+        routing_weights,
+        selected_experts,
+        fc1_1_2_weight,
+        fc2_weight,
+        lora_a_gate,
+        lora_b_gate,
+        lora_a_up,
+        lora_b_up,
+        lora_a_down,
+        lora_b_down,
+        num_experts=num_experts,
+        lora_scale_gate=lora_scale_gate,
+        lora_scale_up=lora_scale_up,
+        lora_scale_down=lora_scale_down,
+    )
+
+
+def _independent_triton_wrapper(
+    hidden_states: Tensor,
+    routing_weights: Tensor,
+    selected_experts: Tensor,
+    fc1_1_2_weight: Tensor,
+    fc2_weight: Tensor,
+    lora_a_gate: Tensor,
+    lora_b_gate: Tensor,
+    lora_a_up: Tensor,
+    lora_b_up: Tensor,
+    lora_a_down: Tensor,
+    lora_b_down: Tensor,
+    *,
+    num_experts: int,
+    lora_scale_gate: float,
+    lora_scale_up: float,
+    lora_scale_down: float,
+) -> Tensor:
+    """Lazy-load and call the independent Triton MoE-LoRA implementation."""
+    from .independent.triton import wrapper
+
+    return wrapper(
+        hidden_states,
+        routing_weights,
+        selected_experts,
+        fc1_1_2_weight,
+        fc2_weight,
+        lora_a_gate,
+        lora_b_gate,
+        lora_a_up,
+        lora_b_up,
+        lora_a_down,
+        lora_b_down,
+        num_experts=num_experts,
+        lora_scale_gate=lora_scale_gate,
+        lora_scale_up=lora_scale_up,
+        lora_scale_down=lora_scale_down,
+    )
 
 
 register_op("moe_experts_lora", "shared", "eager", wrapper=shared_eager.wrapper)
@@ -36,8 +121,8 @@ register_op(
     "moe_experts_lora",
     "shared",
     "fused_triton",
-    wrapper=shared_triton.wrapper,
-    requirement=CudaKernelRequirement(min_cc=70),
+    wrapper=_shared_triton_wrapper,
+    requirement=_GPU_SM70_OR_ROCM,
 )
 
 register_op(
@@ -54,8 +139,8 @@ register_op(
     "moe_experts_lora",
     "independent",
     "fused_triton",
-    wrapper=independent_triton.wrapper,
-    requirement=CudaKernelRequirement(min_cc=70),
+    wrapper=_independent_triton_wrapper,
+    requirement=_GPU_SM70_OR_ROCM,
 )
 
 register_op(

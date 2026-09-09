@@ -14,10 +14,9 @@
 
 """Hardware requirements for kernel rows.
 
-``device`` is the fourth registry key. Rows are always registered.
-``resolve_op`` fills the current device into the public triple, then
-calls ``check()``. ``list_available`` keeps rows whose ``matches()`` is true.
-A row with no requirement is stored under ``ANY_DEVICE``.
+``device`` is the fourth registry key. GPU rows retain ``"cuda"`` because
+PyTorch exposes both NVIDIA CUDA and AMD ROCm tensors through that device
+namespace; ``GpuPlatform`` objects express the actual supported platforms.
 """
 
 from __future__ import annotations
@@ -25,7 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Protocol
 
-from ..utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from ...utils.device import IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
+from .gpu import NVIDIA_GPU, ROCM_GPU, GpuPlatform
 
 
 ANY_DEVICE = "any"
@@ -46,34 +46,29 @@ class KernelRequirement(Protocol):
 
 
 @dataclass(frozen=True)
-class CudaKernelRequirement:
-    """CUDA plus optional compute-capability bounds (``min_cc`` / ``max_cc``)."""
+class GpuKernelRequirement:
+    """One or more supported GPU platforms under PyTorch's ``cuda`` device key."""
 
+    platforms: tuple[GpuPlatform, ...] = (NVIDIA_GPU, ROCM_GPU)
     device: ClassVar[str] = "cuda"
-    min_cc: int | None = None
-    max_cc: int | None = None
+
+    def __post_init__(self) -> None:
+        """Require at least one concrete GPU platform."""
+        if not self.platforms:
+            raise ValueError("GpuKernelRequirement requires at least one platform")
+        if not all(isinstance(platform, GpuPlatform) for platform in self.platforms):
+            raise TypeError("GpuKernelRequirement platforms must be GpuPlatform instances")
 
     def matches(self) -> bool:
-        """Return whether CUDA is available and the compute capability is in range."""
-        if not IS_CUDA_AVAILABLE:
-            return False
-
-        cc = get_gpu_compute_capability()
-        if self.min_cc is not None and cc < self.min_cc:
-            return False
-        if self.max_cc is not None and cc > self.max_cc:
-            return False
-        return True
+        """Return whether any supported GPU platform matches this machine."""
+        return any(platform.matches() for platform in self.platforms)
 
     def check(self) -> None:
-        """Raise if this machine is not CUDA or the compute capability is out of range."""
+        """Raise when none of the supported GPU platforms matches this machine."""
         if self.matches():
             return
-        cc = get_gpu_compute_capability()
-        raise RuntimeError(
-            "CudaKernelRequirement is not satisfied "
-            f"(min_cc={self.min_cc}, max_cc={self.max_cc}, current_cc={cc}, cuda={IS_CUDA_AVAILABLE})"
-        )
+        supported = ", ".join(platform.describe() for platform in self.platforms)
+        raise RuntimeError(f"GpuKernelRequirement is not satisfied (requires one of: {supported})")
 
 
 @dataclass(frozen=True)

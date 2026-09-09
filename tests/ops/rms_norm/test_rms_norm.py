@@ -161,7 +161,7 @@ def _fused_matches_eager(
     assert torch.allclose(w_e.grad, w_o.grad, atol=grad_atol, rtol=grad_rtol)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs a GPU")
 @pytest.mark.parametrize("variant", ["standard", "qwen3_5"])
 def test_liger_matches_eager(variant: str):
     pytest.importorskip("liger_kernel")
@@ -178,7 +178,7 @@ def test_liger_matches_eager(variant: str):
     )
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RMSNorm needs a GPU")
 def test_unweighted_liger_matches_eager():
     pytest.importorskip("liger_kernel")
     eager = resolve_op("rms_norm", "unweighted", "eager").wrapper
@@ -199,7 +199,7 @@ def test_unweighted_liger_matches_eager():
     assert torch.allclose(x_e.grad, x_o.grad, atol=RMS_FUSED_GRAD_ATOL, rtol=RMS_FUSED_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton RMSNorm needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton RMSNorm needs a GPU")
 def test_triton_matches_eager():
     pytest.importorskip("triton")
     _fused_matches_eager(

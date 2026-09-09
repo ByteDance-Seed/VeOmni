@@ -13,7 +13,7 @@ the process-wide attention integration from `install.py`.
 veomni/ops/
 ├── __init__.py          Register built-in families and apply global integrations
 ├── registry.py          OpEntry, register_op, resolve_op, VeomniOp
-├── requirement.py       CUDA, NPU, and MLU availability requirements
+├── platform/            GPU platform constraints plus GPU, NPU, and MLU requirements
 ├── compound.py          Saved-state helpers for ops that call other raw ops
 ├── config.py            Installed op-selection config read during model construction
 ├── install.py           Idempotent process-wide attention integration
@@ -79,7 +79,7 @@ Do not provide both forms for one row.
 
 ```python
 from veomni.ops import register_op
-from veomni.ops.requirement import CudaKernelRequirement
+from veomni.ops.platform import GpuKernelRequirement, NvidiaGpuPlatform
 
 register_op(
     "example",
@@ -94,7 +94,7 @@ register_op(
     "triton",
     forward=triton_forward,
     backward=triton_backward,
-    requirement=CudaKernelRequirement(min_cc=80),
+    requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
 )
 ```
 

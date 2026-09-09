@@ -26,7 +26,7 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
-| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | Model `__init__` via an instance-local `VeomniOp` |
+| Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU; NPU config normalizes this default to `eager`) | `"triton"` | Model `__init__` via an instance-local `VeomniOp` |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU) | Model `__init__` via an instance-local `VeomniOp` |
 
 **Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
@@ -296,7 +296,7 @@ model:
 |---|---|---|---|
 | `rms_norm_gated_implementation` | `fla` | `npu` | HuggingFace reference implementation |
 | `causal_conv1d_implementation` | `fla` | `npu` | No `cu_seqlens` path |
-| `chunk_gated_delta_rule_implementation` | `fla`, `flash_qla` (SM90 only) | `npu`, `npu_ascendc` | No `cu_seqlens` path |
+| `chunk_gated_delta_rule_implementation` | `fla`, `flash_qla` (NVIDIA SM90-SM100) | `npu`, `npu_ascendc` | No `cu_seqlens` path |
 
 The NPU gated RMSNorm uses `torch_npu`. The NPU causal Conv1D and gated
 delta-rule implementations additionally require `triton-ascend`. For the gated
@@ -315,7 +315,7 @@ values are documented by `OpsImplementationConfig`.
 ```yaml
 model:
   ops_implementation:
-    load_balancing_loss_implementation: triton   # CUDA
+    load_balancing_loss_implementation: triton   # GPU
     # load_balancing_loss_implementation: eager  # NPU
 ```
 
@@ -325,12 +325,12 @@ model:
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `triton` | Fused tensor-native `[N, E]` kernel | `triton` on CUDA |
+| `triton` | Fused tensor-native `[N, E]` kernel | `triton` on GPU |
 | `eager` | Pure-PyTorch tensor-native `[N, E]` reference | — |
 
 Normal NPU config construction maps every value equal to the dataclass default
 `triton`—including an explicit YAML value—to `eager` before registry binding.
-The optimized `triton` implementation is CUDA-only; select `eager` in current
+The optimized `triton` implementation is GPU-only; select `eager` in current
 NPU configs.
 
 This loss has no compatibility facade or process-global dispatch. Each MoE model creates
@@ -355,8 +355,8 @@ the tuple of per-layer router logits into the raw op's `[N, E]` input.
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: fused_triton   # Triton group-gemm (GPU SM70+ or MLU)
-    # moe_implementation: fused_quack  # Quack CUTLASS/CuTe (GPU, SM90+)
+    moe_implementation: fused_triton   # Triton group-gemm (GPU, SM70+ or MLU)
+    # moe_implementation: fused_quack  # Quack CUTLASS/CuTe (NVIDIA SM90+)
     # moe_implementation: fused_npu    # NPU group-gemm (Ascend)
     # moe_implementation: fused_mlu    # Apex grouped-GEMM (MLU)
     # moe_implementation: eager   # Reference PyTorch loop (very slow, debug only)
@@ -375,7 +375,7 @@ raise during config validation or op binding.
 | Value | Kernel | Hardware | EP support |
 |-------|--------|----------|:----------:|
 | `eager` | PyTorch expert loop | Any | No |
-| `fused_triton` | Triton group-gemm | GPU SM70+ or MLU | Yes |
+| `fused_triton` | Triton group-gemm | GPU, SM70+ or MLU | Yes |
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |

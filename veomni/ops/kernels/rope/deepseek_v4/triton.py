@@ -241,14 +241,18 @@ def forward(x: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1) -> t
     return output, SavedState((cos, sin), _Meta(True, unsqueeze_dim))
 
 
-def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, None, None]:
-    """Return ``(dx, None, None)``. The fused path uses the conjugate rotation."""
+def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor | None, Tensor | None]:
+    """Use conjugate fused dgrad or the eager fallback's full gradient tuple."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     if not meta.fused:
         # eager SavedState stores (cos, sin); empty vs not is recovered from numel
         empty = grad_output.numel() == 0
-        return _eager.backward(grad_output, SavedState(saved.tensors, _eager._Meta(empty, meta.unsqueeze_dim)))
+        table_gradients = len(saved.tensors) == 3
+        return _eager.backward(
+            grad_output,
+            SavedState(saved.tensors, _eager._Meta(empty, meta.unsqueeze_dim, table_gradients)),
+        )
 
     cos, sin = saved.tensors
     return _rotary_launch(grad_output, cos, sin, conjugate=True), None, None

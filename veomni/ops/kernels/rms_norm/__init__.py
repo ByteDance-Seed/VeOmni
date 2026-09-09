@@ -19,8 +19,8 @@ gemma-style fp32 scale), and ``unweighted`` (no affine weight). Each variant
 registers an eager row plus optional CUDA / NPU adapters.
 """
 
+from ...platform import GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement, NpuKernelRequirement
 from .qwen3_5 import eager as qwen3_5_eager
 from .qwen3_5 import liger_kernel as qwen3_5_liger
 from .qwen3_5 import npu as qwen3_5_npu
@@ -32,6 +32,9 @@ from .unweighted import eager as unweighted_eager
 from .unweighted import liger_kernel as unweighted_liger
 
 
+_GPU = GpuKernelRequirement()
+
+
 register_op("rms_norm", "standard", "eager", standard_eager.forward, standard_eager.backward)
 
 register_op(
@@ -40,7 +43,7 @@ register_op(
     "liger_kernel",
     standard_liger.forward,
     standard_liger.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op(
@@ -58,7 +61,7 @@ register_op(
     "triton",
     standard_triton.forward,
     standard_triton.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op("rms_norm", "qwen3_5", "eager", qwen3_5_eager.forward, qwen3_5_eager.backward)
@@ -69,7 +72,7 @@ register_op(
     "liger_kernel",
     qwen3_5_liger.forward,
     qwen3_5_liger.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op(
@@ -95,5 +98,5 @@ register_op(
     "liger_kernel",
     unweighted_liger.forward,
     unweighted_liger.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )

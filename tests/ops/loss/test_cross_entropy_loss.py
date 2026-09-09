@@ -157,7 +157,7 @@ def test_chunk_loss_requires_weight():
         )
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
 def test_liger_matches_eager():
     pytest.importorskip("liger_kernel")
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
@@ -184,7 +184,7 @@ def test_liger_matches_eager():
     )
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
 def test_liger_matches_eager_with_frozen_weight():
     pytest.importorskip("liger_kernel")
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
@@ -210,7 +210,7 @@ def test_liger_matches_eager_with_frozen_weight():
     assert weight_o.grad is None
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
 def test_liger_matches_eager_num_items():
     pytest.importorskip("liger_kernel")
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
@@ -239,7 +239,7 @@ def test_liger_matches_eager_num_items():
     )
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
 def test_liger_matches_eager_noncontiguous_hidden():
     pytest.importorskip("liger_kernel")
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
@@ -261,7 +261,7 @@ def test_liger_matches_eager_noncontiguous_hidden():
     )
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
 def test_liger_requires_weight():
     pytest.importorskip("liger_kernel")
     with pytest.raises(RuntimeError, match="nonempty ``weight``"):

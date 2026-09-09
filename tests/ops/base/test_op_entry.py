@@ -21,8 +21,17 @@ import torch
 from torch import Tensor
 
 from veomni.ops import OP_REGISTRY, VeomniOp, register_op, resolve_op
+from veomni.ops.platform import (
+    ANY_DEVICE,
+    GpuKernelRequirement,
+    MluKernelRequirement,
+    NpuKernelRequirement,
+    NvidiaGpuPlatform,
+)
 from veomni.ops.registry import OpEntry, SavedState
-from veomni.ops.requirement import ANY_DEVICE, CudaKernelRequirement, MluKernelRequirement, NpuKernelRequirement
+
+
+_GPU = GpuKernelRequirement()
 
 
 @pytest.fixture
@@ -119,7 +128,7 @@ class TestRegisterAndResolve:
                 impl="fused",
                 forward=_add_forward,
                 backward=_add_backward,
-                requirement=CudaKernelRequirement(),
+                requirement=_GPU,
             )
         )
         OP_REGISTRY.register(
@@ -154,7 +163,7 @@ class TestRegisterAndResolve:
                     impl="fused",
                     forward=_add_forward,
                     backward=_add_backward,
-                    requirement=CudaKernelRequirement(),
+                    requirement=_GPU,
                 )
             )
 
@@ -168,11 +177,11 @@ class TestRegisterAndResolve:
         def any_wrapper(x: Tensor) -> Tensor:
             return x + 3
 
-        register_op("add", "standard", "fused", wrapper=cuda_wrapper, requirement=CudaKernelRequirement())
+        register_op("add", "standard", "fused", wrapper=cuda_wrapper, requirement=_GPU)
         register_op("add", "standard", "fused", wrapper=mlu_wrapper, requirement=MluKernelRequirement())
         register_op("add", "standard", "eager", wrapper=any_wrapper)
         monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "mlu")
-        monkeypatch.setattr("veomni.ops.requirement.IS_MLU_AVAILABLE", True)
+        monkeypatch.setattr("veomni.ops.platform.requirement.IS_MLU_AVAILABLE", True)
         assert resolve_op("add", "standard", "fused").wrapper is mlu_wrapper
         assert resolve_op("add", "standard", "eager").wrapper is any_wrapper
         monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cpu")
@@ -188,7 +197,7 @@ class TestRegisterAndResolve:
             "cuda_only",
             _add_forward,
             _add_backward,
-            requirement=CudaKernelRequirement(min_cc=999),
+            requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=999),)),
         )
         assert "cuda_only" in OP_REGISTRY.list_registered("add", "standard")
         assert "cuda_only" not in OP_REGISTRY.list_available("add", "standard")

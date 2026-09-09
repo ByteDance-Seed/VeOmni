@@ -20,8 +20,8 @@ TileKernels on SM90+. ``post`` / ``tilelang`` is a raw pair; ``pre`` and
 ``head`` keep an opaque wrapper because TileKernels owns that autograd.
 """
 
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement
 from .head import eager as head_eager
 from .head import tilelang as head_tilelang
 from .post import eager as post_eager
@@ -30,7 +30,7 @@ from .pre import eager as pre_eager
 from .pre import tilelang as pre_tilelang
 
 
-_TILELANG = CudaKernelRequirement(min_cc=90)
+_TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
 register_op("mhc", "pre", "eager", wrapper=pre_eager.wrapper)
 

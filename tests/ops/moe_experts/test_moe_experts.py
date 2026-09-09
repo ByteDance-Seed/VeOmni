@@ -511,35 +511,40 @@ def test_npu_fc1_layout_matches_eager_contract():
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 def test_triton_matches_eager():
     _run_fused_vs_eager("fused_triton")
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 def test_triton_matches_eager_merged():
     _run_fused_vs_eager("fused_triton", merged=True)
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 def test_triton_matches_eager_swiglu_limit():
     _run_fused_vs_eager("fused_triton", swiglu_limit=1.0)
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 def test_triton_matches_eager_merged_swiglu_limit():
     _run_fused_vs_eager("fused_triton", merged=True, swiglu_limit=1.0)
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 def test_triton_matches_eager_duplicate_expert():
     device = torch.device("cuda")
@@ -567,7 +572,8 @@ def test_triton_matches_eager_duplicate_expert():
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 def test_triton_matches_eager_larger_gpu():
     _run_fused_vs_eager("fused_triton", shape=(128, 16, 256, 128, 4), seed=11)
@@ -676,14 +682,16 @@ def test_mlu_matches_eager_merged():
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 def test_triton_split_matches_merged():
     _run_split_vs_merged("fused_triton")
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 @pytest.mark.parametrize("swiglu_limit", [7.0, 10.0])
 def test_triton_split_matches_merged_swiglu_limit(swiglu_limit: float):
@@ -691,7 +699,8 @@ def test_triton_split_matches_merged_swiglu_limit(swiglu_limit: float):
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 def test_triton_split_matches_merged_duplicate_expert():
     device = torch.device("cuda")
@@ -710,7 +719,8 @@ def test_triton_split_matches_merged_duplicate_expert():
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or not is_fused_moe_available(), reason="triton fused MoE needs CUDA + triton"
+    not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
+    reason="triton fused MoE needs a GPU + triton",
 )
 @pytest.mark.parametrize(
     "shape,seed",
@@ -781,8 +791,9 @@ def test_moe_experts_eager_resolves_without_hw():
 
 def test_quack_rejects_low_compute_capability(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
-    monkeypatch.setattr("veomni.ops.requirement.IS_CUDA_AVAILABLE", True)
-    monkeypatch.setattr("veomni.ops.requirement.get_gpu_compute_capability", lambda: 80)
+    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_gpu_compute_capability", lambda: 80)
+    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", None, raising=False)
     with pytest.raises(RuntimeError, match="requirement is not satisfied"):
         resolve_op("moe_experts", "standard", "fused_quack")
 

@@ -115,7 +115,7 @@ def sparse_mqa_fwd(
         + H_per_block * BI * 2  # S_shared, bf16
         + max(num_stages, 1) * BI * D * 2  # KV_shared, one buffer per stage
     )
-    # Every kernel here is CUDA-only, so the device-agnostic helper reads as more
+    # Every kernel here is NVIDIA CUDA-only, so the device-agnostic helper reads as more
     # portable than it is -- but it stays: `device-api-check` rejects a vendor-namespaced
     # device reference under veomni/ unless `veomni/utils/device.py` has no equivalent,
     # and here it does. Reaching this line already implies an accelerator anyway, since

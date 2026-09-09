@@ -127,7 +127,7 @@ def test_vision_eager_matches_hf():
     assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs a GPU")
 def test_full_liger_matches_eager():
     pytest.importorskip("liger_kernel")
     eager = resolve_op("rope", "full", "eager").wrapper
@@ -154,7 +154,7 @@ def test_full_liger_matches_eager():
     assert torch.allclose(k_e.grad, k_o.grad, atol=ROPE_FUSED_GRAD_ATOL, rtol=ROPE_FUSED_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs a GPU")
 def test_full_liger_matches_eager_unsqueeze_dim_2():
     pytest.importorskip("liger_kernel")
     eager = resolve_op("rope", "full", "eager").wrapper
@@ -320,6 +320,38 @@ def test_deepseek_v4_eager_matches_hf():
     assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize(
+    ("cos_requires_grad", "sin_requires_grad"),
+    ((True, False), (False, True), (True, True)),
+)
+def test_deepseek_v4_eager_table_gradients_match_hf(cos_requires_grad: bool, sin_requires_grad: bool):
+    torch.manual_seed(1)
+    x = torch.randn(2, 4, 8, 32, dtype=torch.float32)
+    angle = torch.randn(2, 8, 8, dtype=torch.float32)
+    cos, sin = angle.cos(), angle.sin()
+
+    x_h = x.detach().clone().requires_grad_(True)
+    x_e = x.detach().clone().requires_grad_(True)
+    cos_h = cos.detach().clone().requires_grad_(cos_requires_grad)
+    cos_e = cos.detach().clone().requires_grad_(cos_requires_grad)
+    sin_h = sin.detach().clone().requires_grad_(sin_requires_grad)
+    sin_e = sin.detach().clone().requires_grad_(sin_requires_grad)
+    out_h = hf_dsv4_rope(x_h, cos_h, sin_h, unsqueeze_dim=1)
+    out_e = resolve_op("rope", "deepseek_v4", "eager").wrapper(x_e, cos_e, sin_e, unsqueeze_dim=1)
+
+    grad = torch.randn_like(out_h)
+    out_h.backward(grad)
+    out_e.backward(grad)
+
+    torch.testing.assert_close(x_e.grad, x_h.grad)
+    assert (cos_e.grad is not None) == cos_requires_grad
+    assert (sin_e.grad is not None) == sin_requires_grad
+    if cos_requires_grad:
+        torch.testing.assert_close(cos_e.grad, cos_h.grad)
+    if sin_requires_grad:
+        torch.testing.assert_close(sin_e.grad, sin_h.grad)
+
+
 # Mirrors the real DeepSeek-V4 RoPE call sites. ``transposed`` marks the ones
 # that reach the op as a ``[B, S, H, D].transpose(1, 2)`` view (Q, MQA KV, the
 # attention output) rather than a contiguous tensor (compressor entries).
@@ -362,7 +394,7 @@ _DSV4_ROPE_GRAD_TOLERANCE = {
 }
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs a GPU")
 @pytest.mark.parametrize("batch, heads, seqlen, head_dim, rope_dim, transposed", _DSV4_ROPE_CALL_SITES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_deepseek_v4_triton_matches_eager(batch, heads, seqlen, head_dim, rope_dim, transposed, dtype):
@@ -386,7 +418,7 @@ def test_deepseek_v4_triton_matches_eager(batch, heads, seqlen, head_dim, rope_d
     torch.testing.assert_close(x_o.grad, x_e.grad, **_DSV4_ROPE_GRAD_TOLERANCE[dtype])
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs a GPU")
 def test_deepseek_v4_triton_inverse_rotation_round_trips():
     pytest.importorskip("triton")
     rope = resolve_op("rope", "deepseek_v4", "triton").wrapper
@@ -398,7 +430,7 @@ def test_deepseek_v4_triton_inverse_rotation_round_trips():
     torch.testing.assert_close(round_tripped, x.contiguous(), rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs a GPU")
 def test_deepseek_v4_triton_saves_only_cos_sin():
     pytest.importorskip("triton")
     rope = resolve_op("rope", "deepseek_v4", "triton").wrapper
@@ -408,7 +440,7 @@ def test_deepseek_v4_triton_saves_only_cos_sin():
     assert [tensor.shape for tensor in out.grad_fn.saved_tensors] == [cos.shape, sin.shape]
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs a GPU")
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -446,6 +478,30 @@ def test_deepseek_v4_triton_falls_back_when_unsupported(monkeypatch, mutate):
     assert reached_eager
 
 
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek-V4 Triton RoPE needs a GPU")
+def test_deepseek_v4_triton_table_gradient_fallback_matches_hf():
+    pytest.importorskip("triton")
+    torch.manual_seed(8)
+    x, cos, sin = _dsv4_rope_inputs(1, 4, 16, 128, 64, True, torch.float32)
+
+    x_h = x.detach().clone().requires_grad_(True)
+    x_o = x.detach().clone().requires_grad_(True)
+    cos_h = cos.detach().clone().requires_grad_(True)
+    cos_o = cos.detach().clone().requires_grad_(True)
+    sin_h = sin.detach().clone().requires_grad_(True)
+    sin_o = sin.detach().clone().requires_grad_(True)
+    out_h = hf_dsv4_rope(x_h, cos_h, sin_h, unsqueeze_dim=1)
+    out_o = resolve_op("rope", "deepseek_v4", "triton").wrapper(x_o, cos_o, sin_o, unsqueeze_dim=1)
+
+    grad = torch.randn_like(out_h)
+    out_h.backward(grad)
+    out_o.backward(grad)
+
+    torch.testing.assert_close(x_o.grad, x_h.grad)
+    torch.testing.assert_close(cos_o.grad, cos_h.grad)
+    torch.testing.assert_close(sin_o.grad, sin_h.grad)
+
+
 def test_deepseek_v4_triton_fallback_matches_eager():
     from veomni.ops.kernels.rope.deepseek_v4 import eager as dsv4_eager
     from veomni.ops.kernels.rope.deepseek_v4 import triton as dsv4_triton
@@ -477,7 +533,7 @@ def test_wan_eager_matches_reference():
     assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Wan Triton RoPE needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Wan Triton RoPE needs a GPU")
 def test_wan_triton_matches_eager():
     pytest.importorskip("triton")
     eager = resolve_op("rope", "wan", "eager").wrapper

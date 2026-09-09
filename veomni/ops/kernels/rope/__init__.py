@@ -20,8 +20,8 @@ by freqs). Each variant registers an eager row plus optional CUDA / NPU
 adapters.
 """
 
+from ...platform import GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement, NpuKernelRequirement
 from .deepseek_v4 import eager as dsv4_eager
 from .deepseek_v4 import triton as dsv4_triton
 from .full import eager as full_eager
@@ -34,6 +34,9 @@ from .wan import npu as wan_npu
 from .wan import triton as wan_triton
 
 
+_GPU = GpuKernelRequirement()
+
+
 register_op("rope", "full", "eager", full_eager.forward, full_eager.backward)
 
 register_op(
@@ -42,7 +45,7 @@ register_op(
     "liger_kernel",
     full_liger.forward,
     full_liger.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op(
@@ -73,7 +76,7 @@ register_op(
     "triton",
     dsv4_triton.forward,
     dsv4_triton.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op("rope", "wan", "eager", wan_eager.forward, wan_eager.backward)
@@ -84,7 +87,7 @@ register_op(
     "triton",
     wan_triton.forward,
     wan_triton.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op(

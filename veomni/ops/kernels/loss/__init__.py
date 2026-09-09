@@ -23,13 +23,16 @@ the first tensor is already logits. Label shift and SP reduction stay in the
 caller. ``chunk_logprobs`` / top-k distill are not this kernel.
 """
 
+from ...platform import GpuKernelRequirement
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement
 from .cross_entropy_loss.standard import chunk_loss as ce_chunk
 from .cross_entropy_loss.standard import eager as ce_eager
 from .cross_entropy_loss.standard import liger_kernel as ce_liger
 from .load_balancing_loss.standard import eager as lb_eager
 from .load_balancing_loss.standard import triton as lb_triton
+
+
+_GPU = GpuKernelRequirement()
 
 
 register_op("load_balancing_loss", "standard", "eager", lb_eager.forward, lb_eager.backward)
@@ -40,7 +43,7 @@ register_op(
     "triton",
     lb_triton.forward,
     lb_triton.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op("cross_entropy_loss", "standard", "eager", ce_eager.forward, ce_eager.backward)
@@ -51,7 +54,7 @@ register_op(
     "liger_kernel",
     ce_liger.forward,
     ce_liger.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op("cross_entropy_loss", "standard", "chunk_loss", ce_chunk.forward, ce_chunk.backward)

@@ -31,7 +31,7 @@ import torch
 from torch import Tensor
 
 from ..utils.device import get_device_type
-from .requirement import ANY_DEVICE, KernelRequirement
+from .platform import ANY_DEVICE, KernelRequirement
 
 
 Output = Tensor | tuple[Tensor, ...]

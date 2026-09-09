@@ -138,6 +138,23 @@ def test_dsa_rows_are_registered():
         assert "eager" in OP_REGISTRY.list_available(kernel, variant)
 
 
+def test_dsa_fused_rows_reject_rocm(monkeypatch):
+    """NVIDIA-only DSA rows must fail before importing their vendor kernels."""
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
+    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", "6.0", raising=False)
+
+    for op, variant, impl in (
+        ("dsa_attention", "deepseek_v4", "tilelang"),
+        ("dsa_indexer", "deepseek_v4", "tilelang"),
+        ("dsa_attention", "glm", "flashmla_cudnn"),
+        ("dsa_indexer", "glm", "cudnn"),
+    ):
+        assert impl not in OP_REGISTRY.list_available(op, variant)
+        with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+            resolve_op(op, variant, impl)
+
+
 def test_dsa_attention_deepseek_v4_eager_matches_hf():
     """Eager sparse MQA matches HF ``eager_attention_forward`` plus sink."""
     torch.manual_seed(0)

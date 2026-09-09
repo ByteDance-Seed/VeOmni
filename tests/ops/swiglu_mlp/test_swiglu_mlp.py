@@ -193,7 +193,7 @@ def test_eager_matches_swiglu_limit():
     assert torch.allclose(down_e.grad, experts.down_proj.grad[0], atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs a GPU")
 @pytest.mark.parametrize("hidden, intermediate", [(64, 128), (128, 256)])
 def test_liger_matches_eager(hidden: int, intermediate: int):
     pytest.importorskip("liger_kernel")

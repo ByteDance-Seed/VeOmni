@@ -47,8 +47,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/models_kernel/checkpoint/weights.py",
     "veomni/models_kernel/transformers/flux/encode_flux.py",
     "veomni/arguments/arguments_types.py",
-    # Declarative device requirement; this is not a direct torch.cuda call.
-    "veomni/ops/requirement.py",
+    # Declarative GPU platform detection; this is not kernel device management.
+    "veomni/ops/platform/gpu.py",
+    "veomni/ops/platform/requirement.py",
     # Magi FA4 is an intrinsically CUDA-only backend. It uses CUDA device
     # contexts and cuda.bindings.runtime for the per-device stack limit, which
     # has no device-agnostic equivalent.

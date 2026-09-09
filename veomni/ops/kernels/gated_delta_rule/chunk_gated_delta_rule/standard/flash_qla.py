@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""standard chunk_gated_delta_rule FlashQLA adapter (Hopper SM90)."""
+"""Standard chunk_gated_delta_rule FlashQLA adapter for NVIDIA SM90-SM100."""
 
 from __future__ import annotations
 

@@ -18,10 +18,13 @@ Variant ``standard`` is the full MLP: ``down(silu(gate(x)) * up(x))``.
 Empty biases are unused. ``swiglu_limit`` is a keyword for DeepSeek-V4 clamp.
 """
 
+from ...platform import GpuKernelRequirement
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
+
+
+_GPU = GpuKernelRequirement()
 
 
 register_op("swiglu_mlp", "standard", "eager", standard_eager.forward, standard_eager.backward)
@@ -32,5 +35,5 @@ register_op(
     "liger_kernel",
     standard_liger.forward,
     standard_liger.backward,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )

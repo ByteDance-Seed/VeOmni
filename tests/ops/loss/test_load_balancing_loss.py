@@ -188,7 +188,7 @@ def test_eager_forward_matrix_matches_hf(num_experts, top_k, num_layers, batch, 
     torch.testing.assert_close(actual, expected, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
 @pytest.mark.parametrize("use_mask", [False, True])
 @pytest.mark.parametrize("num_experts,top_k,num_layers,batch,seq_len", _CONFIGS)
 def test_triton_matches_eager(use_mask: bool, num_experts, top_k, num_layers, batch, seq_len):
@@ -214,7 +214,7 @@ def test_triton_matches_eager(use_mask: bool, num_experts, top_k, num_layers, ba
     assert torch.allclose(concat_e.grad, concat_o.grad, atol=LB_FUSED_GRAD_ATOL, rtol=LB_FUSED_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
 def test_triton_all_masked_returns_zero_with_zero_grad():
     pytest.importorskip("triton")
     gate_logits = torch.randn(8, 4, device="cuda", requires_grad=True)
@@ -225,7 +225,7 @@ def test_triton_all_masked_returns_zero_with_zero_grad():
     assert torch.count_nonzero(gate_logits.grad) == 0
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
 @pytest.mark.parametrize(
     "num_experts,top_k,num_layers,batch_size,seq_len",
     [(8, 2, 2, 4, 128), (60, 8, 4, 2, 512)],
@@ -248,7 +248,7 @@ def test_triton_is_deterministic(num_experts, top_k, num_layers, batch_size, seq
         assert torch.equal(outputs[0], output)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="triton load-balancing loss needs a GPU")
 @pytest.mark.parametrize("num_experts,top_k,num_layers,batch_size,seq_len", _CONFIGS)
 def test_triton_uses_less_peak_memory_than_hf(num_experts, top_k, num_layers, batch_size, seq_len):
     pytest.importorskip("triton")

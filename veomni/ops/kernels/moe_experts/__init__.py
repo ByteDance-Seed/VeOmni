@@ -19,8 +19,15 @@ interleaved gate/up layout with bias and ``alpha`` / ``limit``. Eager is
 the HF expert loop (regular autograd). Fused rows wrap the local Functions.
 """
 
+from ...platform import (
+    NVIDIA_SM70_PLUS,
+    NVIDIA_SM90_PLUS,
+    ROCM_GPU,
+    GpuKernelRequirement,
+    MluKernelRequirement,
+    NpuKernelRequirement,
+)
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
 from .standard import eager as standard_eager
@@ -30,6 +37,10 @@ from .standard import quack as standard_quack
 from .standard import triton as standard_triton
 
 
+_GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
+_NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+
+
 register_op("moe_experts", "standard", "eager", wrapper=standard_eager.wrapper)
 
 register_op(
@@ -37,7 +48,7 @@ register_op(
     "standard",
     "fused_triton",
     wrapper=standard_triton.wrapper,
-    requirement=CudaKernelRequirement(min_cc=70),
+    requirement=_GPU_SM70_OR_ROCM,
 )
 
 register_op(
@@ -53,7 +64,7 @@ register_op(
     "standard",
     "fused_quack",
     wrapper=standard_quack.wrapper,
-    requirement=CudaKernelRequirement(min_cc=90),
+    requirement=_NVIDIA_SM90_PLUS,
 )
 
 register_op(
@@ -79,5 +90,5 @@ register_op(
     "gpt_oss",
     "fused_quack",
     wrapper=gpt_oss_quack.wrapper,
-    requirement=CudaKernelRequirement(min_cc=90),
+    requirement=_NVIDIA_SM90_PLUS,
 )

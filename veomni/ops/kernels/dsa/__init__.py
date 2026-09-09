@@ -19,8 +19,8 @@ rows. Fused impls are opaque wrappers around TileLang or FlashMLA
 ``Function.apply``.
 """
 
+from ...platform import NVIDIA_GPU, NVIDIA_SM90_PLUS, GpuKernelRequirement
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement
 from .attention.deepseek_v4 import eager as dsv4_attn_eager
 from .attention.deepseek_v4 import tilelang as dsv4_attn_tilelang
 from .attention.glm import eager as glm_attn_eager
@@ -31,8 +31,8 @@ from .indexer.glm import cudnn as glm_indexer_cudnn
 from .indexer.glm import eager as glm_indexer_eager
 
 
-_TILELANG = CudaKernelRequirement(min_cc=90)
-_CUDA = CudaKernelRequirement()
+_TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_NVIDIA = GpuKernelRequirement(platforms=(NVIDIA_GPU,))
 
 register_op("dsa_attention", "deepseek_v4", "eager", wrapper=dsv4_attn_eager.wrapper)
 
@@ -50,7 +50,7 @@ register_op(
     "glm",
     "flashmla_cudnn",
     wrapper=glm_attn_flashmla.wrapper,
-    requirement=_CUDA,
+    requirement=_NVIDIA,
 )
 
 register_op("dsa_indexer", "deepseek_v4", "eager", wrapper=dsv4_indexer_eager.wrapper)
@@ -64,4 +64,4 @@ register_op(
 )
 register_op("dsa_indexer", "glm", "eager", wrapper=glm_indexer_eager.wrapper)
 
-register_op("dsa_indexer", "glm", "cudnn", wrapper=glm_indexer_cudnn.wrapper, requirement=_CUDA)
+register_op("dsa_indexer", "glm", "cudnn", wrapper=glm_indexer_cudnn.wrapper, requirement=_NVIDIA)

@@ -106,7 +106,7 @@ def test_rms_norm_gated_eager_matches_hf():
     assert torch.allclose(w_e.grad, module.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA rms_norm_gated needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA rms_norm_gated needs a GPU")
 def test_rms_norm_gated_fla_matches_eager():
     pytest.importorskip("fla")
     eager = resolve_op("rms_norm_gated", "standard", "eager").wrapper
@@ -217,7 +217,7 @@ def test_causal_conv1d_eager_matches_hf():
     assert torch.allclose(b_e.grad, b_r.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA causal_conv1d needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA causal_conv1d needs a GPU")
 def test_causal_conv1d_fla_matches_eager():
     pytest.importorskip("fla")
     eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
@@ -417,7 +417,7 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     assert seen_scales == [("forward", explicit_scale), ("backward", explicit_scale)]
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA chunk_gated_delta_rule needs CUDA")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA chunk_gated_delta_rule needs a GPU")
 def test_chunk_gated_delta_rule_fla_matches_eager():
     pytest.importorskip("fla")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
@@ -460,8 +460,8 @@ def test_chunk_gated_delta_rule_fla_matches_eager():
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or get_gpu_compute_capability() != 90,
-    reason="flash_qla only ships Hopper SM90 kernels",
+    not IS_CUDA_AVAILABLE or not 90 <= get_gpu_compute_capability() <= 100,
+    reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
 def test_chunk_gated_delta_rule_flash_qla_matches_fla():
     pytest.importorskip("flash_qla")
@@ -481,8 +481,8 @@ def test_chunk_gated_delta_rule_flash_qla_matches_fla():
 
 
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE or get_gpu_compute_capability() != 90,
-    reason="flash_qla only ships Hopper SM90 kernels",
+    not IS_CUDA_AVAILABLE or not 90 <= get_gpu_compute_capability() <= 100,
+    reason="flash_qla requires an NVIDIA GPU from SM90 through SM100",
 )
 def test_chunk_gated_delta_rule_flash_qla_matches_eager():
     pytest.importorskip("flash_qla")

@@ -27,8 +27,13 @@ Eager has no varlen path.
 Eager has no varlen path.
 """
 
+from ...platform import (
+    GpuKernelRequirement,
+    MluKernelRequirement,
+    NpuKernelRequirement,
+    NvidiaGpuPlatform,
+)
 from ...registry import register_op
-from ...requirement import CudaKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 from .causal_conv1d.standard import eager as conv_eager
 from .causal_conv1d.standard import fla as conv_fla
 from .causal_conv1d.standard import npu as conv_npu
@@ -42,6 +47,10 @@ from .rms_norm_gated.standard import fla as rms_fla
 from .rms_norm_gated.standard import npu as rms_npu
 
 
+_GPU = GpuKernelRequirement()
+_FLASH_QLA_GPU = GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=100),))
+
+
 register_op("rms_norm_gated", "standard", "eager", wrapper=rms_eager.wrapper)
 
 register_op(
@@ -49,7 +58,7 @@ register_op(
     "standard",
     "fla",
     wrapper=rms_fla.wrapper,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op(
@@ -75,7 +84,7 @@ register_op(
     "standard",
     "fla",
     wrapper=conv_fla.wrapper,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op(
@@ -102,7 +111,7 @@ register_op(
     "standard",
     "fla",
     wrapper=chunk_fla.wrapper,
-    requirement=CudaKernelRequirement(),
+    requirement=_GPU,
 )
 
 register_op(
@@ -118,7 +127,7 @@ register_op(
     "standard",
     "flash_qla",
     wrapper=chunk_flash_qla.wrapper,
-    requirement=CudaKernelRequirement(min_cc=90, max_cc=90),
+    requirement=_FLASH_QLA_GPU,
 )
 
 register_op(

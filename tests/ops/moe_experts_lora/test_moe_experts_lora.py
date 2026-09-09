@@ -161,7 +161,7 @@ def test_moe_experts_lora_eager_forward_smoke(variant):
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_moe_experts_lora_triton_available_on_cuda(variant):
     if not IS_CUDA_AVAILABLE:
-        pytest.skip("triton LoRA row is CUDA-gated")
+        pytest.skip("triton LoRA row requires a GPU")
     assert "fused_triton" in OP_REGISTRY.list_available("moe_experts_lora", variant)
     resolve_op("moe_experts_lora", variant, "fused_triton")
 
@@ -176,7 +176,7 @@ def test_moe_experts_lora_npu_available_on_npu(variant):
 
 @pytest.mark.skipif(
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
-    reason="triton moe_experts_lora needs CUDA + triton",
+    reason="triton moe_experts_lora needs a GPU + triton",
 )
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_triton_matches_eager(variant):
@@ -191,7 +191,7 @@ def test_npu_matches_eager(variant):
 
 @pytest.mark.skipif(
     not IS_CUDA_AVAILABLE or not is_fused_moe_available(),
-    reason="triton moe_experts_lora needs CUDA + triton",
+    reason="triton moe_experts_lora needs a GPU + triton",
 )
 @pytest.mark.parametrize("variant", ["shared", "independent"])
 def test_triton_ep_class_matches_nonep_single_rank(variant):

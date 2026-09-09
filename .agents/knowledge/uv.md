@@ -24,7 +24,7 @@ pyproject.toml
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
 │   │                  + FA3 / FlashMLA wheels on both architectures
-│   │                  + FA4 (PyPI) / FlashQLA (source-built from git)
+│   │                  + FA4 / FlashQLA (PyPI)
 │   │                  + liger-kernel + FLA + quack + TileLang/TileKernels + DLPack ext
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
@@ -44,9 +44,8 @@ pyproject.toml
 │   ├── required-version     Pinned uv version
 │   ├── override-dependencies  Per-extra torch/CUDA pins (markers scoped to gpu/npu/npu_aarch64)
 │   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion
-│   └── sources              Custom indexes, direct wheel URLs (av, torch,
-│                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA);
-│                            git source (flash-qla)
+│   └── sources              Custom indexes and direct wheel URLs (av, torch,
+│                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA)
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
 ```
 
@@ -63,9 +62,8 @@ uv sync --extra npu_aarch64 --dev   # Ascend NPU ARM
 
 A fresh `--extra gpu` installs architecture-specific torch, torchcodec, AV,
 FA3, and FlashMLA wheels. FA2 is installed from prebuilt wheels on x86_64 and
-omitted on aarch64. FA4 is a pure-Python wheel; only FlashQLA builds from git.
-The aarch64 FA3 wheel requires glibc 2.34 or newer. uv caches built wheels
-under `~/.cache/uv`.
+omitted on aarch64. FA4 and FlashQLA are pure-Python wheels. The aarch64 FA3
+wheel requires glibc 2.34 or newer. uv caches built wheels under `~/.cache/uv`.
 
 The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
@@ -92,31 +90,25 @@ forced into a specific 5.x patch.
 | `flash-attn-3` (Hopper) | cp310-abi3 Luosuu wheel on x86_64; cp39-abi3 PyTorch cu130 wheel on aarch64 | abi3 covers supported Python versions; aarch64 requires glibc 2.34+ |
 | `flash-mla` | cp311/cp312 Luosuu cu130/torch2.11/sm90a+sm100f wheels | architecture-specific x86_64/aarch64 wheels |
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
-| `flash-qla` | git: QwenLM/FlashQLA | source-built; uv overrides its TileLang 0.1.8 metadata pin |
+| `flash-qla` | PyPI `0.1.2` | pure-Python wheel; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
 
-Two pyproject knobs make the remaining FlashQLA source build succeed:
+FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
+SM100. Its SM120 path is forward-only, so VeOmni's full op registration is
+limited to the SM90-SM100 range. The GPU extra also installs
+`tile-kernels==1.0.0`, which requires `tilelang>=0.1.9`.
+`[tool.uv].override-dependencies` pins the shared GPU environment to
+`tilelang==0.1.9`; gated-delta-rule and DeepSeek V4 tests cover that resolved
+combination.
 
-1. **`[[tool.uv.dependency-metadata]]`** with `version` for `flash-qla`.
-   It has no `pyproject.toml`; without static metadata uv runs its setup.py
-   on a fresh venv and crashes with `ModuleNotFoundError: No module named
-   'setuptools'`. The static `requires-dist` mirrors flash-qla's own
-   install_requires (`torch`, `tilelang==0.1.8`, `apache-tvm-ffi==0.1.9`)
-   — `flash_qla/__init__.py` top-level imports `tilelang`, so they have to
-   ship alongside, even though the `flash_qla` kernel itself only binds on
-   sm90 (gated by `KernelSpec(min_compute_capability=90)`).
-
-   The GPU extra also installs `tile-kernels==1.0.0`, which requires
-   `tilelang>=0.1.9`. `[tool.uv].override-dependencies` therefore pins the
-   shared GPU environment to `tilelang==0.1.9`; DeepSeek V4 TileLang and
-   TileKernels tests cover that resolved combination.
-
-2. **`[tool.uv.extra-build-dependencies]`** seeds `setuptools / wheel /
-   packaging / ninja` (+ `torch` where needed) — uv venvs are not seeded.
+`[tool.uv.extra-build-dependencies]` seeds `setuptools / wheel / packaging /
+ninja` (+ `torch` where needed) for packages that still build from source;
+uv build environments are not seeded.
 
 `FLASH_ATTENTION_FORCE_BUILD=TRUE` and `[tool.uv.no-build-isolation-package]`
-are gone — no FA setup.py runs anywhere now (FA2/3 wheel, FA4 cute is a
-DSL package, flash-qla uses dependency-metadata).
+are gone — no FA setup.py runs anywhere now (FA2/3 use wheels and FA4 cute is
+a DSL package). FlashQLA also uses its PyPI wheel and needs no static
+dependency-metadata override.
 
 ## Common Commands
 
