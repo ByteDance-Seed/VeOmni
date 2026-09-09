@@ -27,8 +27,8 @@ jobs:
       - run: pip install ruff==${{ env.RUFF_VERSION }}
       - name: Ruff check & format
         run: |
-          ruff check tasks tests veomni docs
-          ruff format --check tasks tests veomni docs
+          ruff check tasks tests veomni docs scripts
+          ruff format --check tasks tests veomni docs scripts
 
   version-check:
     name: Verify tag matches package version
