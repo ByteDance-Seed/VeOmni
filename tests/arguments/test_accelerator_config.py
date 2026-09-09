@@ -408,7 +408,9 @@ def test_model_arguments_extends_base():
 def test_the_runtime_pair_is_declared_once_for_subclasses_to_inherit():
     """An omni module/model args class should not have to re-declare either field."""
     base = {f.name for f in dataclasses.fields(BaseModelArguments)}
-    assert {"accelerator", "optimizer", "broadcast_model_weights_from_rank0", "ep_sharded_stream_load"}.isdisjoint(base)
+    assert {"accelerator", "optimizer", "broadcast_model_weights_from_rank0", "ep_sharded_stream_load"}.isdisjoint(
+        base
+    )
     assert {"tokenizer_path", "safetensor_idx_path"} <= base
 
     own = ModelArguments.__dataclass_fields__
