@@ -11,13 +11,19 @@ Item shape
 ----------
 Each item is ``{type, value, role, meta}``:
 
-* ``type``  — ``"text"`` | ``"image"`` | ``"video"`` | ``"output"``.  ``"output"``
-  is the transient row a backbone appends while generating; :func:`seal_outputs`
-  renames it to its final modality once the span closes.  Janus interleaved
-  generation also accepts the legacy ``"image_output"`` on input, which
-  ``JanusSiglip.generate`` re-encodes and seals to ``"image"``.
-* ``value`` — polymorphic: raw content (``str`` / PIL image / pixel tensor)
-  before encoding, an ``(L, D)`` / ``(1, L, D)`` embedding tensor after.
+* ``type``  — ``"text"`` | ``"image"`` | ``"video"`` | ``"audio"`` | ``"output"``.
+  ``"output"`` is the transient row a backbone appends while generating;
+  :func:`seal_outputs` renames it to its final modality once the span closes.
+  Janus interleaved generation also accepts the legacy ``"image_output"`` on
+  input, which ``JanusSiglip.generate`` re-encodes and seals to ``"image"``.
+  ``"audio"`` is a standalone sound item (speech in, or speech out once sealed).
+  Sound carried *inside* a video clip is not an ``"audio"`` item — it rides on
+  the video item as ``meta["audio_stream"]`` so that one clip stays one item and
+  the backbone can interleave both streams on a shared timeline; see
+  ``docs/seed_omni/av_video_design.md``.
+* ``value`` — polymorphic: raw content (``str`` / PIL image / pixel tensor /
+  ``(samples,)`` waveform) before encoding, an ``(L, D)`` / ``(1, L, D)``
+  embedding tensor after.
 * ``role``  — ``"user"`` | ``"assistant"`` | ``"dummy"`` (``"dummy"`` rows are
   zero-tensor FSDP placeholders appended by encoders on text-only
   micro-batches; the backbone skips them and folds a zero-grad anchor).
@@ -44,7 +50,7 @@ import torch
 from PIL import Image
 
 
-ItemType = str  # "text" | "image" | "video" | "output" (+ legacy "image_output")
+ItemType = str  # "text" | "image" | "video" | "audio" | "output" (+ legacy "image_output")
 ItemRole = str  # "user" | "assistant" | "dummy"
 ItemValue = Union[str, torch.Tensor, Image.Image]
 
@@ -92,6 +98,10 @@ class ConversationItem:
                 parts.append(f"audio.shape={audio_shape}")
                 parts.append(f"audio_fps={getattr(v, 'audio_fps', None)}")
             return f"[VideoInputs | {', '.join(parts)}]"
+        elif hasattr(value, "shape") and hasattr(value, "dtype"):
+            # Raw audio waveforms arrive as numpy arrays. Duck-typed for the same
+            # reason as VideoInputs above: keep this core module import-free.
+            return f"[{type(value).__name__}]{tuple(value.shape)}"
         else:
             return f"[UnknownType]{type(value).__name__}"
 
@@ -131,11 +141,18 @@ def build_conversation(
     *,
     prompt: str,
     images: list[Any] | None = None,
+    audios: list[Any] | None = None,
 ) -> list[ConversationItem]:
-    """Build the canonical conversation list for a single inference request."""
+    """Build the canonical conversation list for a single inference request.
+
+    ``audios`` are standalone waveforms. Sound belonging to a video clip does not
+    come through here — it rides on the video item's ``meta["audio_stream"]``.
+    """
     parts: list[ConversationItem] = []
     for img in images or []:
         parts.append(ConversationItem(type="image", value=img, role="user"))
+    for wav in audios or []:
+        parts.append(ConversationItem(type="audio", value=wav, role="user"))
     parts.append(ConversationItem(type="text", value=prompt, role="user"))
     return parts
 

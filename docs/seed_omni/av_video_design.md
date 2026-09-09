@@ -1,12 +1,17 @@
 # Design Note: Video With Audio (Qwen-Omni style av-video)
 
-> **Status: not implemented (design-only).** SeedOmni V2 has no audio modality,
-> so audio-bearing video is unsupported — silent video understanding *is*
-> implemented (see [`example_models/qwen3vl.md`](example_models/qwen3vl.md)). The
-> data layer already decodes and carries the audio stream (`VideoInputs.audio` in
+> **Status: not implemented (design-only).** Audio-bearing video is still
+> unsupported; silent video understanding *is* implemented (see
+> [`example_models/qwen3vl.md`](example_models/qwen3vl.md)). The data layer
+> already decodes and carries the audio stream (`VideoInputs.audio` in
 > `veomni/data/seed_omni/video_utils.py`), but nothing downstream consumes it.
 > This note records the intended design so a future implementation has a decided
 > starting point.
+>
+> What *does* exist now is the standalone `type="audio"` conversation item (a
+> bare waveform, no video), added for Qwen3-Omni speech in/out. That is a
+> different carrier shape on purpose: one sound item on its own needs no shared
+> timeline, so it needs none of the interleave or TMRoPE machinery below.
 
 ## Reference implementation (transformers `qwen2_5_omni` / `qwen3_omni_moe`)
 

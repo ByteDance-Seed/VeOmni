@@ -33,6 +33,47 @@ def test_build_conversation_with_images_places_them_first():
     assert parts[2].value == "describe"
 
 
+def test_build_conversation_with_audios_places_them_before_the_prompt():
+    wav_a, wav_b = object(), object()
+    parts = build_conversation(prompt="transcribe", audios=[wav_a, wav_b])
+    assert [(p.type, p.role) for p in parts] == [
+        ("audio", "user"),
+        ("audio", "user"),
+        ("text", "user"),
+    ]
+    assert parts[0].value is wav_a
+    assert parts[1].value is wav_b
+
+
+def test_build_conversation_orders_images_before_audios():
+    img, wav = object(), object()
+    parts = build_conversation(prompt="what is in these", images=[img], audios=[wav])
+    assert [p.type for p in parts] == ["image", "audio", "text"]
+
+
+def test_audio_items_are_filterable_like_any_other_modality():
+    conversation_list = [
+        [
+            ConversationItem(type="audio", value=torch.zeros(16000), role="user"),
+            ConversationItem(type="text", value="hi", role="user"),
+        ],
+        [ConversationItem(type="audio", value=torch.zeros(8000), role="assistant")],
+    ]
+    user_audio = list(iter_desired_items(conversation_list, types=["audio"], roles=["user"]))
+    assert [tuple(item.value.shape) for item in user_audio] == [(16000,)]
+    all_audio = list(iter_desired_items(conversation_list, types=["audio"]))
+    assert len(all_audio) == 2
+
+
+def test_value_repr_shows_shape_for_array_like_waveforms():
+    class FakeArray:
+        shape = (24000,)
+        dtype = "float32"
+
+    item = ConversationItem(type="audio", value=FakeArray(), role="user")
+    assert item.__value_repr__() == "[FakeArray](24000,)"
+
+
 def test_conversation_item_meta_defaults_empty():
     p = ConversationItem(type="text", value="", role="user")
     assert p.meta == {}
