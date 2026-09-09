@@ -40,8 +40,8 @@ Phase 5: Test and document             -> pending
 1. **Create the model directory**: `veomni/models/transformers/<model_name>/`.
 
 2. **Switch to `/veomni-patchgen-model`.** It owns the whole modeling surface —
-   the `<model_name>_{gpu,npu}_patch_gen_config.py` files, the MoE
-   `parallel_plan.py` and `checkpoint_tensor_converter.py`, `__init__.py`
+   the `<model_name>_{gpu,npu}_patch_gen_config.py` files, ExtraParallel
+   `parallel_plan.py`, any required MoE `checkpoint_tensor_converter.py`, `__init__.py`
    registration, `make patchgen`, and the model-level test cases — with the
    working examples and the pitfalls that cost the most time. Do not re-derive
    it from this file.
@@ -49,8 +49,9 @@ Phase 5: Test and document             -> pending
    Note that `parallel_plan.py` is **not** an FSDP wrapping policy: FSDP2 wraps
    generically in `build_parallelize_model()`, and `ParallelPlan`
    (`veomni/distributed/parallel_plan.py`) only describes ExtraParallel
-   EP/embedding sharding. Every `parallel_plan.py` in the repo belongs to a MoE
-   model; a dense model does not need one.
+   sharding, such as expert parallelism or embedding sharding. Add a plan
+   whenever the model uses ExtraParallel, including dense models that shard
+   embeddings; a model without ExtraParallel does not need one.
 
 3. **Exception — non-transformers architectures.** Diffusion models under
    `veomni/models/diffusers/<model_name>/`, and the `flux` / `movqgan` / `wan`
