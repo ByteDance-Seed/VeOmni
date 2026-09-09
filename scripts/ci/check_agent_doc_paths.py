@@ -66,10 +66,7 @@ PLACEHOLDER_CHARS = set("<>*?{}$()|\"' \t")
 # `.py` name is usually an upstream transformers module or an example filename.
 BARE_NAME_SUFFIXES = frozenset({".yml", ".yaml"})
 
-# Repo-wide skill-reference scan: skip anything that is not plausibly text.
-TEXT_SUFFIXES = frozenset(
-    {".py", ".md", ".mdc", ".yml", ".yaml", ".toml", ".cfg", ".ini", ".sh", ".txt", ".json", ".j2", ""}
-)
+# Bound the repo-wide scan; UTF-8 decoding below skips binary files.
 MAX_SCAN_BYTES = 2 * 1024 * 1024
 
 
@@ -156,12 +153,8 @@ def tracked_files(repo_root: Path) -> list[Path]:
 
 
 def tracked_text_files(repo_root: Path) -> list[Path]:
-    """Every git-tracked file that is plausibly text, for the skill-name scan."""
-    return [
-        path
-        for path in tracked_files(repo_root)
-        if path.suffix in TEXT_SUFFIXES and path.is_file() and path.stat().st_size <= MAX_SCAN_BYTES
-    ]
+    """Bounded git-tracked candidates; the caller skips files that fail UTF-8 decoding."""
+    return [path for path in tracked_files(repo_root) if path.is_file() and path.stat().st_size <= MAX_SCAN_BYTES]
 
 
 def scan_skill_refs(repo_root: Path) -> list[str]:
