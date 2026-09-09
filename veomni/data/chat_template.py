@@ -13,9 +13,9 @@
 # limitations under the License.
 
 
+import json
 from abc import ABC, abstractmethod
 from collections import defaultdict
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Sequence, Union
 
