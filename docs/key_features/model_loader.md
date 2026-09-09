@@ -27,7 +27,7 @@ Users can directly load models from HuggingFace and start the training process b
 
 ### 1. Create Your Model Implementation
 
-First, create new modeling file for your model implementation. Note that the custom models should inherit from `PreTrainedModel` and implement the necessary methods.
+First, create a new modeling file for your model implementation. Custom models should inherit from `PreTrainedModel` and implement the necessary methods.
 
 
 ### 2. Register Your Model
