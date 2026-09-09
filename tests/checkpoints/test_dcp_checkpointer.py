@@ -1454,22 +1454,39 @@ class TestStageDirValidation:
 
         assert (someone_elses / "important.bin").exists(), "swept outside our own root"
 
-    def test_only_the_node_leader_sweeps(self, tmp_path):
-        """Every rank on the node shares the directory; one sweep is enough."""
+    def test_only_the_node_leader_touches_the_filesystem(self, tmp_path):
+        """Peers sweeping and creating in the same place would race with the leader.
+
+        They do not need to: the reduction is a collective, so the leader's work
+        is done and visible by the time any rank leaves.
+        """
         import os as _os
 
         from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
 
         with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
-            with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0):
-                stale = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_10")
-            with open(_os.path.join(stale, "leftover"), "w") as f:
-                f.write("x")
-            # A non-leader must not wipe what the leader already prepared.
             with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
-                _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_20")
+                path = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_10")
+            assert not _os.path.exists(path), "a peer created the directory itself"
 
-        assert _os.path.exists(_os.path.join(stale, "leftover"))
+            with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0):
+                assert _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_10") == path
+            assert _os.path.isdir(path), "the leader must have created it"
+
+    def test_a_concurrent_run_sharing_stage_dir_is_not_swept(self, tmp_path):
+        """stage_dir is often generic (/tmp); two runs on one node must not collide."""
+        import os as _os
+
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            other = _prepare_stage_dir(str(tmp_path), "/remote/other_run/global_step_10")
+            with open(_os.path.join(other, "in_flight.distcp"), "w") as f:
+                f.write("another job is using this")
+
+            _prepare_stage_dir(str(tmp_path), "/remote/this_run/global_step_10")
+
+        assert _os.path.exists(_os.path.join(other, "in_flight.distcp")), "swept another run's data"
 
     def test_staging_dir_failure_is_agreed_across_ranks(self, tmp_path):
         """A scratch disk fails per node, so ranks that could still stage must stop too.

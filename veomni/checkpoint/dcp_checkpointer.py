@@ -526,32 +526,45 @@ def _promotion_phase(state: _Promotion, work, *, participates: bool, always: boo
 _STAGE_ROOT = "veomni_ckpt_stage"
 
 
+def _stage_run_root(stage_dir: str, checkpoint_dir: str) -> str:
+    """Directory holding every staged checkpoint of one run, and nothing else.
+
+    Keyed on the destination the run writes to, so two runs sharing a node and a
+    ``stage_dir`` -- which is often something generic like /tmp -- never land in
+    the same place. That matters because this directory gets swept: keying it any
+    more coarsely would let one run delete another's staged data.
+    """
+    return os.path.join(stage_dir, _STAGE_ROOT, _stage_key(os.path.dirname(os.path.abspath(checkpoint_dir))))
+
+
 def _prepare_stage_dir(stage_dir: str, checkpoint_dir: str) -> str:
     """Create an empty staging directory for one checkpoint, agreed by every rank.
 
-    Every staged checkpoint this process has ever written lives under one root,
-    and all of them are cleared here, not just this checkpoint's own directory.
-    A save killed part-way -- by a hang detector, a failover, a preemption --
-    leaves behind a copy the size of the model plus its optimizer state, under a
-    key naming *its* step. Removing only the current key would strand it, and the
-    next save on that node then asks for the same space again on a disk that is
-    already short of it.
+    Clears the whole run root rather than just this checkpoint's directory. A
+    save killed part-way -- by a hang detector, a failover, a preemption --
+    leaves a copy the size of the model plus its optimizer state under a key
+    naming *its* step, and removing only the current key would strand it; the
+    next save on that node then asks for the same space again on a disk already
+    short of it.
 
-    A scratch disk fills or goes read-only per node, so the ranks that could not
-    prepare a directory must not be the only ones to stop: the rest would go on
-    into ``dcp.save`` and wait on a collective that never arrives. Everyone
-    agrees here, before any of that starts.
+    Only the node leader touches the filesystem. Sweeping under peers that are
+    creating directories in the same place would race, and there is no need for
+    them to: the reduction below is a collective, so by the time any rank leaves
+    this function the leader's work is done and visible.
+
+    That reduction is also what keeps a per-node failure -- a full or read-only
+    scratch disk -- from being seen by one rank alone, which would leave the rest
+    waiting in ``dcp.save`` on a collective that never arrives.
     """
-    stage_root = os.path.join(stage_dir, _STAGE_ROOT)
-    stage_path = os.path.join(stage_root, _stage_key(checkpoint_dir))
+    run_root = _stage_run_root(stage_dir, checkpoint_dir)
+    stage_path = os.path.join(run_root, _stage_key(checkpoint_dir))
     error: Optional[BaseException] = None
-    try:
-        # One process per node does the sweep; the rest only need the directory.
-        if _local_rank() == 0:
-            shutil.rmtree(stage_root, ignore_errors=True)
-        os.makedirs(stage_path, exist_ok=True)
-    except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
-        error = e
+    if _local_rank() == 0:
+        try:
+            shutil.rmtree(run_root, ignore_errors=True)
+            os.makedirs(stage_path, exist_ok=True)
+        except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+            error = e
     if _any_rank_failed(error is not None):
         raise error or RuntimeError(f"another rank could not prepare a staging directory under {stage_dir}")
     return stage_path
