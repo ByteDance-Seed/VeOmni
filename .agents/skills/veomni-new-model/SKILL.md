@@ -3,9 +3,9 @@ name: veomni-new-model
 description: "Use this skill when adding support for a new model to VeOmni. Covers the full lifecycle: analyzing the HuggingFace model, creating model patches, defining parallel plans, writing configs, integrating with the trainer, and testing. Trigger: 'add model', 'support new model', 'integrate a model', 'new model support'."
 ---
 
-## Before You Start: Create Todos
+## Before You Start: Create a Plan
 
-Use TodoWrite to track all phases:
+Track the phases with whatever todo/plan tool the running agent provides:
 
 ```
 Phase 1: Analyze HF model             -> in_progress
@@ -102,12 +102,17 @@ Phase 6: Test                          -> pending
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
 
-2. **Unit tests**: Add tests in `tests/models/` to verify:
-   - Model loads correctly via `veomni.models.auto`
-   - Forward pass produces correct output shape
-   - Model patch applies without errors
+2. **Unit tests**: add cases to the existing enumerated tables rather than new
+   files — `tests/models/test_model_registry.py` and
+   `tests/models/test_models_patch.py` (`TEST_CASES`) already cover loading via
+   `veomni.models.auto`, forward output shape, and patch application. See
+   `.agents/knowledge/testing.md` for the full landing-spot table and for why a
+   new file outside `tests/ops/` / `tests/data/` will not run in CI unless it is
+   wired into the unit-test workflows.
 
-3. **E2e tests** (if feasible): Test a short training run using the toy config.
+3. **E2e tests** (if feasible): add a `pytest.param` to
+   `tests/e2e/test_e2e_parallel.py` using the toy config, rather than a new
+   e2e file.
 
 4. Run `make quality` and `pytest tests/models/`.
 

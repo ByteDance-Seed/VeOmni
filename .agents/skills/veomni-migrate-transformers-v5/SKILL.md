@@ -79,27 +79,35 @@ source .venv/bin/activate
 patchgen config is the single biggest accelerator for catching subtle
 signature/contract drift while iterating.
 
-```bash
-mkdir -p .agents_workspace/hf_reference/<m>/v5_8_1
+Use the pinned version as the directory name so several pins can coexist:
 
-curl -sL -o .agents_workspace/hf_reference/<m>/v5_8_1/modeling_<m>.py \
-  "https://github.com/huggingface/transformers/raw/v5.9.0/src/transformers/models/<m>/modeling_<m>.py"
+```bash
+PIN=$(python -c "import transformers; print(transformers.__version__)")
+mkdir -p ".agents_workspace/hf_reference/<m>/v${PIN}"
+
+curl -fsSL -o ".agents_workspace/hf_reference/<m>/v${PIN}/modeling_<m>.py" \
+  "https://github.com/huggingface/transformers/raw/v${PIN}/src/transformers/models/<m>/modeling_<m>.py"
 ```
+
+`-f` matters: without it a missing tag or renamed module returns 404 and curl
+writes the error page into `modeling_<m>.py` with exit status 0, so you would
+diff against an HTML page and not notice.
 
 For VLMs also grab `processing_<m>.py` / `image_processing_<m>.py` /
 `configuration_<m>.py` if you expect processor-side or config-shape work.
 
 If you are **refreshing** an existing patchgen-generated file across a
-transformers minor bump (e.g. the current pin `5.9.0 → 5.9.0`), pull both
-versions side-by-side and diff to spot contract drift — substitute the
+transformers minor bump (the pin the generated file was produced against → the
+new pin), pull both versions side-by-side and diff to spot contract drift —
+substitute the
 `<old_ver>` / `<new_ver>` tags with the actual versions you are migrating
 between:
 
 ```bash
 mkdir -p .agents_workspace/hf_reference/<m>/{old,new}
-curl -sL -o .agents_workspace/hf_reference/<m>/old/modeling_<m>.py \
+curl -fsSL -o .agents_workspace/hf_reference/<m>/old/modeling_<m>.py \
   "https://github.com/huggingface/transformers/raw/<old_ver>/src/transformers/models/<m>/modeling_<m>.py"
-curl -sL -o .agents_workspace/hf_reference/<m>/new/modeling_<m>.py \
+curl -fsSL -o .agents_workspace/hf_reference/<m>/new/modeling_<m>.py \
   "https://github.com/huggingface/transformers/raw/<new_ver>/src/transformers/models/<m>/modeling_<m>.py"
 diff -u .agents_workspace/hf_reference/<m>/{old,new}/modeling_<m>.py | less
 ```
@@ -139,9 +147,10 @@ already gitignored so it won't leak into the repo).
 
 ---
 
-## Before You Start: Create Todos
+## Before You Start: Create a Plan
 
-Use TodoWrite to track phases. Suggested plan:
+Track the phases with whatever todo/plan tool the running agent provides.
+Suggested plan:
 
 ```
 Phase 0: Verify venv + drop HF reference files       -> in_progress
@@ -152,7 +161,7 @@ Phase 4: Wire __init__.py to expose generated classes -> pending
 Phase 5: Run patchgen + verify diff                   -> pending
 Phase 6: Add test cases                               -> pending
 Phase 7: Run tests (single-GPU + e2e)                 -> pending
-Phase 8: Docs + /veomni-review + commit               -> pending
+Phase 8: Docs + commit; /veomni-review before the PR  -> pending
 ```
 
 Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
@@ -657,7 +666,11 @@ and regenerate. This is a hard rule called out in `AGENTS.md`.
 
 ## Phase 6: Add Test Cases
 
-Follow `docs/transformers_v5/testing_new_model.md`. Minimum coverage:
+Follow `docs/transformers_v5/testing_new_model.md`. Every file below is already
+enumerated in the unit-test workflows, so appending a case needs no workflow
+change — that is exactly why this phase extends tables instead of adding files.
+If you think you need a new test file, read `.agents/knowledge/testing.md` first.
+Minimum coverage:
 
 1. **Toy config**: create `tests/toy_config/<m>_toy/config.json` (few layers,
    small hidden/intermediate, tiny vocab). Add a `README.md` next to it noting
@@ -760,14 +773,15 @@ Extra e2e gotchas:
 2. **.agents knowledge**: if the work surfaced a new hard constraint
    (e.g. "model X requires `logits_to_keep` handled in ForCausalLM.forward"),
    add it to `.agents/knowledge/constraints.md`.
-3. **Run `/veomni-review`** (mandatory pre-commit gate).
-   - `safe` → commit.
-   - `risky` → report, wait for user.
-4. **Commit**:
+3. **Commit**:
    - Title: `[BREAKING]` only if the change alters checkpoint format
      expectations or public APIs. Follow `[{modules}] {type}: {description}`.
      Example: `[veomni] feat: add patchgen-generated modeling for <m>`.
    - Commit message **must not** mention Claude / AI / Co-Authored-By.
+4. **Before opening the PR**: run `/veomni-review` over the branch diff. This
+   work touches `veomni/`, so the gate applies.
+   - `safe` / `needs-attention` → open the PR.
+   - `risky` → report, wait for the user.
 
 ---
 
