@@ -113,8 +113,11 @@ Phase 5: Knowledge capture           -> pending
 
    Compare the package sets here too, using `uv pip freeze --python` with
    `../bisect-a/.venv/bin/python` and `../bisect-b/.venv/bin/python`, and
-   reconcile every non-transformers difference as above. Run codegen and the
-   reproducer from each worktree with its own environment activated:
+   reconcile non-transformers dependency version differences as above. The
+   editable VeOmni and patchgen paths must point to their respective worktrees;
+   normalize those corresponding paths only when comparing the freeze output,
+   without changing either environment's editable installs. Run codegen and
+   the reproducer from each worktree with its own environment activated:
    ```bash
    (cd ../bisect-a && source .venv/bin/activate && make patchgen && <reproducer>)
    (cd ../bisect-b && source .venv/bin/activate && make patchgen && <reproducer>)
