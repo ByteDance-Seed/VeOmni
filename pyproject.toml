@@ -341,7 +341,26 @@ version = {attr = "veomni._version.__version__"}
 [tool.setuptools.packages.find]
 where = ["."]
 # patchgen-pkg* — sibling project, not bundled into the veomni wheel.
-exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts", "patchgen-pkg*"]
+# The trailing `*` matters: `packages.find` treats a bare name as that package
+# only, and pyproject-based discovery enables namespace packages, so bare
+# `tasks` / `scripts` still shipped `tasks.infer`, `scripts.ci` and friends as
+# top-level packages in the wheel.
+exclude = [
+  "tests*",
+  "ci*",
+  "configs*",
+  "docs*",
+  "veomni_patch*",
+  "tasks*",
+  "scripts*",
+  "patchgen-pkg*",
+]
+
+[tool.setuptools.package-data]
+# LTX-2.3 reads its default Gemma system prompts from disk at import-adjacent
+# runtime (`veomni/models/diffusers/ltx2_3/.../encoders/prompts/*.txt`), so they
+# have to travel with the package instead of only living in the git checkout.
+veomni = ["**/*.txt"]
 
 [tool.patchgen]
 search_root = "veomni/models/transformers"
