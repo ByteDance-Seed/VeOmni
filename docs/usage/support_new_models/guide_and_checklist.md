@@ -217,7 +217,7 @@ For implementation details of each patch, refer to the example docs.
 - [ ] Toy config in `tests/toy_config/your_model_toy/`
 - [ ] `DummyYourModelDataset` in `veomni/data/dummy_dataset.py` (multimodal)
 - [ ] `MODEL_TO_DATASET` entry in `tests/models/utils.py`
-- [ ] `pytest.param` in `test_cases` in `tests/models/test_models_patch.py` (Level 1)
+- [ ] `pytest.param` in `TEST_CASES` in `tests/models/test_models_patch.py` (Level 1)
 - [ ] Test case + fixture + test function in `tests/e2e/test_e2e_parallel.py` (Level 2)
 - [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/models/test_vlm_trainer.py`
 

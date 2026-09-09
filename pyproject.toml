@@ -34,10 +34,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Three mutually-exclusive hardware extras (see `[tool.uv].conflicts`): a
-# typical install is `uv sync --extra <gpu|npu|npu_aarch64>`. trl is NOT
-# included — VeOmni's DPO trainer (veomni/trainer/text_dpo_trainer.py) is
-# from-scratch and the trl<=0.9.6 pin is transformers v4-era anyway.
+# Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
+# (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM90+ and
+# requires gpu: `uv sync --extra gpu --extra magi`.
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",
@@ -91,6 +90,11 @@ gpu = [
   "peft==0.18.1",
   "megatron-energon>=7.2.1",
   "hf_transfer",
+]
+
+# MagiAttention FFA (NVIDIA SM90+). Requires gpu via veomni[gpu]; conflicts with npu extras.
+magi = [
+  "veomni[gpu]",
   # MagiAttention 1.1.1 imports debugpy unconditionally from
   # magi_attention.utils.debug but omits it from package metadata.
   "debugpy",
@@ -204,6 +208,14 @@ conflicts = [
     { extra = "npu" },
     { extra = "npu_aarch64" },
   ],
+  [
+    { extra = "magi" },
+    { extra = "npu" },
+  ],
+  [
+    { extra = "magi" },
+    { extra = "npu_aarch64" },
+  ],
 ]
 
 [tool.uv.sources]
@@ -284,8 +296,8 @@ explicit = true
 # MagiAttention omits project dependencies and keeps a separate requirements
 # file that targets CUDA 12 NVSHMEM and an older Quack release. VeOmni skips
 # the communication extension and supplies the CUDA 13-compatible runtime
-# closure explicitly through the complete gpu extra: torch, CUTLASS DSL,
-# Quack, the three companion packages, and the otherwise undeclared debugpy.
+# closure through the gpu extra (torch, CUTLASS DSL, Quack) plus this magi
+# extra (the three companion packages and the otherwise undeclared debugpy).
 # Re-audit those direct dependencies whenever the pinned revisions change.
 [[tool.uv.dependency-metadata]]
 name = "magi-attention"
@@ -329,7 +341,26 @@ version = {attr = "veomni._version.__version__"}
 [tool.setuptools.packages.find]
 where = ["."]
 # patchgen-pkg* — sibling project, not bundled into the veomni wheel.
-exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts", "patchgen-pkg*"]
+# The trailing `*` matters: `packages.find` treats a bare name as that package
+# only, and pyproject-based discovery enables namespace packages, so bare
+# `tasks` / `scripts` still shipped `tasks.infer`, `scripts.ci` and friends as
+# top-level packages in the wheel.
+exclude = [
+  "tests*",
+  "ci*",
+  "configs*",
+  "docs*",
+  "veomni_patch*",
+  "tasks*",
+  "scripts*",
+  "patchgen-pkg*",
+]
+
+[tool.setuptools.package-data]
+# LTX-2.3 reads its default Gemma system prompts from disk at import-adjacent
+# runtime (`veomni/models/diffusers/ltx2_3/.../encoders/prompts/*.txt`), so they
+# have to travel with the package instead of only living in the git checkout.
+veomni = ["**/*.txt"]
 
 [tool.patchgen]
 search_root = "veomni/models/transformers"

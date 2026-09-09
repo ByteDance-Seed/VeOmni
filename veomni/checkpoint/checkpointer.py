@@ -63,7 +63,24 @@ class CheckpointerBase(ABC):
         trainable_only: bool = False,
         save_to_lowest_rank: bool = False,
         parallel_state=None,
+        stage_dir: Optional[str] = None,
     ):
+        """Persist training state to ``path``.
+
+        Args:
+            path: Destination the checkpoint is written to.
+            state: Objects to persist; must contain ``model``.
+            save_async: Return before the write completes, leaving it to a
+                background thread. Backends without async support ignore this.
+            global_steps: Step number; when given, the checkpoint goes into a
+                per-step subdirectory of ``path``.
+            trainable_only: Persist only parameters with ``requires_grad``.
+            save_to_lowest_rank: Concentrate replicated shards on the lowest rank
+                that holds them instead of spreading the writes.
+            parallel_state: Parallelism layout the state was sharded under.
+            stage_dir: Write under this directory and copy to ``path`` afterwards,
+                for a destination far slower than local disk.
+        """
         return
 
     @abstractmethod

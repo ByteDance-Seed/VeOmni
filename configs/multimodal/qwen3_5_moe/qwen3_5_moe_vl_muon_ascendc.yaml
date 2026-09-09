@@ -1,0 +1,69 @@
+model:
+  model_path: Qwen/Qwen3.5-35B-A3B
+  ops_implementation:
+    attn_implementation: veomni_flash_attention_2_with_sp
+    rms_norm_implementation: npu
+    rotary_pos_emb_implementation: npu
+    cross_entropy_loss_implementation: chunk_loss
+    swiglu_mlp_implementation: eager
+    moe_implementation: fused_npu
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu_ascendc
+    load_balancing_loss_implementation: eager
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+  data_type: conversation
+  chat_template: qwen3vl
+  max_seq_len: 16384
+  train_size: 160000000
+  mm_configs:
+    image_max_pixels: 602112 # 28 * 28 * 768
+    video_max_pixels: 602112 # 28 * 28 * 768
+    video_total_pixels: 11560550 # max_seq_len * 28^2 * 0.9, dynamic per-frame budget
+    max_frames: 16
+    fps: 2.0
+    use_audio_in_video: false
+
+train:
+  accelerator:
+    ulysses_size: 1
+    ep_size: 4
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable_reentrant: false
+  wandb:
+    enable: false
+    project: VeOmni
+    name: Qwen3.5-35B-A3B-vl-muon-ascend
+  freeze_vit: false
+  optimizer:
+    type: muon
+    lr: 1.0e-5
+    weight_decay: 0.1
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+    muon_lr: 1.0e-5
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.1
+    muon_ns_steps: 5
+    muon_ns_implementation: gram
+    muon_adjust_lr_fn: match_rms_adamw
+    muon_expert_zero_comm: true
+  num_train_epochs: 2
+  micro_batch_size: 1
+  global_batch_size: 16
+  max_steps: 500
+  init_device: meta
+  profile:
+    enable: true
+    start_step: 20
+    end_step: 21
+    record_shapes: true
+  checkpoint:
+    output_dir: Qwen3.5-35B-A3B-vl-muon-ascend
+    manager: dcp
+    save_hf_weights: false

@@ -60,6 +60,30 @@ class CheckpointerCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._load_checkpoint()
 
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        """Block until an in-flight async save has finished before the run exits.
+
+        With ``save_async``, ``_save_checkpoint`` returns as soon as
+        ``dcp.async_save`` has been queued: the write runs on a background thread
+        and any exception it raises stays captured in the future.
+        ``wait_for_pending_save`` is the only place that future is consumed, and
+        until now it was reached only from ``_load_checkpoint`` (needs
+        ``load_path``), from ``HuggingfaceCkptCallback`` / ``HFLoraCkptCallback``
+        (need ``save_hf_weights``), or from the *next* async save. A run whose
+        last save is also its only save therefore exited without ever observing
+        the result: ``ThreadPoolExecutor``'s atexit join let the write finish,
+        but a write that raised was silently discarded and the process still
+        exited 0, leaving no checkpoint behind.
+
+        Waiting here makes that failure visible, and puts the tail of the write
+        in the log rather than in an invisible interpreter-shutdown join.
+
+        No-op when nothing is pending, and ``save_future`` is set on every rank
+        or on none, so the barrier inside ``wait_for_pending_save`` stays
+        balanced.
+        """
+        self.trainer.checkpointer.wait_for_pending_save()
+
     def _load_checkpoint(self):
         """Load checkpoint from path."""
         args: "VeOmniArguments" = self.trainer.args
@@ -158,6 +182,7 @@ class CheckpointerCallback(Callback):
             trainable_only=bool(getattr(args.model, "lora_config", None)),
             save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
             parallel_state=self.parallel_state,
+            stage_dir=args.train.checkpoint.stage_dir,
         )
 
         # Empty cache and barrier

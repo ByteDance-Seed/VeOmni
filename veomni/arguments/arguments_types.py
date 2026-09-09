@@ -14,6 +14,7 @@
 
 import math
 import os
+import sys
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
@@ -23,6 +24,8 @@ from ..utils.env import get_env
 
 
 logger = logging.get_logger(__name__)
+
+_MAX_HOST_CACHE_LIMIT_GB = sys.maxsize // 1024**3
 
 
 def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
@@ -176,9 +179,11 @@ class OptimizerConfig:
         default_factory=list,
         metadata={
             "help": (
-                "Leaf module names to head-split, matched exactly against the children of an "
-                "attention module, e.g. ['q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
-                "['q_proj', 'k_proj', 'v_proj'] for GQA. Required whenever "
+                "Projection modules to head-split, each matched as a leaf module name or a dotted "
+                "path suffix, e.g. ['self_attn.q_b_proj'] for DeepSeek V3/V4 MLA up-projections or "
+                "['q_proj', 'k_proj', 'v_proj'] for GQA. An entry that would split two nested "
+                "projections is rejected with the qualified names to use instead -- DeepSeek-V4's "
+                "MLA and the DSA indexer inside it both call theirs q_b_proj. Required whenever "
                 "muon_head_group_size >= 1; see docs/usage/basic_modules.md."
             )
         },
@@ -478,7 +483,7 @@ class OffloadConfig:
 
     enable_activation: bool = field(
         default=False,
-        metadata={"help": "Enable activation offload to CPU."},
+        metadata={"help": "Enable synchronous activation offload to CPU."},
     )
     activation_gpu_limit: float = field(
         default=0.0,
@@ -486,6 +491,55 @@ class OffloadConfig:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
+    enable_async_activation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
+                "More efficient than synchronous offload. Mutually exclusive with "
+                "`enable_activation`. Uses `model._no_split_modules` when "
+                "`activation_offload_modules` is empty."
+            )
+        },
+    )
+    activation_offload_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Module name patterns for async activation offload. Supports glob patterns "
+                "(e.g. `model.layers.*`) and the special `{*}` wildcard for sequential "
+                "module groups (e.g. `model.layers.{*}` expands to all decoder layers)."
+            )
+        },
+    )
+    activation_offload_host_cache_limit_gb: float = field(
+        default=4.0,
+        metadata={
+            "help": (
+                "Maximum GB of free host buffers retained by async activation offload between steps. "
+                "In-flight offloads may temporarily use more host memory. Set to 0 to disable reuse."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        if self.enable_activation and self.enable_async_activation:
+            raise ValueError(
+                "enable_activation and enable_async_activation are mutually exclusive; "
+                "select exactly one activation offload mode."
+            )
+        if not math.isfinite(self.activation_offload_host_cache_limit_gb) or (
+            self.activation_offload_host_cache_limit_gb < 0
+        ):
+            raise ValueError(
+                "activation_offload_host_cache_limit_gb must be a finite non-negative value, "
+                f"got {self.activation_offload_host_cache_limit_gb}."
+            )
+        if self.activation_offload_host_cache_limit_gb > _MAX_HOST_CACHE_LIMIT_GB:
+            raise ValueError(
+                "activation_offload_host_cache_limit_gb is too large to convert to bytes: "
+                f"got {self.activation_offload_host_cache_limit_gb}, maximum {_MAX_HOST_CACHE_LIMIT_GB}."
+            )
 
 
 @dataclass
@@ -566,6 +620,21 @@ class CheckpointConfig:
     save_async: bool = field(
         default=False,
         metadata={"help": "Whether to save checkpoint asynchronously."},
+    )
+    stage_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Write checkpoints under this directory and copy them to `output_dir` "
+                "afterwards, instead of writing straight to `output_dir`. Intended for a "
+                "destination far slower than local disk, where a direct write can block the "
+                "training loop long enough to trip the collective timeout. The caller owns "
+                "the choice of directory: nothing is probed and free space is not checked, "
+                "so point it at a node-local filesystem that can hold every rank on the node "
+                "writing the model plus its optimizer state at once. Unset (default) writes "
+                "directly. Cannot be combined with `save_async`."
+            )
+        },
     )
     dcp_save_to_lowest_rank: bool = field(
         default=False,
@@ -1152,6 +1221,20 @@ class OpsImplementationConfig:
             "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
         },
     )
+    qat_implementation: Literal["none", "fp8_blockwise"] = field(
+        default="none",
+        metadata={
+            "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
+            "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
+            "true FP8 GEMM (128x128 weight tiles, 1x128 activation blocks, ue8m0 scales), the NoPE "
+            "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
+            "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
+            "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
+            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
+            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
+            "recipe rather than a kernel backend, so it is not an OpSlot -- see veomni/ops/qat/."
+        },
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
@@ -1312,6 +1395,32 @@ class OpsImplementationConfig:
                 "load_balancing_loss_implementation='triton' requires the 'triton' package "
                 "on CUDA. Install it or set the field to 'eager'."
             )
+
+        # ``qat_implementation`` selects a quantization recipe instead of a
+        # kernel backend, so no OpSlot resolution validates it. Its fake
+        # quantizers are the SM90-only TileLang kernels: without this check a
+        # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
+        # inside the first fake-quant call.
+        if self.qat_implementation != "none":
+            import torch
+
+            from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+
+            unsupported = torch.version.hip is not None or not IS_CUDA_AVAILABLE
+            if not unsupported:
+                # Reading the capability initializes CUDA, and parsing happens
+                # before the trainer calls ``set_device`` -- query this rank's
+                # own GPU so the early context does not land on device 0 for
+                # every rank. The count is NVML-based and needs no context.
+                local_rank = int(os.getenv("LOCAL_RANK", "0"))
+                device = local_rank if local_rank < torch.cuda.device_count() else 0
+                unsupported = get_gpu_compute_capability(device) < 90
+            if unsupported:
+                raise ValueError(
+                    f"qat_implementation={self.qat_implementation!r} requires an SM90 or later NVIDIA CUDA "
+                    f"GPU, because its fake quantizers are the DeepSeek V4 TileLang kernels. "
+                    f"Set it to 'none' to train in the model dtype."
+                )
 
 
 @dataclass

@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+import json
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -21,6 +24,10 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_comp
 
 
 DEVICE = get_device_type()
+
+# The generated modeling module by import path, for ``mock.patch`` targets.
+_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
+
 
 # Warnings this module tolerates, matched as substrings of the warning message.
 # Everything else fails test_target_kernel_emits_no_unexpected_warnings, so a new
@@ -34,6 +41,16 @@ _TOLERATED_WARNING_SUBSTRINGS = (
     # DeepSeek-V4 tilelang kernel in this tree sets -- including the attention
     # forward these tests call to produce the LSE.
     "`tl.disable_tma_lower` is deprecated",
+)
+
+# Importing ``veomni.arguments`` or the generated modeling module (which pulls in
+# ``veomni.distributed``) imports ``bytedance.hdfs_stdenv``, and that package calls the
+# deprecated ``Logger.warn`` during its own env setup. Third-party and not fixable from
+# here, so it is filtered rather than left to accumulate in pytest's summary. The
+# filter is pinned to that package's module path, so the same warning raised from our
+# own code would still be reported.
+_HDFS_STDENV_DEPRECATION_FILTER = pytest.mark.filterwarnings(
+    r"ignore:The 'warn' method is deprecated:DeprecationWarning:bytedance\.hdfs_stdenv\..*"
 )
 
 
@@ -361,3 +378,2982 @@ def test_sparse_attn_returns_non_differentiable_lse():
 
     out.sum().backward()
     assert q.grad is not None and torch.isfinite(q.grad).all()
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_two_fields_are_declared_on_the_model_config():
+    """The objective is reachable from YAML only because ``DeepseekV4Config`` declares
+    these two fields, and that is silent to break.
+
+    ``model.model_config`` entries arrive as ``**kwargs`` to
+    ``PreTrainedConfig.from_dict``, which constructs the config from the on-disk JSON
+    and then applies only those keys the result already answers ``hasattr`` for --
+    dropping the rest with no error and no warning. Delete either declaration and
+    ``dsa_indexer_loss: true`` still parses, still launches, and trains the
+    language-model objective alone while reporting no indexer metric: the exact
+    silent no-op every other gate in this feature exists to refuse.
+
+    Asserted through ``from_dict`` rather than the constructor, because the
+    constructor is not where the hole is -- ``PreTrainedConfig.__post_init__``
+    ``setattr``s whatever it is handed, so an *undeclared* field reaches a
+    directly-constructed config just fine and only the ``from_pretrained`` path that
+    every real run takes loses it. The upstream class is checked alongside as the
+    control: it is the same call, and it drops both.
+    """
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
+
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    base = UpstreamConfig(num_hidden_layers=2, layer_types=["compressed_sparse_attention"] * 2).to_dict()
+
+    overridden = DeepseekV4Config.from_dict(dict(base), dsa_indexer_loss=True, dsa_indexer_loss_coef=0.25)
+    assert overridden.dsa_indexer_loss is True, (
+        "model_config could not switch the objective on; the field is no longer declared and "
+        "from_dict dropped it silently"
+    )
+    assert overridden.dsa_indexer_loss_coef == 0.25
+
+    dropped = UpstreamConfig.from_dict(dict(base), dsa_indexer_loss=True)
+    assert not hasattr(dropped, "dsa_indexer_loss"), (
+        "the upstream config kept an undeclared override, so from_dict no longer drops unknown "
+        "keys and the declarations above are no longer what makes the YAML reach the model"
+    )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_defaults_leave_the_objective_off():
+    """Both defaults, pinned: the objective is opt-in, and a checkpoint whose
+    ``config.json`` predates it must read as off rather than as on at weight 1.0."""
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    config = DeepseekV4Config(num_hidden_layers=2, layer_types=["compressed_sparse_attention"] * 2)
+    assert config.dsa_indexer_loss is False
+    assert config.dsa_indexer_loss_coef == 1.0
+
+
+@contextlib.contextmanager
+def _ops_config_installed(**overrides):
+    """Install an ``OpsImplementationConfig`` singleton, and restore the previous one.
+
+    ``DeepseekV4Config.validate_build_prerequisites`` reads the installed singleton
+    because the two fields it checks live there while the flag it gates on is one of
+    its own; reading it is how a model config sees the rest of the run. The singleton is process-wide, so it is
+    saved and restored for the same reason the ops slots are.
+
+    ``load_balancing_loss_implementation`` is pinned to eager only so these tests do
+    not depend on ``triton`` being installed; it is unrelated to anything under test.
+    """
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.ops.config.singleton import get_ops_config, set_ops_config
+
+    previous = get_ops_config()
+    installed = OpsImplementationConfig(load_balancing_loss_implementation="eager", **overrides)
+    set_ops_config(installed)
+    try:
+        yield installed
+    finally:
+        set_ops_config(previous)
+
+
+def _config_asking_for_the_loss(coef=1.0, **overrides):
+    """A ``DeepseekV4Config`` with the objective on, for the model-build gate."""
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    return DeepseekV4Config(
+        num_hidden_layers=2,
+        layer_types=["compressed_sparse_attention"] * 2,
+        dsa_indexer_loss=True,
+        dsa_indexer_loss_coef=coef,
+        **overrides,
+    )
+
+
+def _strip_indexer_loss_keys(path):
+    """Rewrite a saved ``config.json`` without either objective key.
+
+    Stands in for a base checkpoint published before the objective existed, which is
+    what the two fields' declaration has to work against.
+    """
+    config_json = Path(path) / "config.json"
+    saved = json.loads(config_json.read_text())
+    saved.pop("dsa_indexer_loss", None)
+    saved.pop("dsa_indexer_loss_coef", None)
+    config_json.write_text(json.dumps(saved))
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+@pytest.mark.parametrize("coef", [-1.0, -1e-8, float("nan"), float("inf"), float("-inf")])
+def test_indexer_loss_coef_rejects_negative_and_non_finite(coef):
+    """The coefficient is multiplied into the indexer KL before it joins the total
+    loss, so a negative value trains the indexer *away* from the teacher and a
+    non-finite one wipes out every other term in the sum. Both would show up as a
+    loss curve rather than as an error.
+
+    Checked at model build rather than in the config's ``__post_init__``, and that is
+    forced rather than chosen: ``from_dict`` constructs the config from the on-disk
+    JSON and only then ``setattr``s the ``model_config`` overrides, so a bound checked
+    in ``__post_init__`` would read ``config.json`` and never the YAML line that
+    contradicts it. ``validate_build_prerequisites`` runs on the finished config,
+    called from ``build_foundation_model`` before any rank reads a weight.
+    """
+    with pytest.raises(ValueError, match="dsa_indexer_loss_coef"):
+        _config_asking_for_the_loss(coef=coef).validate_build_prerequisites()
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("dsa_indexer_loss", "false"),
+        ("dsa_indexer_loss", "true"),
+        ("dsa_indexer_loss", 1),
+        ("dsa_indexer_loss_coef", "0.5"),
+        ("dsa_indexer_loss_coef", None),
+    ],
+)
+def test_the_two_fields_are_refused_when_they_arrive_with_the_wrong_type(field, value):
+    """``model_config`` is an untyped ``Dict`` the whole way from YAML to ``setattr``,
+    so nothing between the two coerces anything and a quoted value stays a string.
+
+    Worth its own refusal because the failure is *truthy*: ``dsa_indexer_loss: "false"``
+    reads as on and would switch the objective on for a user who wrote it to switch the
+    objective off. A quoted coefficient fails differently and no better -- it reaches
+    ``math.isfinite`` and raises ``TypeError: must be real number, not str`` from inside
+    the validator whose job was to explain the problem.
+
+    ``1`` is in the list because ``bool`` is the one case ``isinstance(x, int)`` would
+    wave through, and a config field that silently accepts ints is one that has stopped
+    being a bool.
+    """
+    config = _config_asking_for_the_loss()
+    setattr(config, field, value)
+    with pytest.raises(TypeError, match=field):
+        config.validate_build_prerequisites()
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it():
+    """``dsa_indexer_implementation`` is a plain ``Literal`` with no hardware gate, so
+    ``tilelang`` parses on NPU and ``_indexer_loss_enabled`` admits the objective there.
+
+    The NPU CSA compressor takes ``build_indexer_loss`` only because it shares a call
+    site with the GPU one, and it cannot honour it: the student distribution is the
+    TileLang indexer's per-slot scores and that kernel is CUDA-only. Dropping the
+    argument would leave the run to fail several frames later on the attention
+    forward's own wiring check, which reports an internal invariant rather than the
+    two lines of YAML behind it.
+
+    Called with no tensors at all: the refusal is the first thing past the
+    slices/metadata pairing check, before ``hidden_states`` is touched, which is
+    itself part of the claim -- an NPU run should not build a layer's worth of
+    activations before being told the objective is unavailable.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu
+
+    with pytest.raises(NotImplementedError, match="dsa_indexer_loss is not implemented on NPU"):
+        npu.DeepseekV4CSACompressor.forward(
+            None,
+            hidden_states=None,
+            q_residual=None,
+            position_ids=None,
+            past_key_values=None,
+            layer_idx=0,
+            build_indexer_loss=True,
+        )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+@pytest.mark.parametrize("coef", [0.5, 1.0, 100.0])
+def test_indexer_loss_coef_accepts_finite_positive_weights(coef):
+    """The other half of the bound: the check must not reject the ordinary weights."""
+    with _ops_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
+        _config_asking_for_the_loss(coef=coef).validate_build_prerequisites()
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({}, "dsa_indexer_implementation"),
+        ({"dsa_indexer_implementation": "tilelang"}, "dsa_attention_implementation"),
+        (
+            {"dsa_indexer_implementation": "cudnn", "dsa_attention_implementation": "tilelang"},
+            "dsa_indexer_implementation",
+        ),
+    ],
+)
+def test_the_two_ops_config_prerequisites_are_refused_at_model_build(overrides, expected):
+    """The model refuses these again on its first forward, and that refusal is not
+    what this is about: getting there means every rank has already built a model and
+    read the checkpoint -- 54.8 GB for DeepSeek-V4-Flash -- to be told that three
+    lines of YAML disagree with each other.
+
+    The flag is on the model config and the two implementations are on
+    ``OpsImplementationConfig``, so neither dataclass can see the disagreement alone
+    and neither ``__post_init__`` is a possible home. This gate is the earliest point
+    that holds both.
+
+    Parametrised over which of the two is wrong, because a check written as one
+    condition over both would pass this test while naming the wrong field in its
+    message, and the message is the entire value of failing early.
+    """
+    with _ops_config_installed(**overrides):
+        with pytest.raises(ValueError, match=expected):
+            _config_asking_for_the_loss().validate_build_prerequisites()
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_a_zero_coefficient_is_not_held_to_the_prerequisites():
+    """A zero coefficient switches the objective off, so it is not a configuration of
+    the objective any more and must not be refused over one.
+
+    The runtime gate reads the coefficient before its own refusals for exactly this
+    reason; this one has to agree, or the two would disagree about what "off" means
+    and a config that trains fine would fail to launch. It is also what makes the
+    coefficient a usable escape hatch on a checkpoint whose ``config.json`` carries
+    ``dsa_indexer_loss: true`` from the run that produced it.
+    """
+    with _ops_config_installed():
+        _config_asking_for_the_loss(coef=0.0).validate_build_prerequisites()
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_a_config_that_cannot_ask_for_the_objective_is_left_alone():
+    """No allow-list, and no model type named anywhere in the generic builder.
+
+    Two things do the model gating and neither enumerates anything. The flag being a
+    ``DeepseekV4Config`` field means a config class that never declared it cannot be
+    asked for the objective; the check being a method on that class means
+    ``build_foundation_model`` does not know the objective exists. A model with
+    neither passes through ``check_model_build_prerequisites`` untouched, which is what
+    this pins -- along with the hook tolerating its absence rather than requiring every
+    config class to declare an empty one.
+
+    This is the test that would have to change if either gate grew a model-type check
+    again, and it is why the previous allow-list -- which existed only because the flag
+    sat on a model-agnostic dataclass -- could be deleted rather than extended.
+    """
+    from transformers import AutoConfig
+
+    from veomni.models.auto import check_model_build_prerequisites
+
+    other = AutoConfig.for_model("llama", num_hidden_layers=2)
+    assert not hasattr(other, "dsa_indexer_loss")
+    assert not hasattr(other, "validate_build_prerequisites")
+    with _ops_config_installed():
+        check_model_build_prerequisites(other)
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_generic_hook_reaches_the_model_that_implements_it():
+    """The other half: ``build_foundation_model`` calls the hook on a config that has
+    one, and the refusal that arrives is DeepSeek-V4's own.
+
+    Worth pinning separately from the method's own tests because a hook wired to the
+    wrong attribute name, or guarded by an ``isinstance`` that no longer matches, fails
+    exactly this way -- silently, with the objective launching unchecked on a stack
+    that cannot train it.
+    """
+    from veomni.models.auto import check_model_build_prerequisites
+
+    with _ops_config_installed(dsa_indexer_implementation="eager"):
+        with pytest.raises(ValueError, match="dsa_indexer_implementation"):
+            check_model_build_prerequisites(_config_asking_for_the_loss())
+
+
+@contextlib.contextmanager
+def _ops_config_slots_bound(pre_state):
+    """Put the generated module's ``OpsConfigSlot``s in a known state, and undo every
+    binding afterwards.
+
+    The slots are globals on a module shared with the rest of the session, so without
+    this a test leaks its configuration into whatever runs next — and a refusal test
+    that reads a value some earlier test happened to leave behind proves nothing about
+    the refusal it names. Binding ``pre_state`` closes the same hole from the other
+    side: a test that binds only some of the slots reads the rest from here, not from
+    the session. Both directions go through ``bind``, the same public path the tests
+    use.
+
+    The ``isinstance`` filter that collects the slots to restore would happily match
+    nothing at all — after a slot rename or a move out of the generated module —
+    leaving a teardown loop over an empty list and no failure anywhere, so the setup
+    asserts that every slot named in ``pre_state`` was found.
+    """
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+    from veomni.ops.dispatch import OpsConfigSlot
+
+    saved = [(slot, slot.value) for slot in vars(modeling).values() if isinstance(slot, OpsConfigSlot)]
+    collected = {slot.field_name: slot for slot, _ in saved}
+    missing = sorted(pre_state.keys() - collected.keys())
+    assert not missing, (
+        f"no OpsConfigSlot found on {modeling.__name__} for {missing}; this is the only "
+        "thing keeping the tests that bind slots independent of each other and of the "
+        "session, and it just restored nothing"
+    )
+    for field_name, value in pre_state.items():
+        collected[field_name].bind(SimpleNamespace(**{field_name: value}))
+    try:
+        yield
+    finally:
+        for slot, value in saved:
+            slot.bind(SimpleNamespace(**{slot.field_name: value}))
+
+
+def _gate_module(*, enabled=True, coef=1.0):
+    """A stand-in for the module ``_indexer_loss_enabled`` reads its config off.
+
+    The gate takes a ``DeepseekV4Attention`` or the ``DeepseekV4Model`` and reads
+    ``module.config``, so the module half can be a namespace -- there is nothing to
+    it but the attribute. The config half is the real ``DeepseekV4Config`` rather
+    than a namespace carrying two fields, for the reason
+    ``test_indexer_loss_refuses_every_sequence_parallel_mode`` gives about the
+    parallel state: a duck-typed stand-in would keep these tests green through a
+    rename that the production read raises on.
+    """
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    config = DeepseekV4Config(
+        num_hidden_layers=2,
+        layer_types=["compressed_sparse_attention"] * 2,
+        dsa_indexer_loss=enabled,
+        dsa_indexer_loss_coef=coef,
+    )
+    return SimpleNamespace(config=config)
+
+
+class TestIndexerLossGate:
+    """``_indexer_loss_enabled``: the three refusals, the flag-off path, and the one
+    configuration that enables the loss.
+
+    Each refusal guards a configuration that would otherwise train the indexer on a
+    wrong signal or on none while the loss curve looked entirely reasonable, so a
+    test here has to fail when *its own* refusal is deleted. Two things are needed
+    for that:
+
+    * every test pins *everything* the gate reads -- the flag and weight on the
+      config it is handed, the two implementations on the ops slots -- so a deleted
+      refusal falls through to a supported configuration rather than into the next
+      refusal, and
+    * every ``match=`` names the field its own refusal is about. ``tilelang`` alone
+      does not: it appears in the indexer refusal and the attention refusal both.
+
+    The slot half of the first point is enforced by the fixture below rather than
+    left to each test: it binds both implementation slots to a known pre-state, so a
+    test that binds one reads the other from that pre-state instead of from whatever
+    the session left behind. The config half needs no such protection -- each test
+    builds its own config and nothing is shared.
+
+    The class exists to scope the autouse fixture below to this group.
+    """
+
+    # Every test here imports the generated modeling module; see the note on
+    # ``_HDFS_STDENV_DEPRECATION_FILTER`` for what that drags in and why it is
+    # filtered rather than left to accumulate in pytest's summary.
+    pytestmark = _HDFS_STDENV_DEPRECATION_FILTER
+
+    # The slots ``_indexer_loss_enabled`` reads, and the pre-state the fixture puts
+    # them in before every test: a configuration that is supported but off. Spelled
+    # out here rather than read back from the module, so a slot that is renamed or
+    # moved out of the generated module fails the fixture's setup assertion instead
+    # of quietly dropping out of the collected set.
+    _GATE_SLOT_PRE_STATE = {
+        "dsa_indexer_implementation": "eager",
+        "dsa_attention_implementation": "eager",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _restore_ops_config_slots(self):
+        """Bind the pre-state above before each test and restore every slot after it.
+
+        See ``_ops_config_slots_bound`` for why both directions are load-bearing. It
+        lives at module scope because the tests below this class bind slots too and
+        need exactly the same protection.
+        """
+        with _ops_config_slots_bound(self._GATE_SLOT_PRE_STATE):
+            yield
+
+    @pytest.mark.parametrize(
+        "mode, expected",
+        [
+            ("ulysses", r"requires ulysses_size=1, got ulysses_size=2"),
+            ("cp", r"requires cp_size=1, got cp_size=2"),
+        ],
+    )
+    def test_indexer_loss_refuses_every_sequence_parallel_mode(self, monkeypatch, mode, expected):
+        """Both modes shard something the teacher needs whole, and each is wrong in its
+        own way rather than merely unsupported -- which is why neither may warn.
+
+        Under Ulysses a rank holds a head shard, so the head sum inside the teacher
+        would cover only that shard: a *wrong* teacher, and one that still produces a
+        decreasing curve. Under context parallelism the sharding is of the sequence
+        and DeepSeek-V4's forward has no context-parallel path at all, so each rank
+        would treat its shard as a whole sequence and the teacher would be built from
+        the resulting attention.
+
+        The match pins each message's two actionable halves: the size observed, and
+        the one size that is supported.
+
+        The state is a real ``ParallelState`` rather than a namespace carrying the
+        attribute: a duck-typed stand-in keeps this test green through a rename of the
+        field, while the gate's own read would raise ``AttributeError`` in production.
+        Two accommodations are needed to build one in a single process, the first with
+        precedent in ``tests/parallel/context_parallel/test_dsv4_cp_gates.py`` --
+        ``ParallelState.world_size`` reads ``torch.distributed`` directly, and a
+        sequence-parallel state requires a non-``None`` device mesh that nothing here
+        touches.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+        from unittest.mock import MagicMock
+
+        from veomni.distributed.parallel_state import ParallelState
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        monkeypatch.setattr("veomni.distributed.parallel_state.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("veomni.distributed.parallel_state.dist.get_world_size", lambda: 2)
+        sizes = {"ulysses_size": 2} if mode == "ulysses" else {"cp_size": 2}
+        state = ParallelState(dp_size=1, device_type="cpu", device_mesh=MagicMock(), **sizes)
+
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        with mock.patch(
+            "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
+            return_value=state,
+        ):
+            with pytest.raises(ValueError, match=expected):
+                modeling._indexer_loss_enabled(_gate_module())
+
+    def test_indexer_loss_refuses_eager_indexer(self):
+        """The eager indexer discards its scores, so there would be no student to
+        train against and the KL would have nothing to say.
+
+        Attention is bound to the *supported* value so that deleting the indexer
+        refusal leaves nothing else to raise, and the match names
+        ``dsa_indexer_implementation``, which appears in no other refusal.
+        """
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        with pytest.raises(ValueError, match="dsa_indexer_implementation"):
+            modeling._indexer_loss_enabled(_gate_module())
+
+    def test_indexer_loss_refuses_eager_attention(self):
+        """The teacher is read off the TileLang attention LSE, which the eager
+        attention path never computes. Unlike the eager indexer, this one has a
+        student and no teacher, but the outcome is the same: a loss that cannot mean
+        what it appears to mean.
+
+        The indexer is bound to the supported value so the earlier refusal cannot
+        stand in for this one, and the match names ``dsa_attention_implementation``.
+        """
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+        with pytest.raises(ValueError, match="dsa_attention_implementation"):
+            modeling._indexer_loss_enabled(_gate_module())
+
+    def test_indexer_loss_off_by_default(self):
+        """With the flag off, none of the refusals above fire: eager everything is a
+        perfectly ordinary configuration until someone asks for the loss."""
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+        assert modeling._indexer_loss_enabled(_gate_module(enabled=False)) is False
+
+    def test_a_config_without_the_fields_reads_as_off(self):
+        """``MODELING_BACKEND=hf`` skips ``MODEL_CONFIG_REGISTRY``, so the patched
+        classes can be handed an upstream ``DeepseekV4Config``, which declares
+        neither field.
+
+        The gate reads both through ``getattr`` with a default for exactly that, and
+        off is the only safe reading: a config that cannot express the objective
+        cannot have asked for it. Written as plain attribute access instead, this
+        raises ``AttributeError`` from inside the first forward of a configuration
+        that has nothing to do with the objective.
+        """
+        from types import SimpleNamespace
+
+        from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        upstream = UpstreamConfig(num_hidden_layers=2, layer_types=["compressed_sparse_attention"] * 2)
+        assert not hasattr(upstream, "dsa_indexer_loss")
+        assert modeling._indexer_loss_enabled(SimpleNamespace(config=upstream)) is False
+
+    def test_undeclared_is_not_the_same_as_absent(self, tmp_path):
+        """The case above is a *missing key*, not merely an undeclaring class, and the
+        difference is the whole reason ``MODEL_CONFIG_REGISTRY`` and the subclass exist.
+
+        Three behaviours of ``from_pretrained``, pinned here because the design rests on
+        them and none is obvious: a key present in ``config.json`` is ``setattr``ed
+        whether or not the class declared it; a *kwarg* is applied only when the
+        attribute already exists, so it overrides a flag-on checkpoint but is dropped on
+        a config that has neither the declaration nor the key; and the subclass is what
+        turns that last drop into an override.
+
+        The dropped one is not a corner: it is the primary use case, switching the
+        objective on from YAML against a base checkpoint that never carried the field.
+        Without the declaration a user's ``dsa_indexer_loss: true`` would vanish between
+        the YAML and the model, and the run would train the language-model objective
+        alone while reporting nothing amiss.
+        """
+        from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
+
+        from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+        _config_asking_for_the_loss(coef=1.0).save_pretrained(tmp_path)
+
+        # On disk, so it arrives even in a class that never declared it.
+        assert UpstreamConfig.from_pretrained(tmp_path).dsa_indexer_loss is True
+        # ...and a kwarg overrides it, because by then the attribute exists.
+        assert UpstreamConfig.from_pretrained(tmp_path, dsa_indexer_loss=False).dsa_indexer_loss is False
+
+        _strip_indexer_loss_keys(tmp_path)
+
+        # Neither declared nor on disk: the kwarg is dropped without a word.
+        assert not hasattr(UpstreamConfig.from_pretrained(tmp_path, dsa_indexer_loss=True), "dsa_indexer_loss")
+        # Declared: the same kwarg lands. This one line is what the subclass is for.
+        assert DeepseekV4Config.from_pretrained(tmp_path, dsa_indexer_loss=True).dsa_indexer_loss is True
+
+    def test_indexer_loss_enabled_on_the_supported_configuration(self):
+        """The one configuration this whole flag exists for, and the only test that
+        reaches the gate's ``return True``.
+
+        The three refusals raise before that line and the flag-off test returns from
+        the early guard, so without this test ``return True`` could read ``return
+        False`` and nothing would notice — the indexer loss would silently never be
+        built on precisely the setup it was written for. That is the same "plausible
+        curve, nothing trained" failure the refusals were written to prevent, so the
+        success path is pinned as tightly as they are: ``is True`` rather than a
+        truthiness check, since a gate returning a truthy non-``bool`` is not the
+        contract the call sites read.
+
+        ``ulysses_size=1`` is the default of a real ``ParallelState``, and at that
+        size the state needs no mesh and no world of more than one rank, so nothing
+        has to be accommodated to build it.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from veomni.distributed.parallel_state import ParallelState
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        state = ParallelState(dp_size=1, ulysses_size=1, device_type="cpu")
+        assert state.ulysses_size == 1  # the premise of this test, not an assumption about the default
+        with mock.patch(
+            "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
+            return_value=state,
+        ):
+            assert modeling._indexer_loss_enabled(_gate_module()) is True
+
+    @pytest.mark.parametrize("coef", [0.0, -0.0, 0, -1.0])
+    def test_a_non_positive_coefficient_switches_the_objective_off(self, coef):
+        """``dsa_indexer_loss_coef <= 0`` is *off*, not "on and weighted by nothing".
+
+        A Python ``0.0`` multiplied into the fold-in still builds the graph, so the
+        backward propagates a zero tensor rather than none and every indexer
+        parameter ends the step with ``p.grad`` set. Muon skips only
+        ``p.grad is None`` (``muon.py:902``) and ``_apply_ortho`` then runs
+        ``p.mul_(1 - lr * weight_decay)`` unconditionally (``:1005-1006``), decaying
+        226M otherwise-frozen parameters -- while the run pays the teacher kernel's
+        full cost for a term that contributes nothing. The gate is what makes
+        ``arguments_types.py``'s "use 0.0 to switch the term off" true.
+
+        Checked on the predicate rather than on the fold-in because the fold-in is
+        one of four things the answer decides: the indexer's return arity, the
+        compressor's, the teacher recompute in the attention forward, and only then
+        the fold-in. Gating the fold-in alone would leave the teacher running.
+
+        The negative case cannot be reached through a launched run, whose model-build
+        gate refuses it before any weight is read, but a config carrying it is
+        constructible and a ``> 0`` gate should not read a sign flip as "on".
+        """
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        assert modeling._indexer_loss_enabled(_gate_module(coef=coef)) is False
+
+    def test_a_coefficient_of_zero_does_not_refuse_an_unsupported_configuration(self):
+        """Off is off, all the way: at ``coef=0`` the three refusals must not fire.
+
+        A user who switches the term off with the coefficient has not asked for a
+        TileLang indexer, and telling them to configure one is advice about a feature
+        they just disabled. This is also what makes the coefficient a usable escape
+        hatch on a run whose implementation flags are set for something else.
+        """
+        from types import SimpleNamespace
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
+        assert modeling._indexer_loss_enabled(_gate_module(coef=0.0)) is False
+
+    @pytest.mark.parametrize("coef", [1e-8, 0.5, 1.0])
+    def test_a_positive_coefficient_leaves_the_objective_on(self, coef):
+        """The other side of the gate above: ``> 0`` and not ``>= 0``, and not a gate
+        that reads any coefficient but 1.0 as off.
+
+        Without this leg the coefficient check could be inverted, or written as
+        ``!= 0``, and only the tests that already had to bind ``1.0`` would notice.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from veomni.distributed.parallel_state import ParallelState
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+        state = ParallelState(dp_size=1, ulysses_size=1, device_type="cpu")
+        with mock.patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=state):
+            assert modeling._indexer_loss_enabled(_gate_module(coef=coef)) is True
+
+
+_TOY_CONFIG_DIR = Path(__file__).resolve().parents[1] / "toy_config" / "deepseek_v4_toy"
+
+
+def _dsv4_indexer_test_config(indexer_loss=False, coef=1.0):
+    """The toy DeepSeek-V4 config, re-geometried to the 4-layer checkpoint's indexer.
+
+    ``index_n_heads=64`` / ``index_head_dim=128`` / ``index_topk=512`` over the CSA
+    compression rate of 4 are the values ``DeepSeek-V4-Flash-Base-4L/config.json``
+    ships, and the indexer forward's TileLang gate reads every one of them: the head
+    count and the head dim decide whether the kernel is eligible at all, and
+    ``index_topk`` against the compressed length decides how wide the score the loss
+    trains on is. The toy config's own ``index_n_heads=8`` would take the head count
+    off production's boundary of 64.
+
+    ``hidden_size`` (256) and ``q_lora_rank`` (64) stay at the toy config's values
+    rather than the checkpoint's 4096 / 1024: nothing under test reads them beyond the
+    widths of the indexer's two input projections.
+
+    Loaded through VeOmni's ``DeepseekV4Config`` rather than ``AutoConfig``, and the
+    two objective fields are passed as ``from_pretrained`` overrides rather than
+    ``setattr``ed afterwards. That is the path ``model.model_config`` takes, and it is
+    the path that silently drops a field the class does not declare -- so the modules
+    these tests drive are configured the way a run configures them, and a lost
+    declaration fails here instead of training nothing in production.
+    """
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    config = DeepseekV4Config.from_pretrained(
+        str(_TOY_CONFIG_DIR),
+        dsa_indexer_loss=indexer_loss,
+        dsa_indexer_loss_coef=coef,
+    )
+    config.index_n_heads = 64
+    config.index_head_dim = 128
+    config.index_topk = 512
+    assert config.dsa_indexer_loss is indexer_loss, (
+        "the objective override did not survive from_pretrained; the field is no longer declared "
+        "on VeOmni's DeepseekV4Config and every test below is now testing the flag-off path"
+    )
+    return config
+
+
+def _build_test_indexer(device=DEVICE, dtype=torch.bfloat16):
+    """A ``DeepseekV4Indexer`` on the geometry above, ready to call.
+
+    ``position_bias`` is a ``torch.empty`` parameter in the upstream constructor, so a
+    directly built indexer scores against uninitialised memory until it is zeroed.
+
+    Returns the config alongside the module because the caller needs both
+    ``hidden_size`` and ``q_lora_rank`` to build inputs, and they differ — the indexer
+    projects ``hidden_states`` for its keys, gates and per-head weights but
+    ``q_residual`` for its queries, so one ``randn_like`` cannot serve for both.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = _dsv4_indexer_test_config()
+    indexer = modeling.DeepseekV4Indexer(config).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        torch.nn.init.zeros_(indexer.position_bias)
+    return indexer, config
+
+
+def _build_test_csa_compressor(device=DEVICE, dtype=torch.bfloat16):
+    """A ``DeepseekV4CSACompressor`` around an indexer of the same geometry.
+
+    Both modules declare ``position_bias`` as ``torch.empty``, and the compressor's own
+    is the easy one to forget because it sits one level above the module under test.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = _dsv4_indexer_test_config()
+    compressor = modeling.DeepseekV4CSACompressor(config).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        torch.nn.init.zeros_(compressor.position_bias)
+        torch.nn.init.zeros_(compressor.indexer.position_bias)
+    return compressor, config
+
+
+def _run_indexer(indexer, hidden_states, q_residual, position_ids=None, **kwargs):
+    """Call the indexer exactly as ``DeepseekV4CSACompressor.forward`` calls it.
+
+    Positional, in the compressor's argument order, with the compressor's ``None``
+    cache and its layer index, so that a change to the real call site's shape breaks
+    these tests rather than leaving them agreeing with a signature nothing uses. The
+    compressor's own two call sites are exercised directly by
+    ``test_csa_compressor_carries_the_indexer_scores``.
+    """
+    if position_ids is None:
+        position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+    return indexer(hidden_states, q_residual, position_ids, None, 0, **kwargs)
+
+
+def _bind_indexer_implementations(*, indexer_implementation="tilelang"):
+    """Bind both implementation slots, defaulting to the one configuration the loss
+    supports.
+
+    Both, always: a test that left one unbound would read it from whatever ran before,
+    and a deleted guard would then fall into a neighbouring refusal instead of through
+    to the behaviour under test.
+
+    ``indexer_implementation`` is overridable for the two tests about the eager
+    scorer: requesting ``tilelang`` and missing its per-call gate is refused rather
+    than fallen back from, so ``eager`` is the only way to reach that scorer at all --
+    with the objective off to run it, and with the objective on to be refused for it.
+
+    The objective's own flag and weight are no longer here. They are fields of
+    ``DeepseekV4Config``, and the modules these tests drive receive the decision as
+    the ``build_indexer_loss`` argument their real caller passes them, so a test says
+    what it means at the call rather than by arranging module state first.
+    """
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation=indexer_implementation))
+    modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
+
+
+@contextlib.contextmanager
+def _single_rank_parallel_state():
+    """Pin the ambient parallel state to a real single-rank ``ParallelState``.
+
+    Both ``_indexer_loss_enabled`` and the indexer forward resolve
+    ``get_parallel_state()``, and an uninitialised process only returns a default
+    single-rank state *because* nothing has initialised one — which is a fact about the
+    session, not about the code under test. A real ``ParallelState`` rather than a
+    namespace, for the reason ``test_indexer_loss_refuses_ulysses`` gives: a duck-typed
+    stand-in survives a rename of a field the production path would raise on.
+    """
+    from unittest import mock
+
+    from veomni.distributed.parallel_state import ParallelState
+
+    state = ParallelState(dp_size=1, ulysses_size=1)
+    with mock.patch(f"{_PATCHED_MODULE}.get_parallel_state", return_value=state):
+        yield state
+
+
+@contextlib.contextmanager
+def _counting_tilelang_indexer():
+    """Count the calls that reach the TileLang Lightning Indexer kernel.
+
+    Without this, a test that means to exercise the kernel branch would still pass if
+    the forward quietly took the eager fallback — which returns a bare index tensor
+    too, so the arity assertions below would be satisfied by the path they are not
+    about.
+    """
+    from unittest import mock
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    calls = []
+    real_kernel = modeling.v4_lighting_indexer
+
+    def _counting(*args, **kwargs):
+        calls.append(None)
+        return real_kernel(*args, **kwargs)
+
+    with mock.patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _counting):
+        yield calls
+
+
+class TestIndexerScoresAndDecoupling:
+    """The indexer returning its scores, and detaching its own inputs to pay for it.
+
+    Returning ``index_score`` is what gives the KL a student to train; the detach is
+    what stops that KL from reaching the language-modelling objective. They belong in
+    one group because they are one change: before it, the indexer's forward returned
+    integer indices and the graph was severed by accident.
+
+    Every test here binds both implementation slots through
+    ``_bind_indexer_implementations`` and pins the parallel state, and the
+    class-scoped fixture restores every slot afterwards, so nothing leaks into the
+    rest of the session. Whether the objective is on is passed at the call as
+    ``build_indexer_loss``, which is how the real caller passes it: the compressor and
+    the indexer keep only scalars off the config they were constructed with, so
+    ``DeepseekV4Attention.forward`` evaluates the predicate once for the layer and
+    hands the answer down.
+    """
+
+    # Every test here imports the generated modeling module; see the note on
+    # ``_HDFS_STDENV_DEPRECATION_FILTER`` for what that drags in.
+    pytestmark = _HDFS_STDENV_DEPRECATION_FILTER
+
+    # Supported but off, matching ``TestIndexerLossGate``: a test that failed to bind a
+    # slot reads it from here rather than from whatever the session left behind.
+    _SLOT_PRE_STATE = {
+        "dsa_indexer_implementation": "eager",
+        "dsa_attention_implementation": "eager",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _restore_ops_config_slots(self):
+        with _ops_config_slots_bound(self._SLOT_PRE_STATE):
+            yield
+
+    def test_indexer_detaches_its_input(self):
+        """The indexer must not backpropagate into the main model.
+
+        DeepSeek-V3.2 §2.1: "we detach the indexer input from the computational graph
+        for separate optimization." Until this change the graph was severed only by
+        accident, because the forward returned integer indices, which carry no
+        gradient. Returning ``index_score`` ends that accident: without an explicit
+        detach the KL would flow back through the indexer's projections into
+        ``hidden_states`` and perturb the LM objective.
+
+        The parameter half of the assertions is not a formality either. A detach
+        placed one line too late — after the projections rather than before them —
+        would still leave ``hidden_states.grad`` unset while cutting the indexer off
+        from its own gradient, so the loss would train nothing. All three of
+        ``q_b_proj`` / ``kv_proj`` / ``weights_proj`` are checked because they are
+        exactly the three tensors ``v4_lighting_indexer`` differentiates: the query,
+        the compressed key and the per-head weight. ``grad.abs().sum() > 0`` rather
+        than a ``grad_fn`` check, because a graph that exists and carries zeros trains
+        nothing.
+        """
+        _require_tilelang_cuda()
+        _bind_indexer_implementations()
+
+        seq_len = 2048
+        indexer, config = _build_test_indexer(device=DEVICE)
+        hidden = torch.randn(1, seq_len, config.hidden_size, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        q_residual = torch.randn(
+            1, seq_len, config.q_lora_rank, device=DEVICE, dtype=torch.bfloat16, requires_grad=True
+        )
+
+        with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
+            top_k_indices, index_score = _run_indexer(indexer, hidden, q_residual, build_indexer_loss=True)
+        assert len(kernel_calls) == 1, "the TileLang scorer is the only path that has scores to return"
+
+        # The contract Task 5 reads: one score per selected slot, in fp32.
+        assert index_score.shape == top_k_indices.shape
+        assert index_score.dtype == torch.float32
+        # ``-inf`` marks the invalid slots and ``nan_to_num``'s own backward zeroes the
+        # gradient there, so this reduction stays finite and touches only real slots.
+        index_score.float().nan_to_num(neginf=0.0).sum().backward()
+
+        assert hidden.grad is None, "indexer input must be detached"
+        assert q_residual.grad is None, "indexer q_residual must be detached"
+        for name in ("q_b_proj", "kv_proj", "weights_proj"):
+            grad = getattr(indexer, name).weight.grad
+            assert grad is not None, f"{name} received no gradient from the indexer score"
+            assert grad.abs().sum() > 0, f"{name} received an all-zero gradient"
+
+    def test_indexer_returns_indices_only_with_the_loss_off(self):
+        """Default off means the return *arity* is what it was, not just the values.
+
+        This is the only test that pins the off side of that branch. Invert it and the
+        two-tuple leaks into every flag-off forward: ``DeepseekV4CSACompressor`` would
+        keep working, because it unpacks by the same argument, so the break would
+        surface wherever something calls the indexer without passing through it.
+
+        The argument is left at its default rather than passed as ``False``, because
+        the default is what every pre-existing caller relies on and is the thing worth
+        pinning.
+        """
+        _require_tilelang_cuda()
+        _bind_indexer_implementations()
+
+        seq_len = 2048
+        indexer, config = _build_test_indexer(device=DEVICE)
+        hidden = torch.randn(1, seq_len, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+        q_residual = torch.randn(1, seq_len, config.q_lora_rank, device=DEVICE, dtype=torch.bfloat16)
+
+        with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
+            result = _run_indexer(indexer, hidden, q_residual)
+
+        assert len(kernel_calls) == 1, "the eager fallback returns a bare tensor too, so it pins nothing here"
+        assert isinstance(result, torch.Tensor), f"expected a bare index tensor, got {type(result).__name__}"
+        assert result.dtype == torch.long
+        assert result.shape == (1, seq_len, min(config.index_topk, seq_len // indexer.compress_rate))
+
+    def test_the_loss_never_reaches_the_eager_scorer(self):
+        """The eager scorer discards the scores the KL trains against, so reaching it
+        with the objective on is the worst outcome available: the loss would train on
+        nothing at all while its curve looked entirely reasonable.
+
+        The indexer carries no refusal of its own for that, and what makes the absence
+        safe is that both routes to it are closed elsewhere.
+
+        This test closes the one that is the indexer's own: a configuration that passes
+        every construction-time check and then misses the kernel at runtime. TileLang
+        having been asked for, a per-call gate that declines is refused outright rather
+        than demoted to the eager scorer. The miss staged here is the device -- CPU
+        tensors -- but an fp32 activation dtype or a head count outside the kernel's
+        range lands at the same line. Narrowing this to a warning or a fallback would
+        leave the objective silently untrained.
+
+        The other route -- asking for the eager scorer outright while the objective is
+        on -- is refused a frame up, by the predicate in ``DeepseekV4Attention.forward``
+        that produces ``build_indexer_loss`` in the first place
+        (``TestIndexerLossGate.test_indexer_loss_refuses_eager_indexer``), and again at
+        model build before any weight is read. Neither is reachable from here: this
+        module is handed the answer and does not derive it, so an eager scorer under
+        the objective cannot be staged by calling the indexer.
+
+        The message is matched on its per-call half rather than on ``tilelang`` alone,
+        which appears in the refusals a frame up as well.
+        """
+        _bind_indexer_implementations()
+
+        indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
+        hidden = torch.randn(1, 32, config.hidden_size)
+        q_residual = torch.randn(1, 32, config.q_lora_rank)
+
+        with _single_rank_parallel_state():
+            with pytest.raises(ValueError, match="TileLang indexer does not support this call"):
+                _run_indexer(indexer, hidden, q_residual, build_indexer_loss=True)
+
+    def test_the_refusal_names_the_objective_when_the_objective_is_what_chose_tilelang(self):
+        """A user who enabled the objective never wrote ``dsa_indexer_implementation``
+        themselves -- the objective requires it -- so a refusal that named only the
+        implementation would be an error about a flag they did not set.
+
+        The same per-call miss without the objective must *not* claim that, or the
+        message would misattribute an ordinary TileLang request. Both halves are here
+        because the attribution is a conditional and either branch alone would pass a
+        test of the other.
+        """
+        _bind_indexer_implementations()
+
+        indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
+        hidden = torch.randn(1, 32, config.hidden_size)
+        q_residual = torch.randn(1, 32, config.q_lora_rank)
+
+        with _single_rank_parallel_state():
+            with pytest.raises(ValueError, match=r"required by dsa_indexer_loss"):
+                _run_indexer(indexer, hidden, q_residual, build_indexer_loss=True)
+
+            with pytest.raises(ValueError) as without_objective:
+                _run_indexer(indexer, hidden, q_residual)
+        assert "required by dsa_indexer_loss" not in str(without_objective.value)
+
+    def test_the_eager_scorer_still_runs_when_it_is_the_one_asked_for(self):
+        """The refusals above are about running the eager scorer *under the objective*,
+        and this is the only test that says the scorer itself still works.
+
+        It is the production path for cache/decode and for anyone who asks for it, so
+        an indexer-loss change that broke it would break inference for every
+        DeepSeek-V4 model in the tree -- while the suite stayed green on the enabled
+        path, because that path never reaches the eager scorer.
+
+        Called with the objective off, which is the only way to reach this scorer: with
+        it on, an eager indexer is refused a frame up rather than silently demoted.
+        """
+        _bind_indexer_implementations(indexer_implementation="eager")
+
+        indexer, config = _build_test_indexer(device="cpu", dtype=torch.float32)
+        hidden = torch.randn(1, 32, config.hidden_size)
+        q_residual = torch.randn(1, 32, config.q_lora_rank)
+
+        with _single_rank_parallel_state(), _counting_tilelang_indexer() as kernel_calls:
+            result = _run_indexer(indexer, hidden, q_residual)
+
+        assert not kernel_calls, "the eager scorer is what this test is about, and the kernel ran instead"
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (1, 32, 32 // indexer.compress_rate)
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_csa_compressor_carries_the_indexer_scores(self, packed):
+        """``CompressedCandidates.indexer_scores`` is how the scores reach the loss.
+
+        Both of ``DeepseekV4CSACompressor.forward``'s indexer call sites are exercised
+        — the packed one and the contiguous one — because each builds its own
+        ``CompressedCandidates`` and a dropped field at one is invisible from the
+        other.
+
+        The flag-off half is not a bonus. It pins that the compressor unpacks by the
+        same argument it passed the indexer, and the index comparison pins that
+        turning the loss on leaves the selection the model attends over untouched: a
+        detach cannot change a forward value, so exact equality is the right bar and
+        any tolerance would hide a real perturbation of the LM path.
+        """
+        _require_tilelang_cuda()
+        _bind_indexer_implementations()
+
+        seq_len = 2048
+        compressor, config = _build_test_csa_compressor(device=DEVICE)
+        hidden = torch.randn(1, seq_len, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+        q_residual = torch.randn(1, seq_len, config.q_lora_rank, device=DEVICE, dtype=torch.bfloat16)
+        if packed:
+            from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+
+            sequence_slices = ((0, 1024), (1024, seq_len))
+            position_ids = torch.cat(
+                [torch.arange(end - start, device=DEVICE) for start, end in sequence_slices]
+            ).unsqueeze(0)
+            packed_kwargs = {
+                "packed_sequence_slices": sequence_slices,
+                "packed_compression_metadata": build_packed_compression_metadata(
+                    hidden, position_ids, sequence_slices, (compressor.compress_rate,)
+                ),
+            }
+        else:
+            position_ids = torch.arange(seq_len, device=DEVICE).unsqueeze(0)
+            packed_kwargs = {}
+
+        def _candidates(**loss_kwargs):
+            with _single_rank_parallel_state():
+                _, _, candidates = compressor(
+                    hidden,
+                    q_residual,
+                    position_ids,
+                    None,
+                    0,
+                    return_topk_indices=True,
+                    **loss_kwargs,
+                    **packed_kwargs,
+                )
+            return candidates
+
+        without_loss = _candidates()
+        assert without_loss.indexer_scores is None, "the scores must not appear with the loss off"
+
+        with_loss = _candidates(build_indexer_loss=True)
+        scores = with_loss.indexer_scores
+        assert scores is not None, "the compressor dropped the indexer scores on the floor"
+        assert scores.shape == with_loss.topk_indices.shape
+        assert scores.dtype == torch.float32
+        # The kernel marks a miss with ``-1`` and scores it ``-inf``. The loss reads the
+        # two together, so anything but an exact correspondence means they are
+        # describing different slots.
+        assert (with_loss.topk_indices < 0).any(), "no invalid slot here, so the -inf correspondence is untested"
+        assert torch.equal(torch.isneginf(scores), with_loss.topk_indices < 0)
+        assert torch.equal(with_loss.topk_indices, without_loss.topk_indices)
+
+
+def _build_test_attention(
+    device=DEVICE,
+    seq_len=4096,
+    layer_type="compressed_sparse_attention",
+    seed=0,
+    indexer_loss=True,
+    coef=1.0,
+):
+    """One ``DeepseekV4Attention`` of the requested layer type, plus the kwargs its
+    real call site hands it.
+
+    ``indexer_loss`` / ``coef`` go onto the layer's own config, which is where the
+    objective is configured and where ``_indexer_loss_enabled`` reads it. Per-layer
+    rather than per-process, so a test needs no teardown for them and two layers in
+    one test can differ.
+
+    The kwargs mirror ``DeepseekV4Model.forward``'s call into the decoder layer,
+    which forwards them verbatim to ``self_attn``: the ``position_embeddings`` dict
+    keyed by rope layer type, global ``position_ids``, ``attention_mask`` and
+    ``past_key_values``. Mirrored rather than invented so that a change to the real
+    call site's shape breaks these tests instead of leaving them agreeing with a
+    signature nothing uses.
+
+    ``attention_mask=None`` is the mask-free sparse path, which is the one bf16
+    TileLang training takes -- ``DeepseekV4Model.forward`` withholds the dense mask
+    exactly when the sparse index builder can validate candidates on its own. It also
+    keeps a ``[1, 1, 4096, 5120]`` mask off a device this test shares.
+
+    ``sinks`` and both ``position_bias`` parameters are ``torch.empty`` in the
+    upstream constructors, so a directly built layer attends against uninitialised
+    memory until they are written. The sinks are drawn per-head rather than set to a
+    constant so that they cannot all cancel out of the teacher's denominators; note
+    though that they are *not* what separates the paper's teacher from a
+    compressed-only one. Measured on this configuration, forcing every sink to the
+    same value moves that separation from 1.9633 to 1.9620 — it is the per-head query
+    content that makes the summed compressed mass differ across heads, and
+    ``test_kl_uses_the_paper_correct_teacher`` asserts the separation itself rather
+    than trusting either.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = _dsv4_indexer_test_config(indexer_loss=indexer_loss, coef=coef)
+    if layer_type not in config.layer_types:
+        # The 4-layer checkpoint this config mirrors has no sliding layer, and the
+        # gate has to keep one on its two-value return just as it does an HCA layer.
+        config.layer_types = [*config.layer_types[:-1], layer_type]
+    layer_idx = config.layer_types.index(layer_type)
+    torch.manual_seed(seed)
+    attn = modeling.DeepseekV4Attention(config, layer_idx=layer_idx).to(device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        attn.sinks.normal_(0.0, 1.0)
+        for name, param in attn.named_parameters():
+            if name.endswith("position_bias"):
+                param.zero_()
+
+    hidden = torch.randn(1, seq_len, config.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True)
+    position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+    rotary = modeling.DeepseekV4RotaryEmbedding(config).to(device=device)
+    inputs = {
+        "hidden_states": hidden,
+        "position_embeddings": {
+            rope_type: rotary(hidden, position_ids=position_ids, layer_type=rope_type)
+            for rope_type in ("main", "compress")
+        },
+        "position_ids": position_ids,
+        "attention_mask": None,
+        "past_key_values": None,
+    }
+    return attn, inputs
+
+
+class _DsaKernelProbe:
+    """What the TileLang attention, indexer-teacher and Lightning Indexer kernels were
+    handed, and what they returned.
+
+    Reading the tensors at the kernel boundary is deliberate. Rebuilding ``q`` and
+    ``kv`` inside the test would mean copying the attention forward's projection,
+    per-head normalisation, RoPE and compressor concatenation out of the module under
+    test, and a copy like that agrees with the implementation by construction. What
+    the reference has to supply independently is the *teacher* -- one softmax over
+    ``[selected slots ‖ sink]`` -- and ``reference_compressed_target`` does.
+
+    ``index_score`` is captured from the indexer kernel rather than from the attention
+    forward's own use of it, so a forward that handed the KL a permuted or otherwise
+    mismatched student is compared against the selection the indexer really made.
+    """
+
+    def __init__(self):
+        self.attention = []
+        self.target = []
+        self.indexer = []
+
+    def one(self, name):
+        calls = getattr(self, name)
+        assert len(calls) == 1, f"expected exactly one {name} kernel call, got {len(calls)}"
+        return calls[0]
+
+
+@contextlib.contextmanager
+def _probe_dsa_kernels():
+    """Record every DSA kernel call the generated module makes, without changing one.
+
+    The wrappers bind their arguments by name, so a call site that renames or
+    reorders one fails here rather than being recorded under the wrong key.
+    """
+    from unittest import mock
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    probe = _DsaKernelProbe()
+    real_attention = modeling.sparse_attn_tilelang
+    real_target = modeling.sparse_mqa_target_fwd
+    real_indexer = modeling.v4_lighting_indexer
+
+    def _attention(q, kv, attn_sink, topk_idxs, sm_scale=None, return_lse=False):
+        result = real_attention(q, kv, attn_sink, topk_idxs, sm_scale, return_lse)
+        lse = result[1] if return_lse else None
+        probe.attention.append(
+            {"q": q, "kv": kv, "sink": attn_sink, "topk": topk_idxs, "sm_scale": sm_scale, "lse": lse}
+        )
+        return result
+
+    def _target(q, kv, topk_idxs, lse, sm_scale=None):
+        probe.target.append({"q": q, "kv": kv, "topk": topk_idxs, "lse": lse, "sm_scale": sm_scale})
+        return real_target(q, kv, topk_idxs, lse, sm_scale)
+
+    def _indexer(*args, **kwargs):
+        index_score, topk_indices = real_indexer(*args, **kwargs)
+        probe.indexer.append({"index_score": index_score, "topk_indices": topk_indices})
+        return index_score, topk_indices
+
+    with (
+        mock.patch(f"{_PATCHED_MODULE}.sparse_attn_tilelang", _attention),
+        mock.patch(f"{_PATCHED_MODULE}.sparse_mqa_target_fwd", _target),
+        mock.patch(f"{_PATCHED_MODULE}.v4_lighting_indexer", _indexer),
+    ):
+        yield probe
+
+
+def _reference_compressed_only_target(q, kv, topk_idxs, compressed_start, sm_scale):
+    """The teacher this loss must **not** build: Megatron's compressed-only variant.
+
+    One softmax per head over the compressed slice alone, so the sliding window and
+    the attention sink are absent from the denominator (NVIDIA/Megatron-LM#5776).
+    Written here so that ``test_kl_uses_the_paper_correct_teacher`` can assert its own
+    premise -- that the two teachers are far enough apart for its tolerance to tell
+    them apart -- instead of taking that on trust.
+
+    All-miss compressed rows are neutralised on the way in, as
+    ``indexer_kl_terms`` does: without the sink in the denominator such a row is an
+    all-``-inf`` softmax, i.e. NaN, and a NaN teacher would make the separation below
+    unreadable rather than small.
+
+    Args / returns as ``reference_compressed_target``, minus the sink.
+    """
+    idx = topk_idxs[..., compressed_start:]
+    b = q.shape[0]
+    valid = idx >= 0
+    batch_index = torch.arange(b, device=kv.device).view(b, 1, 1)
+    gathered = kv[batch_index, idx.clamp_min(0).long()]
+    logits = torch.einsum("bshd,bskd->bshk", q.float(), gathered.float()) * sm_scale
+    logits = logits.masked_fill(~valid.unsqueeze(2), float("-inf"))
+    all_missing = ~torch.isfinite(logits).any(-1, keepdim=True)
+    probs = torch.softmax(torch.where(all_missing, torch.zeros_like(logits), logits), dim=-1)
+    compressed = torch.where(all_missing, torch.zeros_like(probs), probs).sum(dim=2)  # head sum -> [B, S, C]
+    return compressed / compressed.sum(-1, keepdim=True).clamp_min(1e-20)
+
+
+def _reference_compressed_only_target_by_query_chunk(q, kv, topk_idxs, compressed_start, sm_scale, chunk=512):
+    """``_reference_compressed_only_target`` over query chunks, for the reason
+    ``_reference_target_by_query_chunk`` gives."""
+    return torch.cat(
+        [
+            _reference_compressed_only_target(
+                q[:, start : start + chunk],
+                kv,
+                topk_idxs[:, start : start + chunk],
+                compressed_start,
+                sm_scale,
+            )
+            for start in range(0, q.shape[1], chunk)
+        ],
+        dim=1,
+    )
+
+
+def _reference_target_by_query_chunk(q, kv, sink, topk_idxs, compressed_start, sm_scale, chunk=512):
+    """``reference_compressed_target`` over query chunks, concatenated.
+
+    The reference gathers ``[B, S, W + C, D]`` in one allocation, which at S=4096,
+    W + C = 544 and D = 64 is 285 MB in bf16 and another 570 MB once it upcasts --
+    on a device shared with whatever else is running. Query rows are independent, so
+    chunking moves the peak and nothing else.
+    """
+    return torch.cat(
+        [
+            reference_compressed_target(
+                q[:, start : start + chunk],
+                kv,
+                sink,
+                topk_idxs[:, start : start + chunk],
+                compressed_start,
+                sm_scale,
+            )
+            for start in range(0, q.shape[1], chunk)
+        ],
+        dim=1,
+    )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_indexer_kl_terms_matches_hand_computation():
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    target = torch.tensor([[[0.5, 0.5, 0.0]]])
+    index_score = torch.tensor([[[0.0, 0.0, float("-inf")]]])
+    # softmax over the two finite slots is [0.5, 0.5]; KL(t || q) == 0.
+    kl, _ = modeling.indexer_kl_terms(index_score, target)
+    assert torch.allclose(kl, torch.zeros(1, 1), atol=1e-6)
+
+    index_score = torch.tensor([[[1.0, 0.0, float("-inf")]]])
+    q0 = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)
+    expected = 0.5 * (torch.log(torch.tensor(0.5)) - torch.log(q0[0])) + 0.5 * (
+        torch.log(torch.tensor(0.5)) - torch.log(q0[1])
+    )
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
+    assert torch.allclose(kl, expected.view(1, 1), atol=1e-6)
+    # The masked branches use scalar zeros rather than materialising a 50 MB
+    # ``zeros_like``; a Python float is a weak scalar under type promotion, so the
+    # accumulation stays fp32 rather than following the scalar to fp64.
+    assert kl.dtype is torch.float32 and uniform.dtype is torch.float32
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_indexer_kl_terms_gradient_is_finite_when_a_query_sees_no_compressed_slot():
+    """A query row whose *every* compressed slot is a miss must not poison the
+    gradient, and the forward value cannot be trusted to reveal it.
+
+    Such rows are not a corner case: the first ``compress_rate - 1`` positions of
+    every packed sample have no complete compression window behind them, so the
+    indexer's causal range is empty, its top-k comes back all ``-1``, and its score
+    row is entirely ``-inf``. ``log_softmax`` of that row is NaN, and the NaN is
+    invisible in the forward — ``torch.where`` selects the zero branch, so the KL
+    for the row is exactly 0, which is the right answer. The backward is where it
+    bites: ``log_softmax``'s own backward computes ``g - softmax * g.sum(-1)`` with
+    ``softmax = exp(NaN)``, so a zero incoming gradient still comes out NaN. That
+    NaN survives the indexer's backward too, because its kernel forms
+    ``grad * relu(logits)`` and ``NaN * 0`` is NaN, so ``weights_proj`` ends up with
+    a NaN gradient while the loss curve stays finite.
+
+    Row 1 is here to keep the fix honest: the row-wise neutralisation must be
+    confined to the all-miss rows, so row 1's gradient has to match what it gets
+    when it is the only row present.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    neg_inf = float("-inf")
+    index_score = torch.tensor([[[neg_inf, neg_inf], [0.0, 1.0]]], requires_grad=True)
+    target = torch.tensor([[[0.0, 0.0], [0.4, 0.6]]])
+
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
+    assert torch.allclose(kl[0, 0], torch.zeros(())), "an all-miss row has no teacher mass and no KL"
+    assert torch.isfinite(uniform).all(), f"non-finite reference: {uniform}"
+    kl.sum().backward()
+
+    assert torch.isfinite(index_score.grad).all(), f"non-finite gradient: {index_score.grad}"
+    assert (index_score.grad[0, 0] == 0).all(), "an all-miss row must not push the indexer anywhere"
+
+    alone = index_score.detach()[:, 1:].clone().requires_grad_(True)
+    modeling.indexer_kl_terms(alone, target[:, 1:])[0].sum().backward()
+    torch.testing.assert_close(index_score.grad[:, 1:], alone.grad)
+    assert alone.grad.abs().sum() > 0, "row 1 carries no gradient, so it pins nothing here"
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_indexer_kl_terms_ignores_zero_target_slots():
+    """A -inf score paired with zero target mass must contribute 0, not NaN."""
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    target = torch.tensor([[[1.0, 0.0]]])
+    index_score = torch.tensor([[[0.0, float("-inf")]]])
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
+    assert torch.isfinite(kl).all()
+    assert torch.allclose(kl, torch.zeros(1, 1), atol=1e-6)
+    assert torch.isfinite(uniform).all()
+    assert torch.allclose(uniform, torch.zeros(1, 1), atol=1e-6), (
+        "one scoreable slot carrying all the mass is a row where nothing can be learned"
+    )
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_a_row_the_teacher_gave_no_mass_is_excluded_from_both_terms():
+    """A row can be scoreable and still have nothing to teach, and it has to leave
+    *both* returned terms rather than only the KL.
+
+    The attention forward emits an exactly-zero teacher row when the compressed
+    slots carried no mass -- every selected logit far enough below the LSE that
+    ``exp`` underflowed, i.e. attention put essentially everything on the sliding
+    window and the sink. The KL of such a row is 0 whatever the student did, so
+    leaving its ``log(n_candidates)`` in the reference would credit the objective
+    with capturing everything on exactly the rows where it did no work: the
+    published fraction moves and neither term looks wrong.
+
+    Distinct from ``test_indexer_kl_terms_gradient_is_finite_...``, whose rows are
+    unscoreable; here the student has two live candidates and the teacher has
+    nothing to say about them.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    index_score = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]], requires_grad=True)
+    target = torch.tensor([[[0.0, 0.0], [0.4, 0.6]]])
+
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
+    assert torch.allclose(kl[0, 0], torch.zeros(())), "no teacher mass, so no KL"
+    assert torch.allclose(uniform[0, 0], torch.zeros(())), (
+        "a row with nothing to capture must not enlarge the reference the captured fraction divides by"
+    )
+    assert uniform[0, 1] > 0, "the row that does carry mass still has a reference, or this pins nothing"
+
+    kl.sum().backward()
+    assert torch.isfinite(index_score.grad).all()
+    assert (index_score.grad[0, 0] == 0).all(), "an empty teacher must not push the indexer anywhere"
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_uniform_reference_is_what_a_zero_information_student_pays():
+    """``log(n_candidates) - H(target)`` is a definition, so it is pinned against the
+    thing it is defined to be: the KL of a student that scores every candidate alike.
+
+    That equality is the whole content of the metric. ``indexer_kl_captured`` reads
+    1 - kl/reference, so a reference computed over a different support than the KL --
+    counting the zero-target slots the KL skips, say, or every slot rather than the
+    scoreable ones -- would still produce a plausible fraction in [0, 1] with no
+    number anywhere to contradict it.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    neg_inf = float("-inf")
+    # Row 0: three candidates, skewed teacher. Row 1: two candidates, one of the
+    # three slots unscoreable -- so a reference over `C` rather than over the
+    # scoreable count is a different number here.
+    target = torch.tensor([[[0.7, 0.2, 0.1], [0.25, 0.75, 0.0]]])
+    flat = torch.tensor([[[0.0, 0.0, 0.0], [0.0, 0.0, neg_inf]]])
+
+    kl_of_a_flat_student, uniform = modeling.indexer_kl_terms(flat, target)
+    torch.testing.assert_close(uniform, kl_of_a_flat_student, atol=1e-6, rtol=1e-6)
+
+    entropy = -(target * torch.log(target.clamp_min(torch.finfo(torch.float32).tiny))).sum(-1)
+    expected = torch.log(torch.tensor([[3.0, 2.0]])) - entropy
+    torch.testing.assert_close(uniform, expected, atol=1e-6, rtol=1e-6)
+
+    # And the fraction such a student captures is 0, which is the calibration the
+    # reported number is read against at the other end.
+    captured = 1.0 - kl_of_a_flat_student / uniform
+    torch.testing.assert_close(captured, torch.zeros_like(captured), atol=1e-6, rtol=0)
+
+
+@_HDFS_STDENV_DEPRECATION_FILTER
+def test_the_uniform_reference_carries_no_gradient_into_the_objective():
+    """The reference is a metric. It must not move a single weight.
+
+    Both halves are asserted, because either alone is weak: that the returned tensor
+    has no graph is a structural claim a future differentiable teacher could quietly
+    break, and that the KL's gradient is unchanged by the reference's presence is the
+    behavioural one. The second is exact -- same forward, same tensor -- so it is a
+    bitwise comparison rather than a tolerance, and it is checked against a
+    closed-form gradient that owes nothing to the implementation.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    target = torch.tensor([[[0.7, 0.2, 0.1]]])
+    index_score = torch.tensor([[[0.3, -0.4, 1.2]]], requires_grad=True)
+
+    kl, uniform = modeling.indexer_kl_terms(index_score, target)
+    assert uniform.grad_fn is None and not uniform.requires_grad, (
+        "the zero-information reference carries a graph, so a backward through the reported metric "
+        "would reach the indexer"
+    )
+
+    (kl.sum() + uniform.sum()).backward()
+    with_reference = index_score.grad.clone()
+
+    # d/ds KL(t || softmax(s)) = softmax(s) - t, independent of this file.
+    expected = torch.softmax(index_score.detach(), dim=-1) - target
+    torch.testing.assert_close(with_reference, expected, atol=1e-6, rtol=1e-6)
+
+    index_score.grad = None
+    modeling.indexer_kl_terms(index_score, target)[0].sum().backward()
+    assert torch.equal(with_reference, index_score.grad), (
+        "backward through KL + reference and backward through the KL alone gave different gradients"
+    )
+
+
+class TestAttentionForwardIndexerKL:
+    """The attention forward assembling the KL: the teacher it builds, the slice it
+    takes, the student it pairs with, and the arity it returns.
+
+    Every test binds both implementation slots through ``_bind_indexer_implementations``
+    and pins the parallel state, and the fixture restores every slot afterwards. The
+    objective itself is set on the layer's config by ``_build_test_attention``, which
+    defaults it on -- this class is about the enabled path.
+    """
+
+    # Every test here imports the generated modeling module; see the note on
+    # ``_HDFS_STDENV_DEPRECATION_FILTER`` for what that drags in.
+    pytestmark = _HDFS_STDENV_DEPRECATION_FILTER
+
+    # Supported but off, matching the two classes above.
+    _SLOT_PRE_STATE = {
+        "dsa_indexer_implementation": "eager",
+        "dsa_attention_implementation": "eager",
+    }
+
+    # 4096 tokens at the CSA compression rate of 4 give 1024 compressed slots while
+    # the indexer selects ``index_topk = 512``, so the top-k genuinely ranks. At the
+    # 2048 the other tests in this file use, the two are equal and every causally
+    # visible slot is selected -- a teacher that never exercises selection, against
+    # which a student misaligned with its own selection would still look right.
+    _RANKING_SEQ_LEN = 4096
+    # Where ranking is beside the point, 2048 is used instead: it is half the work and
+    # it keeps ``sliding_window + top_k`` at 544, so it reuses the same compiled
+    # TileLang kernels rather than paying for a second set.
+    _CHEAP_SEQ_LEN = 2048
+
+    @pytest.fixture(autouse=True)
+    def _restore_ops_config_slots(self):
+        with _ops_config_slots_bound(self._SLOT_PRE_STATE):
+            yield
+
+    def test_kl_uses_the_paper_correct_teacher(self):
+        """The KL the forward returns must match one built from the independent
+        reference teacher -- a single softmax over ``[selected slots ‖ sink]``, which
+        carries the sliding window and the attention sink in its denominator.
+
+        This is the assertion that separates the paper's teacher from Megatron's
+        (NVIDIA/Megatron-LM#5776): a compressed-only denominator is a plausible,
+        decreasing loss that trains the indexer toward the wrong distribution. The
+        reference is deliberately LSE-free, so it cannot reproduce that mistake by
+        sharing it.
+        """
+        _require_tilelang_cuda()
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        _bind_indexer_implementations()
+        seq_len = self._RANKING_SEQ_LEN
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            _, _, kl_sum, _ = attn(**inputs)
+
+        assert kl_sum.shape == (), f"the KL must be a scalar, got {tuple(kl_sum.shape)}"
+        assert kl_sum.dtype == torch.float32
+
+        attention, target, indexer = probe.one("attention"), probe.one("target"), probe.one("indexer")
+        # The premise of the sequence length: the selection is a strict subset of what
+        # is causally visible for a large share of the query rows, so the KL is being
+        # asked about a ranking rather than about "everything visible".
+        visible = (inputs["position_ids"] + 1) // attn.compressor.compress_rate
+        selected = (indexer["topk_indices"] >= 0).sum(-1)
+        ranked_rows = int((visible > selected).sum())
+        assert ranked_rows > seq_len // 4, (
+            f"only {ranked_rows} of {seq_len} query rows had more visible compressed slots than the "
+            "indexer selected, so this test barely exercises the top-k"
+        )
+
+        compressed_start = attention["topk"].shape[-1] - target["topk"].shape[-1]
+        expected_target = _reference_target_by_query_chunk(
+            attention["q"],
+            attention["kv"],
+            attention["sink"],
+            attention["topk"],
+            compressed_start,
+            attn.scaling,
+        )
+        expected = modeling.indexer_kl_terms(indexer["index_score"], expected_target)[0].sum()
+
+        # Measured on GB200: the kernel teacher and this reference put the summed KL
+        # 6.1e-5 apart on a KL of 413.35, i.e. 1.5e-7 relative, both consuming the
+        # same bf16 inputs and accumulating in fp32. ``assert_close`` admits
+        # ``atol + rtol * |expected|``, so these bounds accept 5.1e-2 -- ~840x the
+        # observed gap, which is headroom for a different summation order.
+        atol, rtol = 1e-2, 1e-4
+        admitted = atol + rtol * expected.abs()
+
+        # The other half of that arithmetic, and the premise this whole test rests on:
+        # the wrong teacher has to sit *outside* what the bound accepts, or the
+        # comparison above would pass against the mistake it exists to catch. The
+        # separation is not free -- for a single head the LSE cancels under the L1
+        # renormalisation at the end of the forward, and the two teachers coincide
+        # exactly -- so it is asserted rather than assumed, the way the ranking premise
+        # above is. Measured here: 1.96, i.e. 38x the bound.
+        wrong_target = _reference_compressed_only_target_by_query_chunk(
+            attention["q"], attention["kv"], attention["topk"], compressed_start, attn.scaling
+        )
+        wrong = modeling.indexer_kl_terms(indexer["index_score"], wrong_target)[0].sum()
+        separation = (expected - wrong).abs()
+        assert separation > 10 * admitted, (
+            f"the compressed-only teacher is only {separation:.3e} from the correct one while the "
+            f"tolerance below admits {admitted:.3e}, so this test can no longer tell them apart"
+        )
+
+        torch.testing.assert_close(kl_sum, expected, atol=atol, rtol=rtol)
+
+    def test_target_reads_the_full_window_lse_and_the_trailing_compressed_slice(self):
+        """The three structural contracts the numeric test above can only observe
+        through their consequences.
+
+        1. The LSE must come from a forward fed the *full* window+compressed index
+           tensor: that is the only reason the teacher's per-head denominator is the
+           true CSA denominator. A second forward over a compressed-only index list
+           would produce the Megatron variant.
+        2. The compressed entries are the *trailing* range of the index tensor, which
+           is what ``[:, :, -width:]`` relies on. Both index builders end at
+           ``torch.cat((sliding_indices, compressed_indices), dim=-1)``.
+        3. ``index_score[..., j]`` and the teacher's slot ``j`` must be the same slot,
+           or the KL trains the student's score for one slot toward another slot's
+           probability. The chain is checked link by link, against the selection the
+           indexer kernel really returned.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_implementations()
+        seq_len = self._RANKING_SEQ_LEN
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            attn(**inputs)
+
+        attention, target, indexer = probe.one("attention"), probe.one("target"), probe.one("indexer")
+        width = target["topk"].shape[-1]
+
+        # (1) One attention call, over sink + sliding window + compressed entries, and
+        # the LSE the teacher consumed is that call's own -- not a second forward's.
+        assert attention["topk"].shape[-1] == attn.sliding_window + width, (
+            "the attention forward's index tensor no longer spans window + compressed slots, "
+            "so its LSE is not the full CSA denominator the teacher needs"
+        )
+        assert target["lse"] is attention["lse"], "the teacher must consume the attention forward's own LSE"
+        assert target["q"] is attention["q"] and target["kv"] is attention["kv"]
+        assert target["sm_scale"] == attention["sm_scale"] == attn.scaling
+
+        # (2) The teacher's slots are the trailing range of the attention forward's.
+        assert torch.equal(target["topk"], attention["topk"][:, :, -width:])
+        assert not torch.equal(target["topk"], attention["topk"][:, :, :width]), (
+            "the leading and trailing slices coincide here, so this test cannot tell them apart"
+        )
+
+        # (3) Those slots are exactly the indexer's selection, lifted past the
+        # full-resolution KV rows, in the indexer's own order -- so slot ``j`` of the
+        # teacher is the slot ``index_score[..., j]`` scored.
+        selection = indexer["topk_indices"].to(torch.int32)
+        assert width == selection.shape[-1] == indexer["index_score"].shape[-1]
+        expected_slice = torch.where(selection >= 0, selection + seq_len, torch.full_like(selection, -1))
+        assert torch.equal(target["topk"], expected_slice)
+        assert (selection < 0).any(), "no miss in this selection, so the -1 half of the mapping is untested"
+
+    def test_the_kl_survives_the_dense_mask_path(self):
+        """The other index-building path: a dense ``attention_mask``.
+
+        Every other test here passes ``attention_mask=None``, which is the mask-free
+        path bf16 TileLang training takes. When ``DeepseekV4Model.forward`` cannot
+        validate candidates from packed metadata alone it hands the layer the dense
+        sliding-window mask instead, and the layer then builds its candidates with
+        ``build_sparse_attention_indices`` and filters them through
+        ``mask_sparse_attention_indices``. This test is coverage of that path: the KL
+        has to come out finite, positive and trainable there too.
+
+        What the filtering step does *not* do is worth recording here, because the
+        obvious guess is wrong. Measured on this configuration it changes nothing at
+        all: the layer extends the dense mask with the compressor's own ``block_bias``
+        before handing it over, and the indexer's selection is already a subset of the
+        blocks that bias allows, so the call invalidates 0 of the 1048576 compressed
+        slots and returns a tensor bit-identical to its input. The ``-1`` slots the
+        premise below looks for are therefore the indexer's own misses carried through
+        the builder -- the same ones the mask-free path produces, scored ``-inf`` by
+        the indexer as well as zero-massed in the teacher -- and not a teacher/student
+        asymmetry this path creates.
+
+        The mask is built the way the model builds it, not by hand, so that a change to
+        the real mask's shape or dtype breaks this test rather than leaving it agreeing
+        with a mask nothing produces.
+        """
+        _require_tilelang_cuda()
+        from unittest import mock
+
+        from transformers.masking_utils import create_sliding_window_causal_mask
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        _bind_indexer_implementations()
+        seq_len = self._CHEAP_SEQ_LEN
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=seq_len)
+        # The mask builder dispatches on the config's attention implementation, and a
+        # directly built layer leaves it unset; "eager" is what the model configures
+        # here and it is the interface this file's patched forward replaces.
+        attn.config._attn_implementation = "eager"
+        inputs["attention_mask"] = create_sliding_window_causal_mask(
+            config=attn.config,
+            inputs_embeds=inputs["hidden_states"],
+            attention_mask=torch.ones(1, seq_len, dtype=torch.long, device=DEVICE),
+            past_key_values=None,
+            position_ids=inputs["position_ids"],
+        )
+        assert inputs["attention_mask"] is not None, "no dense mask here, so this test is the mask-free path again"
+
+        with (
+            _single_rank_parallel_state(),
+            _probe_dsa_kernels() as probe,
+            mock.patch(
+                f"{_PATCHED_MODULE}.mask_sparse_attention_indices",
+                wraps=modeling.mask_sparse_attention_indices,
+            ) as masking,
+        ):
+            _, _, kl_sum, _ = attn(**inputs)
+
+        # The premise: the dense path really ran -- the mask-free path never reaches
+        # this call, so without it this test is that path again under another name.
+        assert masking.call_count == 1, f"the dense masking step ran {masking.call_count} times, expected once"
+        target_width = probe.one("target")["topk"].shape[-1]
+        compressed_slots = probe.one("attention")["topk"][:, :, -target_width:]
+        assert (compressed_slots < 0).any(), (
+            "no missing compressed slot, so the KL's zero-mass masking is not exercised here"
+        )
+
+        assert torch.isfinite(kl_sum), f"the dense-mask path made the KL {kl_sum}"
+        assert kl_sum > 0, "the KL collapsed to zero on the dense-mask path"
+        kl_sum.backward()
+        for name in ("q_b_proj", "kv_proj", "weights_proj"):
+            grad = getattr(attn.compressor.indexer, name).weight.grad
+            assert grad is not None, f"indexer.{name} received no gradient from the KL"
+            assert torch.isfinite(grad).all(), f"indexer.{name} received a non-finite gradient from the KL"
+            assert grad.abs().sum() > 0, f"indexer.{name} received an all-zero gradient from the KL"
+
+    def test_the_flag_off_forward_returns_two_values(self):
+        """Default off means the return *arity* is what it was.
+
+        This is the only test that pins the off side of the branch. Invert it and
+        every flag-off DeepSeek-V4 forward returns a 4-tuple into a decoder layer
+        that unpacks two, breaking inference for every model in the tree -- while the
+        enabled path stays green, because it never takes this branch.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, indexer_loss=False)
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            result = attn(**inputs)
+
+        assert len(result) == 2, f"expected (output, attn_weights), got {len(result)} values"
+        assert not probe.target, "the teacher kernel ran with the loss off"
+        assert probe.one("attention")["lse"] is None, "the LSE was computed with nothing to consume it"
+
+    def test_the_language_model_path_is_bit_identical_with_the_loss_on(self):
+        """Turning the loss on must not perturb the model it is attached to.
+
+        The two runs share their parameters and their input, and the enabled path
+        reaches the same attention kernel with the same arguments, so the outputs are
+        equal *bitwise*: a detach cannot change a forward value, and any tolerance
+        here would hide a real perturbation of the LM objective. This is the
+        forward-value half of the decoupling; the gradient half is
+        ``test_the_kl_gradient_reaches_the_indexer_and_stops_there``.
+
+        One layer, its config flipped between the two calls, rather than two layers
+        built with the flag already set: two layers would have to be shown to hold the
+        same weights before the outputs could mean anything, and ``_build_test_attention``
+        seeds them identically only by construction. Flipping the field on the one
+        config is also what the layer actually reads, so nothing is bypassed.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, indexer_loss=False)
+        with _single_rank_parallel_state():
+            output_off, weights_off = attn(**inputs)
+            attn.config.dsa_indexer_loss = True
+            output_on, weights_on, kl_sum, _ = attn(**inputs)
+
+        assert torch.equal(output_off, output_on), "the indexer loss moved the attention output"
+        assert weights_off is None and weights_on is None
+        assert torch.isfinite(kl_sum) and kl_sum > 0, f"the KL is not a usable objective: {kl_sum}"
+
+    @pytest.mark.parametrize("layer_type", ["heavily_compressed_attention", "sliding_attention"])
+    def test_a_non_csa_layer_keeps_the_two_tuple(self, layer_type):
+        """Only a compressed-sparse-attention layer carries a Lightning Indexer, so
+        only it can build the KL -- and the other layer types must pass the flag-on
+        forward through unchanged rather than raise on it.
+
+        Both directions are easy to get wrong. An HCA layer's compressor returns a
+        perfectly ordinary ``CompressedCandidates`` -- carrying the causal
+        ``range_starts`` / ``range_ends`` its index builder needs -- with no
+        ``indexer_scores``, because it has no indexer to produce them; gating on the
+        candidates being present would make every HCA layer raise "the CSA compressor
+        produced no indexer scores" the moment the flag went on, which is three of the
+        four layers here. A sliding layer has no compressor at all, so it would reach
+        the same refusal through ``compressed_candidates is None``.
+
+        The gate keys on ``self.layer_type`` rather than on the compressor having an
+        attribute called ``indexer``, because a rename of that attribute has to break
+        loudly instead of turning the auxiliary objective into a silent no-op.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type)
+        assert attn.layer_type != "compressed_sparse_attention", "this test is about the layers the gate excludes"
+        assert getattr(attn.compressor, "indexer", None) is None, "this layer type is supposed to have no indexer"
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            result = attn(**inputs)
+
+        assert len(result) == 2, f"a {layer_type} layer has no student to train; expected 2 values, got {len(result)}"
+        assert not probe.target, "the teacher kernel ran for a layer with no indexer"
+
+    def test_a_compressor_that_drops_the_scores_is_refused(self):
+        """The scores travelling from the indexer to the loss pass through a
+        ``CompressedCandidates`` field that no index builder reads, so losing them
+        would show up as a loss of exactly zero -- a plausible curve, nothing trained.
+
+        Staged by narrowing the compressor's own return rather than by editing the
+        module, because the field is what the contract is about.
+        """
+        _require_tilelang_cuda()
+        from unittest import mock
+
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
+        real_forward = attn.compressor.forward
+
+        def _without_scores(*args, **kwargs):
+            compressed_kv, block_bias, candidates = real_forward(*args, **kwargs)
+            return compressed_kv, block_bias, candidates._replace(indexer_scores=None)
+
+        with _single_rank_parallel_state(), mock.patch.object(attn.compressor, "forward", _without_scores):
+            with pytest.raises(RuntimeError, match="produced no indexer scores"):
+                attn(**inputs)
+
+    def test_scores_and_indices_of_different_widths_are_refused(self):
+        """``[:, :, -width:]`` takes the compressed slice on the strength of the
+        indexer's score width, so a width that disagrees with the selection would
+        silently slide the slice into the sliding-window entries and train the indexer
+        against window probabilities.
+
+        Staged as a one-slot-narrower score tensor. This pins the width invariant
+        only, which is all the production check claims; a *reordering* of the index
+        tensor leaves both widths equal and is caught instead by
+        ``test_target_reads_the_full_window_lse_and_the_trailing_compressed_slice``.
+
+        ``RuntimeError``, not ``AssertionError``: this guard has to survive
+        ``python -O``, which strips asserts. ``tests/ops/test_deepseek_v4_indexer_loss.py``
+        is run under ``-O`` to confirm the refusal is still there.
+        """
+        _require_tilelang_cuda()
+        from unittest import mock
+
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._CHEAP_SEQ_LEN)
+        real_forward = attn.compressor.forward
+
+        def _narrower_scores(*args, **kwargs):
+            compressed_kv, block_bias, candidates = real_forward(*args, **kwargs)
+            return (
+                compressed_kv,
+                block_bias,
+                candidates._replace(indexer_scores=candidates.indexer_scores[..., :-1]),
+            )
+
+        with _single_rank_parallel_state(), mock.patch.object(attn.compressor, "forward", _narrower_scores):
+            with pytest.raises(RuntimeError, match="must be the same width"):
+                attn(**inputs)
+
+    def test_a_declined_tilelang_dispatch_under_the_loss_is_refused(self):
+        """The teacher's LSE comes out of the TileLang kernel, so a dispatch declined
+        at runtime leaves the loss with no teacher at all.
+
+        ``_indexer_loss_enabled`` can only check the *configured* implementation; the
+        dispatch additionally requires bf16 CUDA tensors and declines silently on
+        anything else. Without this refusal the caller would unpack three values from
+        a two-value eager return and report a bare "not enough values to unpack",
+        pointing at the loss's plumbing rather than at the dtype that caused it.
+        """
+        _require_tilelang_cuda()
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        _bind_indexer_implementations()
+        # fp32 is the realistic way to lose the dispatch: the kernel is bf16-only, and
+        # the attention forward hands it whatever dtype the module was built in.
+        query = torch.randn(1, 4, 8, 64, device=DEVICE)
+        kv = torch.randn(1, 1, 24, 64, device=DEVICE)
+        with pytest.raises(RuntimeError, match="needs the TileLang sparse attention dispatch"):
+            modeling.eager_attention_forward(
+                None, query, kv, kv, None, 0.1, sparse_topk_indices=None, indexer_target_width=8
+            )
+
+    def test_the_kl_gradient_reaches_the_indexer_and_stops_there(self):
+        """The KL has to be a trainable objective for the indexer and *only* for the
+        indexer, and it has to be finite.
+
+        Three separate ways this can fail silently, all pinned here:
+
+        * a KL detached from the indexer's own graph would log a plausible decreasing
+          number while training nothing, so the assertion is on parameter gradients
+          rather than on ``grad_fn``, and on their magnitude rather than their
+          presence -- a graph carrying zeros trains nothing either;
+        * a teacher or an LSE that stayed attached to the attention query would make
+          the auxiliary objective a second gradient path into the language model,
+          which ``hidden_states.grad is None`` is what rules out; and
+        * the ``-inf`` score rows of the first positions of the sequence make the KL's
+          gradient NaN unless they are neutralised, and NaN parameter gradients here
+          would be blamed on anything but the auxiliary loss.
+        """
+        _require_tilelang_cuda()
+
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(device=DEVICE, seq_len=self._RANKING_SEQ_LEN)
+        with _single_rank_parallel_state():
+            _, _, kl_sum, _ = attn(**inputs)
+        kl_sum.backward()
+
+        assert inputs["hidden_states"].grad is None, "the indexer KL reached the language-model input"
+        for name in ("q_b_proj", "kv_proj", "weights_proj"):
+            grad = getattr(attn.compressor.indexer, name).weight.grad
+            assert grad is not None, f"indexer.{name} received no gradient from the KL"
+            assert torch.isfinite(grad).all(), f"indexer.{name} received a non-finite gradient from the KL"
+            assert grad.abs().sum() > 0, f"indexer.{name} received an all-zero gradient from the KL"
+        # Nothing outside the indexer may move on this objective. The compressor and
+        # the attention projections sit on the language-model path.
+        for module_name in ("compressor.kv_proj", "compressor.gate_proj", "q_b_proj", "kv_proj"):
+            module = attn
+            for part in module_name.split("."):
+                module = getattr(module, part)
+            assert module.weight.grad is None, f"{module_name} moved on the indexer objective"
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize(
+        "layer_type", ["sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention"]
+    )
+    def test_the_shared_gate_predicts_the_attention_return_arity(self, layer_type, enabled):
+        """``_builds_indexer_kl`` is the *only* thing that may decide the arity, and
+        every caller above reads it rather than re-deriving it.
+
+        Three call sites act on this predicate -- the attention forward that returns
+        the KL and its reference, the decoder layer that unpacks them, and the model
+        loop that accumulates them -- and they are in three different functions. A copy
+        of the expression in any of them can go stale independently: the decoder layer
+        gating on ``_indexer_loss_enabled`` alone (the whole expression before Task 5's
+        fix round narrowed it) would four-unpack the two-tuple every sliding and HCA
+        layer returns, which is three of the four layers of the reference checkpoint.
+
+        Reading the predicate twice would prove nothing, so the assertion is against
+        ``len(attn(...))``: what the attention forward actually returned.
+        """
+        _require_tilelang_cuda()
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        _bind_indexer_implementations()
+        attn, inputs = _build_test_attention(
+            device=DEVICE, seq_len=self._CHEAP_SEQ_LEN, layer_type=layer_type, indexer_loss=enabled
+        )
+        with _single_rank_parallel_state():
+            verdict = modeling._builds_indexer_kl(attn)
+            result = attn(**inputs)
+
+        assert verdict is (len(result) == 4), (
+            f"the gate says {verdict} for a {layer_type} layer with the flag {enabled}, "
+            f"while the forward returned {len(result)} values"
+        )
+        # And that the verdict itself is the intended one, so that a predicate stuck at
+        # ``False`` against a forward stuck at two values cannot agree vacuously.
+        assert verdict is (enabled and layer_type == "compressed_sparse_attention")
+
+
+# The layer schedule this whole task is about: two sliding layers, one CSA layer
+# and one HCA layer, i.e. exactly one layer carrying a Lightning Indexer and three
+# that must pass a flag-on forward through untouched. It is the schedule of the
+# reference 4-layer checkpoint ``DeepSeek-V4-Flash-Base-4L``, whose legacy
+# ``compress_ratios`` of ``[0, 0, 4, 128]`` derives exactly this.
+_LAYER_SCHEDULE_4L = (
+    "sliding_attention",
+    "sliding_attention",
+    "compressed_sparse_attention",
+    "heavily_compressed_attention",
+)
+_TOY_CONFIG_4L = Path("tests/toy_config/deepseek_v4_toy")
+
+
+def _4layer_test_config():
+    """The reference 4-layer checkpoint's architecture, at the toy config's widths.
+
+    Built from the in-repo toy config rather than from the checkpoint itself. The
+    checkpoint lives on an HDFS FUSE mount, and reading it would make every test
+    below skip on any machine without one -- CI included, where these are the only
+    tests covering this objective's integration with the model. Width was never the
+    point in any case: at the checkpoint's own widths the model is 27.4B parameters
+    and 54.8 GB in bf16 before gradients, so these tests reduced it anyway, to
+    exactly the widths the toy config already carries.
+
+    Taken from the reference checkpoint's architecture rather than the toy config's,
+    because the objective reads them:
+
+    - ``layer_types``, the schedule above. The toy config derives three HCA layers
+      and one CSA layer from its own ``compress_rates``, which leaves no sliding
+      layer to pass a flag-on forward through and puts the CSA layer last.
+    - ``compress_rates``. The CSA rate of 4 the toy config already has, and it is
+      what makes ``compressed_len`` a quarter of the sequence and so decides whether
+      the top-k binds; what moves is the HCA rate, from 32 to 128, so that the
+      non-CSA layer these tests pass a forward through is the one the checkpoint has.
+    - ``index_topk=512``, over the toy config's 32, so that at ``seq_len=4096`` and
+      rate 4 the ``compressed_len`` of 1024 exceeds it and the top-k actually ranks
+      rather than selecting everything visible. Not a kernel requirement: the teacher
+      interface pads ``topk`` up to its ``block_I`` of 64 and slices the result back,
+      so 32 runs -- it just does not exercise a selection.
+    - ``index_n_heads=64``, over the toy config's 8. The indexer's own head count is
+      what resolves its ``q_b_proj`` to 64 row blocks under head-split Muon, and the
+      8192 rows that makes are the shape the decoupling tests assert gradients on.
+    - ``num_attention_heads=64``, over the toy config's 8. This is the head axis the
+      teacher sums over, and 64 is the count the kernel is designed around: one CTA
+      owns every head of a query, so the sum needs no atomics, and the interface
+      passes it through without the padding to 16 that 8 heads would take. It is
+      also what makes the head aggregation observable at all -- at 8 heads the two
+      aggregations ``test_the_captured_fraction_is_a_ratio_of_means_and_touches_no_gradient``
+      exists to distinguish sit 1.3e-04 apart, under that test's own separation
+      guard, which then fails rather than passing vacuously.
+
+    Everything else stays at the toy config's value, and is pinned here rather than
+    inherited so that an unrelated edit to a config shared with other test files
+    cannot quietly change what these tests exercise. ``sliding_window`` is the one
+    worth naming: it is a term in the teacher's denominator, so it moves the numbers
+    the separation guard reads, and the toy config's 32 is the *least* favourable of
+    the widths tried -- the fixture is not tuned to make that guard pass.
+    """
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    config = DeepseekV4Config.from_pretrained(str(_TOY_CONFIG_4L))
+    config.layer_types = list(_LAYER_SCHEDULE_4L)
+    config.compress_rates = {"compressed_sparse_attention": 4, "heavily_compressed_attention": 128}
+    config.index_topk = 512
+    config.index_n_heads = 64
+    config.index_head_dim = 128
+    config.num_attention_heads = 64
+    config.sliding_window = 32
+    return config
+
+
+@contextlib.contextmanager
+def _veomni_loss_mapping_installed():
+    """Install VeOmni's loss wrappers into HuggingFace's ``LOSS_MAPPING``, and undo it.
+
+    ``DeepseekV4ForCausalLM.forward`` unpacks three values from
+    ``self.loss_function``, which is VeOmni's contract and not HuggingFace's -- with
+    HF's stock ``ForCausalLMLoss`` in the mapping the forward fails on the unpack
+    long before it reaches anything this file is about. ``build_foundation_model``
+    installs these through ``apply_ops_config``; a test that builds the model
+    directly has to do it itself.
+
+    Restored afterwards for the reason ``_ops_config_slots_bound`` gives: the mapping
+    is a module-level dict shared with the rest of the session.
+    """
+    from transformers.loss.loss_utils import LOSS_MAPPING
+
+    from veomni.ops.kernels.cross_entropy import install_loss_mapping
+
+    saved = dict(LOSS_MAPPING)
+    install_loss_mapping("eager")
+    try:
+        yield
+    finally:
+        LOSS_MAPPING.clear()
+        LOSS_MAPPING.update(saved)
+
+
+def _build_4layer_test_model(
+    device=DEVICE,
+    seq_len=4096,
+    indexer_loss=True,
+    enable_reentrant=False,
+    seed=0,
+    labels=True,
+    layer_types=None,
+    coef=1.0,
+):
+    """Returns ``(model, batch)`` for the 4-layer CSA checkpoint's configuration.
+
+    Builds the config above, puts ``dsa_indexer_loss`` / ``dsa_indexer_loss_coef`` on
+    it, binds the two implementation slots, enables gradient checkpointing with the
+    given ``enable_reentrant``, and seeds both the model init and the batch from
+    ``seed`` so two calls with the same seed are comparable.
+
+    ``seq_len=4096`` is not incidental: at the CSA compression rate of 4 it gives
+    ``compressed_len == 1024 > index_topk == 512``, so the top-k actually ranks. At
+    2048 the indexer would select every causally visible slot and a student permuted
+    within the valid region would still look right.
+
+    The batch is the packed one production trains on -- one sample filling the row,
+    global ``position_ids``, and ``cu_seq_lens_q`` spanning it -- which is what puts
+    ``DeepseekV4Model.forward`` on the mask-free TileLang path. ``labels`` are the
+    inputs themselves: what is under test is which objectives the gradient reaches,
+    not what the model predicts.
+
+    ``enable_reentrant=True`` uses PyTorch's own reentrant ``CheckpointFunction``
+    rather than the copy at ``veomni/distributed/checkpoint.py`` that
+    ``build_parallelize_model`` installs. That copy reads ``run_function.__self__``,
+    while ``GradientCheckpointingLayer.__call__`` hands the checkpoint a
+    ``functools.partial``, so it raises ``AttributeError: 'functools.partial' object
+    has no attribute '__self__'`` here -- with the indexer loss *off* as well as on,
+    i.e. an existing incompatibility with this transformers version rather than
+    anything this file introduces. Both implementations run the first forward inside
+    ``torch.no_grad()``, which is the property these tests are about.
+
+    ``layer_types`` overrides the checkpoint's own schedule, for the one test that
+    needs a model with no CSA layer at all. Set after the config is constructed
+    rather than passed to it, because the constructor derives ``layer_types`` from
+    the checkpoint's legacy ``compress_ratios`` and would ignore the keyword.
+    """
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = _4layer_test_config()
+    if layer_types is not None:
+        config.layer_types = list(layer_types)
+    config.dsa_indexer_loss = indexer_loss
+    config.dsa_indexer_loss_coef = coef
+    _bind_indexer_implementations()
+
+    torch.manual_seed(seed)
+    with torch.device(device):
+        model = modeling.DeepseekV4ForCausalLM(config)
+    model = model.to(dtype=torch.bfloat16)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": enable_reentrant})
+    model.train()
+
+    torch.manual_seed(seed + 1)
+    input_ids = torch.randint(0, config.vocab_size, (1, seq_len), device=device)
+    cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    batch = {
+        "input_ids": input_ids,
+        "position_ids": torch.arange(seq_len, device=device).unsqueeze(0),
+        "cu_seq_lens_q": cu_seq_lens,
+        "cu_seq_lens_k": cu_seq_lens,
+        "use_cache": False,
+    }
+    if labels:
+        batch["labels"] = input_ids.clone()
+    return model, batch
+
+
+@contextlib.contextmanager
+def _checkpointed_layer_calls_recorded(model):
+    """Record the calls that actually go through each decoder layer's checkpointing.
+
+    ``GradientCheckpointingLayer.__call__`` runs the layer through
+    ``self._gradient_checkpointing_func`` only when ``self.gradient_checkpointing and
+    self.training`` (``transformers/modeling_layers.py:60,92``), and falls through to
+    an ordinary call otherwise. Wrapping that function observes the branch being
+    taken, rather than inferring it from the attributes that decide it: a model that
+    was never put in training mode, or whose layers never received the flag, records
+    nothing at all here.
+
+    The recorded ``use_reentrant`` is read off the ``functools.partial``
+    ``gradient_checkpointing_enable`` built, so it also pins that the parametrised
+    setting is the one the checkpoint call receives -- otherwise the two legs of that
+    parametrisation could be running the same thing.
+    """
+    recorded = []
+    originals = []
+    for layer in model.model.layers:
+        original = getattr(layer, "_gradient_checkpointing_func", None)
+        assert original is not None, (
+            f"decoder layer {layer.layer_idx} has no _gradient_checkpointing_func, so "
+            "gradient checkpointing was never enabled on it"
+        )
+
+        def _recording(*args, _layer=layer, _original=original, **kwargs):
+            recorded.append((_layer.layer_idx, _original.keywords.get("use_reentrant")))
+            return _original(*args, **kwargs)
+
+        layer._gradient_checkpointing_func = _recording
+        originals.append((layer, original))
+    try:
+        yield recorded
+    finally:
+        for layer, original in originals:
+            layer._gradient_checkpointing_func = original
+
+
+def _csa_layers(model):
+    """The layers carrying a Lightning Indexer, i.e. the ones that can build a KL."""
+    return [
+        layer
+        for layer in model.model.layers
+        if getattr(getattr(layer.self_attn, "compressor", None), "indexer", None) is not None
+    ]
+
+
+def _model_only_batch(batch):
+    """``batch`` without the fields only ``DeepseekV4ForCausalLM.forward`` takes."""
+    return {key: value for key, value in batch.items() if key != "labels"}
+
+
+class TestFourLayerModelIndexerKL:
+    """The KL leaving the attention layer and arriving in the total loss: the decoder
+    layer's arity, the model loop's accumulation, the reduction and the coefficient.
+
+    Every test here runs a whole ``DeepseekV4ForCausalLM`` forward on the reference
+    checkpoint's layer schedule, so three of its four layers exercise the pass-through
+    the gate has to leave alone and one exercises the KL itself.
+    """
+
+    # Every test here imports the generated modeling module; see the note on
+    # ``_HDFS_STDENV_DEPRECATION_FILTER`` for what that drags in.
+    pytestmark = _HDFS_STDENV_DEPRECATION_FILTER
+
+    # Supported but off, matching the classes above. The coefficient is here too:
+    # every test below reads it through the loss, and one of them binds it to 0, so a
+    # test that took it from the session rather than from here would be reading
+    # whatever ran before it.
+    _SLOT_PRE_STATE = {
+        "dsa_indexer_implementation": "eager",
+        "dsa_attention_implementation": "eager",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _restore_ops_config_slots_and_loss_mapping(self):
+        with _ops_config_slots_bound(self._SLOT_PRE_STATE), _veomni_loss_mapping_installed():
+            yield
+
+    @pytest.mark.parametrize("enable_reentrant", [False, True])
+    def test_indexer_receives_gradient_under_checkpointing(self, enable_reentrant):
+        """The silent-failure guard, and this task's acceptance criterion: a flag-on
+        forward *and backward* completing on the reference schedule.
+
+        Asserts parameter gradients, not ``kl.grad_fn is not None``. Under reentrant
+        checkpointing the first forward runs inside ``torch.no_grad()``, so any tensor
+        smuggled out through a side channel rather than through the layer's return
+        value is graph-less -- and a ``grad_fn`` proxy would not notice. The KL would
+        still log a plausible decreasing number while the indexer learned nothing.
+
+        Checkpointing is asserted engaged rather than trusted. Enabling it and
+        believing the call is not enough: with checkpointing silently off, every
+        assertion below still holds, so the whole acceptance criterion would be
+        vacuous and nothing would say so. The ``[True]`` leg has independent evidence
+        -- the side-channel mutation fails it and passes ``[False]`` -- but ``[False]``
+        is the setting production runs, and it had none.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, enable_reentrant=enable_reentrant)
+        with _single_rank_parallel_state(), _checkpointed_layer_calls_recorded(model) as checkpointed:
+            out = model(**batch)
+            out.loss.backward()
+
+        assert [layer_idx for layer_idx, _ in checkpointed] == list(range(len(model.model.layers))), (
+            f"gradient checkpointing ran on layers {[i for i, _ in checkpointed]}, not on every layer of "
+            f"the {len(model.model.layers)}-layer model: the forward this criterion is about was not the "
+            "checkpointed one"
+        )
+        assert {reentrant for _, reentrant in checkpointed} == {enable_reentrant}, (
+            f"the checkpoint calls ran with use_reentrant="
+            f"{ {reentrant for _, reentrant in checkpointed} }, not the parametrised {enable_reentrant}"
+        )
+
+        csa = _csa_layers(model)
+        assert csa, "test model must contain at least one CSA layer"
+        for layer in csa:
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+                param = getattr(layer.self_attn.compressor.indexer, name).weight
+                assert param.grad is not None, f"{name} received no gradient"
+                assert param.grad.abs().sum() > 0, f"{name} received an all-zero gradient"
+
+    @pytest.mark.parametrize(
+        "indexer_loss, layer_index, regression",
+        [
+            # The review's exact case: a decoder layer regressed to ``(output, None)``
+            # on the flag-off path. A loop branching on ``isinstance(layer_output,
+            # tuple)`` absorbs this one silently -- it reads the ``None`` as "this
+            # layer built a KL", sums nothing, and every test still passes.
+            (False, 0, "extra_none"),
+            (True, 0, "extra_none"),
+            # And the other direction: the CSA layer dropping the KL it promised.
+            (True, 2, "dropped_kl"),
+        ],
+    )
+    def test_a_layer_that_disagrees_with_the_shared_gate_is_refused(self, indexer_loss, layer_index, regression):
+        """The model loop reads ``_builds_indexer_kl`` and holds the layer to it.
+
+        This is what makes the "bare tensor when the layer builds no KL" contract
+        enforced rather than merely documented. Two things would otherwise be silent:
+
+        * a loop that *decided* on ``isinstance(layer_output, tuple)`` would accept
+          any arity a layer happened to return, which is what the three comments
+          claiming the loop reads the predicate were describing and the code was not
+          doing; and
+        * the unpacking alone is not self-checking. ``a, b = tensor`` succeeds for any
+          tensor whose leading dimension is 2, so on a two-sample batch a bare tensor
+          from a regressed layer would be split into hidden states and a "KL" without
+          error. The batch size would decide whether the bug was loud.
+
+        Patching one layer's ``forward`` is the closest a test can get to that
+        regression: patching ``_builds_indexer_kl`` itself would move the decoder
+        layer's read and the loop's read together, since both call the same
+        module-level function on the same object, and they would agree again.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=indexer_loss)
+        layer = model.model.layers[layer_index]
+        real_forward = layer.forward
+        if regression == "extra_none":
+            layer.forward = lambda *args, **kwargs: (real_forward(*args, **kwargs), None)
+        else:
+            layer.forward = lambda *args, **kwargs: real_forward(*args, **kwargs)[0]
+
+        with _single_rank_parallel_state():
+            with pytest.raises(RuntimeError, match="disagree about the indexer-KL return arity"):
+                model(**batch)
+
+    # No CSA entry, so no layer of this model carries a Lightning Indexer. Otherwise
+    # a supported configuration: tilelang indexer, tilelang attention, one rank --
+    # every refusal in ``_indexer_loss_enabled`` passes it.
+    _NO_CSA_LAYER_TYPES = [
+        "sliding_attention",
+        "sliding_attention",
+        "heavily_compressed_attention",
+        "heavily_compressed_attention",
+    ]
+
+    # Two CSA layers where the checkpoint's own schedule has one. ``compress_rates``
+    # is keyed by layer *type*, not by index, so a second CSA entry gets the same
+    # rate-4 compressor and indexer the first one has. This is the only configuration
+    # in this file where the layer sum and the per-layer mean differ, and therefore
+    # the only one that can tell them apart -- at one CSA layer the divisor is 1 and
+    # every arrangement of the two agrees.
+    _TWO_CSA_LAYER_TYPES = [
+        "sliding_attention",
+        "compressed_sparse_attention",
+        "compressed_sparse_attention",
+        "heavily_compressed_attention",
+    ]
+
+    @pytest.mark.parametrize("labels", [True, False])
+    def test_the_flag_is_refused_when_no_layer_can_build_a_kl(self, labels):
+        """A model with no CSA layer accepts ``dsa_indexer_loss=True`` and trains
+        nothing, unless it is refused here.
+
+        ``_indexer_loss_enabled`` refuses a non-tilelang indexer, a non-tilelang
+        attention and ``ulysses_size > 1``, but a tilelang, one-rank model whose
+        ``layer_types`` has no CSA entry passes all three. It then has no student to
+        train: ``indexer_kl_total`` stays ``None``, and both the metric and the
+        fold-in are skipped without a word. That is the same "plausible curve,
+        nothing trained" failure those three refusals exist for.
+
+        Parametrised on ``labels`` because the fold-in is the half that is
+        conditional on them -- the refusal must fire on the inference path exactly as
+        it does on the training one, which is what putting it in the model body
+        rather than beside the fold-in buys.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(
+            device=DEVICE, seq_len=4096, labels=labels, layer_types=self._NO_CSA_LAYER_TYPES
+        )
+        assert not _csa_layers(model), "the no-CSA config still built a layer with an indexer"
+
+        with _single_rank_parallel_state():
+            with pytest.raises(RuntimeError, match="no layer of this model builds an indexer KL"):
+                model(**batch)
+
+    def test_a_model_with_no_csa_layer_is_fine_with_the_flag_off(self):
+        """The other side of the refusal above: no CSA layer is a perfectly ordinary
+        model until someone asks for the indexer loss.
+
+        Without this, the refusal could be unconditional on the flag and the test
+        above would not notice -- it would break every non-CSA DeepSeek-V4 forward in
+        the tree while the enabled path stayed green.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(
+            device=DEVICE, seq_len=4096, indexer_loss=False, layer_types=self._NO_CSA_LAYER_TYPES
+        )
+        with _single_rank_parallel_state():
+            out = model(**batch)
+
+        assert out.aux_metrics is None
+        assert torch.isfinite(out.loss)
+
+    def test_only_csa_layers_carry_an_indexer(self):
+        """The reference checkpoint has ``compress_ratios [0, 0, 4, 128]``: two sliding
+        layers, one CSA layer at rate 4, one HCA layer at rate 128. Only the CSA layer
+        has an indexer, so only it may contribute to the KL, and the total must be a
+        finite positive number rather than a silent zero."""
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096)
+
+        with_indexer = [
+            i
+            for i, layer in enumerate(model.model.layers)
+            if getattr(getattr(layer.self_attn, "compressor", None), "indexer", None) is not None
+        ]
+        assert with_indexer == [2], f"expected exactly the rate-4 layer to have an indexer, got {with_indexer}"
+
+        with _single_rank_parallel_state():
+            out = model(**batch)
+        kl = out.aux_metrics["indexer_kl"]
+        assert torch.isfinite(kl).all()
+        assert kl > 0, "a zero KL here means the teacher and the indexer already agree exactly, which is not credible"
+
+    def test_the_model_output_carries_the_kl_where_a_round_trip_can_find_it(self):
+        """The KL leaves ``DeepseekV4Model.forward`` in a declared field, not as an
+        attribute assigned onto the output object.
+
+        ``ModelOutput.__setattr__`` writes into the underlying dict only for keys that
+        already exist; a new name becomes a plain instance attribute, invisible to
+        ``keys()``, to ``to_tuple()`` and to pytree flattening, and dropped by any
+        round-trip. The immediate read in ``ForCausalLM.forward`` would still work, so
+        nothing about the loss value would look wrong -- and this repository has been
+        bitten by exactly that before, with FSDP2's pre-backward unshard hook, which
+        finds the tensors it must unshard for by walking that same flattened output
+        (see the note above ``MoeCausalLMOutputWithLogProbs``'s import in the patch
+        config).
+
+        A flat-out ``kl > 0`` assertion elsewhere does not cover this: the value is
+        right either way. What has to hold is that the tensor is *reachable* the way
+        every generic consumer reaches it.
+        """
+        _require_tilelang_cuda()
+        from torch.utils import _pytree as pytree
+
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096)
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+
+        assert outputs.indexer_kl_total is not None, "the model dropped the KL"
+        assert "indexer_kl_total" in outputs, "the KL is an ad-hoc attribute, not a field of the output"
+        assert outputs.indexer_query_tokens == batch["input_ids"].numel()
+        assert outputs.indexer_kl_layers == len(_csa_layers(model))
+
+        leaves, spec = pytree.tree_flatten(outputs)
+        assert any(leaf is outputs.indexer_kl_total for leaf in leaves), (
+            "the KL is invisible to pytree flattening, which is how FSDP2 finds the tensors "
+            "a backward will need unsharded"
+        )
+        rebuilt = pytree.tree_unflatten(leaves, spec)
+        assert rebuilt.indexer_kl_total is outputs.indexer_kl_total
+        assert rebuilt.indexer_query_tokens == outputs.indexer_query_tokens
+        assert rebuilt.indexer_kl_layers == outputs.indexer_kl_layers
+
+    def test_the_reported_kl_is_the_per_token_mean_of_the_layer_sum(self):
+        """What reaches the loss is a *mean* over local query rows, not the sum the
+        attention layer returns.
+
+        ``reduce_sequence_parallel_loss`` takes a local mean and the local token count
+        and re-weights by that count across the group; handing it a sum instead trains
+        perfectly well on one rank and converges to the wrong cross-rank weighting,
+        which no single-process test of the value alone would ever notice.
+
+        This model runs the checkpoint's own schedule, so it has one CSA layer and the
+        metric's per-layer divisor is 1; the divisor itself is pinned by
+        ``test_the_reported_kl_is_a_per_layer_mean_while_the_loss_keeps_the_sum``.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096)
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+            out = model(**batch)
+
+        tokens = batch["input_ids"].numel()
+        assert outputs.indexer_query_tokens == tokens
+        # The error this comparison hunts -- the layer sum reaching the metric where
+        # the per-token mean belongs -- is a factor of ``tokens``, a relative error of
+        # 4095, so the bound only has to sit far below 1 to be diagnostic. Measured
+        # over 12 repeated pairs of these two forwards the values agree *bitwise*, so
+        # today any bound whatsoever passes; what it has to survive is a future
+        # forward that reorders its reductions. Bound it at bf16 epsilon, the
+        # precision the forward runs in and so the granularity at which two runs of it
+        # could legitimately disagree -- this file already documents a backward that
+        # disagrees with itself at exactly that scale, on 77 of 102 gradients. That is
+        # still five orders of magnitude tighter than the error it is looking for.
+        # ``rtol=1e-6`` bought none of that margin back: the token count is pinned
+        # exactly on the line above, so this comparison does not also have to police
+        # it, and no arithmetic mistake here is small.
+        torch.testing.assert_close(
+            out.aux_metrics["indexer_kl"],
+            outputs.indexer_kl_total / tokens,
+            atol=0,
+            rtol=torch.finfo(torch.bfloat16).eps,
+        )
+        assert not out.aux_metrics["indexer_kl"].requires_grad, "the reported metric must be detached"
+
+    def test_a_zero_coefficient_costs_nothing_and_trains_nothing(self):
+        """``dsa_indexer_loss_coef: 0.0`` is the documented way to switch the term off,
+        and this is what "off" has to mean at model scope.
+
+        Three separate claims, and each fails on a different half-fix:
+
+        * **the teacher is never built.** ``sparse_mqa_target_fwd`` is the expensive
+          half of the objective, and a gate placed only at the fold-in would still run
+          it on every CSA layer of every step, for a term multiplied by zero. The
+          probe counts calls, so this cannot be satisfied by the value coming out
+          right.
+        * **no indexer parameter ends the step with a gradient.** ``loss + 0.0 * kl``
+          is exactly ``loss`` as a *value* while still building the graph, so the
+          backward writes a zero ``p.grad`` on all 226M of them. Muon skips only
+          ``p.grad is None`` (``muon.py:902``) and ``_apply_ortho`` decays whatever it
+          steps (``:1005-1006``), so a zero gradient is not the same as no gradient:
+          it is weight decay on an otherwise-frozen indexer.
+        * **the language-model objective is bitwise untouched**, which is the
+          branch's central guarantee and the reason ``x + 0.0 * kl`` was not simply
+          left alone.
+
+        ``aux_metrics is None`` is asserted rather than a zero metric: the term is
+        off, and reporting a KL for an objective that is not being trained is the
+        silent-no-op class this feature refuses everywhere else.
+        """
+        _require_tilelang_cuda()
+
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=True, coef=0.0, seed=0)
+        assert _csa_layers(model), "the test model has no indexer to leave untrained"
+        with _single_rank_parallel_state(), _probe_dsa_kernels() as probe:
+            out = model(**batch)
+        assert probe.target == [], (
+            f"the teacher kernel ran {len(probe.target)} time(s) at coefficient 0, so the objective is "
+            "still paying for a term that contributes nothing"
+        )
+        assert out.aux_metrics is None, "a switched-off objective reported a metric"
+
+        out.loss.backward()
+        for layer in _csa_layers(model):
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+                param = getattr(layer.self_attn.compressor.indexer, name).weight
+                assert param.grad is None, (
+                    f"indexer.{name} ends the step with p.grad set at coefficient 0; Muon steps it and "
+                    "weight decay applies"
+                )
+
+        off, off_batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=False, seed=0)
+        with _single_rank_parallel_state():
+            off_out = off(**off_batch)
+        assert torch.equal(out.loss, off_out.loss), (
+            "the total loss at coefficient 0 differs from the flag-off run, so switching the term off "
+            "perturbs the language-model objective"
+        )
+
+    def test_the_coefficient_scales_what_the_loss_receives(self):
+        """The KL enters the loss weighted by ``dsa_indexer_loss_coef``, and by nothing
+        else.
+
+        Run at coefficient 0 the total loss must be *bitwise* what the flag-off run
+        produced. Since the gate reads the coefficient, that leg now says the term is
+        genuinely off rather than that a zero multiply cancelled -- what it still pins
+        here is that turning the loss on perturbs no part of the language-model
+        objective, with the cost and gradient halves of "off" covered by
+        ``test_a_zero_coefficient_costs_nothing_and_trains_nothing`` above. Run at 1
+        the difference from that baseline must be the reported KL itself, which is the
+        leg that pins the coefficient being applied at all.
+        """
+        _require_tilelang_cuda()
+
+        def loss_at(indexer_loss, coef):
+            model, batch = _build_4layer_test_model(
+                device=DEVICE, seq_len=4096, indexer_loss=indexer_loss, coef=coef, seed=0
+            )
+            with _single_rank_parallel_state():
+                out = model(**batch)
+            return out
+
+        off = loss_at(indexer_loss=False, coef=1.0)
+        assert off.aux_metrics is None, "the flag-off forward reported an indexer metric"
+
+        zero_weighted = loss_at(indexer_loss=True, coef=0.0)
+        assert torch.equal(zero_weighted.loss, off.loss), (
+            "at coefficient 0 the total loss moved, so either the coefficient is ignored "
+            "or the language-model objective was perturbed"
+        )
+
+        weighted = loss_at(indexer_loss=True, coef=1.0)
+        difference = weighted.loss - off.loss
+        reported = weighted.aux_metrics["indexer_kl"].to(off.loss.dtype)
+        # Subtracting two losses of the same magnitude cancels, and what survives is
+        # the KL plus a few ULPs of the larger number. Bound the comparison by those
+        # ULPs rather than by a relative tolerance on the KL itself, and assert the KL
+        # clears the bound -- otherwise this comparison would pass on a KL of zero.
+        admitted = 8 * torch.finfo(off.loss.dtype).eps * off.loss.detach().abs().item()
+        assert reported > 100 * admitted, (
+            f"the reported KL {float(reported):.3e} is within the {float(admitted):.3e} of "
+            "floating-point noise this subtraction carries, so it cannot be told from zero here"
+        )
+        torch.testing.assert_close(difference, reported, atol=admitted, rtol=0)
+
+    def test_the_reported_kl_is_a_per_layer_mean_while_the_loss_keeps_the_sum(self):
+        """The two halves that have to disagree: the loss sums over CSA layers, the
+        metric averages over them.
+
+        Summed, ``training/indexer_kl`` is ~21x larger on DeepSeek-V4-Flash (21 CSA
+        layers) than on the 1-CSA-layer smoke checkpoint at identical per-layer
+        quality, so no two runs with different layer counts are comparable and neither
+        is any Megatron number (``dsa.py:427`` reports
+        ``values.sum() / max(num_indexer_layers, 1)``). The summed *loss* is a settled
+        decision and stays, which is why both legs are here: dividing the folded value
+        too would silently rescale the objective this branch has already tuned.
+
+        Every other test in this class runs the checkpoint's own one-CSA-layer
+        schedule, where the divisor is 1 and the two are indistinguishable.
+        """
+        _require_tilelang_cuda()
+
+        model, batch = _build_4layer_test_model(
+            device=DEVICE, seq_len=4096, layer_types=self._TWO_CSA_LAYER_TYPES, coef=1.0, seed=0
+        )
+        assert len(_csa_layers(model)) == 2, "the two-CSA schedule did not build two indexers"
+
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+            out = model(**batch)
+
+        assert outputs.indexer_kl_layers == 2, (
+            f"the model body counted {outputs.indexer_kl_layers} contributing layers, not 2"
+        )
+        tokens = batch["input_ids"].numel()
+        per_layer_mean = outputs.indexer_kl_total / tokens / 2
+        torch.testing.assert_close(
+            out.aux_metrics["indexer_kl"], per_layer_mean, atol=0, rtol=torch.finfo(torch.bfloat16).eps
+        )
+        # ... and the layer *sum* is what the loss received. Bounded by the ULPs of
+        # the subtraction, with the KL asserted clear of them, exactly as
+        # ``test_the_coefficient_scales_what_the_loss_receives`` does.
+        folded = out.loss.detach() - out.aux_metrics["lm_loss_before_indexer_kl"]
+        layer_sum = (outputs.indexer_kl_total / tokens).to(out.loss.dtype)
+        admitted = 8 * torch.finfo(out.loss.dtype).eps * out.loss.detach().abs().item()
+        assert layer_sum > 100 * admitted, (
+            f"the layer-summed KL {float(layer_sum):.3e} is inside this subtraction's noise, so the "
+            "leg below cannot tell a sum from a mean"
+        )
+        torch.testing.assert_close(folded, layer_sum, atol=admitted, rtol=0)
+
+    def test_the_captured_fraction_is_a_ratio_of_means_and_touches_no_gradient(self):
+        """``indexer_kl`` says nothing on its own -- 0.021 means one thing against a
+        zero-information reference of 0.374 and another against 0.02 -- so the reference
+        and the fraction of it the student captures are reported beside it.
+
+        Three things are pinned, and the first is the one that is easy to get wrong in
+        a way nothing else would catch:
+
+        * it is a **ratio of means**, ``sum(kl) / sum(uniform)`` over every row and
+          layer, not the mean of the per-row ratios. The two are near enough to look
+          alike and far enough apart to matter, so both are computed here from the
+          per-row terms the reported forward actually formed, and their separation is
+          asserted to be well outside the tolerance the first leg admits -- otherwise
+          that leg would pass against the mistake it exists to catch.
+        * the fraction is **invariant to the layer divisor** of the test above: both
+          terms are summed over the same layers, so the divisor cancels. A reference
+          divided by a stale or absent layer count would be off by exactly 2 here.
+        * none of the three metrics carries a graph, and the loss is exactly what it
+          was before the reference existed -- the same fold-in identity the per-layer
+          test asserts, re-checked here because it is what "metric-only" means at the
+          model level.
+        """
+        _require_tilelang_cuda()
+
+        from unittest import mock
+
+        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+        model, batch = _build_4layer_test_model(
+            device=DEVICE, seq_len=4096, layer_types=self._TWO_CSA_LAYER_TYPES, coef=1.0, seed=0
+        )
+
+        # The per-row terms as the *reported* forward formed them, so the expectation
+        # and the metric come out of one run: these kernels are not bit-reproducible
+        # across forwards, and a second run's totals would only support a tolerance
+        # wider than the two aggregations below are apart.
+        terms = []
+        real_terms = modeling.indexer_kl_terms
+
+        def _recording(index_score, target):
+            kl, uniform = real_terms(index_score, target)
+            terms.append((kl.detach().float(), uniform.detach().float()))
+            return kl, uniform
+
+        with _single_rank_parallel_state():
+            with mock.patch(f"{_PATCHED_MODULE}.indexer_kl_terms", _recording):
+                out = model(**batch)
+            outputs = model.model(**_model_only_batch(batch))
+
+        tokens = batch["input_ids"].numel()
+        layers = outputs.indexer_kl_layers
+        assert layers == 2 and len(terms) == layers
+
+        kl_rows = torch.cat([kl.flatten() for kl, _ in terms])
+        uniform_rows = torch.cat([uniform.flatten() for _, uniform in terms])
+        ratio_of_means = kl_rows.sum() / uniform_rows.sum()
+
+        # fp32 throughout and one forward, so the two sides differ only in the order
+        # they sum in.
+        rtol = 1e-4
+        torch.testing.assert_close(
+            out.aux_metrics["indexer_kl_uniform"], uniform_rows.sum() / tokens / layers, atol=0, rtol=rtol
+        )
+        torch.testing.assert_close(out.aux_metrics["indexer_kl_captured"], 1.0 - ratio_of_means, atol=0, rtol=rtol)
+        assert torch.isfinite(out.aux_metrics["indexer_kl_captured"]).all()
+
+        # ... and the alternative is measured rather than assumed to differ. The
+        # threshold is scaled by what the leg above actually admits, which is
+        # ``rtol * |1 - ratio_of_means|`` and not ``rtol * ratio_of_means``: the two
+        # differ by a factor of 35 on this fixture, and the second would make this
+        # guard the strictest assertion in the test rather than a floor under the
+        # first. Observed here: 1.030161 against 1.029003, a separation of 1.16e-03
+        # where the leg admits 2.9e-06, so the wrong aggregation misses by ~400x. The
+        # factor of 10 leaves ordinary drift in the forward a wide berth while still
+        # failing before the fixture stops discriminating.
+        scoreable = uniform_rows > 1e-6
+        mean_of_ratios = (kl_rows[scoreable] / uniform_rows[scoreable]).mean()
+        separation = float((mean_of_ratios - ratio_of_means).abs())
+        assert separation > 10 * rtol * abs(1.0 - float(ratio_of_means)), (
+            f"the mean of the per-row ratios is {float(mean_of_ratios):.6f} against a ratio of means of "
+            f"{float(ratio_of_means):.6f}, only {separation:.2e} apart: this fixture can no longer tell the "
+            "two aggregations apart and the leg above is vacuous"
+        )
+
+        # The layer divisor cancels: the same fraction comes out of the undivided sums.
+        torch.testing.assert_close(
+            out.aux_metrics["indexer_kl_captured"],
+            1.0 - (kl_rows.sum() / tokens) / (uniform_rows.sum() / tokens),
+            atol=0,
+            rtol=rtol,
+        )
+
+        for name, value in out.aux_metrics.items():
+            assert value.grad_fn is None and not value.requires_grad, f"aux metric {name!r} carries a graph"
+        assert not outputs.indexer_uniform_total.requires_grad, (
+            "the reference reaches the model output with a graph attached, so a backward through anything "
+            "that touched it would reach the indexer"
+        )
+
+        # And the objective is untouched: the loss still differs from the pre-fold LM
+        # loss by the layer-summed KL alone.
+        folded = out.loss.detach() - out.aux_metrics["lm_loss_before_indexer_kl"]
+        layer_sum = (outputs.indexer_kl_total / tokens).to(out.loss.dtype)
+        admitted = 8 * torch.finfo(out.loss.dtype).eps * out.loss.detach().abs().item()
+        torch.testing.assert_close(folded, layer_sum, atol=admitted, rtol=0)
+
+    def test_the_pre_fold_language_model_loss_is_reported(self):
+        """The clean LM curve a flag-on run needs to be comparable to a flag-off one.
+
+        The KL is folded into ``loss`` -- deliberately, because that is what makes the
+        indexer's gradient scale right by construction -- so ``training/foundation_loss``
+        on a flag-on run is contaminated by it, which is Task 10's one unmet acceptance
+        criterion. The value from *before* the fold-in is reported alongside the KL so
+        that the criterion can be read directly.
+
+        Two things pin it, and the second is the one that matters:
+
+        * the difference between the reported total and this metric is the folded KL,
+          which fails if the metric is simply ``out.loss`` read after the fold-in -- the
+          obvious way to get this wrong -- and
+        * the metric tracks a flag-off run's loss to within the ULPs that separate two
+          runs of this forward, which is the criterion itself. Without that leg the
+          metric could be any pre-fold quantity at all.
+
+        The tolerance is the same one ``test_the_coefficient_scales_what_the_loss_receives``
+        derives: two forwards of this model that differ only in whether the attention
+        kernel also returned its LSE are not bitwise equal, and the bound has to admit
+        that while staying far below the KL it is separating.
+        """
+        _require_tilelang_cuda()
+
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=True, coef=1.0, seed=0)
+        with _single_rank_parallel_state():
+            out = model(**batch)
+
+        pre_fold = out.aux_metrics["lm_loss_before_indexer_kl"]
+        assert not pre_fold.requires_grad and pre_fold.grad_fn is None, "the pre-fold loss must be a metric only"
+
+        reported = out.aux_metrics["indexer_kl"].to(out.loss.dtype)
+        admitted = 8 * torch.finfo(out.loss.dtype).eps * out.loss.detach().abs().item()
+        assert reported > 100 * admitted, (
+            f"the reported KL {float(reported):.3e} cannot be told from zero at this precision, so "
+            "neither leg below separates anything"
+        )
+        torch.testing.assert_close(out.loss.detach() - pre_fold, reported, atol=admitted, rtol=0)
+
+        off, off_batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=False, seed=0)
+        with _single_rank_parallel_state():
+            off_out = off(**off_batch)
+        torch.testing.assert_close(pre_fold, off_out.loss.detach(), atol=admitted, rtol=0)
+
+    def test_the_pre_fold_loss_is_absent_when_there_is_nothing_to_fold_into(self):
+        """Without labels there is no loss, so there is no pre-fold value to report.
+
+        ``loss`` is ``None`` on that path and ``None.detach()`` would raise, so the
+        entry has to sit inside the ``labels is not None`` branch rather than beside
+        the KL. The KL itself is still reported, which is what distinguishes this from
+        skipping the block.
+        """
+        _require_tilelang_cuda()
+
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, labels=False)
+        with _single_rank_parallel_state():
+            out = model(**batch)
+
+        assert out.loss is None
+        assert "lm_loss_before_indexer_kl" not in out.aux_metrics
+        assert out.aux_metrics["indexer_kl"] > 0
+
+    def test_the_indexer_objective_moves_only_the_indexer(self):
+        """Decoupling at model scope: the auxiliary objective may move indexer
+        parameters and nothing else.
+
+        The KL leaving ``DeepseekV4Model.forward`` in a declared field is what makes
+        this exact. Comparing two whole runs' gradients would not be: measured on this
+        model, two identical flag-off runs already disagree on 77 of their 102
+        gradients at the bf16 ULP level, because the backward's reductions are not
+        deterministic -- so an equality comparison there cannot separate a leak from
+        the noise floor. Backpropagating the KL alone has no noise floor at all: a
+        parameter outside the indexer either receives a gradient from it or does not.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096)
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+        outputs.indexer_kl_total.backward()
+
+        moved = [name for name, param in model.named_parameters() if param.grad is not None]
+        assert moved, "the model-level KL trained nothing at all"
+        assert all(".indexer." in name for name in moved), (
+            f"the indexer objective moved parameters outside the indexer: "
+            f"{[name for name in moved if '.indexer.' not in name]}"
+        )
+        for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+            grad = getattr(_csa_layers(model)[0].self_attn.compressor.indexer, name).weight.grad
+            assert grad is not None and grad.abs().sum() > 0, f"indexer.{name} received no usable gradient"
+
+    def test_the_flag_off_model_forward_is_untouched(self):
+        """The off side of every branch this task adds, at model scope.
+
+        With the flag off the decoder layer must still return a bare tensor, the model
+        output must carry no indexer fields, and the causal-LM output must report no
+        aux metrics. Inverting any of those gates would break every flag-off DeepSeek-V4
+        forward in the tree while leaving the enabled path green.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, indexer_loss=False)
+        with _single_rank_parallel_state():
+            outputs = model.model(**_model_only_batch(batch))
+            out = model(**batch)
+
+        assert outputs.indexer_kl_total is None
+        assert outputs.indexer_query_tokens is None
+        assert list(outputs.keys()) == ["last_hidden_state"], (
+            f"the flag-off model output grew fields: {list(outputs.keys())}"
+        )
+        assert out.aux_metrics is None
+        assert torch.isfinite(out.loss)
+        for layer in _csa_layers(model):
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+                param = getattr(layer.self_attn.compressor.indexer, name).weight
+                assert param.grad is None
+
+        out.loss.backward()
+        for layer in _csa_layers(model):
+            for name in ("q_b_proj", "kv_proj", "gate_proj", "weights_proj"):
+                param = getattr(layer.self_attn.compressor.indexer, name).weight
+                assert param.grad is None, f"indexer.{name} received a gradient with the loss disabled"
+
+    def test_the_kl_is_reported_but_not_added_when_there_are_no_labels(self):
+        """Inference has no loss to add the KL to.
+
+        ``loss`` is ``None`` without labels, so a fold-in that did not check would
+        raise ``TypeError: unsupported operand type(s) for +: 'NoneType'``. The metric
+        is still reported, which is what makes this distinguishable from skipping the
+        KL entirely.
+        """
+        _require_tilelang_cuda()
+        model, batch = _build_4layer_test_model(device=DEVICE, seq_len=4096, labels=False)
+        with _single_rank_parallel_state():
+            out = model(**batch)
+
+        assert out.loss is None
+        assert out.aux_metrics is not None and out.aux_metrics["indexer_kl"] > 0
+
+
+class TestModelBuildRefusesUnsupportedPrerequisites:
+    """The prerequisite check being *wired into* ``build_foundation_model``, which is
+    what makes it a launch-time refusal rather than a function nothing calls.
+
+    The refusals themselves are covered above, on
+    ``DeepseekV4Config.validate_build_prerequisites`` directly. What only this group can see is
+    that the call happens, that it happens before the loader runs, and that it does
+    not refuse the configurations it has no business refusing -- a gate that raised
+    on every build, or on none, would pass every test above.
+    """
+
+    @staticmethod
+    def _build(config_path, loader, indexer_loss=True, coef=1.0, implementation="tilelang"):
+        """``build_foundation_model`` with nothing built, returning the loader's calls.
+
+        ``build_foundation_model`` is the whole surface: it is the one construction
+        path in the tree, so a gate installed there covers every model build.
+
+        The objective goes in as a ``config_kwargs`` override, which is the path
+        ``model.model_config`` takes from YAML, and the two implementations go on the
+        ops config, which is where they live. Together they are the disagreement the
+        gate exists to catch, and staging it this way means the test would also fail
+        if the override stopped reaching the config at all.
+        """
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from veomni.models.auto import build_config, build_foundation_model
+
+        parallel_state = SimpleNamespace(cp_enabled=False, sp_enabled=False, global_rank=0)
+        ops_config = SimpleNamespace(
+            attn_implementation="eager",
+            dsa_indexer_implementation=implementation,
+            dsa_attention_implementation=implementation,
+        )
+        config = build_config(config_path, dsa_indexer_loss=indexer_loss, dsa_indexer_loss_coef=coef)
+        with (
+            mock.patch("veomni.models.auto.get_parallel_state", return_value=parallel_state),
+            mock.patch("veomni.ops.config.singleton.get_ops_config", return_value=ops_config),
+            mock.patch("veomni.models.auto.get_loader", return_value=loader),
+        ):
+            build_foundation_model(config_path=config, init_device="meta")
+        return loader.calls
+
+    def test_an_unsupported_implementation_is_refused_before_the_model_is_built(self):
+        """The point of checking at build time at all: the answer has to arrive before
+        every rank has read a checkpoint -- 54.8 GB for DeepSeek-V4-Flash -- to be told
+        that three lines of YAML disagree with each other.
+
+        ``loader.calls == 0`` is the assertion that matters here; the message content
+        is pinned where the check itself is tested.
+        """
+        loader = _StubLoader()
+        with pytest.raises(ValueError, match="dsa_indexer_loss requires"):
+            self._build("tests/toy_config/deepseek_v4_toy", loader=loader, implementation="eager")
+        assert loader.calls == 0, "the refusal must come before the model is constructed"
+
+    def test_the_supported_configuration_builds(self):
+        """The one configuration the objective exists for.
+
+        Without this leg a gate stuck at "refuse everything" would look correct.
+        """
+        loader = _StubLoader()
+        assert self._build("tests/toy_config/deepseek_v4_toy", loader=loader) == 1
+
+    def test_the_flag_off_admits_an_unsupported_implementation(self):
+        """The flag-off inertness guarantee at build time: with the objective off, the
+        two implementations are nobody's prerequisite and an eager run is ordinary.
+
+        Every model in the tree goes through this line on every build.
+        """
+        loader = _StubLoader()
+        assert (
+            self._build("tests/toy_config/deepseek_v4_toy", loader=loader, indexer_loss=False, implementation="eager")
+            == 1
+        )
+
+    def test_a_model_that_cannot_declare_the_field_is_untouched(self):
+        """A model whose config never declared the field cannot be asked for the
+        objective, so the gate has nothing to say about it -- no allow-list, and no
+        model type named anywhere.
+
+        GLM MoE DSA is the case from the earlier review: it has a Lightning Indexer of
+        its own and declares both DSA implementation fields, so it is the model most
+        likely to be pointed at this objective by mistake. Under the previous design,
+        where the flag was a field of the model-agnostic ``OpsImplementationConfig``,
+        that mistake had to be refused by an explicit allow-list. Now the flag is a
+        ``DeepseekV4Config`` field, so there is no ``dsa_indexer_loss`` for a GLM run
+        to set and nothing to enumerate: this build is refused by nothing and reaches
+        the loader with an eager DSA stack, exactly as it would have before the
+        objective existed.
+        """
+        loader = _StubLoader()
+        assert (
+            self._build("tests/toy_config/glm_moe_dsa_toy", loader=loader, indexer_loss=False, implementation="eager")
+            == 1
+        )
+
+    def test_a_zero_coefficient_admits_an_unsupported_implementation(self):
+        """The coefficient-only switch has to mean the same thing here as everywhere
+        else, or it is not a switch.
+
+        The runtime gate reads the weight before anything else and treats zero as off,
+        and ``arguments.md`` documents it as the way to disable the term without
+        editing the flag. It is also the escape hatch for a checkpoint whose
+        ``config.json`` carries ``dsa_indexer_loss: true`` from the run that produced
+        it and which someone now wants to serve on an eager stack.
+        """
+        loader = _StubLoader()
+        assert self._build("tests/toy_config/deepseek_v4_toy", loader=loader, coef=0.0, implementation="eager") == 1
+
+
+class _StubLoader:
+    """Stands in for the real loader, so the gate is the only thing under test.
+
+    The gate runs before construction, so building a real model would make an
+    assertion that *nothing happened* the most expensive test in the file. Carrying
+    no ``model_cls`` is deliberate --
+    ``build_foundation_model`` reads it with ``getattr(..., None)`` and skips the
+    OpSlot binding.
+    """
+
+    def __init__(self):
+        self.model = torch.nn.Identity()
+        self.calls = 0
+
+    def load_model(self, **kwargs):
+        self.calls += 1
+        return self.model

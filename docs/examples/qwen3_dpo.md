@@ -38,7 +38,7 @@ The script appends the model name to `--local_dir`, saving to `./Qwen3-0.6B`.
 bash train.sh tasks/train_text_dpo.py configs/text/qwen3_dpo.yaml
 ```
 
-Key config values (full DPO argument reference: [arguments.md — DPOConfig](../usage/arguments.md#dpo-arguments)):
+Key config values (full DPO argument reference: [arguments.md — DPOConfig](../usage/arguments.md#dpoconfig)):
 
 | Parameter | Value |
 |---|---|

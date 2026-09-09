@@ -27,6 +27,7 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
         load_path=None,
         manager="dcp",
         dcp_save_to_lowest_rank=False,
+        stage_dir=None,
         save_hf_weights=True,
         hf_save_steps=5,
         hf_save_epochs=1,
@@ -244,3 +245,44 @@ class TestHuggingfaceCkptCallbackLastSavedStep:
         mock_save_hf.reset_mock()
         cb.on_train_end(state)
         mock_save_hf.assert_not_called()
+
+
+@patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer")
+@patch("veomni.trainer.callbacks.checkpoint_callback.dist")
+@patch("veomni.trainer.callbacks.checkpoint_callback.helper")
+class TestCheckpointerCallbackTrainEndWait:
+    """CheckpointerCallback.on_train_end must consume a pending async save.
+
+    Without it, a run whose last save is also its only save (no load_path, no
+    save_hf_weights) exits without ever calling result() on the async future, so
+    a write that raised in the background thread is discarded and the process
+    still exits 0 with no checkpoint on disk.
+    """
+
+    def test_train_end_waits_for_pending_async_save(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer(save_async=True)
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        cb.on_train_end(TrainerState(global_step=60))
+
+        trainer.checkpointer.wait_for_pending_save.assert_called_once_with()
+
+    def test_train_end_propagates_async_save_failure(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer(save_async=True)
+        mock_build_ckpt.return_value = trainer.checkpointer
+        trainer.checkpointer.wait_for_pending_save.side_effect = RuntimeError("HDFS write failed")
+        cb = CheckpointerCallback(trainer)
+
+        with pytest.raises(RuntimeError, match="HDFS write failed"):
+            cb.on_train_end(TrainerState(global_step=60))
+
+    def test_train_end_waits_even_without_async(self, mock_helper, mock_dist, mock_build_ckpt):
+        """The call is unconditional; wait_for_pending_save is a no-op when nothing is pending."""
+        trainer = _make_mock_trainer(save_async=False)
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        cb.on_train_end(TrainerState(global_step=60))
+
+        trainer.checkpointer.wait_for_pending_save.assert_called_once_with()

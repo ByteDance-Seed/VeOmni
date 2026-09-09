@@ -13,7 +13,7 @@ This guide walks through **training** and **inference** for MiniMax H3 FL2VA (fi
 2. [Data Format](#2-data-format)
 3. [Training (Two Stages, Step by Step)](#3-training-two-stages-step-by-step)
 4. [Training Config Notes](#4-training-config-notes)
-5. [Inference](#5-inference-step-by-step)
+5. [Inference](#5-inference)
 6. [Inference Config Notes](#6-inference-config-notes)
 
 ---
@@ -45,7 +45,7 @@ dataset/my_data/
 
 The following 4 columns are **required**, with fixed column names:
 
-```csv
+```text
 video,prompt,input_audio,frame_rate
 video.mp4,"A girl is very happy, she is speaking in english.",video.mp4,24
 ```
@@ -65,8 +65,6 @@ video.mp4,"A girl is very happy, she is speaking in english.",video.mp4,24
 | Resolution | **480x832** (height x width) | Must be divisible by the VAE downsampling factor |
 | Frame rate | 24 | `fps: 24` in the config; audio latent length is computed as `num_frames/24*40` |
 | Audio | 32kHz stereo | Audio is resampled to 32kHz automatically; videos without audio fail during training |
-
----
 
 ## 3. Training (Two Stages, Step by Step)
 
@@ -259,5 +257,3 @@ video, audio = pipe(
 **Important**:
 
 - `num_frames` must satisfy `(N-5) % 17 == 0`, otherwise the Video VAE raises an error
-
----

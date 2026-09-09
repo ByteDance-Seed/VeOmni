@@ -46,6 +46,13 @@ def main() -> None:
         config_path=args.infer.model_path,
         weights_path=args.infer.model_path,
         ops_implementation=_INFERENCE_OPS,
+        # A training objective baked into a checkpoint's ``config.json`` would
+        # otherwise follow it here: DeepSeek-V4 serialises ``dsa_indexer_loss``,
+        # which demands the TileLang DSA stack that ``_INFERENCE_OPS`` has just
+        # pinned to eager, so a flag-on checkpoint would be refused at build with
+        # no way to override it from ``InferArguments``. Inference trains nothing.
+        # Dropped silently for every other model, whose config never declares it.
+        config_kwargs={"dsa_indexer_loss": False},
     )
     tokenizer = AutoTokenizer.from_pretrained(args.infer.tokenizer_path, padding_side="left")
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)

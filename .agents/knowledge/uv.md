@@ -19,7 +19,7 @@ CI install a concrete pin and use `--locked` / `--frozen` for reproducibility.
 ```
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed, transformers NOT included here)
-├── [project.optional-dependencies]     Hardware-shaped extras (deliberately just three + legacy `dev`)
+├── [project.optional-dependencies]     Hardware extras + optional Magi extra + legacy `dev`
 │   ├── gpu          NVIDIA x86_64 / aarch64 (glibc 2.34+) — full superset:
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
@@ -28,6 +28,9 @@ pyproject.toml
 │   │                  + liger-kernel + FLA + quack + TileLang/TileKernels + DLPack ext
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
+│   ├── magi         Optional NVIDIA SM90+ MagiAttention FFA (combine with gpu):
+│   │                  magi-attention + create-block-mask-cuda + flash-attn-cute
+│   │                  + magi-to-hstu-cuda + debugpy; source-built CUDA extensions
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
 │   │                  torch 2.10.0+cpu + torch-npu 2.10.0
 │   │                  + diffusers / av / audio / video / peft / megatron-energon
@@ -43,29 +46,34 @@ pyproject.toml
 ├── [tool.uv]
 │   ├── required-version     Pinned uv version
 │   ├── override-dependencies  Per-extra torch/CUDA pins (markers scoped to gpu/npu/npu_aarch64)
-│   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion
+│   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion;
+│   │                        magi also conflicts with npu / npu_aarch64
 │   └── sources              Custom indexes, direct wheel URLs (av, torch,
 │                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA);
 │                            git source (flash-qla)
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
 ```
 
-## Hardware Extras (Mutually Exclusive)
+## Hardware Extras
 
-`gpu` / `npu` / `npu_aarch64` are declared as conflicts. trl is not included
-— VeOmni's DPO trainer is from-scratch.
+`gpu` / `npu` / `npu_aarch64` are declared as conflicts. MagiAttention is a
+fourth extra that requires `gpu` (`veomni[gpu]` in the magi extra) and
+conflicts with the NPU extras.
 
 ```bash
-uv sync --extra gpu --dev           # NVIDIA GPU
-uv sync --extra npu --dev           # Ascend NPU x86
-uv sync --extra npu_aarch64 --dev   # Ascend NPU ARM
+uv sync --extra gpu --dev                      # NVIDIA GPU
+uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM90+)
+uv sync --extra npu --dev                      # Ascend NPU x86
+uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
 ```
 
 A fresh `--extra gpu` installs architecture-specific torch, torchcodec, AV,
 FA3, and FlashMLA wheels. FA2 is installed from prebuilt wheels on x86_64 and
 omitted on aarch64. FA4 is a pure-Python wheel; only FlashQLA builds from git.
 The aarch64 FA3 wheel requires glibc 2.34 or newer. uv caches built wheels
-under `~/.cache/uv`.
+under `~/.cache/uv`. MagiAttention is not part of that default GPU set:
+`--extra magi` also pulls `gpu` and source-builds SM90/SM100 CUDA extensions.
+Omit it on Ampere/Ada (SM80/SM89) and CPU environments.
 
 The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
@@ -94,6 +102,7 @@ forced into a specific 5.x patch.
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
 | `flash-qla` | git: QwenLM/FlashQLA | source-built; uv overrides its TileLang 0.1.8 metadata pin |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
+| `magi-attention` | git: SandAI-org/MagiAttention | optional `--extra magi`; SM90/SM100 source build |
 
 Two pyproject knobs make the remaining FlashQLA source build succeed:
 
@@ -122,8 +131,9 @@ DSL package, flash-qla uses dependency-metadata).
 
 ```bash
 uv sync --extra gpu --dev                          # local dev (cp311 or cp312)
+uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM90+)
 uv lock                                             # after pyproject edits
-uv sync --locked --all-packages --extra gpu --dev  # docker / CI
+uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
 ```
 
 ## Key Rules

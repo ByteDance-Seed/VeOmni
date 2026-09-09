@@ -7,15 +7,21 @@ in-tree bugs — they become regression guards once the fix lands.
 """
 
 import inspect
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.distributed.fsdp import fully_shard
 
 from veomni.distributed import torch_parallelize
+from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import (
     build_parallelize_model,
     parallelize_model_ddp,
@@ -24,6 +30,76 @@ from veomni.distributed.torch_parallelize import (
 from veomni.models.module_utils import init_empty_weights
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
+
+
+def _fsdp2_multi_optimizer_worker(rank: int, world_size: int, tmp_path: Path):
+    """Worker for the FSDP2 MultiOptimizer DCP round-trip test."""
+    from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
+    from veomni.optim.optimizer import MultiOptimizer
+    from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(os.environ.get("_TEST_MASTER_PORT", "0"))
+    device_type = get_device_type()
+    backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+    device = torch.device("cpu" if device_type == "cpu" else f"{device_type}:{rank}")
+    if device_type != "cpu":
+        get_torch_device().set_device(device)
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+
+    try:
+        init_parallel_state(dp_size=world_size, dp_mode="fsdp2")
+        mesh = get_parallel_state().dp_shard_mesh
+
+        def build_model_and_optimizer():
+            model = nn.Sequential(nn.Linear(4, 4, bias=True), nn.Linear(4, 4, bias=True)).to(device)
+            for layer in model:
+                fully_shard(layer, mesh=mesh)
+            fully_shard(model, mesh=mesh)
+            optimizer = MultiOptimizer(
+                model,
+                {
+                    "adamw0": torch.optim.AdamW(model[0].parameters(), lr=1e-3),
+                    "adamw1": torch.optim.AdamW(model[1].parameters(), lr=1e-3),
+                },
+                ["adamw0", "adamw1"],
+            )
+            return model, optimizer
+
+        source_model, source_optimizer = build_model_and_optimizer()
+        x = torch.randn(2, 4, device=device)
+        source_model(x).sum().backward()
+        source_optimizer.step()
+        expected = source_optimizer.state_dict()
+
+        checkpoint_dir = tmp_path / "ckpt"
+        dcp.save(
+            {"model": ModelState(source_model), "optimizer": OptimizerState(source_model, source_optimizer)},
+            checkpoint_id=str(checkpoint_dir),
+        )
+        dist.barrier()
+
+        target_model, target_optimizer = build_model_and_optimizer()
+        dcp.load(
+            {
+                "model": ModelState(target_model),
+                "optimizer": OptimizerState(target_model, target_optimizer, load=True),
+            },
+            checkpoint_id=str(checkpoint_dir),
+        )
+
+        actual = target_optimizer.state_dict()
+        assert expected.keys() == actual.keys()
+        for key in expected:
+            expected_value = expected[key]
+            actual_value = actual[key]
+            if torch.is_tensor(expected_value):
+                torch.testing.assert_close(expected_value, actual_value, atol=0.0, rtol=0.0)
+            else:
+                assert expected_value == actual_value
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +153,100 @@ class TestOptimizerStateNoFill:
 
         with pytest.raises(TypeError, match="fill_missing_optimizer_states"):
             OptimizerState(model, optimizer, fill_missing_optimizer_states=True)
+
+
+class TestMultiOptimizerState:
+    """Non-ExtraParallel MultiOptimizer must use its own DCP protocol."""
+
+    def test_single_process_dcp_roundtrip(self, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.optim.optimizer import MultiOptimizer
+
+        def build_model_and_optimizer():
+            model = nn.Linear(4, 4)
+            optimizer = MultiOptimizer(
+                model,
+                {
+                    "adamw_w": torch.optim.AdamW([model.weight], lr=1e-3),
+                    "adamw_b": torch.optim.AdamW([model.bias], lr=1e-3),
+                },
+                ["adamw_w", "adamw_b"],
+            )
+            return model, optimizer
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        source_model, source_optimizer = build_model_and_optimizer()
+        for param in source_model.parameters():
+            param.grad = torch.randn_like(param)
+        source_optimizer.step()
+        expected = source_optimizer.state_dict()
+        assert any("exp_avg" in key for key in expected)
+        assert any("step" in key for key in expected)
+
+        target_model, target_optimizer = build_model_and_optimizer()
+        dcp.save(
+            {"optimizer": OptimizerState(source_model, source_optimizer, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+        dcp.load(
+            {"optimizer": OptimizerState(target_model, target_optimizer, parallel_state=parallel_state, load=True)},
+            checkpoint_id=tmp_path,
+        )
+
+        actual = target_optimizer.state_dict()
+        assert expected.keys() == actual.keys()
+        for key, expected_value in expected.items():
+            actual_value = actual[key]
+            if torch.is_tensor(expected_value):
+                torch.testing.assert_close(expected_value, actual_value, atol=0.0, rtol=0.0)
+            else:
+                assert expected_value == actual_value
+
+    def test_fsdp2_multi_optimizer_roundtrip(self, tmp_path):
+        """Run the MultiOptimizer DCP round-trip across two real FSDP2 ranks."""
+        from tests.tools.launch_utils import find_free_port
+
+        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
+        mp.spawn(_fsdp2_multi_optimizer_worker, args=(2, tmp_path), nprocs=2, join=True)
+
+    def test_multi_optimizer_sparse_state_excludes_synthetic(self, tmp_path):
+        """A fresh sub-optimizer must not have synthetic state materialized in the checkpoint."""
+        from torch.distributed.checkpoint import FileSystemReader
+        from torch.distributed.checkpoint.metadata import Metadata
+
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+        from veomni.optim.optimizer import MultiOptimizer
+
+        model = nn.Linear(4, 4)
+        optimizer = MultiOptimizer(
+            model,
+            {
+                "adamw_w": torch.optim.AdamW([model.weight], lr=1e-3),
+                "adamw_b": torch.optim.AdamW([model.bias], lr=1e-3),
+            },
+            ["adamw_w", "adamw_b"],
+        )
+        # Only bias gets a gradient; the adamw_w sub-optimizer remains empty.
+        model.bias.grad = torch.randn_like(model.bias)
+        optimizer.step()
+        assert optimizer.optimizers_dict["adamw_b"].state
+        assert not optimizer.optimizers_dict["adamw_w"].state
+
+        parallel_state = SimpleNamespace(dp_mode="fsdp2")
+        dcp.save(
+            {"optimizer": OptimizerState(model, optimizer, parallel_state=parallel_state)},
+            checkpoint_id=tmp_path,
+        )
+
+        reader = FileSystemReader(tmp_path)
+        metadata = reader.read_metadata()
+        assert isinstance(metadata, Metadata)
+        keys = list(metadata.state_dict_metadata.keys())
+        state_keys = [k for k in keys if k.startswith("optimizer.state.")]
+        assert any("bias" in k for k in state_keys), f"expected bias state in checkpoint keys: {keys}"
+        assert not any(k.startswith("optimizer.state.weight.") for k in state_keys), (
+            f"synthetic weight state must not be saved: {keys}"
+        )
 
 
 class TestAllowPartialLoad:
@@ -938,3 +1108,221 @@ class TestExtraStateSaveLoad:
 
         state = {"model": MagicMock()}
         DistributedCheckpointer._load_extra_state(str(tmp_path), state)
+
+
+class TestPromoteStagedCheckpoint:
+    """`stage_dir` promotion: a staged checkpoint becomes visible only once complete.
+
+    Choosing a usable staging directory is the caller's job, so what is pinned
+    down here is what the checkpointer itself owns: ordering of the completion
+    marker, collective parity across success and failure, and never leaving the
+    staged copy behind.
+    """
+
+    @pytest.fixture
+    def make_staged(self, tmp_path):
+        """Build an independent staged checkpoint and destination on each call.
+
+        Promotion consumes the staged copy, so anything exercising it more than
+        once needs a fresh one per run rather than a shared directory.
+        """
+
+        def _make(name: str = "default"):
+            stage_path = tmp_path / name / "stage"
+            final_path = tmp_path / name / "final"
+            stage_path.mkdir(parents=True)
+            for entry in ("__0_0.distcp", "__0_1.distcp", ".metadata"):
+                (stage_path / entry).write_text(entry)
+            return str(stage_path), str(final_path)
+
+        return _make
+
+    @pytest.fixture
+    def staged(self, make_staged):
+        """A single staged checkpoint (two data files plus `.metadata`) and its destination."""
+        return make_staged()
+
+    def test_copies_everything_and_removes_the_staged_copy(self, staged):
+        """The happy path: the destination ends up complete and the scratch copy is gone."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
+            _promote_staged_checkpoint(stage_path, final_path)
+        assert sorted(os.listdir(final_path)) == [".metadata", "__0_0.distcp", "__0_1.distcp"]
+        assert not os.path.exists(stage_path)
+
+    def test_metadata_lands_after_the_data_files(self, staged):
+        """DCP reads `.metadata` as "complete", so it must be copied last."""
+        import shutil as _shutil
+
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        order = []
+        real_copy = _shutil.copyfile
+
+        def spy(src, dst):
+            """Record each copied filename, then perform the real copy."""
+            order.append(os.path.basename(dst))
+            return real_copy(src, dst)
+
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
+            with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=spy):
+                _promote_staged_checkpoint(stage_path, final_path)
+        assert order[-1] == ".metadata"
+
+    def test_stale_metadata_is_removed_before_any_data_is_copied(self, staged):
+        """Overwriting in place must not leave the old marker over half-new data."""
+        import shutil as _shutil
+
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        os.makedirs(final_path)
+        with open(os.path.join(final_path, ".metadata"), "w") as f:
+            f.write("previous checkpoint")
+
+        events = []
+        real_copy = _shutil.copyfile
+        real_remove = os.remove
+
+        def copy_spy(src, dst):
+            """Record a copy event, then perform the real copy."""
+            events.append(("copy", os.path.basename(dst)))
+            return real_copy(src, dst)
+
+        def remove_spy(path):
+            """Record a removal event, then perform the real removal."""
+            events.append(("remove", os.path.basename(path)))
+            return real_remove(path)
+
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
+            with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=copy_spy):
+                with patch("veomni.checkpoint.dcp_checkpointer.os.remove", side_effect=remove_spy):
+                    _promote_staged_checkpoint(stage_path, final_path)
+
+        assert events[0] == ("remove", ".metadata")
+        assert events[-1] == ("copy", ".metadata")
+
+    def test_staged_copy_is_removed_even_when_promotion_fails(self, staged):
+        """A leftover staged copy is the size of the model plus its optimizer state."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
+            with patch(
+                "veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=OSError("destination is full")
+            ):
+                with pytest.raises(OSError, match="destination is full"):
+                    _promote_staged_checkpoint(stage_path, final_path)
+        assert not os.path.exists(stage_path)
+
+    # (global_rank, local_rank) for the three roles promotion distinguishes.
+    # Rank 8 matters on its own: it leads its node but is not the coordinator, so
+    # it copies data without ever touching `.metadata`.
+    _ROLES = {"coordinator_leader": (0, 0), "leader_only": (8, 0), "participant": (1, 1)}
+    # The participant copies nothing, so it cannot be a copy-failure source.
+    _COPYING_ROLES = ["coordinator_leader", "leader_only"]
+
+    @pytest.mark.parametrize("failing_role", _COPYING_ROLES)
+    def test_every_rank_runs_the_same_barriers_when_a_copy_fails(self, make_staged, failing_role):
+        """Collective parity: barriers are untagged, so one rank skipping one hangs the job.
+
+        Whichever role fails, every role -- including the participant that copies
+        nothing -- must reach the same number of barriers, and the error must
+        surface only after the last one.
+        """
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        counts = {}
+        for role, (global_rank, local_rank) in self._ROLES.items():
+            stage_path, final_path = make_staged(f"{failing_role}-{role}")
+            barrier = MagicMock()
+            raised = False
+            with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
+                with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier", barrier):
+                    with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=global_rank):
+                        with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=local_rank):
+                            with patch(
+                                "veomni.checkpoint.dcp_checkpointer.shutil.copyfile",
+                                side_effect=OSError("boom") if role == failing_role else None,
+                            ):
+                                try:
+                                    _promote_staged_checkpoint(stage_path, final_path)
+                                except OSError:
+                                    raised = True
+            counts[role] = barrier.call_count
+            assert raised == (role == failing_role), f"{role}: unexpected raise={raised}"
+
+        assert len(set(counts.values())) == 1, f"barrier count diverged across roles: {counts}"
+        assert set(counts.values()) == {4}
+
+    def test_failure_is_raised_only_after_the_last_barrier(self, staged):
+        """Raising early would strand the other ranks on a collective that never completes."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        calls = []
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
+            with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier", side_effect=lambda: calls.append("barrier")):
+                with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0):
+                    with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0):
+                        with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=OSError("boom")):
+                            with pytest.raises(OSError, match="boom"):
+                                _promote_staged_checkpoint(stage_path, final_path)
+        assert len(calls) == 4
+
+    def test_non_leader_non_coordinator_ranks_touch_nothing(self, staged):
+        """Ranks other than the node leaders and the coordinator only participate in barriers."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
+            with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier"):
+                with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=3):
+                    with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
+                        _promote_staged_checkpoint(stage_path, final_path)
+        assert not os.path.exists(final_path)
+        assert os.path.exists(stage_path)
+
+
+class TestStageDirValidation:
+    def test_stage_dir_with_explicit_storage_writer_is_rejected(self, tmp_path):
+        """Silently ignoring stage_dir would write to the slow destination it was avoiding."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        with pytest.raises(ValueError, match="explicit storage_writer"):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=False,
+                storage_writer=MagicMock(),
+                stage_dir=str(tmp_path / "stage"),
+            )
+        assert not final.exists()
+
+    def test_stage_key_does_not_collide_across_similar_paths(self):
+        """Separator substitution maps /tmp/a_b/c and /tmp/a/b_c onto one directory."""
+        from veomni.checkpoint.dcp_checkpointer import _stage_key
+
+        assert _stage_key("/tmp/a_b/c") != _stage_key("/tmp/a/b_c")
+        assert _stage_key("/tmp/run/step_1") == _stage_key("/tmp/run/step_1")
+        assert _stage_key("/tmp/run/step_1") != _stage_key("/tmp/run/step_2")
+        # a relative destination and its absolute spelling stage together
+        assert _stage_key("run/step_1") == _stage_key(os.path.join(os.getcwd(), "run", "step_1"))
+
+    def test_stage_dir_with_save_async_is_rejected_before_any_side_effect(self, tmp_path):
+        """The staged copy is dropped when save() returns, i.e. before an async write ends."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        with pytest.raises(ValueError, match="stage_dir cannot be combined with save_async"):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=True,
+                stage_dir=str(tmp_path / "stage"),
+            )
+        assert not final.exists()
