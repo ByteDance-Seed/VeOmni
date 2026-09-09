@@ -152,7 +152,7 @@ already gitignored so it won't leak into the repo).
 Track the phases with whatever todo/plan tool the running agent provides.
 Suggested plan:
 
-```
+```text
 Phase 0: Verify venv + drop HF reference files       -> in_progress
 Phase 1: Scope & audit upstream surface              -> pending
 Phase 2: Draft <model>_gpu_patch_gen_config.py       -> pending
@@ -161,7 +161,7 @@ Phase 4: Wire __init__.py to expose generated classes -> pending
 Phase 5: Run patchgen + verify diff                   -> pending
 Phase 6: Add test cases                               -> pending
 Phase 7: Run tests (single-GPU + e2e)                 -> pending
-Phase 8: Docs + commit; /veomni-review before the PR  -> pending
+Phase 8: Docs + commit; review before PR or substantive update -> pending
 ```
 
 Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
@@ -447,7 +447,7 @@ Guidelines:
 
 **Regen command** (put at top of file as docstring, mirror qwen3):
 
-```
+```bash
 patchgen \
     veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
     -o veomni/models/transformers/<m>/generated --diff
@@ -786,9 +786,10 @@ Extra e2e gotchas:
      expectations or public APIs. Follow `[{modules}] {type}: {description}`.
      Example: `[veomni] feat: add patchgen-generated modeling for <m>`.
    - Commit message **must not** mention Claude / AI / Co-Authored-By.
-4. **Before opening the PR**: run `/veomni-review` over the branch diff. This
-   work touches `veomni/`, so the gate applies.
-   - `safe` / `needs-attention` → open the PR.
+4. **Before opening the PR or pushing a substantive update**: run
+   `/veomni-review` over the branch diff. This work touches `veomni/`, so the
+   gate applies.
+   - `safe` / `needs-attention` → address findings, then open or update the PR.
    - `risky` → report, wait for the user.
 
 ---
