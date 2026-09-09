@@ -35,9 +35,9 @@ Extra parallelism is applied on dim-0 (expert number, vocab size), while FSDP2 i
 
 When using train script (e.g. [tasks/train_vlm.py](../../tasks/train_vlm.py)), add the arguments:
 ```shell
---train.accelerator.extra_parallel_sizes size1 size2
---train.accelerator.extra_parallel_placement_innermost bool1 bool2
---train.accelerator.extra_parallel_names name1 name2
+--model.accelerator.extra_parallel_sizes size1 size2
+--model.accelerator.extra_parallel_placement_innermost bool1 bool2
+--model.accelerator.extra_parallel_names name1 name2
 ```
 
 In the parallel plan config (e.g. [qwen3_moe/parallel_plan.py](../../veomni/models/transformers/qwen3_moe/parallel_plan.py)), add

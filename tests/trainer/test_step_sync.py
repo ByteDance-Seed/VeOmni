@@ -40,18 +40,18 @@ def test_reset_async_activation_offload_skips_missing_config(monkeypatch):
 
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.model = object()
-    trainer.args = SimpleNamespace(train=SimpleNamespace(accelerator=SimpleNamespace()))
+    trainer.args = SimpleNamespace(model=SimpleNamespace(accelerator=SimpleNamespace()))
 
     trainer._reset_async_activation_offload_if_enabled()
     assert calls == []
 
-    trainer.args.train.accelerator.offload_config = SimpleNamespace(enable_async_activation=True)
+    trainer.args.model.accelerator.offload_config = SimpleNamespace(enable_async_activation=True)
     trainer._reset_async_activation_offload_if_enabled()
     assert calls == [trainer.model]
 
 
 def test_resolve_offload_config_defaults_when_absent():
-    cfg = _resolve_offload_config(SimpleNamespace(train=SimpleNamespace(accelerator=SimpleNamespace())))
+    cfg = _resolve_offload_config(SimpleNamespace(model=SimpleNamespace(accelerator=SimpleNamespace())))
 
     assert cfg.enable_async_activation is False
     assert cfg.enable_activation is False
@@ -63,9 +63,10 @@ def test_build_training_context_without_offload_config(monkeypatch):
 
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.args = SimpleNamespace(
-        train=SimpleNamespace(
-            accelerator=SimpleNamespace(),
-            gradient_checkpointing=SimpleNamespace(enable=False),
+        model=SimpleNamespace(
+            accelerator=SimpleNamespace(
+                gradient_checkpointing=SimpleNamespace(enable=False),
+            ),
         )
     )
 
@@ -79,7 +80,7 @@ def test_configure_hsdp_allreduce_toggles_outer_micro_steps():
     calls = []
     trainer = BaseTrainer.__new__(BaseTrainer)
     trainer.args = SimpleNamespace(
-        train=SimpleNamespace(
+        model=SimpleNamespace(
             accelerator=SimpleNamespace(
                 fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
                 dp_replicate_size=2,

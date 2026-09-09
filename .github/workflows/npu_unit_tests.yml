@@ -146,6 +146,9 @@ jobs:
       - name: Check final pip list
         run: |
           uv pip list
+      - name: Run arguments tests
+        run: |
+          uv run --frozen pytest -v -s -x tests/arguments
       - name: Run parallel tests
         run: |
           uv run --frozen pytest -v -s -x tests/parallel/ulysses/test_ulysses.py

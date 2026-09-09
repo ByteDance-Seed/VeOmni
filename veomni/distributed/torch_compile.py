@@ -87,27 +87,29 @@ def validate_compile_model(
     expected_decoder_block = _SUPPORTED_MULTIMODAL_DECODER_BLOCKS.get(model_type)
     if expected_decoder_block is None:
         raise RuntimeError(
-            "train.torch_compile.enable currently supports multimodal training only for dense Qwen3-VL "
+            "model.accelerator.torch_compile.enable currently supports multimodal training only for dense Qwen3-VL "
             f"(model_type='qwen3_vl'); got model_type={model_type!r}."
         )
     if compile_config.dynamic:
-        raise RuntimeError("train.torch_compile.enable for Qwen3-VL requires train.torch_compile.dynamic=False.")
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable for Qwen3-VL requires model.accelerator.torch_compile.dynamic=False."
+        )
     if compile_config.uses_cuda_graphs():
         raise RuntimeError(
-            "train.torch_compile.enable for Qwen3-VL does not support CUDA Graph replay yet because packed "
+            "model.accelerator.torch_compile.enable for Qwen3-VL does not support CUDA Graph replay yet because packed "
             "FlashAttention metadata can vary between micro-batches; use backend='inductor' and mode=None."
         )
     if sequence_parallel_enabled or async_enabled:
         raise RuntimeError(
-            "train.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism, "
-            "Ring Attention context parallelism, or async Ulysses yet; set train.accelerator.ulysses_size=1, "
-            "train.accelerator.cp_size=1, and train.accelerator.enable_async=False."
+            "model.accelerator.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism, "
+            "Ring Attention context parallelism, or async Ulysses yet; set model.accelerator.ulysses_size=1, "
+            "model.accelerator.cp_size=1, and model.accelerator.enable_async=False."
         )
 
     decoder_block_class_names = _decoder_block_class_names(model)
     if expected_decoder_block not in decoder_block_class_names:
         raise RuntimeError(
-            f"train.torch_compile.enable for Qwen3-VL requires {expected_decoder_block!r} in model._no_split_modules."
+            f"model.accelerator.torch_compile.enable for Qwen3-VL requires {expected_decoder_block!r} in model._no_split_modules."
         )
 
 
@@ -130,9 +132,9 @@ def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_resh
         return
     if compile_config.uses_cuda_graphs() and enable_reshard_after_forward:
         raise RuntimeError(
-            "train.torch_compile with CUDA Graphs requires "
-            "train.accelerator.fsdp_config.reshard_after_forward=False. "
-            "Set train.torch_compile.mode=None or disable forward resharding before enabling graph replay."
+            "model.accelerator.torch_compile with CUDA Graphs requires "
+            "model.accelerator.fsdp_config.reshard_after_forward=False. "
+            "Set model.accelerator.torch_compile.mode=None or disable forward resharding before enabling graph replay."
         )
 
 
@@ -150,14 +152,16 @@ def validate_compile_runtime(
     if not compile_config.enable:
         return
     if not device.IS_CUDA_AVAILABLE or device_type != device.get_device_type():
-        raise RuntimeError("train.torch_compile.enable is CUDA-only for now.")
+        raise RuntimeError("model.accelerator.torch_compile.enable is CUDA-only for now.")
     if not fsdp_enabled:
-        raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable requires FSDP2; compile without FSDP is not supported."
+        )
     if fsdp_mode != "fsdp2":
-        raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
+        raise RuntimeError("model.accelerator.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
     if any_extra_parallel_enabled:
         raise RuntimeError(
-            "train.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
+            "model.accelerator.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
             "communication may be captured inside compiled blocks."
         )
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
@@ -178,7 +182,7 @@ def compile_decoder_blocks(
 
     if not hasattr(torch, "compile"):
         raise RuntimeError(
-            "train.torch_compile.enable requires torch.compile, but this PyTorch build has no torch.compile."
+            "model.accelerator.torch_compile.enable requires torch.compile, but this PyTorch build has no torch.compile."
         )
 
     validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
@@ -192,7 +196,7 @@ def compile_decoder_blocks(
     if compile_config.mode is not None:
         if compile_config.backend == "cudagraphs":
             raise ValueError(
-                "train.torch_compile.mode is not accepted by the 'cudagraphs' backend. "
+                "model.accelerator.torch_compile.mode is not accepted by the 'cudagraphs' backend. "
                 "Leave mode=None with backend='cudagraphs', or switch backend to 'inductor'."
             )
         compile_kwargs["mode"] = compile_config.mode

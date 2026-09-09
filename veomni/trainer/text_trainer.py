@@ -151,7 +151,7 @@ class TextTrainer:
 
         # Gradient clipping (reads FSDP/EP groups from current ParallelState)
         with use_parallel_state("base"):
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.model.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()

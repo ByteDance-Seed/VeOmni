@@ -31,6 +31,22 @@ model:
     sigma_shift_audio: 3.0
     imgvid_cond_noise_aug: 0.999
     audio_cond_noise_aug: 1.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      offload: false
+      mixed_precision:
+        enable: false
+
 # -----------------------------------------------------------------------------
 # Data
 # -----------------------------------------------------------------------------
@@ -66,27 +82,11 @@ train:
   micro_batch_size: 1
   dyn_bsz: false
 
-  init_device: meta
   seed: 42
 
   num_train_epochs: 1
   # max_steps unset: process all data (set to 0 would clamp train_steps to 0
   # via VeOmniArguments.train_steps property)
-
-  gradient_checkpointing:
-    enable: false
-
-  optimizer:
-    type: adamw
-    lr: 1.0e-4
-
-  accelerator:
-    ulysses_size: 1
-    fsdp_config:
-      fsdp_mode: fsdp2
-      offload: false
-      mixed_precision:
-        enable: false
 
   checkpoint:
     output_dir: output/minimax_h3_fl2va_embedding
