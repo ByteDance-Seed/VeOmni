@@ -451,8 +451,8 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
         on_step_begin=lambda **_: None,
         on_step_end=lambda **_: None,
     )
-    trainer.base._reset_async_activation_offload_if_enabled = (
-        lambda: BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base)
+    trainer.base._reset_async_activation_offload_if_enabled = lambda: (
+        BaseTrainer._reset_async_activation_offload_if_enabled(trainer.base)
     )
 
     trainer.train_step(iter([[{}, {}]]))
