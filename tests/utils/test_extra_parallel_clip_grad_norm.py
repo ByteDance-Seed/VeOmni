@@ -296,6 +296,7 @@ def _run_clip_grad_norm_fsdp2_test(
         "--nproc_per_node=8",
         "--master_port=4321",
         "tests/utils/test_extra_parallel_clip_grad_norm.py",
+        "--model.config_path=test",
         f"--model.accelerator.ep_size={ep_size}",
         "--model.accelerator.ep_outside=False",
         f"--model.accelerator.extra_parallel_sizes={emb_size}",
