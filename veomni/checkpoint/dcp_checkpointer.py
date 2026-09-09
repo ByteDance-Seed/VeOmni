@@ -523,6 +523,26 @@ def _promotion_phase(state: _Promotion, work, *, participates: bool, always: boo
     state.failed = _any_rank_failed(state.error is not None) or state.failed
 
 
+def _prepare_stage_dir(stage_dir: str, checkpoint_dir: str) -> str:
+    """Create an empty staging directory for one checkpoint, agreed by every rank.
+
+    A scratch disk fills or goes read-only per node, so the ranks that could not
+    prepare one must not be the only ones to stop: the rest would go on into
+    ``dcp.save`` and wait on a collective that never arrives. Everyone agrees
+    here, before any of that starts.
+    """
+    stage_path = os.path.join(stage_dir, _stage_key(checkpoint_dir))
+    error: Optional[BaseException] = None
+    try:
+        shutil.rmtree(stage_path, ignore_errors=True)  # leftovers from a crashed run
+        os.makedirs(stage_path, exist_ok=True)
+    except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
+        error = e
+    if _any_rank_failed(error is not None):
+        raise error or RuntimeError(f"another rank could not prepare a staging directory under {stage_dir}")
+    return stage_path
+
+
 def _promote_staged_checkpoint(stage_path: str, final_path: str) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
@@ -691,11 +711,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 load=False,
             )
 
-        stage_path = None
-        if stage_dir:
-            stage_path = os.path.join(stage_dir, _stage_key(checkpoint_dir))
-            shutil.rmtree(stage_path, ignore_errors=True)  # drop leftovers from a crashed run
-            os.makedirs(stage_path, exist_ok=True)
+        stage_path = _prepare_stage_dir(stage_dir, checkpoint_dir) if stage_dir else None
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(stage_path or checkpoint_dir)

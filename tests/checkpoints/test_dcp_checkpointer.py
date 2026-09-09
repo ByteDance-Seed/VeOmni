@@ -1420,6 +1420,39 @@ class TestPromoteStagedCheckpoint:
 
 
 class TestStageDirValidation:
+    def test_staging_dir_failure_is_agreed_across_ranks(self, tmp_path):
+        """A scratch disk fails per node, so ranks that could still stage must stop too.
+
+        Otherwise they go on into dcp.save and wait on a collective the failed
+        ranks never reach.
+        """
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        # This rank prepares its directory fine; another node's did not.
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=True):
+            with pytest.raises(RuntimeError, match="another rank could not prepare"):
+                _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+
+    def test_staging_dir_is_emptied_and_returned(self, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            first = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+            with open(os.path.join(first, "leftover.distcp"), "w") as f:
+                f.write("from a crashed run")
+            second = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+        assert second == first
+        assert os.listdir(second) == []
+
+    def test_local_staging_failure_raises_its_own_error(self, tmp_path):
+        """The rank that actually failed reports what happened, not the peer message."""
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda f: f):
+            with patch("veomni.checkpoint.dcp_checkpointer.os.makedirs", side_effect=OSError("No space left")):
+                with pytest.raises(OSError, match="No space left"):
+                    _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+
     def test_stage_dir_with_explicit_storage_writer_is_rejected(self, tmp_path):
         """Silently ignoring stage_dir would write to the slow destination it was avoiding."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
