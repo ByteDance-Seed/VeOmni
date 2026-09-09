@@ -147,9 +147,10 @@ already gitignored so it won't leak into the repo).
 
 ---
 
-## Before You Start: Create Todos
+## Before You Start: Create a Plan
 
-Use TodoWrite to track phases. Suggested plan:
+Track the phases with whatever todo/plan tool the running agent provides.
+Suggested plan:
 
 ```
 Phase 0: Verify venv + drop HF reference files       -> in_progress
@@ -160,7 +161,7 @@ Phase 4: Wire __init__.py to expose generated classes -> pending
 Phase 5: Run patchgen + verify diff                   -> pending
 Phase 6: Add test cases                               -> pending
 Phase 7: Run tests (single-GPU + e2e)                 -> pending
-Phase 8: Docs + /veomni-review + commit               -> pending
+Phase 8: Docs + commit; /veomni-review before the PR  -> pending
 ```
 
 Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
@@ -772,14 +773,15 @@ Extra e2e gotchas:
 2. **.agents knowledge**: if the work surfaced a new hard constraint
    (e.g. "model X requires `logits_to_keep` handled in ForCausalLM.forward"),
    add it to `.agents/knowledge/constraints.md`.
-3. **Run `/veomni-review`** (mandatory pre-commit gate).
-   - `safe` → commit.
-   - `risky` → report, wait for user.
-4. **Commit**:
+3. **Commit**:
    - Title: `[BREAKING]` only if the change alters checkpoint format
      expectations or public APIs. Follow `[{modules}] {type}: {description}`.
      Example: `[veomni] feat: add patchgen-generated modeling for <m>`.
    - Commit message **must not** mention Claude / AI / Co-Authored-By.
+4. **Before opening the PR**: run `/veomni-review` over the branch diff. This
+   work touches `veomni/`, so the gate applies.
+   - `safe` / `needs-attention` → open the PR.
+   - `risky` → report, wait for the user.
 
 ---
 

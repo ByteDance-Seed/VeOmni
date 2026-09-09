@@ -92,6 +92,13 @@ description: "Create a pull request for the current branch. Handles uncommitted 
 
 ### Step 3: Generate Draft File and Push (automatic)
 
+0. **Apply `/veomni-review` before pushing.** Use its applicability rules for
+   `<base>...HEAD`, including the documentation self-check and the narrowly
+   defined exemption for clean, exact reverts or approved-diff reapplications.
+   Partial reverts, extra edits and conflict resolutions need the normal gate.
+   Review again before a substantive update to an open PR. A `risky` verdict
+   stops the PR: report it and wait for the user.
+
 1. Draft PR title in `[{modules}] {type}: {description}` format:
    - Multiple modules separated by comma: `[model, data] feat: ...`
    - Description: concise, lowercase start, no period, under 60 chars

@@ -3,9 +3,9 @@ name: veomni-new-model
 description: "Use this skill when adding support for a new model to VeOmni. Covers the full lifecycle: analyzing the HuggingFace model, creating model patches, defining parallel plans, writing configs, integrating with the trainer, and testing. Trigger: 'add model', 'support new model', 'integrate a model', 'new model support'."
 ---
 
-## Before You Start: Create Todos
+## Before You Start: Create a Plan
 
-Use TodoWrite to track all phases:
+Track the phases with whatever todo/plan tool the running agent provides:
 
 ```
 Phase 1: Analyze HF model             -> in_progress

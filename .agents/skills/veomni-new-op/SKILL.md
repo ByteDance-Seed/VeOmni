@@ -189,9 +189,9 @@ ships a `device_patch.py`.
 
 ## Phase 5: Finalize
 
-1. Run `/veomni-review` skill.
-2. Run `make quality`.
-3. Verify the new variant shows up in `KERNEL_REGISTRY.dump()` and that the relevant `OpSlot` is rebound after `build_foundation_model`.
+1. Run `make quality`.
+2. Verify the new variant shows up in `KERNEL_REGISTRY.dump()` and that the relevant `OpSlot` is rebound after `build_foundation_model`.
+3. Before opening the PR, run `/veomni-review` over the branch diff — a new kernel touches `veomni/`, so the gate applies.
 
 ## Common Pitfalls
 

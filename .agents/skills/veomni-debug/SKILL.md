@@ -20,7 +20,7 @@ description: "Use this skill for ANY bug, error, crash, wrong output, loss diver
 3. Write a reproducer test if feasible.
 4. Minimal fix — root cause only, don't touch surrounding code.
 5. Verify: reproducer passes, `pytest tests/<module>/` passes, no regressions across modalities.
-6. Run `/veomni-review`, `make quality`, commit.
+6. Run `make quality`, commit. Run `/veomni-review` before opening the PR or pushing a substantive update, not per commit.
 
 If not resolved in 15 min → switch to Full Protocol.
 
@@ -30,7 +30,7 @@ If not resolved in 15 min → switch to Full Protocol.
 
 ### Before You Start
 
-Use TodoWrite to track all phases:
+Track the phases with whatever todo/plan tool the running agent provides:
 
 ```
 Phase 1: Investigate <symptom>       -> in_progress
@@ -61,11 +61,67 @@ Phase 5: Knowledge capture           -> pending
 4. Check dependencies — different transformers version? Different PyTorch version?
 5. **If a package version upgrade is suspected**, create isolated uv environments to bisect:
    ```bash
-   # Create the default env on the default pin (`transformers-stable` → 5.9.0).
-   uv venv .venv-default
-   VIRTUAL_ENV=.venv-default uv sync --extra gpu --dev
+   # Env A: the current default pin (the `transformers-stable` group).
+   uv venv .venv-a
+   VIRTUAL_ENV=.venv-a uv sync --active --extra gpu --dev
+
+   # Env B: the same tree with exactly one package moved.
+   uv venv .venv-b
+   VIRTUAL_ENV=.venv-b uv sync --active --extra gpu --dev
+   VIRTUAL_ENV=.venv-b uv pip install "<package>==<other-version>"
    ```
-   Run the same reproducer in both envs to confirm the version is the root cause. This avoids polluting the main `.venv/`.
+   `--active` is load-bearing. Without it `uv sync` runs in project mode and
+   targets `.venv/`, ignoring `VIRTUAL_ENV` — so both commands would rebuild
+   the main environment instead of the two you just created, which is the
+   opposite of what this is for. (`UV_PROJECT_ENVIRONMENT` works too.)
+
+   Confirm that installing the alternate version did not change other packages:
+   ```bash
+   uv pip freeze --python .venv-a/bin/python > /tmp/veomni-bisect-a.freeze
+   uv pip freeze --python .venv-b/bin/python > /tmp/veomni-bisect-b.freeze
+   diff -u /tmp/veomni-bisect-a.freeze /tmp/veomni-bisect-b.freeze
+   ```
+   Only the target package may differ. Pin or restore every non-target
+   difference in Env B to Env A's version, then compare again before running
+   the reproducer. If the target cannot run with that dependency set, report
+   the compatibility conflict; a multi-package change is not a one-package bisect.
+
+   Then run the same reproducer in both envs, each with its own env
+   *activated* — the `VIRTUAL_ENV=` prefixes above apply only to the `uv sync`
+   lines they are attached to, not to whatever you run next:
+   ```bash
+   (source .venv-a/bin/activate && <reproducer>)
+   (source .venv-b/bin/activate && <reproducer>)
+   ```
+
+   **If the suspect package is transformers, you need two worktrees *and* two
+   venvs — one venv per worktree.** They isolate different things and neither
+   substitutes for the other: a venv isolates the installed packages, a
+   worktree isolates the checkout. `generated/` modeling lives in the
+   checkout, so two venvs in one worktree share a single `generated/` and
+   regenerating it for Env B silently changes what Env A runs. Two worktrees
+   without separate venvs share one transformers install, which defeats the
+   bisect outright.
+   ```bash
+   git worktree add ../bisect-a HEAD && (cd ../bisect-a && uv venv .venv && VIRTUAL_ENV=.venv uv sync --active --extra gpu --dev)
+   git worktree add ../bisect-b HEAD && (cd ../bisect-b && uv venv .venv && VIRTUAL_ENV=.venv uv sync --active --extra gpu --dev && VIRTUAL_ENV=.venv uv pip install "transformers==<other-version>")
+   ```
+   Regenerate `generated/` inside each worktree against its own pin
+   (`make patchgen`) before running the reproducer — it is produced against
+   the pinned version, and a stale `generated/` is itself a source of
+   failures.
+
+   Compare the package sets here too, using `uv pip freeze --python` with
+   `../bisect-a/.venv/bin/python` and `../bisect-b/.venv/bin/python`, and
+   reconcile non-transformers dependency version differences as above. The
+   editable VeOmni and patchgen paths must point to their respective worktrees;
+   normalize those corresponding paths only when comparing the freeze output,
+   without changing either environment's editable installs. Run codegen and
+   the reproducer from each worktree with its own environment activated:
+   ```bash
+   (cd ../bisect-a && source .venv/bin/activate && make patchgen && <reproducer>)
+   (cd ../bisect-b && source .venv/bin/activate && make patchgen && <reproducer>)
+   ```
 
 ### Phase 3: Hypothesis and Testing
 
@@ -73,11 +129,6 @@ Phase 5: Knowledge capture           -> pending
 2. Design a MINIMAL experiment (change one thing only).
 3. Run the experiment. Record the result.
 4. If wrong, update understanding and form new hypothesis. No random guess-and-check.
-
-**Red flags — STOP and restart from Phase 1:**
-- "Let me just try changing X and see what happens"
-- "Quick fix for now, clean up later"
-- "It probably works, let me move on"
 
 **Verification gate** — before acting on a conclusion, check:
 - Does the evidence actually support this cause, or just correlate?
@@ -91,7 +142,7 @@ Phase 5: Knowledge capture           -> pending
 2. Implement a SINGLE targeted fix addressing the root cause.
 3. Verify: test passes, training runs correctly, no regressions.
 4. Check for collateral — did the fix break other modalities or trainers?
-5. Before committing: run `/veomni-review` skill.
+5. Before opening the PR or pushing a substantive update: run `/veomni-review` over the branch diff.
 
 ### Phase 5: Knowledge Capture (mandatory)
 
@@ -100,22 +151,24 @@ Phase 5: Knowledge capture           -> pending
 - [ ] **New hard constraint?** → add to `.agents/knowledge/constraints.md`
 - [ ] **Architecture insight?** → add to `.agents/knowledge/architecture.md`
 - [ ] **Regression guard needed?** → prefer adding a case to an existing
-      CI-enumerated test; see `.agents/knowledge/testing.md`. A new file outside
-      `tests/ops/` / `tests/data/` must be wired into the unit-test workflows or
-      it never runs.
+      CI-enumerated test; see `.agents/knowledge/testing.md`. Only paths not
+      already covered by a directory-level CI entry need a new workflow line.
+      Use the workflow that owns the path, including the e2e workflows for
+      end-to-end tests; account for the GPU/NPU differences in that table.
 - [ ] **Docs outdated?** → update `docs/` if the fix changes API behavior, config semantics, or usage patterns
 
 If none apply, explicitly note "no new knowledge to capture."
 
 ---
 
-## Three-Strike Rule
+## Stop Conditions
 
-If 3 consecutive fix attempts fail:
-- **STOP fixing symptoms.**
-- Question whether the underlying approach/architecture is wrong.
-- Step back and re-examine: are you solving the right problem?
-- Report to user with analysis before continuing.
+Restart from Phase 1 if you catch yourself thinking "let me just try changing X
+and see", "quick fix for now, clean up later", or "it probably works, moving on".
+
+After **3 consecutive failed fix attempts**, stop fixing symptoms. Question
+whether the underlying approach is wrong, re-examine whether you are solving the
+right problem, and report the analysis to the user before continuing.
 
 ## Common Pitfalls
 
