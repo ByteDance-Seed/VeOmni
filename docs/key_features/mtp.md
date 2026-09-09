@@ -7,14 +7,14 @@
   - [📚 Overview](#-overview)
   - [🚀 Quick Start](#-quick-start)
   - [🔍 How the MTP head works](#-how-the-mtp-head-works)
-  - [⚙️ Plumbing](#️-plumbing)
+  - [Plumbing](#plumbing)
     - [The MTP label row](#the-mtp-label-row)
     - [Why `loss_dict` and not `loss`](#why-loss_dict-and-not-loss)
     - [`mtp_context`](#mtp_context)
   - [💾 Checkpoints](#-checkpoints)
   - [📉 Cost](#-cost)
   - [🚧 Limitations](#-limitations)
-  - [🛠️ Supporting MTP for a new model](#️-supporting-mtp-for-a-new-model)
+  - [Supporting MTP for a new model](#supporting-mtp-for-a-new-model)
 
 ## 📚 Overview
 
@@ -121,7 +121,7 @@ do not affect expert-balancing statistics. The combined auxiliary term is
 controlled by `router_aux_loss_coef`; `mtp_loss_weight` continues to scale only
 the MTP cross-entropy contribution.
 
-## ⚙️ Plumbing
+## Plumbing
 
 ### The MTP label row
 
@@ -237,7 +237,7 @@ MTP per step (median, +3.9%). Peak memory increased from 43.95GB to 44.89GB (+2.
 - **Ascend NPU is supported.** Use `configs/text/qwen3_5_27b_mtp_npu.yaml` as the
   dense-model reference; MoE uses the same MTP knob and FLA Ascend operator settings.
 
-## 🛠️ Supporting MTP for a new model
+## Supporting MTP for a new model
 
 The trainer-side loss plumbing (`loss_dict` in `postforward` and
 `count_loss_token`'s `{prefix}_tokens`) is model-agnostic. Per model you need,
