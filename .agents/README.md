@@ -1,6 +1,6 @@
 # .agents/ — Shared Agent Configuration
 
-Reusable skills and knowledge for AI coding agents working on VeOmni. Follows the [Agent Skills](https://agentskills.io) open standard — compatible with Gemini, Codex, Claude Code, Cursor, and other agents.
+Reusable skills and knowledge for AI coding agents working on VeOmni. Follows the [Agent Skills](https://agentskills.io) open standard, so any agent that implements it can use these as-is.
 
 ## Structure
 
@@ -18,8 +18,8 @@ Reusable skills and knowledge for AI coding agents working on VeOmni. Follows th
 │   └── create-pr/
 ├── knowledge/           # Shared knowledge base
 │   ├── architecture.md
-│   ├── cloud_env.md
 │   ├── constraints.md
+│   ├── cpu_only_env.md
 │   ├── multimodal_metadata.md
 │   ├── testing.md
 │   └── uv.md
@@ -29,13 +29,12 @@ Reusable skills and knowledge for AI coding agents working on VeOmni. Follows th
 
 ## Quick Start
 
-Some agents natively support the `.agents/` directory and will auto-discover skills and knowledge — no extra setup needed.
+Some agents read the `.agents/` directory natively and will auto-discover skills and knowledge — no extra setup needed.
 
-For agents that require their own dotfile directory, run the bootstrap script:
+For an agent that insists on its own dotfile directory, run the bootstrap script with that agent's name:
 
 ```bash
-# Example: set up for Gemini (replace with your agent name)
-bash .agents/setup_agent.sh gemini
+bash .agents/setup_agent.sh <agent-name>
 ```
 
 This will:
@@ -54,6 +53,7 @@ The `knowledge/` directory contains domain-specific context loaded by agents on 
 
 - **architecture.md** — module map, trainer hierarchy, data flow
 - **constraints.md** — hard constraints checked before any code change
+- **cpu_only_env.md** — what can be verified without a GPU/NPU
 - **multimodal_metadata.md** — canonical multimodal metadata keys and ownership
 - **testing.md** — how CI selects tests; whether a change needs one and where it goes
 - **uv.md** — dependency management architecture
