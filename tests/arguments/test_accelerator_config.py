@@ -38,7 +38,6 @@ from veomni.arguments.arguments_types import (
     DataArguments,
     FSDPConfig,
     ModelArguments,
-    ModelRuntimeArguments,
     OptimizerConfig,
     TrainingArguments,
     VeOmniArguments,
@@ -57,7 +56,7 @@ def world_size(monkeypatch):
 
 
 def make_model_args(**kwargs) -> ModelArguments:
-    """``ModelArguments`` needs a config_path or model_path; nothing here reads it."""
+    """Nothing here reads the path; it only satisfies the required-path check."""
     return ModelArguments(config_path="dummy", **kwargs)
 
 
@@ -158,7 +157,11 @@ def test_ddp_rejects_cpu_init(world_size):
 def test_ep_sharded_stream_load_conflicts_with_broadcast(world_size):
     world_size(1)
     with pytest.raises(AssertionError, match="ep_sharded_stream_load requires"):
-        AcceleratorConfig(ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=True)
+        ModelArguments(
+            config_path="dummy",
+            ep_sharded_stream_load=True,
+            broadcast_model_weights_from_rank0=True,
+        )
 
 
 def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
@@ -171,12 +174,13 @@ def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
     warnings = []
     monkeypatch.setattr(arguments_types.logger, "warning_rank0", lambda msg, *a, **k: warnings.append(msg))
 
-    acc = AcceleratorConfig(
+    args = ModelArguments(
+        config_path="dummy",
         broadcast_model_weights_from_rank0=True,
-        fsdp_config=FSDPConfig(fsdp_mode="ddp"),
+        accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="ddp")),
     )
 
-    assert acc.broadcast_model_weights_from_rank0 is True
+    assert args.broadcast_model_weights_from_rank0 is True
     assert not any("broadcast_model_weights_from_rank0" in msg for msg in warnings)
 
 
@@ -184,8 +188,6 @@ def test_ddp_takes_broadcast_at_face_value(world_size, monkeypatch):
     "name",
     [
         "init_device",
-        "broadcast_model_weights_from_rank0",
-        "ep_sharded_stream_load",
         "gradient_checkpointing",
         "torch_compile",
     ],
@@ -194,6 +196,22 @@ def test_moved_knobs_live_on_the_accelerator_and_not_on_training_arguments(name,
     world_size(1)
 
     assert hasattr(make_model_args().accelerator, name)
+    assert not hasattr(TrainingArguments(), name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "broadcast_model_weights_from_rank0",
+        "ep_sharded_stream_load",
+    ],
+)
+def test_weight_load_knobs_live_on_the_model_not_the_accelerator(name, world_size):
+    world_size(1)
+    args = make_model_args()
+
+    assert hasattr(args, name)
+    assert not hasattr(args.accelerator, name)
     assert not hasattr(TrainingArguments(), name)
 
 
@@ -224,20 +242,14 @@ def test_batch_config_follows_a_model_level_ulysses_override(world_size):
     assert args.train.global_batch_size == args.train.micro_batch_size * 4
 
 
-def test_model_runtime_arguments_is_a_standalone_training_unit():
-    """What an omni module inherits: model fields + its own accelerator/optimizer.
-
-    ``config_path`` is included — every unit has to say where its architecture is
-    defined. ``tokenizer_path``/``safetensor_idx_path`` are not: a composed model
-    has one tokenizer, and a module is addressed by its subfolder in a shared
-    checkpoint, so inheriting those would hand every module a tokenizer it has no
-    use for and an index override it cannot meaningfully set.
-    """
-    names = {f.name for f in dataclasses.fields(ModelRuntimeArguments)}
+def test_model_arguments_is_a_standalone_training_unit():
+    """What an omni module inherits: identity plus its own accelerator/optimizer."""
+    names = {f.name for f in dataclasses.fields(ModelArguments)}
 
     assert {"model_path", "config_path", "model_config", "basic_modules", "lora_config"} <= names
     assert {"ops_implementation", "accelerator", "optimizer"} <= names
-    assert names.isdisjoint({"tokenizer_path", "safetensor_idx_path"})
+    assert {"broadcast_model_weights_from_rank0", "ep_sharded_stream_load"} <= names
+    assert {"tokenizer_path", "safetensor_idx_path"} <= names
 
 
 def test_base_localizes_model_path_so_every_subclass_inherits_it(monkeypatch):
@@ -251,19 +263,19 @@ def test_base_localizes_model_path_so_every_subclass_inherits_it(monkeypatch):
     monkeypatch.setattr("veomni.utils.fs.copy_to_local", fake_copy_to_local)
     monkeypatch.setattr("veomni.utils.fs.is_non_local", lambda p: str(p).startswith("hdfs://"))
 
-    runtime = ModelRuntimeArguments(model_path="hdfs://ns/ckpt/vision")
+    runtime = ModelArguments(model_path="hdfs://ns/ckpt/vision")
 
     assert seen == ["hdfs://ns/ckpt/vision"]
     assert runtime.model_path == "/local/cache/vision"
 
 
 def test_base_settles_config_path_so_a_module_inherits_it(monkeypatch):
-    """A module points at its own architecture; only the tokenizer belongs to the model."""
+    """A module points at its own architecture; tokenizer falls back to that path."""
     monkeypatch.setattr("veomni.utils.fs.copy_to_local", lambda path, **kw: f"/local/cache/{path.rsplit('/', 1)[-1]}")
     monkeypatch.setattr("veomni.utils.fs.is_non_local", lambda p: str(p).startswith("hdfs://"))
 
-    derived = ModelRuntimeArguments(model_path="hdfs://ns/ckpt/vision")
-    explicit = ModelRuntimeArguments(model_path="/ckpt/vision", config_path="hdfs://ns/cfg/vit_cfg")
+    derived = ModelArguments(model_path="hdfs://ns/ckpt/vision")
+    explicit = ModelArguments(model_path="/ckpt/vision", config_path="hdfs://ns/cfg/vit_cfg")
 
     assert derived.config_path == "/local/cache/vision"
     assert explicit.config_path == "/local/cache/vit_cfg"
@@ -285,7 +297,7 @@ def test_a_config_missing_both_paths_fails_before_any_download(monkeypatch):
     monkeypatch.setattr("veomni.utils.fs.copy_to_local", explode)
 
     with pytest.raises(ValueError, match="`config_path` must be specified"):
-        ModelArguments()
+        BaseModelArguments()
 
 
 @pytest.fixture
@@ -302,7 +314,7 @@ def _write_index(tmp_path, weight_map):
 def test_index_mapping_is_derived_from_model_path_without_an_explicit_path(tmp_path, index_cache):
     _write_index(tmp_path, {"layer.weight": "model-00001-of-00002.safetensors"})
 
-    runtime = ModelRuntimeArguments(model_path=str(tmp_path))
+    runtime = BaseModelArguments(model_path=str(tmp_path))
 
     assert runtime.fqn_to_index_mapping == {"layer.weight": 1}
 
@@ -316,8 +328,8 @@ def test_index_mapping_is_parsed_once_across_modules_sharing_a_checkpoint(tmp_pa
     real = ctl.parse_fqn_to_index_mapping_from_json
     monkeypatch.setattr(ctl, "parse_fqn_to_index_mapping_from_json", lambda p: (parses.append(p), real(p))[1])
 
-    first = ModelRuntimeArguments(model_path=str(tmp_path))
-    second = ModelRuntimeArguments(model_path=str(tmp_path))
+    first = BaseModelArguments(model_path=str(tmp_path))
+    second = BaseModelArguments(model_path=str(tmp_path))
 
     assert first.fqn_to_index_mapping == second.fqn_to_index_mapping
     assert len(parses) == 1
@@ -333,16 +345,17 @@ def test_index_mapping_is_not_read_until_asked_for(tmp_path, index_cache, monkey
     )
     _write_index(tmp_path, {"layer.weight": "model-00001-of-00002.safetensors"})
 
-    ModelRuntimeArguments(model_path=str(tmp_path))
+    BaseModelArguments(model_path=str(tmp_path))
 
 
-def test_model_arguments_honours_an_explicit_index_path(tmp_path, index_cache):
+def test_base_honours_an_explicit_index_path(tmp_path, index_cache):
+    """An independent module can point at its own index, not the composed model's."""
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     _write_index(elsewhere, {"layer.weight": "model-00003-of-00004.safetensors"})
     _write_index(tmp_path, {"layer.weight": "model-00001-of-00002.safetensors"})
 
-    args = ModelArguments(
+    args = BaseModelArguments(
         model_path=str(tmp_path),
         safetensor_idx_path=str(elsewhere / "model.safetensors.index.json"),
     )
@@ -361,7 +374,7 @@ def test_an_explicit_hdfs_index_path_is_localized(tmp_path, index_cache, monkeyp
     monkeypatch.setattr("veomni.utils.fs.is_non_local", lambda p: str(p).startswith("hdfs://"))
     monkeypatch.setattr("veomni.utils.fs.copy_to_local", lambda path, **kw: (downloads.append(path), local_index)[1])
 
-    args = ModelArguments(
+    args = BaseModelArguments(
         model_path=str(tmp_path),
         safetensor_idx_path="hdfs://ns/ckpt/model.safetensors.index.json",
     )
@@ -376,24 +389,33 @@ def test_a_checkpoint_without_an_index_still_warns(tmp_path, index_cache, monkey
     warnings = []
     monkeypatch.setattr(arguments_types.logger, "warning_once", lambda msg, *a, **k: warnings.append(msg))
 
-    args = ModelArguments(model_path=str(tmp_path))
+    args = BaseModelArguments(model_path=str(tmp_path))
 
     assert args.fqn_to_index_mapping is None
     assert any("single file instead of sharded" in msg for msg in warnings)
 
 
-def test_model_arguments_extends_the_runtime_shape():
-    assert issubclass(ModelArguments, ModelRuntimeArguments)
-    assert issubclass(ModelRuntimeArguments, BaseModelArguments)
+def test_tokenizer_path_falls_back_to_config_path(tmp_path):
+    runtime = BaseModelArguments(model_path=str(tmp_path))
+
+    assert runtime.tokenizer_path == str(tmp_path)
+
+
+def test_model_arguments_extends_base():
+    assert issubclass(ModelArguments, BaseModelArguments)
 
 
 def test_the_runtime_pair_is_declared_once_for_subclasses_to_inherit():
     """An omni module/model args class should not have to re-declare either field."""
-    assert {"accelerator", "optimizer"}.isdisjoint({f.name for f in dataclasses.fields(BaseModelArguments)})
+    base = {f.name for f in dataclasses.fields(BaseModelArguments)}
+    assert {"accelerator", "optimizer", "broadcast_model_weights_from_rank0", "ep_sharded_stream_load"}.isdisjoint(base)
+    assert {"tokenizer_path", "safetensor_idx_path"} <= base
 
-    own = ModelRuntimeArguments.__dataclass_fields__
+    own = ModelArguments.__dataclass_fields__
     assert own["accelerator"].name == "accelerator"
     assert own["optimizer"].name == "optimizer"
+    assert "broadcast_model_weights_from_rank0" in own
+    assert "ep_sharded_stream_load" in own
 
 
 def test_eager_is_reserved_but_refuses_to_run():
@@ -466,6 +488,8 @@ def test_parser_still_accepts_the_new_paths(world_size):
         ModelArguments,
         {
             "config_path": "dummy",
+            "broadcast_model_weights_from_rank0": False,
+            "ep_sharded_stream_load": True,
             "accelerator": {
                 "init_device": "meta",
                 "gradient_checkpointing": {"enable": False},
@@ -475,6 +499,21 @@ def test_parser_still_accepts_the_new_paths(world_size):
         path="model",
     )
 
+    assert args.broadcast_model_weights_from_rank0 is False
+    assert args.ep_sharded_stream_load is True
     assert args.accelerator.init_device == "meta"
     assert args.accelerator.gradient_checkpointing.enable is False
     assert args.optimizer.lr == pytest.approx(3.0e-4)
+
+
+def test_parser_rejects_load_flags_left_on_the_accelerator(world_size):
+    world_size(1)
+    with pytest.raises(ValueError, match="model.accelerator.ep_sharded_stream_load is not a field"):
+        _instantiate_recursive(
+            ModelArguments,
+            {
+                "config_path": "dummy",
+                "accelerator": {"ep_sharded_stream_load": True},
+            },
+            path="model",
+        )

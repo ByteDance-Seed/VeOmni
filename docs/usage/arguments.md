@@ -53,8 +53,10 @@ Top-level configuration that assembles all argument groups.
 
 Model architecture, paths, and multimodal encoder / decoder setup.
 
-* `ModelArguments` — `model.*`
+* `ModelArguments` — `model.*` (root and per-module overlay share this shape)
     * `OpsImplementationConfig` — `model.ops_implementation.*`
+    * `broadcast_model_weights_from_rank0` / `ep_sharded_stream_load` — weight-load policy
+    * `tokenizer_path` / `safetensor_idx_path` — identity paths on `BaseModelArguments` (a tower that never tokenizes simply does not call them)
     * `OptimizerConfig` — `model.optimizer.*`
     * `AcceleratorConfig` — `model.accelerator.*`
         * `FSDPConfig` — `model.accelerator.fsdp_config.*`
@@ -143,6 +145,10 @@ Root config — assembles `model`, `data`, and `train`.
 ### ModelArguments
 
 `model.*` — Model architecture, paths, and multimodal encoder / decoder setup.
+Root ``model.*`` and a per-module overlay share this class; every unit needs
+`model_path` or `config_path`. Omni towers may carry `tokenizer_path` /
+`safetensor_idx_path` without calling them; an independent module can set its
+own `safetensor_idx_path`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -154,6 +160,8 @@ Root config — assembles `model`, `data`, and `train`.
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
+| broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
@@ -518,7 +526,9 @@ distinct from the first emission.
 ### AcceleratorConfig
 
 `model.accelerator.*` — Everything about how one model is placed on the hardware:
-topology, weight initialization, activation recomputation, and compilation.
+topology, device initialization, activation recomputation, and compilation.
+Weight loading (`broadcast_model_weights_from_rank0`, `ep_sharded_stream_load`)
+lives on `model.*`, not here.
 
 The config resolves itself. `__post_init__` reads `WORLD_SIZE`, derives `dp_size`
 from the non-DP dimensions, fills in whichever of `dp_replicate_size` /
@@ -542,8 +552,6 @@ configured and never round-trip through a saved config.
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
 | init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
-| broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Activation recomputation settings. |

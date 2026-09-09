@@ -225,7 +225,7 @@ class TextDPOTrainer:
             enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.model.accelerator.fsdp_config.offload_pin_memory,
-            broadcast_model_weights_from_rank0=args.model.accelerator.broadcast_model_weights_from_rank0,
+            broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
         )

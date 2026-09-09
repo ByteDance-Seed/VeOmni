@@ -13,7 +13,7 @@ import torch.nn as nn
 from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
-from veomni.arguments import ModelRuntimeArguments, TrainingArguments, parse_args
+from veomni.arguments import ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import init_parallel_state
@@ -42,7 +42,7 @@ def _torch_npu_version() -> str:
 
 @dataclass
 class Argument:
-    model: "ModelRuntimeArguments" = field(default_factory=ModelRuntimeArguments)
+    model: "ModelArguments" = field(default_factory=ModelArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
@@ -152,7 +152,7 @@ def main():
         basic_modules=[],
         enable_reentrant=args.model.accelerator.gradient_checkpointing.enable_reentrant,
         enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
-        broadcast_model_weights_from_rank0=args.model.accelerator.broadcast_model_weights_from_rank0,
+        broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,
         max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
     )
 

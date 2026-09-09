@@ -530,6 +530,8 @@ def _run_async_offload_base_trainer_fsdp2_gc():
             model_path=None,
             basic_modules=[],
             optimizer=OptimizerConfig(),
+            broadcast_model_weights_from_rank0=False,
+            ep_sharded_stream_load=False,
             accelerator=SimpleNamespace(
                 offload_config=OffloadConfig(
                     enable_async_activation=True,
@@ -538,8 +540,6 @@ def _run_async_offload_base_trainer_fsdp2_gc():
                 fsdp_config=FSDPConfig(mixed_precision=MixedPrecisionConfig(enable=False)),
                 init_device="meta",
                 gradient_checkpointing=GradientCheckpointingConfig(enable=True),
-                broadcast_model_weights_from_rank0=False,
-                ep_sharded_stream_load=False,
                 torch_compile=TorchCompileConfig(enable=False),
             ),
         ),

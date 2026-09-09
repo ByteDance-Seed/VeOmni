@@ -591,8 +591,8 @@ class BaseTrainer(Stateful, ABC):
             enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.model.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.model.accelerator.fsdp_config.offload_pin_memory,
-            broadcast_model_weights_from_rank0=args.model.accelerator.broadcast_model_weights_from_rank0,
-            ep_sharded_stream_load=args.model.accelerator.ep_sharded_stream_load,
+            broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0,
+            ep_sharded_stream_load=args.model.ep_sharded_stream_load,
             max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
             compile_config=CompileConfig(

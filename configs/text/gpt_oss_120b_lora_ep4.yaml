@@ -34,12 +34,12 @@ model:
     lr_decay_style: cosine
     weight_decay: 0.1
     max_grad_norm: 1.0
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
   accelerator:
     gradient_checkpointing:
       enable: true
     init_device: meta
-    broadcast_model_weights_from_rank0: false
-    ep_sharded_stream_load: true
     ulysses_size: 1
     ep_size: 4
     fsdp_config:
