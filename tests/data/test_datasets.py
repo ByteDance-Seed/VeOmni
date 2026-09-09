@@ -598,11 +598,13 @@ class _ListStream(IterableDataset):
     def __init__(self, values):
         self.values = list(values)
         self.epoch = 0
+        self.epochs = []
 
     def __iter__(self):
         yield from self.values
 
     def set_epoch(self, epoch: int):
+        self.epochs.append(epoch)
         self.epoch = epoch
 
 
@@ -674,4 +676,4 @@ def test_iterable_repeat_advances_inner_epoch():
     stream = ShardedIterableDataset(inner, repeat=True, seed=10)
     stream.set_epoch(3)
     assert list(islice(stream, 2)) == ["a", "a"]
-    assert inner.epoch == 14
+    assert inner.epochs == [13, 14]
