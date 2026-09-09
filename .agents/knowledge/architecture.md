@@ -45,23 +45,40 @@ veomni/
 │   │                   ep_fsdp mesh.
 │   └── lr_scheduler.py LR scheduler construction
 ├── ops/                Optimized kernels and dispatch
-│   ├── config/         Unified ops registry + singleton resolved config
-│   │   ├── registry.py OpSpec/BackendSpec/OpScope + register_op/apply_*
+│   ├── kernel_registry.py  KERNEL_REGISTRY: (op_name, variant) ->
+│   │                   {impl_name: KernelSpec}. register() takes one
+│   │                   KernelSpec; it is not a decorator. The mechanism
+│   │                   new kernels should use.
+│   ├── dispatch.py     OpSlot placeholders declared in patchgen-generated
+│   │                   modeling; bound by _bind_veomni_ops() in models/auto.py
+│   ├── config/         Legacy per-model / global dispatch, still live
+│   │   ├── registry.py OpSpec/BackendSpec/OpScope. apply_global_ops() resolves
+│   │   │               OpScope.GLOBAL ops for every run (called from
+│   │   │               apply_ops_config); apply_per_model_patches() resolves
+│   │   │               OpScope.PER_MODEL ops and is called only from the
+│   │   │               device_patch.py of wan, deepseek_v3 and deepseek_v4
 │   │   └── singleton.py  get_ops_config()/set_ops_config() for patch files
 │   ├── kernels/        Kernel implementations (one subdir per op)
+│   │   ├── deepseek_sparse_attention/  DSA indexer/top-k selection
 │   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
 │   │   ├── attention/  Flash attention v2/3/4 + SP-aware variants
 │   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
+│   │   ├── gated_delta_rule/  Qwen3.5 linear-attention kernels
 │   │   ├── load_balancing_loss/  eager + triton variants
 │   │   ├── mhc/        TileKernels DeepSeek V4 pre/post/head adapters
 │   │   ├── rms_norm/   Liger/NPU/batch-invariant Triton RMSNorm
 │   │   ├── rotary/     Liger/NPU + DeepSeek V3 deterministic + Wan Triton
-│   │   ├── swiglu_mlp/ Liger SwiGLU MLP
+│   │   ├── swiglu/     Liger SwiGLU MLP
 │   │   └── moe/        Fused MoE kernels + group_gemm sub-kernels
 │   ├── platform/       Platform-specific runtime patches
 │   │   └── npu/        HCCL pre-mul sum patch
+│   ├── liger/          Liger kernel adapters
 │   └── batch_invariant_ops/  Mode switch for deterministic ops
-├── patchgen/           Auto-generate model patches from HuggingFace models
+├── lora/               LoRA / PEFT injection: linear + MoE-expert adapters,
+│                       DCP + HF-adapter save/load, target mapping
+├── patchgen/           Patch specs + codegen driver consumed by the `patchgen`
+│                       CLI, which is a separate package under patchgen-pkg/
+│                       (installed via the `patchgen` dependency group)
 ├── schedulers/         LR scheduler implementations (flow matching)
 ├── trainer/            Training loop implementations
 │   ├── base.py         BaseTrainer (ABC): the composable training skeleton
@@ -169,10 +186,17 @@ tests/
 ├── data/           Data pipeline, collator, transform tests
 ├── ops/            Kernel operation tests
 ├── parallel/       Distributed parallelism tests (ulysses, data balance)
+├── distributed/    dummy forward, torch.compile, FSDP equivalence, grad ckpt
+├── trainer/        Callback / trainer-unit tests (channel loss, step sync, DPO)
+├── lora/           LoRA + MoE-LoRA unit, kernel-parity and trainer tests
+├── optim/          Muon / optimizer param-group tests
 ├── checkpoints/    Checkpoint save/load tests
 ├── utils/          Utility function tests
 ├── e2e/            End-to-end training tests (require GPU)
+├── special_sanity/ Standalone sanity scripts (e.g. device API usage check)
+├── testdata/       Fixture assets used by tests
 ├── toy_config/     Minimal model configs for fast testing
+├── train_scripts/  Python training entry scripts launched by tests/e2e/utils.py
 └── tools/          Test utilities (launch_utils, common_utils)
 ```
 
@@ -183,13 +207,22 @@ tests/
 | `veomni/models/` | `pytest tests/models/` |
 | `veomni/data/` | `pytest tests/data/` |
 | `veomni/ops/` | `pytest tests/ops/` |
-| `veomni/distributed/` | `pytest tests/parallel/` |
+| `veomni/distributed/` | `pytest tests/parallel/ tests/distributed/` |
 | `veomni/checkpoint/` | `pytest tests/checkpoints/` |
 | `veomni/utils/` | `pytest tests/utils/` |
-| `veomni/trainer/` | `pytest tests/e2e/` |
+| `veomni/trainer/` | `pytest tests/trainer/`, then `pytest tests/e2e/` for loop changes |
+| `veomni/lora/` | `pytest tests/lora/` |
+| `veomni/optim/` | `pytest tests/optim/` |
 | Full regression | `pytest tests/` |
 
-Distributed tests (`tests/parallel/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
+Distributed tests (`tests/parallel/`, `tests/distributed/`, `tests/e2e/`) may require multiple GPUs and use `torchrun` or `tests/tools/launch_utils.py`.
+
+**A passing local run does not mean CI runs it.**
+`.github/workflows/gpu_unit_tests.yml` and `npu_unit_tests.yml` enumerate most
+test files one by one. Only `tests/data` runs as a whole directory in both
+workflows; `tests/ops` runs wholesale on GPU only (the NPU job enumerates three
+named ops files). A new file anywhere else is invisible to CI until it is added
+to those workflows, usually both.
 
 ## Key Entry Points
 

@@ -23,3 +23,19 @@ or
 ```
 
 These add visual noise without value. If code needs grouping, use module-level or class-level docstrings, or simply rely on class/function structure.
+
+## Exception: patchgen patch headers
+
+`veomni/models/transformers/*/**_patch_gen_config.py` and the
+`generated/patched_modeling_*.py` files they emit are exempt. There, the
+
+```python
+# ================================================================
+# Patch: <Class>.<method>
+# 1. <what changed> — <why>
+# ================================================================
+```
+
+headers plus inline `# --- Patch.N ---` markers are a required convention: they
+survive into the generated file and are what makes it reviewable against the
+upstream HuggingFace source. See `.agents/skills/veomni-migrate-transformers-v5/SKILL.md`.
