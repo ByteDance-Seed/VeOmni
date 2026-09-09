@@ -98,13 +98,14 @@ Two authoritative sources:
 When HF and v5 use identical expert key names but different axis orders
 (qwen3_vl_moe pattern), the converter will be invoked on both HF-original
 checkpoints *and* v5-saved checkpoints (VeOmni's save path can emit either
-format). Dispatch on the `dim-1` shape:
+format). Validate both trailing dimensions against the HF and v5 shapes:
 
 - `gate_up_proj`: HF has `dim-1 == hidden_size`, v5 has `dim-1 == 2 * intermediate_size`.
 - `down_proj`:    HF has `dim-1 == intermediate_size`, v5 has `dim-1 == hidden_size`.
 
-Transpose only when dim-1 matches the HF expectation; pass through when it
-matches v5; **raise on anything else** rather than silently corrupting weights.
+Transpose only when the complete shape matches HF alone; pass through when it
+matches v5 alone; **raise on ambiguous or unrecognized shapes** rather than
+silently corrupting weights.
 See `qwen3_vl_moe/checkpoint_tensor_converter.py` for the canonical
 implementation.
 
