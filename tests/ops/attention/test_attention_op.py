@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +25,7 @@ from transformers.integrations.flex_attention import flex_attention_forward as h
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from veomni.ops import VeomniOp, resolve_op
+from veomni.ops import OP_REGISTRY, VeomniOp, resolve_op
 from veomni.ops.install import apply_veomni_attention_patch
 from veomni.ops.kernels.attention import lookup
 from veomni.ops.kernels.attention import ulysses as ulysses_backend
@@ -34,6 +35,7 @@ from veomni.ops.kernels.attention.standard.magi import magi_attention_forward
 from veomni.ops.kernels.attention.standard.sage import sage_attention_forward
 from veomni.ops.kernels.attention.standard.sdpa import sdpa_attention_forward
 from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
+from veomni.ops.platform import ANY_DEVICE
 
 
 _VEOMNI_FORWARDS = {
@@ -46,16 +48,68 @@ _VEOMNI_FORWARDS = {
     "veomni_sdpa": sdpa_attention_forward,
 }
 
+_STANDARD_IMPLS = (
+    "eager",
+    "sdpa",
+    "flash_attention_2",
+    "flash_attention_3",
+    "flash_attention_4",
+    "flex_attention",
+    "magi_attention",
+    "native-sparse",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_4",
+    "veomni_flex_attention",
+    "veomni_magi_attention",
+    "veomni_sage_attention",
+    "veomni_sdpa",
+)
+
+_PUBLIC_PARAMETERS = (
+    "module",
+    "query",
+    "key",
+    "value",
+    "attention_mask",
+    "dropout",
+    "scaling",
+    "sliding_window",
+    "softcap",
+    "kwargs",
+)
+
 
 def test_standard_rows_are_registered():
-    for impl in (
-        "eager",
-        "sdpa",
-        "flash_attention_2",
-        *_VEOMNI_FORWARDS,
-    ):
+    assert OP_REGISTRY.list_registered("attention", "standard") == list(_STANDARD_IMPLS)
+    assert {key for key in OP_REGISTRY._entries if key[0] == "attention"} == {
+        ("attention", "standard", impl, ANY_DEVICE) for impl in _STANDARD_IMPLS
+    }
+    for impl in _STANDARD_IMPLS:
         entry = resolve_op("attention", "standard", impl)
         assert entry.wrapper is not None
+
+
+def test_registered_attention_rows_share_public_signature_contract():
+    for impl in _STANDARD_IMPLS:
+        wrapper = resolve_op("attention", "standard", impl).wrapper
+        assert wrapper is not None
+        parameters = inspect.signature(wrapper).parameters
+        assert tuple(parameters) == _PUBLIC_PARAMETERS
+        assert parameters["attention_mask"].default is inspect.Parameter.empty
+        assert parameters["dropout"].default == 0.0
+        assert parameters["scaling"].default is None
+        assert parameters["sliding_window"].default is None
+        assert parameters["softcap"].default is None
+        assert parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
+
+
+def test_veomni_hf_attention_adapters_share_extended_signature_contract():
+    for forward in set(_VEOMNI_FORWARDS.values()):
+        parameters = inspect.signature(forward).parameters
+        assert tuple(parameters) == (*_PUBLIC_PARAMETERS[:-1], "skip_ulysses", "kwargs")
+        assert parameters["skip_ulysses"].default is False
+        assert parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
 
 
 def test_veomni_names_register_on_hf_dict_without_overwriting_stock():

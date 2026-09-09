@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lifecycle tests for the process-wide batch-invariant ATen patch."""
+"""Lifecycle, dispatcher, numerical, and gradient tests for the batch-invariant ATen patch."""
 
 from __future__ import annotations
 
@@ -21,8 +21,10 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from veomni.ops.batch_invariant import patch as batch_patch
+from veomni.utils.device import IS_CUDA_AVAILABLE
 
 
 class _FakeLibrary:
@@ -169,3 +171,69 @@ def test_failed_registration_destroys_partial_library(fake_library):
     assert not batch_patch.is_batch_invariant_mode_enabled()
     assert len(_FakeLibrary.instances) == 1
     assert _FakeLibrary.instances[0].destroyed
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="batch-invariant handlers require CUDA + Triton")
+@pytest.mark.parametrize("op_name", ("mm", "addmm", "log_softmax", "mean"))
+def test_real_handler_matches_torch_output_gradient_and_dispatcher(op_name, monkeypatch):
+    """Exercise each real handler through its public ATen-dispatched torch API."""
+    batch_patch.disable_batch_invariant_mode()
+    torch.manual_seed(17)
+    calls: list[str] = []
+    implementations = batch_patch._batch_invariant_implementations()
+
+    def track(name, implementation):
+        def tracked(*args, **kwargs):
+            calls.append(name)
+            return implementation(*args, **kwargs)
+
+        return tracked
+
+    monkeypatch.setattr(
+        batch_patch,
+        "_batch_invariant_implementations",
+        lambda: tuple((name, track(name, implementation)) for name, implementation in implementations),
+    )
+
+    if op_name in {"mm", "addmm"}:
+        input_bases = (
+            torch.randn(37, 29, device="cuda", dtype=torch.bfloat16),
+            torch.randn(29, 23, device="cuda", dtype=torch.bfloat16),
+        )
+        if op_name == "addmm":
+            input_bases = (torch.randn(23, device="cuda", dtype=torch.bfloat16), *input_bases)
+        operation = torch.mm if op_name == "mm" else torch.addmm
+    elif op_name == "log_softmax":
+        input_bases = (torch.randn(7, 37, device="cuda", dtype=torch.float32),)
+
+        def operation(value):
+            return torch.log_softmax(value, dim=-1)
+
+    else:
+        input_bases = (torch.randn(3, 11, 7, device="cuda", dtype=torch.float32),)
+
+        def operation(value):
+            return torch.mean(value, dim=1, keepdim=True)
+
+    expected_inputs = tuple(value.detach().clone().requires_grad_(True) for value in input_bases)
+    actual_inputs = tuple(value.detach().clone().requires_grad_(True) for value in input_bases)
+    expected = operation(*expected_inputs)
+    grad_output = torch.randn_like(expected)
+    expected.backward(grad_output)
+
+    with batch_patch.set_batch_invariant_mode():
+        assert batch_patch.is_batch_invariant_mode_enabled()
+        actual = operation(*actual_inputs)
+        actual.backward(grad_output)
+    assert not batch_patch.is_batch_invariant_mode_enabled()
+
+    expected_dispatch = {
+        "mm": "aten::mm",
+        "addmm": "aten::addmm",
+        "log_softmax": "aten::_log_softmax",
+        "mean": "aten::mean.dim",
+    }
+    assert expected_dispatch[op_name] in calls
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    for actual_input, expected_input in zip(actual_inputs, expected_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_input.grad, atol=3e-2, rtol=3e-2)

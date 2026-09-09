@@ -12,7 +12,7 @@
 # See the License for the specific language governing limitations
 # under the License.
 
-"""Registry rows and fused-vs-eager math for ``moe_experts_lora``."""
+"""Registry, hand-written oracle, and fused parity tests for ``moe_experts_lora``."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from veomni.ops import OP_REGISTRY, VeomniOp, resolve_op
 from veomni.ops.kernels.moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
@@ -75,14 +76,21 @@ def _run_fused_vs_eager(impl: str, variant: str):
     fc1 = (0.05 * torch.randn(E, 2 * I, H, device=device, dtype=dtype)).detach()
     fc2 = (0.05 * torch.randn(E, H, I, device=device, dtype=dtype)).detach()
     loras = _lora_tensors(variant, E=E, H=H, I=I, r=r, device=device, dtype=dtype)
+    train_base_weights = impl == "fused_triton"
 
     hidden_e = hidden.detach().requires_grad_(True)
     hidden_f = hidden.detach().requires_grad_(True)
+    routing_e = routing.detach().clone().requires_grad_(train_base_weights)
+    routing_f = routing.detach().clone().requires_grad_(train_base_weights)
+    fc1_e = fc1.detach().clone().requires_grad_(train_base_weights)
+    fc1_f = fc1.detach().clone().requires_grad_(train_base_weights)
+    fc2_e = fc2.detach().clone().requires_grad_(train_base_weights)
+    fc2_f = fc2.detach().clone().requires_grad_(train_base_weights)
     lora_e = [t.detach().clone().requires_grad_(True) for t in loras]
     lora_f = [t.detach().clone().requires_grad_(True) for t in loras]
 
-    out_e = _call("eager", variant, hidden_e, routing, selected, fc1, fc2, lora_e, num_experts=E)
-    out_f = _call(impl, variant, hidden_f, routing, selected, fc1, fc2, lora_f, num_experts=E)
+    out_e = _call("eager", variant, hidden_e, routing_e, selected, fc1_e, fc2_e, lora_e, num_experts=E)
+    out_f = _call(impl, variant, hidden_f, routing_f, selected, fc1_f, fc2_f, lora_f, num_experts=E)
     fwd_l2 = _l2_rel(out_f, out_e)
     assert fwd_l2 <= _FWD_L2REL_TOL, (
         f"[{impl}/{variant}] forward L2 rel {fwd_l2:.4%} > {_FWD_L2REL_TOL:.2%} "
@@ -92,14 +100,64 @@ def _run_fused_vs_eager(impl: str, variant: str):
     go = (0.1 * torch.randn_like(out_e)).detach()
     out_e.backward(go)
     out_f.backward(go)
-    h_l2 = _l2_rel(hidden_f.grad, hidden_e.grad)
-    assert h_l2 <= _GRAD_L2REL_TOL, f"[{impl}/{variant}] hidden grad L2 rel {h_l2:.4%} > {_GRAD_L2REL_TOL:.2%}"
-    for name, ge, gf in zip(_LORA_KEYS, lora_e, lora_f, strict=True):
-        l2 = _l2_rel(gf.grad, ge.grad)
+    gradient_pairs = [("hidden_states", hidden_e, hidden_f)]
+    if train_base_weights:
+        gradient_pairs.extend(
+            (
+                ("routing_weights", routing_e, routing_f),
+                ("fc1_1_2_weight", fc1_e, fc1_f),
+                ("fc2_weight", fc2_e, fc2_f),
+            )
+        )
+    gradient_pairs.extend(zip(_LORA_KEYS, lora_e, lora_f, strict=True))
+    for name, eager_input, fused_input in gradient_pairs:
+        l2 = _l2_rel(fused_input.grad, eager_input.grad)
         assert l2 <= _GRAD_L2REL_TOL, (
             f"[{impl}/{variant}] {name} grad L2 rel {l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
-            f"(eager_norm={ge.grad.float().norm().item():.3e})"
+            f"(eager_norm={eager_input.grad.float().norm().item():.3e})"
         )
+
+
+def _manual_moe_lora_oracle(
+    variant: str,
+    hidden: torch.Tensor,
+    routing: torch.Tensor,
+    selected: torch.Tensor,
+    fc1: torch.Tensor,
+    fc2: torch.Tensor,
+    loras: list[torch.Tensor],
+) -> torch.Tensor:
+    """Compute routed MoE-LoRA directly, without registry or scatter/grouped-GEMM helpers."""
+    lora_a_gate, lora_b_gate, lora_a_up, lora_b_up, lora_a_down, lora_b_down = loras
+    outputs = []
+    for token_index, token in enumerate(hidden):
+        token_output = torch.zeros_like(token)
+        for slot_index in range(selected.shape[1]):
+            expert_index = int(selected[token_index, slot_index])
+            if variant == "shared":
+                expert_loras = (
+                    lora_a_gate,
+                    lora_b_gate,
+                    lora_a_up,
+                    lora_b_up,
+                    lora_a_down,
+                    lora_b_down,
+                )
+            else:
+                expert_loras = tuple(lora[expert_index] for lora in loras)
+            a_gate, b_gate, a_up, b_up, a_down, b_down = expert_loras
+
+            base_gate, base_up = F.linear(token, fc1[expert_index]).chunk(2, dim=-1)
+            gate = base_gate + F.linear(F.linear(token, a_gate), b_gate) * _SCALES["lora_scale_gate"]
+            up = base_up + F.linear(F.linear(token, a_up), b_up) * _SCALES["lora_scale_up"]
+            intermediate = F.silu(gate) * up
+            expert_output = F.linear(intermediate, fc2[expert_index])
+            expert_output = expert_output + (
+                F.linear(F.linear(intermediate, a_down), b_down) * _SCALES["lora_scale_down"]
+            )
+            token_output = token_output + routing[token_index, slot_index] * expert_output
+        outputs.append(token_output)
+    return torch.stack(outputs)
 
 
 def _make_lora_leaf(*shape: int, dtype: torch.dtype, device: torch.device, scale: float = 0.02) -> torch.Tensor:
@@ -156,6 +214,41 @@ def test_moe_experts_lora_eager_forward_smoke(variant):
     loras = _lora_tensors(variant, E=E, H=H, I=I, r=r, device=hidden.device, dtype=hidden.dtype)
     out = _call("eager", variant, hidden, routing, selected, fc1, fc2, loras, num_experts=E)
     assert out.shape == hidden.shape
+
+
+@pytest.mark.parametrize("variant", ["shared", "independent"])
+def test_moe_experts_lora_eager_matches_manual_oracle_forward_and_all_gradients(variant):
+    torch.manual_seed(11)
+    B, H, I, E, top_k, r = 4, 5, 7, 3, 2, 3
+    dtype = torch.float64
+    hidden = torch.randn(B, H, dtype=dtype)
+    routing = torch.softmax(torch.randn(B, top_k, dtype=dtype), dim=-1)
+    selected = torch.tensor([[0, 1], [2, 0], [1, 2], [2, 1]])
+    fc1 = torch.randn(E, 2 * I, H, dtype=dtype) * 0.2
+    fc2 = torch.randn(E, H, I, dtype=dtype) * 0.2
+    loras = _lora_tensors(variant, E=E, H=H, I=I, r=r, device=hidden.device, dtype=dtype)
+
+    eager_inputs = [value.detach().clone().requires_grad_(True) for value in (hidden, routing, fc1, fc2, *loras)]
+    oracle_inputs = [value.detach().clone().requires_grad_(True) for value in (hidden, routing, fc1, fc2, *loras)]
+    hidden_e, routing_e, fc1_e, fc2_e, *lora_e = eager_inputs
+    hidden_o, routing_o, fc1_o, fc2_o, *lora_o = oracle_inputs
+
+    output_e = _call("eager", variant, hidden_e, routing_e, selected, fc1_e, fc2_e, lora_e, num_experts=E)
+    output_o = _manual_moe_lora_oracle(variant, hidden_o, routing_o, selected, fc1_o, fc2_o, lora_o)
+    torch.testing.assert_close(output_e, output_o, atol=1e-10, rtol=1e-10)
+
+    grad_output = torch.randn_like(output_e)
+    eager_grads = torch.autograd.grad(output_e, eager_inputs, grad_outputs=grad_output)
+    oracle_grads = torch.autograd.grad(output_o, oracle_inputs, grad_outputs=grad_output)
+    gradient_names = ("hidden_states", "routing_weights", "fc1_1_2_weight", "fc2_weight", *_LORA_KEYS)
+    for name, actual, expected in zip(gradient_names, eager_grads, oracle_grads, strict=True):
+        torch.testing.assert_close(
+            actual,
+            expected,
+            atol=1e-10,
+            rtol=1e-10,
+            msg=lambda message, name=name: f"{name}: {message}",
+        )
 
 
 @pytest.mark.parametrize("variant", ["shared", "independent"])

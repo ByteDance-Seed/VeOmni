@@ -211,6 +211,32 @@ def test_liger_matches_eager_with_frozen_weight():
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
+def test_liger_matches_eager_with_frozen_hidden():
+    pytest.importorskip("liger_kernel")
+    eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper
+    other = resolve_op("cross_entropy_loss", "standard", "liger_kernel").wrapper
+    torch.manual_seed(6)
+    hidden = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+    labels = torch.randint(0, 64, (2, 16), device="cuda")
+    labels[:, 0] = -100
+
+    hidden_e, hidden_o = hidden.clone(), hidden.clone()
+    weight_e, weight_o = _clone(weight), _clone(weight)
+    out_e = eager(hidden_e, labels, weight_e)
+    out_o = other(hidden_o, labels, weight_o)
+    assert torch.allclose(out_e.float(), out_o.float(), atol=CE_FUSED_ATOL, rtol=CE_FUSED_RTOL)
+
+    out_e.backward()
+    out_o.backward()
+    assert hidden_e.grad is None
+    assert hidden_o.grad is None
+    assert torch.allclose(
+        weight_e.grad.float(), weight_o.grad.float(), atol=CE_FUSED_GRAD_ATOL, rtol=CE_FUSED_GRAD_RTOL
+    )
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger fused CE needs a GPU")
 def test_liger_matches_eager_num_items():
     pytest.importorskip("liger_kernel")
     eager = resolve_op("cross_entropy_loss", "standard", "eager").wrapper

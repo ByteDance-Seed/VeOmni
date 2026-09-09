@@ -44,11 +44,30 @@ from tests.ops.tol import (
 )
 from veomni.ops import OP_REGISTRY, resolve_op
 from veomni.ops.registry import OpEntry
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 
 
 def _clone(*tensors: Tensor) -> tuple[Tensor, ...]:
     return tuple(t.detach().requires_grad_(True) for t in tensors)
+
+
+_FLA_DEVICE_CASES = (
+    pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA needs a CUDA GPU")),
+    pytest.param("mlu", marks=pytest.mark.skipif(not IS_MLU_AVAILABLE, reason="FLA needs an MLU")),
+)
+
+
+def _require_npu_gdr_dependencies(*, ascendc: bool = False) -> None:
+    """Skip real NPU numerics unless the optional GDR runtime is installed."""
+    pytest.importorskip("triton")
+    try:
+        from triton._C import libtriton
+    except ImportError:
+        pytest.skip("NPU GDR kernels require triton-ascend")
+    if not hasattr(libtriton, "ascend"):
+        pytest.skip("NPU GDR kernels require the Triton Ascend backend")
+    if ascendc:
+        pytest.importorskip("fla_npu")
 
 
 @pytest.mark.parametrize(
@@ -106,16 +125,16 @@ def test_rms_norm_gated_eager_matches_hf():
     assert torch.allclose(w_e.grad, module.weight.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA rms_norm_gated needs a GPU")
-def test_rms_norm_gated_fla_matches_eager():
+@pytest.mark.parametrize("device", _FLA_DEVICE_CASES)
+def test_rms_norm_gated_fla_matches_eager(device):
     pytest.importorskip("fla")
     eager = resolve_op("rms_norm_gated", "standard", "eager").wrapper
     other = resolve_op("rms_norm_gated", "standard", "fla").wrapper
     torch.manual_seed(0)
     hidden = 64
-    x = torch.randn(2, 16, hidden, device="cuda", dtype=torch.bfloat16)
-    gate = torch.randn(2, 16, hidden, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(2, 16, hidden, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(2, 16, hidden, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(hidden, device=device, dtype=torch.bfloat16)
 
     x_e, g_e, w_e = _clone(x, gate, weight)
     x_o, g_o, w_o = _clone(x, gate, weight)
@@ -217,16 +236,16 @@ def test_causal_conv1d_eager_matches_hf():
     assert torch.allclose(b_e.grad, b_r.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA causal_conv1d needs a GPU")
-def test_causal_conv1d_fla_matches_eager():
+@pytest.mark.parametrize("device", _FLA_DEVICE_CASES)
+def test_causal_conv1d_fla_matches_eager(device):
     pytest.importorskip("fla")
     eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
     other = resolve_op("causal_conv1d", "standard", "fla").wrapper
     torch.manual_seed(1)
     batch, seq, dim, kernel = 2, 16, 32, 4
-    x = torch.randn(batch, seq, dim, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(dim, kernel, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(batch, seq, dim, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(dim, kernel, device=device, dtype=torch.bfloat16)
+    bias = torch.randn(dim, device=device, dtype=torch.bfloat16)
 
     x_e, w_e, b_e = _clone(x, weight, bias)
     x_o, w_o, b_o = _clone(x, weight, bias)
@@ -240,6 +259,40 @@ def test_causal_conv1d_fla_matches_eager():
     assert torch.allclose(x_e.grad, x_o.grad, atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL)
     assert torch.allclose(w_e.grad, w_o.grad, atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL)
     assert torch.allclose(b_e.grad, b_o.grad, atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
+def test_causal_conv1d_npu_matches_eager_forward_and_backward():
+    _require_npu_gdr_dependencies()
+    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
+
+    if is_arch35():
+        pytest.skip("vendored NPU causal_conv1d does not support arch35")
+
+    eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
+    other = resolve_op("causal_conv1d", "standard", "npu").wrapper
+    torch.manual_seed(13)
+    batch, seq, dim, kernel = 2, 64, 128, 4
+    x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(dim, kernel, device="npu", dtype=torch.bfloat16)
+    bias = torch.randn(dim, device="npu", dtype=torch.bfloat16)
+
+    x_e, w_e, b_e = _clone(x, weight, bias)
+    x_o, w_o, b_o = _clone(x, weight, bias)
+    out_e = eager(x_e, w_e, b_e, activation="silu")
+    out_o = other(x_o, w_o, b_o, activation="silu")
+    torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+    out_o.backward(grad_output)
+    for actual, expected in zip((x_o, w_o, b_o), (x_e, w_e, b_e), strict=True):
+        torch.testing.assert_close(
+            actual.grad.float(),
+            expected.grad.float(),
+            atol=GDN_FUSED_GRAD_ATOL,
+            rtol=GDN_FUSED_GRAD_RTOL,
+        )
 
 
 def test_chunk_gated_delta_rule_eager_matches_hf():
@@ -417,18 +470,18 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     assert seen_scales == [("forward", explicit_scale), ("backward", explicit_scale)]
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="FLA chunk_gated_delta_rule needs a GPU")
-def test_chunk_gated_delta_rule_fla_matches_eager():
+@pytest.mark.parametrize("device", _FLA_DEVICE_CASES)
+def test_chunk_gated_delta_rule_fla_matches_eager(device):
     pytest.importorskip("fla")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", "fla").wrapper
     torch.manual_seed(2)
     batch, seq, heads, dim = 1, 32, 2, 16
-    q = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-    g = -torch.rand(batch, seq, heads, device="cuda", dtype=torch.float32) * 0.5
-    beta = torch.rand(batch, seq, heads, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(batch, seq, heads, dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch, seq, heads, dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch, seq, heads, dim, device=device, dtype=torch.bfloat16)
+    g = -torch.rand(batch, seq, heads, device=device, dtype=torch.float32) * 0.5
+    beta = torch.rand(batch, seq, heads, device=device, dtype=torch.bfloat16)
 
     q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
     q_o, k_o, v_o, g_o, b_o = _clone(q, k, v, g, beta)
@@ -457,6 +510,38 @@ def test_chunk_gated_delta_rule_fla_matches_eager():
     assert torch.allclose(q_e.grad, q_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
     assert torch.allclose(k_e.grad, k_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
     assert torch.allclose(v_e.grad, v_o.grad, atol=GDN_CHUNK_GRAD_ATOL, rtol=GDN_CHUNK_GRAD_RTOL)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
+@pytest.mark.parametrize("impl", ("npu", "npu_ascendc"))
+def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl):
+    _require_npu_gdr_dependencies(ascendc=impl == "npu_ascendc")
+    eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
+    other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
+    torch.manual_seed(19)
+    batch, seq, heads, dim = 1, 64, 4, 64
+    q = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
+    k = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
+    v = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
+    g = -torch.rand(batch, seq, heads, device="npu", dtype=torch.float32) * 0.5
+    beta = torch.rand(batch, seq, heads, device="npu", dtype=torch.bfloat16)
+
+    q_e, k_e, v_e, g_e, b_e = _clone(q, k, v, g, beta)
+    q_o, k_o, v_o, g_o, b_o = _clone(q, k, v, g, beta)
+    out_e, _ = eager(q_e, k_e, v_e, g_e, b_e, use_qk_l2norm_in_kernel=True)
+    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, use_qk_l2norm_in_kernel=True)
+    torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+    out_o.backward(grad_output)
+    for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
+        torch.testing.assert_close(
+            actual.grad.float(),
+            expected.grad.float(),
+            atol=GDN_CHUNK_GRAD_ATOL,
+            rtol=GDN_CHUNK_GRAD_RTOL,
+        )
 
 
 @pytest.mark.skipif(
