@@ -33,5 +33,3 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 The dispatch table in [`AGENTS.md`](../../AGENTS.md) is the single index — it maps
 a task to the skill to use, and every agent already loads it. Each skill's own
 `description` frontmatter is the authoritative statement of when it applies.
-
-Keeping a second copy of the index here only produced drift, so it is gone.
