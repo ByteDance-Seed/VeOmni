@@ -1420,6 +1420,57 @@ class TestPromoteStagedCheckpoint:
 
 
 class TestStageDirValidation:
+    def test_stale_staged_copies_from_earlier_steps_are_swept(self, tmp_path):
+        """A killed save strands a model-plus-optimizer-sized copy under its own key.
+
+        Clearing only the current key would leave it there, and the next save on
+        that node would ask for the same space again on a disk already short of it.
+        """
+        import os as _os
+
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            abandoned = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_10")
+            with open(_os.path.join(abandoned, "big.distcp"), "w") as f:
+                f.write("a save that never finished")
+
+            current = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_20")
+
+        assert not _os.path.exists(abandoned), "the earlier step's copy must not survive"
+        assert _os.path.isdir(current)
+
+    def test_sweep_is_confined_to_veomni_own_directory(self, tmp_path):
+        """stage_dir is the caller's, often /tmp; only our own subtree may be removed."""
+
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        someone_elses = tmp_path / "someone_elses_data"
+        someone_elses.mkdir()
+        (someone_elses / "important.bin").write_text("not ours")
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_10")
+
+        assert (someone_elses / "important.bin").exists(), "swept outside our own root"
+
+    def test_only_the_node_leader_sweeps(self, tmp_path):
+        """Every rank on the node shares the directory; one sweep is enough."""
+        import os as _os
+
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0):
+                stale = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_10")
+            with open(_os.path.join(stale, "leftover"), "w") as f:
+                f.write("x")
+            # A non-leader must not wipe what the leader already prepared.
+            with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
+                _prepare_stage_dir(str(tmp_path), "/remote/ckpt/global_step_20")
+
+        assert _os.path.exists(_os.path.join(stale, "leftover"))
+
     def test_staging_dir_failure_is_agreed_across_ranks(self, tmp_path):
         """A scratch disk fails per node, so ranks that could still stage must stop too.
 

@@ -523,18 +523,32 @@ def _promotion_phase(state: _Promotion, work, *, participates: bool, always: boo
     state.failed = _any_rank_failed(state.error is not None) or state.failed
 
 
+_STAGE_ROOT = "veomni_ckpt_stage"
+
+
 def _prepare_stage_dir(stage_dir: str, checkpoint_dir: str) -> str:
     """Create an empty staging directory for one checkpoint, agreed by every rank.
 
+    Every staged checkpoint this process has ever written lives under one root,
+    and all of them are cleared here, not just this checkpoint's own directory.
+    A save killed part-way -- by a hang detector, a failover, a preemption --
+    leaves behind a copy the size of the model plus its optimizer state, under a
+    key naming *its* step. Removing only the current key would strand it, and the
+    next save on that node then asks for the same space again on a disk that is
+    already short of it.
+
     A scratch disk fills or goes read-only per node, so the ranks that could not
-    prepare one must not be the only ones to stop: the rest would go on into
-    ``dcp.save`` and wait on a collective that never arrives. Everyone agrees
-    here, before any of that starts.
+    prepare a directory must not be the only ones to stop: the rest would go on
+    into ``dcp.save`` and wait on a collective that never arrives. Everyone
+    agrees here, before any of that starts.
     """
-    stage_path = os.path.join(stage_dir, _stage_key(checkpoint_dir))
+    stage_root = os.path.join(stage_dir, _STAGE_ROOT)
+    stage_path = os.path.join(stage_root, _stage_key(checkpoint_dir))
     error: Optional[BaseException] = None
     try:
-        shutil.rmtree(stage_path, ignore_errors=True)  # leftovers from a crashed run
+        # One process per node does the sweep; the rest only need the directory.
+        if _local_rank() == 0:
+            shutil.rmtree(stage_root, ignore_errors=True)
         os.makedirs(stage_path, exist_ok=True)
     except BaseException as e:  # noqa: BLE001 - raised once every rank has agreed
         error = e
