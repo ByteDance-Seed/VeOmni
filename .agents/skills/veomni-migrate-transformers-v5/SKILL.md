@@ -665,7 +665,11 @@ and regenerate. This is a hard rule called out in `AGENTS.md`.
 
 ## Phase 6: Add Test Cases
 
-Follow `docs/transformers_v5/testing_new_model.md`. Minimum coverage:
+Follow `docs/transformers_v5/testing_new_model.md`. Every file below is already
+enumerated in the unit-test workflows, so appending a case needs no workflow
+change — that is exactly why this phase extends tables instead of adding files.
+If you think you need a new test file, read `.agents/knowledge/testing.md` first.
+Minimum coverage:
 
 1. **Toy config**: create `tests/toy_config/<m>_toy/config.json` (few layers,
    small hidden/intermediate, tiny vocab). Add a `README.md` next to it noting

@@ -19,6 +19,7 @@ On session start, read the following:
 - `.agents/knowledge/cloud_env.md` — Cursor Cloud (CPU-only VM) setup; read when running on the Cursor Cloud VM
 
 Read on demand:
+- `.agents/knowledge/testing.md` — how CI selects tests, and how to decide whether a change needs one; read before adding or wiring a test
 - `.agents/knowledge/multimodal_metadata.md` — multimodal metadata precompute contract; read before touching VLM/Omni collators, ViT forwards, or the model metadata hooks
 
 ---
