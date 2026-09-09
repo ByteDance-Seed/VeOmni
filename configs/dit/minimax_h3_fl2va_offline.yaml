@@ -47,11 +47,11 @@ data:
   train_path: output/minimax_h3_fl2va_embedding
   data_type: diffusion
   source_name: minimax_h3
-  datasets_type: minimax_h3_offline
+  data_transform: dit_offline
+  datasets_type: iterable
+  dataset_repeat: true
   log_sample: false
   text_keys: text
-  mm_configs:
-    repeat: 100
   dataloader:
     type: native
     num_workers: 8
