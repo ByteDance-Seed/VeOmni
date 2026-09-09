@@ -75,13 +75,25 @@ class MagiAttentionMask:
         *,
         causal: bool = True,
         device: torch.device | str | None = None,
+        q_length: int | None = None,
+        kv_length: int | None = None,
     ) -> MagiAttentionMask:
-        """Build a packed range mask from cumulative sequence lengths."""
+        """Build packed ranges, optionally requiring complete Q/K coverage."""
         if cu_seqlens_k is None:
             cu_seqlens_k = cu_seqlens_q
         device = cu_seqlens_q.device if device is None else torch.device(device)
-        q_ranges = _ranges_from_cu_seqlens(cu_seqlens_q, device)
-        k_ranges = _ranges_from_cu_seqlens(cu_seqlens_k, device)
+        q_ranges = _ranges_from_cu_seqlens(
+            "cu_seqlens_q",
+            cu_seqlens_q,
+            device=device,
+            sequence_length=q_length,
+        )
+        k_ranges = _ranges_from_cu_seqlens(
+            "cu_seqlens_k",
+            cu_seqlens_k,
+            device=device,
+            sequence_length=kv_length,
+        )
         attn_type_map = torch.ones(q_ranges.shape[0], device=device, dtype=torch.int32) if causal else None
         result = cls.from_ranges(q_ranges, k_ranges, attn_type_map, device=device)
         if causal:
@@ -156,13 +168,23 @@ def _full_sequence_lengths(q_length: int, kv_length: int, *, skip_ulysses: bool)
     return q_length * scale, kv_length * scale
 
 
-def _ranges_from_cu_seqlens(cu_seqlens: torch.Tensor, device: torch.device) -> torch.Tensor:
+def _ranges_from_cu_seqlens(
+    name: str,
+    cu_seqlens: torch.Tensor,
+    *,
+    device: torch.device,
+    sequence_length: int | None,
+) -> torch.Tensor:
     """Convert cumulative sequence lengths to contiguous half-open ranges."""
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
-        raise ValueError(f"cu_seqlens must have shape [num_sequences + 1], got {tuple(cu_seqlens.shape)}.")
+        raise ValueError(f"{name} must have shape [num_sequences + 1], got {tuple(cu_seqlens.shape)}.")
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
-    if int(cu_seqlens[0]) != 0:
-        raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens.tolist()}.")
+    require_all(cu_seqlens[:1] == 0, f"{name} must start at 0.")
+    if sequence_length is not None:
+        require_all(
+            cu_seqlens[-1:] == sequence_length,
+            f"{name} must end at the full sequence length ({sequence_length}).",
+        )
     return torch.stack((cu_seqlens[:-1], cu_seqlens[1:]), dim=1).contiguous()
 
 

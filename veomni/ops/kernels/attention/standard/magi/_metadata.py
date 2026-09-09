@@ -22,10 +22,11 @@ import torch
 
 @dataclass(frozen=True)
 class _CacheEntry:
-    """One prepared attention argument and the tensor identity key it serves."""
+    """Prepared argument plus strong references anchoring its tensor identities."""
 
     key: tuple[object, ...]
     attn_arg: object
+    metadata_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
 
 
 _CACHE_LOCK = Lock()
@@ -50,7 +51,15 @@ def get_or_prepare_attn_arg(
             return _cache_entry.attn_arg
 
         attn_arg = _prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map, metadata_head_dim)
-        _cache_entry = _CacheEntry(key=cache_key, attn_arg=attn_arg) if cache_key is not None else None
+        _cache_entry = (
+            _CacheEntry(
+                key=cache_key,
+                attn_arg=attn_arg,
+                metadata_tensors=(q_ranges, k_ranges, attn_type_map),
+            )
+            if cache_key is not None
+            else None
+        )
         return attn_arg
 
 

@@ -202,6 +202,29 @@ def test_magi_packed_aligns_with_from_cu_seqlens():
     torch.testing.assert_close(shaped.attn_type_map, built.attn_type_map)
 
 
+def test_magi_packed_rejects_incomplete_query_coverage():
+    with pytest.raises(ValueError, match=r"cu_seqlens_q must end at the full sequence length \(8\)"):
+        packed_causal_mask(
+            8,
+            8,
+            impl="magi_attention",
+            device="cpu",
+            cu_seqlens=torch.tensor([0, 4]),
+        )
+
+
+def test_magi_packed_rejects_incomplete_key_coverage():
+    with pytest.raises(ValueError, match=r"cu_seqlens_k must end at the full sequence length \(8\)"):
+        packed_causal_mask(
+            8,
+            8,
+            impl="magi_attention",
+            device="cpu",
+            cu_seqlens=torch.tensor([0, 8]),
+            cu_seqlens_k=torch.tensor([0, 4]),
+        )
+
+
 def test_magi_sliding_window_is_unsupported():
     with pytest.raises(ValueError, match="sliding windows in ranges"):
         sliding_window_mask(4, 4, impl="magi_attention", device="cpu", sliding_window=2)

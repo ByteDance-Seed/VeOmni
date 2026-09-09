@@ -259,17 +259,25 @@ def test_magi_fa4_metadata_cache_reuses_only_matching_inputs(monkeypatch):
     monkeypatch.setattr(magi_metadata, "_cache_entry", None)
     query = torch.randn(8, 4, 16)
     key = torch.randn(8, 2, 16)
-    ranges = torch.tensor([[0, 8]], dtype=torch.int32)
+    q_ranges = torch.tensor([[0, 8]], dtype=torch.int32)
+    k_ranges = torch.tensor([[0, 8]], dtype=torch.int32)
+    attn_type_map = torch.tensor([1], dtype=torch.int32)
 
-    first = magi_metadata.get_or_prepare_attn_arg(query, key, ranges, ranges, None)
-    second = magi_metadata.get_or_prepare_attn_arg(query, key, ranges, ranges, None)
+    first = magi_metadata.get_or_prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
+    second = magi_metadata.get_or_prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
 
-    ranges[0, 1] = 7
-    after_mutation = magi_metadata.get_or_prepare_attn_arg(query, key, ranges, ranges, None)
-    repeated_after_mutation = magi_metadata.get_or_prepare_attn_arg(query, key, ranges, ranges, None)
+    q_ranges[0, 1] = 7
+    after_mutation = magi_metadata.get_or_prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
+    repeated_after_mutation = magi_metadata.get_or_prepare_attn_arg(query, key, q_ranges, k_ranges, attn_type_map)
 
     shorter_query = query[:7]
-    after_shape_change = magi_metadata.get_or_prepare_attn_arg(shorter_query, key, ranges, ranges, None)
+    after_shape_change = magi_metadata.get_or_prepare_attn_arg(
+        shorter_query,
+        key,
+        q_ranges,
+        k_ranges,
+        attn_type_map,
+    )
 
     assert first is second
     assert after_mutation is repeated_after_mutation
@@ -277,6 +285,9 @@ def test_magi_fa4_metadata_cache_reuses_only_matching_inputs(monkeypatch):
     assert after_mutation is not after_shape_change
     assert len(built_args) == 3
     assert magi_metadata._cache_entry is not None
+    assert magi_metadata._cache_entry.metadata_tensors[0] is q_ranges
+    assert magi_metadata._cache_entry.metadata_tensors[1] is k_ranges
+    assert magi_metadata._cache_entry.metadata_tensors[2] is attn_type_map
 
 
 def test_magi_fa4_metadata_cache_disables_reuse_without_version_counters(monkeypatch):

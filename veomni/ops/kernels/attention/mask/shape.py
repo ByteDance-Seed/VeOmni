@@ -277,5 +277,7 @@ def packed_causal_mask(
             cu_seqlens,
             extra.pop("cu_seq_lens_k", extra.pop("cu_seqlens_k", cu_seqlens)),
             device=device,
+            q_length=q_len,
+            kv_length=kv_len,
         )
     raise ValueError(f"unsupported attention impl for packed_causal_mask: {impl!r}")
