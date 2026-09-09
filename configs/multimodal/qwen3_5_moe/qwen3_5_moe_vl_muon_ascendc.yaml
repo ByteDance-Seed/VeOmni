@@ -15,7 +15,7 @@ model:
 data:
   train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
   data_type: conversation
-  chat_template: qwen3vl
+  chat_template: qwen3_5vl
   max_seq_len: 16384
   train_size: 160000000
   mm_configs:

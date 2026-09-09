@@ -20,7 +20,7 @@ import torch
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.registry import Registry
 
-from .chat_template import add_mtp_labels
+from .chat_template import _get_mtp_num_hidden_layers, add_mtp_labels
 
 
 if TYPE_CHECKING:
@@ -66,7 +66,6 @@ def process_plaintext_example(
     tokenizer: "PreTrainedTokenizer",
     max_seq_len: int,
     text_keys: Union[str, List[str]] = "content_split",
-    mtp_num_hidden_layers: int = 0,
     **kwargs,
 ) -> List[Dict[str, "torch.Tensor"]]:
     examples = []
@@ -83,6 +82,7 @@ def process_plaintext_example(
         raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
 
     tokens = tokenizer.encode(text_example, add_special_tokens=False) + [tokenizer.eos_token_id]
+    mtp_num_hidden_layers = _get_mtp_num_hidden_layers(tokenizer)
     for input_ids in split_into_chunks(tokens, max_seq_len):
         examples.append(
             {

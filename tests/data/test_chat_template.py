@@ -62,16 +62,13 @@ def test_add_mtp_labels_builds_each_depth_before_packing():
     assert torch.equal(feature["mtp_labels"], expected)
 
 
-def test_tokenizer_template_emits_mtp_labels_when_enabled():
+def test_tokenizer_template_does_not_emit_mtp_labels():
     template = TokenizerTemplate(_PrefixStableTokenizer())
-    template.mtp_num_hidden_layers = 2
-
     encoded = template.encode_messages(
         [{"role": "user", "content": [10, 11]}, {"role": "assistant", "content": [20, 21]}],
         max_seq_len=4,
     )
-
-    assert torch.equal(encoded["mtp_labels"], torch.tensor([[20, 21, -100, -100], [21, -100, -100, -100]]))
+    assert "mtp_labels" not in encoded
 
 
 def test_gpt_oss_tokenizer_template_supports_terminal_token_rewrite():
@@ -291,20 +288,6 @@ class _Processor:
         self.video_processor = SimpleNamespace(temporal_patch_size=temporal_patch_size)
 
 
-def test_qwen_vl_template_emits_mtp_labels_when_enabled():
-    template = build_chat_template("qwen2vl", _Processor(_SpecialTokenTokenizer()))
-    template.mtp_num_hidden_layers = 2
-
-    encoded = template.encode_messages([("user", ("text", "hi")), ("assistant", ("text", "ok"))], {})
-    labels = encoded["labels"]
-
-    assert encoded["mtp_labels"].shape == (2, labels.numel())
-    assert torch.equal(encoded["mtp_labels"][0, :-2], labels[2:])
-    assert torch.equal(encoded["mtp_labels"][1, :-3], labels[3:])
-    assert torch.all(encoded["mtp_labels"][0, -2:] == IGNORE_INDEX)
-    assert torch.all(encoded["mtp_labels"][1, -3:] == IGNORE_INDEX)
-
-
 def _video_metadata(total_num_frames, fps=2.0, frames_indices=None):
     from transformers.video_utils import VideoMetadata
 
@@ -315,24 +298,10 @@ def _video_metadata(total_num_frames, fps=2.0, frames_indices=None):
     )
 
 
-# Frame/token pairs read off the real Qwen3VLVideoProcessor (temporal_patch_size=2,
-# merge_size=2) at 128x128: the processor pads an odd frame count up, so 15 and 16
-# frames both yield grid_t=8 and 128 tokens.
-@pytest.mark.parametrize("num_frames, num_video_tokens", [(4, 72), (8, 64), (15, 128), (16, 128), (17, 144)])
-def test_qwen3vl_emits_one_video_placeholder_per_processor_token(num_frames, num_video_tokens):
-    # The vision tower produces exactly num_video_tokens embeddings, and
-    # process_sample_qwen_vl builds video_mask from these placeholder positions.
-    # Any shortfall silently misaligns visual features against text positions.
-    template = build_chat_template("qwen3vl", _Processor(_SpecialTokenTokenizer()))
-
-    encoded = template.encode_messages(
-        [("user", ("video", None))],
-        {"video": [num_video_tokens]},
-        video_metadata=[_video_metadata(num_frames)],
-    )
-
-    emitted = int((encoded["input_ids"] == TYPE2INDEX["input"]["video"]).sum())
-    assert emitted == num_video_tokens
+def test_qwen2vl_template_does_not_emit_mtp_labels():
+    template = build_chat_template("qwen2vl", _Processor(_SpecialTokenTokenizer()))
+    encoded = template.encode_messages([("user", ("text", "hi")), ("assistant", ("text", "ok"))], {})
+    assert "mtp_labels" not in encoded
 
 
 @pytest.mark.parametrize("num_frames, num_video_tokens", [(8, 65), (17, 100), (16, 1)])

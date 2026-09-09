@@ -15,6 +15,8 @@
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Sequence, Union
 
 import torch
@@ -49,6 +51,23 @@ def add_mtp_labels(feature: Dict[str, torch.Tensor | List[int]], num_depths: int
     )
 
 
+def _get_mtp_num_hidden_layers(tokenizer_or_processor) -> int:
+    tokenizer = getattr(tokenizer_or_processor, "tokenizer", tokenizer_or_processor)
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    if not name_or_path:
+        name_or_path = getattr(tokenizer, "init_kwargs", {}).get("name_or_path")
+    if not name_or_path:
+        return 0
+    config_path = Path(name_or_path) / "config.json"
+    try:
+        with config_path.open() as config_file:
+            config = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    text_config = config.get("text_config", config)
+    return int(text_config.get("mtp_num_hidden_layers", 0) or 0)
+
+
 def build_chat_template(
     template_name: str,
     tokenizer_or_processor: Union["PreTrainedTokenizer", "ProcessorMixin"],
@@ -74,7 +93,6 @@ class ChatTemplate(ABC):
 
     def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
         self.tokenizer = tokenizer
-        self.mtp_num_hidden_layers = 0
 
     def save_pretrained(self, output_dir: str) -> None:
         self.tokenizer.chat_template = self.get_jinja_template()
@@ -114,7 +132,6 @@ class DefaultTemplate(ChatTemplate):
 
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
-        add_mtp_labels(model_inputs, self.mtp_num_hidden_layers)
         return model_inputs
 
     def get_jinja_template(self) -> str:
@@ -171,7 +188,6 @@ class TokenizerTemplate(ChatTemplate):
         input_ids = input_ids[-max_seq_len:]
         labels = labels[-max_seq_len:]
         model_inputs = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
-        add_mtp_labels(model_inputs, self.mtp_num_hidden_layers)
         return model_inputs
 
     def get_jinja_template(self) -> str:
@@ -242,7 +258,6 @@ class Llama2Template(ChatTemplate):
 
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
-        add_mtp_labels(model_inputs, self.mtp_num_hidden_layers)
         return model_inputs
 
     def get_jinja_template(self) -> str:
@@ -287,7 +302,6 @@ class ChatmlTemplate(ChatTemplate):
 
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
-        add_mtp_labels(model_inputs, self.mtp_num_hidden_layers)
         return model_inputs
 
     def get_jinja_template(self) -> str:
@@ -298,6 +312,22 @@ class ChatmlTemplate(ChatTemplate):
             "{% endfor %}"
             "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
         )
+
+
+class MTPLabelMixin:
+    def __init__(self, tokenizer_or_processor):
+        super().__init__(tokenizer_or_processor)
+        self.mtp_num_hidden_layers = _get_mtp_num_hidden_layers(tokenizer_or_processor)
+
+    def encode_messages(self, *args, **kwargs):
+        feature = super().encode_messages(*args, **kwargs)
+        add_mtp_labels(feature, self.mtp_num_hidden_layers)
+        return feature
+
+
+@CHAT_TEMPLATE_REGISTRY.register("qwen3_5")
+class Qwen3_5ChatTemplate(MTPLabelMixin, ChatmlTemplate):
+    pass
 
 
 class MultimodalChatTemplate(ChatTemplate):
@@ -408,7 +438,6 @@ class Qwen2VLTemplate(MultimodalChatTemplate):
         video_mask = tokenized_example["input_ids"] == self.video_token_id
         tokenized_example["input_ids"][video_mask] = TYPE2INDEX["input"]["video"]
 
-        add_mtp_labels(tokenized_example, self.mtp_num_hidden_layers)
         return tokenized_example
 
     @abstractmethod
@@ -583,3 +612,8 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
             )
 
         return self._tokenize_and_remap(messages)
+
+
+@CHAT_TEMPLATE_REGISTRY.register("qwen3_5vl")
+class Qwen3_5VLChatTemplate(MTPLabelMixin, Qwen3VLChatTemplate):
+    pass

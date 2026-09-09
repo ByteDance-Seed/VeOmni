@@ -15,7 +15,7 @@ model:
 data:
   train_path: tulu-3-sft-mixture
   data_type: conversation
-  chat_template: chatml
+  chat_template: qwen3_5
   max_seq_len: 1024
   train_size: 500
   text_keys: messages
