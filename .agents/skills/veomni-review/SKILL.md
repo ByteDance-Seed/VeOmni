@@ -1,6 +1,6 @@
 ---
 name: veomni-review
-description: "Pre-PR code review gate. Run once before opening a pull request, and again before pushing a substantive update to an open one — not per commit. Required when the PR's branch diff touches Python under veomni/, tasks/ or tests/, or CI workflows, pyproject.toml, uv.lock, docker/ or configs/. Also trigger proactively when a change spans multiple files, touches shared infrastructure (BaseTrainer, distributed, model loading, data pipeline, ops dispatch), or you are unsure a fix is safe. The review launches a subagent that checks implementation quality, multi-file consistency, and known constraint violations, then rates the change as safe/needs-attention/risky."
+description: "Pre-PR code review gate. Run before opening a pull request, and again before pushing a substantive update to an open one — not per commit. Required when the PR's branch diff touches Python under veomni/, tasks/ or tests/, or CI workflows, pyproject.toml, uv.lock, docker/ or configs/. Also trigger proactively for runtime or configuration changes that span multiple files, touch shared infrastructure (BaseTrainer, distributed, model loading, data pipeline, ops dispatch), or have uncertain safety. Docs, comments and .agents/-only changes use the self-check below. The review launches a subagent that checks implementation quality, multi-file consistency, and known constraint violations, then rates the change as safe/needs-attention/risky."
 ---
 
 ## When this gate applies
@@ -20,7 +20,10 @@ you. It is the *obligation* that moved, not the option.
 | Python under `veomni/`, `tasks/`, `tests/` | Required |
 | `.github/workflows/`, `pyproject.toml`, `uv.lock`, `docker/`, `configs/` | Required |
 | Docs, comments, or `.agents/` knowledge and skills only | Skip — self-check instead: verify every repo path, config key and version you assert actually exists |
-| A revert, or re-applying a diff a reviewer already approved | Skip |
+| A clean, exact revert or reapplication of a previously approved diff, with no additional or conflict-resolved changes | Skip |
+
+Partial reverts and reapplications with extra edits or conflict resolutions
+must follow the normal review gate; prior approval does not cover those changes.
 
 Skipping means skipping the subagent, not skipping verification. Say which
 branch you took, so the reader knows a review happened or why it didn't.
