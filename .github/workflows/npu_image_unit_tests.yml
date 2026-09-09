@@ -83,50 +83,50 @@ jobs:
           fetch-depth: 0
           clean: true
 
-      - name: Run additional image tests (disabled)
+      - name: Run additional image tests
         run: |
-          echo "Additional tests are disabled; uncomment one command at a time."
+          echo "Running additional NPU image tests."
 
           # Parallel tests
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses_npu.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_op_wrapper.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/context_parallel
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_qwen3_5_gated_deltanet_ulysses_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/ulysses/test_op_wrapper.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/parallel/context_parallel
 
           # Model tests
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_deepseek_v4_liger_ops.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_generated_call_site_signatures.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_models_logits_equal_v5_npu.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_return_log_probs_e2e_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_deepseek_v4_liger_ops.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_generated_call_site_signatures.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_models_logits_equal_v5_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/models/test_return_log_probs_e2e_npu.py
 
           # FSDP and model loading tests
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
 
           # Ops tests
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunk_loss.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunk_topk_distill.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunked_fused_linear_grad_gating.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_eager_kernels_cpu.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_expert_scatter_index.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_fused_load_balancing_loss.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_gdn_ascend_gate.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_gdn_varlen_metadata.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_kernel_registry_sanity.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_npu_kernels_extended.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_seqcls_loss_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunk_loss.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunk_topk_distill.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_chunked_fused_linear_grad_gating.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_eager_kernels_cpu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_expert_scatter_index.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_fused_load_balancing_loss.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_gdn_ascend_gate.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_gdn_varlen_metadata.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_kernel_registry_sanity.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_npu_kernels_extended.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/ops/test_seqcls_loss_npu.py
 
           # Distributed and optimizer tests
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/distributed/test_muon_zero_comm_shard.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_unit.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_fsdp2_parity.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_fsdp2_smoke_npu.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_optimizer_vlm_param_groups.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/distributed/test_muon_zero_comm_shard.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_unit.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_fsdp2_parity.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_muon_fsdp2_smoke_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/optim/test_optimizer_vlm_param_groups.py
 
           # LoRA tests
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_target_mapping.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_veomni_lora_moe_native.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_eager.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_trainer.py
-          # "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_ep2_npu.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_target_mapping.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_veomni_lora_moe_native.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_eager.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_trainer.py
+          "$IMAGE_PYTHON" -m pytest -v -s -x tests/lora/test_moe_lora_ep2_npu.py
 
       - name: Run parallel tests
         run: |
