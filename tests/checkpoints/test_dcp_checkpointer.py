@@ -1325,9 +1325,12 @@ class TestPromoteStagedCheckpoint:
             assert r["reductions"] == 4, f"{role} did not finish the cleanup reduction: {results}"
             assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} left a marker"
 
-        # The roles that copy data must still have copied it; only publishing broke.
+        # The roles that copy data must still have copied all of it; only
+        # publishing broke. Checking the exact set keeps this sensitive to a
+        # partial copy, which "something was written" would not catch.
         for role in self._COPYING_ROLES:
-            assert os.listdir(results[role]["final"]), f"{role} copied nothing"
+            copied = sorted(n for n in os.listdir(results[role]["final"]) if n.endswith(".distcp"))
+            assert copied == ["__0_0.distcp", "__0_1.distcp"], f"{role} copied {copied}"
 
     def test_a_failing_publish_leaves_no_partial_marker(self, staged):
         """copyfile creates the destination before writing, so a half marker is possible."""
