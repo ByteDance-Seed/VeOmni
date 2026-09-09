@@ -765,7 +765,8 @@ def parallelize_model_ddp(
     # module's buffer semantics must not change with the ``fsdp_mode`` a config
     # happened to pick. Nothing is lost: rank0's copy is either identical to the
     # others or, for dynamic-rope ``inv_freq``, wrong for them. See constraint 7a
-    # in `.agents/knowledge/constraints.md`.
+    # in `.agents/knowledge/constraints.md`, and
+    # `docs/design/ddp_under_sequence_parallel.md` for why.
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],
