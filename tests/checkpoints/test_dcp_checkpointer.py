@@ -1119,6 +1119,20 @@ class TestPromoteStagedCheckpoint:
     staged copy behind.
     """
 
+    @pytest.fixture(autouse=True)
+    def _no_real_collectives(self):
+        """Keep `_any_rank_failed` off a real process group.
+
+        These tests fake `dist.is_initialized()`, so its all_reduce would other-
+        wise hit an uninitialised group. Leaving the tensor untouched makes the
+        reduction reflect this rank's own flag, which is what a single-rank test
+        means; cases about *another* rank failing patch `_any_rank_failed`
+        directly.
+        """
+        with patch("veomni.checkpoint.dcp_checkpointer.get_device_type", return_value="cpu"):
+            with patch("veomni.checkpoint.dcp_checkpointer.dist.all_reduce", side_effect=lambda t, op=None: None):
+                yield
+
     @pytest.fixture
     def make_staged(self, tmp_path):
         """Build an independent staged checkpoint and destination on each call.
@@ -1225,53 +1239,171 @@ class TestPromoteStagedCheckpoint:
     # The participant copies nothing, so it cannot be a copy-failure source.
     _COPYING_ROLES = ["coordinator_leader", "leader_only"]
 
-    @pytest.mark.parametrize("failing_role", _COPYING_ROLES)
-    def test_every_rank_runs_the_same_barriers_when_a_copy_fails(self, make_staged, failing_role):
-        """Collective parity: barriers are untagged, so one rank skipping one hangs the job.
+    def _replay_every_role(self, make_staged, label, *, fails=None, peer_fails_from=None):
+        """Run promotion once as each role and report what each one saw.
 
-        Whichever role fails, every role -- including the participant that copies
-        nothing -- must reach the same number of barriers, and the error must
-        surface only after the last one.
+        Copies run for real unless ``fails(role, dst)`` says otherwise, so the
+        assertions look at files that were actually written or actually withheld.
+        A no-op copy mock would make "no marker was published" true for the wrong
+        reason.
+
+        ``peer_fails_from`` is the 1-based reduction index from which the group
+        reports failure -- i.e. which phase a *different* rank broke in. Phase 1
+        closes reduction 1, so a copy failure is 2 and a publish failure is 3;
+        reporting earlier would skip the phase under test.
         """
+        import shutil as _shutil
+
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
-        counts = {}
+        real_copyfile = _shutil.copyfile
+        results = {}
         for role, (global_rank, local_rank) in self._ROLES.items():
-            stage_path, final_path = make_staged(f"{failing_role}-{role}")
-            barrier = MagicMock()
+            stage_path, final_path = make_staged(f"{label}-{role}")
+            seen = []
+
+            def reduction(failed, _seen=seen):
+                _seen.append(failed)
+                if peer_fails_from is not None and len(_seen) >= peer_fails_from:
+                    return True
+                return failed
+
+            def copyfile(src, dst, _role=role):
+                if fails is not None and fails(_role, dst):
+                    # Mirror shutil: the destination exists before the write fails,
+                    # which is what can leave a truncated file behind.
+                    with open(dst, "w") as f:
+                        f.write("partial")
+                    raise OSError("boom")
+                return real_copyfile(src, dst)
+
             raised = False
             with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
-                with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier", barrier):
+                with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=reduction):
                     with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=global_rank):
                         with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=local_rank):
-                            with patch(
-                                "veomni.checkpoint.dcp_checkpointer.shutil.copyfile",
-                                side_effect=OSError("boom") if role == failing_role else None,
-                            ):
+                            with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=copyfile):
                                 try:
                                     _promote_staged_checkpoint(stage_path, final_path)
-                                except OSError:
+                                except (OSError, RuntimeError):
                                     raised = True
-            counts[role] = barrier.call_count
-            assert raised == (role == failing_role), f"{role}: unexpected raise={raised}"
+            results[role] = {"reductions": len(seen), "raised": raised, "final": final_path}
+        return results
 
-        assert len(set(counts.values())) == 1, f"barrier count diverged across roles: {counts}"
-        assert set(counts.values()) == {4}
+    @pytest.mark.parametrize("failing_role", _COPYING_ROLES)
+    def test_every_role_runs_the_same_collectives_and_all_raise_when_a_copy_fails(self, make_staged, failing_role):
+        """Collectives are untagged, so one rank skipping one desynchronises the job."""
+        results = self._replay_every_role(
+            make_staged,
+            f"copyfail-{failing_role}",
+            fails=lambda role, dst: role == failing_role and dst.endswith(".distcp"),
+            peer_fails_from=2,
+        )
 
-    def test_failure_is_raised_only_after_the_last_barrier(self, staged):
-        """Raising early would strand the other ranks on a collective that never completes."""
+        for role, r in results.items():
+            assert r["raised"], f"{role} must raise once a peer failed"
+            # One collective per phase, four phases -- including on the role that
+            # does no work at all.
+            assert r["reductions"] == 4, f"{role} ran {r['reductions']} collectives: {results}"
+            assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} published a marker"
+
+    def test_every_role_sees_a_failed_metadata_copy(self, make_staged):
+        """Publishing is part of the save, so its failure cannot stay with the coordinator.
+
+        The coordinator's marker copy really is attempted and really does fail,
+        leaving a partial file behind, so this also covers that cleanup.
+        """
+        results = self._replay_every_role(
+            make_staged,
+            "metafail",
+            fails=lambda role, dst: role == "coordinator_leader" and dst.endswith(".metadata"),
+            peer_fails_from=3,
+        )
+
+        for role, r in results.items():
+            assert r["raised"], f"{role} must raise after a failed publish"
+            assert r["reductions"] == 4, f"{role} did not finish the cleanup reduction: {results}"
+            assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} left a marker"
+
+        # The roles that copy data must still have copied all of it; only
+        # publishing broke. Checking the exact set keeps this sensitive to a
+        # partial copy, which "something was written" would not catch.
+        for role in self._COPYING_ROLES:
+            copied = sorted(n for n in os.listdir(results[role]["final"]) if n.endswith(".distcp"))
+            assert copied == ["__0_0.distcp", "__0_1.distcp"], f"{role} copied {copied}"
+
+    def test_a_failing_publish_leaves_no_partial_marker(self, staged):
+        """copyfile creates the destination before writing, so a half marker is possible."""
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
         stage_path, final_path = staged
-        calls = []
+
+        def copy_only_data(src, dst):
+            if dst.endswith(".metadata"):
+                with open(dst, "w") as f:
+                    f.write("half")  # the destination exists before the failure
+                raise OSError("marker write failed")
+            with open(src) as r, open(dst, "w") as w:
+                w.write(r.read())
+
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
+            with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=copy_only_data):
+                with pytest.raises(OSError, match="marker write failed"):
+                    _promote_staged_checkpoint(stage_path, final_path)
+
+        assert os.path.exists(os.path.join(final_path, "__0_0.distcp")), "data should still be there"
+        assert not os.path.exists(os.path.join(final_path, ".metadata")), "no partial marker may survive"
+
+    def test_cleanup_still_runs_after_an_earlier_phase_failed(self, staged):
+        """The staged copy is model-plus-optimizer sized; a failure must not strand it."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
+            with patch(
+                "veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=OSError("destination is full")
+            ):
+                with pytest.raises(OSError, match="destination is full"):
+                    _promote_staged_checkpoint(stage_path, final_path)
+        assert not os.path.exists(stage_path)
+
+    def test_stale_metadata_stays_removed_when_promotion_fails(self, staged):
+        """Half-replaced data must not keep the previous checkpoint's marker."""
+        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
+
+        stage_path, final_path = staged
+        os.makedirs(final_path)
+        with open(os.path.join(final_path, ".metadata"), "w") as f:
+            f.write("previous checkpoint")
+
         with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
-            with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier", side_effect=lambda: calls.append("barrier")):
+            with patch("veomni.checkpoint.dcp_checkpointer.dist.barrier"):
                 with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0):
                     with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0):
-                        with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=OSError("boom")):
-                            with pytest.raises(OSError, match="boom"):
+                        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=True):
+                            with pytest.raises(RuntimeError, match="failed on another rank"):
                                 _promote_staged_checkpoint(stage_path, final_path)
-        assert len(calls) == 4
+
+        assert not os.path.exists(os.path.join(final_path, ".metadata"))
+
+    def test_any_rank_failed_is_a_max_reduction(self):
+        """One failing rank must make every rank see a failure."""
+        import torch as _torch
+
+        from veomni.checkpoint.dcp_checkpointer import _any_rank_failed
+
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False):
+            assert _any_rank_failed(True) is True
+            assert _any_rank_failed(False) is False
+
+        def fake_all_reduce(tensor, op=None):
+            assert op is _torch.distributed.ReduceOp.MAX, "must be MAX; SUM would overflow on many ranks"
+            tensor.fill_(1)
+
+        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
+            with patch("veomni.checkpoint.dcp_checkpointer.get_device_type", return_value="cpu"):
+                with patch("veomni.checkpoint.dcp_checkpointer.dist.all_reduce", side_effect=fake_all_reduce):
+                    assert _any_rank_failed(False) is True
 
     def test_non_leader_non_coordinator_ranks_touch_nothing(self, staged):
         """Ranks other than the node leaders and the coordinator only participate in barriers."""
@@ -1288,6 +1420,39 @@ class TestPromoteStagedCheckpoint:
 
 
 class TestStageDirValidation:
+    def test_staging_dir_failure_is_agreed_across_ranks(self, tmp_path):
+        """A scratch disk fails per node, so ranks that could still stage must stop too.
+
+        Otherwise they go on into dcp.save and wait on a collective the failed
+        ranks never reach.
+        """
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        # This rank prepares its directory fine; another node's did not.
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=True):
+            with pytest.raises(RuntimeError, match="another rank could not prepare"):
+                _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+
+    def test_staging_dir_is_emptied_and_returned(self, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            first = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+            with open(os.path.join(first, "leftover.distcp"), "w") as f:
+                f.write("from a crashed run")
+            second = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+        assert second == first
+        assert os.listdir(second) == []
+
+    def test_local_staging_failure_raises_its_own_error(self, tmp_path):
+        """The rank that actually failed reports what happened, not the peer message."""
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda f: f):
+            with patch("veomni.checkpoint.dcp_checkpointer.os.makedirs", side_effect=OSError("No space left")):
+                with pytest.raises(OSError, match="No space left"):
+                    _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+
     def test_stage_dir_with_explicit_storage_writer_is_rejected(self, tmp_path):
         """Silently ignoring stage_dir would write to the slow destination it was avoiding."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
