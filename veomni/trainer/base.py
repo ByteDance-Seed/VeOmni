@@ -601,6 +601,23 @@ class BaseTrainer(Stateful, ABC):
         )
         self.model.train()
 
+        # SAC process-level switch, read by recompute_utils.checkpoint_forward.
+        # gradient_checkpoint_layers → which blocks recompute;
+        # selective_gradient_checkpoint_layers → which of those run SAC.
+        from veomni.utils import recompute_utils
+
+        gc_cfg = args.train.gradient_checkpointing
+        recompute_utils.configure(
+            enabled=bool(
+                gc_cfg.enable
+                and (gc_cfg.selective or gc_cfg.selective_gradient_checkpoint_layers)
+                and not gc_cfg.enable_reentrant
+            ),
+            extra_op_names=gc_cfg.selective_ops,
+            gradient_checkpoint_layers=gc_cfg.gradient_checkpoint_layers,
+            selective_gradient_checkpoint_layers=gc_cfg.selective_gradient_checkpoint_layers,
+        )
+
     def _build_optimizer(self):
         args: VeOmniArguments = self.args
         # Build optimizer
