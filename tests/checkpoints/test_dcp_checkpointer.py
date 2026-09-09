@@ -1239,17 +1239,24 @@ class TestPromoteStagedCheckpoint:
     # The participant copies nothing, so it cannot be a copy-failure source.
     _COPYING_ROLES = ["coordinator_leader", "leader_only"]
 
-    def _replay_every_role(self, make_staged, label, *, fails_locally=None, peer_fails_from=None):
+    def _replay_every_role(self, make_staged, label, *, fails=None, peer_fails_from=None):
         """Run promotion once as each role and report what each one saw.
 
-        ``fails_locally`` names the role whose own ``copyfile`` raises.
+        Copies run for real unless ``fails(role, dst)`` says otherwise, so the
+        assertions look at files that were actually written or actually withheld.
+        A no-op copy mock would make "no marker was published" true for the wrong
+        reason.
+
         ``peer_fails_from`` is the 1-based reduction index from which the group
-        starts reporting failure -- i.e. which phase a *different* rank broke in.
-        Phase 1 closes reduction 1, so a copy failure is `2` and a publish
-        failure is `3`; reporting it earlier would skip the phase under test.
+        reports failure -- i.e. which phase a *different* rank broke in. Phase 1
+        closes reduction 1, so a copy failure is 2 and a publish failure is 3;
+        reporting earlier would skip the phase under test.
         """
+        import shutil as _shutil
+
         from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
 
+        real_copyfile = _shutil.copyfile
         results = {}
         for role, (global_rank, local_rank) in self._ROLES.items():
             stage_path, final_path = make_staged(f"{label}-{role}")
@@ -1261,15 +1268,21 @@ class TestPromoteStagedCheckpoint:
                     return True
                 return failed
 
+            def copyfile(src, dst, _role=role):
+                if fails is not None and fails(_role, dst):
+                    # Mirror shutil: the destination exists before the write fails,
+                    # which is what can leave a truncated file behind.
+                    with open(dst, "w") as f:
+                        f.write("partial")
+                    raise OSError("boom")
+                return real_copyfile(src, dst)
+
             raised = False
             with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
                 with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=reduction):
                     with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=global_rank):
                         with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=local_rank):
-                            with patch(
-                                "veomni.checkpoint.dcp_checkpointer.shutil.copyfile",
-                                side_effect=OSError("boom") if role == fails_locally else None,
-                            ):
+                            with patch("veomni.checkpoint.dcp_checkpointer.shutil.copyfile", side_effect=copyfile):
                                 try:
                                     _promote_staged_checkpoint(stage_path, final_path)
                                 except (OSError, RuntimeError):
@@ -1279,13 +1292,12 @@ class TestPromoteStagedCheckpoint:
 
     @pytest.mark.parametrize("failing_role", _COPYING_ROLES)
     def test_every_role_runs_the_same_collectives_and_all_raise_when_a_copy_fails(self, make_staged, failing_role):
-        """Collectives are untagged, so one rank skipping one desynchronises the job.
-
-        The group starts reporting failure at reduction 2, the one closing the
-        copy phase, so the copy really is where it breaks.
-        """
+        """Collectives are untagged, so one rank skipping one desynchronises the job."""
         results = self._replay_every_role(
-            make_staged, f"copyfail-{failing_role}", fails_locally=failing_role, peer_fails_from=2
+            make_staged,
+            f"copyfail-{failing_role}",
+            fails=lambda role, dst: role == failing_role and dst.endswith(".distcp"),
+            peer_fails_from=2,
         )
 
         for role, r in results.items():
@@ -1298,15 +1310,24 @@ class TestPromoteStagedCheckpoint:
     def test_every_role_sees_a_failed_metadata_copy(self, make_staged):
         """Publishing is part of the save, so its failure cannot stay with the coordinator.
 
-        Failure is reported from reduction 3 -- the one closing the publish phase --
-        so phases 1 and 2 complete normally and the break really is in publishing.
+        The coordinator's marker copy really is attempted and really does fail,
+        leaving a partial file behind, so this also covers that cleanup.
         """
-        results = self._replay_every_role(make_staged, "metafail", peer_fails_from=3)
+        results = self._replay_every_role(
+            make_staged,
+            "metafail",
+            fails=lambda role, dst: role == "coordinator_leader" and dst.endswith(".metadata"),
+            peer_fails_from=3,
+        )
 
         for role, r in results.items():
             assert r["raised"], f"{role} must raise after a failed publish"
             assert r["reductions"] == 4, f"{role} did not finish the cleanup reduction: {results}"
-            assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} published a marker"
+            assert not os.path.exists(os.path.join(r["final"], ".metadata")), f"{role} left a marker"
+
+        # The roles that copy data must still have copied it; only publishing broke.
+        for role in self._COPYING_ROLES:
+            assert os.listdir(results[role]["final"]), f"{role} copied nothing"
 
     def test_a_failing_publish_leaves_no_partial_marker(self, staged):
         """copyfile creates the destination before writing, so a half marker is possible."""
