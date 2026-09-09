@@ -20,7 +20,7 @@ description: "Use this skill for ANY bug, error, crash, wrong output, loss diver
 3. Write a reproducer test if feasible.
 4. Minimal fix — root cause only, don't touch surrounding code.
 5. Verify: reproducer passes, `pytest tests/<module>/` passes, no regressions across modalities.
-6. Run `make quality`, commit. (The subagent review is owed once before the PR, not per commit.)
+6. Run `make quality`, commit. Run `/veomni-review` before opening the PR or pushing a substantive update, not per commit.
 
 If not resolved in 15 min → switch to Full Protocol.
 
@@ -75,6 +75,17 @@ Phase 5: Knowledge capture           -> pending
    the main environment instead of the two you just created, which is the
    opposite of what this is for. (`UV_PROJECT_ENVIRONMENT` works too.)
 
+   Confirm that installing the alternate version did not change other packages:
+   ```bash
+   uv pip freeze --python .venv-a/bin/python > /tmp/veomni-bisect-a.freeze
+   uv pip freeze --python .venv-b/bin/python > /tmp/veomni-bisect-b.freeze
+   diff -u /tmp/veomni-bisect-a.freeze /tmp/veomni-bisect-b.freeze
+   ```
+   Only the target package may differ. Pin or restore every non-target
+   difference in Env B to Env A's version, then compare again before running
+   the reproducer. If the target cannot run with that dependency set, report
+   the compatibility conflict; a multi-package change is not a one-package bisect.
+
    Then run the same reproducer in both envs, each with its own env
    *activated* — the `VIRTUAL_ENV=` prefixes above apply only to the `uv sync`
    lines they are attached to, not to whatever you run next:
@@ -100,6 +111,15 @@ Phase 5: Knowledge capture           -> pending
    the pinned version, and a stale `generated/` is itself a source of
    failures.
 
+   Compare the package sets here too, using `uv pip freeze --python` with
+   `../bisect-a/.venv/bin/python` and `../bisect-b/.venv/bin/python`, and
+   reconcile every non-transformers difference as above. Run codegen and the
+   reproducer from each worktree with its own environment activated:
+   ```bash
+   (cd ../bisect-a && source .venv/bin/activate && make patchgen && <reproducer>)
+   (cd ../bisect-b && source .venv/bin/activate && make patchgen && <reproducer>)
+   ```
+
 ### Phase 3: Hypothesis and Testing
 
 1. Form ONE specific, falsifiable hypothesis.
@@ -119,7 +139,7 @@ Phase 5: Knowledge capture           -> pending
 2. Implement a SINGLE targeted fix addressing the root cause.
 3. Verify: test passes, training runs correctly, no regressions.
 4. Check for collateral — did the fix break other modalities or trainers?
-5. Before opening the PR: run `/veomni-review` over the branch diff.
+5. Before opening the PR or pushing a substantive update: run `/veomni-review` over the branch diff.
 
 ### Phase 5: Knowledge Capture (mandatory)
 
@@ -128,9 +148,10 @@ Phase 5: Knowledge capture           -> pending
 - [ ] **New hard constraint?** → add to `.agents/knowledge/constraints.md`
 - [ ] **Architecture insight?** → add to `.agents/knowledge/architecture.md`
 - [ ] **Regression guard needed?** → prefer adding a case to an existing
-      CI-enumerated test; see `.agents/knowledge/testing.md`. A new file outside
-      `tests/ops/` / `tests/data/` must be wired into the unit-test workflows or
-      it never runs.
+      CI-enumerated test; see `.agents/knowledge/testing.md`. Only paths not
+      already covered by a directory-level CI entry need a new workflow line.
+      Use the workflow that owns the path, including the e2e workflows for
+      end-to-end tests; account for the GPU/NPU differences in that table.
 - [ ] **Docs outdated?** → update `docs/` if the fix changes API behavior, config semantics, or usage patterns
 
 If none apply, explicitly note "no new knowledge to capture."
