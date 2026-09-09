@@ -182,6 +182,7 @@ class CheckpointerCallback(Callback):
             trainable_only=bool(getattr(args.model, "lora_config", None)),
             save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
             parallel_state=self.parallel_state,
+            stage_dir=args.train.checkpoint.stage_dir,
         )
 
         # Empty cache and barrier
