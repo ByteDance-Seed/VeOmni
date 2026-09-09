@@ -145,9 +145,10 @@ tensors through and confirm they come out identical (no transpose applied).
   and v5 use *identical* fused expert key names but different axis orders
   (qwen3_vl_moe pattern), a converter that transposes every matching key will
   silently corrupt a v5-saved checkpoint on reload (VeOmni's training save path
-  can emit the v5 layout directly). Dispatch on `tensor.shape[1]`: transpose
-  only when it matches the HF layout, pass through when it matches v5, hard-error
-  otherwise. The qwen3_moe-style per-expert converter is immune because its
+  can emit the v5 layout directly). Check the complete tensor shape: transpose
+  only for an unambiguous HF match, pass through only for an unambiguous v5
+  match, and raise if both or neither layout matches. The qwen3_moe-style
+  per-expert converter is immune because its
   regex only matches HF-side keys (the v5 fused keys have different names).
 - **Converter factory assumes nested `config.text_config`** → VLM-MoE submodels
   like `<M>TextModel` are loaded standalone with a flat `<M>TextConfig` that
