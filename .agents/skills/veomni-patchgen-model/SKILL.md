@@ -340,11 +340,11 @@ identified in Phase 1 has a corresponding decorator here.
 
 **Skip this phase entirely for dense models.**
 
-MoE models need a runtime converter because v5 stores fused expert tensors
-while HF checkpoints ship one of three different layouts. Picking the wrong
-one loads zero expert weights, silently. The full procedure — how to verify the
-HF layout empirically, which template to copy, and the round-trip safety rule —
-is in `references/moe.md`, "Phase 3: checkpoint tensor converter".
+Verify the HF checkpoint layout empirically for every MoE model. Add a runtime
+converter only when that layout differs from the v5 fused-expert layout;
+direct v5-compatible checkpoints need no converter. The verification procedure,
+converter templates, and round-trip safety checks are in `references/moe.md`,
+"Phase 3: checkpoint tensor converter".
 
 ---
 
@@ -370,8 +370,9 @@ def register_<m>_modeling(architecture: str):
     return <M>Model
 ```
 
-**Pattern B — MoE (qwen3_moe style):** same as A, plus register the converter
-on each generated model class:
+**Pattern B — MoE with a converter selected in Phase 3 (qwen3_moe style):**
+same as A, plus register the converter on each generated model class. Use
+Pattern A when the verified checkpoint layout needs no conversion:
 
 ```python
 from .checkpoint_tensor_converter import create_<m>_checkpoint_tensor_converter
@@ -492,22 +493,24 @@ Minimum coverage:
    covers single-GPU vs FSDP2 `grad_norm` for *text* models only. If the model
    is text-only, append to the text test cases list. VLM/Omni models are out
    of scope for this suite (no VLM scaffolding exists).
-7. **MoE only** — `tests/models/test_checkpoint_tensor_converter.py`: add a
+7. **MoE with a converter** — `tests/models/test_checkpoint_tensor_converter.py`: add a
    test group mirroring the existing `qwen3_moe` / `qwen3_vl_moe` blocks.
    Minimum coverage:
    - `can_handle` — matches the expected key regex, rejects non-expert keys.
    - `convert` — HF-layout input produces correct v5-layout output (shape +
      value-preserving transpose for fused-key converters); for fused-key
      converters also test **v5-layout passthrough** (same tensor object / values)
-     and **hard-error on unrecognized shape**.
+     and **hard-error on ambiguous or unrecognized shapes**.
    - `finalize` — returns `[]` (or raises on unflushed per-expert buffers for
      the qwen3_moe-style stacking converter).
    - Factory — works with both nested `config.text_config` (top-level VLM-MoE
      config) *and* flat `config` (standalone `<M>TextModel` with `<M>TextConfig`).
    - Integration — run one layer end-to-end through `maybe_convert_checkpoint_tensor`.
-   Use constants where the shape dims are pairwise-distinct (e.g.
+   Use constants where the shape dims are pairwise-distinct for successful conversions (e.g.
    `hidden=8`, `intermediate=6` so `2*intermediate=12 ≠ hidden`) — overlapping
-   dims silently hide dispatch bugs.
+   dims silently hide dispatch bugs. Separately verify that the ambiguous
+   `hidden == 2 * intermediate` gate/up and `hidden == intermediate` down
+   layouts raise rather than transposing a v5-saved checkpoint.
 
 ---
 
@@ -524,19 +527,31 @@ source .venv/bin/activate
 Run:
 
 ```bash
+pytest tests/models/test_model_registry.py -v
+pytest tests/models/test_models_logits_equal_v5.py -k <m> -v
 pytest tests/models/test_models_patch.py -k <m> -v
 pytest tests/e2e/test_e2e_parallel.py::<test_fn> -k <model_name> -v   # see note below; needs multi-GPU worker
+# MoE with a converter:
+pytest tests/models/test_checkpoint_tensor_converter.py -v
+# VLM / Omni (requires multiple GPUs):
+pytest tests/distributed/test_dummy_forward.py -k <m> -v
 # VLM only:
 pytest tests/models/test_vlm_trainer.py -k <m> -v
 ```
 
-**`-k` keyword rules — the three suites use *different* id conventions, and
+Run every applicable minimum-coverage suite from Phase 6 on a worker with the
+required hardware. Report any suite that could not run; a skipped suite or
+zero selected cases does not establish coverage.
+
+**`-k` keyword rules — the suites use *different* id conventions, and
 getting this wrong silently produces `0 selected / N deselected`:**
 
 | Suite | id source | keyword to pass to `-k` |
 |---|---|---|
 | `test_models_patch.py` | explicit `pytest.param(..., id="<m>")` | model id as registered (e.g. `qwen2_5_vl`, `qwen3_5_moe`) |
 | `test_vlm_trainer.py` | explicit `id="<m>"` | same as above |
+| `test_models_logits_equal_v5.py` | `case_id` from `CASES` / `_LOADER_CASES` | matching model keyword from `--collect-only` |
+| `test_dummy_forward.py` | explicit ids in `_vlm_cases` / `_omni_cases` | model id as registered |
 | `test_e2e_parallel.py` | **first positional arg (`model_name`)**, *no explicit id* | the HF-style short name (e.g. `qwen25vl`, `qwen2vl`, `qwen3vl`, `qwen3vlmoe`) — **no underscores for VL series** |
 
 Extra e2e gotchas:
@@ -644,7 +659,7 @@ category too, since most of the expensive, silent failures live there.
   through `hidden_states=outputs.hidden_states` and
   `attentions=outputs.attentions`. Otherwise callers using
   `output_hidden_states=True` / `output_attentions=True` silently get `None`.
-- **Skipping `check_patchgen`** → CI will fail on PR. Always run it locally.
+- **Skipping `patchgen --check`** → CI will fail on PR. Always run it locally.
 - **Empty class body written as `: ...` instead of `: pass`** — when the upstream
   HF source defines an empty class via inline Ellipsis (e.g.
   `class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...`)
