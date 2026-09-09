@@ -55,7 +55,7 @@ Two authoritative sources:
    per_expert = sum(1 for k in idx['weight_map'] if '.experts.' in k and k.endswith('gate_proj.weight'))
    fused      = sum(1 for k in idx['weight_map'] if k.endswith('.experts.gate_up_proj'))
    print(f'per-expert keys: {per_expert}, fused keys: {fused}')
-   " <ckpt_path>/model.safetensors.index.json
+   " "<ckpt_path>/model.safetensors.index.json"
    ```
    If per-expert > 0 → qwen3_moe-style. If fused > 0 → inspect one tensor's
    shape to distinguish transposed (qwen3_vl_moe-style) from direct v5 (no
