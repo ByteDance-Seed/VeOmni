@@ -127,6 +127,19 @@ exercise their sequence-parallel forward and backward paths.
   chunked prefill. It still reads `torch.all(attention_mask == 1)` behind an
   `is_tracing` guard, so that host sync is upstream behaviour now.
 
+### MoE auxiliary-loss memory comparison
+
+HF's Qwen3-MoE load-balancing loss now accumulates routing statistics per
+layer without a one-hot expert mask. Its no-grad forward can use less memory
+than VeOmni's Triton implementation, which concatenates the layer logits.
+The memory regression test therefore measures training forward with
+`requires_grad=True`, where HF retains softmax activations for backward.
+It subtracts the live input allocation from each measured peak and warms up
+both implementations. This is a forward-only comparison: the fused kernel's
+full forward/backward peak can exceed HF's for multi-layer inputs. Numerical
+forward and backward parity remain checked separately against the new HF
+reference.
+
 ### DeepSeek-V3 MoE
 
 `DeepseekV3NaiveMoe` was renamed `DeepseekV3Experts` (and carries
