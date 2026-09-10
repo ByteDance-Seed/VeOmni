@@ -66,6 +66,8 @@ def test_generated_modeling_modules_discovered():
 
 @pytest.mark.parametrize("module_name", _MODULES, ids=lambda name: name.rsplit(".", 1)[-1])
 def test_generated_modeling_imports(module_name: str):
+    if module_name.endswith("_gpu") and IS_NPU_AVAILABLE:
+        pytest.skip("GPU modeling may depend on CUDA-only packages absent from the NPU environment")
     if module_name.endswith("_npu") and not IS_NPU_AVAILABLE:
         # Most NPU files import fine on GPU hosts (the device split lives inside
         # the patched bodies), but a few pull ``torch_npu`` at module scope.

@@ -9,6 +9,8 @@ import torch
 from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from transformers import AutoConfig
 
+from veomni.utils.device import IS_NPU_AVAILABLE
+
 
 _TOY_CONFIGS = Path(__file__).parents[1] / "toy_config"
 
@@ -42,7 +44,10 @@ def test_deepseek_v4_indexer_preserves_model_and_optimizer_keys(backend):
     [("qwen2_5_omni", "Qwen2_5Omni"), ("qwen3_omni_moe", "Qwen3OmniMoe")],
 )
 def test_omni_generation_prepares_text_positions(family, prefix):
-    modeling = importlib.import_module(f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_gpu")
+    backend = "npu" if IS_NPU_AVAILABLE else "gpu"
+    modeling = importlib.import_module(
+        f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{backend}"
+    )
     cls = getattr(modeling, f"{prefix}ThinkerForConditionalGeneration")
     model = object.__new__(cls)
     torch.nn.Module.__init__(model)
