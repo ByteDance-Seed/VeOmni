@@ -516,8 +516,11 @@ class OffloadConfig:
         default=4.0,
         metadata={
             "help": (
-                "Maximum GB of free host buffers retained by async activation offload between steps. "
-                "In-flight offloads may temporarily use more host memory. Set to 0 to disable reuse."
+                "Maximum GB of free host buffers retained between steps by one host-buffer "
+                "pool. Each `apply_async_activation_offload` call given only this limit owns "
+                "a pool of this size; pass the same `host_buffer_pool` to share one budget "
+                "across calls. Bounds the idle cache only; in-flight offloads may temporarily "
+                "use more. Set to 0 to disable reuse."
             )
         },
     )
