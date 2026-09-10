@@ -60,7 +60,7 @@ Core entry points:
    - `gather_heads_scatter_seq(output)` — after attention: inverse exchange → **full heads, subset of sequence** per rank.
    - Underlying primitive: `_SeqAllToAll` (autograd-aware `all_to_all_tensor`).
    - Async variants in `async_ulysses*.py` for DiT and pipelined QKV/output projections.
-   - With USP (`cp_size > 1`), Ulysses runs first and zig-zag Ring Attention runs over the CP group. CUDA uses `ring_attention.py` (FA2/FA4); Ascend uses the guarded `ring_attention_npu.py` (`torch_npu.npu_fusion_attention`).
+   - With USP (`cp_size > 1`), Ulysses runs first and zig-zag Ring Attention runs over the CP group. The unified entry and shared communication/layout helpers live under `sequence_parallel/ring_attention/`; CUDA uses `gpu.py` (FA2/FA4) and Ascend uses the guarded `npu.py` (`torch_npu.npu_fusion_attention`).
    - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
    - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks (optional `group=` arg; defaults to the current state's unified SP group).
    - Process groups: `comm.py` has NO group globals. Its getters (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, `get_data_parallel_group`) resolve from the *current* `ParallelState`'s device mesh (`get_parallel_state().{ulysses,sp,cp,dp}_group`) — exactly how `fsdp_group` already worked. `set_ulysses_sequence_parallel_group(group)` survives ONLY as a unit-test injection seam (`_ULYSSES_SP_GROUP_OVERRIDE`, `None` in production); no production code calls it. Meshless SP is unsupported — `ParallelState.__post_init__` raises if `sp_enabled and device_mesh is None`; always build via `init_parallel_state`.
@@ -168,7 +168,7 @@ Core files:
 
 22. **NPU (Ascend) code paths require guards**
     - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
-    - NPU kernels generally live in `veomni/ops/kernels/*/npu.py` and `veomni/ops/platform/npu/`. Distributed NPU Ring Attention lives in `veomni/distributed/sequence_parallel/ring_attention_npu.py`; all such modules must remain importable on GPU-only environments without importing `torch_npu`.
+    - NPU kernels generally live in `veomni/ops/kernels/*/npu.py` and `veomni/ops/platform/npu/`. Distributed NPU Ring Attention lives in `veomni/distributed/sequence_parallel/ring_attention/npu.py`; all such modules must remain importable on GPU-only environments without importing `torch_npu`.
 
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.

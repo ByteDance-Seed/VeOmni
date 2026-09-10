@@ -17,7 +17,7 @@ veomni/
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
-│   └── sequence_parallel/  Ulysses + USP Ring Attention (CUDA FA2/FA4 and Ascend torch_npu)
+│   └── sequence_parallel/  Ulysses plus the ring_attention/ package for USP (CUDA FA2/FA4 and Ascend torch_npu)
 ├── models/             Model loading and patching
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)

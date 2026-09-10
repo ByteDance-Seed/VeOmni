@@ -27,9 +27,9 @@ import torch
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from ...utils.import_utils import is_torch_npu_available
-from .comm import get_context_parallel_group
-from .ring_attention import RingComm
+from ....utils.import_utils import is_torch_npu_available
+from ..comm import get_context_parallel_group
+from .comm import RingComm
 
 
 if is_torch_npu_available():
@@ -45,8 +45,9 @@ RNGState = Tuple[int, int, int]
 _CAUSAL_MASK_CACHE: dict[tuple[str, Optional[int]], Tensor] = {}
 
 __all__ = [
-    "prepare_npu_cu_seqlens",
     "update_npu_out_and_softmax_stats",
+    "forward",
+    "packed_forward",
     "zigzag_ring_npu_flash_attn_func",
     "zigzag_ring_npu_flash_attn_varlen_func",
 ]
@@ -57,19 +58,36 @@ def _require_torch_npu() -> None:
         raise RuntimeError("NPU ring attention requires torch_npu to be installed.")
 
 
-def prepare_npu_cu_seqlens(cu_seqlens: ActualSeqLen) -> Tensor:
-    """Convert leading-zero cumulative lengths to NPU CPU endpoint format."""
+def _normalize_cu_seqlens(cu_seqlens: ActualSeqLen) -> Tensor:
+    """Normalize packed sequence offsets while preserving the leading zero."""
     if isinstance(cu_seqlens, Tensor):
-        endpoints = cu_seqlens.detach().to(device="cpu", dtype=torch.long)
+        offsets = cu_seqlens.detach().to(device="cpu", dtype=torch.long)
     else:
-        endpoints = torch.as_tensor(cu_seqlens, dtype=torch.long, device="cpu")
-    if endpoints.ndim != 1 or endpoints.numel() == 0:
-        raise ValueError("cu_seqlens must be a non-empty 1-D tensor or sequence")
-    if endpoints[0].item() == 0:
-        endpoints = endpoints[1:]
-    if endpoints.numel() == 0 or (endpoints <= 0).any() or (endpoints[1:] < endpoints[:-1]).any():
-        raise ValueError("cu_seqlens must contain positive, non-decreasing cumulative endpoints")
-    return endpoints.contiguous()
+        offsets = torch.as_tensor(cu_seqlens, dtype=torch.long, device="cpu")
+    if offsets.ndim != 1 or offsets.numel() < 2:
+        raise ValueError("cu_seqlens must be a 1-D tensor or sequence with at least two offsets")
+    if offsets[0].item() != 0:
+        raise ValueError("cu_seqlens must start with zero")
+    if (offsets[1:] <= 0).any() or (offsets[1:] < offsets[:-1]).any():
+        raise ValueError("cu_seqlens must contain positive, non-decreasing cumulative offsets")
+    return offsets.contiguous()
+
+
+def _to_npu_actual_seq_len(actual_seq_len: Optional[ActualSeqLen]) -> Optional[list[int]]:
+    """Convert cumulative lengths to the endpoint list expected by torch_npu."""
+    if actual_seq_len is None:
+        return None
+    if isinstance(actual_seq_len, Tensor):
+        values = actual_seq_len.detach().to(device="cpu", dtype=torch.long)
+    else:
+        values = torch.as_tensor(actual_seq_len, dtype=torch.long, device="cpu")
+    if values.ndim != 1 or values.numel() == 0:
+        raise ValueError("actual_seq_len must be a non-empty 1-D sequence")
+    if values[0].item() == 0:
+        values = values[1:]
+    if values.numel() == 0 or (values <= 0).any() or (values[1:] < values[:-1]).any():
+        raise ValueError("actual_seq_len must contain positive, non-decreasing endpoints")
+    return [int(value) for value in values.tolist()]
 
 
 def _causal_mask(device: torch.device) -> Tensor:
@@ -87,6 +105,8 @@ def _head_num(q: Tensor, input_layout: str) -> int:
         return q.shape[1]
     if input_layout == "BSND":
         return q.shape[2]
+    if input_layout == "BNSD":
+        return q.shape[1]
     raise ValueError(f"Unsupported NPU attention input layout: {input_layout!r}")
 
 
@@ -99,13 +119,15 @@ def _npu_fa_forward(
     softmax_scale: float,
     dropout_p: float,
     causal: bool,
-    actual_seq_qlen: Optional[Tensor] = None,
-    actual_seq_kvlen: Optional[Tensor] = None,
+    actual_seq_qlen: Optional[ActualSeqLen] = None,
+    actual_seq_kvlen: Optional[ActualSeqLen] = None,
     softmax_layout: str = "",
 ) -> Tuple[Tensor, Tensor, Tensor, RNGState]:
     _require_torch_npu()
     attention_mask = _causal_mask(q.device) if causal else None
     sparse_mode = 2 if causal else 0
+    actual_seq_qlen = _to_npu_actual_seq_len(actual_seq_qlen)
+    actual_seq_kvlen = _to_npu_actual_seq_len(actual_seq_kvlen)
     block_out, block_max, block_sum, _, seed, offset, numels = torch_npu.npu_fusion_attention(
         q,
         k,
@@ -137,13 +159,18 @@ def _npu_fa_backward(
     dropout_p: float,
     causal: bool,
     rng_state: RNGState,
-    actual_seq_qlen: Optional[Tensor] = None,
-    actual_seq_kvlen: Optional[Tensor] = None,
+    actual_seq_qlen: Optional[ActualSeqLen] = None,
+    actual_seq_kvlen: Optional[ActualSeqLen] = None,
     softmax_layout: str = "",
 ) -> Tuple[Tensor, Tensor, Tensor]:
     _require_torch_npu()
     attention_mask = _causal_mask(q.device) if causal else None
+    actual_seq_qlen = _to_npu_actual_seq_len(actual_seq_qlen)
+    actual_seq_kvlen = _to_npu_actual_seq_len(actual_seq_kvlen)
     seed, offset, numels = rng_state
+    if softmax_max.ndim == q.ndim - 1:
+        softmax_max = softmax_max.unsqueeze(-1).expand(*softmax_max.shape, 8).contiguous()
+        softmax_sum = softmax_sum.unsqueeze(-1).expand(*softmax_sum.shape, 8).contiguous()
     dq, dk, dv, *_ = torch_npu.npu_fusion_attention_grad(
         q,
         k,
@@ -457,23 +484,22 @@ def _zigzag_npu_varlen_forward(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    endpoints: Tensor,
+    cu_seqlens: Tensor,
     half0: HalfIndex,
     half1: HalfIndex,
     softmax_scale: float,
     dropout_p: float,
 ) -> Tuple[Tensor, Tensor, Tensor, list[RNGState]]:
     comm = RingComm(group)
-    full_cu = torch.cat((torch.zeros(1, dtype=endpoints.dtype), endpoints))
-    half_endpoints = (full_cu // 2)[1:].contiguous()
+    half_cu_seqlens = (cu_seqlens // 2).contiguous()
     block = q.shape[0] // 2
     q1 = q[half1].contiguous()
     out = softmax_max = softmax_sum = None
     rng_states: list[RNGState] = [(0, 0, 0) for _ in range(comm.world_size)]
 
     def forward_block(block_q: Tensor, block_k: Tensor, block_v: Tensor, causal: bool):
-        q_endpoints = half_endpoints if block_q.shape[0] == block else endpoints
-        kv_endpoints = half_endpoints if block_k.shape[0] == block else endpoints
+        q_cu_seqlens = half_cu_seqlens if block_q.shape[0] == block else cu_seqlens
+        kv_cu_seqlens = half_cu_seqlens if block_k.shape[0] == block else cu_seqlens
         return _npu_fa_forward(
             block_q,
             block_k,
@@ -482,8 +508,8 @@ def _zigzag_npu_varlen_forward(
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
             causal=causal,
-            actual_seq_qlen=q_endpoints,
-            actual_seq_kvlen=kv_endpoints,
+            actual_seq_qlen=q_cu_seqlens,
+            actual_seq_kvlen=kv_cu_seqlens,
             softmax_layout="TND",
         )
 
@@ -526,7 +552,7 @@ def _zigzag_npu_varlen_backward(
     out: Tensor,
     softmax_max: Tensor,
     softmax_sum: Tensor,
-    endpoints: Tensor,
+    cu_seqlens: Tensor,
     half0: HalfIndex,
     half1: HalfIndex,
     rng_states: Sequence[RNGState],
@@ -535,8 +561,7 @@ def _zigzag_npu_varlen_backward(
 ) -> Tuple[Tensor, Tensor, Tensor]:
     kv_comm = RingComm(group)
     d_kv_comm = RingComm(group)
-    full_cu = torch.cat((torch.zeros(1, dtype=endpoints.dtype), endpoints))
-    half_endpoints = (full_cu // 2)[1:].contiguous()
+    half_cu_seqlens = (cu_seqlens // 2).contiguous()
     block = q.shape[0] // 2
     q1 = q[half1].contiguous()
     dout1 = dout[half1].contiguous()
@@ -557,8 +582,8 @@ def _zigzag_npu_varlen_backward(
         causal: bool,
         rng_state: RNGState,
     ):
-        q_endpoints = half_endpoints if block_q.shape[0] == block else endpoints
-        kv_endpoints = half_endpoints if block_k.shape[0] == block else endpoints
+        q_cu_seqlens = half_cu_seqlens if block_q.shape[0] == block else cu_seqlens
+        kv_cu_seqlens = half_cu_seqlens if block_k.shape[0] == block else cu_seqlens
         return _npu_fa_backward(
             block_dout,
             block_q,
@@ -572,8 +597,8 @@ def _zigzag_npu_varlen_backward(
             dropout_p=dropout_p,
             causal=causal,
             rng_state=rng_state,
-            actual_seq_qlen=q_endpoints,
-            actual_seq_kvlen=kv_endpoints,
+            actual_seq_qlen=q_cu_seqlens,
+            actual_seq_kvlen=kv_cu_seqlens,
             softmax_layout="TND",
         )
 
@@ -651,19 +676,18 @@ class _ZigzagRingNPUFlashAttentionVarlen(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        endpoints = prepare_npu_cu_seqlens(cu_seqlens)
-        full_cu = torch.cat((torch.zeros(1, dtype=endpoints.dtype), endpoints))
-        half0 = _varlen_half_index(full_cu, front=True)
-        half1 = _varlen_half_index(full_cu, front=False)
+        cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+        half0 = _varlen_half_index(cu_seqlens, front=True)
+        half1 = _varlen_half_index(cu_seqlens, front=False)
         if isinstance(half0, Tensor):
             half0 = half0.to(q.device)
             half1 = half1.to(q.device)
 
         out, softmax_max, softmax_sum, rng_states = _zigzag_npu_varlen_forward(
-            group, q, k, v, endpoints, half0, half1, softmax_scale, dropout_p
+            group, q, k, v, cu_seqlens, half0, half1, softmax_scale, dropout_p
         )
         ctx.half_indices_are_tensors = isinstance(half0, Tensor)
-        tensors = [q, k, v, out, softmax_max, softmax_sum, endpoints]
+        tensors = [q, k, v, out, softmax_max, softmax_sum, cu_seqlens]
         if ctx.half_indices_are_tensors:
             tensors.extend((half0, half1))
         else:
@@ -678,7 +702,7 @@ class _ZigzagRingNPUFlashAttentionVarlen(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         saved = ctx.saved_tensors
-        q, k, v, out, softmax_max, softmax_sum, endpoints = saved[:7]
+        q, k, v, out, softmax_max, softmax_sum, cu_seqlens = saved[:7]
         if ctx.half_indices_are_tensors:
             half0, half1 = saved[7:]
         else:
@@ -692,7 +716,7 @@ class _ZigzagRingNPUFlashAttentionVarlen(torch.autograd.Function):
             out,
             softmax_max,
             softmax_sum,
-            endpoints,
+            cu_seqlens,
             half0,
             half1,
             ctx.rng_states,
@@ -715,6 +739,52 @@ def zigzag_ring_npu_flash_attn_varlen_func(
 ) -> Tensor:
     """Balanced causal Ring Attention for packed NPU ``(T, N, D)`` tensors."""
     _require_torch_npu()
-    del max_seqlen  # NPU fusion attention uses endpoint-style actual sequence lengths.
+    del max_seqlen  # Compatibility with the shared CUDA/NPU varlen wrapper API.
     group = get_context_parallel_group() if group is None else group
     return _ZigzagRingNPUFlashAttentionVarlen.apply(group, q, k, v, cu_seqlens, dropout_p, softmax_scale, causal)
+
+
+def forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    group: Optional[ProcessGroup] = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Run balanced causal Ring Attention on fixed-shape NPU tensors."""
+    return zigzag_ring_npu_flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        group=group,
+        dropout_p=dropout_p,
+    )
+
+
+def packed_forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens: ActualSeqLen,
+    max_seqlen: Optional[int] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    group: Optional[ProcessGroup] = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Run balanced causal Ring Attention on packed NPU tensors."""
+    return zigzag_ring_npu_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        group=group,
+        dropout_p=dropout_p,
+    )

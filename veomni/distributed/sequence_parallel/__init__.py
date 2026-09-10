@@ -41,17 +41,15 @@ from .data import (
     sp_pad,
     sp_pad_and_slice,
     sp_take_own_seq,
-    zigzag_reorder,
-    zigzag_undo,
 )
 from .loss import reduce_sequence_parallel_loss
 from .ring_attention import (
     ring_flash_attn_func,
+    zigzag_reorder,
     zigzag_ring_flash_attn_func,
-)
-from .ring_attention_npu import (
     zigzag_ring_npu_flash_attn_func,
     zigzag_ring_npu_flash_attn_varlen_func,
+    zigzag_undo,
 )
 from .ulysses import (
     all_to_all_images,

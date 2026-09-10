@@ -514,16 +514,21 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
 
 ### Implementation Map
 
-- CUDA Ring kernel: `veomni/distributed/sequence_parallel/ring_attention.py`
+- Unified Ring entry and CUDA backend:
+  `veomni/distributed/sequence_parallel/ring_attention/__init__.py` and
+  `veomni/distributed/sequence_parallel/ring_attention/gpu.py`
   (`zigzag_ring_flash_attn_func` for dense, `zigzag_ring_flash_attn_varlen_func`
-  for packed, online-softmax `update_out_and_lse`, `RingComm`).
-- Ascend Ring kernel:
-  `veomni/distributed/sequence_parallel/ring_attention_npu.py` (dense and
+  for packed and online-softmax `update_out_and_lse`). Shared P2P communication
+  lives in `veomni/distributed/sequence_parallel/ring_attention/comm.py`.
+- Ascend Ring backend:
+  `veomni/distributed/sequence_parallel/ring_attention/npu.py` (fixed-shape and
   packed `torch_npu` fusion attention, softmax max/sum merge, explicit
-  forward/backward RNG state).
-- Data layout: `veomni/distributed/sequence_parallel/data.py`
-  (`zigzag_reorder` / `zigzag_undo` for dense, `zigzag_reorder_varlen` /
+  forward/backward RNG state). Packed APIs use standard leading-zero cumulative
+  offsets such as `[0, 6, 10]`; conversion to the endpoint list expected by
+  `torch_npu` happens only at the operator boundary.
+- Data layout: `veomni/distributed/sequence_parallel/ring_attention/layout.py`
+  (`zigzag_reorder` / `zigzag_undo` for fixed-shape inputs, `zigzag_reorder_packed` /
   `local_cu_seqlens` for packed) and `SequenceParallelCollator._usp_slice`.
-- Attention integration: the ring branch in
-  `veomni/ops/kernels/attention/__init__.py` runs after the Ulysses all-to-all.
+- Attention integration: `ring_attention(...)` runs after the Ulysses all-to-all;
+  `veomni/ops/kernels/attention/__init__.py` only delegates to that entry.
 - Mesh: `init_parallel_state()` builds `[ulysses, cp]` and flattens `sp`.

@@ -22,12 +22,12 @@ from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed import parallel_state as PS
-from veomni.distributed.sequence_parallel.data import (
+from veomni.distributed.sequence_parallel.ring_attention.layout import (
     local_cu_seqlens,
     zigzag_reorder,
-    zigzag_reorder_varlen,
+    zigzag_reorder_packed,
 )
-from veomni.distributed.sequence_parallel.ring_attention_npu import (
+from veomni.distributed.sequence_parallel.ring_attention.npu import (
     zigzag_ring_npu_flash_attn_func,
     zigzag_ring_npu_flash_attn_varlen_func,
 )
@@ -95,7 +95,7 @@ class NPUZigzagRingTest(MultiProcessTestCase):
         return reordered[:, self.rank * chunk : (self.rank + 1) * chunk].clone()
 
     def _shard_varlen(self, full: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        reordered = zigzag_reorder_varlen(full.detach(), cu_seqlens, dim=0, cp_size=self.world_size)
+        reordered = zigzag_reorder_packed(full.detach(), cu_seqlens, dim=0, cp_size=self.world_size)
         chunk = reordered.shape[0] // self.world_size
         return reordered[self.rank * chunk : (self.rank + 1) * chunk].clone()
 
@@ -223,7 +223,7 @@ class NPUUSPAttentionTest(MultiProcessTestCase):
         if cu_seqlens is None:
             reordered = zigzag_reorder(full.detach(), dim=1, cp_size=self.cp_size)
         else:
-            reordered = zigzag_reorder_varlen(full.detach(), cu_seqlens, dim=1, cp_size=self.cp_size)
+            reordered = zigzag_reorder_packed(full.detach(), cu_seqlens, dim=1, cp_size=self.cp_size)
         cp_rank = mesh.get_local_rank("cp")
         ulysses_rank = mesh.get_local_rank("ulysses")
         cp_chunk = reordered.shape[1] // self.cp_size

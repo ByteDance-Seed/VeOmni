@@ -48,14 +48,14 @@ from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed import parallel_state as PS
-from veomni.distributed.sequence_parallel.data import (
-    local_cu_seqlens,
-    zigzag_reorder,
-    zigzag_reorder_varlen,
-)
 from veomni.distributed.sequence_parallel.ring_attention import (
     zigzag_ring_flash_attn_func,
     zigzag_ring_flash_attn_varlen_func,
+)
+from veomni.distributed.sequence_parallel.ring_attention.layout import (
+    local_cu_seqlens,
+    zigzag_reorder,
+    zigzag_reorder_packed,
 )
 
 from ..ulysses.utils import SequenceParallelTest
@@ -167,7 +167,7 @@ class _ZigzagRingVarlenTest(MultiProcessTestCase):
         ref.backward(g)
 
         def shard(t):
-            tr = zigzag_reorder_varlen(t.detach(), cu, dim=0, cp_size=world)
+            tr = zigzag_reorder_packed(t.detach(), cu, dim=0, cp_size=world)
             chunk = tr.shape[0] // world
             return tr[self.rank * chunk : (self.rank + 1) * chunk].clone()
 
@@ -315,7 +315,7 @@ class USPAttentionE2ETest(MultiProcessTestCase):
         """Per-document zig-zag cp-outer + ulysses-inner slice (varlen layout)."""
         uly_rank = mesh.get_local_rank("ulysses")
         cp_rank = mesh.get_local_rank("cp")
-        reordered = zigzag_reorder_varlen(full.detach(), cu, dim=1, cp_size=CP)
+        reordered = zigzag_reorder_packed(full.detach(), cu, dim=1, cp_size=CP)
         cp_chunk = reordered.shape[1] // CP
         cp_region = reordered[:, cp_rank * cp_chunk : (cp_rank + 1) * cp_chunk]
         uly_chunk = cp_region.shape[1] // ULYSSES

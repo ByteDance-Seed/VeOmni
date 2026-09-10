@@ -25,8 +25,8 @@ from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
 )
+from ....distributed.sequence_parallel.ring_attention import ring_attention
 from ....utils import logging
-from ....utils.device import get_device_type
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
@@ -308,88 +308,21 @@ def flash_attention_forward(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
         )
 
-    # USP ring-attention (context-parallel) branch.
-    #
-    # When ``cp_size > 1`` the sequence is additionally split across the ``cp``
-    # mesh dimension and attention is computed with zig-zag ring attention over
-    # the ``cp`` group. This composes with Ulysses: the Ulysses all-to-all above
-    # already restored the full ``cp``-local sequence with a head subset, so the
-    # ring only needs to span the ``cp`` group. The data collator lays the
-    # sequence out in zig-zag block order (see ``SequenceParallelCollator`` /
-    # ``sequence_parallel.data.zigzag_reorder``), so causal attention is balanced
-    # across ``cp`` ranks. CUDA uses FA2 on Ampere/Hopper or FA4 CuTe on
-    # Blackwell; Ascend uses torch_npu fusion attention. Both dense and packed
-    # (varlen) sequences are supported, and packed documents use per-document
-    # LOCAL cu_seqlens derived from the FULL ``cu_seq_lens_q``.
     cp_state = get_parallel_state()
     if cp_state.cp_enabled:
-        from ....distributed.sequence_parallel.data import local_cu_seqlens
-
-        if get_device_type() == "npu":
-            from ....distributed.sequence_parallel.ring_attention_npu import (
-                zigzag_ring_npu_flash_attn_func as zigzag_ring_attn_func,
-            )
-            from ....distributed.sequence_parallel.ring_attention_npu import (
-                zigzag_ring_npu_flash_attn_varlen_func as zigzag_ring_attn_varlen_func,
-            )
-
-            ring_backend_kwargs = {"dropout_p": dropout}
-        else:
-            from ....distributed.sequence_parallel.ring_attention import (
-                zigzag_ring_flash_attn_func as zigzag_ring_attn_func,
-            )
-            from ....distributed.sequence_parallel.ring_attention import (
-                zigzag_ring_flash_attn_varlen_func as zigzag_ring_attn_varlen_func,
-            )
-
-            ring_backend_kwargs = {}
-
-        if not is_causal:
-            raise NotImplementedError("context-parallel (cp_size>1) ring attention requires causal attention")
-        if attention_mask is not None:
-            raise NotImplementedError(
-                "context-parallel (cp_size>1) ring attention does not support explicit attention masks"
-            )
-        # ``cu_seq_lens_q`` (when present) is computed by the collator on the FULL
-        # (pre-slice) packed position_ids, so it describes the whole sequence
-        # across the ``cp`` group. A single ``[0, S]`` segment is a plain
-        # (non-packed) sequence and takes the dense ring path; multiple segments
-        # are genuinely packed documents and take the varlen ring path, where
-        # each document is zig-zag split independently across ``cp`` (see
-        # ``SequenceParallelCollator`` / ``sequence_parallel.data``).
-        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
-        is_packed = cu_seq_lens_q is not None and cu_seq_lens_q.numel() > 2
-        # query/key/value are (b, s, h, d) here (already transposed for FA).
-        if is_packed:
-            # Derive the per-rank LOCAL document offsets for this cp-region: every
-            # document is split evenly across ``cp`` so each local document length
-            # is ``doc_len // cp_size``. ``varlen`` FA wants ``(total, h, d)``.
-            local_cu = local_cu_seqlens(cu_seq_lens_q.to(torch.int32), cp_state.cp_size)
-            seqlens = local_cu[1:] - local_cu[:-1]
-            local_max = int(seqlens.max().item()) if seqlens.numel() else 0
-            q3, k3, v3 = query.squeeze(0), key.squeeze(0), value.squeeze(0)
-            attn_output = zigzag_ring_attn_varlen_func(
-                q3,
-                k3,
-                v3,
-                local_cu,
-                local_max,
-                softmax_scale=scaling,
-                causal=True,
-                group=cp_state.cp_group,
-                **ring_backend_kwargs,
-            )
-            attn_output = attn_output.unsqueeze(0)
-        else:
-            attn_output = zigzag_ring_attn_func(
-                query,
-                key,
-                value,
-                softmax_scale=scaling,
-                causal=True,
-                group=cp_state.cp_group,
-                **ring_backend_kwargs,
-            )
+        attn_output = ring_attention(
+            query,
+            key,
+            value,
+            group=cp_state.cp_group,
+            cp_size=cp_state.cp_size,
+            device_type=cp_state.device_type,
+            cu_seqlens=kwargs.get("cu_seq_lens_q"),
+            attention_mask=attention_mask,
+            softmax_scale=scaling,
+            dropout_p=dropout,
+            causal=is_causal,
+        )
     else:
         attn_output = _flash_attention_forward(
             query,
