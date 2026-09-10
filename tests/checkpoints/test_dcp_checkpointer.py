@@ -1519,6 +1519,36 @@ class TestStageDirValidation:
                 with pytest.raises(OSError, match="No space left"):
                     _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
 
+    def test_unset_stage_dir_writes_straight_to_the_destination(self, tmp_path):
+        """Staging is opt-in: unset, nothing about the write changes.
+
+        DCP is pointed at the destination itself, and neither the staging directory
+        nor the promotion is reached -- so no scratch disk is touched and no extra
+        collective is issued.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        with (
+            patch.object(DistributedCheckpointer, "execute_save") as execute_save,
+            patch.object(DistributedCheckpointer, "_create_storage_writer") as create_writer,
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+            patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir") as prepare,
+            patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,
+        ):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=False,
+                global_steps=10,
+            )
+
+        assert create_writer.call_args.args[0] == str(final / "global_step_10")
+        assert execute_save.call_args.kwargs["storage_writer"] is create_writer.return_value
+        prepare.assert_not_called()
+        promote.assert_not_called()
+
     def test_stage_dir_with_explicit_storage_writer_is_rejected(self, tmp_path):
         """Silently ignoring stage_dir would write to the slow destination it was avoiding."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
