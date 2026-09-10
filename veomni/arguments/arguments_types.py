@@ -807,6 +807,32 @@ class CheckpointConfig:
             )
         },
     )
+    stage_promote_async: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "With `stage_dir`, resume training as soon as the checkpoint is staged and "
+                "copy it to `output_dir` on a background thread. The copy is what takes "
+                "minutes on a slow destination, and while it runs inline every rank that is "
+                "not writing sits on a collective, which is what trips the watchdog. The "
+                "next save, a load, and the end of training all wait for the copy, so it "
+                "overlaps training rather than going missing. Needs the scratch disk to hold "
+                "the staged checkpoint for longer, since it is not freed until the copy ends. "
+                "Requires `stage_dir`."
+            )
+        },
+    )
+    stage_promote_timeout_seconds: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Collective timeout in seconds for the background promotion's own process "
+                "group, a positive integer. Must outlast the copy: the ranks not copying wait "
+                "on it for the whole duration. Unset (default) keeps gloo's 30-minute default."
+            )
+        },
+    )
+
     dcp_save_to_lowest_rank: bool = field(
         default=False,
         metadata={
@@ -848,6 +874,21 @@ class CheckpointConfig:
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
+
+    def __post_init__(self):
+        if self.stage_promote_async and not self.stage_dir:
+            raise ValueError("stage_promote_async needs stage_dir; there is nothing to promote without it.")
+
+        # The parser hands YAML values through untouched, so the type is checked here.
+        # ``bool`` is an ``int`` subclass: without this, a stray ``true`` would pass as a
+        # one-second timeout and abort the promotion's first collective.
+        if self.stage_promote_timeout_seconds is not None and (
+            type(self.stage_promote_timeout_seconds) is not int or self.stage_promote_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "stage_promote_timeout_seconds must be a positive integer, "
+                f"got {self.stage_promote_timeout_seconds!r}."
+            )
 
 
 @dataclass

@@ -8,6 +8,8 @@ in-tree bugs — they become regression guards once the fix lands.
 
 import inspect
 import os
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1124,14 +1126,21 @@ class TestPromoteStagedCheckpoint:
         """Keep `_any_rank_failed` off a real process group.
 
         These tests fake `dist.is_initialized()`, so its all_reduce would other-
-        wise hit an uninitialised group. Leaving the tensor untouched makes the
+        wise hit an uninitialised group -- and so would the backend lookup that
+        picks the reduction's device. Leaving the tensor untouched makes the
         reduction reflect this rank's own flag, which is what a single-rank test
         means; cases about *another* rank failing patch `_any_rank_failed`
         directly.
         """
-        with patch("veomni.checkpoint.dcp_checkpointer.get_device_type", return_value="cpu"):
-            with patch("veomni.checkpoint.dcp_checkpointer.dist.all_reduce", side_effect=lambda t, op=None: None):
-                yield
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.get_device_type", return_value="cpu"),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_backend", return_value="gloo"),
+            patch(
+                "veomni.checkpoint.dcp_checkpointer.dist.all_reduce",
+                side_effect=lambda t, op=None, group=None: None,
+            ),
+        ):
+            yield
 
     @pytest.fixture
     def make_staged(self, tmp_path):
@@ -1262,7 +1271,7 @@ class TestPromoteStagedCheckpoint:
             stage_path, final_path = make_staged(f"{label}-{role}")
             seen = []
 
-            def reduction(failed, _seen=seen):
+            def reduction(failed, group=None, _seen=seen):
                 _seen.append(failed)
                 if peer_fails_from is not None and len(_seen) >= peer_fails_from:
                     return True
@@ -1278,7 +1287,10 @@ class TestPromoteStagedCheckpoint:
                 return real_copyfile(src, dst)
 
             raised = False
-            with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
+            with (
+                patch("veomni.checkpoint.dcp_checkpointer.dist.get_backend", return_value="gloo"),
+                patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            ):
                 with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=reduction):
                     with patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=global_rank):
                         with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=local_rank):
@@ -1396,14 +1408,20 @@ class TestPromoteStagedCheckpoint:
             assert _any_rank_failed(True) is True
             assert _any_rank_failed(False) is False
 
-        def fake_all_reduce(tensor, op=None):
+        sentinel = object()
+
+        def fake_all_reduce(tensor, op=None, group=None):
             assert op is _torch.distributed.ReduceOp.MAX, "must be MAX; SUM would overflow on many ranks"
+            assert group is sentinel, "the reduction must run on the group it was handed"
             tensor.fill_(1)
 
-        with patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True):
-            with patch("veomni.checkpoint.dcp_checkpointer.get_device_type", return_value="cpu"):
-                with patch("veomni.checkpoint.dcp_checkpointer.dist.all_reduce", side_effect=fake_all_reduce):
-                    assert _any_rank_failed(False) is True
+        with (
+            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=True),
+            patch("veomni.checkpoint.dcp_checkpointer.get_device_type", return_value="cpu"),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.get_backend", return_value="gloo"),
+            patch("veomni.checkpoint.dcp_checkpointer.dist.all_reduce", side_effect=fake_all_reduce),
+        ):
+            assert _any_rank_failed(False, sentinel) is True
 
     def test_non_leader_non_coordinator_ranks_touch_nothing(self, staged):
         """Ranks other than the node leaders and the coordinator only participate in barriers."""
@@ -1587,3 +1605,340 @@ class TestStageDirValidation:
                 stage_dir=str(tmp_path / "stage"),
             )
         assert not final.exists()
+
+
+def _async_promote_worker(rank: int, world_size: int, base: str, scenario: str) -> None:
+    """One rank of the real background-promotion check; see ``TestAsyncPromotionAcrossRanks``."""
+    import shutil
+
+    from veomni.checkpoint import dcp_checkpointer as module
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(os.environ.get("_TEST_MASTER_PORT", "0"))
+    os.environ["LOCAL_RANK"] = str(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+    stage, final = os.path.join(base, "stage"), os.path.join(base, "final")
+    if rank == 0:
+        os.makedirs(stage, exist_ok=True)
+        for name in ("__0_0.distcp", ".metadata"):
+            with open(os.path.join(stage, name), "w") as f:
+                f.write(name)
+    dist.barrier()
+
+    real_copy = shutil.copyfile
+
+    def instrumented_copy(src, dst):
+        if scenario == "copy_fails" and rank == 0:
+            raise OSError("simulated: destination is full")
+        if scenario == "outlives_timeout" and rank == 0:
+            time.sleep(8)
+        return real_copy(src, dst)
+
+    module.shutil.copyfile = instrumented_copy
+    checkpointer = module.DistributedCheckpointer
+    checkpointer._pending_promotion = None
+    checkpointer._promotion_executor = None
+    checkpointer._promotion_process_group = None
+
+    checkpointer._promote_in_background(stage, final, 3 if scenario == "outlives_timeout" else 120)
+
+    # The training thread keeps issuing its own collectives while the promotion
+    # runs. This interleaving is the whole reason the promotion needs its own
+    # group, and it is what a mocked test cannot exercise.
+    for step in range(20):
+        dist.all_reduce(torch.tensor([float(rank + step)]))
+
+    raised = None
+    try:
+        checkpointer.wait_for_pending_save()
+    except BaseException as e:  # noqa: BLE001 - asserted below
+        raised = f"{type(e).__name__}: {e}"
+
+    module.shutil.copyfile = real_copy
+    with open(os.path.join(base, f"outcome_{rank}"), "w") as f:
+        f.write(raised or "completed")
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+class TestAsyncPromotion:
+    """``promote_async`` moves the copy off the training thread.
+
+    What has to hold is that nothing reads or overwrites the checkpoint while that
+    copy is still running, and that a failure inside the worker still reaches the
+    caller.
+    """
+
+    @staticmethod
+    def _reset():
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        DistributedCheckpointer._pending_promotion = None
+        DistributedCheckpointer._promotion_executor = None
+        DistributedCheckpointer._promotion_process_group = None
+        DistributedCheckpointer.save_future = None
+
+    def test_promote_async_without_stage_dir_is_rejected(self, tmp_path):
+        """Silently doing nothing would leave the caller thinking the copy overlaps."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        with pytest.raises(ValueError, match="promote_async requires stage_dir"):
+            DistributedCheckpointer.save(
+                path=str(tmp_path / "ckpt"),
+                state={"model": MagicMock()},
+                save_async=False,
+                promote_async=True,
+            )
+
+    def test_save_returns_before_the_copy_and_wait_joins_it(self, tmp_path):
+        """The point of the flag: ``save`` hands the copy over rather than doing it."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        self._reset()
+        released = threading.Event()
+        copied = threading.Event()
+
+        def slow_promote(stage_path, final_path, group=None):
+            released.wait(timeout=10)
+            copied.set()
+
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save"),
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(tmp_path / "s")),
+                patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint", slow_promote),
+            ):
+                DistributedCheckpointer.save(
+                    path=str(tmp_path / "ckpt"),
+                    state={"model": MagicMock()},
+                    save_async=False,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                    promote_async=True,
+                )
+                assert not copied.is_set(), "save waited for the copy instead of handing it over"
+                assert DistributedCheckpointer._pending_promotion is not None
+
+                released.set()
+                DistributedCheckpointer.wait_for_pending_save()
+
+            assert copied.is_set(), "wait_for_pending_save returned with the copy still running"
+            assert DistributedCheckpointer._pending_promotion is None
+        finally:
+            released.set()
+            self._reset()
+
+    def test_the_next_save_waits_before_it_sweeps_the_staging_directory(self, tmp_path):
+        """The in-flight copy is reading the directory the next save empties.
+
+        Sweeping first would delete the checkpoint out from under it, so the join
+        has to come before ``_prepare_stage_dir`` -- not merely somewhere in ``save``.
+        The second save runs on its own thread so this can look at what it has done
+        while the first copy is still holding the directory.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        self._reset()
+        prepared = []
+        copying = threading.Event()
+        release = threading.Event()
+        failed = []
+
+        def blocking_promote(stage_path, final_path, group=None):
+            copying.set()
+            release.wait(timeout=10)
+
+        def record_prepare(stage_dir, path):
+            prepared.append(path)
+            return str(tmp_path / "s")
+
+        def save(step):
+            DistributedCheckpointer.save(
+                path=str(tmp_path / "ckpt"),
+                state={"model": MagicMock()},
+                save_async=False,
+                global_steps=step,
+                stage_dir=str(tmp_path / "stage"),
+                promote_async=True,
+            )
+
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save"),
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", record_prepare),
+                patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint", blocking_promote),
+            ):
+                save(10)
+                assert copying.wait(timeout=5), "the copy never started"
+
+                def second():
+                    try:
+                        save(20)
+                    except BaseException as e:  # noqa: BLE001 - reported below
+                        failed.append(e)
+
+                thread = threading.Thread(target=second)
+                thread.start()
+                thread.join(timeout=0.5)
+
+                assert prepared == [str(tmp_path / "ckpt")], (
+                    f"the second save swept while the first copy was still running: {prepared}"
+                )
+                assert thread.is_alive(), "the second save did not wait for the copy at all"
+
+                release.set()
+                thread.join(timeout=10)
+                assert not thread.is_alive()
+                assert not failed, failed
+                assert len(prepared) == 2, "the second save never staged"
+
+                DistributedCheckpointer.wait_for_pending_save()
+        finally:
+            release.set()
+            self._reset()
+
+    def test_a_failed_copy_reaches_the_caller_once(self, tmp_path):
+        """The worker's exception is the caller's, and only the first caller's.
+
+        Re-raising it again later would fail a save that had nothing to do with it.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        self._reset()
+
+        def failing_promote(stage_path, final_path, group=None):
+            raise OSError("destination is full")
+
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save"),
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(tmp_path / "s")),
+                patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint", failing_promote),
+            ):
+                DistributedCheckpointer.save(
+                    path=str(tmp_path / "ckpt"),
+                    state={"model": MagicMock()},
+                    save_async=False,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                    promote_async=True,
+                )
+                with pytest.raises(OSError, match="destination is full"):
+                    DistributedCheckpointer.wait_for_pending_save()
+                # Cleared by the first join, so it does not resurface.
+                DistributedCheckpointer.wait_for_pending_save()
+        finally:
+            self._reset()
+
+    def test_unset_promote_async_copies_inline(self, tmp_path):
+        """Background promotion is opt-in; without it the copy stays where it was."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        self._reset()
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save"),
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(tmp_path / "s")),
+                patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,
+            ):
+                DistributedCheckpointer.save(
+                    path=str(tmp_path / "ckpt"),
+                    state={"model": MagicMock()},
+                    save_async=False,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                )
+            promote.assert_called_once()
+            assert DistributedCheckpointer._pending_promotion is None
+        finally:
+            self._reset()
+
+
+class TestAsyncPromotionAcrossRanks:
+    """The background promotion, run for real on four ranks.
+
+    A mocked join proves the handle is consumed. It cannot prove that promotion
+    collectives on a worker thread interleave safely with the training thread's
+    own collectives, which is the risk the design turns on.
+    """
+
+    @staticmethod
+    def _run(tmp_path, scenario):
+        from tests.tools.launch_utils import find_free_port
+
+        base = str(tmp_path / scenario)
+        os.makedirs(base, exist_ok=True)
+        os.environ["_TEST_MASTER_PORT"] = str(find_free_port())
+        mp.spawn(_async_promote_worker, args=(4, base, scenario), nprocs=4, join=True)
+        return base, [open(os.path.join(base, f"outcome_{r}")).read() for r in range(4)]
+
+    def test_promotion_completes_while_training_collectives_run(self, tmp_path):
+        base, outcomes = self._run(tmp_path, "ok")
+
+        assert outcomes == ["completed"] * 4, outcomes
+        assert sorted(os.listdir(os.path.join(base, "final"))) == [".metadata", "__0_0.distcp"]
+        assert not os.path.exists(os.path.join(base, "stage")), "the staged copy was not freed"
+
+    def test_one_ranks_failure_stops_every_rank_without_a_marker(self, tmp_path):
+        base, outcomes = self._run(tmp_path, "copy_fails")
+
+        assert all(o != "completed" for o in outcomes), outcomes
+        assert "destination is full" in outcomes[0]
+        assert os.listdir(os.path.join(base, "final")) == [], "a checkpoint was published after a failed copy"
+
+    def test_a_rank_that_outlives_the_group_timeout_fails_instead_of_hanging(self, tmp_path):
+        """The deadline lives in the process group, not in the join.
+
+        A per-rank join deadline is not a collective; the group's is, so every rank
+        gives up on the same collective rather than one running ahead of the others.
+        """
+        _, outcomes = self._run(tmp_path, "outlives_timeout")
+
+        assert all(o != "completed" for o in outcomes), outcomes
+        assert any("Timed out" in o for o in outcomes), outcomes
+
+
+class TestStagePromoteConfig:
+    """``CheckpointConfig`` rejects promotion settings that cannot mean anything."""
+
+    def test_promote_async_without_stage_dir_is_rejected(self):
+        """There is nothing to promote without a staging directory, and silently
+        ignoring the flag would leave the operator believing the copy overlaps."""
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        with pytest.raises(ValueError, match="stage_promote_async needs stage_dir"):
+            CheckpointConfig(stage_promote_async=True)
+
+    def test_promote_async_with_stage_dir_is_accepted(self):
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        assert CheckpointConfig(stage_dir="/tmp/stage", stage_promote_async=True).stage_promote_async
+
+    @pytest.mark.parametrize("timeout", [0, -1, True, 1800.5, "1800"])
+    def test_non_positive_or_non_integer_timeout_is_rejected(self, timeout):
+        """The parser hands YAML values through untouched, and ``bool`` is an ``int``
+        subclass: a stray ``true`` would otherwise be a one-second timeout, aborting
+        the promotion's first collective."""
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        with pytest.raises(ValueError, match="stage_promote_timeout_seconds must be a positive integer"):
+            CheckpointConfig(stage_promote_timeout_seconds=timeout)
+
+    def test_unset_timeout_defers_to_gloo(self):
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        assert CheckpointConfig().stage_promote_timeout_seconds is None
