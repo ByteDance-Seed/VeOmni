@@ -373,6 +373,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
+| dist_timeout_seconds | `Optional[int]` | `None` | Collective timeout for the default process group. `None` keeps torch's per-backend default (10 min for NCCL). Raise it when a step legitimately blocks longer — a checkpoint written over a slow network filesystem — at the cost of taking that much longer to notice a real deadlock. Device-mesh subgroups keep torch's default. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | moe_load_balance_monitor_interval | `int` | `0` | Log a globally reduced MoE expert-load heatmap every N steps. `0` disables monitoring. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |

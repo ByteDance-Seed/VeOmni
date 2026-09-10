@@ -353,9 +353,10 @@ class BaseTrainer(Stateful, ABC):
         get_torch_device().set_device(device_str)
         self.device = torch.device(device_str)
 
-        # Initialize distributed process group
+        # Initialize distributed process group. A ``None`` timeout leaves torch to
+        # apply its own per-backend default; see ``train.dist_timeout_seconds``.
         if not dist.is_initialized():
-            dist.init_process_group(backend=get_dist_comm_backend())
+            dist.init_process_group(backend=get_dist_comm_backend(), timeout=self.args.train.dist_timeout)
 
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 

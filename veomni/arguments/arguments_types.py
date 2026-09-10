@@ -16,6 +16,7 @@ import math
 import os
 import sys
 from dataclasses import MISSING, dataclass, field, fields
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -825,6 +826,22 @@ class TrainingArguments:
         default=42,
         metadata={"help": "Random seed."},
     )
+    dist_timeout_seconds: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Timeout for collective operations on the default process group. Unset "
+                "(default) keeps torch's own per-backend default, which is 10 minutes for "
+                "NCCL. A collective that outlives it is treated as a hang: the NCCL "
+                "watchdog aborts the process and the run restarts. Raise it when a step "
+                "legitimately blocks that long -- loading a model or writing a checkpoint "
+                "over a slow network filesystem -- at the cost of taking that much longer "
+                "to notice a real deadlock. Applies to the default group, which is what "
+                "checkpoint save and load collectives run on; device-mesh subgroups keep "
+                "torch's default."
+            )
+        },
+    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
@@ -856,6 +873,9 @@ class TrainingArguments:
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
 
+        if self.dist_timeout_seconds is not None and self.dist_timeout_seconds <= 0:
+            raise ValueError(f"dist_timeout_seconds must be positive, got {self.dist_timeout_seconds}.")
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
@@ -865,6 +885,17 @@ class TrainingArguments:
         self._derive_batch_config()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
+
+    @property
+    def dist_timeout(self) -> Optional[timedelta]:
+        """``dist_timeout_seconds`` as ``init_process_group`` wants it.
+
+        ``None`` means "leave it to torch", which is not the same as any number we
+        could substitute: the default differs per backend.
+        """
+        if self.dist_timeout_seconds is None:
+            return None
+        return timedelta(seconds=self.dist_timeout_seconds)
 
     # -- validation & derivation helpers (called by __post_init__) -----------------------
 
