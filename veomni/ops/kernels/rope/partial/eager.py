@@ -26,10 +26,11 @@ from ....registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
-    """Empty flag plus the ``unsqueeze_dim`` used to broadcast ``cos`` / ``sin``."""
+    """Broadcast metadata and whether input tensors were saved for table gradients."""
 
     empty: bool
     unsqueeze_dim: int
+    table_gradients: bool
 
 
 def _rotate_half(x: Tensor) -> Tensor:
@@ -54,34 +55,63 @@ def _grad_prefix(grad_output: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((grad_rotated, passed), dim=-1)
 
 
+def _collapse_table_gradient(grad: Tensor, expanded: Tensor, table: Tensor, unsqueeze_dim: int) -> Tensor:
+    """Undo broadcasting and the table's inserted head dimension."""
+    return grad.sum_to_size(expanded.shape).squeeze(unsqueeze_dim).to(table.dtype)
+
+
 def forward(
-    q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1
+    q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, unsqueeze_dim: int = 1
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
     """Rotate a prefix of each head. The remaining channels pass through.
 
     Prefix width is ``cos.shape[-1]``. Empty inputs are returned unchanged.
-    Backward returns ``(dq, dk, None, None)``.
     """
     if q.numel() == 0 or k.numel() == 0:
-        return (q, k), SavedState((cos, sin), _Meta(True, unsqueeze_dim))
+        return (q, k), SavedState((cos, sin), _Meta(True, unsqueeze_dim, False))
 
     cos_u = cos.unsqueeze(unsqueeze_dim)
     sin_u = sin.unsqueeze(unsqueeze_dim)
+    table_gradients = cos.requires_grad or sin.requires_grad
+    tensors = (q, k, cos, sin) if table_gradients else (cos, sin)
     return (
         _apply_prefix(q, cos_u, sin_u),
         _apply_prefix(k, cos_u, sin_u),
-    ), SavedState((cos, sin), _Meta(False, unsqueeze_dim))
+    ), SavedState(tensors, _Meta(False, unsqueeze_dim, table_gradients))
 
 
-def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Tensor, Tensor, None, None]:
-    """Return ``(dq, dk, None, None)``. ``cos`` / ``sin`` are not differentiated."""
+def backward(
+    grad_output: tuple[Tensor, Tensor], saved: SavedState
+) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, None]:
+    """Return q/k, optional table, and ``unsqueeze_dim`` gradients."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     grad_q, grad_k = grad_output
     if meta.empty:
-        return grad_q, grad_k, None, None
+        return grad_q, grad_k, None, None, None
 
-    cos, sin = saved.tensors
+    if meta.table_gradients:
+        q, k, cos, sin = saved.tensors
+    else:
+        cos, sin = saved.tensors
     cos_u = cos.unsqueeze(meta.unsqueeze_dim)
     sin_u = sin.unsqueeze(meta.unsqueeze_dim)
-    return _grad_prefix(grad_q, cos_u, sin_u), _grad_prefix(grad_k, cos_u, sin_u), None, None
+    dq = _grad_prefix(grad_q, cos_u, sin_u)
+    dk = _grad_prefix(grad_k, cos_u, sin_u)
+    if not meta.table_gradients:
+        return dq, dk, None, None, None
+
+    rotary_dim = cos.shape[-1]
+    grad_q_rot, q_rot = grad_q[..., :rotary_dim], q[..., :rotary_dim]
+    grad_k_rot, k_rot = grad_k[..., :rotary_dim], k[..., :rotary_dim]
+    grad_cos = None
+    if cos.requires_grad:
+        grad_cos = _collapse_table_gradient(
+            grad_q_rot * q_rot, cos_u, cos, meta.unsqueeze_dim
+        ) + _collapse_table_gradient(grad_k_rot * k_rot, cos_u, cos, meta.unsqueeze_dim)
+    grad_sin = None
+    if sin.requires_grad:
+        grad_sin = _collapse_table_gradient(
+            grad_q_rot * _rotate_half(q_rot), sin_u, sin, meta.unsqueeze_dim
+        ) + _collapse_table_gradient(grad_k_rot * _rotate_half(k_rot), sin_u, sin, meta.unsqueeze_dim)
+    return dq, dk, grad_cos, grad_sin, None

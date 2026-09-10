@@ -23,14 +23,14 @@ from transformers.masking_utils import (
     and_masks,
     causal_mask_function,
     or_masks,
-    packed_sequence_mask_function,
     sliding_window_overlay,
 )
 
+from ..ulysses import effective_sequence_lengths
 from .flash import flash_attention_mask_builder
 from .flex import flex_attention_mask_builder
 from .magi import MagiAttentionMask, magi_attention_mask_builder
-from .sdpa import _packed_segment_ids, sdpa_attention_mask_builder
+from .sdpa import sdpa_attention_mask_builder
 
 
 # Flash-like kernels keep causal visibility in ``is_causal`` / varlen kwargs,
@@ -118,20 +118,7 @@ def _flex_mask(
     mask_function = extra.get("mask_function", causal_mask_function)
     if sliding_window is not None:
         mask_function = and_masks(mask_function, sliding_window_overlay(sliding_window))
-    if cu_seqlens is not None:
-        mask_function = and_masks(
-            mask_function,
-            packed_sequence_mask_function(
-                _packed_segment_ids(
-                    batch_size=batch_size,
-                    q_length=q_len,
-                    kv_length=kv_len,
-                    cu_seqlens=cu_seqlens,
-                    cu_seqlens_k=extra.pop("cu_seq_lens_k", extra.pop("cu_seqlens_k", None)),
-                    device=device,
-                )
-            ),
-        )
+    cu_seqlens_k = extra.pop("cu_seq_lens_k", extra.pop("cu_seqlens_k", None))
     extra["mask_function"] = mask_function
     return flex_attention_mask_builder(
         batch_size=batch_size,
@@ -139,6 +126,8 @@ def _flex_mask(
         kv_length=kv_len,
         q_offset=kv_len - q_len,
         device=device,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
         **extra,
     )
 
@@ -257,8 +246,8 @@ def packed_causal_mask(
     """Packed causal mask from ``cu_seqlens``.
 
     Flash returns only optional 2D padding metadata; packed lengths stay in
-    kernel kwargs. Flex / SDPA builders receive ``skip_ulysses``. Magi packed
-    ranges come from ``cu_seqlens`` and are not scaled.
+    kernel kwargs. Flex / SDPA builders receive ``skip_ulysses``. Magi validates
+    ``cu_seqlens`` against the effective post-Ulysses sequence lengths.
     """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
@@ -295,12 +284,16 @@ def packed_causal_mask(
     if backend == "magi_attention":
         extra.pop("dtype", None)
         extra.pop("mask_function", None)
-        extra.pop("skip_ulysses", None)
+        effective_q_len, effective_kv_len = effective_sequence_lengths(
+            q_len,
+            kv_len,
+            skip_ulysses=extra.pop("skip_ulysses", False),
+        )
         return MagiAttentionMask.from_cu_seqlens(
             cu_seqlens,
             extra.pop("cu_seq_lens_k", extra.pop("cu_seqlens_k", cu_seqlens)),
             device=device,
-            q_length=q_len,
-            kv_length=kv_len,
+            q_length=effective_q_len,
+            kv_length=effective_kv_len,
         )
     raise ValueError(f"unsupported attention impl for packed_causal_mask: {impl!r}")

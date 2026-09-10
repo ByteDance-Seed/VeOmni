@@ -42,6 +42,25 @@ def should_apply_ulysses(*, skip_ulysses: bool = False) -> bool:
     return not bool(parallel_state.async_enabled)
 
 
+def effective_sequence_lengths(
+    q_length: int,
+    kv_length: int,
+    *,
+    skip_ulysses: bool = False,
+) -> tuple[int, int]:
+    """Return the Q/K lengths seen by the attention kernel.
+
+    Synchronous Ulysses gathers the sequence inside attention, so mask
+    metadata must describe the global sequence. Async Ulysses gathers before
+    attention, and skipped calls stay local, so their input lengths are already
+    the effective lengths.
+    """
+    if not should_apply_ulysses(skip_ulysses=skip_ulysses):
+        return q_length, kv_length
+    scale = get_parallel_state().ulysses_size
+    return q_length * scale, kv_length * scale
+
+
 def prepare_ulysses_qkv(
     query: torch.Tensor,
     key: torch.Tensor,

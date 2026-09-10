@@ -28,6 +28,8 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import eager_attention
 
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops.kernels.dsa.attention.glm import flashmla_cudnn as glm_fused_attention
+from veomni.ops.kernels.dsa.indexer.glm import cudnn as glm_fused_indexer
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
 
 
@@ -153,6 +155,44 @@ def test_dsa_fused_rows_reject_rocm(monkeypatch):
         assert impl not in OP_REGISTRY.list_available(op, variant)
         with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
             resolve_op(op, variant, impl)
+
+
+def test_glm_fused_rows_reject_sm80(monkeypatch):
+    """The packaged FlashMLA dependency requires Hopper or newer."""
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
+    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", None, raising=False)
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_gpu_compute_capability", lambda: 80)
+
+    for op, variant, impl in (
+        ("dsa_attention", "glm", "flashmla_cudnn"),
+        ("dsa_indexer", "glm", "cudnn"),
+    ):
+        assert impl not in OP_REGISTRY.list_available(op, variant)
+        with pytest.raises(RuntimeError, match="compute capability >= 90"):
+            resolve_op(op, variant, impl)
+
+
+def test_glm_fused_rows_reject_attention_mask_before_vendor_import(monkeypatch):
+    """Unsupported masks must not be silently ignored by fused GLM rows."""
+    vendor_module = "veomni.ops.kernels.dsa.vendor.flashmla_cudnn"
+    monkeypatch.delitem(sys.modules, vendor_module, raising=False)
+    tensor = torch.empty(0)
+    attention_mask = torch.ones(1, 1, 1, 1)
+
+    with pytest.raises(ValueError, match="does not support attention_mask"):
+        glm_fused_attention.wrapper(
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            attention_mask=attention_mask,
+        )
+    with pytest.raises(ValueError, match="does not support attention_mask"):
+        glm_fused_indexer.wrapper(tensor, tensor, tensor, 1, attention_mask=attention_mask)
+
+    assert vendor_module not in sys.modules
 
 
 def test_dsa_attention_deepseek_v4_eager_matches_hf():

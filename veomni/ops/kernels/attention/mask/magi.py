@@ -25,9 +25,8 @@ from transformers.masking_utils import (
     causal_mask_function,
 )
 
-from .....distributed.parallel_state import get_parallel_state
 from ..helper import require_all
-from ..ulysses import should_apply_ulysses
+from ..ulysses import effective_sequence_lengths
 
 
 @dataclass(frozen=True)
@@ -160,7 +159,11 @@ def magi_attention_mask_builder(
         raise ValueError("MagiAttention mask creation requires a device or tensor metadata.")
     device = torch.device(device)
 
-    full_q_length, full_kv_length = _full_sequence_lengths(q_length, kv_length, skip_ulysses=skip_ulysses)
+    full_q_length, full_kv_length = effective_sequence_lengths(
+        q_length,
+        kv_length,
+        skip_ulysses=skip_ulysses,
+    )
     attn_type_map = torch.ones(1, device=device, dtype=torch.int32) if causal else None
     return MagiAttentionMask.from_ranges(
         torch.tensor([[0, full_q_length]], device=device, dtype=torch.int32),
@@ -168,14 +171,6 @@ def magi_attention_mask_builder(
         attn_type_map,
         device=device,
     )
-
-
-def _full_sequence_lengths(q_length: int, kv_length: int, *, skip_ulysses: bool) -> tuple[int, int]:
-    """Return sequence lengths after the optional Ulysses all-gather."""
-    if not should_apply_ulysses(skip_ulysses=skip_ulysses):
-        return q_length, kv_length
-    scale = get_parallel_state().ulysses_size
-    return q_length * scale, kv_length * scale
 
 
 def _ranges_from_cu_seqlens(

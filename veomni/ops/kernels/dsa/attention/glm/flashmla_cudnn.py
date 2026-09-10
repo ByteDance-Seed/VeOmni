@@ -33,10 +33,12 @@ def wrapper(
 
     ``q_pe`` / ``q_nope_absorbed`` are ``[B, S, H, D]``. ``k_pe`` and
     ``kv_cache`` are MQA ``[B, S_kv, 1, D]``.
-    ``attention_mask`` is accepted for call-face parity with eager. The
-    fused row applies causality through top-k.
+    The fused row applies causality through top-k, but cannot represent an
+    additional padding or additive mask.
     """
-    del attention_mask
+    if attention_mask is not None:
+        raise ValueError("flashmla_cudnn GLM sparse attention does not support attention_mask.")
+
     from ....vendor.flashmla_cudnn import flash_mla_sparse_attention_with_cudnn_backward
 
     return flash_mla_sparse_attention_with_cudnn_backward(

@@ -157,8 +157,8 @@ def test_triton_moe_rows_apply_cc_only_to_nvidia(op, variant, impl):
     (
         ("dsa_attention", "deepseek_v4", "tilelang", NVIDIA_SM90_PLUS),
         ("dsa_indexer", "deepseek_v4", "tilelang", NVIDIA_SM90_PLUS),
-        ("dsa_attention", "glm", "flashmla_cudnn", NVIDIA_GPU),
-        ("dsa_indexer", "glm", "cudnn", NVIDIA_GPU),
+        ("dsa_attention", "glm", "flashmla_cudnn", NVIDIA_SM90_PLUS),
+        ("dsa_indexer", "glm", "cudnn", NVIDIA_SM90_PLUS),
         ("mhc", "pre", "tilelang", NVIDIA_SM90_PLUS),
         ("mhc", "post", "tilelang", NVIDIA_SM90_PLUS),
         ("mhc", "head", "tilelang", NVIDIA_SM90_PLUS),

@@ -33,6 +33,7 @@ from tests.ops.attention.attention_cases import (
     materialize_magi_mask,
 )
 from veomni.ops.install import _VEOMNI_HF_PATCHES
+from veomni.ops.kernels.attention import ulysses as ulysses_mask
 from veomni.ops.kernels.attention.mask import flex as flex_mask
 from veomni.ops.kernels.attention.mask import magi as magi_mask
 from veomni.ops.kernels.attention.mask import sdpa as sdpa_mask
@@ -147,9 +148,15 @@ def _sync_ulysses_state(*, size: int = 2) -> SimpleNamespace:
 
 def _patch_mask_ulysses(monkeypatch, *modules, apply: bool, size: int = 2) -> None:
     state = _sync_ulysses_state(size=size)
-    for module in modules:
-        monkeypatch.setattr(module, "should_apply_ulysses", lambda *, skip_ulysses=False: apply and not skip_ulysses)
-        monkeypatch.setattr(module, "get_parallel_state", lambda: state)
+    for module in (*modules, ulysses_mask):
+        if hasattr(module, "should_apply_ulysses"):
+            monkeypatch.setattr(
+                module,
+                "should_apply_ulysses",
+                lambda *, skip_ulysses=False: apply and not skip_ulysses,
+            )
+        if hasattr(module, "get_parallel_state"):
+            monkeypatch.setattr(module, "get_parallel_state", lambda: state)
 
 
 def test_flex_ulysses_2d_mask_length_aligns(monkeypatch):
@@ -168,13 +175,13 @@ def test_flex_ulysses_2d_mask_length_aligns(monkeypatch):
             flex_attention_mask_builder,
             flex_mask,
             torch.ones(1, 4, dtype=torch.bool),
-            "local q_length \\* ulysses_size",
+            "post-Ulysses key length",
         ),
         (
             sdpa_attention_mask_builder,
             sdpa_mask,
             torch.ones(1, 4, dtype=torch.bool),
-            "local q_length \\* ulysses_size",
+            "post-Ulysses key length",
         ),
     ],
 )

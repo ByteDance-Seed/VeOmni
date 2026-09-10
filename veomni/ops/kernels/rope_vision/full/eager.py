@@ -26,9 +26,10 @@ from ....registry import SavedState
 
 @dataclass(frozen=True)
 class _Meta:
-    """Whether the empty-tensor path ran."""
+    """Whether the empty path ran and inputs were saved for table gradients."""
 
     empty: bool
+    table_gradients: bool
 
 
 def _rotate_half(x: Tensor) -> Tensor:
@@ -47,32 +48,68 @@ def _grad_x(grad_output: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return (grad_output * cos) - _rotate_half(grad_output * sin)
 
 
-def forward(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[tuple[Tensor, Tensor], SavedState]:
+def _collapse_table_gradient(grad: Tensor, expanded: Tensor, table: Tensor) -> Tensor:
+    """Undo broadcasting and the fixed vision head dimension."""
+    return grad.sum_to_size(expanded.shape).squeeze(-2).to(table.dtype)
+
+
+def forward(
+    q: Tensor,
+    k: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    position_ids: Tensor | None = None,
+    unsqueeze_dim: int = 1,
+) -> tuple[tuple[Tensor, Tensor], SavedState]:
     """Rotate every channel of ``[S, H, D]`` query/key.
 
-    ``cos`` / ``sin`` are unsqueezed on the head axis. Empty inputs are
-    returned unchanged. Backward returns ``(dq, dk, None, None)``.
+    ``position_ids`` and ``unsqueeze_dim`` retain the previous public call
+    face. Vision tensors always insert the broadcast dimension at ``-2``.
+    Empty inputs are returned unchanged.
     """
+    del position_ids, unsqueeze_dim
     if q.numel() == 0 or k.numel() == 0:
-        return (q, k), SavedState((cos, sin), _Meta(True))
+        return (q, k), SavedState((cos, sin), _Meta(True, False))
 
     q_f, k_f = q.float(), k.float()
     cos_u, sin_u = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
     q_embed = _apply(q_f, cos_u, sin_u).to(q.dtype)
     k_embed = _apply(k_f, cos_u, sin_u).to(k.dtype)
-    return (q_embed, k_embed), SavedState((cos, sin), _Meta(False))
+    table_gradients = cos.requires_grad or sin.requires_grad
+    tensors = (q, k, cos, sin) if table_gradients else (cos, sin)
+    return (q_embed, k_embed), SavedState(tensors, _Meta(False, table_gradients))
 
 
-def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Tensor, Tensor, None, None]:
-    """Return ``(dq, dk, None, None)``. ``cos`` / ``sin`` are not differentiated."""
+def backward(
+    grad_output: tuple[Tensor, Tensor], saved: SavedState
+) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, None, None]:
+    """Return q/k, optional table, and compatibility-argument gradients."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     grad_q, grad_k = grad_output
     if meta.empty:
-        return grad_q, grad_k, None, None
+        return grad_q, grad_k, None, None, None, None
 
-    cos, sin = saved.tensors
+    if meta.table_gradients:
+        q, k, cos, sin = saved.tensors
+    else:
+        cos, sin = saved.tensors
     cos_u, sin_u = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
     dq = _grad_x(grad_q.float(), cos_u, sin_u).to(grad_q.dtype)
     dk = _grad_x(grad_k.float(), cos_u, sin_u).to(grad_k.dtype)
-    return dq, dk, None, None
+    if not meta.table_gradients:
+        return dq, dk, None, None, None, None
+
+    grad_q_f, grad_k_f = grad_q.float(), grad_k.float()
+    q_f, k_f = q.float(), k.float()
+    grad_cos = None
+    if cos.requires_grad:
+        grad_cos = _collapse_table_gradient(grad_q_f * q_f, cos_u, cos) + _collapse_table_gradient(
+            grad_k_f * k_f, cos_u, cos
+        )
+    grad_sin = None
+    if sin.requires_grad:
+        grad_sin = _collapse_table_gradient(grad_q_f * _rotate_half(q_f), sin_u, sin) + _collapse_table_gradient(
+            grad_k_f * _rotate_half(k_f), sin_u, sin
+        )
+    return dq, dk, grad_cos, grad_sin, None, None

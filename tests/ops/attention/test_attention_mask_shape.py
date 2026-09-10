@@ -28,6 +28,7 @@ from transformers.masking_utils import (
 )
 
 from tests.ops.attention.attention_cases import flex_visible
+from veomni.ops.kernels.attention import ulysses as ulysses_mask
 from veomni.ops.kernels.attention.mask import flex as flex_mask
 from veomni.ops.kernels.attention.mask import magi as magi_mask
 from veomni.ops.kernels.attention.mask import sdpa as sdpa_mask
@@ -244,6 +245,33 @@ def test_magi_packed_aligns_with_from_cu_seqlens():
     torch.testing.assert_close(shaped.attn_type_map, built.attn_type_map)
 
 
+@pytest.mark.parametrize("impl", ("sdpa", "flex_attention", "magi_attention"))
+def test_packed_mask_uses_post_ulysses_lengths(monkeypatch, impl):
+    state = SimpleNamespace(ulysses_size=2, async_enabled=False)
+    monkeypatch.setattr(ulysses_mask, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
+    monkeypatch.setattr(ulysses_mask, "get_parallel_state", lambda: state)
+    for module in (sdpa_mask, flex_mask):
+        monkeypatch.setattr(module, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
+
+    shaped = packed_causal_mask(
+        4,
+        4,
+        impl=impl,
+        device="cpu",
+        cu_seqlens=torch.tensor([0, 4, 8]),
+    )
+
+    if impl == "magi_attention":
+        assert shaped.q_ranges.tolist() == [[0, 4], [4, 8]]
+        assert shaped.k_ranges.tolist() == [[0, 4], [4, 8]]
+        return
+    visible = shaped[0, 0] if impl == "sdpa" else flex_visible(shaped, 8, 8)
+    expected = torch.zeros(8, 8, dtype=torch.bool)
+    expected[:4, :4] = torch.tril(torch.ones(4, 4, dtype=torch.bool))
+    expected[4:, 4:] = torch.tril(torch.ones(4, 4, dtype=torch.bool))
+    torch.testing.assert_close(visible, expected)
+
+
 def test_magi_packed_rejects_incomplete_query_coverage():
     with pytest.raises(ValueError, match=r"cu_seqlens_q must end at the full sequence length \(8\)"):
         packed_causal_mask(
@@ -282,8 +310,10 @@ def test_magi_sliding_window_is_unsupported():
 )
 def test_causal_mask_forwards_skip_ulysses(monkeypatch, impl, module):
     state = SimpleNamespace(ulysses_size=2, async_enabled=False)
-    monkeypatch.setattr(module, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
-    monkeypatch.setattr(module, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(ulysses_mask, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
+    monkeypatch.setattr(ulysses_mask, "get_parallel_state", lambda: state)
+    if hasattr(module, "should_apply_ulysses"):
+        monkeypatch.setattr(module, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
     if impl == "magi_attention":
         expanded = causal_mask(4, 4, impl=impl, device="cpu")
         skipped = causal_mask(4, 4, impl=impl, device="cpu", skip_ulysses=True)

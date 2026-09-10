@@ -31,6 +31,7 @@ class _Meta:
     use_eager: bool
     unsqueeze_dim: int
     eager_empty: bool = False
+    eager_table_gradients: bool = False
 
 
 def _to_liger_layout(q: Tensor, k: Tensor, unsqueeze_dim: int) -> tuple[Tensor, Tensor]:
@@ -48,20 +49,28 @@ def _from_liger_layout(q: Tensor, k: Tensor, unsqueeze_dim: int) -> tuple[Tensor
 
 
 def forward(
-    q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, *, unsqueeze_dim: int = 1
+    q: Tensor,
+    k: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    position_ids: Tensor | None = None,
+    unsqueeze_dim: int = 1,
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
     """Liger fused full RoPE.
 
     ``unsqueeze_dim`` is the HF broadcast axis and therefore the q/k layout:
     ``1`` is ``[B, H, S, D]``, ``2`` is ``[B, S, H, D]``. Liger only speaks
-    ``[B, H, S, D]``, so ``2`` is transposed in and out. Any other value, or
-    empty inputs, falls back to the eager pair.
+    ``[B, H, S, D]``, so ``2`` is transposed in and out. Any other value,
+    empty input, or trainable rotary table falls back to the eager pair.
     """
-    if q.numel() == 0 or k.numel() == 0 or unsqueeze_dim not in (1, 2):
-        output, saved = _eager.forward(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    if q.numel() == 0 or k.numel() == 0 or unsqueeze_dim not in (1, 2) or cos.requires_grad or sin.requires_grad:
+        output, saved = _eager.forward(q, k, cos, sin, position_ids, unsqueeze_dim)
         eager_meta = saved.metadata
         assert isinstance(eager_meta, _eager._Meta)
-        return output, SavedState(saved.tensors, _Meta(True, unsqueeze_dim, eager_meta.empty))
+        return output, SavedState(
+            saved.tensors,
+            _Meta(True, unsqueeze_dim, eager_meta.empty, eager_meta.table_gradients),
+        )
 
     from liger_kernel.ops.rope import rope_forward
 
@@ -72,13 +81,19 @@ def forward(
     )
 
 
-def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Tensor, Tensor, None, None]:
-    """Return ``(dq, dk, None, None)``. Eager fallbacks reuse the eager backward."""
+def backward(
+    grad_output: tuple[Tensor, Tensor], saved: SavedState
+) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, None, None]:
+    """Return q/k, optional table, and compatibility-argument gradients."""
     meta = saved.metadata
     assert isinstance(meta, _Meta)
     if meta.use_eager:
         return _eager.backward(
-            grad_output, SavedState(saved.tensors, _eager._Meta(meta.eager_empty, meta.unsqueeze_dim))
+            grad_output,
+            SavedState(
+                saved.tensors,
+                _eager._Meta(meta.eager_empty, meta.unsqueeze_dim, meta.eager_table_gradients),
+            ),
         )
 
     from liger_kernel.ops.rope import rope_backward
@@ -87,4 +102,4 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
     cos, sin = saved.tensors
     dq, dk = rope_backward(grad_q, grad_k, cos, sin)
     dq, dk = _from_liger_layout(dq, dk, meta.unsqueeze_dim)
-    return dq, dk, None, None
+    return dq, dk, None, None, None, None

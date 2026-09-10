@@ -127,6 +127,146 @@ def test_vision_eager_matches_hf():
     assert torch.allclose(k_e.grad, k_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize("kind", ("full", "partial", "vision"))
+@pytest.mark.parametrize(
+    ("cos_requires_grad", "sin_requires_grad"),
+    ((True, False), (False, True), (True, True)),
+)
+def test_eager_rope_table_gradients_match_hf(kind: str, cos_requires_grad: bool, sin_requires_grad: bool):
+    torch.manual_seed(1)
+    if kind == "full":
+        q = torch.randn(2, 3, 4, 8)
+        k = torch.randn(2, 2, 4, 8)
+        cos = torch.randn(2, 4, 8)
+        sin = torch.randn(2, 4, 8)
+        reference = hf_full_rope
+        op = resolve_op("rope", "full", "eager").wrapper
+        attrs = {"unsqueeze_dim": 1}
+    elif kind == "partial":
+        q = torch.randn(2, 3, 4, 12)
+        k = torch.randn(2, 2, 4, 12)
+        cos = torch.randn(2, 4, 8)
+        sin = torch.randn(2, 4, 8)
+        reference = hf_partial_rope
+        op = resolve_op("rope", "partial", "eager").wrapper
+        attrs = {"unsqueeze_dim": 1}
+    else:
+        q = torch.randn(4, 3, 8)
+        k = torch.randn(4, 2, 8)
+        cos = torch.randn(4, 8)
+        sin = torch.randn(4, 8)
+        reference = hf_vision_rope
+        op = resolve_op("rope_vision", "full", "eager").wrapper
+        attrs = {}
+
+    q_h, k_h = _clone_qk(q, k)
+    q_e, k_e = _clone_qk(q, k)
+    cos_h = cos.detach().clone().requires_grad_(cos_requires_grad)
+    cos_e = cos.detach().clone().requires_grad_(cos_requires_grad)
+    sin_h = sin.detach().clone().requires_grad_(sin_requires_grad)
+    sin_e = sin.detach().clone().requires_grad_(sin_requires_grad)
+    out_h = reference(q_h, k_h, cos_h, sin_h, **attrs)
+    out_e = op(q_e, k_e, cos_e, sin_e, **attrs)
+
+    grad = (torch.randn_like(out_h[0]), torch.randn_like(out_h[1]))
+    torch.autograd.backward(out_h, grad)
+    torch.autograd.backward(out_e, grad)
+
+    torch.testing.assert_close(q_e.grad, q_h.grad)
+    torch.testing.assert_close(k_e.grad, k_h.grad)
+    assert (cos_e.grad is not None) == cos_requires_grad
+    assert (sin_e.grad is not None) == sin_requires_grad
+    if cos_requires_grad:
+        torch.testing.assert_close(cos_e.grad, cos_h.grad)
+    if sin_requires_grad:
+        torch.testing.assert_close(sin_e.grad, sin_h.grad)
+
+
+@pytest.mark.parametrize("kind", ("full", "partial", "vision"))
+def test_eager_rope_fixed_tables_do_not_save_inputs(kind: str):
+    if kind == "vision":
+        q = torch.randn(4, 3, 8, requires_grad=True)
+        k = torch.randn(4, 2, 8, requires_grad=True)
+        cos = torch.randn(4, 8)
+        sin = torch.randn(4, 8)
+        output = resolve_op("rope_vision", "full", "eager").wrapper(q, k, cos, sin)
+    else:
+        head_dim = 8 if kind == "full" else 12
+        q = torch.randn(2, 3, 4, head_dim, requires_grad=True)
+        k = torch.randn(2, 2, 4, head_dim, requires_grad=True)
+        cos = torch.randn(2, 4, 8)
+        sin = torch.randn(2, 4, 8)
+        output = resolve_op("rope", kind, "eager").wrapper(q, k, cos, sin, unsqueeze_dim=1)
+
+    assert [tensor.shape for tensor in output[0].grad_fn.saved_tensors] == [cos.shape, sin.shape]
+
+
+@pytest.mark.parametrize("kind", ("full", "vision"))
+def test_rope_accepts_compatible_optional_arguments(kind: str):
+    position_ids = torch.arange(4).unsqueeze(0)
+    if kind == "full":
+        q = torch.randn(2, 3, 4, 8)
+        k = torch.randn(2, 2, 4, 8)
+        cos = torch.randn(2, 4, 8)
+        sin = torch.randn(2, 4, 8)
+        op = resolve_op("rope", "full", "eager").wrapper
+    else:
+        q = torch.randn(4, 3, 8)
+        k = torch.randn(4, 2, 8)
+        cos = torch.randn(4, 8)
+        sin = torch.randn(4, 8)
+        op = resolve_op("rope_vision", "full", "eager").wrapper
+
+    expected = op(q, k, cos, sin)
+    keyword = op(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=1)
+    positional = op(q, k, cos, sin, position_ids, 1)
+    _assert_pair(keyword, expected, atol=0.0, rtol=0.0)
+    _assert_pair(positional, expected, atol=0.0, rtol=0.0)
+
+
+def test_partial_rope_accepts_positional_unsqueeze_dim():
+    q = torch.randn(2, 3, 4, 12)
+    k = torch.randn(2, 2, 4, 12)
+    cos = torch.randn(2, 4, 8)
+    sin = torch.randn(2, 4, 8)
+    op = resolve_op("rope", "partial", "eager").wrapper
+    _assert_pair(op(q, k, cos, sin, 1), op(q, k, cos, sin, unsqueeze_dim=1), atol=0.0, rtol=0.0)
+
+
+def test_fused_rope_rows_fall_back_for_trainable_tables_before_vendor_import():
+    from veomni.ops.kernels.rope.full import eager as full_eager
+    from veomni.ops.kernels.rope.full import liger_kernel as full_liger
+    from veomni.ops.kernels.rope.full import npu as full_npu
+    from veomni.ops.kernels.rope.partial import eager as partial_eager
+    from veomni.ops.kernels.rope.partial import npu as partial_npu
+    from veomni.ops.kernels.rope_vision.full import eager as vision_eager
+    from veomni.ops.kernels.rope_vision.full import npu as vision_npu
+
+    position_ids = torch.arange(4).unsqueeze(0)
+    q = torch.randn(2, 3, 4, 8)
+    k = torch.randn(2, 2, 4, 8)
+    cos = torch.randn(2, 4, 8, requires_grad=True)
+    sin = torch.randn(2, 4, 8)
+    expected, _ = full_eager.forward(q, k, cos, sin, position_ids, 1)
+    for module in (full_liger, full_npu):
+        actual, _ = module.forward(q, k, cos, sin, position_ids, 1)
+        _assert_pair(actual, expected, atol=0.0, rtol=0.0)
+
+    q_partial = torch.randn(2, 3, 4, 12)
+    k_partial = torch.randn(2, 2, 4, 12)
+    expected, _ = partial_eager.forward(q_partial, k_partial, cos, sin, 1)
+    actual, _ = partial_npu.forward(q_partial, k_partial, cos, sin, 1)
+    _assert_pair(actual, expected, atol=0.0, rtol=0.0)
+
+    q_vision = torch.randn(4, 3, 8)
+    k_vision = torch.randn(4, 2, 8)
+    cos_vision = torch.randn(4, 8, requires_grad=True)
+    sin_vision = torch.randn(4, 8)
+    expected, _ = vision_eager.forward(q_vision, k_vision, cos_vision, sin_vision, position_ids, 1)
+    actual, _ = vision_npu.forward(q_vision, k_vision, cos_vision, sin_vision, position_ids, 1)
+    _assert_pair(actual, expected, atol=0.0, rtol=0.0)
+
+
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger RoPE needs a GPU")
 def test_full_liger_matches_eager():
     pytest.importorskip("liger_kernel")

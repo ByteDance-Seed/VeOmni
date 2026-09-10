@@ -19,7 +19,7 @@ rows. Fused impls are opaque wrappers around TileLang or FlashMLA
 ``Function.apply``.
 """
 
-from ...platform import NVIDIA_GPU, NVIDIA_SM90_PLUS, GpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
 from ...registry import register_op
 from .attention.deepseek_v4 import eager as dsv4_attn_eager
 from .attention.deepseek_v4 import tilelang as dsv4_attn_tilelang
@@ -32,7 +32,7 @@ from .indexer.glm import eager as glm_indexer_eager
 
 
 _TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
-_NVIDIA = GpuKernelRequirement(platforms=(NVIDIA_GPU,))
+_GLM_FUSED = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
 register_op(
     "dsa_attention",
@@ -64,7 +64,7 @@ register_op(
     "flashmla_cudnn",
     description="FlashMLA cuDNN GLM sparse attention",
     wrapper=glm_attn_flashmla.wrapper,
-    requirement=_NVIDIA,
+    requirement=_GLM_FUSED,
 )
 
 register_op(
@@ -97,5 +97,5 @@ register_op(
     "cudnn",
     description="cuDNN GLM sparse-attention indexer",
     wrapper=glm_indexer_cudnn.wrapper,
-    requirement=_NVIDIA,
+    requirement=_GLM_FUSED,
 )

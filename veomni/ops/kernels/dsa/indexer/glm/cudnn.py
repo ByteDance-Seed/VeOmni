@@ -34,10 +34,12 @@ def wrapper(
 
     ``q`` is ``[B, S, H, D]``, ``k`` is ``[B, T, D]`` or ``[B, T, 1, D]``,
     ``w`` is ``[B, S, H]``. Returns ``[B, S, top_k]`` long indices.
-    ``attention_mask`` is accepted for call-face parity with eager. cuDNN
-    applies causality through ``ratio``.
+    cuDNN applies causality through ``ratio`` but cannot represent an
+    additional padding or additive mask.
     """
-    del attention_mask
+    if attention_mask is not None:
+        raise ValueError("cuDNN GLM sparse-attention indexer does not support attention_mask.")
+
     from ....vendor.flashmla_cudnn import indexer_select_topk
 
     return indexer_select_topk(
