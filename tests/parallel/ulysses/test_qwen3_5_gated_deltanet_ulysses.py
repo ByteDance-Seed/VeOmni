@@ -9,7 +9,7 @@ Validates:
 import os
 import random
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -127,6 +127,7 @@ class _TinyQwen3_5Config:
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     dtype: torch.dtype = torch.bfloat16
+    layer_types: list[str] = field(default_factory=lambda: ["linear_attention"])
 
 
 def _assert_forward_deterministic(
