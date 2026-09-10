@@ -202,6 +202,23 @@ class TestCheckpointCallbackHfLastSavedStep:
 
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.helper")
+class TestCheckpointCallbackTrainBegin:
+    """Sidecar export and DCP resume share on_train_begin; assets go first."""
+
+    def test_on_train_begin_exports_assets_then_loads(self, mock_helper):
+        trainer = _make_mock_trainer()
+        order = []
+        trainer.save_model_assets.side_effect = lambda: order.append("assets")
+        trainer.load.side_effect = lambda: order.append("load")
+        cb = CheckpointCallback(trainer)
+
+        cb.on_train_begin(TrainerState())
+
+        assert order == ["assets", "load"]
+        mock_helper.empty_cache.assert_called_once_with()
+
+
+@patch("veomni.trainer.callbacks.checkpoint_callback.helper")
 class TestCheckpointCallbackTrainEndWait:
     """CheckpointCallback.on_train_end must consume a pending async save."""
 

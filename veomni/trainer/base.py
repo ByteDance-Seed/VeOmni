@@ -85,7 +85,6 @@ from .callbacks import (
     GlobalStateCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
-    RootAssetsCallback,
     TqdmCallback,
     TrainerState,
     WandbTraceCallback,
@@ -658,7 +657,6 @@ class BaseTrainer(Stateful, ABC):
         self.tqdm_callback = TqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
-        self.root_assets_callback = RootAssetsCallback(self)
         self.checkpoint_callback = CheckpointCallback(self)
         self.global_state_callback = GlobalStateCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
@@ -685,7 +683,6 @@ class BaseTrainer(Stateful, ABC):
             self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
-            self.root_assets_callback,
             self.checkpoint_callback,
             self.global_state_callback,
             self.evaluate_callback,

@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Job-level checkpoint callbacks, as distinct from per-model checkpoint I/O.
+"""Job-level checkpoint callback, as distinct from per-model checkpoint I/O.
 
 Nothing here belongs to a model: where the dataloader is, the rng, the metric
-meters. The sidecars an export needs are the model's; :class:`RootAssetsCallback`
-only decides *when*. Model weights and optimizers are scheduled by
-:mod:`~veomni.trainer.callbacks.checkpoint_callback`.
+meters. Model weights, optimizer, HF/LoRA export, and the tokenizer/config
+sidecars are scheduled by :mod:`~veomni.trainer.callbacks.checkpoint_callback`.
 """
 
 import os
@@ -41,13 +40,6 @@ _GLOBAL_STATE_FORMAT = "trainer_state_rank_{}.pt"
 
 def global_state_path(root: str, rank: int) -> str:
     return os.path.join(root, _GLOBAL_STATE_FORMAT.format(rank))
-
-
-class RootAssetsCallback(Callback):
-    """Export the config / tokenizer / processor sidecars once, at train begin."""
-
-    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
-        self.trainer.save_model_assets()
 
 
 class GlobalStateCallback(Callback):
@@ -153,4 +145,4 @@ class GlobalStateCallback(Callback):
         self.trainer.start_step = global_step % args.train_steps
 
 
-__all__ = ["GlobalStateCallback", "RootAssetsCallback", "global_state_path"]
+__all__ = ["GlobalStateCallback", "global_state_path"]

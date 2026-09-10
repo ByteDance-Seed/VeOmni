@@ -14,9 +14,10 @@
 
 """Trainer-layer callback that schedules model checkpoint I/O.
 
-This owns the every-N-steps / epochs cadence and nothing else. *What* is written
-is :meth:`BaseTrainer.save_dcp` / :meth:`~BaseTrainer.save_hf_or_lora` /
-:meth:`~BaseTrainer.load`. *How* belongs to
+This owns the every-N-steps / epochs cadence and the one-shot sidecar export.
+*What* is written is :meth:`BaseTrainer.save_dcp` /
+:meth:`~BaseTrainer.save_hf_or_lora` / :meth:`~BaseTrainer.load` /
+:meth:`~BaseTrainer.save_model_assets`. *How* belongs to
 :class:`~veomni.models.checkpoint_manager.ModelCheckpointManager`.
 
 DCP and HF/LoRA share this callback because they share a manager; each format
@@ -42,7 +43,7 @@ logger = helper.create_logger(__name__)
 
 
 class CheckpointCallback(Callback):
-    """Schedule DCP resume I/O and the HF / LoRA export for this trainer."""
+    """Schedule DCP / HF / LoRA I/O and the one-shot tokenizer/config export."""
 
     def __init__(self, trainer: "BaseTrainer"):
         super().__init__(trainer)
@@ -57,6 +58,7 @@ class CheckpointCallback(Callback):
         self._last_hf_step: int = -1
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        self.trainer.save_model_assets()
         self.trainer.load()
         helper.empty_cache()
 
