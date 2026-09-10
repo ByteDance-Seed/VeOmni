@@ -286,3 +286,49 @@ class TestCheckpointerCallbackTrainEndWait:
         cb.on_train_end(TrainerState(global_step=60))
 
         trainer.checkpointer.wait_for_pending_save.assert_called_once_with()
+
+
+@patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer")
+@patch("veomni.trainer.callbacks.checkpoint_callback.dist")
+@patch("veomni.trainer.callbacks.checkpoint_callback.helper")
+class TestCheckpointerCallbackStagingPath:
+    """``stage_dir`` keys its staging directory on the ``path`` given to ``save``.
+
+    That path must name the run, not the step. A caller that folds the step in
+    gets a fresh staging directory per step, and a save killed part-way then
+    strands a model-plus-optimizer-sized copy that no later save clears.
+    """
+
+    def test_the_step_reaches_save_instead_of_being_folded_into_the_path(
+        self, mock_helper, mock_dist, mock_build_ckpt, tmp_path
+    ):
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "run"))
+        trainer.args.train.checkpoint.stage_dir = str(tmp_path / "stage")
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        staged = []
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            for step in (10, 20):
+                cb._save_checkpoint(TrainerState(global_step=step))
+                call = trainer.checkpointer.save.call_args
+                assert call.kwargs["global_steps"] == step
+                staged.append(_prepare_stage_dir(call.kwargs["stage_dir"], call.args[0]))
+
+        assert staged[0] == staged[1], "each step staged somewhere different"
+
+    def test_the_logged_destination_is_the_one_save_writes(self, mock_helper, mock_dist, mock_build_ckpt):
+        """The callback names the step directory for its log and its HF export, while
+        ``save`` builds the same directory from ``path`` and ``global_steps``."""
+        from veomni.checkpoint.dcp_checkpointer import _GLOBAL_STEP_PREFIX
+
+        trainer = _make_mock_trainer(save_path="/remote/run")
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        cb._save_checkpoint(TrainerState(global_step=10))
+
+        call = trainer.checkpointer.save.call_args
+        assert f"{call.args[0]}/{_GLOBAL_STEP_PREFIX}{call.kwargs['global_steps']}" == "/remote/run/global_step_10"

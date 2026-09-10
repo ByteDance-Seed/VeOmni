@@ -663,7 +663,10 @@ class DistributedCheckpointer(CheckpointerBase):
             path: path to save checkpoint
             state: state to save
             save_async: whether to save asynchronously
-            global_steps: global steps
+            global_steps: step this checkpoint belongs to. Given, the checkpoint goes
+                into a per-step subdirectory of ``path`` and ``path`` identifies the run,
+                which is what ``stage_dir`` keys its staging directory on. Callers that
+                fold the step into ``path`` themselves get a staging directory per step.
             storage_writer: storage writer backend for dcp.save and dcp.async_save. If None, will use FileSystemWriter
             trainable_only: when True, only persist parameters with ``requires_grad=True``
                 (LoRA / PEFT path). Frozen base weights are skipped on save and must be
@@ -702,7 +705,9 @@ class DistributedCheckpointer(CheckpointerBase):
         if stage_dir and storage_writer is not None:
             raise ValueError("stage_dir cannot be combined with an explicit storage_writer")
 
-        checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
+        # ``is not None`` rather than truthiness: step 0 is a step like any other, and
+        # folding it onto ``path`` would write it over the run's own directory.
+        checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps is not None else path
         cls._create_checkpoint_dir(checkpoint_dir)
 
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
