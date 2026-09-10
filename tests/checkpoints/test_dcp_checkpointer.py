@@ -1539,7 +1539,6 @@ class TestStageDirValidation:
                 DistributedCheckpointer.wait_for_pending_save()
         finally:
             DistributedCheckpointer._pending_promotion = None
-            DistributedCheckpointer._promotion_executor = None
 
         assert marker_seen_by_extra_state == [False]
 
@@ -1600,7 +1599,6 @@ def _async_promote_worker(rank: int, world_size: int, base: str, scenario: str) 
     module.shutil.copyfile = instrumented_copy
     checkpointer = module.DistributedCheckpointer
     checkpointer._pending_promotion = None
-    checkpointer._promotion_executor = None
     checkpointer._background_process_group = None
 
     checkpointer._promote_in_background(stage, final, 3 if scenario == "outlives_timeout" else 120)
@@ -1638,7 +1636,6 @@ class TestAsyncPromotion:
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         DistributedCheckpointer._pending_promotion = None
-        DistributedCheckpointer._promotion_executor = None
         DistributedCheckpointer._background_process_group = None
         DistributedCheckpointer.save_future = None
 
@@ -1860,6 +1857,60 @@ class TestAsyncPromotion:
             assert not stage_path.exists(), "the staged copy was left with nobody owning it"
         finally:
             self._reset()
+
+    def test_a_worker_that_fails_to_start_leaves_nothing_for_the_next_save(self, tmp_path):
+        """``submit`` queues the work before it starts the thread.
+
+        An executor kept across saves would run that stale item ahead of the next
+        promotion, copying the next save's staged data into the previous save's
+        directory and publishing a marker over it.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        class ThreadStartFailsOnce(ThreadPoolExecutor):
+            failed = False
+
+            def _adjust_thread_count(self):
+                if not ThreadStartFailsOnce.failed:
+                    ThreadStartFailsOnce.failed = True
+                    raise RuntimeError("can't start new thread")
+                super()._adjust_thread_count()
+
+        self._reset()
+        promoted = []
+
+        def save(step):
+            DistributedCheckpointer.save(
+                path=str(tmp_path / "ckpt"),
+                state={"model": MagicMock()},
+                save_async=True,
+                global_steps=step,
+                stage_dir=str(tmp_path / "stage"),
+            )
+
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save"),
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(tmp_path / "s")),
+                patch(
+                    "veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint",
+                    side_effect=lambda stage_path, final_path, group=None: promoted.append(final_path),
+                ),
+                patch("veomni.checkpoint.dcp_checkpointer.ThreadPoolExecutor", ThreadStartFailsOnce),
+            ):
+                with pytest.raises(RuntimeError, match="can't start new thread"):
+                    save(10)
+                save(20)
+                DistributedCheckpointer.wait_for_pending_save()
+        finally:
+            self._reset()
+
+        assert promoted == [str(tmp_path / "ckpt" / "global_step_20")]
 
     def test_unset_save_async_copies_inline(self, tmp_path):
         """Background promotion is opt-in; without it the copy stays where it was."""

@@ -646,11 +646,9 @@ class DistributedCheckpointer(CheckpointerBase):
     """
 
     save_future: Optional[Any] = None
-    # Whatever a background save needs, created on first use. The gloo group keeps
-    # its collectives out of the training stream; one worker keeps promotions
-    # ordered; the handle is the copy that has not landed yet.
+    # What background saves share: the gloo group, created on first use, and the
+    # copy that has not landed yet.
     _background_process_group: Optional[Any] = None
-    _promotion_executor: Optional[ThreadPoolExecutor] = None
     _pending_promotion: Optional[Tuple[Future, str]] = None
 
     @classmethod
@@ -904,16 +902,20 @@ class DistributedCheckpointer(CheckpointerBase):
         On the training thread, every rank not copying would wait on a collective for
         the whole copy -- long enough on a slow destination to trip the NCCL
         watchdog. The worker runs its collectives on the background gloo group
-        instead, and a single worker keeps promotions from overlapping.
+        instead. ``save`` joins the previous promotion before staging, so only one
+        runs at a time.
 
-        A rank that cannot start the worker raises out of ``save`` like any other
-        rank-local failure; its peers' promotions then fail on the group timeout
-        without publishing a marker.
+        Each promotion gets its own executor: ``submit`` queues the work before it
+        starts the thread, so a reused executor whose thread failed to start would
+        run that stale item ahead of the next promotion. A rank that cannot start
+        the worker raises out of ``save`` like any other rank-local failure; its
+        peers' promotions then fail on the group timeout without publishing a marker.
         """
         group = cls._get_background_process_group(timeout_seconds)
-        if cls._promotion_executor is None:
-            cls._promotion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="veomni-promote")
-        future = cls._promotion_executor.submit(_promote_staged_checkpoint, stage_path, final_path, group)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="veomni-promote")
+        future = executor.submit(_promote_staged_checkpoint, stage_path, final_path, group)
+        # The worker thread exits once this promotion is done.
+        executor.shutdown(wait=False)
         cls._pending_promotion = (future, final_path)
 
     @classmethod
