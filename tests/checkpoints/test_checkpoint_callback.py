@@ -315,7 +315,9 @@ class TestCheckpointerCallbackStagingPath:
                 cb._save_checkpoint(TrainerState(global_step=step))
                 call = trainer.checkpointer.save.call_args
                 assert call.kwargs["global_steps"] == step
-                staged.append(_prepare_stage_dir(call.kwargs["stage_dir"], call.args[0]))
+                staged.append(
+                    _prepare_stage_dir(call.kwargs["stage_dir"], call.args[0], f"{call.args[0]}/global_step_{step}")
+                )
 
         assert staged[0] == staged[1], "each step staged somewhere different"
 
