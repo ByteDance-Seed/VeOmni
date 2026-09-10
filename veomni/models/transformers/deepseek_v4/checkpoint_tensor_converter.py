@@ -43,7 +43,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from functools import lru_cache
-from typing import Generator
+from typing import Collection, Generator
 
 import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
@@ -378,49 +378,61 @@ class DeepseekV4CheckpointTensorConverter:
         self._scaled_weight_buffer.clear()
         return finalized
 
-    def export_weights(self, model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]]:
-        config = model.config
-        fqn_to_index_mapping = model._veomni_fqn_to_index_mapping
-        expert_dtype = config.expert_dtype
+    def export_name(self, name: str) -> str:
+        """Map a split model parameter name to DeepSeek's native checkpoint name."""
+        # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
+        if "mlp.experts." in name:
+            fields = name.split(".")
+            fields[-2] = _PROJ_NAME_TO_W_NAME[fields[-2]]
+            name = ".".join(fields)
+
+        # 2. reverse the renaming
+        origin, _ = rename_source_key(
+            name.removeprefix(self.target_model_prefix), _DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS, []
+        )
+        return origin
+
+    def export_tensor(
+        self,
+        name: str,
+        param: torch.Tensor,
+        fqn_to_index_mapping: Collection[str],
+        expert_dtype: str,
+    ) -> Generator[tuple[str, torch.Tensor]]:
+        """Rename and quantize one tensor using the target checkpoint's scale keys."""
+        origin = self.export_name(name)
+        if origin not in fqn_to_index_mapping:
+            raise ValueError(f"Unexpected exported weight name: {name}, origin: {origin}")
         scale_fmt = "ue8m0"
         scale_dtype = torch.float8_e8m0fnu if expert_dtype == "fp4" else torch.float32
+        # 3. check if the weight needs to be quantized
+        scale_name = None
+        if origin.endswith(".weight"):
+            scale_name = origin.removesuffix(".weight") + ".scale"
+
+        if scale_name is None or scale_name not in fqn_to_index_mapping:
+            yield origin, param
+            return
+
+        # 4. quantize the weight
+        fp4_quantize = "ffn.experts." in origin and expert_dtype == "fp4"
+        param = param.to(torch.bfloat16)
+        if fp4_quantize:
+            weight, scale = fp4_act_quant(param, block_size=32)
+            weight = weight.view(torch.int8)
+        else:
+            weight, scale = fp8_weight_quant(param, block_size=128, scale_fmt=scale_fmt, scale_dtype=scale_dtype)
+
+        yield origin, weight
+        yield scale_name, scale
+
+    def export_weights(self, model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]]:
+        fqn_to_index_mapping = model._veomni_fqn_to_index_mapping
         export_weight_names = set()
         for name, param in export_weights(model):
-            # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
-            if "mlp.experts." in name:
-                fields = name.split(".")
-                fields[-2] = _PROJ_NAME_TO_W_NAME[fields[-2]]
-                name = ".".join(fields)
-
-            # 2. reverse the renaming
-            origin, _ = rename_source_key(
-                name.removeprefix(self.target_model_prefix), _DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS, []
-            )
-            assert origin in fqn_to_index_mapping, f"Unexpected exported weight name: {name}, origin: {origin}"
-
-            # 3. check if the weight needs to be quantized
-            scale_name = None
-            if origin.endswith(".weight"):
-                scale_name = origin.removesuffix(".weight") + ".scale"
-
-            if scale_name is None or scale_name not in fqn_to_index_mapping:
+            for origin, tensor in self.export_tensor(name, param, fqn_to_index_mapping, model.config.expert_dtype):
                 export_weight_names.add(origin)
-                yield origin, param
-                continue
-
-            # 4. quantize the weight
-            fp4_quantize = "ffn.experts." in origin and expert_dtype == "fp4"
-            param = param.to(torch.bfloat16)
-            if fp4_quantize:
-                weight, scale = fp4_act_quant(param, block_size=32)
-                weight = weight.view(torch.int8)
-            else:
-                weight, scale = fp8_weight_quant(param, block_size=128, scale_fmt=scale_fmt, scale_dtype=scale_dtype)
-
-            export_weight_names.add(origin)
-            export_weight_names.add(scale_name)
-            yield origin, weight
-            yield scale_name, scale
+                yield origin, tensor
 
         missing_weight_names = fqn_to_index_mapping.keys() - export_weight_names
         # MTP not supported for now, ignore it.
