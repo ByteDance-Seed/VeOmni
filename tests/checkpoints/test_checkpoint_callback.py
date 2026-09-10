@@ -288,6 +288,36 @@ class TestModelCheckpointManagerSaveContract:
         assert set(extra_state) == {"lr_scheduler"}
         assert extra_state["lr_scheduler"] == {"lr": 1e-4}
 
+    def test_legacy_extra_state_restores_the_job_cursor(self, mock_helper, mock_dist, mock_build_ckpt, mock_get_ps):
+        """Checkpoints written by CheckpointerCallback still resume the cursor."""
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = "/tmp/old_ckpt"
+        trainer.train_dataloader = MagicMock()
+        mock_checkpointer = MagicMock()
+        mock_build_ckpt.return_value = mock_checkpointer
+
+        def load_checkpoint(path, state, **kwargs):
+            state["extra_state"] = {
+                "global_step": 7,
+                "lr_scheduler": {"lr": 1e-5},
+                "train_dataloader": {"cursor": 3},
+                "environ_meter": {"tokens": 1},
+                "channel_loss_callback": {"source_registry": [(1, "train/a")]},
+                "torch_rng_state": torch.get_rng_state(),
+            }
+
+        mock_checkpointer.load.side_effect = load_checkpoint
+        manager = ModelCheckpointManager(trainer)
+        manager.load()
+
+        assert trainer.state.global_step == 7
+        assert trainer.start_epoch == 0
+        assert trainer.start_step == 7
+        trainer.lr_scheduler.load_state_dict.assert_called_once_with({"lr": 1e-5})
+        trainer.train_dataloader.load_state_dict.assert_called_once_with({"cursor": 3})
+        trainer.channel_loss_callback.load_state_dict.assert_called_once_with({"source_registry": [(1, "train/a")]})
+        assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is mock_get_ps.return_value
+
 
 @patch("veomni.trainer.callbacks.global_state_callback.dist")
 class TestGlobalStateCallbackJobState:

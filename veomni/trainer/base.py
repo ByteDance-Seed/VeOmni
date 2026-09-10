@@ -669,8 +669,9 @@ class BaseTrainer(Stateful, ABC):
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
         # ChannelLossComputer receives that same cached state. Shared objects
-        # (EnvironMeter, DCP checkpointer) are handed the state directly, so
-        # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
+        # (EnvironMeter) are handed the state directly. The checkpoint manager
+        # caches ParallelState at construction the same way, so save/load do
+        # not depend on ambient.
         #
         # ``channel_loss_callback`` is ordered after the meter (which resets
         # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which

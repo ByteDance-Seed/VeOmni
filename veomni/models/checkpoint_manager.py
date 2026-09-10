@@ -17,6 +17,7 @@
 import os
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import torch
 import torch.distributed as dist
 
 from ..checkpoint import CheckpointerBase, build_checkpointer
@@ -63,6 +64,9 @@ class ModelCheckpointManager:
         self.trainer = trainer
         self.config: "CheckpointConfig" = trainer.args.train.checkpoint
         self._last_saved_step: int = -1
+        # Cached at construction, same as Callback.parallel_state: later save/load
+        # must not depend on whichever mesh is ambient.
+        self.parallel_state = get_parallel_state()
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=trainer.args.model.accelerator.fsdp_config.fsdp_mode,
@@ -109,6 +113,44 @@ class ModelCheckpointManager:
         if lr_state is not None and lr_scheduler is not None:
             lr_scheduler.load_state_dict(lr_state)
 
+        # Pre-split DCP extra_state also held the job cursor. New writes do not;
+        # GlobalStateCallback owns that file. Restore the old blob so a mid-job
+        # resume from a CheckpointerCallback checkpoint does not silently restart
+        # at step 0 with restored weights.
+        if "global_step" not in extra_state:
+            return
+        logger.warning_rank0(
+            "DCP extra_state still contains job-level keys (global_step, dataloader, "
+            "rng). Restoring them for compatibility with checkpoints written before "
+            "GlobalStateCallback; new saves keep only lr_scheduler here."
+        )
+        self._restore_legacy_job_state(extra_state)
+
+    def _restore_legacy_job_state(self, extra_state: Dict[str, Any]) -> None:
+        args = self.trainer.args
+        global_step = extra_state["global_step"]
+        self.trainer.state.global_step = global_step
+        self.trainer.start_epoch = global_step // args.train_steps
+        self.trainer.start_step = global_step % args.train_steps
+
+        channel_loss_state = extra_state.get("channel_loss_callback")
+        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+        if channel_loss_state is not None and channel_loss_callback is not None:
+            channel_loss_callback.load_state_dict(channel_loss_state)
+
+        if self.trainer.train_dataloader is not None and extra_state.get("train_dataloader") is not None:
+            self.trainer.train_dataloader.load_state_dict(extra_state["train_dataloader"])
+
+        environ_meter = getattr(self.trainer, "environ_meter", None)
+        if environ_meter is not None and extra_state.get("environ_meter") is not None:
+            environ_meter.load_state_dict(extra_state["environ_meter"])
+
+        rng_state = extra_state.get("torch_rng_state")
+        if rng_state is not None:
+            torch.set_rng_state(rng_state)
+        if self.trainer.start_step == 0 and self.trainer.train_dataloader is not None:
+            iter(self.trainer.train_dataloader)
+
     def wait_for_pending_save(self) -> None:
         self.checkpointer.wait_for_pending_save()
 
@@ -127,7 +169,7 @@ class ModelCheckpointManager:
             load_dir,
             state,
             trainable_only=self.trainable_only,
-            parallel_state=get_parallel_state(),
+            parallel_state=self.parallel_state,
         )
         self._load_extra_state(state["extra_state"])
         dist.barrier()
@@ -149,7 +191,7 @@ class ModelCheckpointManager:
             save_async=self.config.save_async,
             trainable_only=self.trainable_only,
             save_to_lowest_rank=self.config.dcp_save_to_lowest_rank,
-            parallel_state=get_parallel_state(),
+            parallel_state=self.parallel_state,
             stage_dir=self.config.stage_dir,
         )
         helper.empty_cache()
@@ -175,7 +217,6 @@ class ModelCheckpointManager:
         from ..utils.save_safetensor_utils import save_hf_safetensor
 
         save_path = self._prepare_export(state, stage)
-        parallel_state = get_parallel_state()
 
         save_hf_safetensor(
             save_hf_safetensor_path=self.hf_export_dir(state),
@@ -186,7 +227,7 @@ class ModelCheckpointManager:
             model=self.trainer.model,
             fqn_to_index_mapping=self.trainer.args.model.fqn_to_index_mapping,
             is_rank_0=self.trainer.args.train.global_rank == 0,
-            parallel_state=parallel_state,
+            parallel_state=self.parallel_state,
         )
         helper.empty_cache()
         dist.barrier()
