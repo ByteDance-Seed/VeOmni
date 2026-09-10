@@ -803,32 +803,19 @@ class CheckpointConfig:
                 "the choice of directory: nothing is probed and free space is not checked, "
                 "so point it at a node-local filesystem that can hold every rank on the node "
                 "writing the model plus its optimizer state at once. Unset (default) writes "
-                "directly. Cannot be combined with `save_async`."
+                "directly. With `save_async` the copy to `output_dir` runs in the background, "
+                "so the staged checkpoint stays on the scratch disk until it finishes."
             )
         },
     )
-    stage_promote_async: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "With `stage_dir`, resume training as soon as the checkpoint is staged and "
-                "copy it to `output_dir` on a background thread. The copy is what takes "
-                "minutes on a slow destination, and while it runs inline every rank that is "
-                "not writing sits on a collective, which is what trips the watchdog. The "
-                "next save, a load, and the end of training all wait for the copy, so it "
-                "overlaps training rather than going missing. Needs the scratch disk to hold "
-                "the staged checkpoint for longer, since it is not freed until the copy ends. "
-                "Requires `stage_dir`."
-            )
-        },
-    )
-    stage_promote_timeout_seconds: Optional[int] = field(
+    save_async_timeout_seconds: Optional[int] = field(
         default=None,
         metadata={
             "help": (
-                "Collective timeout in seconds for the background promotion's own process "
-                "group, a positive integer. Must outlast the copy: the ranks not copying wait "
-                "on it for the whole duration. Unset (default) keeps gloo's 30-minute default."
+                "Collective timeout in seconds for the process group a `save_async` "
+                "checkpoint runs on, a positive integer. Must outlast the work, since the "
+                "ranks not writing wait on it for the whole duration. Unset (default) keeps "
+                "gloo's 30-minute default."
             )
         },
     )
@@ -876,18 +863,14 @@ class CheckpointConfig:
     )
 
     def __post_init__(self):
-        if self.stage_promote_async and not self.stage_dir:
-            raise ValueError("stage_promote_async needs stage_dir; there is nothing to promote without it.")
-
         # The parser hands YAML values through untouched, so the type is checked here.
         # ``bool`` is an ``int`` subclass: without this, a stray ``true`` would pass as a
-        # one-second timeout and abort the promotion's first collective.
-        if self.stage_promote_timeout_seconds is not None and (
-            type(self.stage_promote_timeout_seconds) is not int or self.stage_promote_timeout_seconds <= 0
+        # one-second timeout and abort the background save's first collective.
+        if self.save_async_timeout_seconds is not None and (
+            type(self.save_async_timeout_seconds) is not int or self.save_async_timeout_seconds <= 0
         ):
             raise ValueError(
-                "stage_promote_timeout_seconds must be a positive integer, "
-                f"got {self.stage_promote_timeout_seconds!r}."
+                f"save_async_timeout_seconds must be a positive integer, got {self.save_async_timeout_seconds!r}."
             )
 
 

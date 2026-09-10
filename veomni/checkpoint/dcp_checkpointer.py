@@ -652,11 +652,10 @@ class DistributedCheckpointer(CheckpointerBase):
     """
 
     save_future: Optional[Any] = None
-    # Dedicated process group for async saves (created on first use)
-    _async_process_group: Optional[Any] = None
-    # Background promotion: its own gloo group, a single worker so promotions stay
-    # ordered, and the handle for the one that has not landed yet.
-    _promotion_process_group: Optional[Any] = None
+    # Whatever a background save needs, created on first use. The gloo group keeps
+    # its collectives out of the training stream; one worker keeps promotions
+    # ordered; the handle is the copy that has not landed yet.
+    _background_process_group: Optional[Any] = None
     _promotion_executor: Optional[ThreadPoolExecutor] = None
     _pending_promotion: Optional[Tuple[Future, str]] = None
 
@@ -672,8 +671,7 @@ class DistributedCheckpointer(CheckpointerBase):
         save_to_lowest_rank: bool = False,
         parallel_state=None,
         stage_dir: Optional[str] = None,
-        promote_async: bool = False,
-        promote_timeout_seconds: Optional[int] = None,
+        save_async_timeout_seconds: Optional[int] = None,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -681,7 +679,12 @@ class DistributedCheckpointer(CheckpointerBase):
         args:
             path: path to save checkpoint
             state: state to save
-            save_async: whether to save asynchronously
+            save_async: return before the checkpoint is durable at ``path``, leaving
+                the slow part to a background thread. Without ``stage_dir`` that is
+                DCP's own async write; with it, the staging write stays inline (local
+                disk, fast and bounded) and the copy to ``path`` is what runs in the
+                background. Either way the next save, a load and the end of training
+                all wait for it through ``wait_for_pending_save``.
             global_steps: step this checkpoint belongs to. Given, the checkpoint goes
                 into a per-step subdirectory of ``path`` and ``path`` identifies the run,
                 which is what ``stage_dir`` keys its staging directory on. Callers that
@@ -708,31 +711,21 @@ class DistributedCheckpointer(CheckpointerBase):
                 for a usable directory or check free space, and an unusable ``stage_dir``
                 fails the save rather than silently writing elsewhere. See
                 ``CheckpointConfig.stage_dir``.
-            promote_async: return once the checkpoint is staged, leaving the copy to
-                ``path`` on a background thread. The next save, a load, and the end of
-                training all wait for it, so it is the copy that overlaps training, not
-                the checkpoint that goes missing. Requires ``stage_dir``.
-            promote_timeout_seconds: collective timeout for the background promotion's
-                own process group. It has to outlast the copy, since the ranks not
-                copying wait on it for the whole duration. Unset keeps gloo's default.
+            save_async_timeout_seconds: collective timeout for the group a background
+                save runs on. It has to outlast the work, since the ranks not writing
+                wait on it for the whole duration. Unset keeps gloo's default.
         return:
             None
         """
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
-        # Rejected up front, before anything reaches disk. An async write is still
-        # running when save() returns and drops the staged copy; a caller-supplied
-        # writer already points somewhere, and ignoring stage_dir would write straight
-        # to the slow destination it was meant to avoid.
-        if stage_dir and save_async:
-            raise ValueError("stage_dir cannot be combined with save_async")
-
+        # Rejected before anything reaches disk: a caller-supplied writer already
+        # points somewhere, and redirecting it to the staging directory is not ours
+        # to do, while ignoring stage_dir would write straight to the slow
+        # destination it was meant to avoid.
         if stage_dir and storage_writer is not None:
             raise ValueError("stage_dir cannot be combined with an explicit storage_writer")
-
-        if promote_async and not stage_dir:
-            raise ValueError("promote_async requires stage_dir")
 
         # A promotion still in flight owns the staging directory the next few lines
         # empty, so it has to land before anything here touches disk.
@@ -767,8 +760,13 @@ class DistributedCheckpointer(CheckpointerBase):
             cls.execute_save(
                 save_state=save_state,
                 storage_writer=storage_writer,
-                save_async=save_async,
+                # Staging writes to local disk, which is fast and bounded; there is
+                # nothing to gain by also backgrounding it, and DCP's stager would
+                # hold a full copy of every rank's shard in host memory to do it.
+                # With stage_dir it is the promotion that runs in the background.
+                save_async=save_async and stage_path is None,
                 save_to_lowest_rank=save_to_lowest_rank,
+                timeout_seconds=save_async_timeout_seconds,
             )
         except BaseException:
             if stage_path is not None and _local_rank() == 0:
@@ -776,8 +774,8 @@ class DistributedCheckpointer(CheckpointerBase):
             raise
 
         if stage_path is not None:
-            if promote_async:
-                cls._promote_in_background(stage_path, checkpoint_dir, promote_timeout_seconds)
+            if save_async:
+                cls._promote_in_background(stage_path, checkpoint_dir, save_async_timeout_seconds)
             else:
                 _promote_staged_checkpoint(stage_path, checkpoint_dir)
 
@@ -924,19 +922,31 @@ class DistributedCheckpointer(CheckpointerBase):
 
         One worker, so two promotions never overlap on the same staging directory.
         """
-        if cls._promotion_process_group is None and dist.is_initialized():
-            # Collective, so it runs on the training thread where every rank reaches
-            # it in the same order.
-            cls._promotion_process_group = dist.new_group(
+        group = cls._get_background_process_group(timeout_seconds)
+        if cls._promotion_executor is None:
+            cls._promotion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="veomni-promote")
+        future = cls._promotion_executor.submit(_promote_staged_checkpoint, stage_path, final_path, group)
+        cls._pending_promotion = (future, final_path)
+
+    @classmethod
+    def _get_background_process_group(cls, timeout_seconds: Optional[int]) -> Optional[Any]:
+        """The group a background save runs its collectives on, created on first use.
+
+        Gloo rather than the training backend: those collectives must not be
+        interleaved into the training stream, and gloo raises on timeout where NCCL
+        aborts the whole process.
+
+        Creating it is itself a collective, so this is called from the training
+        thread, where every rank reaches it in the same order. ``timeout_seconds``
+        therefore only takes effect on the first save of a run -- which is all a
+        configuration value needs, since it does not change under us.
+        """
+        if cls._background_process_group is None and dist.is_initialized():
+            cls._background_process_group = dist.new_group(
                 backend="gloo",
                 timeout=timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None,
             )
-        if cls._promotion_executor is None:
-            cls._promotion_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="veomni-promote")
-        future = cls._promotion_executor.submit(
-            _promote_staged_checkpoint, stage_path, final_path, cls._promotion_process_group
-        )
-        cls._pending_promotion = (future, final_path)
+        return cls._background_process_group
 
     @classmethod
     def execute_save(
@@ -945,6 +955,7 @@ class DistributedCheckpointer(CheckpointerBase):
         storage_writer: FileSystemWriter,
         save_async: bool,
         save_to_lowest_rank: bool = False,
+        timeout_seconds: Optional[int] = None,
     ) -> None:
         """Execute DCP save with optional async support.
 
@@ -953,16 +964,14 @@ class DistributedCheckpointer(CheckpointerBase):
         """
         planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         if save_async:
-            # Lazily create a dedicated Gloo process group for async DCP saves
-            if cls._async_process_group is None:
-                cls._async_process_group = dist.new_group(backend="gloo")
+            group = cls._get_background_process_group(timeout_seconds)
 
             cls.wait_for_pending_save()
 
             cls.save_future = dcp.async_save(
                 state_dict=save_state,
                 storage_writer=storage_writer,
-                process_group=cls._async_process_group,
+                process_group=group,
                 planner=planner,
             )
         else:

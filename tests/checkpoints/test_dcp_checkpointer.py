@@ -1592,20 +1592,6 @@ class TestStageDirValidation:
         # a relative destination and its absolute spelling stage together
         assert _stage_key("run") == _stage_key(os.path.join(os.getcwd(), "run"))
 
-    def test_stage_dir_with_save_async_is_rejected_before_any_side_effect(self, tmp_path):
-        """The staged copy is dropped when save() returns, i.e. before an async write ends."""
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-
-        final = tmp_path / "ckpt"
-        with pytest.raises(ValueError, match="stage_dir cannot be combined with save_async"):
-            DistributedCheckpointer.save(
-                path=str(final),
-                state={"model": MagicMock()},
-                save_async=True,
-                stage_dir=str(tmp_path / "stage"),
-            )
-        assert not final.exists()
-
 
 def _async_promote_worker(rank: int, world_size: int, base: str, scenario: str) -> None:
     """One rank of the real background-promotion check; see ``TestAsyncPromotionAcrossRanks``."""
@@ -1639,7 +1625,7 @@ def _async_promote_worker(rank: int, world_size: int, base: str, scenario: str) 
     checkpointer = module.DistributedCheckpointer
     checkpointer._pending_promotion = None
     checkpointer._promotion_executor = None
-    checkpointer._promotion_process_group = None
+    checkpointer._background_process_group = None
 
     checkpointer._promote_in_background(stage, final, 3 if scenario == "outlives_timeout" else 120)
 
@@ -1664,7 +1650,7 @@ def _async_promote_worker(rank: int, world_size: int, base: str, scenario: str) 
 
 
 class TestAsyncPromotion:
-    """``promote_async`` moves the copy off the training thread.
+    """With ``stage_dir``, ``save_async`` moves the copy off the training thread.
 
     What has to hold is that nothing reads or overwrites the checkpoint while that
     copy is still running, and that a failure inside the worker still reaches the
@@ -1677,20 +1663,8 @@ class TestAsyncPromotion:
 
         DistributedCheckpointer._pending_promotion = None
         DistributedCheckpointer._promotion_executor = None
-        DistributedCheckpointer._promotion_process_group = None
+        DistributedCheckpointer._background_process_group = None
         DistributedCheckpointer.save_future = None
-
-    def test_promote_async_without_stage_dir_is_rejected(self, tmp_path):
-        """Silently doing nothing would leave the caller thinking the copy overlaps."""
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-
-        with pytest.raises(ValueError, match="promote_async requires stage_dir"):
-            DistributedCheckpointer.save(
-                path=str(tmp_path / "ckpt"),
-                state={"model": MagicMock()},
-                save_async=False,
-                promote_async=True,
-            )
 
     def test_save_returns_before_the_copy_and_wait_joins_it(self, tmp_path):
         """The point of the flag: ``save`` hands the copy over rather than doing it."""
@@ -1716,10 +1690,9 @@ class TestAsyncPromotion:
                 DistributedCheckpointer.save(
                     path=str(tmp_path / "ckpt"),
                     state={"model": MagicMock()},
-                    save_async=False,
+                    save_async=True,
                     global_steps=10,
                     stage_dir=str(tmp_path / "stage"),
-                    promote_async=True,
                 )
                 assert not copied.is_set(), "save waited for the copy instead of handing it over"
                 assert DistributedCheckpointer._pending_promotion is not None
@@ -1761,10 +1734,9 @@ class TestAsyncPromotion:
             DistributedCheckpointer.save(
                 path=str(tmp_path / "ckpt"),
                 state={"model": MagicMock()},
-                save_async=False,
+                save_async=True,
                 global_steps=step,
                 stage_dir=str(tmp_path / "stage"),
-                promote_async=True,
             )
 
         try:
@@ -1829,10 +1801,9 @@ class TestAsyncPromotion:
                 DistributedCheckpointer.save(
                     path=str(tmp_path / "ckpt"),
                     state={"model": MagicMock()},
-                    save_async=False,
+                    save_async=True,
                     global_steps=10,
                     stage_dir=str(tmp_path / "stage"),
-                    promote_async=True,
                 )
                 with pytest.raises(OSError, match="destination is full"):
                     DistributedCheckpointer.wait_for_pending_save()
@@ -1841,7 +1812,40 @@ class TestAsyncPromotion:
         finally:
             self._reset()
 
-    def test_unset_promote_async_copies_inline(self, tmp_path):
+    def test_the_staging_write_itself_stays_inline(self, tmp_path):
+        """``save_async`` backgrounds the copy, not the write into ``stage_dir``.
+
+        That write goes to local disk, so there is nothing to gain by backgrounding
+        it, and DCP's stager would hold a full copy of every rank's shard in host
+        memory to do so. It would also race the promotion, which starts as soon as
+        ``save`` returns.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        self._reset()
+        try:
+            with (
+                patch.object(DistributedCheckpointer, "execute_save") as execute_save,
+                patch.object(DistributedCheckpointer, "_create_storage_writer"),
+                patch.object(DistributedCheckpointer, "_save_extra_state"),
+                patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+                patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir", return_value=str(tmp_path / "s")),
+                patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint"),
+            ):
+                DistributedCheckpointer.save(
+                    path=str(tmp_path / "ckpt"),
+                    state={"model": MagicMock()},
+                    save_async=True,
+                    global_steps=10,
+                    stage_dir=str(tmp_path / "stage"),
+                )
+                DistributedCheckpointer.wait_for_pending_save()
+
+            assert execute_save.call_args.kwargs["save_async"] is False
+        finally:
+            self._reset()
+
+    def test_unset_save_async_copies_inline(self, tmp_path):
         """Background promotion is opt-in; without it the copy stays where it was."""
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
@@ -1912,21 +1916,8 @@ class TestAsyncPromotionAcrossRanks:
         assert any("Timed out" in o for o in outcomes), outcomes
 
 
-class TestStagePromoteConfig:
-    """``CheckpointConfig`` rejects promotion settings that cannot mean anything."""
-
-    def test_promote_async_without_stage_dir_is_rejected(self):
-        """There is nothing to promote without a staging directory, and silently
-        ignoring the flag would leave the operator believing the copy overlaps."""
-        from veomni.arguments.arguments_types import CheckpointConfig
-
-        with pytest.raises(ValueError, match="stage_promote_async needs stage_dir"):
-            CheckpointConfig(stage_promote_async=True)
-
-    def test_promote_async_with_stage_dir_is_accepted(self):
-        from veomni.arguments.arguments_types import CheckpointConfig
-
-        assert CheckpointConfig(stage_dir="/tmp/stage", stage_promote_async=True).stage_promote_async
+class TestSaveAsyncTimeoutConfig:
+    """``CheckpointConfig`` rejects a timeout that cannot mean what it says."""
 
     @pytest.mark.parametrize("timeout", [0, -1, True, 1800.5, "1800"])
     def test_non_positive_or_non_integer_timeout_is_rejected(self, timeout):
@@ -1935,10 +1926,10 @@ class TestStagePromoteConfig:
         the promotion's first collective."""
         from veomni.arguments.arguments_types import CheckpointConfig
 
-        with pytest.raises(ValueError, match="stage_promote_timeout_seconds must be a positive integer"):
-            CheckpointConfig(stage_promote_timeout_seconds=timeout)
+        with pytest.raises(ValueError, match="save_async_timeout_seconds must be a positive integer"):
+            CheckpointConfig(save_async_timeout_seconds=timeout)
 
     def test_unset_timeout_defers_to_gloo(self):
         from veomni.arguments.arguments_types import CheckpointConfig
 
-        assert CheckpointConfig().stage_promote_timeout_seconds is None
+        assert CheckpointConfig().save_async_timeout_seconds is None
