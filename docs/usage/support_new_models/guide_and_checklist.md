@@ -14,7 +14,7 @@
 > happening in `<model>_gpu_patch_gen_config.py`. For step-by-step
 > instructions on the patchgen flow, see
 > [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-migrate-transformers-v5` agent skill.
+> the `veomni-patchgen-model` agent skill.
 
 ---
 

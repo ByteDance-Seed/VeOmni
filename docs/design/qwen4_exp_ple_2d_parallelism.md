@@ -483,7 +483,7 @@ unsharded reference.
 No new user-facing TP option is introduced. Existing configuration remains:
 
 ```yaml
-train:
+model:
   accelerator:
     tp_size: 1
     ep_size: 4

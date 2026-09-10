@@ -2,7 +2,7 @@
 # Example inference invocation for Wan2.1-T2V (text-to-video) using
 # scripts/inference/infer_omni.py.
 #
-# VeOmni pins ``transformers==5.16.0`` in the ``transformers-stable`` group.
+# VeOmni pins ``transformers==5.9.0`` in the ``transformers-stable`` group.
 # This script mirrors that pin through ``uv run --with`` so standalone runs
 # use the supported version without modifying the project's ``.venv``
 # (``--no-sync`` skips the auto-sync that would otherwise touch it).
@@ -37,7 +37,7 @@ LORA_WEIGHT="${LORA_WEIGHT:-1.0}"
 # (``TRANSFORMERS_VERSION='' bash scripts/inference/infer_wan.sh``) to skip
 # the overlay and use whatever is already in .venv. Bare ``-`` (not ``:-``)
 # distinguishes "unset" from "set to empty".
-TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION-5.16.0}"
+TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION-5.9.0}"
 
 PROMPTS=(
     "Tom, the mischievous gray cat, is sprawled out on a vibrant red pillow, his body relaxed and his eyes half-closed."

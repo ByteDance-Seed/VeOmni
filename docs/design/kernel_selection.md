@@ -28,6 +28,12 @@ selection knob.
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
+| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Read by the patched modeling helpers (`veomni/ops/qat/`) |
+
+The last row is the one field that is not a kernel backend: `qat_implementation`
+selects a fake-quantization recipe, so it has no `OpSlot` and no per-model
+variants. `fp8_blockwise` is rejected at config-parse time on anything but an
+SM90+ NVIDIA CUDA GPU.
 
 **Most optimized-op defaults are GPU-oriented.** On Ascend NPU, values still
 equal to the dataclass defaults automatically resolve to `npu` for RMSNorm,
@@ -391,11 +397,16 @@ SM90+ `tilelang` indexer and attention implementations. Its MoE path
 uses the independent `moe_implementation` selection and therefore defaults to
 `fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
-directly to `fused_moe_forward(...)` and forwards `swiglu_limit` so backends
-that implement the clamp preserve V4's clamped SwiGLU pre-activation semantics.
-Clamp-aware fused V4 support is GPU-only today (`fused_triton` / `fused_quack`);
-selecting `fused_npu` for a V4 model raises because the NPU fused MoE kernel
-does not yet implement `swiglu_limit`.
+directly to `fused_moe_forward(...)` and forwards `swiglu_limit` so every
+supported fused backend preserves V4's clamped SwiGLU pre-activation semantics.
+On Ascend, `fused_npu` keeps the existing `torch_npu.npu_swiglu` path when no
+limit is configured and uses a forward/backward `triton-ascend` kernel for the
+clamped DeepSeek-V4 path when the Ascend backend is available. The import stays lazy, so
+other NPU MoE models do not gain a Triton dependency. A bare or legacy NPU
+environment preserves the original eager clamp, SiLU, and multiply training
+path instead. VeOmni's product-based Ascend images install and verify
+`triton-ascend`; other environments can install a release compatible with their
+CANN and `torch_npu` stack to enable the fused activation.
 
 ### Key files
 

@@ -7,17 +7,35 @@ each of which contains further nested sub-configs.
 Example YAML structure:
 
 ```yaml
+model:
+  model_path: Qwen3-8B-Base
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+  accelerator:
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
 train:
+  global_batch_size: 8
   wandb:
     enable: true
     project: VeOmni
-  accelerator:
-    fsdp_config:
-      fsdp_mode: fsdp2
-  init_device: meta
   checkpoint:
     manager: dcp
 ```
+
+Every knob that describes *how a model is placed on the hardware* — and the
+optimizer that steps it — lives under `model.*`, not `train.*`. Both are
+per-model decisions, so an omni model gives each module its own pair under
+`model.modules.<name>.accelerator.*` / `.optimizer.*` with the same shape, and
+the two merge through one code path. Anything that describes the *job* — batch
+sizes, schedules, checkpointing, logging — stays on `train.*`, which is singular
+no matter how many modules the model has.
+
+Unknown keys are rejected. A config carrying a key that no dataclass declares
+fails at parse time rather than being silently dropped. There is no compatibility
+alias.
 
 ---
 
@@ -35,8 +53,17 @@ Top-level configuration that assembles all argument groups.
 
 Model architecture, paths, and multimodal encoder / decoder setup.
 
-* `ModelArguments` — `model.*`
-* `OpsImplementationConfig` — `model.ops_implementation.*`
+* `ModelArguments` — `model.*` (root and per-module overlay share this shape)
+    * `OpsImplementationConfig` — `model.ops_implementation.*`
+    * `broadcast_model_weights_from_rank0` / `ep_sharded_stream_load` — weight-load policy
+    * `tokenizer_path` / `safetensor_idx_path` — identity paths on `BaseModelArguments` (a tower that never tokenizes simply does not call them)
+    * `OptimizerConfig` — `model.optimizer.*`
+    * `AcceleratorConfig` — `model.accelerator.*`
+        * `FSDPConfig` — `model.accelerator.fsdp_config.*`
+            * `MixedPrecisionConfig` — `model.accelerator.fsdp_config.mixed_precision.*`
+        * `OffloadConfig` — `model.accelerator.offload_config.*`
+        * `GradientCheckpointingConfig` — `model.accelerator.gradient_checkpointing.*`
+        * `TorchCompileConfig` — `model.accelerator.torch_compile.*`
 
 ### VLM Extensions
 
@@ -67,19 +94,13 @@ Dataset paths, tokenization, and batching configuration.
 
 ## Training
 
-Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
+Training loop, checkpointing, profiling, and logging. Optimizer and parallelism
+live on `model.*` — see the **Model** section above.
 
 * `TrainingArguments` — `train.*`
-    * `OptimizerConfig` — `train.optimizer.*`
     * `WandbConfig` — `train.wandb.*`
     * `ProfileConfig` — `train.profile.*`
     * `ChannelLossConfig` — `train.channel_loss.*`
-    * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
-    * `TorchCompileConfig` — `train.torch_compile.*`
-    * `AcceleratorConfig` — `train.accelerator.*`
-        * `FSDPConfig` — `train.accelerator.fsdp_config.*`
-          * `MixedPrecisionConfig` — `train.accelerator.fsdp_config.mixed_precision`
-        * `OffloadConfig` — `train.accelerator.offload_config.*`
     * `CheckpointConfig` — `train.checkpoint.*`
 
 ### VLM Extensions
@@ -124,6 +145,10 @@ Root config — assembles `model`, `data`, and `train`.
 ### ModelArguments
 
 `model.*` — Model architecture, paths, and multimodal encoder / decoder setup.
+Root ``model.*`` and a per-module overlay share this class; every unit needs
+`model_path` or `config_path`. Omni towers may carry `tokenizer_path` /
+`safetensor_idx_path` without calling them; an independent module can set its
+own `safetensor_idx_path`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -135,6 +160,10 @@ Root config — assembles `model`, `data`, and `train`.
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
+| broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
+| optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
+| accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
 ### OpsImplementationConfig
 
@@ -179,7 +208,7 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, and Magi values resolve to SP-aware registry names. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. |
+| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash, Flex, and Magi values resolve to SP-aware registry names. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. MagiAttention requires the optional `--extra magi` install (`uv sync --extra gpu --extra magi`), a model-provided `MagiAttentionMask`, physical batch size 1, `cp_size == 1`, and zero attention dropout; it does not support KV-cache offsets. It uses the CUTLASS overlay on SM90 and CUTE DSL/JIT on SM100+. |
 | moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
@@ -193,6 +222,7 @@ NPU validation runs at two times:
 | dsa_indexer_implementation | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
 | mhc_implementation | `Literal["eager", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. |
+| qat_implementation | `Literal["none", "fp8_blockwise"]` | `"none"` | DeepSeek V4 quantization-aware training recipe. Unlike the other fields this selects a quantization recipe rather than a kernel backend. `fp8_blockwise` fake-quantizes what FP8 inference rounds — linear operands (128x128 weight tiles, 1x128 activation blocks), the NoPE channels of every stored KV entry (1x64), both sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path (FP4 `1x32` groups when the checkpoint's `expert_dtype` is `fp4`, otherwise FP8 tiles) — and requires an SM90+ CUDA GPU. See `veomni/ops/qat/`. |
 
 #### The Lightning Indexer KL objective (`dsa_indexer_loss`)
 
@@ -271,7 +301,7 @@ Four metrics are reported, all per micro-batch means:
 
 It scales the KL where the loss is assembled, so it moves two things: the value of
 `training/foundation_loss`, and the indexer's share of the global gradient norm —
-hence how often `train.optimizer.max_grad_norm` clips. The four metrics above are
+hence how often `model.optimizer.max_grad_norm` clips. The four metrics above are
 coefficient-free, so tuning it does not change how they read.
 
 It is **not** a learning-rate knob for the indexer. Muon orthogonalises its update
@@ -317,8 +347,9 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | train_size | `int` | `10_000_000` | Number of tokens for training (used to compute steps under dynamic batch). |
 | train_sample | `int` | `10_000` | Number of samples for training (used to compute steps under non-dynamic batch). |
 | data_type | `Literal["plaintext", "conversation", "diffusion", "classification", "dpo"]` | `"conversation"` | Type of the training data. |
-| datasets_type | `str` | `"mapping"` | `IterableDataset` or `MappingDataset` (or custom). |
-| multisource_datasets_type | `str` | `"interleave"` | Dataset type for multisource training. |
+| datasets_type | `str` | `"mapping"` | Single-source builder for a non-YAML `train_path`. Built-in values: `"mapping"`, `"iterable"`. |
+| dataset_repeat | `bool` | `false` | Iterable-only. If true, replay the stream so one epoch can reach `train.max_steps` when the dump is shorter than that cap. If false, one pass ends the epoch. Each pass drops the last incomplete DP round. Mapping ignores this. |
+| multisource_datasets_type | `str` | `"interleave"` | Dataset builder when `train_path` is a YAML. Built-in value: `"interleave"`. |
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
 | text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
@@ -360,9 +391,6 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
 | bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |
 | bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
-| init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
-| broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
 | sync_each_train_step | `bool` | `True` | Synchronize the accelerator before each training step's forward/backward work. Disable to allow async dataloader and H2D work to overlap with the next step. |
@@ -373,32 +401,28 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | seed | `int` | `42` | Random seed. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | moe_load_balance_monitor_interval | `int` | `0` | Log a globally reduced MoE expert-load heatmap every N steps. `0` disables monitoring. |
-| optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
 | channel_loss | `ChannelLossConfig` | — | Detached per-channel causal-LM loss logging. |
-| gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
-| torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
-| accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
 | checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
 
 ### TorchCompileConfig
 
-`train.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `train.torch_compile.dynamic=False`, `train.accelerator.ulysses_size=1`, `train.accelerator.cp_size=1`, and `train.accelerator.enable_async=False`. Qwen3-VL-MoE, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
+`model.accelerator.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `model.accelerator.torch_compile.dynamic=False`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=False`. Qwen3-VL-MoE, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
 
-The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `train.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
+The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `model.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable per-block `torch.compile` on supported FSDP2 decoder blocks. |
 | backend | `Optional[str]` | `"inductor"` | Backend passed to `torch.compile`. |
-| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `train.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
+| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `model.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
 | fullgraph | `bool` | `True` | Whether to pass `fullgraph=True` to `torch.compile`. |
 | dynamic | `bool` | `False` | Whether to pass `dynamic=True` to `torch.compile`. |
 
 ### OptimizerConfig
 
-`train.optimizer.*` — Optimizer and learning-rate schedule.
+`model.optimizer.*` — Optimizer and learning-rate schedule.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -413,6 +437,8 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
+| grad_clip_scope | `Literal["per_module", "global"]` | `"per_module"` | Which parameters `max_grad_norm` is computed over. `"per_module"` clips each module against its own norm; `"global"` would clip every module against one norm taken across all of them, but is not implemented yet and raises `NotImplementedError`. A single-model job has one module, so the two agree and only an omni model would see a difference. |
+| betas | `Tuple[float, float]` | `(0.9, 0.95)` | AdamW betas (`beta1`, `beta2`). |
 | muon_lr | `Optional[float]` | `None` | Learning rate for Muon-managed 2-D/3-D weights. Unset: inherits `lr` under `match_rms_adamw`, else `25×lr` under `original`. |
 | muon_momentum | `float` | `0.95` | Momentum factor for Muon. |
 | muon_nesterov | `bool` | `True` | Enable Nesterov momentum for Muon. |
@@ -488,7 +514,7 @@ distinct from the first emission.
 
 ### GradientCheckpointingConfig
 
-`train.gradient_checkpointing.*` — Activation recomputation settings.
+`model.accelerator.gradient_checkpointing.*` — Activation recomputation settings.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -499,12 +525,22 @@ distinct from the first emission.
 
 ### AcceleratorConfig
 
-`train.accelerator.*` — Parallelism and distributed-training topology.
+`model.accelerator.*` — Everything about how one model is placed on the hardware:
+topology, device initialization, activation recomputation, and compilation.
+Weight loading (`broadcast_model_weights_from_rank0`, `ep_sharded_stream_load`)
+lives on `model.*`, not here.
+
+The config resolves itself. `__post_init__` reads `WORLD_SIZE`, derives `dp_size`
+from the non-DP dimensions, fills in whichever of `dp_replicate_size` /
+`dp_shard_size` was left at `-1`, and enforces the init-device rules — no
+surrounding `TrainingArguments` required. `world_size` and `dp_size` are exposed
+as plain attributes rather than fields, so they are derived rather than
+configured and never round-trip through a saved config.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| dp_replicate_size | `int` | `-1` | Data parallel replicate size for both dense and moe parameters. |
-| dp_shard_size | `int` | `-1` | Data parallel shard degree. |
+| dp_replicate_size | `int` | `-1` | HSDP replicate degree for both dense and MoE parameters. `-1` derives it from `dp_size` and `dp_shard_size`. |
+| dp_shard_size | `int` | `-1` | HSDP shard degree. `-1` derives it from `dp_size` and `dp_replicate_size`. Setting neither gives pure sharding (`dp_replicate_size=1`). |
 | tp_size | `int` | `1` | Tensor parallel size. |
 | ep_size | `int` | `1` | Expert parallel size, should be fit into dp_shard group if HSDP enabled |
 | ep_outside | `bool` | `False` | Expert parallelism outside in EP-FSDP. |
@@ -515,26 +551,30 @@ distinct from the first emission.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
+| init_device | `Literal["cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
+| gradient_checkpointing | `GradientCheckpointingConfig` | — | Activation recomputation settings. |
+| torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
 
 ### FSDPConfig
 
-`train.accelerator.fsdp_config.*` — FSDP sharding configuration.
+`model.accelerator.fsdp_config.*` — FSDP sharding configuration.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| fsdp_mode | `Literal["ddp", "fsdp2"]` | `"fsdp2"` | Data parallel mode. |
+| fsdp_mode | `Literal["ddp", "fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"eager"` is reserved for a future single-process `from_pretrained(device_map=...)` inference path that skips every wrapper; it is not implemented yet and raises `NotImplementedError`. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
 | forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
+| offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
 ### MixedPrecisionConfig
 
-`train.accelerator.fsdp_config.mixed_precision.*` — Mixed precision configuration.
+`model.accelerator.fsdp_config.mixed_precision.*` — Mixed precision configuration.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -547,7 +587,7 @@ distinct from the first emission.
 
 ### OffloadConfig
 
-`train.accelerator.offload_config.*` — Activation offload settings.
+`model.accelerator.offload_config.*` — Activation offload settings.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -555,13 +595,17 @@ distinct from the first emission.
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
 | enable_async_activation | `bool` | `False` | Enable async activation offload via stream-based D2H/H2D. Mutually exclusive with `enable_activation`. When `activation_offload_modules` is empty, targets are discovered from `model._no_split_modules`; missing or unmatched model metadata fails closed. |
 | activation_offload_modules | `List[str]` | `[]` | Optional module name patterns for async offload, overriding `_no_split_modules` auto-discovery. Supports segment-aware glob (`model.layers.*` matches direct children only) and `{*}` for sequential groups (`model.layers.{*}`). |
-| activation_offload_host_cache_limit_gb | `float` | `4.0` | Maximum GB of free host buffers retained between steps. In-flight offloads may temporarily exceed this value. Set to `0` to disable reuse. |
+| activation_offload_host_cache_limit_gb | `float` | `4.0` | Idle-cache cap of **one** host-buffer pool, in GB. The trainer applies offload once with this limit, so it is the cap for that call. Each extra `apply_async_activation_offload` given only this limit gets its own pool (caps add); pass the same `host_buffer_pool` to share one cap. Bounds the idle cache only — in-flight offloads may temporarily exceed it. Set to `0` to disable reuse. |
 
 Async activation offload is enabled for CUDA/NPU tensors only; CPU tensors pass
 through unchanged. Only private, dense, contiguous activations are swapped so
-shared-storage views are never resized. Host buffers are pooled per model,
-keyed by shape, stride, and dtype, and evicted by least-recently-used layout to
-enforce `activation_offload_host_cache_limit_gb`. The manager is reset at every training-step
+shared-storage views are never resized. Host buffers are pooled, keyed by shape,
+stride, and dtype, and evicted by least-recently-used layout to enforce the
+pool's `max_cached_bytes`. Passing `host_cache_limit_bytes` (the trainer path)
+builds one pool of that size for that `apply_async_activation_offload` call.
+A caller that applies more than once may pass the same `host_buffer_pool` so
+several schedules share the cap, or omit it so each call owns a pool and the
+caps add. The manager is reset at every training-step
 boundary, including before a step after a failed forward/backward, so stale
 autograd keys cannot affect the next step. The path wraps selected module instances
 and is not intended to be captured by `torch.compile`.

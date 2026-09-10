@@ -21,6 +21,7 @@ import torch.distributed as dist
 from ...checkpoint import CheckpointerBase, build_checkpointer
 from ...models import save_model_assets
 from ...utils import helper
+from ...utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ...utils.save_safetensor_utils import save_hf_safetensor, save_lora_adapter_with_dcp
 from .base import Callback, TrainerState
 
@@ -40,7 +41,7 @@ class CheckpointerCallback(Callback):
         self.every_n_epochs = args.train.checkpoint.save_epochs
         self._last_saved_step: int = -1
         self.trainer.checkpointer: CheckpointerBase = build_checkpointer(
-            dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
+            dist_backend=args.model.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
         )
 
     def on_step_end(self, state: TrainerState, **kwargs):
@@ -59,6 +60,30 @@ class CheckpointerCallback(Callback):
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._load_checkpoint()
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        """Block until an in-flight async save has finished before the run exits.
+
+        With ``save_async``, ``_save_checkpoint`` returns as soon as
+        ``dcp.async_save`` has been queued: the write runs on a background thread
+        and any exception it raises stays captured in the future.
+        ``wait_for_pending_save`` is the only place that future is consumed, and
+        until now it was reached only from ``_load_checkpoint`` (needs
+        ``load_path``), from ``HuggingfaceCkptCallback`` / ``HFLoraCkptCallback``
+        (need ``save_hf_weights``), or from the *next* async save. A run whose
+        last save is also its only save therefore exited without ever observing
+        the result: ``ThreadPoolExecutor``'s atexit join let the write finish,
+        but a write that raised was silently discarded and the process still
+        exited 0, leaving no checkpoint behind.
+
+        Waiting here makes that failure visible, and puts the tail of the write
+        in the log rather than in an invisible interpreter-shutdown join.
+
+        No-op when nothing is pending, and ``save_future`` is set on every rank
+        or on none, so the barrier inside ``wait_for_pending_save`` stays
+        balanced.
+        """
+        self.trainer.checkpointer.wait_for_pending_save()
 
     def _load_checkpoint(self):
         """Load checkpoint from path."""
@@ -117,7 +142,9 @@ class CheckpointerCallback(Callback):
         """Save distributed checkpoint and optimizer state at each save_steps."""
         args: "VeOmniArguments" = self.trainer.args
 
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(
+            args.train.checkpoint.save_path, f"{_GLOBAL_STEP_PREFIX}{state.global_step}"
+        )
 
         if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
             train_dataloader_state = self.trainer.data_iterator.state_dict()
@@ -152,12 +179,14 @@ class CheckpointerCallback(Callback):
         helper.empty_cache()
 
         self.trainer.checkpointer.save(
-            save_checkpoint_path,
+            args.train.checkpoint.save_path,
             ckpt_state,
+            global_steps=state.global_step,
             save_async=args.train.checkpoint.save_async,
             trainable_only=bool(getattr(args.model, "lora_config", None)),
             save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
             parallel_state=self.parallel_state,
+            stage_dir=args.train.checkpoint.stage_dir,
         )
 
         # Empty cache and barrier
@@ -212,7 +241,9 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save model in HuggingFace format."""
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(
+            args.train.checkpoint.save_path, f"{_GLOBAL_STEP_PREFIX}{state.global_step}"
+        )
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             super()._save_checkpoint(state)
@@ -249,7 +280,9 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save LoRA checkpoint in HuggingFace format at train end."""
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = os.path.join(
+            args.train.checkpoint.save_path, f"{_GLOBAL_STEP_PREFIX}{state.global_step}"
+        )
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             CheckpointerCallback._save_checkpoint(self, state)

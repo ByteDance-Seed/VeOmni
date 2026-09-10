@@ -313,7 +313,7 @@ class TrainerTest(BaseTrainer):
             batch["position_ids"] = batch["position_ids"].transpose(0, 1).contiguous()
 
         loss, loss_dict, _ = super().forward_backward_step(batch)
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(self.model, args.model.optimizer.max_grad_norm)
 
         _release_device_memory()
         print_device_mem_info(f"[Memory Info] after model {model_name} train_one_step:")
@@ -328,8 +328,8 @@ class TrainerTest(BaseTrainer):
 _DEFAULT_RTOL = 1e-2
 _DEFAULT_ATOL = 1e-2
 
-# Models without a patchgen path are not covered here. Migrate them via
-# ``/veomni-migrate-transformers-v5`` to bring them back into this list.
+# Models without a patchgen path are not covered here. Add one via
+# ``/veomni-patchgen-model`` to bring them back into this list.
 TEST_CASES = [
     pytest.param(
         "./tests/toy_config/llama31_toy/config.json",
@@ -464,13 +464,11 @@ def test_models_patch_fwd_bwd(
     # compressor concatenation. The default FA-based mode grid would fail at
     # ``TrainerTest(hf_model_modes[0])`` with
     # ``ValueError: DeepseekV4ForCausalLM does not support Flash Attention 2``.
-    # Keep attention eager, but exercise VeOmni's default GPU MoE path: the
-    # DeepSeek-V4 experts patch forwards ``swiglu_limit`` into the fused kernel.
-    # NPU fused MoE still raises for that clamp, so NPU keeps the eager MoE
-    # baseline until ``fused_npu`` implements ``swiglu_limit``.
+    # Keep attention eager, but exercise the clamp-aware fused MoE path on each
+    # backend: DeepSeek-V4 forwards ``swiglu_limit`` into fused_triton/fused_npu.
     if case_id == "deepseek_v4":
         hf_model_modes = [ModelMode("hf", "eager")]
-        moe_impl = "eager" if IS_NPU_AVAILABLE else "fused_triton"
+        moe_impl = "fused_npu" if get_device_type() == "npu" else "fused_triton"
         veomni_model_modes = [ModelMode("veomni", "eager", moe_implementation=moe_impl)]
 
     # Qwen3.5 compatibility:
@@ -494,18 +492,21 @@ def test_models_patch_fwd_bwd(
     # this the public ``OpsImplementationConfig()`` defaults (liger_kernel /
     # fused_triton / triton) would fail validation on NPU before the test
     # even runs.
-    model_config = ModelArguments(config_path=config_path, ops_implementation=make_eager_ops_config())
-    data_config = DataArguments(train_path="")
-    training_config = TrainingArguments(
-        checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
+    model_config = ModelArguments(
+        config_path=config_path,
+        ops_implementation=make_eager_ops_config(),
         accelerator=AcceleratorConfig(
+            init_device=get_device_type(),
             fsdp_config=FSDPConfig(
                 fsdp_mode="ddp",
                 mixed_precision=MixedPrecisionConfig(enable=False),
             ),
         ),
+    )
+    data_config = DataArguments(train_path="")
+    training_config = TrainingArguments(
+        checkpoint=CheckpointConfig(output_dir="./test_models_patch"),
         enable_full_determinism=True,
-        init_device=get_device_type(),
     )
 
     trainer_config = VeOmniArguments(

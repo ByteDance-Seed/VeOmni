@@ -70,11 +70,11 @@ _QWEN4_EXP_TRAINING_ARGS = [
     f"--model.ops_implementation.rms_norm_gated_implementation={_QWEN4_EXP_GDN_IMPL}",
     f"--model.ops_implementation.causal_conv1d_implementation={_QWEN4_EXP_GDN_IMPL}",
     f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_QWEN4_EXP_GDN_IMPL}",
-    "--train.accelerator.extra_parallel_names=ple",
-    "--train.accelerator.extra_parallel_sizes=2",
-    "--train.accelerator.extra_parallel_placement_innermost=false",
-    "--train.broadcast_model_weights_from_rank0=false",
-    "--train.ep_sharded_stream_load=true",
+    "--model.accelerator.extra_parallel_names=ple",
+    "--model.accelerator.extra_parallel_sizes=2",
+    "--model.accelerator.extra_parallel_placement_innermost=false",
+    "--model.broadcast_model_weights_from_rank0=false",
+    "--model.ep_sharded_stream_load=true",
 ]
 
 
@@ -258,7 +258,7 @@ deepseek_v4_tilelang_dyn_bsz_test_cases = [
     ),
     pytest.param(
         "dummy_deepseek_v4_dense_packed_text_dataset",
-        ["--train.gradient_checkpointing.enable=False"],
+        ["--model.accelerator.gradient_checkpointing.enable=False"],
         id="packed-4x512-no-gc",
     ),
 ]
@@ -641,8 +641,8 @@ def test_qwen4_exp_training_smoke(tmp_path):
                 "--data.max_seq_len=64",
                 "--data.dataloader.num_workers=0",
                 "--train.global_batch_size=4",
-                "--train.gradient_checkpointing.enable=false",
-                "--train.optimizer.lr=0.01",
+                "--model.accelerator.gradient_checkpointing.enable=false",
+                "--model.optimizer.lr=0.01",
             ],
             model_name="qwen4_exp",
         )
@@ -706,9 +706,9 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert cmd_kwargs["extra_args"] == [
-            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
-            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+            "--model.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--model.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--model.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
 

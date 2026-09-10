@@ -8,31 +8,6 @@ model:
   ops_implementation:
     attn_implementation: flash_attention_2
     moe_implementation: fused_triton
-
-data:
-  train_path: tulu-3-sft-mixture
-  data_type: conversation
-  chat_template: chatml
-  max_seq_len: 2048
-  train_size: 20000000
-  text_keys: messages
-  dyn_bsz_buffer_size: 200
-
-train:
-  accelerator:
-    ulysses_size: 1
-    ep_size: 8
-    fsdp_config:
-      fsdp_mode: fsdp2
-      mixed_precision:
-        enable: true
-    offload:
-      enable_activation: false
-  gradient_checkpointing:
-    enable: true
-  global_batch_size: 8
-  micro_batch_size: 1
-  bsz_warmup_ratio: 0.007
   optimizer:
     type: muon
     lr: 1.0e-4
@@ -56,8 +31,33 @@ train:
     # muon_head_split_modules: [q_proj, k_proj, v_proj]
     # Requires (num_experts / ep_size) % ep_fsdp_size == 0; otherwise falls back.
     muon_expert_zero_comm: true
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 1
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 2048
+  train_size: 20000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
   num_train_epochs: 1
-  init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   checkpoint:

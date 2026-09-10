@@ -26,7 +26,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 from veomni.arguments.arguments_types import MixedPrecisionConfig
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import _init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.optim.optimizer import MultiOptimizer
@@ -51,7 +51,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
     rank = dist.get_rank()
     assert world_size == 4, f"this test expects exactly 4 ranks, got {world_size}"
 
-    init_parallel_state(
+    _init_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         extra_parallel_sizes=(EP_SIZE,),

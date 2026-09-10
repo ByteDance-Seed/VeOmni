@@ -83,7 +83,7 @@ NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lo
     --data.offline_embedding_save_dir ./Tom-and-Jerry-VideoGeneration-Dataset_offline \
     --train.training_task        offline_embedding \
     --train.global_batch_size    4 \
-    --train.accelerator.ulysses_size 1
+    --model.accelerator.ulysses_size 1
 ```
 
 The resulting `Tom-and-Jerry-VideoGeneration-Dataset_offline/` directory contains `rank_N_shard_M.parquet` files. Each row stores two pickled tensors:
@@ -107,7 +107,7 @@ bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lora.yaml \
     --train.training_task        offline_training \
     --train.global_batch_size    8 \
     --train.micro_batch_size     1 \
-    --train.accelerator.ulysses_size ${SP_SIZE} \
+    --model.accelerator.ulysses_size ${SP_SIZE} \
     --train.checkpoint.output_dir ./exp/Wan2.1-T2V-1.3B-Diffusers_lora \
     --train.checkpoint.save_hf_weights true \
     --train.checkpoint.save_epochs 5 \
@@ -132,7 +132,7 @@ NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lo
     --train.training_task        online_training \
     --train.global_batch_size    4 \
     --train.micro_batch_size     1 \
-    --train.accelerator.ulysses_size 1 \
+    --model.accelerator.ulysses_size 1 \
     --train.checkpoint.output_dir ./exp/Wan2.1-T2V-1.3B-Diffusers_lora \
     --train.checkpoint.save_hf_weights true \
     --train.num_train_epochs 30
@@ -167,7 +167,7 @@ VeOmni supports Ulysses SP for long video sequences. SP splits the sequence dime
 | 1 | 4 |
 | 2 | 8 |
 
-Set `--train.accelerator.ulysses_size` to enable SP. The loss and gradient norms are aligned between SP=1 and SP=2 at equal DP sizes.
+Set `--model.accelerator.ulysses_size` to enable SP. The loss and gradient norms are aligned between SP=1 and SP=2 at equal DP sizes.
 
 ---
 

@@ -1,5 +1,4 @@
-# Internal validation only. Qwen4-Exp currently requires the temporary
-# Transformers git revision pinned in pyproject.toml.
+# Internal validation only. Qwen4-Exp uses VeOmni's generated Transformers 5.9 patch.
 model:
   model_path: Qwen/Qwen3.8-Flash-Next
   ops_implementation:
@@ -8,17 +7,6 @@ model:
     # This is the GPU default; OpsImplementationConfig resolves the same value
     # to fused_npu when torch_npu is available.
     moe_implementation: fused_triton
-
-data:
-  train_path: tulu-3-sft-mixture/data
-  data_type: conversation
-  chat_template: chatml
-  max_seq_len: 16384
-  train_size: 750000
-  text_keys: messages
-  dyn_bsz_buffer_size: 200
-
-train:
   accelerator:
     # PLE/QSA sequence parallelism is intentionally blocked in the initial port.
     ulysses_size: 1
@@ -32,27 +20,38 @@ train:
     extra_parallel_placement_innermost: [false]
     fsdp_config:
       fsdp_mode: fsdp2
-  gradient_checkpointing:
-    enable: true
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  # Required for checkpoint-native PLE streaming: every rank reads only its
+  # local row x column rectangle instead of materializing a 95 GiB tensor.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+
+data:
+  train_path: tulu-3-sft-mixture/data
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 16384
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
   wandb:
     enable: false
     project: VeOmni
     name: qwen4-exp-sft-internal
   freeze_vit: false
-  optimizer:
-    lr: 1.0e-5
-    lr_decay_style: cosine
   num_train_epochs: 2
   micro_batch_size: 1
   # Derive the global batch from the DP world size so the same smoke config can
   # scale beyond 16 ranks without failing batch-size validation.
   global_batch_size: null
   max_steps: 10
-  init_device: meta
-  # Required for checkpoint-native PLE streaming: every rank reads only its
-  # local row x column rectangle instead of materializing a 95 GiB tensor.
-  broadcast_model_weights_from_rank0: false
-  ep_sharded_stream_load: true
   checkpoint:
     output_dir: qwen4-exp-sft-internal
     manager: dcp

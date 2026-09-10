@@ -14,7 +14,7 @@ Before implementing, check which areas your change affects:
 | `veomni/distributed/` | FSDP2 + ExtraParallel/MoE/SP paths | Shared distributed code is used by many downstream modalities |
 | `veomni/models/auto.py`, `loader.py` | Model registry, import-time side effects | `MODELING_REGISTRY` is populated at import time; moving registrations breaks loading |
 | `configs/` | YAML config keys | Renaming config keys breaks existing training configs silently |
-| `veomni/models/transformers/*/` | `__init__.py` registration entry points | All models ship a patchgen-generated v5 path under `generated/`; never import or call legacy `modeling_<m>.py` or `apply_veomni_<m>_patch()` (these no longer exist) |
+| `veomni/models/transformers/*/` | `__init__.py` registration entry points | Every transformers-family LLM/VLM/Omni model ships a patchgen-generated path under `generated/`; never import or call legacy `modeling_<m>.py` or `apply_veomni_<m>_patch()` (these no longer exist). The non-transformers-architecture models (`flux`, `movqgan`, `wan`) have no `generated/` and patch through `device_patch.py` or direct modeling — check the directory before assuming |
 
 ## Refactoring Safety Rules
 
@@ -42,6 +42,17 @@ Before committing, check if the change requires documentation updates:
 - **New/changed config fields** → update config examples in `configs/` and relevant docs.
 - **Architecture change** → update `.agents/knowledge/architecture.md`.
 - **New constraint discovered** → add to `.agents/knowledge/constraints.md`.
+
+## Tests
+
+Follow `.agents/knowledge/testing.md`. In short: extend an existing
+CI-enumerated test before creating a new file. If you do create one, check its
+path against the table there and wire it into the workflow that owns that path
+— the directory-level entries (`tests/data/`, `tests/ops/` on GPU,
+`tests/parallel/context_parallel/` on GPU) need no line, e2e paths belong to
+`{gpu,npu}_e2e_test.yml`, and everything else is invisible to CI until it is
+listed. A pure refactor with existing coverage does not need a new test — say
+so in the PR instead of adding one.
 
 ## When to Use Other Skills
 
