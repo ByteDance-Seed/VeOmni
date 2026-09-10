@@ -137,6 +137,8 @@ def _flex_mask(
         batch_size=batch_size,
         q_length=q_len,
         kv_length=kv_len,
+        q_offset=kv_len - q_len,
+        device=device,
         **extra,
     )
 
@@ -151,16 +153,23 @@ def causal_mask(
     skip_ulysses: bool = False,
     **kwargs: Any,
 ):
-    """Build a causal mask for ``impl``, or ``None`` when flash uses kwargs.
+    """Build a causal mask for ``impl``.
 
     ``skip_ulysses`` is forwarded to the Flex / SDPA / Magi builders so
-    local lengths stay local when attention will not gather.
+    local lengths stay local when attention will not gather. Flash-like
+    implementations return ``None`` only when no padding mask is needed.
     """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
     extra["skip_ulysses"] = skip_ulysses
     if backend in _FLASH_LIKE_CAUSAL:
-        return flash_attention_mask_builder()
+        return flash_attention_mask_builder(
+            batch_size,
+            q_len,
+            kv_len,
+            q_offset=kv_len - q_len,
+            **extra,
+        )
     if backend in _SDPA or backend in _EAGER:
         return _sdpa_or_eager_mask(backend, batch_size, q_len, kv_len, device, extra)
     if backend == "flex_attention":
@@ -189,9 +198,10 @@ def sliding_window_mask(
     skip_ulysses: bool = False,
     **kwargs: Any,
 ):
-    """Sliding-window causal mask. Flash returns ``None``.
+    """Sliding-window causal mask. Flash preserves an optional 2D padding mask.
 
-    ``skip_ulysses`` is forwarded to the Flex / SDPA builders.
+    With no padding, Flash returns ``None`` and carries the window in kernel
+    kwargs. ``skip_ulysses`` is forwarded to the Flex / SDPA builders.
     """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
@@ -200,7 +210,13 @@ def sliding_window_mask(
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support sliding_window_mask")
     if backend in _FLASH:
-        return flash_attention_mask_builder()
+        return flash_attention_mask_builder(
+            batch_size,
+            q_len,
+            kv_len,
+            q_offset=kv_len - q_len,
+            **extra,
+        )
     if backend in _SDPA or backend in _EAGER:
         return _sdpa_or_eager_mask(
             backend,
@@ -238,10 +254,11 @@ def packed_causal_mask(
     skip_ulysses: bool = False,
     **kwargs: Any,
 ):
-    """Packed causal mask from ``cu_seqlens``. Flash returns ``None``.
+    """Packed causal mask from ``cu_seqlens``.
 
-    Flex / SDPA builders receive ``skip_ulysses``. Magi packed ranges come
-    from ``cu_seqlens`` and are not scaled.
+    Flash returns only optional 2D padding metadata; packed lengths stay in
+    kernel kwargs. Flex / SDPA builders receive ``skip_ulysses``. Magi packed
+    ranges come from ``cu_seqlens`` and are not scaled.
     """
     backend = impl.removeprefix("veomni_")
     extra = _compose_or_and(kwargs)
@@ -249,7 +266,13 @@ def packed_causal_mask(
     if backend in _SAGE:
         raise ValueError("veomni_sage_attention does not support packed_causal_mask")
     if backend in _FLASH:
-        return flash_attention_mask_builder()
+        return flash_attention_mask_builder(
+            batch_size,
+            q_len,
+            kv_len,
+            q_offset=kv_len - q_len,
+            **extra,
+        )
     if backend in _SDPA or backend in _EAGER:
         return _sdpa_or_eager_mask(
             backend,

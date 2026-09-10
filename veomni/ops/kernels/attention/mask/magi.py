@@ -137,6 +137,22 @@ def magi_attention_mask_builder(
             "Packed and model-specific visibility must use MagiAttentionMask.from_ranges or from_cu_seqlens."
         )
 
+    if attention_mask is not None:
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+            raise TypeError(
+                "MagiAttention mask creation accepts only a 2D attention mask, "
+                f"got {type(attention_mask).__name__} with shape "
+                f"{getattr(attention_mask, 'shape', None)}."
+            )
+        if attention_mask.shape[0] != batch_size:
+            raise ValueError(
+                f"MagiAttention attention_mask batch size must be {batch_size}, got {attention_mask.shape[0]}."
+            )
+        raise ValueError(
+            "The registered MagiAttention mask builder cannot recover packed boundaries from a 2D attention mask. "
+            "Pass cumulative sequence lengths or explicit ranges to the corresponding MagiAttentionMask constructor."
+        )
+
     device = kwargs.get("device")
     if device is None and attention_mask is not None:
         device = attention_mask.device
@@ -145,12 +161,6 @@ def magi_attention_mask_builder(
     device = torch.device(device)
 
     full_q_length, full_kv_length = _full_sequence_lengths(q_length, kv_length, skip_ulysses=skip_ulysses)
-    if attention_mask is not None and attention_mask.shape[-1] != full_kv_length:
-        raise ValueError(
-            "MagiAttention attention_mask must describe the full post-Ulysses key sequence, "
-            f"got mask length {attention_mask.shape[-1]} and expected {full_kv_length}."
-        )
-
     attn_type_map = torch.ones(1, device=device, dtype=torch.int32) if causal else None
     return MagiAttentionMask.from_ranges(
         torch.tensor([[0, full_q_length]], device=device, dtype=torch.int32),

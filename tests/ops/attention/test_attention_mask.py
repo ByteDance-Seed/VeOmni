@@ -65,6 +65,15 @@ def test_mask_builder_return_types():
     assert magi.q_ranges.shape == (1, 2)
 
 
+def test_flash_mask_builder_preserves_padding_and_elides_all_valid_mask():
+    padded = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+    torch.testing.assert_close(
+        flash_attention_mask_builder(1, 4, 4, attention_mask=padded),
+        padded,
+    )
+    assert flash_attention_mask_builder(1, 4, 4, attention_mask=torch.ones_like(padded)) is None
+
+
 def test_hf_create_causal_mask_uses_registered_builders():
     embeds = torch.randn(1, 8, 16)
     position_ids = torch.arange(8).unsqueeze(0)
@@ -83,6 +92,27 @@ def test_hf_create_causal_mask_uses_registered_builders():
     assert magi.k_ranges.tolist() == [[0, 8]]
 
 
+@pytest.mark.parametrize(
+    "implementation",
+    (
+        "veomni_flash_attention_2",
+        "veomni_flash_attention_3",
+        "veomni_flash_attention_4",
+        "veomni_sage_attention",
+    ),
+)
+def test_hf_create_causal_mask_preserves_flash_like_padding(implementation):
+    config = PreTrainedConfig()
+    config._attn_implementation = implementation
+    embeds = torch.randn(1, 4, 16)
+    position_ids = torch.arange(4).unsqueeze(0)
+    attention_2d = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+
+    mask = create_causal_mask(config, embeds, attention_2d, None, position_ids)
+
+    torch.testing.assert_close(mask, attention_2d)
+
+
 def test_flex_and_sdpa_2d_padding_masks_align():
     attention_2d = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
     flex = flex_attention_mask_builder(1, 4, 4, attention_mask=attention_2d, device="cpu")
@@ -99,13 +129,16 @@ def test_flex_and_sdpa_2d_padding_masks_align():
     assert not bool(sdpa[0, 0, :, -1].any())
 
 
-def test_magi_2d_mask_length_aligns_with_full_kv():
-    attention_2d = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
-    mask = magi_attention_mask_builder(1, 4, 4, attention_mask=attention_2d, device="cpu")
-    assert mask.q_ranges.tolist() == [[0, 4]]
-    assert mask.k_ranges.tolist() == [[0, 4]]
-    with pytest.raises(ValueError, match="full post-Ulysses key sequence"):
-        magi_attention_mask_builder(1, 4, 4, attention_mask=torch.ones(1, 3, dtype=torch.bool), device="cpu")
+@pytest.mark.parametrize(
+    "attention_2d",
+    (
+        torch.tensor([[1, 1, 1, 0]], dtype=torch.bool),
+        torch.ones(1, 4, dtype=torch.bool),
+    ),
+)
+def test_magi_hf_builder_rejects_implicit_2d_visibility(attention_2d):
+    with pytest.raises(ValueError, match="cannot recover packed boundaries"):
+        magi_attention_mask_builder(1, 4, 4, attention_mask=attention_2d, device="cpu")
 
 
 def _sync_ulysses_state(*, size: int = 2) -> SimpleNamespace:
@@ -119,14 +152,11 @@ def _patch_mask_ulysses(monkeypatch, *modules, apply: bool, size: int = 2) -> No
         monkeypatch.setattr(module, "get_parallel_state", lambda: state)
 
 
-def test_flex_and_magi_ulysses_2d_mask_lengths_align(monkeypatch):
-    _patch_mask_ulysses(monkeypatch, flex_mask, magi_mask, apply=True)
+def test_flex_ulysses_2d_mask_length_aligns(monkeypatch):
+    _patch_mask_ulysses(monkeypatch, flex_mask, apply=True)
     full_2d = torch.ones(1, 8, dtype=torch.bool)
     flex = flex_attention_mask_builder(1, 4, 4, attention_mask=full_2d, device="cpu")
-    magi = magi_attention_mask_builder(1, 4, 4, attention_mask=full_2d, device="cpu")
     assert tuple(flex.shape[-2:]) == (8, 8)
-    assert magi.q_ranges.tolist() == [[0, 8]]
-    assert magi.k_ranges.tolist() == [[0, 8]]
 
 
 @pytest.mark.parametrize(
@@ -211,10 +241,8 @@ def test_magi_hf_builder_does_not_recover_packed_visibility_from_position_ids():
     embeds = torch.randn(1, 8, 16)
     attention_mask = torch.ones(1, 8, dtype=torch.long)
     packed_position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
-    mask = create_causal_mask(config, embeds, attention_mask, None, packed_position_ids)
-    assert isinstance(mask, MagiAttentionMask)
-    assert mask.q_ranges.tolist() == [[0, 8]]
-    assert mask.k_ranges.tolist() == [[0, 8]]
+    with pytest.raises(ValueError, match="cannot recover packed boundaries"):
+        create_causal_mask(config, embeds, attention_mask, None, packed_position_ids)
 
 
 def test_magi_from_ranges_casts_ffa_contract():

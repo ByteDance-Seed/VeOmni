@@ -31,6 +31,7 @@ from tests.ops.attention.attention_cases import flex_visible
 from veomni.ops.kernels.attention.mask import flex as flex_mask
 from veomni.ops.kernels.attention.mask import magi as magi_mask
 from veomni.ops.kernels.attention.mask import sdpa as sdpa_mask
+from veomni.ops.kernels.attention.mask import shape as shape_mask
 from veomni.ops.mask import (
     MagiAttentionMask,
     causal_mask,
@@ -50,6 +51,20 @@ def test_flash_shapes_are_none():
         packed_causal_mask(8, 8, impl="veomni_flash_attention_3", device="cpu", cu_seqlens=torch.tensor([0, 8]))
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "impl",
+    (
+        "flash_attention_2",
+        "veomni_flash_attention_2",
+        "veomni_sage_attention",
+    ),
+)
+def test_flash_like_causal_shape_preserves_padding(impl):
+    attention_2d = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+    mask = causal_mask(4, 4, impl=impl, device="cpu", attention_mask=attention_2d)
+    torch.testing.assert_close(mask, attention_2d)
 
 
 def test_sage_mask_builder_is_flash_like_for_causal_only():
@@ -182,6 +197,33 @@ def test_flex_causal_aligns_with_hf_builder(impl):
     built = flex_attention_mask_builder(1, 4, 4, device="cpu")
     shaped = causal_mask(4, 4, impl=impl, device="cpu")
     torch.testing.assert_close(flex_visible(shaped, 4, 4), flex_visible(built, 4, 4))
+
+
+@pytest.mark.parametrize("impl", ("flex_attention", "veomni_flex_attention"))
+def test_flex_cached_causal_uses_query_offset(impl):
+    shaped = causal_mask(2, 4, impl=impl, device="cpu")
+    expected = torch.tensor(
+        [
+            [True, True, True, False],
+            [True, True, True, True],
+        ]
+    )
+    torch.testing.assert_close(flex_visible(shaped, 2, 4), expected)
+
+
+def test_flex_shape_forwards_requested_device(monkeypatch):
+    captured = {}
+    sentinel = object()
+
+    def fake_builder(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(shape_mask, "flex_attention_mask_builder", fake_builder)
+
+    assert causal_mask(2, 4, impl="flex_attention", device="cuda:7") is sentinel
+    assert captured["q_offset"] == 2
+    assert captured["device"] == "cuda:7"
 
 
 @pytest.mark.parametrize("impl", ("magi_attention", "veomni_magi_attention"))
