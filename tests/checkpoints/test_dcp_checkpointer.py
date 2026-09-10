@@ -1420,6 +1420,83 @@ class TestPromoteStagedCheckpoint:
 
 
 class TestStageDirValidation:
+    def test_every_checkpoint_of_a_run_reuses_one_emptied_directory(self, tmp_path):
+        """A killed save strands a model-plus-optimizer-sized copy on the scratch disk.
+
+        One directory per run, emptied before each save, is what reclaims it: the
+        next save on that node clears the copy instead of asking for the same space
+        again on a disk already short of it.
+        """
+        import os as _os
+
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            abandoned = _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
+            with open(_os.path.join(abandoned, "big.distcp"), "w") as f:
+                f.write("a save that never finished")
+
+            current = _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
+
+        assert current == abandoned
+        assert _os.listdir(current) == [], "the abandoned copy must not survive"
+
+    def test_sweep_is_confined_to_veomni_own_directory(self, tmp_path):
+        """stage_dir is the caller's, often /tmp; only our own subtree may be removed."""
+
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        someone_elses = tmp_path / "someone_elses_data"
+        someone_elses.mkdir()
+        (someone_elses / "important.bin").write_text("not ours")
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
+
+        assert (someone_elses / "important.bin").exists(), "swept outside our own root"
+
+    def test_only_the_node_leader_touches_the_filesystem(self, tmp_path):
+        """Peers sweeping or creating in the same place would race with the leader.
+
+        They do not need to: the reduction is a collective, so the leader's work
+        is done and visible by the time any rank leaves. Checks both halves --
+        a peer neither creates the directory nor removes what the leader made.
+        """
+        import os as _os
+
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
+                path = _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
+            assert not _os.path.exists(path), "a peer created the directory itself"
+
+            with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0):
+                assert _prepare_stage_dir(str(tmp_path), "/remote/ckpt") == path
+            assert _os.path.isdir(path), "the leader must have created it"
+
+            marker = _os.path.join(path, "written_by_the_leader")
+            with open(marker, "w") as f:
+                f.write("x")
+            with patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=3):
+                _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
+            assert _os.path.exists(marker), "a peer swept the leader's directory"
+
+    def test_a_concurrent_run_sharing_stage_dir_is_not_swept(self, tmp_path):
+        """stage_dir is often generic (/tmp); two runs on one node must not collide."""
+        import os as _os
+
+        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
+
+        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
+            other = _prepare_stage_dir(str(tmp_path), "/remote/other_run")
+            with open(_os.path.join(other, "in_flight.distcp"), "w") as f:
+                f.write("another job is using this")
+
+            _prepare_stage_dir(str(tmp_path), "/remote/this_run")
+
+        assert _os.path.exists(_os.path.join(other, "in_flight.distcp")), "swept another run's data"
+
     def test_staging_dir_failure_is_agreed_across_ranks(self, tmp_path):
         """A scratch disk fails per node, so ranks that could still stage must stop too.
 
@@ -1431,18 +1508,7 @@ class TestStageDirValidation:
         # This rank prepares its directory fine; another node's did not.
         with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=True):
             with pytest.raises(RuntimeError, match="another rank could not prepare"):
-                _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
-
-    def test_staging_dir_is_emptied_and_returned(self, tmp_path):
-        from veomni.checkpoint.dcp_checkpointer import _prepare_stage_dir
-
-        with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", return_value=False):
-            first = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
-            with open(os.path.join(first, "leftover.distcp"), "w") as f:
-                f.write("from a crashed run")
-            second = _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
-        assert second == first
-        assert os.listdir(second) == []
+                _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
 
     def test_local_staging_failure_raises_its_own_error(self, tmp_path):
         """The rank that actually failed reports what happened, not the peer message."""
@@ -1451,7 +1517,37 @@ class TestStageDirValidation:
         with patch("veomni.checkpoint.dcp_checkpointer._any_rank_failed", side_effect=lambda f: f):
             with patch("veomni.checkpoint.dcp_checkpointer.os.makedirs", side_effect=OSError("No space left")):
                 with pytest.raises(OSError, match="No space left"):
-                    _prepare_stage_dir(str(tmp_path), "/remote/ckpt/step_1")
+                    _prepare_stage_dir(str(tmp_path), "/remote/ckpt")
+
+    def test_unset_stage_dir_writes_straight_to_the_destination(self, tmp_path):
+        """Staging is opt-in: unset, nothing about the write changes.
+
+        DCP is pointed at the destination itself, and neither the staging directory
+        nor the promotion is reached -- so no scratch disk is touched and no extra
+        collective is issued.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        final = tmp_path / "ckpt"
+        with (
+            patch.object(DistributedCheckpointer, "execute_save") as execute_save,
+            patch.object(DistributedCheckpointer, "_create_storage_writer") as create_writer,
+            patch.object(DistributedCheckpointer, "_save_extra_state"),
+            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
+            patch("veomni.checkpoint.dcp_checkpointer._prepare_stage_dir") as prepare,
+            patch("veomni.checkpoint.dcp_checkpointer._promote_staged_checkpoint") as promote,
+        ):
+            DistributedCheckpointer.save(
+                path=str(final),
+                state={"model": MagicMock()},
+                save_async=False,
+                global_steps=10,
+            )
+
+        assert create_writer.call_args.args[0] == str(final / "global_step_10")
+        assert execute_save.call_args.kwargs["storage_writer"] is create_writer.return_value
+        prepare.assert_not_called()
+        promote.assert_not_called()
 
     def test_stage_dir_with_explicit_storage_writer_is_rejected(self, tmp_path):
         """Silently ignoring stage_dir would write to the slow destination it was avoiding."""
@@ -1473,10 +1569,10 @@ class TestStageDirValidation:
         from veomni.checkpoint.dcp_checkpointer import _stage_key
 
         assert _stage_key("/tmp/a_b/c") != _stage_key("/tmp/a/b_c")
-        assert _stage_key("/tmp/run/step_1") == _stage_key("/tmp/run/step_1")
-        assert _stage_key("/tmp/run/step_1") != _stage_key("/tmp/run/step_2")
+        assert _stage_key("/remote/run") == _stage_key("/remote/run")
+        assert _stage_key("/remote/run_a") != _stage_key("/remote/run_b")
         # a relative destination and its absolute spelling stage together
-        assert _stage_key("run/step_1") == _stage_key(os.path.join(os.getcwd(), "run", "step_1"))
+        assert _stage_key("run") == _stage_key(os.path.join(os.getcwd(), "run"))
 
     def test_stage_dir_with_save_async_is_rejected_before_any_side_effect(self, tmp_path):
         """The staged copy is dropped when save() returns, i.e. before an async write ends."""
